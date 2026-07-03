@@ -2004,9 +2004,9 @@ dependencies = [
 
 [[package]]
 name = "loctree"
-version = "0.8.16"
+version = "0.8.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "888e92efb82d051d421830210132ed387d0cd27ebbd9fef858438ff726215426"
+checksum = "bea3c35330789c35fda40a693331df8002fb81a4c624f041301438e231b4ce7c"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3316,9 +3316,9 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "report-leptos"
-version = "0.8.16"
+version = "0.8.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fb8a27e0b854d9ee305563e85bac9cf0994c87026c4f6612ffa7075b26a75d9"
+checksum = "2e5e2a646050d92c9d248367ec4a744059216deec4c7a5c41db2136cb0689473"
 dependencies = [
  "leptos",
  "serde",
