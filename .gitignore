@@ -1,0 +1,13 @@
+/target
+.DS_Store
+*.swp
+*.swo
+/.loctree
+*.log
+CLAUDE.md
+.claude/settings.local.json
+/docs/plans
+/.vibecrafted
+*.out
+*.txt
+/.ai-agents/

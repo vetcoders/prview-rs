@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Match local dev / CI (1.94.x); the old 1.92.0 leptos-via-loctree pin no
+  # longer reproduces — see ci.yml.
+  RUST_TOOLCHAIN: "1.94"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate Release Metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tag, Cargo.toml, and CHANGELOG
+        shell: bash
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          TAG="${GITHUB_REF_NAME}"
+
+          if [ "v${VERSION}" != "${TAG}" ]; then
+            echo "Tag ${TAG} does not match Cargo.toml version v${VERSION}"
+            exit 1
+          fi
+
+          grep -q '^## \[Unreleased\]' CHANGELOG.md || {
+            echo "CHANGELOG.md must contain an [Unreleased] section"
+            exit 1
+          }
+
+          grep -q "^## \[${VERSION}\]" CHANGELOG.md || {
+            echo "CHANGELOG.md must contain a release section for ${VERSION}"
+            exit 1
+          }
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Strip binary
+        run: |
+          BIN="target/${{ matrix.target }}/release/prview"
+          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
+            strip -x "$BIN"
+          else
+            strip "$BIN"
+          fi
+      - name: Package archive
+        run: |
+          ARCHIVE="prview-${{ matrix.target }}.tar.gz"
+          tar czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" prview
+          shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prview-${{ matrix.target }}
+          path: |
+            prview-${{ matrix.target }}.tar.gz
+            prview-${{ matrix.target }}.tar.gz.sha256
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          cat *.sha256 | sort > SHA256SUMS
+          rm -f *.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/prview-*.tar.gz
+            artifacts/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

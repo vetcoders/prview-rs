@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+  <rect x="0" y="0" width="120" height="120" rx="26" fill="#0D0D0D"></rect>
+  <g transform="translate(16.8,16.8) scale(0.72)">
+    <text x="52" y="74" font-family="&#39;Space Grotesk&#39;, sans-serif" font-size="60" font-weight="700" letter-spacing="-3" fill="#F5F5F0" text-anchor="middle">pr</text>
+    <circle cx="87" cy="70" r="4.5" fill="#B8FF00"></circle>
+  </g>
+</svg>

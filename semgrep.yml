@@ -1,0 +1,48 @@
+rules:
+  - id: no-dbg-macro
+    patterns:
+      - pattern: dbg!(...)
+    message: "The dbg! macro is intended for debugging purposes only and should not be used in production code."
+    languages:
+      - rust
+    severity: WARNING
+  - id: no-todo-macro
+    patterns:
+      - pattern: todo!(...)
+    message: "The todo! macro should be resolved before releasing."
+    languages:
+      - rust
+    severity: WARNING
+  - id: no-unimplemented-macro
+    patterns:
+      - pattern: unimplemented!(...)
+    message: "The unimplemented! macro should be resolved before releasing."
+    languages:
+      - rust
+    severity: WARNING
+  - id: avoid-unwrap
+    patterns:
+      - pattern: $X.unwrap()
+      - pattern-not-inside: |
+          #[cfg(test)]
+          ...
+      - pattern-not-inside: |
+          mod tests {
+            ...
+          }
+    message: "Avoid using .unwrap() in production code. Prefer .expect() with a descriptive message or proper error handling with Result."
+    languages:
+      - rust
+    severity: WARNING
+  - id: use-pathbuf-instead-of-string
+    patterns:
+      - pattern: |
+          fn $F(..., $P: String, ...) {
+            ...
+            Path::new(&$P)
+            ...
+          }
+    message: "Use PathBuf or &Path instead of String for file system paths to ensure cross-platform compatibility and better type safety."
+    languages:
+      - rust
+    severity: INFO

@@ -1,0 +1,640 @@
+//! Merge decision: verdict computation, quality-failure classification, review caveats.
+
+use super::*;
+
+// ── Dashboard context ──────────────────────────────────────────────
+
+/// Per-check gate info for dashboard display.
+pub(crate) struct CheckGateEntry {
+    pub name: String,
+    pub id: String,
+    pub blocking: bool,
+    pub class: &'static str,
+    pub severity: &'static str,
+}
+
+/// Inline finding for dashboard display.
+#[derive(Debug, Clone)]
+pub(crate) struct DashboardFinding {
+    pub level: &'static str,
+    pub check_name: String,
+    pub check_id: String,
+    pub message: String,
+    pub in_diff: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QualityFailureClass {
+    Introduced,
+    Preexisting,
+    Mixed,
+    Unclassified,
+}
+
+impl QualityFailureClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            QualityFailureClass::Introduced => "introduced",
+            QualityFailureClass::Preexisting => "pre-existing",
+            QualityFailureClass::Mixed => "mixed",
+            QualityFailureClass::Unclassified => "unclassified",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct QualityFailureDetail {
+    pub name: String,
+    pub classification: QualityFailureClass,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QualityFailureSummary {
+    pub(crate) quality_failures: Vec<String>,
+    pub(crate) introduced_quality_failures: Vec<String>,
+    pub(crate) preexisting_quality_failures: Vec<String>,
+    pub(crate) mixed_quality_failures: Vec<String>,
+    pub(crate) unclassified_quality_failures: Vec<String>,
+    pub(crate) details: Vec<QualityFailureDetail>,
+}
+
+impl QualityFailureSummary {
+    /// Returns true when there are failures that are new or indeterminate.
+    ///
+    /// Purely pre-existing failures do NOT count — they existed before this
+    /// diff and should not block the gate.  Introduced, mixed, and
+    /// unclassified failures are all considered "new" because they either
+    /// definitely or possibly originate from the current change.
+    pub(crate) fn has_new_failures(&self) -> bool {
+        !self.introduced_quality_failures.is_empty()
+            || !self.mixed_quality_failures.is_empty()
+            || !self.unclassified_quality_failures.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MergeDecisionState {
+    Allow,
+    AllowWithReview,
+    Hold,
+    Block,
+}
+
+impl MergeDecisionState {
+    pub(crate) fn hero_class(self) -> &'static str {
+        match self {
+            MergeDecisionState::Allow | MergeDecisionState::AllowWithReview => "merge-allow",
+            MergeDecisionState::Hold => "merge-hold",
+            MergeDecisionState::Block => "merge-block",
+        }
+    }
+
+    pub(crate) fn hero_label(self) -> &'static str {
+        match self {
+            MergeDecisionState::Allow => "ALLOW MERGE",
+            MergeDecisionState::AllowWithReview => "ALLOW WITH REVIEW",
+            MergeDecisionState::Hold => "HOLD MERGE",
+            MergeDecisionState::Block => "BLOCK MERGE",
+        }
+    }
+
+    pub(crate) fn card_badge_class(self) -> &'static str {
+        match self {
+            MergeDecisionState::Allow => "mdb-pass",
+            MergeDecisionState::AllowWithReview | MergeDecisionState::Hold => "mdb-hold",
+            MergeDecisionState::Block => "mdb-fail",
+        }
+    }
+
+    pub(crate) fn card_label(self) -> &'static str {
+        match self {
+            MergeDecisionState::Allow => "GO",
+            MergeDecisionState::AllowWithReview => "GO WITH REVIEW",
+            MergeDecisionState::Hold => "HOLD",
+            MergeDecisionState::Block => "BLOCK",
+        }
+    }
+
+    pub(crate) fn gate_label(self) -> &'static str {
+        match self {
+            MergeDecisionState::Allow => "MERGE",
+            MergeDecisionState::AllowWithReview => "MERGE WITH REVIEW",
+            MergeDecisionState::Hold => "HOLD",
+            MergeDecisionState::Block => "BLOCK",
+        }
+    }
+
+    pub(crate) fn card_class(self) -> &'static str {
+        match self {
+            MergeDecisionState::Allow => "alert-success",
+            MergeDecisionState::AllowWithReview | MergeDecisionState::Hold => "alert-warning",
+            MergeDecisionState::Block => "alert-error",
+        }
+    }
+}
+
+pub(crate) struct MergeDecisionView {
+    pub state: MergeDecisionState,
+    pub reason: String,
+    pub review_caveats: Vec<String>,
+}
+
+/// The single coherent derivation of the scalar decision fields from the two
+/// authoritative axes (`analysis_status` + `merge_recommendation`) plus
+/// `quality_pass`.
+///
+/// `allow_merge` is DERIVED here and nowhere else: it is true **iff** the
+/// verdict is a clean `PASS`. This makes the contradictory state
+/// `allow_merge: true` beside a `CONDITIONAL`/`BLOCK` verdict unrepresentable
+/// (PV-03). The separate "policy did not hard-block" axis (`policy_allow_merge`)
+/// stays owned by the caller and is not conflated with the recommendation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DerivedDecision {
+    pub verdict: &'static str,
+    pub allow_merge: bool,
+    pub recommended_merge: bool,
+}
+
+pub(crate) fn derive_decision(
+    analysis_status: crate::policy::engine::AnalysisStatus,
+    merge_recommendation: crate::policy::engine::MergeRecommendation,
+    quality_pass: bool,
+) -> DerivedDecision {
+    let verdict = merge_recommendation.legacy_verdict(analysis_status, quality_pass);
+    DerivedDecision {
+        verdict,
+        allow_merge: verdict == "PASS",
+        recommended_merge: merge_recommendation.legacy_recommended_merge(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BreakingChangeBreakdown {
+    pub removed_symbols: usize,
+    pub signature_changes: usize,
+    pub new_env_requirements: usize,
+    /// Symbols that moved to another file (same name + kind) and are typically
+    /// still re-exported — non-breaking. Surfaced as a clarifier so the gate
+    /// caveat does not report module splits as mass removals (P1-08).
+    pub relocated_symbols: usize,
+}
+
+impl BreakingChangeBreakdown {
+    pub fn has_any(&self) -> bool {
+        // Relocated symbols alone are non-breaking and must not raise a caveat.
+        self.removed_symbols > 0 || self.signature_changes > 0 || self.new_env_requirements > 0
+    }
+
+    pub fn summary_parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if self.removed_symbols > 0 {
+            parts.push(format!(
+                "{} removed public symbol{}",
+                self.removed_symbols,
+                if self.removed_symbols == 1 { "" } else { "s" }
+            ));
+        }
+        if self.signature_changes > 0 {
+            parts.push(format!(
+                "{} signature change{}",
+                self.signature_changes,
+                if self.signature_changes == 1 { "" } else { "s" }
+            ));
+        }
+        if self.new_env_requirements > 0 {
+            parts.push(format!(
+                "{} new env requirement{}",
+                self.new_env_requirements,
+                if self.new_env_requirements == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
+        // Only consumed when has_any() is true, so a relocation-only diff stays
+        // caveat-free; alongside real breaks it clarifies module-move noise.
+        if self.relocated_symbols > 0 {
+            parts.push(format!(
+                "{} relocated/re-exported (non-breaking)",
+                self.relocated_symbols
+            ));
+        }
+        parts
+    }
+
+    pub fn summary(&self) -> Option<String> {
+        let parts = self.summary_parts();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
+        }
+    }
+}
+
+pub(crate) fn breaking_change_breakdown(breaking: &[BreakingFinding]) -> BreakingChangeBreakdown {
+    let removed_symbols = breaking
+        .iter()
+        .filter(|f| matches!(&f.kind, BreakingKind::RemovedSymbol { .. }))
+        .count();
+    let signature_changes = breaking
+        .iter()
+        .filter(|f| matches!(&f.kind, BreakingKind::ChangedSignature { .. }))
+        .count();
+    let relocated_symbols = breaking
+        .iter()
+        .filter(|f| matches!(&f.kind, BreakingKind::RelocatedSymbol { .. }))
+        .count();
+    let new_env_requirements = breaking
+        .iter()
+        .filter(|f| matches!(&f.kind, BreakingKind::NewEnvRequirement { .. }))
+        .count();
+
+    BreakingChangeBreakdown {
+        removed_symbols,
+        signature_changes,
+        new_env_requirements,
+        relocated_symbols,
+    }
+}
+
+pub(crate) fn build_review_caveats(
+    breaking: &[BreakingFinding],
+    coverage: &CoverageDelta,
+    findings_count: usize,
+) -> Vec<String> {
+    let mut caveats = Vec::new();
+
+    let breaking_breakdown = breaking_change_breakdown(breaking);
+    if breaking_breakdown.has_any() {
+        caveats.push(breaking_breakdown.summary_parts().join(" · "));
+    }
+
+    if coverage.total_source > 0 && coverage.pct < 80 {
+        let mut coverage_caveat = format!("{}% coverage heuristic", coverage.pct);
+        if coverage_has_rust_inline_test_blind_spot(coverage) {
+            coverage_caveat.push_str(" (Rust inline #[cfg(test)] modules may be missed)");
+        }
+        caveats.push(coverage_caveat);
+    }
+
+    if !coverage.ghost_tests.is_empty() {
+        caveats.push(format!(
+            "{} orphaned test candidate{}",
+            coverage.ghost_tests.len(),
+            if coverage.ghost_tests.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+
+    if findings_count > 0 {
+        caveats.push(format!(
+            "{} inline finding{}",
+            findings_count,
+            if findings_count == 1 { "" } else { "s" }
+        ));
+    }
+
+    caveats
+}
+
+pub(crate) fn rust_quality_review_caveats(
+    _config: &Config,
+    _checks: &[CheckResult],
+) -> Vec<String> {
+    // Rust quality signal gaps are now handled by PolicyEngine::evaluate_skip().
+    // Skipped checks with block/warn severity produce review caveats automatically.
+    Vec::new()
+}
+
+pub(crate) fn cargo_audit_review_caveats(checks: &[CheckResult]) -> Vec<String> {
+    checks
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case("cargo audit"))
+        .and_then(|check| cargo_audit_informational_summary(&check.output))
+        .map(|summary| vec![format!("Cargo audit note: {summary}")])
+        .unwrap_or_default()
+}
+
+pub(crate) fn build_merge_decision_view(
+    policy_allow_merge: bool,
+    quality_pass: bool,
+    recommended_merge: bool,
+    quality_failures: &[String],
+    quality_failure_details: &[QualityFailureDetail],
+    blocking_issues: &[String],
+    review_caveats: Vec<String>,
+) -> MergeDecisionView {
+    let state = if !policy_allow_merge {
+        MergeDecisionState::Block
+    } else if recommended_merge {
+        if review_caveats.is_empty() {
+            MergeDecisionState::Allow
+        } else {
+            MergeDecisionState::AllowWithReview
+        }
+    } else if !quality_failures.is_empty() {
+        // A real check failed (even if non-blocking / pre-existing): a human
+        // should look before merging, so this is a genuine HOLD.
+        MergeDecisionState::Hold
+    } else if !review_caveats.is_empty() {
+        // Policy permits the merge and no check actually failed — only advisory
+        // review signals remain (warnings, inline findings, audit notes). This
+        // is "mergeable with advisories", NOT a hold: the label must not read
+        // like a stop sign when status is ALLOW and allow_merge is true.
+        MergeDecisionState::AllowWithReview
+    } else {
+        // Not an explicit approve and nothing concrete to show — stay
+        // conservative and hold for human review.
+        MergeDecisionState::Hold
+    };
+
+    let reason = match state {
+        MergeDecisionState::Allow => "All quality gates passed".to_string(),
+        MergeDecisionState::AllowWithReview => format!(
+            "{}{} review signal{} need attention",
+            quality_failure_reason_text(quality_failures, quality_failure_details)
+                .map(|reason| format!("{reason}; "))
+                .unwrap_or_else(|| "Quality gates passed, but ".to_string()),
+            review_caveats.len(),
+            if review_caveats.len() == 1 { "" } else { "s" }
+        ),
+        MergeDecisionState::Hold => {
+            if !quality_pass && !quality_failures.is_empty() {
+                quality_failure_reason_text(quality_failures, quality_failure_details)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{} quality check{} failed: {}",
+                            quality_failures.len(),
+                            if quality_failures.len() == 1 { "" } else { "s" },
+                            quality_failures.join(", ")
+                        )
+                    })
+            } else if !review_caveats.is_empty() {
+                format!(
+                    "{}review required: {} signal{} need attention",
+                    quality_failure_reason_text(quality_failures, quality_failure_details)
+                        .map(|reason| format!("{reason}; "))
+                        .unwrap_or_default(),
+                    review_caveats.len(),
+                    if review_caveats.len() == 1 { "" } else { "s" }
+                )
+            } else {
+                "Merge not recommended".to_string()
+            }
+        }
+        MergeDecisionState::Block => {
+            if !blocking_issues.is_empty() {
+                format!(
+                    "{} blocking issue{} found: {}",
+                    blocking_issues.len(),
+                    if blocking_issues.len() == 1 { "" } else { "s" },
+                    blocking_issues.join(", ")
+                )
+            } else if !quality_pass {
+                "Blocking policy violations detected".to_string()
+            } else {
+                "Merge blocked by policy".to_string()
+            }
+        }
+    };
+
+    MergeDecisionView {
+        state,
+        reason,
+        review_caveats,
+    }
+}
+
+pub(crate) fn classify_quality_failure(
+    check_id: &str,
+    dashboard_findings: &[DashboardFinding],
+) -> QualityFailureClass {
+    let mut saw_in_diff = false;
+    let mut saw_out_of_diff = false;
+
+    for finding in dashboard_findings
+        .iter()
+        .filter(|finding| finding.check_id == check_id)
+    {
+        match finding.in_diff {
+            Some(true) => saw_in_diff = true,
+            Some(false) => saw_out_of_diff = true,
+            None => {}
+        }
+    }
+
+    match (saw_in_diff, saw_out_of_diff) {
+        (true, true) => QualityFailureClass::Mixed,
+        (true, false) => QualityFailureClass::Introduced,
+        (false, true) => QualityFailureClass::Preexisting,
+        (false, false) => QualityFailureClass::Unclassified,
+    }
+}
+
+pub(crate) fn push_quality_failure(
+    summary: &mut QualityFailureSummary,
+    name: String,
+    classification: QualityFailureClass,
+) {
+    summary.quality_failures.push(name.clone());
+    summary.details.push(QualityFailureDetail {
+        name: name.clone(),
+        classification,
+    });
+
+    match classification {
+        QualityFailureClass::Introduced => summary.introduced_quality_failures.push(name),
+        QualityFailureClass::Preexisting => summary.preexisting_quality_failures.push(name),
+        QualityFailureClass::Mixed => summary.mixed_quality_failures.push(name),
+        QualityFailureClass::Unclassified => summary.unclassified_quality_failures.push(name),
+    }
+}
+
+pub(crate) fn build_quality_failure_summary(
+    checks: &[CheckResult],
+    dashboard_findings: &[DashboardFinding],
+) -> QualityFailureSummary {
+    let mut summary = QualityFailureSummary::default();
+
+    for check in checks.iter().filter(|check| check.is_failure()) {
+        let classification =
+            classify_quality_failure(&check_id_from_name(&check.name), dashboard_findings);
+        push_quality_failure(&mut summary, check.name.clone(), classification);
+    }
+
+    summary
+}
+
+pub(crate) fn quality_failure_reason_text(
+    quality_failures: &[String],
+    quality_failure_details: &[QualityFailureDetail],
+) -> Option<String> {
+    if quality_failures.is_empty() {
+        return None;
+    }
+
+    if quality_failure_details.is_empty() {
+        return None;
+    }
+
+    let mut introduced = 0usize;
+    let mut preexisting = 0usize;
+    let mut mixed = 0usize;
+    let mut unclassified = 0usize;
+
+    for detail in quality_failure_details {
+        match detail.classification {
+            QualityFailureClass::Introduced => introduced += 1,
+            QualityFailureClass::Preexisting => preexisting += 1,
+            QualityFailureClass::Mixed => mixed += 1,
+            QualityFailureClass::Unclassified => unclassified += 1,
+        }
+    }
+
+    let mut parts = Vec::new();
+    if introduced > 0 {
+        parts.push(format!("{} introduced", introduced));
+    }
+    if preexisting > 0 {
+        parts.push(format!("{} pre-existing", preexisting));
+    }
+    if mixed > 0 {
+        parts.push(format!("{} mixed", mixed));
+    }
+    if unclassified > 0 {
+        parts.push(format!("{} unclassified", unclassified));
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "{} quality check{} failed ({})",
+        quality_failures.len(),
+        if quality_failures.len() == 1 { "" } else { "s" },
+        parts.join(", ")
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advisory_only_review_required_is_allow_with_review_not_hold() {
+        // policy allows merge, nothing failed, only non-blocking review signals.
+        // This must read as "mergeable with advisories", not a stop-sign HOLD.
+        let view = build_merge_decision_view(
+            true,  // policy_allow_merge
+            true,  // quality_pass
+            false, // recommended_merge (review_required)
+            &[],   // quality_failures
+            &[],   // quality_failure_details
+            &[],   // blocking_issues
+            vec!["3 inline findings".to_string()],
+        );
+        assert_eq!(view.state, MergeDecisionState::AllowWithReview);
+        assert_eq!(view.state.gate_label(), "MERGE WITH REVIEW");
+        assert_eq!(view.state.card_label(), "GO WITH REVIEW");
+    }
+
+    #[test]
+    fn real_failure_review_required_stays_hold() {
+        // A failing check (even non-blocking / pre-existing) keeps a true HOLD.
+        let view = build_merge_decision_view(
+            true,
+            true,
+            false,
+            &["clippy".to_string()],
+            &[],
+            &[],
+            vec!["clippy returned warnings".to_string()],
+        );
+        assert_eq!(view.state, MergeDecisionState::Hold);
+        assert_eq!(view.state.gate_label(), "HOLD");
+    }
+
+    #[test]
+    fn blocking_policy_violation_is_block() {
+        let view = build_merge_decision_view(
+            false,
+            false,
+            false,
+            &["semgrep".to_string()],
+            &[],
+            &["secret leak".to_string()],
+            vec![],
+        );
+        assert_eq!(view.state, MergeDecisionState::Block);
+    }
+
+    #[test]
+    fn clean_approve_is_allow() {
+        let view = build_merge_decision_view(true, true, true, &[], &[], &[], vec![]);
+        assert_eq!(view.state, MergeDecisionState::Allow);
+        assert_eq!(view.state.gate_label(), "MERGE");
+    }
+
+    /// Property: for every combination of the two authoritative axes plus
+    /// `quality_pass`, the derived scalar decision fields are mutually coherent.
+    /// This is the invariant that makes `allow_merge: true` beside a
+    /// `CONDITIONAL`/`BLOCK` verdict unrepresentable (PV-03).
+    #[test]
+    fn derived_decision_fields_are_always_coherent() {
+        use crate::policy::engine::{AnalysisStatus, MergeRecommendation};
+
+        let statuses = [
+            AnalysisStatus::Complete,
+            AnalysisStatus::Degraded,
+            AnalysisStatus::Incomplete,
+        ];
+        let recs = [
+            MergeRecommendation::Approve,
+            MergeRecommendation::ReviewRequired,
+            MergeRecommendation::Block,
+        ];
+
+        for status in statuses {
+            for rec in recs {
+                for quality_pass in [true, false] {
+                    let d = derive_decision(status, rec, quality_pass);
+
+                    // Vocabulary is exactly the unified set — no stray HOLD.
+                    assert!(
+                        matches!(d.verdict, "PASS" | "CONDITIONAL" | "BLOCK"),
+                        "unexpected verdict {:?}",
+                        d.verdict
+                    );
+
+                    // allow_merge is true iff the verdict is a clean PASS.
+                    assert_eq!(d.allow_merge, d.verdict == "PASS");
+
+                    // A permissive allow_merge can never coexist with a
+                    // non-PASS verdict or a non-approve recommendation.
+                    if d.allow_merge {
+                        assert_eq!(d.verdict, "PASS");
+                        assert_eq!(rec, MergeRecommendation::Approve);
+                        assert!(
+                            d.recommended_merge,
+                            "PASS implies an approve recommendation"
+                        );
+                        assert_eq!(status, AnalysisStatus::Complete);
+                        assert!(quality_pass, "PASS implies quality passed");
+                    }
+
+                    // BLOCK verdict iff the recommendation blocks.
+                    assert_eq!(d.verdict == "BLOCK", rec == MergeRecommendation::Block);
+
+                    // recommended_merge tracks the approve recommendation only.
+                    assert_eq!(d.recommended_merge, rec == MergeRecommendation::Approve);
+                }
+            }
+        }
+    }
+}

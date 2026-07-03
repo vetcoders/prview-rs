@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+
+# Pre-push hook for prview-rs
+# Delegate to the canonical make target to avoid drift.
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+remote="$1"
+url="$2"
+
+echo "Pushing to: $remote ($url)"
+
+echo "=== Pre-push validation ==="
+
+if command -v make >/dev/null 2>&1; then
+  exec make check
+fi
+
+if command -v gmake >/dev/null 2>&1; then
+  exec gmake check
+fi
+
+echo "make (or gmake) is required to run the pre-push hook." >&2
+exit 1

@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# Pre-commit hook for prview-rs
+# Delegate to the canonical make target to avoid drift.
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+if command -v make >/dev/null 2>&1; then
+  exec make precommit
+fi
+
+if command -v gmake >/dev/null 2>&1; then
+  exec gmake precommit
+fi
+
+echo "make (or gmake) is required to run the pre-commit hook." >&2
+exit 1

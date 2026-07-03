@@ -1,0 +1,9 @@
+version: 1
+mode: warn
+default_severity: warn
+checks:
+  cargo_audit: block
+  inline_findings: block
+  heuristics_loctree: warn
+  tests: warn
+  lint: warn
