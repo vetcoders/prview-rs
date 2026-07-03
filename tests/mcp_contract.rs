@@ -33,7 +33,12 @@ fn git_short_head(repo: &Path) -> String {
         .current_dir(repo)
         .output()
         .expect("rev-parse HEAD");
-    assert!(out.status.success(), "rev-parse HEAD failed");
+    assert!(
+        out.status.success(),
+        "rev-parse HEAD failed in {}: {}",
+        repo.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 

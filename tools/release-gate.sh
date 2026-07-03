@@ -47,7 +47,7 @@ if CLIPPY_OUT=$(cargo clippy --all-targets -- -D warnings 2>&1); then
   pass "clippy clean"
 else
   echo "$CLIPPY_OUT"
-  fail "clippy has warnings"
+  fail "clippy failed (warnings or compile errors — output above)"
 fi
 
 # 4. Tests
