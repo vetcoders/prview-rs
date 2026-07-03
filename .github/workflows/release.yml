@@ -58,7 +58,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Strip binary
         run: |
           BIN="target/${{ matrix.target }}/release/prview"

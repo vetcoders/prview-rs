@@ -3,22 +3,43 @@
 //! These drive the real binary over JSON-RPC on stdin/stdout, asserting the
 //! wire contract from `2026-07-01-prview-mcp-v1-design.md`.
 
+use prview::git::git_cmd;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 // --- fixture git repo helpers -------------------------------------------------
 
+/// Route every fixture git invocation through `git_cmd()` — the same isolated
+/// builder production uses. The doctrine is "production and test code alike":
+/// a raw `Command::new("git")` here would inherit a poisoned `GIT_*` env from
+/// the parent (hook/editor/worktree) and could silently retarget the fixture
+/// setup at the wrong repository.
 fn run_git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = git_cmd()
         .args(args)
         .current_dir(repo)
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .expect("run git");
     assert!(status.success(), "git {args:?} failed");
+}
+
+/// Short HEAD sha of `repo`, read through the isolated git builder.
+fn git_short_head(repo: &Path) -> String {
+    let out = git_cmd()
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("rev-parse HEAD");
+    assert!(
+        out.status.success(),
+        "rev-parse HEAD failed in {}: {}",
+        repo.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// A fixture repo on branch `feature` (one commit) diffable against `main`.
@@ -706,6 +727,92 @@ fn server_works_from_foreign_cwd() {
         "state from foreign cwd must work: {result}"
     );
     assert_eq!(tool_body(&result)["branch"], "feature");
+}
+
+#[test]
+fn fixture_git_is_hermetic_under_poisoned_env() {
+    // git_cmd() strips inherited GIT_* so a poisoned parent env cannot retarget
+    // git at the wrong repository. Prove it end-to-end in the contract suite:
+    // with the MCP server's env poisoned to point GIT_DIR/GIT_WORK_TREE at a
+    // *victim* repo, a `state` on the fixture must still report the fixture's
+    // branch, and the victim must be left completely untouched.
+    let home = tempfile::tempdir().unwrap();
+
+    // Victim on a distinct branch: if the poison leaked, state would report it.
+    let victim = tempfile::tempdir().unwrap();
+    run_git(victim.path(), &["init", "-b", "victim-branch"]);
+    run_git(victim.path(), &["config", "user.email", "victim@test.com"]);
+    run_git(victim.path(), &["config", "user.name", "Victim"]);
+    std::fs::write(victim.path().join("v.txt"), "victim\n").unwrap();
+    run_git(victim.path(), &["add", "-A"]);
+    run_git(victim.path(), &["commit", "-m", "victim init"]);
+    let victim_head = git_short_head(victim.path());
+
+    let repo = fixture_repo(); // branch "feature"
+    let victim_git_dir = victim.path().join(".git");
+
+    let mut s = McpSession::start(&[
+        ("PRVIEW_HOME", home.path().to_str().unwrap()),
+        ("GIT_DIR", victim_git_dir.to_str().unwrap()),
+        ("GIT_WORK_TREE", victim.path().to_str().unwrap()),
+    ]);
+    let result = s.call_tool(
+        "state",
+        serde_json::json!({"repo": repo.path().to_str().unwrap()}),
+    );
+    assert!(
+        !is_error(&result),
+        "state under poisoned env must work: {result}"
+    );
+    assert_eq!(
+        tool_body(&result)["branch"],
+        "feature",
+        "server must operate on the fixture, not the poisoned victim"
+    );
+
+    // Victim must be untouched: HEAD did not move.
+    assert_eq!(
+        git_short_head(victim.path()),
+        victim_head,
+        "victim HEAD must not move under a poisoned env"
+    );
+}
+
+#[test]
+fn state_on_relative_repo_errors_even_when_path_exists_under_cwd() {
+    // Contract: the `repo` argument MUST be absolute; the server MUST NOT rely
+    // on its own cwd. Spawn the server with a cwd that DOES contain a real git
+    // repo under a relative path, then pass that relative path. It must still
+    // fail loud (repo_not_found), proving the boundary rejects the path itself
+    // rather than silently resolving it against the server's cwd.
+    let scratch = tempfile::tempdir().unwrap();
+    let nested = scratch.path().join("nested-repo");
+    std::fs::create_dir_all(&nested).unwrap();
+    run_git(&nested, &["init", "-b", "main"]);
+    run_git(&nested, &["config", "user.email", "test@test.com"]);
+    run_git(&nested, &["config", "user.name", "Test"]);
+    std::fs::write(nested.join("a.txt"), "hello\n").unwrap();
+    run_git(&nested, &["add", "-A"]);
+    run_git(&nested, &["commit", "-m", "init"]);
+
+    // Sanity: the relative path really does resolve to a git repo under cwd.
+    assert!(scratch.path().join("nested-repo").join(".git").is_dir());
+
+    let mut s = McpSession::start_in(Some(scratch.path()), &[]);
+    let result = s.call_tool("state", serde_json::json!({"repo": "nested-repo"}));
+    assert!(
+        is_error(&result),
+        "relative repo must be rejected: {result}"
+    );
+    let body = tool_body(&result);
+    assert_eq!(body["error_class"], "repo_not_found");
+    assert!(
+        body["message"]
+            .as_str()
+            .map(|m| m.contains("absolute"))
+            .unwrap_or(false),
+        "message must name the absolute-path requirement: {body}"
+    );
 }
 
 #[test]

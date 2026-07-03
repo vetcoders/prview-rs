@@ -43,10 +43,11 @@ fi
 
 # 3. Clippy
 echo "[3/9] Clippy"
-if cargo clippy --all-targets -- -D warnings 2>&1 | tail -1 | grep -q "Finished"; then
+if CLIPPY_OUT=$(cargo clippy --all-targets -- -D warnings 2>&1); then
   pass "clippy clean"
 else
-  fail "clippy has warnings"
+  echo "$CLIPPY_OUT"
+  fail "clippy failed (warnings or compile errors — output above)"
 fi
 
 # 4. Tests
