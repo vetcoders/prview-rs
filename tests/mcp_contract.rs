@@ -709,6 +709,43 @@ fn server_works_from_foreign_cwd() {
 }
 
 #[test]
+fn state_on_relative_repo_errors_even_when_path_exists_under_cwd() {
+    // Contract: the `repo` argument MUST be absolute; the server MUST NOT rely
+    // on its own cwd. Spawn the server with a cwd that DOES contain a real git
+    // repo under a relative path, then pass that relative path. It must still
+    // fail loud (repo_not_found), proving the boundary rejects the path itself
+    // rather than silently resolving it against the server's cwd.
+    let scratch = tempfile::tempdir().unwrap();
+    let nested = scratch.path().join("nested-repo");
+    std::fs::create_dir_all(&nested).unwrap();
+    run_git(&nested, &["init", "-b", "main"]);
+    run_git(&nested, &["config", "user.email", "test@test.com"]);
+    run_git(&nested, &["config", "user.name", "Test"]);
+    std::fs::write(nested.join("a.txt"), "hello\n").unwrap();
+    run_git(&nested, &["add", "-A"]);
+    run_git(&nested, &["commit", "-m", "init"]);
+
+    // Sanity: the relative path really does resolve to a git repo under cwd.
+    assert!(scratch.path().join("nested-repo").join(".git").is_dir());
+
+    let mut s = McpSession::start_in(Some(scratch.path()), &[]);
+    let result = s.call_tool("state", serde_json::json!({"repo": "nested-repo"}));
+    assert!(
+        is_error(&result),
+        "relative repo must be rejected: {result}"
+    );
+    let body = tool_body(&result);
+    assert_eq!(body["error_class"], "repo_not_found");
+    assert!(
+        body["message"]
+            .as_str()
+            .map(|m| m.contains("absolute"))
+            .unwrap_or(false),
+        "message must name the absolute-path requirement: {body}"
+    );
+}
+
+#[test]
 fn state_on_missing_repo_errors_repo_not_found() {
     let mut s = McpSession::start(&[]);
     let result = s.call_tool(

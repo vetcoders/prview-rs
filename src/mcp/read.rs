@@ -50,10 +50,24 @@ pub fn latest_any<'a>(index: &'a RunIndex, repo: &str, branch_key: &str) -> Opti
 
 /// Validate an absolute `repo` argument and resolve its git top-level.
 ///
-/// `repo_not_found` when the path does not exist; `not_a_git_repo` when it is
-/// not inside a git work tree.
+/// The MCP contract requires an ABSOLUTE path: the server MUST NOT rely on its
+/// own cwd (`2026-07-01-prview-mcp-v1-design.md`). A relative path is rejected
+/// at the boundary — before any `exists()`/git probe — so a review can never
+/// silently resolve against wherever the server happens to run. (`invalid_args`
+/// would be the precise class here, but the v1 schema has no such class yet;
+/// `repo_not_found` is the closest fail-loud contract error. Adding a dedicated
+/// class is a future schema evolution.)
+///
+/// `repo_not_found` when the path is not absolute or does not exist;
+/// `not_a_git_repo` when it is not inside a git work tree.
 pub fn resolve_repo_root(repo: &str) -> Result<PathBuf, ToolError> {
     let path = PathBuf::from(repo);
+    if !path.is_absolute() {
+        return Err(ToolError::new(
+            error_class::REPO_NOT_FOUND,
+            format!("repo path must be absolute: {repo}"),
+        ));
+    }
     if !path.exists() {
         return Err(ToolError::new(
             error_class::REPO_NOT_FOUND,
