@@ -512,6 +512,15 @@ impl Check for CargoGeigerCheck {
                 config.profile.kind.as_str().to_lowercase()
             ));
         }
+        if !config.run_security {
+            // An explicit global security-off (`--skip-security`, or a fast
+            // preset like `--quick` without `--with-security`) must win over
+            // `--security-full`: geiger is minutes-slow and has no business
+            // running when security was deliberately disabled. `--security-full`
+            // on its own still implies security intent (see
+            // `Cli::should_run_security`), so the plain opt-in path stays live.
+            return super::CheckEligibility::Skip("security disabled".to_string());
+        }
         if !config.security_full {
             return super::CheckEligibility::Skip("requires --security-full".to_string());
         }
@@ -846,13 +855,37 @@ mod tests {
     fn test_cargo_geiger_requires_security_full() {
         // Without --security-full geiger is not eligible; it is opt-in and must
         // stay out of the default profile rather than fabricate a caveat.
-        let config = create_test_config(true, true, false);
+        let mut config = create_test_config(true, true, false);
+        config.run_security = true;
         assert!(!config.security_full);
         let check = CargoGeigerCheck;
         assert!(matches!(
             check.check_eligibility(&config),
             super::super::CheckEligibility::Skip(_)
         ));
+    }
+
+    #[test]
+    fn test_cargo_geiger_skipped_when_security_disabled() {
+        // Even with --security-full, an explicit global security-off
+        // (`--skip-security`, or a fast preset without `--with-security`) leaves
+        // `run_security = false`. The minutes-slow geiger scan must not run in
+        // that state, and the skip reason must name the disable, not the flag.
+        let mut config = create_test_config(true, true, false);
+        config.run_security = false;
+        config.security_full = true;
+        let check = CargoGeigerCheck;
+        match check.check_eligibility(&config) {
+            super::super::CheckEligibility::Skip(reason) => {
+                assert!(
+                    reason.contains("security disabled"),
+                    "unexpected skip reason: {reason}"
+                );
+            }
+            super::super::CheckEligibility::Run => {
+                panic!("geiger must not run when security is globally disabled")
+            }
+        }
     }
 
     #[test]
