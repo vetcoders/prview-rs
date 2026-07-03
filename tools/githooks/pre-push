@@ -4,6 +4,15 @@ set -e
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 
+# Resolve GNU Make once. On BSD systems GNU Make ships as `gmake`; on Linux/mac
+# it is `make`. Prefer `gmake` when present, fall back to `make`, and bail with
+# a clear message if neither exists rather than dying on command-not-found.
+MAKE=$(command -v gmake || command -v make || true)
+if [ -z "$MAKE" ]; then
+  echo "make (or gmake) is required to run the pre-push hook." >&2
+  exit 1
+fi
+
 remote="$1"
 url="$2"
 
@@ -12,19 +21,19 @@ echo "Pushing to: $remote ($url)"
 
 # Resolve the default branch dynamically instead of hardcoding it. Prefer the
 # symbolic ref that `git remote set-head` records; fall back to the first
-# conventional branch that actually exists on origin. This keeps the merge-base
+# conventional branch that actually exists on the remote. This keeps the merge-base
 # diff correct regardless of whether the trunk is main/master/develop.
-DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+DEFAULT_BRANCH=$(git symbolic-ref --short "refs/remotes/$remote/HEAD" 2>/dev/null | sed "s|^$remote/||")
 if [ -z "$DEFAULT_BRANCH" ]; then
   for cand in main master develop; do
-    if git show-ref --verify --quiet "refs/remotes/origin/$cand"; then
+    if git show-ref --verify --quiet "refs/remotes/$remote/$cand"; then
       DEFAULT_BRANCH="$cand"
       break
     fi
   done
 fi
 [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
-echo "Default branch: origin/$DEFAULT_BRANCH"
+echo "Default branch: $remote/$DEFAULT_BRANCH"
 
 # Decide whether this push touches Rust/Cargo files. If it does not (docs,
 # markdown, shell, CI yaml, etc.), the heavy clippy+test gates are skipped —
@@ -37,11 +46,15 @@ while read -r _lref lsha _rref rsha; do
   case "$lsha" in *[!0]*) : ;; *) continue ;; esac  # ref deletion: nothing to test
   HAVE_RANGE=1
   if printf '%s' "$rsha" | grep -qE '^0+$' || ! git cat-file -e "$rsha" 2>/dev/null; then
-    base=$(git merge-base "$lsha" "origin/$DEFAULT_BRANCH" 2>/dev/null || true)
+    base=$(git merge-base "$lsha" "$remote/$DEFAULT_BRANCH" 2>/dev/null || true)
     if [ -n "$base" ]; then
       files=$(git diff --name-only "$base" "$lsha")
     else
-      files=$(git show --name-only --format= "$lsha")
+      # No common ancestor found (e.g. remote default branch not fetched).
+      # Diffing a single commit would miss the rest of the pushed branch, so
+      # run the full gate to be safe rather than guessing a narrow file set.
+      RUST_TOUCHED=1
+      files=""
     fi
   else
     files=$(git diff --name-only "$rsha" "$lsha")
@@ -64,7 +77,11 @@ python3 - <<'PY'
 try:
     import tomllib
 except ModuleNotFoundError:
-    import tomli as tomllib
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        print("Warning: manifest portability check skipped (needs Python 3.11+ or tomli)")
+        raise SystemExit(0)
 
 with open("Cargo.toml", "rb") as fh:
     data = tomllib.load(fh)
@@ -94,17 +111,17 @@ print("Manifest portability: ok (path dependencies carry registry versions)")
 PY
 
 echo ""
-echo "[2/5] Format check (make fmt-check)..."
-make fmt-check
+echo "[2/5] Format check ($MAKE fmt-check)..."
+$MAKE fmt-check
 
 if [ "$RUST_TOUCHED" = "1" ]; then
   echo ""
-  echo "[3/5] Clippy (make clippy)..."
-  make clippy
+  echo "[3/5] Clippy ($MAKE clippy)..."
+  $MAKE clippy
 
   echo ""
-  echo "[4/5] Tests (make test)..."
-  make test
+  echo "[4/5] Tests ($MAKE test)..."
+  $MAKE test
 else
   echo ""
   echo "[3/5] Clippy... skipped (no Rust/Cargo changes)"
@@ -112,8 +129,8 @@ else
 fi
 
 echo ""
-echo "[5/5] Semgrep (make semgrep)..."
-make semgrep
+echo "[5/5] Semgrep ($MAKE semgrep)..."
+$MAKE semgrep
 
 echo ""
 echo "=== All pre-push checks passed ==="
