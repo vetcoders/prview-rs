@@ -1,19 +1,32 @@
 #!/bin/sh
 set -e
 
-# Pre-commit hook for prview-rs
-# Delegate to the canonical make target to avoid drift.
-
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 
-if command -v make >/dev/null 2>&1; then
-  exec make precommit
+echo "=== Pre-commit (fast checks) ==="
+
+STAGED_RS=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
+
+if [ -n "$STAGED_RS" ]; then
+  # Check-only: never mutate or stage files from a hook. Auto-formatting and
+  # `git add` here would silently pull a developer's unstaged changes into the
+  # commit when a file is only partially staged. Fail loudly and let the
+  # developer format and re-stage on purpose.
+  echo "Checking formatting (cargo fmt --check)..."
+  # Word-splitting is intentional: STAGED_RS is a newline-separated file list
+  # and each path is passed to rustfmt as a separate --check target.
+  # shellcheck disable=SC2086
+  cargo fmt --check -- $STAGED_RS || {
+    echo "Formatting issues found. Run: cargo fmt --all, then re-stage the changes before committing."
+    exit 1
+  }
+
+  echo "Running cargo check..."
+  cargo check --quiet || {
+    echo "Compilation errors. Fix before committing."
+    exit 1
+  }
 fi
 
-if command -v gmake >/dev/null 2>&1; then
-  exec gmake precommit
-fi
-
-echo "make (or gmake) is required to run the pre-commit hook." >&2
-exit 1
+echo "Pre-commit checks passed."
