@@ -110,18 +110,28 @@ pub struct Cli {
     #[arg(long = "skip-bundle", conflicts_with = "with_bundle")]
     pub skip_bundle: bool,
 
-    /// Enable heavy security checks like cargo-geiger (only runs with --deep or --ci by default)
+    /// Enable the heavy security posture (only runs with --deep or --ci by default)
     #[arg(
         long = "with-security",
-        long_help = "Enable heavy security checks (e.g. cargo-geiger). These are slow (3+ min on \
-                     large projects) so they only run by default with --deep or --ci. Lightweight \
-                     checks like cargo-audit always run regardless."
+        long_help = "Enable the heavy security posture. This raises the security tier used by \
+                     --deep and --ci. cargo-geiger is NOT part of this tier — it is opt-in via \
+                     --security-full. Lightweight checks like cargo-audit always run regardless."
     )]
     pub with_security: bool,
 
     /// Skip heavy security checks even when otherwise enabled
     #[arg(long = "skip-security", conflicts_with = "with_security")]
     pub skip_security: bool,
+
+    /// Run the full security tier including cargo-geiger (slow: minutes on large trees)
+    #[arg(
+        long = "security-full",
+        long_help = "Opt in to the full security tier, which adds cargo-geiger's unsafe-usage \
+                     scan. Geiger can take several minutes on large dependency trees, so it is \
+                     off by default even under --deep; source-side unsafe is already audited \
+                     in-process. Without this flag geiger is simply absent from the profile."
+    )]
+    pub security_full: bool,
 
     // === Profile ===
     /// Language profile for check selection (default: auto-detected from repo contents)
@@ -181,7 +191,7 @@ pub struct Cli {
     pub no_color: bool,
 
     // === Misc ===
-    /// Skip architecture heuristics (madge, knip, loctree cycle/dead-code detection)
+    /// Skip architecture heuristics (loctree cycle/dead-code/twins detection)
     #[arg(long = "no-heuristics")]
     pub no_heuristics: bool,
 
@@ -468,8 +478,15 @@ impl Cli {
     /// Determine effective heavy security setting (cargo geiger)
     ///
     /// Heavy security checks are slow (3+ min on large projects) so they
-    /// only run with --deep, --ci, or --with-security. Lightweight security
-    /// (cargo audit) always runs regardless of this flag.
+    /// only run with --deep, --ci, --with-security, or the explicit
+    /// --security-full opt-in. Lightweight security (cargo audit) always runs
+    /// regardless of this flag.
+    ///
+    /// `--security-full` is a deliberate opt-in to the full security tier, so
+    /// it implies security intent on its own (a bare `prview --security-full`
+    /// runs geiger). It does not override an explicit disable: `--skip-security`
+    /// still wins, and the fast presets (`--quick`/`--ai-only`/`--update`) keep
+    /// requiring an explicit `--with-security` before any heavy security runs.
     pub fn should_run_security(&self) -> bool {
         if self.quick || self.ai_only || self.update {
             return self.with_security; // only if explicitly requested
@@ -477,7 +494,7 @@ impl Cli {
         if self.skip_security {
             return false;
         }
-        self.with_security || self.deep || self.ci
+        self.with_security || self.deep || self.ci || self.security_full
     }
 
     /// Determine effective bundle setting
@@ -538,6 +555,7 @@ mod tests {
             skip_bundle: false,
             with_security: false,
             skip_security: false,
+            security_full: false,
             profile: Profile::Auto,
             pr: None,
             gh_repo: None,
@@ -572,6 +590,37 @@ mod tests {
     fn test_should_run_tests_default() {
         let cli = default_cli();
         assert!(cli.should_run_tests());
+    }
+
+    #[test]
+    fn test_security_full_implies_security_in_default_mode() {
+        // `--security-full` is a deliberate opt-in to the full security tier, so
+        // a bare `prview --security-full` must enable security (and thus geiger),
+        // even without `--with-security`/`--deep`/`--ci`.
+        let mut cli = default_cli();
+        cli.security_full = true;
+        assert!(cli.should_run_security());
+    }
+
+    #[test]
+    fn test_skip_security_overrides_security_full() {
+        // An explicit `--skip-security` is a direct security-off and must win
+        // over `--security-full`: no minutes-slow geiger when security is
+        // deliberately disabled.
+        let mut cli = default_cli();
+        cli.security_full = true;
+        cli.skip_security = true;
+        assert!(!cli.should_run_security());
+    }
+
+    #[test]
+    fn test_quick_does_not_promote_security_full() {
+        // Fast presets stay fast: `--security-full` does not force heavy
+        // security under `--quick` without an explicit `--with-security`.
+        let mut cli = default_cli();
+        cli.security_full = true;
+        cli.quick = true;
+        assert!(!cli.should_run_security());
     }
 
     #[test]

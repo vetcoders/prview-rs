@@ -1,0 +1,22 @@
+# cargo-audit configuration.
+#
+# cargo-audit reads this file from `.cargo/audit.toml` in the project root by
+# default (see rustsec/rustsec cargo-audit audit.toml.example). It mirrors the
+# advisory ignores already applied to the CI Security Audit job in
+# .github/workflows/ci.yml, so local `cargo audit` (and prview's cargo_audit
+# check) agree with CI instead of reporting a spurious BLOCK.
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml advisories.
+    #
+    # WHY: quick-xml 0.39 sits in Cargo.lock only through comrak's target-gated
+    # (wasm) syntect variant; it is NOT part of the build graph on any release
+    # target (proof: `cargo tree -i quick-xml` empty on x86_64-unknown-linux-gnu
+    # and aarch64-apple-darwin) and prview parses no external XML.
+    #
+    # WHEN TO REMOVE: when plist releases quick-xml >=0.41 support
+    # (RUSTSEC-2026-0194/0195 patched there) — bump the chain and drop this
+    # ignore.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

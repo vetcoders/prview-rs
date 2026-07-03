@@ -32,7 +32,7 @@ likely blocker in auth flow · coverage −2.1% · 1 breaking change in public A
 - **Merge decision support** — policy-aware `MERGE_GATE.json/.md` and optional per-finding `INLINE_FINDINGS.sarif`.
 - **Multi-language** — JavaScript/TypeScript, Rust, Python, or mixed repos.
 - **Fast** — native Rust binary, parallel checks, `git2` for git operations.
-- **Structural heuristics** — Loctree (universal), madge / knip / depcruiser (JS).
+- **Structural heuristics** — Loctree (universal: cycles, dead code, twins across Rust/JS/TS/Python).
 - **Made for agents** — a compact `AI_INDEX.md` entry point plus a native MCP server.
 - **Shell completions** — bash, zsh, fish, elvish, powershell.
 

@@ -35,6 +35,9 @@ pub struct Config {
     pub run_bundle: bool,
     pub run_security: bool,
     pub run_heuristics: bool,
+    /// Opt-in to the full security tier (`cargo geiger`). When false, geiger is
+    /// simply not part of the profile — cleanly absent, not a skipped caveat.
+    pub security_full: bool,
 
     // Fetch
     pub do_fetch: bool,
@@ -401,6 +404,11 @@ impl TestConfigBuilder {
         self
     }
 
+    pub(crate) fn security_full(mut self, security_full: bool) -> Self {
+        self.config.security_full = security_full;
+        self
+    }
+
     pub(crate) fn do_fetch(mut self, do_fetch: bool) -> Self {
         self.config.do_fetch = do_fetch;
         self
@@ -467,6 +475,7 @@ impl Config {
             run_bundle: false,
             run_security: false,
             run_heuristics: false,
+            security_full: false,
             do_fetch: false,
             local_only: false,
             remote_only: false,
@@ -612,6 +621,7 @@ impl Config {
 
         config.target = target;
         config.bases = bases;
+        config.security_full = cli.security_full;
         config.execution_mode = cli.execution_mode();
         config.update_mode = cli.update;
         config.remote_mode = remote_mode;

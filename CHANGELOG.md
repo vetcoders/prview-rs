@@ -11,6 +11,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--security-full` flag: opt in to the full security tier, which adds
+  `cargo geiger`'s unsafe-usage scan. Off by default (even under `--deep`).
+
+### Changed
+
+- **BREAKING:** Structural JS/TS heuristics are now served entirely by the
+  built-in loctree signal (cycles, dead exports, unused symbols, exact twins).
+  The `HeuristicsResult` no longer carries `madge`, `knip`, or `depcruiser`
+  fields.
+- **BREAKING:** `cargo geiger` is now opt-in via `--security-full` and is no
+  longer part of the default `--deep`/`--ci` profile. It accounted for the bulk
+  of deep-run wall time (minutes on large dependency trees) while source-side
+  unsafe is already audited in-process. When not requested it is cleanly absent
+  from the profile — not a skipped caveat — so it no longer affects the
+  confidence or analysis status. `--with-security` still raises the heavy
+  security posture but no longer pulls in geiger.
+
+### Fixed
+
+- A missing `ruff` now reports as `Skipped` (with the spawn-failure reason)
+  instead of `Failed`, matching `mypy`'s behavior. Previously any Python repo
+  without ruff installed saw a false gate failure.
+
+### Removed
+
+- **BREAKING:** Dropped the npx-based JS analyzers (`madge`, `knip`,
+  `dependency-cruiser`) from the heuristics pack. Without an installed
+  `node_modules` these tools always reported `not available`, so the promise
+  was never backed by a signal; loctree already covers cycles, dead code, and
+  twins for JS/TS in-process.
+
 ## [0.4.0] - 2026-07-02
 
 ### Changed

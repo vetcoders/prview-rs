@@ -1,8 +1,7 @@
 //! Dependency/architecture regression analysis (v3)
 //!
 //! Computes deltas for cycles, dead exports, and unused symbols from the
-//! loctree heuristic's counts (current vs base snapshot). madge/knip/depcruiser
-//! are collected elsewhere in the heuristics pack but do NOT feed these deltas.
+//! loctree heuristic's counts (current vs base snapshot).
 
 use super::RegressionContext;
 use serde::{Deserialize, Serialize};

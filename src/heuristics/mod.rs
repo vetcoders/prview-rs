@@ -1,29 +1,22 @@
 //! Heuristics module - structural analysis
 //!
 //! Integrates with:
-//! - Loctree: dead code, circular imports, complexity
-//! - Madge: JS circular dependencies
-//! - Knip: JS dead code/exports
-//! - Dependency-cruiser: JS dependency analysis
+//! - Loctree: dead code, circular imports, complexity, exact twins — universal,
+//!   including JS/TS source.
 
 mod loctree;
 
 pub use loctree::{CycleInfo, DeadExport, DeadParrot, LoctreeAnalysis, TwinsAnalysis, run_loctree};
 
 use crate::Config;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::time::Duration;
-use tokio::process::Command as TokioCommand;
 
 /// Combined heuristics results
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HeuristicsResult {
     pub loctree: Option<LoctreeAnalysis>,
-    pub madge: Option<MadgeResult>,
-    pub knip: Option<KnipResult>,
-    pub depcruiser: Option<DepcruiserResult>,
     pub summary: HeuristicsSummary,
     /// Path used for analysis (snapshot or repo root). None = local cwd.
     pub analysis_root: Option<String>,
@@ -77,30 +70,6 @@ pub struct HeuristicsSummary {
     pub exact_twins: usize,
 }
 
-/// Madge circular dependency analysis
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MadgeResult {
-    pub circular_count: usize,
-    pub circular_deps: Vec<Vec<String>>,
-    pub output: String,
-}
-
-/// Knip dead code analysis
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct KnipResult {
-    pub unused_files: usize,
-    pub unused_exports: usize,
-    pub unused_deps: usize,
-    pub output: String,
-}
-
-/// Dependency-cruiser analysis
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DepcruiserResult {
-    pub violations: usize,
-    pub output: String,
-}
-
 /// Run all heuristics.
 ///
 /// `analysis_root` overrides `config.repo_root` as the directory to scan.
@@ -109,7 +78,10 @@ pub async fn run_all(config: &Config, analysis_root: Option<&Path>) -> Result<He
     use colored::Colorize;
 
     if !config.run_heuristics {
-        return Ok(HeuristicsResult::default());
+        return Ok(HeuristicsResult {
+            analysis_root: analysis_root.map(|p| p.to_string_lossy().into_owned()),
+            ..Default::default()
+        });
     }
     let root = analysis_root.unwrap_or(&config.repo_root);
     let emit_human_stdout = !config.json && !config.quiet;
@@ -165,288 +137,15 @@ pub async fn run_all(config: &Config, analysis_root: Option<&Path>) -> Result<He
         }
     }
 
-    // Run JS heuristics only if there are actual JS/TS source files
-    if config.profile.has_js_source {
-        // Madge
-        match run_madge(root).await {
-            Ok(madge) => {
-                let status = if madge.circular_count == 0 {
-                    "✓".green()
-                } else {
-                    "⚠".yellow()
-                };
-                if emit_human_stdout {
-                    println!(
-                        "  {} Madge: {} circular dependencies",
-                        status, madge.circular_count
-                    );
-                }
-                result.madge = Some(madge);
-            }
-            Err(e) => {
-                if emit_human_stdout {
-                    println!("  {} Madge: not available ({})", "○".dimmed(), e);
-                }
-            }
-        }
-
-        // Knip
-        match run_knip(root).await {
-            Ok(knip) => {
-                let total_issues = knip.unused_files + knip.unused_exports + knip.unused_deps;
-                let status = if total_issues == 0 {
-                    "✓".green()
-                } else {
-                    "⚠".yellow()
-                };
-                if emit_human_stdout {
-                    println!(
-                        "  {} Knip: {} unused files, {} unused exports, {} unused deps",
-                        status, knip.unused_files, knip.unused_exports, knip.unused_deps
-                    );
-                }
-                result.knip = Some(knip);
-            }
-            Err(e) => {
-                if emit_human_stdout {
-                    println!("  {} Knip: not available ({})", "○".dimmed(), e);
-                }
-            }
-        }
-
-        // Dependency-cruiser
-        match run_depcruiser(root).await {
-            Ok(depcruiser) => {
-                let status = if depcruiser.violations == 0 {
-                    "✓".green()
-                } else {
-                    "⚠".yellow()
-                };
-                if emit_human_stdout {
-                    println!(
-                        "  {} Dependency-cruiser: {} violations",
-                        status, depcruiser.violations
-                    );
-                }
-                result.depcruiser = Some(depcruiser);
-            }
-            Err(e) => {
-                if emit_human_stdout {
-                    println!(
-                        "  {} Dependency-cruiser: not available ({})",
-                        "○".dimmed(),
-                        e
-                    );
-                }
-            }
-        }
-    }
-
     if emit_human_stdout {
         println!();
     }
 
+    // run_all owns analysis-root provenance: record the directory that was
+    // actually scanned so the serialized result is self-describing and callers
+    // do not have to re-assert it.
+    result.analysis_root = analysis_root.map(|p| p.to_string_lossy().into_owned());
     Ok(result)
-}
-
-/// Hard ceiling for a single JS heuristic tool run. Heuristics are advisory
-/// signals, not gates — a wedged npx must degrade to "not available", never
-/// hang the whole review.
-const NPX_TOOL_TIMEOUT_SECS: u64 = 300;
-
-/// Run a command with the safety rails every child of prview needs:
-/// - stdin detached (a tool must fail or skip, never sit on an interactive
-///   prompt inherited from the operator's terminal),
-/// - kill-on-drop + timeout (a stuck child is killed and reported honestly).
-async fn run_command_with_timeout(
-    cmd: TokioCommand,
-    label: &str,
-    timeout_secs: u64,
-) -> Result<std::process::Output> {
-    // Shared rails (stdin-null, kill_on_drop, own process group) + concurrent
-    // output drain + group-SIGKILL on timeout live in crate::proc.
-    crate::proc::run_capture_with_timeout(cmd, Duration::from_secs(timeout_secs), label, || {
-        anyhow::anyhow!("{label} timed out after {timeout_secs}s (process killed)")
-    })
-    .await
-}
-
-/// Run a JS heuristic tool, preferring a resolved local binary.
-///
-/// A `node_modules/.bin/<tool>` is executed directly — no launcher, no npm
-/// registry consult, no interactive prompt. Only when the tool is not installed
-/// locally do we fall back to `npx --no-install <tool>`, whose `--no-install`
-/// still turns a missing tool into a fast, parseable failure rather than npm's
-/// "Ok to proceed?" prompt (root cause of the --deep hang) (PR #12 review
-/// #15/#17).
-async fn run_npx_tool(root: &Path, tool: &str, args: &[&str]) -> Result<std::process::Output> {
-    if let Some(bin) = crate::checks::local_js_bin(tool, root) {
-        let mut cmd = TokioCommand::new(bin);
-        cmd.args(args).current_dir(root);
-        return run_command_with_timeout(cmd, tool, NPX_TOOL_TIMEOUT_SECS).await;
-    }
-    let mut cmd = TokioCommand::new("npx");
-    cmd.arg("--no-install")
-        .arg(tool)
-        .args(args)
-        .current_dir(root);
-    run_command_with_timeout(cmd, tool, NPX_TOOL_TIMEOUT_SECS).await
-}
-
-/// Run madge circular dependency analysis
-async fn run_madge(root: &Path) -> Result<MadgeResult> {
-    let output = run_npx_tool(root, "madge", &["--circular", "--json", "src"]).await?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if !output.status.success() && stdout.trim().is_empty() {
-        anyhow::bail!(format_tool_failure("madge", &stdout, &stderr));
-    }
-
-    parse_madge_output(&stdout, &stderr)
-}
-
-/// Run knip dead code analysis (uses JSON reporter for reliable parsing)
-async fn run_knip(root: &Path) -> Result<KnipResult> {
-    let output = run_npx_tool(root, "knip", &["--reporter", "json"]).await?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    parse_knip_output(&stdout, &stderr)
-}
-
-fn parse_knip_output(stdout: &str, stderr: &str) -> Result<KnipResult> {
-    // Try to parse JSON output
-    #[derive(serde::Deserialize, Default)]
-    #[serde(default)]
-    struct KnipJson {
-        files: Vec<serde_json::Value>,
-        issues: Vec<serde_json::Value>,
-        #[serde(rename = "unlisted")]
-        unlisted_deps: Vec<serde_json::Value>,
-        #[serde(rename = "unresolved")]
-        unresolved: Vec<serde_json::Value>,
-    }
-
-    let parsed: KnipJson = serde_json::from_str(stdout).with_context(|| {
-        let stdout = stdout.trim();
-        let stderr = stderr.trim();
-
-        match (stdout.is_empty(), stderr.is_empty()) {
-            (false, false) => format!(
-                "knip did not produce valid JSON output\nstdout: {}\nstderr: {}",
-                stdout, stderr
-            ),
-            (false, true) => format!("knip did not produce valid JSON output\nstdout: {}", stdout),
-            (true, false) => format!("knip did not produce valid JSON output\nstderr: {}", stderr),
-            (true, true) => "knip did not produce any output".to_string(),
-        }
-    })?;
-
-    let unused_files = parsed.files.len();
-    let unused_exports = parsed.issues.len();
-    let unused_deps = parsed.unlisted_deps.len() + parsed.unresolved.len();
-
-    Ok(KnipResult {
-        unused_files,
-        unused_exports,
-        unused_deps,
-        output: format!("{}\n{}", stdout, stderr),
-    })
-}
-
-/// Run dependency-cruiser analysis
-async fn run_depcruiser(root: &Path) -> Result<DepcruiserResult> {
-    let output = run_npx_tool(root, "depcruise", &["src", "--output-type", "err"]).await?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    parse_depcruiser_output(output.status.success(), &stdout, &stderr)
-}
-
-fn parse_madge_output(stdout: &str, stderr: &str) -> Result<MadgeResult> {
-    let trimmed_stdout = stdout.trim();
-    if trimmed_stdout.is_empty() {
-        anyhow::bail!(format_tool_failure("madge", stdout, stderr));
-    }
-
-    let circular_deps: Vec<Vec<String>> = serde_json::from_str(trimmed_stdout)
-        .with_context(|| format_tool_failure("madge", stdout, stderr))?;
-    let circular_count = circular_deps.len();
-
-    Ok(MadgeResult {
-        circular_count,
-        circular_deps,
-        output: stdout.to_string(),
-    })
-}
-
-fn parse_depcruiser_output(
-    command_succeeded: bool,
-    stdout: &str,
-    stderr: &str,
-) -> Result<DepcruiserResult> {
-    let combined = combine_tool_output(stdout, stderr);
-    let violations = depcruiser_violation_count(&combined);
-
-    if violations > 0 || command_succeeded {
-        return Ok(DepcruiserResult {
-            violations,
-            output: combined,
-        });
-    }
-
-    anyhow::bail!(format_tool_failure("depcruise", stdout, stderr));
-}
-
-fn depcruiser_violation_count(output: &str) -> usize {
-    output
-        .lines()
-        .filter(|line| is_depcruiser_violation_line(line))
-        .count()
-}
-
-fn is_depcruiser_violation_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    let Some((severity, rest)) = trimmed.split_once(' ') else {
-        return false;
-    };
-
-    if severity != "warn" && severity != "error" {
-        return false;
-    }
-
-    let Some((rule_name, details)) = rest.split_once(':') else {
-        return false;
-    };
-
-    !details.trim().is_empty()
-        && !rule_name.is_empty()
-        && rule_name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
-fn combine_tool_output(stdout: &str, stderr: &str) -> String {
-    match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
-        (false, false) => format!("{}\n{}", stdout, stderr),
-        (false, true) => stdout.to_string(),
-        (true, false) => stderr.to_string(),
-        (true, true) => String::new(),
-    }
-}
-
-fn format_tool_failure(tool: &str, stdout: &str, stderr: &str) -> String {
-    let combined = combine_tool_output(stdout, stderr);
-    let detail = combined
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("no output");
-
-    format!("{tool} failed: {detail}")
 }
 
 /// Compute delta between base and target heuristics snapshots.
@@ -513,34 +212,6 @@ pub fn compute_delta_checked(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn run_command_with_timeout_kills_stuck_child() {
-        // A child that would outlive any sane heuristic must be killed and
-        // reported as a timeout, not awaited forever (the --deep hang class).
-        let mut cmd = TokioCommand::new("sleep");
-        cmd.arg("30");
-        let err = run_command_with_timeout(cmd, "sleepy-tool", 1)
-            .await
-            .expect_err("stuck child must time out");
-        assert!(err.to_string().contains("sleepy-tool timed out after 1s"));
-    }
-
-    // The grandchild process-group kill is proven canonically in
-    // crate::proc::tests; the tests here guard the heuristics integration
-    // (timeout message + stdin detach) through run_command_with_timeout.
-
-    #[tokio::test]
-    async fn run_command_with_timeout_detaches_stdin() {
-        // `cat` with inherited terminal stdin would block forever; with
-        // stdin detached it sees EOF and exits immediately. This guards the
-        // exact npm "Ok to proceed?" prompt scenario.
-        let cmd = TokioCommand::new("cat");
-        let output = run_command_with_timeout(cmd, "cat", 5)
-            .await
-            .expect("cat with null stdin exits at once");
-        assert!(output.status.success());
-    }
-
     #[test]
     fn test_heuristics_result_default() {
         let result = HeuristicsResult::default();
@@ -606,82 +277,6 @@ mod tests {
         let cloned = original.clone();
         assert_eq!(original.summary.total_files, cloned.summary.total_files);
         assert_eq!(original.summary.total_loc, cloned.summary.total_loc);
-    }
-
-    #[test]
-    fn test_parse_knip_output_counts_items() {
-        let result = parse_knip_output(
-            r#"{
-                "files": [{"path":"src/a.ts"}],
-                "issues": [{"symbol":"foo"}, {"symbol":"bar"}],
-                "unlisted": [{"name":"left-pad"}],
-                "unresolved": [{"name":"missing"}]
-            }"#,
-            "",
-        )
-        .expect("valid knip json");
-
-        assert_eq!(result.unused_files, 1);
-        assert_eq!(result.unused_exports, 2);
-        assert_eq!(result.unused_deps, 2);
-    }
-
-    #[test]
-    fn test_parse_knip_output_rejects_invalid_json() {
-        let err = parse_knip_output("npm ERR! knip not found", "command failed")
-            .expect_err("invalid output should fail");
-
-        assert!(
-            err.to_string()
-                .contains("knip did not produce valid JSON output")
-        );
-    }
-
-    #[test]
-    fn test_parse_madge_output_counts_cycles() {
-        let result =
-            parse_madge_output(r#"[["src/a.ts","src/b.ts"]]"#, "").expect("valid madge json");
-
-        assert_eq!(result.circular_count, 1);
-        assert_eq!(result.circular_deps.len(), 1);
-    }
-
-    #[test]
-    fn test_parse_madge_output_rejects_invalid_json() {
-        let err = parse_madge_output("Error: failed to parse file", "SyntaxError")
-            .expect_err("invalid madge output should fail");
-
-        assert!(err.to_string().contains("madge failed"));
-    }
-
-    #[test]
-    fn test_parse_depcruiser_output_counts_rule_violations() {
-        let result = parse_depcruiser_output(
-            false,
-            "warn no-circular: src/a.ts -> src/b.ts\nerror not-to-unresolvable: src/a.ts -> missing\n",
-            "",
-        )
-        .expect("depcruise violations should parse");
-
-        assert_eq!(result.violations, 2);
-    }
-
-    #[test]
-    fn test_parse_depcruiser_output_rejects_command_failure() {
-        let err = parse_depcruiser_output(false, "", "Error: Cannot find module depcruise")
-            .expect_err("command failure should not look clean");
-
-        assert!(err.to_string().contains("depcruise failed"));
-    }
-
-    #[test]
-    fn test_depcruiser_violation_line_rejects_runtime_errors() {
-        assert!(!is_depcruiser_violation_line(
-            "error Error: Cannot find module dependency-cruiser"
-        ));
-        assert!(is_depcruiser_violation_line(
-            "error no-circular: src/a.ts -> src/b.ts"
-        ));
     }
 
     #[test]

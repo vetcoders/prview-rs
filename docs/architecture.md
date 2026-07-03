@@ -103,7 +103,7 @@ app.run()
     ├─► resolve_bases()        ─── resolves bases (repo default plus tool fallbacks)
     ├─► generate_diffs()       ─── git2 diff with per-file stats (Patch API)
     ├─► checks::run_all()      ─── parallel checks (tsc, cargo, ruff...)
-    ├─► heuristics::run()      ─── loctree, madge, knip (profile-dependent)
+    ├─► heuristics::run()      ─── loctree (universal structural signals)
     └─► artifacts::generate()  ─── numbered layout + signal generators
 ```
 
@@ -430,8 +430,8 @@ file stats.
 ### heuristics/
 
 Structural code analysis:
-- `loctree.rs` — universal heuristic (works with any profile)
-- profile-specific: madge, knip, depcruiser (JS)
+- `loctree.rs` — universal heuristic (works with any profile): cycles, dead
+  exports, unused symbols, exact twins across Rust/JS/TS/Python
 
 ### cache/mod.rs
 
