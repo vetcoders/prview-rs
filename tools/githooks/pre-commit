@@ -9,10 +9,18 @@ echo "=== Pre-commit (fast checks) ==="
 STAGED_RS=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
 
 if [ -n "$STAGED_RS" ]; then
-  echo "Running cargo fmt (auto-fix)..."
-  cargo fmt --all
-
-  echo "$STAGED_RS" | xargs -I {} git add "{}" 2>/dev/null || true
+  # Check-only: never mutate or stage files from a hook. Auto-formatting and
+  # `git add` here would silently pull a developer's unstaged changes into the
+  # commit when a file is only partially staged. Fail loudly and let the
+  # developer format and re-stage on purpose.
+  echo "Checking formatting (cargo fmt --check)..."
+  # Word-splitting is intentional: STAGED_RS is a newline-separated file list
+  # and each path is passed to rustfmt as a separate --check target.
+  # shellcheck disable=SC2086
+  cargo fmt --check -- $STAGED_RS || {
+    echo "Formatting issues found. Run: cargo fmt --all, then re-stage the changes before committing."
+    exit 1
+  }
 
   echo "Running cargo check..."
   cargo check --quiet || {
