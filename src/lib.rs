@@ -241,13 +241,10 @@ impl App {
 
         let analysis_root = target_snap.as_ref().map(|s| s.path.as_path());
 
-        // 2. Run heuristics on target
+        // 2. Run heuristics on target. `run_all` records the analysis-root
+        //    provenance itself (see heuristics::run_all), so no post-assignment
+        //    is needed here.
         let mut result = heuristics::run_all(&config, analysis_root).await?;
-
-        // Record provenance
-        if let Some(ref snap) = target_snap {
-            result.analysis_root = Some(snap.path.display().to_string());
-        }
 
         // 3. Try base snapshot for regression detection in heavier modes only.
         if should_compute_snapshot_regression(&self.config)

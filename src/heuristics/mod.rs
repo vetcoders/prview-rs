@@ -78,7 +78,10 @@ pub async fn run_all(config: &Config, analysis_root: Option<&Path>) -> Result<He
     use colored::Colorize;
 
     if !config.run_heuristics {
-        return Ok(HeuristicsResult::default());
+        return Ok(HeuristicsResult {
+            analysis_root: analysis_root.map(|p| p.to_string_lossy().into_owned()),
+            ..Default::default()
+        });
     }
     let root = analysis_root.unwrap_or(&config.repo_root);
     let emit_human_stdout = !config.json && !config.quiet;
@@ -138,6 +141,10 @@ pub async fn run_all(config: &Config, analysis_root: Option<&Path>) -> Result<He
         println!();
     }
 
+    // run_all owns analysis-root provenance: record the directory that was
+    // actually scanned so the serialized result is self-describing and callers
+    // do not have to re-assert it.
+    result.analysis_root = analysis_root.map(|p| p.to_string_lossy().into_owned());
     Ok(result)
 }
 
