@@ -14,6 +14,24 @@ pub struct RuffCheck;
 pub struct MypyCheck;
 pub struct PytestCheck;
 
+/// Classify a ruff run from its exit status and combined output.
+///
+/// A missing tool is a setup gap, not a lint failure. When uv wraps a ruff that
+/// is not installed it emits "error: Failed to spawn: `ruff`" with a non-zero
+/// exit; that must classify as Skipped (mirroring [`mypy_status`], PR #1
+/// b1697d4) rather than a lint Failed that would falsely dent the gate in every
+/// Python repo without ruff. A genuine non-zero exit with lint findings stays
+/// Failed.
+fn ruff_status(success: bool, combined: &str) -> CheckStatus {
+    if success {
+        CheckStatus::Passed
+    } else if tool_spawn_failure_in_output(combined) {
+        CheckStatus::Skipped
+    } else {
+        CheckStatus::Failed
+    }
+}
+
 #[async_trait]
 impl Check for RuffCheck {
     fn name(&self) -> &str {
@@ -53,11 +71,7 @@ impl Check for RuffCheck {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}\n{}", stdout, stderr);
 
-        let status = if output.status.success() {
-            CheckStatus::Passed
-        } else {
-            CheckStatus::Failed
-        };
+        let status = ruff_status(output.status.success(), &combined);
 
         let cmd_str = if use_uv {
             "uv run ruff check ."
@@ -396,6 +410,46 @@ mod tests {
         let check = PytestCheck;
         let key = check.cache_key(&config);
         assert!(key.is_none());
+    }
+
+    // ── ruff missing-tool => Skipped, real lint failure => Failed ──
+
+    #[test]
+    fn test_ruff_status_spawn_fail_is_skipped() {
+        // uv wrapping a missing ruff emits this; it must be Skipped (parity
+        // with mypy), never a lint Failed that dents the gate in every Python
+        // repo without ruff.
+        let combined =
+            "\nerror: Failed to spawn: `ruff`\n  Caused by: No such file or directory (os error 2)";
+        assert_eq!(
+            ruff_status(false, combined),
+            CheckStatus::Skipped,
+            "missing ruff must classify as Skipped, not Failed"
+        );
+    }
+
+    #[test]
+    fn test_ruff_status_command_not_found_is_skipped() {
+        assert_eq!(
+            ruff_status(false, "ruff: command not found"),
+            CheckStatus::Skipped,
+            "a bare 'command not found' missing ruff must be Skipped"
+        );
+    }
+
+    #[test]
+    fn test_ruff_status_real_lint_failure_is_failed() {
+        let combined = "src/x.py:1:1: F401 [*] `os` imported but unused\nFound 1 error.\n";
+        assert_eq!(
+            ruff_status(false, combined),
+            CheckStatus::Failed,
+            "genuine lint findings must classify as Failed"
+        );
+    }
+
+    #[test]
+    fn test_ruff_status_success_is_passed() {
+        assert_eq!(ruff_status(true, "All checks passed!"), CheckStatus::Passed);
     }
 
     // ── PV-01: mypy missing-tool => Skipped, real type error => Failed ──

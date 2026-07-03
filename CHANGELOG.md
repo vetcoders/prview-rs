@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confidence or analysis status. `--with-security` still raises the heavy
   security posture but no longer pulls in geiger.
 
+### Fixed
+
+- A missing `ruff` now reports as `Skipped` (with the spawn-failure reason)
+  instead of `Failed`, matching `mypy`'s behavior. Previously any Python repo
+  without ruff installed saw a false gate failure.
+
 ### Removed
 
 - **BREAKING:** Dropped the npx-based JS analyzers (`madge`, `knip`,
