@@ -181,7 +181,7 @@ pub struct Cli {
     pub no_color: bool,
 
     // === Misc ===
-    /// Skip architecture heuristics (madge, knip, loctree cycle/dead-code detection)
+    /// Skip architecture heuristics (loctree cycle/dead-code/twins detection)
     #[arg(long = "no-heuristics")]
     pub no_heuristics: bool,
 

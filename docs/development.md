@@ -93,7 +93,7 @@ src/
 ├── config/mod.rs      # Configuration & profile detection
 ├── git/mod.rs         # Git operations (git2, Patch API)
 ├── checks/            # Quality checks (trait-based)
-├── heuristics/        # Structural analysis (loctree, madge, knip)
+├── heuristics/        # Structural analysis (loctree)
 ├── artifacts/
 │   ├── mod.rs         # Core layout, patches, merge gate, ZIP
 │   ├── signal/        # High-signal generators (one module per domain)

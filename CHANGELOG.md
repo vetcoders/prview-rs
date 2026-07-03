@@ -11,6 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING:** Structural JS/TS heuristics are now served entirely by the
+  built-in loctree signal (cycles, dead exports, unused symbols, exact twins).
+  The `HeuristicsResult` no longer carries `madge`, `knip`, or `depcruiser`
+  fields.
+
+### Removed
+
+- **BREAKING:** Dropped the npx-based JS analyzers (`madge`, `knip`,
+  `dependency-cruiser`) from the heuristics pack. Without an installed
+  `node_modules` these tools always reported `not available`, so the promise
+  was never backed by a signal; loctree already covers cycles, dead code, and
+  twins for JS/TS in-process.
+
 ## [0.4.0] - 2026-07-02
 
 ### Changed

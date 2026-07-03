@@ -505,41 +505,6 @@ async fn run_doctor_command(config: Result<Config>) -> Result<()> {
         }
     }
 
-    if let Ok(config) = &config
-        && (config.profile.kind == prview::config::ProfileKind::Js
-            || config.profile.kind == prview::config::ProfileKind::Mixed)
-    {
-        println!();
-        println!("{}", "--- Optional Heuristics (Node.js) ---".bold());
-        let js_tools = vec![
-            ("madge", "npx --no-install madge --version"),
-            ("knip", "npx --no-install knip --version"),
-            ("depcruise", "npx --no-install depcruise --version"),
-        ];
-
-        for (name, cmd) in js_tools {
-            let parts: Vec<&str> = cmd.split_whitespace().collect();
-            let mut command = std::process::Command::new(parts[0]);
-            for arg in &parts[1..] {
-                command.arg(arg);
-            }
-
-            match command.output() {
-                Ok(output) if output.status.success() => {
-                    let version = String::from_utf8_lossy(&output.stdout)
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
-                    println!("  {} {:<10} ({})", "✓".green(), name, version.trim());
-                }
-                _ => {
-                    println!("  {} {:<10} not found in PATH or npx", "⚠".yellow(), name);
-                }
-            }
-        }
-    }
-
     println!();
     Ok(())
 }

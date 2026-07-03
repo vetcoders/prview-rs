@@ -1441,9 +1441,6 @@ mod tests {
                 },
                 available: true,
             }),
-            madge: None,
-            knip: None,
-            depcruiser: None,
             summary: HeuristicsSummary::default(),
             analysis_root: None,
             regression: None,
@@ -1470,9 +1467,6 @@ mod tests {
 
         let result = HeuristicsResult {
             loctree: None,
-            madge: None,
-            knip: None,
-            depcruiser: None,
             summary: HeuristicsSummary::default(),
             analysis_root: None,
             regression: None,
