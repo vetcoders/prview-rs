@@ -43,9 +43,10 @@ fi
 
 # 3. Clippy
 echo "[3/9] Clippy"
-if cargo clippy --all-targets -- -D warnings >/dev/null 2>&1; then
+if CLIPPY_OUT=$(cargo clippy --all-targets -- -D warnings 2>&1); then
   pass "clippy clean"
 else
+  echo "$CLIPPY_OUT"
   fail "clippy has warnings"
 fi
 
