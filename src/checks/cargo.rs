@@ -512,8 +512,8 @@ impl Check for CargoGeigerCheck {
                 config.profile.kind.as_str().to_lowercase()
             ));
         }
-        if !config.run_security {
-            return super::CheckEligibility::Skip("security disabled".to_string());
+        if !config.security_full {
+            return super::CheckEligibility::Skip("requires --security-full".to_string());
         }
         if which::which("cargo-geiger").is_err() {
             return super::CheckEligibility::Skip(
@@ -843,9 +843,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cargo_geiger_requires_security_mode() {
-        let mut config = create_test_config(true, true, false);
-        config.run_security = false;
+    fn test_cargo_geiger_requires_security_full() {
+        // Without --security-full geiger is not eligible; it is opt-in and must
+        // stay out of the default profile rather than fabricate a caveat.
+        let config = create_test_config(true, true, false);
+        assert!(!config.security_full);
         let check = CargoGeigerCheck;
         assert!(matches!(
             check.check_eligibility(&config),

@@ -565,7 +565,9 @@ pub fn get_checks_for_profile(config: &Config) -> Vec<Box<dyn Check>> {
             checks.push(Box::new(RustfmtCheck));
             checks.push(Box::new(CargoTestCheck));
             checks.push(Box::new(CargoAuditCheck));
-            checks.push(Box::new(CargoGeigerCheck));
+            if config.security_full {
+                checks.push(Box::new(CargoGeigerCheck));
+            }
         }
         ProfileKind::Python => {
             checks.push(Box::new(RuffCheck));
@@ -587,7 +589,9 @@ pub fn get_checks_for_profile(config: &Config) -> Vec<Box<dyn Check>> {
                 checks.push(Box::new(RustfmtCheck));
                 checks.push(Box::new(CargoTestCheck));
                 checks.push(Box::new(CargoAuditCheck));
-                checks.push(Box::new(CargoGeigerCheck));
+                if config.security_full {
+                    checks.push(Box::new(CargoGeigerCheck));
+                }
             }
             if config.profile.runs_python_checks() {
                 checks.push(Box::new(RuffCheck));
@@ -1114,7 +1118,59 @@ mod tests {
         assert!(check_names.iter().any(|name| name == "Cargo check"));
         assert!(check_names.iter().any(|name| name == "Clippy"));
         assert!(check_names.iter().any(|name| name == "Cargo test"));
+        // cargo geiger is opt-in via --security-full: cleanly absent from the
+        // default profile, never a skipped-caveat.
+        assert!(!check_names.iter().any(|name| name == "Cargo geiger"));
+    }
+
+    #[test]
+    fn test_get_checks_for_profile_adds_geiger_with_security_full() {
+        let mut config = rust_config(false, false, false);
+        config.security_full = true;
+        let check_names: Vec<String> = get_checks_for_profile(&config)
+            .into_iter()
+            .map(|check| check.name().to_string())
+            .collect();
+
         assert!(check_names.iter().any(|name| name == "Cargo geiger"));
+    }
+
+    #[test]
+    fn test_get_checks_for_profile_mixed_geiger_follows_security_full() {
+        use crate::config::{DetectedProfile, ProfileKind, test_config_builder};
+        use std::path::PathBuf;
+
+        let mixed_cargo = || DetectedProfile {
+            kind: ProfileKind::Mixed,
+            has_package_json: false,
+            has_tsconfig: false,
+            has_cargo: true,
+            has_pyproject: false,
+            has_python_source: false,
+            has_js_source: false,
+            cargo_root: Some(PathBuf::from(".")),
+            rust_dirs: vec![PathBuf::from(".")],
+            is_workspace: false,
+        };
+
+        // Default: geiger absent from a mixed cargo profile.
+        let default_cfg = test_config_builder().profile(mixed_cargo()).build();
+        let default_names: Vec<String> = get_checks_for_profile(&default_cfg)
+            .into_iter()
+            .map(|check| check.name().to_string())
+            .collect();
+        assert!(!default_names.iter().any(|name| name == "Cargo geiger"));
+
+        // With --security-full: geiger joins the mixed profile.
+        let full_cfg = test_config_builder()
+            .profile(mixed_cargo())
+            .security_full(true)
+            .build();
+        let full_names: Vec<String> = get_checks_for_profile(&full_cfg)
+            .into_iter()
+            .map(|check| check.name().to_string())
+            .collect();
+        assert!(full_names.iter().any(|name| name == "Cargo geiger"));
     }
 
     #[test]

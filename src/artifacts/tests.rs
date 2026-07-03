@@ -823,14 +823,29 @@ fn checks_status_lists_disabled_rust_quality_checks_as_skipped() {
         status["cargo_test"].as_str(),
         Some("skipped (tests disabled)")
     );
-    assert_eq!(
-        status["cargo_geiger"].as_str(),
-        Some("skipped (security disabled)")
-    );
+    // cargo geiger is opt-in via --security-full: cleanly absent from the
+    // status surface, never a "skipped (security disabled)" caveat.
+    assert!(status.get("cargo_geiger").is_none());
     assert_eq!(
         status["heuristics_loctree"].as_str(),
         Some("skipped (heuristics disabled)")
     );
+}
+
+#[test]
+fn checks_status_includes_geiger_when_security_full() {
+    let mut config = create_test_config(PolicyConfig::default());
+    config.security_full = true;
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    generate_checks_status_json(tmp.path(), &config, &[], None).expect("checks status");
+
+    let raw =
+        std::fs::read_to_string(tmp.path().join("checks-status.json")).expect("read checks status");
+    let status: serde_json::Value = serde_json::from_str(&raw).expect("parse checks status");
+
+    // With the full tier opted in, geiger rejoins the status surface.
+    assert!(status.get("cargo_geiger").is_some());
 }
 
 #[test]

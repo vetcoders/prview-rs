@@ -142,8 +142,9 @@ prview --help
 | `--skip-lint` | Skip linters |
 | `--with-bundle` | Enable the bundle build |
 | `--skip-bundle` | Skip the bundle build |
-| `--with-security` | Enable heavy security checks (e.g. cargo-geiger) |
+| `--with-security` | Raise the heavy security posture (does not add cargo-geiger) |
 | `--skip-security` | Skip heavy security checks |
+| `--security-full` | Full security tier: adds cargo-geiger's unsafe scan (slow; off even under `--deep`) |
 
 ### Profiles
 

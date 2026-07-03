@@ -110,18 +110,28 @@ pub struct Cli {
     #[arg(long = "skip-bundle", conflicts_with = "with_bundle")]
     pub skip_bundle: bool,
 
-    /// Enable heavy security checks like cargo-geiger (only runs with --deep or --ci by default)
+    /// Enable the heavy security posture (only runs with --deep or --ci by default)
     #[arg(
         long = "with-security",
-        long_help = "Enable heavy security checks (e.g. cargo-geiger). These are slow (3+ min on \
-                     large projects) so they only run by default with --deep or --ci. Lightweight \
-                     checks like cargo-audit always run regardless."
+        long_help = "Enable the heavy security posture. This raises the security tier used by \
+                     --deep and --ci. cargo-geiger is NOT part of this tier — it is opt-in via \
+                     --security-full. Lightweight checks like cargo-audit always run regardless."
     )]
     pub with_security: bool,
 
     /// Skip heavy security checks even when otherwise enabled
     #[arg(long = "skip-security", conflicts_with = "with_security")]
     pub skip_security: bool,
+
+    /// Run the full security tier including cargo-geiger (slow: minutes on large trees)
+    #[arg(
+        long = "security-full",
+        long_help = "Opt in to the full security tier, which adds cargo-geiger's unsafe-usage \
+                     scan. Geiger can take several minutes on large dependency trees, so it is \
+                     off by default even under --deep; source-side unsafe is already audited \
+                     in-process. Without this flag geiger is simply absent from the profile."
+    )]
+    pub security_full: bool,
 
     // === Profile ===
     /// Language profile for check selection (default: auto-detected from repo contents)
@@ -538,6 +548,7 @@ mod tests {
             skip_bundle: false,
             with_security: false,
             skip_security: false,
+            security_full: false,
             profile: Profile::Auto,
             pr: None,
             gh_repo: None,
