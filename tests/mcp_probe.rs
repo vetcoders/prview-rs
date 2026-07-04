@@ -16,7 +16,7 @@ fn mcp_probe_human_output_smokes_server() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("prview mcp probe ok"));
-    assert!(stdout.contains("version: 0.4.0"));
+    assert!(stdout.contains(&format!("version: {}", env!("CARGO_PKG_VERSION"))));
     assert!(stdout.contains("schema_version: prview.mcp.v1"));
     assert!(stdout.contains("tools: 6"));
     assert!(stdout.contains("response_ms:"));
@@ -39,7 +39,7 @@ fn mcp_probe_json_output_is_machine_readable() {
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("probe stdout is JSON");
     assert_eq!(payload["ok"], true);
-    assert_eq!(payload["version"], "0.4.0");
+    assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(payload["schema_version"], "prview.mcp.v1");
     assert_eq!(payload["tools"], 6);
     assert!(payload["response_ms"].as_u64().is_some());
