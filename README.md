@@ -175,6 +175,7 @@ prview completions fish > $HOME/.config/fish/completions/prview.fish
 - [`docs/usage.md`](docs/usage.md) — full usage guide
 - [`docs/configuration.md`](docs/configuration.md) — policy & config
 - [`docs/mcp.md`](docs/mcp.md) — MCP server for agents
+- [`docs/mcp-smoke.md`](docs/mcp-smoke.md) — MCP smoke walkthrough for agents
 - [`docs/architecture.md`](docs/architecture.md) — how it works
 - [`docs/development.md`](docs/development.md) — contributing
 - [`docs/contracts/merge_gate.md`](docs/contracts/merge_gate.md) — `MERGE_GATE.json` contract
