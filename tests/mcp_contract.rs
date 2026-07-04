@@ -42,21 +42,44 @@ fn git_short_head(repo: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A fixture repo on branch `feature` (one commit) diffable against `main`.
-fn fixture_repo() -> tempfile::TempDir {
+/// A fixture repo on branch `feature` (one commit) diffable against the named base.
+fn fixture_repo_with_base(base_branch: &str, origin_head: bool) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
-    run_git(repo, &["init", "-b", "main"]);
+    run_git(repo, &["init", "-b", base_branch]);
     run_git(repo, &["config", "user.email", "test@test.com"]);
     run_git(repo, &["config", "user.name", "Test"]);
     std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
     run_git(repo, &["add", "-A"]);
     run_git(repo, &["commit", "-m", "init"]);
+    if origin_head {
+        run_git(
+            repo,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{base_branch}"),
+                "HEAD",
+            ],
+        );
+        run_git(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                &format!("refs/remotes/origin/{base_branch}"),
+            ],
+        );
+    }
     run_git(repo, &["checkout", "-b", "feature"]);
     std::fs::write(repo.join("a.txt"), "hello world\n").unwrap();
     run_git(repo, &["add", "-A"]);
     run_git(repo, &["commit", "-m", "feature change"]);
     dir
+}
+
+/// A fixture repo on branch `feature` (one commit) diffable against `main`.
+fn fixture_repo() -> tempfile::TempDir {
+    fixture_repo_with_base("main", false)
 }
 
 /// Run a synchronous quick review to completion, registering it under `home`.
@@ -366,6 +389,61 @@ fn run_review_quick_completes_and_verdict_reads_it() {
     let vbody = tool_body(&v);
     assert_eq!(vbody["status"], "completed");
     assert_eq!(vbody["run_id"], run_id);
+}
+
+#[test]
+fn run_review_without_base_uses_origin_head_default_branch() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = fixture_repo_with_base("visits-1404", true);
+    let mut s = McpSession::start(&[("PRVIEW_HOME", home.path().to_str().unwrap())]);
+
+    let state = tool_body(&s.call_tool(
+        "state",
+        serde_json::json!({"repo": repo.path().to_str().unwrap()}),
+    ));
+    assert_eq!(state["default_branch"], "visits-1404");
+    assert_eq!(state["base_fallback"], false);
+
+    let result = s.call_tool(
+        "run_review",
+        serde_json::json!({"repo": repo.path().to_str().unwrap(), "profile": "quick"}),
+    );
+    assert!(
+        !is_error(&result),
+        "run_review quick must not error: {result}"
+    );
+    let body = tool_body(&result);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["base_used"], serde_json::json!(["visits-1404"]));
+    assert_eq!(body["base_fallback"], false);
+}
+
+#[test]
+fn run_review_without_detectable_default_uses_fallback_with_caveat() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = fixture_repo();
+    let mut s = McpSession::start(&[("PRVIEW_HOME", home.path().to_str().unwrap())]);
+
+    let result = s.call_tool(
+        "run_review",
+        serde_json::json!({"repo": repo.path().to_str().unwrap(), "profile": "quick"}),
+    );
+    assert!(
+        !is_error(&result),
+        "run_review quick must not error: {result}"
+    );
+    let body = tool_body(&result);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["base_used"], serde_json::json!(["main"]));
+    assert_eq!(body["base_fallback"], true);
+    let caveats = body["caveats"].as_array().expect("caveats");
+    assert!(
+        caveats.iter().any(|c| c
+            .as_str()
+            .map(|s| s.contains("base_fallback"))
+            .unwrap_or(false)),
+        "fallback caveat required: {body}"
+    );
 }
 
 #[test]

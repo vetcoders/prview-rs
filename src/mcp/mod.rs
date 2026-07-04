@@ -195,10 +195,14 @@ impl PrviewMcp {
             .unwrap_or(serde_json::Value::Null);
 
         let dirty = repo_state.is_dirty();
+        let base_selection = run::select_bases(&root, None);
 
         types::tool_success(json!({
             "branch": repo_state.branch,
             "commit": repo_state.head,
+            "default_branch": base_selection.bases.first().cloned(),
+            "base_fallback": base_selection.base_fallback,
+            "base_caveats": base_selection.caveats,
             "dirty": dirty,
             "files_changed": repo_state.files_changed,
             "latest_run_for_head": for_head,
