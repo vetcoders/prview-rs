@@ -227,9 +227,11 @@ on disk, especially the canonical `RUN.json` and `MERGE_GATE.json` pair, plus
 
 ## Output
 
-Artifacts are written to `$PRVIEW_HOME/runs/<repo>/<branch>/<timestamp>/`
+Artifacts are written to `$PRVIEW_HOME/runs/<repo>/<branch>/<run_id>/`
 or, when `PRVIEW_HOME` is unset, to
-`$HOME/.prview/runs/<repo>/<branch>/<timestamp>/` in an ordered numbered layout.
+`$HOME/.prview/runs/<repo>/<branch>/<run_id>/` in an ordered numbered layout.
+New run ids use a timestamp plus short HEAD suffix, for example
+`20260704-120500-a1b2c3d`; treat the full value as opaque.
 A `latest` symlink points at the most recent run in
 `$PRVIEW_HOME/runs/<repo>/<branch>/latest` or
 `$HOME/.prview/runs/<repo>/<branch>/latest` when `PRVIEW_HOME` is unset.

@@ -13,7 +13,7 @@ pub mod types;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router, transport::stdio};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use types::error_class;
 
@@ -600,6 +600,276 @@ pub async fn serve() -> anyhow::Result<()> {
     let service = PrviewMcp::new().serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeReport {
+    ok: bool,
+    version: String,
+    schema_version: String,
+    tools: usize,
+    response_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeFailureBody {
+    ok: bool,
+    step: String,
+    error: String,
+    timeout_s: u64,
+}
+
+#[derive(Debug)]
+struct ProbeFailure {
+    step: &'static str,
+    message: String,
+}
+
+impl ProbeFailure {
+    fn new(step: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            step,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.step, self.message)
+    }
+}
+
+impl std::error::Error for ProbeFailure {}
+
+struct ProbeSession {
+    child: tokio::process::Child,
+    reader: tokio::io::BufReader<tokio::process::ChildStdout>,
+    next_id: i64,
+}
+
+impl ProbeSession {
+    async fn start() -> Result<Self, ProbeFailure> {
+        let exe = std::env::current_exe().map_err(|e| ProbeFailure::new("spawn", e.to_string()))?;
+        let mut cmd = tokio::process::Command::new(exe);
+        cmd.arg("mcp")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ProbeFailure::new("spawn", e.to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ProbeFailure::new("spawn", "server stdout was not piped"))?;
+        Ok(Self {
+            child,
+            reader: tokio::io::BufReader::new(stdout),
+            next_id: 1,
+        })
+    }
+
+    async fn send(&mut self, value: &serde_json::Value) -> Result<(), ProbeFailure> {
+        use tokio::io::AsyncWriteExt;
+        let stdin = self
+            .child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| ProbeFailure::new("write", "server stdin is closed"))?;
+        stdin
+            .write_all(value.to_string().as_bytes())
+            .await
+            .map_err(|e| ProbeFailure::new("write", e.to_string()))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| ProbeFailure::new("write", e.to_string()))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| ProbeFailure::new("write", e.to_string()))?;
+        Ok(())
+    }
+
+    async fn request(
+        &mut self,
+        id: i64,
+        step: &'static str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ProbeFailure> {
+        use tokio::io::AsyncBufReadExt;
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .await
+        .map_err(|e| ProbeFailure::new(step, e.message))?;
+
+        loop {
+            let mut line = String::new();
+            let read = self
+                .reader
+                .read_line(&mut line)
+                .await
+                .map_err(|e| ProbeFailure::new(step, e.to_string()))?;
+            if read == 0 {
+                let stderr = read_child_stderr(&mut self.child).await;
+                let suffix = if stderr.is_empty() {
+                    "server closed stdout before responding".to_string()
+                } else {
+                    format!("server closed stdout before responding: {stderr}")
+                };
+                return Err(ProbeFailure::new(step, suffix));
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if value.get("id").and_then(|value| value.as_i64()) == Some(id) {
+                if let Some(error) = value.get("error") {
+                    return Err(ProbeFailure::new(step, error.to_string()));
+                }
+                return Ok(value);
+            }
+        }
+    }
+
+    async fn initialize(&mut self) -> Result<(), ProbeFailure> {
+        self.request(
+            0,
+            "initialize",
+            "initialize",
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "prview-probe", "version": env!("CARGO_PKG_VERSION") },
+            }),
+        )
+        .await?;
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }))
+        .await
+        .map_err(|e| ProbeFailure::new("initialize", e.message))
+    }
+
+    async fn list_tools(&mut self) -> Result<serde_json::Value, ProbeFailure> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.request(id, "tools/list", "tools/list", json!({}))
+            .await
+    }
+
+    async fn call_health(&mut self) -> Result<serde_json::Value, ProbeFailure> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.request(
+            id,
+            "health",
+            "tools/call",
+            json!({ "name": "health", "arguments": {} }),
+        )
+        .await
+    }
+}
+
+async fn read_child_stderr(child: &mut tokio::process::Child) -> String {
+    use tokio::io::AsyncReadExt;
+    let Some(stderr) = child.stderr.as_mut() else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    let _ = stderr.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf).trim().to_string()
+}
+
+async fn run_probe() -> Result<ProbeReport, ProbeFailure> {
+    let started = std::time::Instant::now();
+    let mut session = ProbeSession::start().await?;
+    session.initialize().await?;
+
+    let tools_response = session.list_tools().await?;
+    let tools = tools_response["result"]["tools"]
+        .as_array()
+        .ok_or_else(|| ProbeFailure::new("tools/list", "missing result.tools array"))?;
+
+    let health_response = session.call_health().await?;
+    if health_response["result"]["isError"].as_bool() == Some(true) {
+        return Err(ProbeFailure::new(
+            "health",
+            format!(
+                "health returned isError=true: {}",
+                health_response["result"]
+            ),
+        ));
+    }
+    let text = health_response["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or_else(|| ProbeFailure::new("health", "missing text content"))?;
+    let body: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| ProbeFailure::new("health", format!("invalid JSON body: {e}")))?;
+    let version = body["version"]
+        .as_str()
+        .ok_or_else(|| ProbeFailure::new("health", "missing version"))?;
+    let schema_version = body["schema_version"]
+        .as_str()
+        .ok_or_else(|| ProbeFailure::new("health", "missing schema_version"))?;
+
+    Ok(ProbeReport {
+        ok: true,
+        version: version.to_string(),
+        schema_version: schema_version.to_string(),
+        tools: tools.len(),
+        response_ms: started.elapsed().as_millis(),
+    })
+}
+
+/// Run a bounded self-smoke of `prview mcp`.
+pub async fn probe(json_output: bool) -> anyhow::Result<()> {
+    let timeout = std::time::Duration::from_secs(10);
+    match tokio::time::timeout(timeout, run_probe()).await {
+        Ok(Ok(report)) => {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("prview mcp probe ok");
+                println!("version: {}", report.version);
+                println!("schema_version: {}", report.schema_version);
+                println!("tools: {}", report.tools);
+                println!("response_ms: {}", report.response_ms);
+            }
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            if json_output {
+                let body = ProbeFailureBody {
+                    ok: false,
+                    step: err.step.to_string(),
+                    error: err.message.clone(),
+                    timeout_s: timeout.as_secs(),
+                };
+                println!("{}", serde_json::to_string_pretty(&body)?);
+            }
+            anyhow::bail!("MCP probe failed at {}: {}", err.step, err.message)
+        }
+        Err(_) => {
+            if json_output {
+                let body = ProbeFailureBody {
+                    ok: false,
+                    step: "timeout".to_string(),
+                    error: format!("probe exceeded {}s timeout", timeout.as_secs()),
+                    timeout_s: timeout.as_secs(),
+                };
+                println!("{}", serde_json::to_string_pretty(&body)?);
+            }
+            anyhow::bail!("MCP probe timed out after {}s", timeout.as_secs())
+        }
+    }
 }
 
 #[cfg(test)]

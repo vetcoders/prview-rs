@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use colored::Colorize;
+use prview::cli::McpArgs;
 use prview::git::git_cmd;
 use prview::{App, Cli, CliCommand, Config, OpenArgs, RunsArgs, ScopeArgs, StateArgs};
 use std::path::{Path, PathBuf};
@@ -79,7 +80,7 @@ async fn run() -> Result<()> {
                 Ok(())
             }
             CliCommand::Scope(args) => run_scope_command(args),
-            CliCommand::Mcp(_) => run_mcp_command().await,
+            CliCommand::Mcp { args } => run_mcp_command(args).await,
         };
     }
 
@@ -551,6 +552,10 @@ fn run_scope_command(args: &ScopeArgs) -> Result<()> {
     prview::scope::run(args)
 }
 
-async fn run_mcp_command() -> Result<()> {
-    prview::mcp::serve().await
+async fn run_mcp_command(args: &McpArgs) -> Result<()> {
+    if args.probe {
+        prview::mcp::probe(args.json).await
+    } else {
+        prview::mcp::serve().await
+    }
 }

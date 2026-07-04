@@ -36,6 +36,10 @@ A few invariants hold across every tool:
 - **Fail-loud.** A failure is a structured error result (`is_error: true`) with
   an `error_class` and a `message`, never an empty success. See
   [Error classes](#error-classes).
+- **Opaque run ids.** `run_id` is globally unique within a repo storage tree and
+  encodes the run's commit identity in new runs (for example
+  `YYYYMMDD-HHMMSS-<short_sha>`). Clients must treat it as an opaque token; older
+  timestamp-only ids remain readable.
 
 A typical agent loop is: `health` at session start → `state` to decide whether a
 fresh run is needed → `run_review` → `verdict` / `findings` / `read_artifact` to
@@ -91,7 +95,7 @@ Response:
   "dirty": false,
   "files_changed": 4,
   "latest_run_for_head": {
-    "run_id": "20260701-120000",
+    "run_id": "20260701-120000-a1b2c3d",
     "commit": "a1b2c3d",
     "status": "completed",
     "profile": null,
@@ -132,7 +136,7 @@ a valid completed review). Response:
 
 ```json
 {
-  "run_id": "20260701-120000",
+  "run_id": "20260701-120000-a1b2c3d",
   "status": "completed",
   "commit": "a1b2c3d",
   "base_used": ["main"],
@@ -146,7 +150,7 @@ a valid completed review). Response:
     { "id": "cargo_test", "status": "PASS", "reason": null, "evidence": null }
   ],
   "artifact_paths": {
-    "pack": "/Users/tester/.prview/runs/<repo>/<branch>/20260701-120000",
+    "pack": "/Users/tester/.prview/runs/<repo>/<branch>/20260701-120000-a1b2c3d",
     "merge_gate": "00_summary/MERGE_GATE.json",
     "sarif": "30_context/INLINE_FINDINGS.sarif",
     "report": "report.json"
@@ -163,7 +167,7 @@ exist for the run; `pack` is absolute, the rest are pack-relative.
 
 ```json
 {
-  "run_id": "20260701-120500",
+  "run_id": "20260701-120500-a1b2c3d",
   "status": "running",
   "commit": "a1b2c3d",
   "base_used": ["main"],
@@ -186,7 +190,7 @@ The single decision truth for a run. Default: the latest run for the current
 | Arg | Required | Description |
 |-----|----------|-------------|
 | `repo` | yes | Absolute path to the git repo. |
-| `run_id` | no | Opaque run id. Default: latest run for HEAD. |
+| `run_id` | no | Opaque repo-global run id. Default: latest run for HEAD. |
 
 The decision surface is normalized so callers read one vocabulary:
 
@@ -205,7 +209,7 @@ Completed response:
 
 ```json
 {
-  "run_id": "20260701-120000",
+  "run_id": "20260701-120000-a1b2c3d",
   "commit": "a1b2c3d",
   "status": "completed",
   "base_used": ["main"],
@@ -244,7 +248,7 @@ an honest empty set, not an error.
 | Arg | Required | Description |
 |-----|----------|-------------|
 | `repo` | yes | Absolute path to the git repo. |
-| `run_id` | no | Opaque run id. Default: latest run for HEAD. |
+| `run_id` | no | Opaque repo-global run id. Default: latest run for HEAD. |
 | `severity` | no | Filter to a single SARIF level (e.g. `error`, `warning`, `note`), case-insensitive. |
 | `path` | no | Keep only findings whose file path starts with this prefix. |
 | `cursor` | no | Opaque pagination cursor from a previous call's `next_cursor`. |
@@ -284,7 +288,7 @@ summaries are not enough.
 | Arg | Required | Description |
 |-----|----------|-------------|
 | `repo` | yes | Absolute path to the git repo. |
-| `run_id` | yes | Opaque run id that owns the artifact. |
+| `run_id` | yes | Opaque repo-global run id that owns the artifact. |
 | `artifact` | yes | Pack-relative artifact path (e.g. `00_summary/MERGE_GATE.json`). |
 | `cursor` | no | Opaque pagination cursor from a previous call's `next_cursor`. |
 | `limit` | no | Max lines this page. Default `200`, clamped to `1..5000`. |
@@ -325,7 +329,7 @@ fields (e.g. `retry_after_ms`, `active_run_id`, `run_id`).
 | `artifact_missing` | The requested artifact does not exist within the run, is not UTF-8 text, or would escape the run directory. |
 | `tool_missing` | A required external tool is unavailable. |
 | `storage_locked` | Another review is already running for this repo branch. Carries `active_run_id` and `retry_after_ms`. |
-| `storage_corrupt` | `MERGE_GATE.json` is missing, invalid, or has no recognizable decision. |
+| `storage_corrupt` | `MERGE_GATE.json` is missing, invalid, has no recognizable decision, or an explicit `run_id` is ambiguous in storage. |
 | `stale_run` | The run is still in progress or its process died before completing. Carries `retry_after_ms` while running. |
 
 ### Retrying

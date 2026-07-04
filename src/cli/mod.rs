@@ -235,7 +235,7 @@ pub struct Cli {
     #[arg(long)]
     pub tui: bool,
 
-    /// Override the artifacts output directory (default: ~/.prview/<repo>/<timestamp>/)
+    /// Override the artifacts output directory (default: ~/.prview/runs/<repo>/<branch>/<run_id>/)
     #[arg(long = "output-dir", value_name = "PATH")]
     pub output_dir: Option<PathBuf>,
 
@@ -267,11 +267,22 @@ pub enum CliCommand {
     /// Generate a scoped review pack (only matching files/commits)
     Scope(ScopeArgs),
     /// Run the MCP server over stdio (for agent integrations)
-    Mcp(McpArgs),
+    Mcp {
+        #[command(flatten)]
+        args: McpArgs,
+    },
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
-pub struct McpArgs {}
+pub struct McpArgs {
+    /// Run a bounded self-smoke of the MCP stdio server and exit
+    #[arg(long)]
+    pub probe: bool,
+
+    /// Emit the probe result as JSON
+    #[arg(long, requires = "probe")]
+    pub json: bool,
+}
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct ScopeArgs {

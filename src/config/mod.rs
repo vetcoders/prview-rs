@@ -6,7 +6,7 @@ pub mod manifest;
 pub use manifest::*;
 
 use crate::cli::{Cli, ExecutionMode, PolicyModeArg, Profile};
-use crate::git::git_cmd;
+use crate::git::{git_cmd, short_sha};
 use crate::policy::{PolicyConfig, PolicyMode, load_policy, resolve_policy_path};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -447,6 +447,138 @@ pub fn prview_home() -> PathBuf {
         })
 }
 
+fn current_run_stamp() -> String {
+    chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+pub(crate) fn short_head(repo: &Path) -> String {
+    git_cmd()
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+pub(crate) fn allocate_run_dir(
+    repo_name: &str,
+    branch_key: &str,
+    commit: &str,
+) -> Result<(PathBuf, String)> {
+    let repo_runs_root = prview_home().join("runs").join(repo_name);
+    let stamp = current_run_stamp();
+    allocate_run_dir_in(&repo_runs_root, branch_key, &stamp, Some(commit))
+}
+
+fn run_id_base(stamp: &str, commit: Option<&str>) -> String {
+    match commit.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(commit) => format!("{stamp}-{}", short_sha(commit)),
+        None => stamp.to_string(),
+    }
+}
+
+fn run_dir_path_in(
+    repo_runs_root: &Path,
+    branch_key: &str,
+    stamp: &str,
+    commit: Option<&str>,
+) -> PathBuf {
+    let id_base = run_id_base(stamp, commit);
+    let mut run_id = id_base.clone();
+    let mut suffix = 2u32;
+    while run_id_taken_in_repo(repo_runs_root, &run_id) {
+        run_id = format!("{id_base}-{suffix}");
+        suffix += 1;
+    }
+    repo_runs_root.join(branch_key).join(run_id)
+}
+
+/// Exclusive, race-free allocation of a run directory under `runs/<repo>`.
+pub(crate) fn allocate_run_dir_in(
+    repo_runs_root: &Path,
+    branch_key: &str,
+    stamp: &str,
+    commit: Option<&str>,
+) -> Result<(PathBuf, String)> {
+    allocate_run_dir_in_with_post_create(repo_runs_root, branch_key, stamp, commit, |_| Ok(()))
+}
+
+fn allocate_run_dir_in_with_post_create(
+    repo_runs_root: &Path,
+    branch_key: &str,
+    stamp: &str,
+    commit: Option<&str>,
+    mut post_create: impl FnMut(&str) -> Result<()>,
+) -> Result<(PathBuf, String)> {
+    let base = repo_runs_root.join(branch_key);
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("failed to create runs dir {}", base.display()))?;
+
+    let id_base = run_id_base(stamp, commit);
+    let mut run_id = id_base.clone();
+    let mut suffix = 2u32;
+    loop {
+        if !run_id_taken_in_repo(repo_runs_root, &run_id) {
+            let run_dir = base.join(&run_id);
+            match std::fs::create_dir(&run_dir) {
+                Ok(()) => {
+                    post_create(&run_id)?;
+                    if run_id_taken_in_other_branch(repo_runs_root, branch_key, &run_id) {
+                        std::fs::remove_dir(&run_dir).with_context(|| {
+                            format!(
+                                "failed to remove duplicate fresh run dir {}",
+                                run_dir.display()
+                            )
+                        })?;
+                    } else {
+                        return Ok((run_dir, run_id));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => bail!("failed to create run dir {}: {e}", run_dir.display()),
+            }
+        }
+        run_id = format!("{id_base}-{suffix}");
+        suffix += 1;
+        if suffix > 10_000 {
+            bail!("exhausted run-id suffixes allocating a run directory");
+        }
+    }
+}
+
+fn run_id_taken_in_other_branch(repo_runs_root: &Path, branch_key: &str, run_id: &str) -> bool {
+    let Ok(read) = std::fs::read_dir(repo_runs_root) else {
+        return false;
+    };
+    for branch in read.flatten() {
+        let bp = branch.path();
+        if branch.file_name().to_string_lossy() == branch_key {
+            continue;
+        }
+        if bp.is_dir() && bp.join(run_id).is_dir() {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `run_id` already names a directory under any `runs/<repo>/<branch>`
+/// subtree.
+fn run_id_taken_in_repo(repo_runs_root: &Path, run_id: &str) -> bool {
+    let Ok(read) = std::fs::read_dir(repo_runs_root) else {
+        return false;
+    };
+    for branch in read.flatten() {
+        let bp = branch.path();
+        if bp.is_dir() && bp.join(run_id).exists() {
+            return true;
+        }
+    }
+    false
+}
+
 impl Config {
     pub(crate) fn base(
         repo_root: PathBuf,
@@ -723,12 +855,79 @@ impl Config {
         if let Some(ref dir) = self.output_dir {
             return dir.clone();
         }
-        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        prview_home()
-            .join("runs")
-            .join(self.repo_name())
-            .join(self.safe_target_name())
-            .join(timestamp.to_string())
+        let repo_runs_root = prview_home().join("runs").join(self.repo_name());
+        let stamp = current_run_stamp();
+        let commit = self.run_id_commit_suffix();
+        run_dir_path_in(
+            &repo_runs_root,
+            &self.safe_target_name(),
+            &stamp,
+            commit.as_deref(),
+        )
+    }
+
+    /// Allocate the artifacts output directory for a real write path.
+    ///
+    /// `artifacts_dir()` remains a cheap predictor for callers that only need a
+    /// path shape. Generation uses this allocator so same-second runs claim an
+    /// exclusive repo-global id before writing.
+    pub fn allocate_artifacts_dir(&self) -> Result<PathBuf> {
+        if let Some(ref dir) = self.output_dir {
+            return Ok(dir.clone());
+        }
+        self.allocate_artifacts_dir_with_stamp(&current_run_stamp())
+    }
+
+    pub(crate) fn allocate_artifacts_dir_for_commit(&self, commit: &str) -> Result<PathBuf> {
+        if let Some(ref dir) = self.output_dir {
+            return Ok(dir.clone());
+        }
+        self.allocate_artifacts_dir_in_home_with_stamp_and_commit(
+            &prview_home(),
+            &current_run_stamp(),
+            Some(commit),
+        )
+    }
+
+    fn allocate_artifacts_dir_with_stamp(&self, stamp: &str) -> Result<PathBuf> {
+        self.allocate_artifacts_dir_in_home_with_stamp(&prview_home(), stamp)
+    }
+
+    fn allocate_artifacts_dir_in_home_with_stamp(
+        &self,
+        prview_home: &Path,
+        stamp: &str,
+    ) -> Result<PathBuf> {
+        let commit = self.run_id_commit_suffix();
+        self.allocate_artifacts_dir_in_home_with_stamp_and_commit(
+            prview_home,
+            stamp,
+            commit.as_deref(),
+        )
+    }
+
+    fn allocate_artifacts_dir_in_home_with_stamp_and_commit(
+        &self,
+        prview_home: &Path,
+        stamp: &str,
+        commit: Option<&str>,
+    ) -> Result<PathBuf> {
+        let repo_runs_root = prview_home.join("runs").join(self.repo_name());
+        let (dir, _) =
+            allocate_run_dir_in(&repo_runs_root, &self.safe_target_name(), stamp, commit)?;
+        Ok(dir)
+    }
+
+    fn run_id_commit_suffix(&self) -> Option<String> {
+        self.pr_head_oid
+            .as_deref()
+            .map(str::trim)
+            .filter(|commit| !commit.is_empty())
+            .map(|commit| short_sha(commit).to_string())
+            .or_else(|| {
+                let head = short_head(&self.repo_root);
+                (!head.is_empty()).then_some(head)
+            })
     }
 
     /// Get artifacts base directory (without timestamp) for history lookups.
@@ -1265,6 +1464,38 @@ mod tests {
         tmp
     }
 
+    fn init_git_repo_with_commit(branch: &str) -> tempfile::TempDir {
+        let tmp = init_git_repo_with_branch(branch);
+        for args in [
+            &["config", "user.email", "t@t.co"][..],
+            &["config", "user.name", "T"][..],
+        ] {
+            assert!(
+                git_cmd()
+                    .args(args)
+                    .current_dir(tmp.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(tmp.path().join("f.txt"), "x\n").unwrap();
+        git_cmd()
+            .args(["add", "."])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert!(
+            git_cmd()
+                .args(["commit", "-q", "-m", "init"])
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        tmp
+    }
+
     /// PR #12 review: a detached HEAD must produce the same storage key as the
     /// write path (`HEAD`), not one derived from a display string. Otherwise a
     /// run recorded on a detached commit is unfindable on read.
@@ -1660,13 +1891,137 @@ mod tests {
     fn test_config_artifacts_dir() {
         let config = make_test_config("/tmp/myrepo", Some("feature/test"));
         let artifacts_dir = config.artifacts_dir();
-        // Should contain runs/<repo>/<branch>/<timestamp>
+        // Should contain runs/<repo>/<branch>/<run_id>
         let path_str = artifacts_dir.to_string_lossy();
         assert!(
             path_str.contains("runs/myrepo/feature%2Ftest/"),
             "path was: {}",
             path_str
         );
+    }
+
+    #[test]
+    fn test_config_artifacts_dir_includes_short_head_suffix() {
+        let repo = init_git_repo_with_commit("main");
+        let config = make_test_config(repo.path().to_str().unwrap(), Some("main"));
+        let artifacts_dir = config.artifacts_dir();
+        let run_id = artifacts_dir.file_name().unwrap().to_string_lossy();
+        let head = short_head(repo.path());
+
+        assert!(
+            run_id.contains(&format!("-{head}")),
+            "run_id {run_id} should include short HEAD {head}"
+        );
+    }
+
+    #[test]
+    fn test_config_allocate_artifacts_dir_uses_resolved_target_suffix() {
+        let repo = init_git_repo_with_commit("main");
+        let target_commit = String::from_utf8(
+            git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        std::fs::write(repo.path().join("f.txt"), "x\ny\n").unwrap();
+        git_cmd()
+            .args(["add", "."])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(
+            git_cmd()
+                .args(["commit", "-q", "-m", "local head"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let local_head = short_head(repo.path());
+        assert_ne!(short_sha(&target_commit), local_head);
+
+        let home = tempfile::tempdir().unwrap();
+        let stamp = "20260704-121500";
+        let config = make_test_config(repo.path().to_str().unwrap(), Some("main"));
+        let artifacts_dir = config
+            .allocate_artifacts_dir_in_home_with_stamp_and_commit(
+                home.path(),
+                stamp,
+                Some(&target_commit),
+            )
+            .unwrap();
+        let run_id = artifacts_dir.file_name().unwrap().to_string_lossy();
+
+        assert_eq!(run_id, format!("{stamp}-{}", short_sha(&target_commit)));
+        assert!(
+            !run_id.ends_with(&local_head),
+            "run_id {run_id} should not use local HEAD {local_head}"
+        );
+    }
+
+    #[test]
+    fn test_config_allocate_artifacts_dir_is_unique_across_branches_same_second() {
+        let repo = init_git_repo_with_commit("main");
+        let home = tempfile::tempdir().unwrap();
+        let stamp = "20260704-120000";
+
+        let main = make_test_config(repo.path().to_str().unwrap(), Some("main"));
+        let feature = make_test_config(repo.path().to_str().unwrap(), Some("feature/test"));
+
+        let main_dir = main
+            .allocate_artifacts_dir_in_home_with_stamp(home.path(), stamp)
+            .unwrap();
+        let feature_dir = feature
+            .allocate_artifacts_dir_in_home_with_stamp(home.path(), stamp)
+            .unwrap();
+        let main_id = main_dir.file_name().unwrap().to_string_lossy();
+        let feature_id = feature_dir.file_name().unwrap().to_string_lossy();
+
+        assert_ne!(main_id, feature_id);
+        assert!(main_id.starts_with(stamp));
+        assert!(feature_id.starts_with(stamp));
+        assert!(main_dir.is_dir());
+        assert!(feature_dir.is_dir());
+    }
+
+    #[test]
+    fn test_allocate_run_dir_retries_when_duplicate_appears_after_create() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_runs_root = home.path().join("runs").join("demo");
+        let branch_key = "feature%2Ftest";
+        let stamp = "20260704-123000";
+        let commit = "abcdef1234567890abcdef1234567890abcdef12";
+        let colliding_id = format!("{stamp}-{}", short_sha(commit));
+        let injected_dir = repo_runs_root.join("main").join(&colliding_id);
+        let mut injected = false;
+
+        let (run_dir, run_id) = allocate_run_dir_in_with_post_create(
+            &repo_runs_root,
+            branch_key,
+            stamp,
+            Some(commit),
+            |created_id| {
+                if !injected {
+                    assert_eq!(created_id, colliding_id);
+                    std::fs::create_dir_all(injected_dir.parent().unwrap()).unwrap();
+                    std::fs::create_dir(&injected_dir).unwrap();
+                    injected = true;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(run_id, format!("{colliding_id}-2"));
+        assert!(run_dir.is_dir());
+        assert!(injected_dir.is_dir());
+        assert!(!repo_runs_root.join(branch_key).join(colliding_id).exists());
     }
 
     #[test]

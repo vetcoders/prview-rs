@@ -1,6 +1,7 @@
 # Example Artifact Pack
 
-When you run `prview`, it generates an artifact pack in `~/.prview/runs/<repo>/<branch>/<timestamp>/` (or `$PRVIEW_HOME/...`).
+When you run `prview`, it generates an artifact pack in `~/.prview/runs/<repo>/<branch>/<run_id>/` (or `$PRVIEW_HOME/...`).
+New run ids use a timestamp plus short HEAD suffix, for example `20260704-120500-a1b2c3d`; treat the value as opaque.
 This pack contains all the analysis output in both human-readable and machine-readable formats.
 
 ## Directory Structure

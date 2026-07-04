@@ -48,6 +48,24 @@ trap cleanup EXIT INT TERM
 
 # Map the running platform to a released target triple. Leaves TARGET empty
 # for anything without a prebuilt binary so the caller can fall back to cargo.
+is_musl_linux() {
+	if [ "${OS}" != "Linux" ]; then
+		return 1
+	fi
+	if command -v getconf >/dev/null 2>&1 && getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+		return 1
+	fi
+	if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -iq musl; then
+		return 0
+	fi
+	for loader in /lib/ld-musl-*.so.1 /usr/lib/ld-musl-*.so.1; do
+		if [ -e "${loader}" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
 detect_target() {
 	OS="$(uname -s)"
 	ARCH="$(uname -m)"
@@ -60,7 +78,13 @@ detect_target() {
 			;;
 		Linux)
 			case "${ARCH}" in
-				x86_64 | amd64) TARGET="x86_64-unknown-linux-gnu" ;;
+				x86_64 | amd64)
+					if is_musl_linux; then
+						TARGET=""
+					else
+						TARGET="x86_64-unknown-linux-gnu"
+					fi
+					;;
 				*) TARGET="" ;;
 			esac
 			;;

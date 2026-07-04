@@ -246,7 +246,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let context_artifacts = plan_context_artifacts(config, diffs, &all_checks);
 
     let emit_human_stdout = !config.json && !config.quiet;
-    let out_dir = config.artifacts_dir();
+    let out_dir = config.allocate_artifacts_dir_for_commit(&resolved_target.commit_id)?;
     fs::create_dir_all(&out_dir)?;
 
     // Open repository once for all generators

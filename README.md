@@ -150,6 +150,8 @@ Six tools cover the loop end to end:
 
 Every tool takes an explicit absolute `repo` path and reads truth from storage, so the server never depends on its own working directory. Every response carries `schema_version: "prview.mcp.v1"`, and failures are fail-loud — a structured `error_class`, never an empty success. Full reference: [`docs/mcp.md`](docs/mcp.md).
 
+Use `prview mcp --probe` as the first manual smoke check; it performs a real MCP handshake and exits instead of leaving the stdio server waiting for a client.
+
 ## Repository workflow
 
 `prview-rs` is trunk-based on `main`:
