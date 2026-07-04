@@ -6,7 +6,7 @@ pub mod manifest;
 pub use manifest::*;
 
 use crate::cli::{Cli, ExecutionMode, PolicyModeArg, Profile};
-use crate::git::git_cmd;
+use crate::git::{git_cmd, short_sha};
 use crate::policy::{PolicyConfig, PolicyMode, load_policy, resolve_policy_path};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -474,7 +474,7 @@ pub(crate) fn allocate_run_dir(
 
 fn run_id_base(stamp: &str, commit: Option<&str>) -> String {
     match commit.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(commit) => format!("{stamp}-{commit}"),
+        Some(commit) => format!("{stamp}-{}", short_sha(commit)),
         None => stamp.to_string(),
     }
 }
@@ -819,12 +819,12 @@ impl Config {
         }
         let repo_runs_root = prview_home().join("runs").join(self.repo_name());
         let stamp = current_run_stamp();
-        let commit = short_head(&self.repo_root);
+        let commit = self.run_id_commit_suffix();
         run_dir_path_in(
             &repo_runs_root,
             &self.safe_target_name(),
             &stamp,
-            Some(&commit),
+            commit.as_deref(),
         )
     }
 
@@ -840,6 +840,17 @@ impl Config {
         self.allocate_artifacts_dir_with_stamp(&current_run_stamp())
     }
 
+    pub(crate) fn allocate_artifacts_dir_for_commit(&self, commit: &str) -> Result<PathBuf> {
+        if let Some(ref dir) = self.output_dir {
+            return Ok(dir.clone());
+        }
+        self.allocate_artifacts_dir_in_home_with_stamp_and_commit(
+            &prview_home(),
+            &current_run_stamp(),
+            Some(commit),
+        )
+    }
+
     fn allocate_artifacts_dir_with_stamp(&self, stamp: &str) -> Result<PathBuf> {
         self.allocate_artifacts_dir_in_home_with_stamp(&prview_home(), stamp)
     }
@@ -849,15 +860,36 @@ impl Config {
         prview_home: &Path,
         stamp: &str,
     ) -> Result<PathBuf> {
-        let commit = short_head(&self.repo_root);
-        let repo_runs_root = prview_home.join("runs").join(self.repo_name());
-        let (dir, _) = allocate_run_dir_in(
-            &repo_runs_root,
-            &self.safe_target_name(),
+        let commit = self.run_id_commit_suffix();
+        self.allocate_artifacts_dir_in_home_with_stamp_and_commit(
+            prview_home,
             stamp,
-            Some(&commit),
-        )?;
+            commit.as_deref(),
+        )
+    }
+
+    fn allocate_artifacts_dir_in_home_with_stamp_and_commit(
+        &self,
+        prview_home: &Path,
+        stamp: &str,
+        commit: Option<&str>,
+    ) -> Result<PathBuf> {
+        let repo_runs_root = prview_home.join("runs").join(self.repo_name());
+        let (dir, _) =
+            allocate_run_dir_in(&repo_runs_root, &self.safe_target_name(), stamp, commit)?;
         Ok(dir)
+    }
+
+    fn run_id_commit_suffix(&self) -> Option<String> {
+        self.pr_head_oid
+            .as_deref()
+            .map(str::trim)
+            .filter(|commit| !commit.is_empty())
+            .map(|commit| short_sha(commit).to_string())
+            .or_else(|| {
+                let head = short_head(&self.repo_root);
+                (!head.is_empty()).then_some(head)
+            })
     }
 
     /// Get artifacts base directory (without timestamp) for history lookups.
@@ -1841,6 +1873,57 @@ mod tests {
         assert!(
             run_id.contains(&format!("-{head}")),
             "run_id {run_id} should include short HEAD {head}"
+        );
+    }
+
+    #[test]
+    fn test_config_allocate_artifacts_dir_uses_resolved_target_suffix() {
+        let repo = init_git_repo_with_commit("main");
+        let target_commit = String::from_utf8(
+            git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        std::fs::write(repo.path().join("f.txt"), "x\ny\n").unwrap();
+        git_cmd()
+            .args(["add", "."])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(
+            git_cmd()
+                .args(["commit", "-q", "-m", "local head"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let local_head = short_head(repo.path());
+        assert_ne!(short_sha(&target_commit), local_head);
+
+        let home = tempfile::tempdir().unwrap();
+        let stamp = "20260704-121500";
+        let config = make_test_config(repo.path().to_str().unwrap(), Some("main"));
+        let artifacts_dir = config
+            .allocate_artifacts_dir_in_home_with_stamp_and_commit(
+                home.path(),
+                stamp,
+                Some(&target_commit),
+            )
+            .unwrap();
+        let run_id = artifacts_dir.file_name().unwrap().to_string_lossy();
+
+        assert_eq!(run_id, format!("{stamp}-{}", short_sha(&target_commit)));
+        assert!(
+            !run_id.ends_with(&local_head),
+            "run_id {run_id} should not use local HEAD {local_head}"
         );
     }
 
