@@ -187,11 +187,19 @@ impl PrviewMcp {
         let branch_key = crate::config::storage_branch_key(&root);
         let index = crate::storage::RunIndex::load();
 
-        let for_head = read::latest_for_head(&index, &repo_name, &branch_key, &repo_state.head)
-            .map(run_summary_for_state)
+        let running_for_head = running_run_summary(&repo_name, &branch_key, Some(&repo_state.head));
+        let running_any = running_run_summary(&repo_name, &branch_key, None);
+
+        let for_head = running_for_head
+            .or_else(|| {
+                read::latest_for_head(&index, &repo_name, &branch_key, &repo_state.head)
+                    .map(run_summary_for_state)
+            })
             .unwrap_or(serde_json::Value::Null);
-        let any = read::latest_any(&index, &repo_name, &branch_key)
-            .map(run_summary_for_state)
+        let any = running_any
+            .or_else(|| {
+                read::latest_any(&index, &repo_name, &branch_key).map(run_summary_for_state)
+            })
             .unwrap_or(serde_json::Value::Null);
 
         let dirty = repo_state.is_dirty();
@@ -263,16 +271,22 @@ impl PrviewMcp {
                     "generated_at": read::read_generated_at(&resolved.run_dir),
                 }))
             }
-            read::RunStatus::Running { .. } => {
-                let marker = read::read_running_marker(&resolved.run_dir);
-                types::tool_success(json!({
-                    "run_id": resolved.run_id,
-                    "commit": resolved.commit,
-                    "status": "running",
-                    "base_used": marker.map(|m| m.base_used).unwrap_or_default(),
-                    "retry_after_ms": 5000,
-                }))
-            }
+            read::RunStatus::Running { .. } => types::tool_success(
+                read::read_running_marker(&resolved.run_dir)
+                    .map(|marker| in_progress_body(&resolved.run_id, &resolved.commit, &marker))
+                    .unwrap_or_else(|| {
+                        json!({
+                            "run_id": resolved.run_id,
+                            "commit": resolved.commit,
+                            "status": "in_progress",
+                            "run_status": "running",
+                            "started_at": serde_json::Value::Null,
+                            "elapsed_s": serde_json::Value::Null,
+                            "base_used": [],
+                            "retry_after_ms": 5000,
+                        })
+                    }),
+            ),
             read::RunStatus::Stale { started_at, .. } => {
                 let marker = read::read_running_marker(&resolved.run_dir);
                 types::tool_success(json!({
@@ -427,7 +441,7 @@ fn require_completed(run_dir: &std::path::Path) -> Result<(), types::ToolError> 
         read::RunStatus::Completed => Ok(()),
         read::RunStatus::Running { .. } => Err(types::ToolError::with_extra(
             error_class::STALE_RUN,
-            "run is still in progress; poll verdict until completed",
+            "run is still in progress; poll verdict(run_id) until status=completed",
             json!({ "retry_after_ms": 5000 }),
         )),
         read::RunStatus::Stale { .. } => Err(types::ToolError::new(
@@ -488,6 +502,61 @@ fn profile_tool_availability(kind: crate::config::ProfileKind) -> serde_json::Va
         .map(|bin| (bin.to_string(), json!(which::which(bin).is_ok())))
         .collect();
     serde_json::Value::Object(map)
+}
+
+fn elapsed_s(started_at: &str) -> Option<i64> {
+    let started = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
+    let elapsed = chrono::Local::now()
+        .fixed_offset()
+        .signed_duration_since(started);
+    Some(elapsed.num_seconds().max(0))
+}
+
+fn in_progress_body(run_id: &str, commit: &str, marker: &read::RunningMarker) -> serde_json::Value {
+    json!({
+        "run_id": run_id,
+        "commit": commit,
+        "status": "in_progress",
+        "run_status": "running",
+        "started_at": marker.started_at.clone(),
+        "elapsed_s": elapsed_s(&marker.started_at),
+        "profile": marker.profile.clone(),
+        "base_used": marker.base_used.clone(),
+        "retry_after_ms": 5000,
+    })
+}
+
+fn running_run_summary(
+    repo_name: &str,
+    branch_key: &str,
+    head: Option<&str>,
+) -> Option<serde_json::Value> {
+    let base = crate::config::prview_home()
+        .join("runs")
+        .join(repo_name)
+        .join(branch_key);
+    let mut candidates: Vec<(String, serde_json::Value)> = Vec::new();
+    for entry in std::fs::read_dir(&base).ok()?.flatten() {
+        let run_dir = entry.path();
+        if !run_dir.is_dir()
+            || !matches!(read::run_status(&run_dir), read::RunStatus::Running { .. })
+        {
+            continue;
+        }
+        let run_id = run_dir.file_name()?.to_str()?.to_string();
+        let marker = read::read_running_marker(&run_dir)?;
+        if let Some(head) = head
+            && !read::commit_matches(&marker.commit, head)
+        {
+            continue;
+        }
+        let body = in_progress_body(&run_id, &marker.commit, &marker);
+        candidates.push((marker.started_at.clone(), body));
+    }
+    candidates
+        .into_iter()
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, body)| body)
 }
 
 /// Summarize a registered (completed) run for the `state` snapshot.

@@ -143,6 +143,35 @@ fn plant_completed_run(
     run_dir
 }
 
+fn plant_running_run(
+    home: &Path,
+    repo_name: &str,
+    branch_key: &str,
+    run_id: &str,
+    commit: &str,
+    base_used: &[&str],
+) -> std::path::PathBuf {
+    let run_dir = home
+        .join("runs")
+        .join(repo_name)
+        .join(branch_key)
+        .join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(
+        run_dir.join("RUNNING.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "pid": std::process::id(),
+            "started_at": "2026-07-01T00:00:00Z",
+            "profile": "deep",
+            "commit": commit,
+            "base_used": base_used,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    run_dir
+}
+
 fn repo_basename(repo: &Path) -> String {
     repo.file_name().unwrap().to_str().unwrap().to_string()
 }
@@ -569,6 +598,77 @@ fn run_review_single_active_run_is_locked() {
     assert_eq!(body["error_class"], "storage_locked");
     assert_eq!(body["active_run_id"], "20260101-000000");
     assert!(body["retry_after_ms"].is_number());
+}
+
+#[test]
+fn polling_running_run_reports_in_progress_and_points_to_verdict() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = fixture_repo();
+    let repo_name = repo_basename(repo.path());
+    let commit = git_short_head(repo.path());
+    plant_running_run(
+        home.path(),
+        &repo_name,
+        "feature",
+        "20260101-010101",
+        &commit,
+        &["main"],
+    );
+
+    let mut s = McpSession::start(&[("PRVIEW_HOME", home.path().to_str().unwrap())]);
+    let repo_arg = repo.path().to_str().unwrap();
+
+    let verdict = tool_body(&s.call_tool(
+        "verdict",
+        serde_json::json!({"repo": repo_arg, "run_id": "20260101-010101"}),
+    ));
+    assert_eq!(verdict["status"], "in_progress");
+    assert_eq!(verdict["run_status"], "running");
+    assert_eq!(verdict["started_at"], "2026-07-01T00:00:00Z");
+    assert!(verdict["elapsed_s"].is_number());
+    assert_eq!(verdict["base_used"], serde_json::json!(["main"]));
+
+    let state = tool_body(&s.call_tool("state", serde_json::json!({"repo": repo_arg})));
+    assert_eq!(state["latest_run_for_head"]["status"], "in_progress");
+    assert_eq!(
+        state["latest_run_for_head"]["started_at"],
+        "2026-07-01T00:00:00Z"
+    );
+    assert!(state["latest_run_for_head"]["elapsed_s"].is_number());
+
+    let findings = s.call_tool(
+        "findings",
+        serde_json::json!({"repo": repo_arg, "run_id": "20260101-010101"}),
+    );
+    assert!(is_error(&findings), "findings on running run must error");
+    let findings_body = tool_body(&findings);
+    assert_eq!(findings_body["error_class"], "stale_run");
+    assert!(
+        findings_body["message"]
+            .as_str()
+            .map(|m| m.contains("verdict(run_id)"))
+            .unwrap_or(false),
+        "message must point callers at verdict polling: {findings_body}"
+    );
+
+    let artifact = s.call_tool(
+        "read_artifact",
+        serde_json::json!({
+            "repo": repo_arg,
+            "run_id": "20260101-010101",
+            "artifact": "00_summary/MERGE_GATE.json"
+        }),
+    );
+    assert!(is_error(&artifact), "artifact on running run must error");
+    let artifact_body = tool_body(&artifact);
+    assert_eq!(artifact_body["error_class"], "stale_run");
+    assert!(
+        artifact_body["message"]
+            .as_str()
+            .map(|m| m.contains("verdict(run_id)"))
+            .unwrap_or(false),
+        "message must point callers at verdict polling: {artifact_body}"
+    );
 }
 
 #[test]
