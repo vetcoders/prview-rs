@@ -2,7 +2,7 @@
 //!
 //! The MCP layer adds no review logic — it prepares a run directory, spawns
 //! `prview` (its own binary) as a subprocess, and reads the resulting pack from
-//! storage. quick waits synchronously within a hard 60s budget; deep detaches
+//! storage. quick waits synchronously within a hard 120s budget; deep detaches
 //! and is polled later through `verdict`/`state`. A single active run per repo
 //! branch is enforced via the `RUNNING.json` liveness marker (R2b).
 
@@ -47,8 +47,18 @@ impl Profile {
     }
 }
 
-const QUICK_BUDGET: Duration = Duration::from_secs(60);
-const DEFAULT_BASES: &[&str] = &["develop", "main", "master"];
+/// Default sync quick budget. 120s comes from 0.4.0 Codescribe/Vista dogfood:
+/// the previous 60s budget timed out repeatedly on a medium-large (~411k LOC)
+/// repo while keeping quick synchronous remains the approved product contract.
+const DEFAULT_QUICK_BUDGET: Duration = Duration::from_secs(120);
+const FALLBACK_BASES: &[&str] = &["develop", "main", "master"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BaseSelection {
+    pub bases: Vec<String>,
+    pub base_fallback: bool,
+    pub caveats: Vec<String>,
+}
 
 fn short_head(repo: &Path) -> String {
     crate::git::git_cmd()
@@ -59,6 +69,15 @@ fn short_head(repo: &Path) -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
+}
+
+fn quick_budget() -> Duration {
+    std::env::var("PRVIEW_MCP_QUICK_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_QUICK_BUDGET)
 }
 
 /// Allocate a fresh, collision-free run directory under the standard storage
@@ -160,23 +179,149 @@ fn write_marker(run_dir: &Path, marker: &read::RunningMarker) {
     }
 }
 
-fn intended_bases(base: &Option<String>) -> Vec<String> {
-    match base {
-        Some(b) => vec![b.clone()],
-        None => DEFAULT_BASES.iter().map(|s| s.to_string()).collect(),
+fn normalize_origin_branch(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let branch = trimmed
+        .strip_prefix("refs/remotes/origin/")
+        .or_else(|| trimmed.strip_prefix("origin/"))
+        .unwrap_or(trimmed);
+    if branch.is_empty() || branch == "HEAD" {
+        None
+    } else {
+        Some(branch.to_string())
+    }
+}
+
+fn origin_head_branch(repo: &Path) -> Option<String> {
+    let out = crate::git::git_cmd()
+        .args([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        normalize_origin_branch(&String::from_utf8_lossy(&out.stdout))
+    } else {
+        None
+    }
+}
+
+fn configured_origin_head(repo: &Path) -> Option<String> {
+    let out = crate::git::git_cmd()
+        .args(["config", "--get", "remote.origin.HEAD"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        normalize_origin_branch(&String::from_utf8_lossy(&out.stdout))
+    } else {
+        None
+    }
+}
+
+fn ref_exists(repo: &Path, name: &str) -> bool {
+    let refs = if name.starts_with("refs/") {
+        vec![name.to_string()]
+    } else {
+        vec![
+            format!("refs/heads/{name}"),
+            format!("refs/remotes/origin/{name}"),
+        ]
+    };
+
+    refs.into_iter().any(|reference| {
+        let mut cmd = crate::git::git_cmd();
+        cmd.args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{reference}^{{commit}}"),
+        ])
+        .current_dir(repo)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    })
+}
+
+fn remote_ref_exists(repo: &Path, branch: &str) -> bool {
+    ref_exists(repo, &format!("refs/remotes/origin/{branch}"))
+}
+
+pub(crate) fn select_bases(repo: &Path, base: Option<&str>) -> BaseSelection {
+    if let Some(base) = base {
+        return BaseSelection {
+            bases: vec![base.to_string()],
+            base_fallback: false,
+            caveats: Vec::new(),
+        };
+    }
+
+    let mut caveats = Vec::new();
+    if let Some(branch) = origin_head_branch(repo).or_else(|| configured_origin_head(repo)) {
+        if remote_ref_exists(repo, &branch) {
+            return BaseSelection {
+                bases: vec![format!("origin/{branch}")],
+                base_fallback: false,
+                caveats: Vec::new(),
+            };
+        }
+        caveats.push(format!(
+            "base_fallback: detected default branch 'origin/{branch}' does not exist remotely; tried develop/main/master"
+        ));
+    }
+
+    let bases: Vec<String> = FALLBACK_BASES
+        .iter()
+        .copied()
+        .filter(|candidate| ref_exists(repo, candidate))
+        .map(str::to_string)
+        .collect();
+    let bases = if bases.is_empty() {
+        FALLBACK_BASES.iter().map(|s| s.to_string()).collect()
+    } else {
+        bases
+    };
+
+    BaseSelection {
+        bases,
+        base_fallback: true,
+        caveats: if caveats.is_empty() {
+            vec![
+                "base_fallback: default branch was not detectable; tried develop/main/master"
+                    .to_string(),
+            ]
+        } else {
+            caveats
+        },
     }
 }
 
 /// Positional args for the child prview: `[branch, base]` when a base is given
 /// (base is positional in the CLI, so target must precede it), else none.
-fn positional_args(repo: &Path, base: &Option<String>) -> Vec<String> {
-    match base {
-        Some(b) => {
-            let branch =
-                crate::config::current_branch_name(repo).unwrap_or_else(|| "HEAD".to_string());
-            vec![branch, b.clone()]
-        }
-        None => Vec::new(),
+fn positional_args(repo: &Path, selection: &BaseSelection) -> Vec<String> {
+    let branch = crate::config::current_branch_name(repo).unwrap_or_else(|| "HEAD".to_string());
+    let mut args = vec![branch];
+    args.extend(selection.bases.iter().cloned());
+    args
+}
+
+fn add_base_metadata(body: &mut serde_json::Value, selection: &BaseSelection) {
+    body["base_fallback"] = serde_json::json!(selection.base_fallback);
+    if selection.base_fallback {
+        let mut caveats = body["caveats"].as_array().cloned().unwrap_or_default();
+        caveats.extend(
+            selection
+                .caveats
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String),
+        );
+        body["caveats"] = serde_json::Value::Array(caveats);
     }
 }
 
@@ -227,13 +372,14 @@ pub async fn start(
     let (run_dir, run_id) = allocate_run_dir(&repo_name, &branch_key)?;
     let commit = short_head(repo);
     let (out_file, err_file) = stdio_files(&run_dir)?;
+    let selection = select_bases(repo, base.as_deref());
 
     let mut args: Vec<String> = vec![
         "--output-dir".to_string(),
         run_dir.to_string_lossy().to_string(),
         profile.cli_flag().to_string(),
     ];
-    args.extend(positional_args(repo, &base));
+    args.extend(positional_args(repo, &selection));
 
     match profile {
         Profile::Quick => {
@@ -266,11 +412,12 @@ pub async fn start(
                     started_at: chrono::Local::now().to_rfc3339(),
                     profile: profile.as_str().to_string(),
                     commit: commit.clone(),
-                    base_used: intended_bases(&base),
+                    base_used: selection.bases.clone(),
                 },
             );
 
-            match tokio::time::timeout(QUICK_BUDGET, child.wait()).await {
+            let budget = quick_budget();
+            match tokio::time::timeout(budget, child.wait()).await {
                 Err(_) => {
                     // Kill the whole group first so the check-tool grandchildren
                     // die, then reap the direct child.
@@ -281,8 +428,17 @@ pub async fn start(
                     let _ = child.start_kill();
                     Err(ToolError::with_extra(
                         error_class::RUN_TIMEOUT,
-                        "quick review exceeded the 60s budget",
-                        serde_json::json!({ "run_id": run_id }),
+                        "quick review exceeded the configured budget; retry with profile=deep",
+                        serde_json::json!({
+                            "run_id": run_id,
+                            "base_used": selection.bases,
+                            "base_fallback": selection.base_fallback,
+                            "caveats": selection.caveats,
+                            "retry_hint": {
+                                "profile": "deep",
+                                "reason": "quick exceeded its synchronous budget"
+                            }
+                        }),
                     ))
                 }
                 Ok(Err(e)) => Err(ToolError::new(
@@ -307,7 +463,9 @@ pub async fn start(
                     // Completed: the child already registered the run; drop the
                     // marker so status readers see a clean completion.
                     let _ = std::fs::remove_file(read::running_marker_path(&run_dir));
-                    Ok(completed_body(&run_dir, &run_id, &commit))
+                    let mut body = completed_body(&run_dir, &run_id, &commit);
+                    add_base_metadata(&mut body, &selection);
+                    Ok(body)
                 }
             }
         }
@@ -320,15 +478,18 @@ pub async fn start(
                     started_at: chrono::Local::now().to_rfc3339(),
                     profile: profile.as_str().to_string(),
                     commit: commit.clone(),
-                    base_used: intended_bases(&base),
+                    base_used: selection.bases.clone(),
                 },
             );
-            Ok(serde_json::json!({
+            let mut body = serde_json::json!({
                 "run_id": run_id,
                 "status": "running",
                 "commit": commit,
-                "base_used": intended_bases(&base),
-            }))
+                "base_used": selection.bases,
+                "caveats": [],
+            });
+            add_base_metadata(&mut body, &selection);
+            Ok(body)
         }
     }
 }
@@ -457,8 +618,128 @@ mod tests {
 
     #[test]
     fn intended_bases_uses_explicit_then_defaults() {
-        assert_eq!(intended_bases(&Some("dev".to_string())), vec!["dev"]);
-        assert_eq!(intended_bases(&None), vec!["develop", "main", "master"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        crate::git::git_cmd()
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
+        crate::git::git_cmd()
+            .args(["add", "-A"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["commit", "-m", "init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        let explicit = select_bases(repo, Some("dev"));
+        assert_eq!(explicit.bases, vec!["dev"]);
+        assert!(!explicit.base_fallback);
+
+        let fallback = select_bases(repo, None);
+        assert!(fallback.base_fallback);
+        assert_eq!(fallback.bases, vec!["main"]);
+    }
+
+    #[test]
+    fn detected_default_branch_must_exist_before_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        crate::git::git_cmd()
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
+        crate::git::git_cmd()
+            .args(["add", "-A"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["commit", "-m", "init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args([
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/missing",
+            ])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        let selection = select_bases(repo, None);
+
+        assert!(selection.base_fallback);
+        assert_eq!(selection.bases, vec!["main"]);
+        assert!(selection.caveats.iter().any(|c| c.contains("missing")));
+    }
+
+    #[test]
+    fn ref_exists_handles_dash_prefixed_branch_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        crate::git::git_cmd()
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
+        crate::git::git_cmd()
+            .args(["add", "-A"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["commit", "-m", "init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["update-ref", "refs/heads/-dash", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        assert!(ref_exists(repo, "-dash"));
+        assert!(!ref_exists(repo, "-missing"));
     }
 
     /// PR #12 review: two allocations that collide on the same timestamp within

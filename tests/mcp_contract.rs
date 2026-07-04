@@ -42,20 +42,78 @@ fn git_short_head(repo: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A fixture repo on branch `feature` (one commit) diffable against `main`.
-fn fixture_repo() -> tempfile::TempDir {
+/// A fixture repo on branch `feature` (one commit) diffable against the named base.
+fn fixture_repo_with_base(base_branch: &str, origin_head: bool) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
-    run_git(repo, &["init", "-b", "main"]);
+    run_git(repo, &["init", "-b", base_branch]);
     run_git(repo, &["config", "user.email", "test@test.com"]);
     run_git(repo, &["config", "user.name", "Test"]);
     std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
     run_git(repo, &["add", "-A"]);
     run_git(repo, &["commit", "-m", "init"]);
+    if origin_head {
+        run_git(
+            repo,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{base_branch}"),
+                "HEAD",
+            ],
+        );
+        run_git(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                &format!("refs/remotes/origin/{base_branch}"),
+            ],
+        );
+    }
     run_git(repo, &["checkout", "-b", "feature"]);
     std::fs::write(repo.join("a.txt"), "hello world\n").unwrap();
     run_git(repo, &["add", "-A"]);
     run_git(repo, &["commit", "-m", "feature change"]);
+    dir
+}
+
+/// A fixture repo on branch `feature` (one commit) diffable against `main`.
+fn fixture_repo() -> tempfile::TempDir {
+    fixture_repo_with_base("main", false)
+}
+
+/// A fixture where local `main` has drifted past `origin/main`, while the
+/// feature branch is still based on `origin/main`.
+fn fixture_repo_with_stale_local_default() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    run_git(repo, &["init", "-b", "main"]);
+    run_git(repo, &["config", "user.email", "test@test.com"]);
+    run_git(repo, &["config", "user.name", "Test"]);
+
+    std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "base"]);
+    run_git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    run_git(
+        repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    run_git(repo, &["checkout", "-b", "feature"]);
+    std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "feature change"]);
+
+    run_git(repo, &["checkout", "main"]);
+    std::fs::write(repo.join("local.txt"), "local drift\n").unwrap();
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "local main drift"]);
+    run_git(repo, &["checkout", "feature"]);
     dir
 }
 
@@ -117,6 +175,35 @@ fn plant_completed_run(
         )
         .unwrap();
     }
+    run_dir
+}
+
+fn plant_running_run(
+    home: &Path,
+    repo_name: &str,
+    branch_key: &str,
+    run_id: &str,
+    commit: &str,
+    base_used: &[&str],
+) -> std::path::PathBuf {
+    let run_dir = home
+        .join("runs")
+        .join(repo_name)
+        .join(branch_key)
+        .join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(
+        run_dir.join("RUNNING.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "pid": std::process::id(),
+            "started_at": "2026-07-01T00:00:00Z",
+            "profile": "deep",
+            "commit": commit,
+            "base_used": base_used,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     run_dir
 }
 
@@ -369,6 +456,120 @@ fn run_review_quick_completes_and_verdict_reads_it() {
 }
 
 #[test]
+fn run_review_without_base_uses_origin_head_default_branch() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = fixture_repo_with_base("visits-1404", true);
+    let mut s = McpSession::start(&[("PRVIEW_HOME", home.path().to_str().unwrap())]);
+
+    let state = tool_body(&s.call_tool(
+        "state",
+        serde_json::json!({"repo": repo.path().to_str().unwrap()}),
+    ));
+    assert_eq!(state["default_branch"], "origin/visits-1404");
+    assert_eq!(state["base_fallback"], false);
+
+    let result = s.call_tool(
+        "run_review",
+        serde_json::json!({"repo": repo.path().to_str().unwrap(), "profile": "quick"}),
+    );
+    assert!(
+        !is_error(&result),
+        "run_review quick must not error: {result}"
+    );
+    let body = tool_body(&result);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["base_used"], serde_json::json!(["origin/visits-1404"]));
+    assert_eq!(body["base_fallback"], false);
+}
+
+#[test]
+fn run_review_without_base_uses_remote_origin_head_not_stale_local_main() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = fixture_repo_with_stale_local_default();
+    let mut s = McpSession::start(&[("PRVIEW_HOME", home.path().to_str().unwrap())]);
+
+    let result = s.call_tool(
+        "run_review",
+        serde_json::json!({"repo": repo.path().to_str().unwrap(), "profile": "quick"}),
+    );
+    assert!(
+        !is_error(&result),
+        "run_review quick must not error: {result}"
+    );
+    let body = tool_body(&result);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["base_used"], serde_json::json!(["origin/main"]));
+    assert_eq!(body["base_fallback"], false);
+    assert_eq!(body["stats"]["files_changed"], 1);
+}
+
+#[test]
+fn run_review_without_detectable_default_uses_fallback_with_caveat() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = fixture_repo();
+    let mut s = McpSession::start(&[("PRVIEW_HOME", home.path().to_str().unwrap())]);
+
+    let result = s.call_tool(
+        "run_review",
+        serde_json::json!({"repo": repo.path().to_str().unwrap(), "profile": "quick"}),
+    );
+    assert!(
+        !is_error(&result),
+        "run_review quick must not error: {result}"
+    );
+    let body = tool_body(&result);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["base_used"], serde_json::json!(["main"]));
+    assert_eq!(body["base_fallback"], true);
+    let caveats = body["caveats"].as_array().expect("caveats");
+    assert!(
+        caveats.iter().any(|c| c
+            .as_str()
+            .map(|s| s.contains("base_fallback"))
+            .unwrap_or(false)),
+        "fallback caveat required: {body}"
+    );
+}
+
+#[test]
+fn run_review_quick_timeout_suggests_deep_and_does_not_stay_running() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = fixture_repo();
+    let mut s = McpSession::start(&[
+        ("PRVIEW_HOME", home.path().to_str().unwrap()),
+        ("PRVIEW_MCP_QUICK_BUDGET_MS", "1"),
+    ]);
+
+    let result = s.call_tool(
+        "run_review",
+        serde_json::json!({"repo": repo.path().to_str().unwrap(), "profile": "quick"}),
+    );
+    assert!(is_error(&result), "quick timeout must fail loud: {result}");
+    let body = tool_body(&result);
+    assert_eq!(body["error_class"], "run_timeout");
+    assert_eq!(body["retry_hint"]["profile"], "deep");
+    assert_eq!(body["base_used"], serde_json::json!(["main"]));
+    let run_id = body["run_id"].as_str().expect("run_id").to_string();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let final_status = loop {
+        let verdict = tool_body(&s.call_tool(
+            "verdict",
+            serde_json::json!({"repo": repo.path().to_str().unwrap(), "run_id": run_id}),
+        ));
+        let status = verdict["status"].as_str().unwrap_or("").to_string();
+        if status != "running" || std::time::Instant::now() >= deadline {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_ne!(
+        final_status, "running",
+        "timed-out quick run must not stay running forever"
+    );
+}
+
+#[test]
 fn run_review_deep_returns_running_then_completes() {
     let home = tempfile::tempdir().unwrap();
     let repo = fixture_repo();
@@ -453,6 +654,77 @@ fn run_review_single_active_run_is_locked() {
     assert_eq!(body["error_class"], "storage_locked");
     assert_eq!(body["active_run_id"], "20260101-000000");
     assert!(body["retry_after_ms"].is_number());
+}
+
+#[test]
+fn polling_running_run_reports_in_progress_and_points_to_verdict() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = fixture_repo();
+    let repo_name = repo_basename(repo.path());
+    let commit = git_short_head(repo.path());
+    plant_running_run(
+        home.path(),
+        &repo_name,
+        "feature",
+        "20260101-010101",
+        &commit,
+        &["main"],
+    );
+
+    let mut s = McpSession::start(&[("PRVIEW_HOME", home.path().to_str().unwrap())]);
+    let repo_arg = repo.path().to_str().unwrap();
+
+    let verdict = tool_body(&s.call_tool(
+        "verdict",
+        serde_json::json!({"repo": repo_arg, "run_id": "20260101-010101"}),
+    ));
+    assert_eq!(verdict["status"], "in_progress");
+    assert_eq!(verdict["run_status"], "running");
+    assert_eq!(verdict["started_at"], "2026-07-01T00:00:00Z");
+    assert!(verdict["elapsed_s"].is_number());
+    assert_eq!(verdict["base_used"], serde_json::json!(["main"]));
+
+    let state = tool_body(&s.call_tool("state", serde_json::json!({"repo": repo_arg})));
+    assert_eq!(state["latest_run_for_head"]["status"], "in_progress");
+    assert_eq!(
+        state["latest_run_for_head"]["started_at"],
+        "2026-07-01T00:00:00Z"
+    );
+    assert!(state["latest_run_for_head"]["elapsed_s"].is_number());
+
+    let findings = s.call_tool(
+        "findings",
+        serde_json::json!({"repo": repo_arg, "run_id": "20260101-010101"}),
+    );
+    assert!(is_error(&findings), "findings on running run must error");
+    let findings_body = tool_body(&findings);
+    assert_eq!(findings_body["error_class"], "stale_run");
+    assert!(
+        findings_body["message"]
+            .as_str()
+            .map(|m| m.contains("verdict(run_id)"))
+            .unwrap_or(false),
+        "message must point callers at verdict polling: {findings_body}"
+    );
+
+    let artifact = s.call_tool(
+        "read_artifact",
+        serde_json::json!({
+            "repo": repo_arg,
+            "run_id": "20260101-010101",
+            "artifact": "00_summary/MERGE_GATE.json"
+        }),
+    );
+    assert!(is_error(&artifact), "artifact on running run must error");
+    let artifact_body = tool_body(&artifact);
+    assert_eq!(artifact_body["error_class"], "stale_run");
+    assert!(
+        artifact_body["message"]
+            .as_str()
+            .map(|m| m.contains("verdict(run_id)"))
+            .unwrap_or(false),
+        "message must point callers at verdict polling: {artifact_body}"
+    );
 }
 
 #[test]

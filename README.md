@@ -38,28 +38,28 @@ likely blocker in auth flow · coverage −2.1% · 1 breaking change in public A
 
 ## Install
 
-From a local checkout (recommended for contributors / maintainers):
+Quickest — download the latest checksum-verified release binary into `~/.local/bin` (no sudo):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vetcoders/prview-rs/main/install.sh | sh
+```
+
+From crates.io:
+
+```bash
+cargo install prview --locked --force
+```
+
+`--force` overwrites any older `prview` in place, so upgrades are seamless; it is harmless on a clean machine.
+
+From a local checkout (contributors / maintainers):
 
 ```bash
 make install        # binary + local pre-commit / pre-push hooks
 make install-bin    # binary only
-cargo install --path .
 ```
 
-After the crates.io release:
-
-```bash
-cargo install prview
-```
-
-Or build without installing:
-
-```bash
-cargo build --release
-./target/release/prview --help
-```
-
-Full instructions, including release binaries and checksums, live in [`docs/INSTALL.md`](docs/INSTALL.md).
+Full instructions — release binaries, checksums, and PATH setup — live in [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ## Quick start
 
@@ -175,6 +175,7 @@ prview completions fish > $HOME/.config/fish/completions/prview.fish
 - [`docs/usage.md`](docs/usage.md) — full usage guide
 - [`docs/configuration.md`](docs/configuration.md) — policy & config
 - [`docs/mcp.md`](docs/mcp.md) — MCP server for agents
+- [`docs/mcp-smoke.md`](docs/mcp-smoke.md) — MCP smoke walkthrough for agents
 - [`docs/architecture.md`](docs/architecture.md) — how it works
 - [`docs/development.md`](docs/development.md) — contributing
 - [`docs/contracts/merge_gate.md`](docs/contracts/merge_gate.md) — `MERGE_GATE.json` contract
