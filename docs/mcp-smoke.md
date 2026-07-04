@@ -23,10 +23,10 @@ Register the server with your MCP client (for example in an `mcp.json`):
 }
 ```
 
-Set the client's per-call timeout to **≥ 90 s** for `run_review` with the
-`quick` profile: the server enforces a hard 60 s budget on the child review, and
-the extra headroom covers process startup and I/O without the client giving up
-first. `deep` returns immediately (it is async), so it does not need a long
+Set the client's per-call timeout to **≥ 150 s** for `run_review` with the
+`quick` profile: the server enforces a hard 120 s budget on the child review,
+and the extra headroom covers process startup and I/O without the client giving
+up first. `deep` returns immediately (it is async), so it does not need a long
 timeout — you poll `verdict` instead.
 
 ## The loop
