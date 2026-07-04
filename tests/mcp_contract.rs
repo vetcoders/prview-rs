@@ -82,6 +82,41 @@ fn fixture_repo() -> tempfile::TempDir {
     fixture_repo_with_base("main", false)
 }
 
+/// A fixture where local `main` has drifted past `origin/main`, while the
+/// feature branch is still based on `origin/main`.
+fn fixture_repo_with_stale_local_default() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    run_git(repo, &["init", "-b", "main"]);
+    run_git(repo, &["config", "user.email", "test@test.com"]);
+    run_git(repo, &["config", "user.name", "Test"]);
+
+    std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "base"]);
+    run_git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    run_git(
+        repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    run_git(repo, &["checkout", "-b", "feature"]);
+    std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "feature change"]);
+
+    run_git(repo, &["checkout", "main"]);
+    std::fs::write(repo.join("local.txt"), "local drift\n").unwrap();
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "local main drift"]);
+    run_git(repo, &["checkout", "feature"]);
+    dir
+}
+
 /// Run a synchronous quick review to completion, registering it under `home`.
 fn run_quick_review(repo: &Path, home: &Path) {
     let status = Command::new(env!("CARGO_BIN_EXE_prview"))
@@ -430,7 +465,7 @@ fn run_review_without_base_uses_origin_head_default_branch() {
         "state",
         serde_json::json!({"repo": repo.path().to_str().unwrap()}),
     ));
-    assert_eq!(state["default_branch"], "visits-1404");
+    assert_eq!(state["default_branch"], "origin/visits-1404");
     assert_eq!(state["base_fallback"], false);
 
     let result = s.call_tool(
@@ -443,8 +478,29 @@ fn run_review_without_base_uses_origin_head_default_branch() {
     );
     let body = tool_body(&result);
     assert_eq!(body["status"], "completed");
-    assert_eq!(body["base_used"], serde_json::json!(["visits-1404"]));
+    assert_eq!(body["base_used"], serde_json::json!(["origin/visits-1404"]));
     assert_eq!(body["base_fallback"], false);
+}
+
+#[test]
+fn run_review_without_base_uses_remote_origin_head_not_stale_local_main() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = fixture_repo_with_stale_local_default();
+    let mut s = McpSession::start(&[("PRVIEW_HOME", home.path().to_str().unwrap())]);
+
+    let result = s.call_tool(
+        "run_review",
+        serde_json::json!({"repo": repo.path().to_str().unwrap(), "profile": "quick"}),
+    );
+    assert!(
+        !is_error(&result),
+        "run_review quick must not error: {result}"
+    );
+    let body = tool_body(&result);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["base_used"], serde_json::json!(["origin/main"]));
+    assert_eq!(body["base_fallback"], false);
+    assert_eq!(body["stats"]["files_changed"], 1);
 }
 
 #[test]

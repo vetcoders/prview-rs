@@ -248,6 +248,10 @@ fn ref_exists(repo: &Path, name: &str) -> bool {
     })
 }
 
+fn remote_ref_exists(repo: &Path, branch: &str) -> bool {
+    ref_exists(repo, &format!("refs/remotes/origin/{branch}"))
+}
+
 pub(crate) fn select_bases(repo: &Path, base: Option<&str>) -> BaseSelection {
     if let Some(base) = base {
         return BaseSelection {
@@ -259,15 +263,15 @@ pub(crate) fn select_bases(repo: &Path, base: Option<&str>) -> BaseSelection {
 
     let mut caveats = Vec::new();
     if let Some(branch) = origin_head_branch(repo).or_else(|| configured_origin_head(repo)) {
-        if ref_exists(repo, &branch) {
+        if remote_ref_exists(repo, &branch) {
             return BaseSelection {
-                bases: vec![branch],
+                bases: vec![format!("origin/{branch}")],
                 base_fallback: false,
                 caveats: Vec::new(),
             };
         }
         caveats.push(format!(
-            "base_fallback: detected default branch '{branch}' does not exist locally; tried develop/main/master"
+            "base_fallback: detected default branch 'origin/{branch}' does not exist remotely; tried develop/main/master"
         ));
     }
 
