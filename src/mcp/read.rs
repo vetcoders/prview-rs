@@ -287,6 +287,13 @@ fn find_run_dir_by_id_in(
     Ok(matches.into_iter().next())
 }
 
+fn same_run_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 /// Resolve a run for `verdict`/`findings`/`read_artifact`.
 ///
 /// With `run_id`: look it up in the index (completed runs), else scan storage
@@ -303,7 +310,7 @@ pub fn resolve_run(root: &Path, run_id: Option<&str>) -> Result<ResolvedRun, Too
             let disk_run = find_run_dir_by_id(&repo_name, id)?;
             if let Some(e) = find_index_entry_by_id(&index, &repo_name, id)? {
                 if let Some(ref run_dir) = disk_run
-                    && *run_dir != e.path
+                    && !same_run_path(run_dir, &e.path)
                 {
                     return Err(ambiguous_run_id_error(
                         &repo_name,
@@ -1135,6 +1142,22 @@ mod tests {
         assert_eq!(err.class, error_class::STORAGE_CORRUPT);
         assert!(err.message.contains("ambiguous run_id"));
         assert_eq!(err.extra["matches"].as_array().unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_run_path_accepts_symlinked_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real-root");
+        let run = real_root.join("demo/main/20260101-120000");
+        std::fs::create_dir_all(&run).unwrap();
+        let symlink_root = dir.path().join("symlink-root");
+        std::os::unix::fs::symlink(&real_root, &symlink_root).unwrap();
+
+        assert!(same_run_path(
+            &symlink_root.join("demo/main/20260101-120000"),
+            &run
+        ));
     }
 
     #[test]
