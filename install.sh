@@ -16,6 +16,10 @@ set -eu
 
 REPO="vetcoders/prview-rs"
 BIN="prview"
+PRVIEW_INSTALL_DIR_EXPLICIT=0
+if [ "${PRVIEW_INSTALL_DIR+x}" = "x" ]; then
+	PRVIEW_INSTALL_DIR_EXPLICIT=1
+fi
 : "${PRVIEW_INSTALL_DIR:=${HOME}/.local/bin}"
 INSTALL_DIR="${PRVIEW_INSTALL_DIR}"
 BASE_URL="https://github.com/${REPO}/releases/latest/download"
@@ -135,10 +139,21 @@ Install Rust from https://rustup.rs then re-run this script, or run:
   cargo install prview --locked --force"
 	fi
 	info "Installing prview via cargo (this compiles from source)..."
-	cargo install prview --locked --force
-	cargo_root="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-${HOME}/.cargo}}"
-	INSTALL_DIR="${cargo_root}/bin"
-	INSTALLED_BIN="${INSTALL_DIR}/${BIN}"
+	if [ "${PRVIEW_INSTALL_DIR_EXPLICIT}" -eq 1 ]; then
+		if [ -z "${TMPDIR_INSTALL}" ]; then
+			TMPDIR_INSTALL="$(mktemp -d 2>/dev/null)" || err "could not create temporary cargo install root"
+		fi
+		cargo_root="${TMPDIR_INSTALL}/cargo-root"
+		mkdir -p "${cargo_root}" "${INSTALL_DIR}"
+		cargo install prview --locked --force --root "${cargo_root}"
+		install -m 755 "${cargo_root}/bin/${BIN}" "${INSTALL_DIR}/${BIN}"
+		INSTALLED_BIN="${INSTALL_DIR}/${BIN}"
+	else
+		cargo install prview --locked --force
+		cargo_root="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-${HOME}/.cargo}}"
+		INSTALL_DIR="${cargo_root}/bin"
+		INSTALLED_BIN="${INSTALL_DIR}/${BIN}"
+	fi
 }
 
 path_guidance() {
