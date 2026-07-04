@@ -2,7 +2,7 @@
 //!
 //! The MCP layer adds no review logic — it prepares a run directory, spawns
 //! `prview` (its own binary) as a subprocess, and reads the resulting pack from
-//! storage. quick waits synchronously within a hard 60s budget; deep detaches
+//! storage. quick waits synchronously within a hard 120s budget; deep detaches
 //! and is polled later through `verdict`/`state`. A single active run per repo
 //! branch is enforced via the `RUNNING.json` liveness marker (R2b).
 
@@ -47,7 +47,10 @@ impl Profile {
     }
 }
 
-const QUICK_BUDGET: Duration = Duration::from_secs(60);
+/// Default sync quick budget. 120s comes from 0.4.0 Codescribe/Vista dogfood:
+/// the previous 60s budget timed out repeatedly on a medium-large (~411k LOC)
+/// repo while keeping quick synchronous remains the approved product contract.
+const DEFAULT_QUICK_BUDGET: Duration = Duration::from_secs(120);
 const FALLBACK_BASES: &[&str] = &["develop", "main", "master"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +69,15 @@ fn short_head(repo: &Path) -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
+}
+
+fn quick_budget() -> Duration {
+    std::env::var("PRVIEW_MCP_QUICK_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_QUICK_BUDGET)
 }
 
 /// Allocate a fresh, collision-free run directory under the standard storage
@@ -394,7 +406,8 @@ pub async fn start(
                 },
             );
 
-            match tokio::time::timeout(QUICK_BUDGET, child.wait()).await {
+            let budget = quick_budget();
+            match tokio::time::timeout(budget, child.wait()).await {
                 Err(_) => {
                     // Kill the whole group first so the check-tool grandchildren
                     // die, then reap the direct child.
@@ -405,8 +418,17 @@ pub async fn start(
                     let _ = child.start_kill();
                     Err(ToolError::with_extra(
                         error_class::RUN_TIMEOUT,
-                        "quick review exceeded the 60s budget",
-                        serde_json::json!({ "run_id": run_id }),
+                        "quick review exceeded the configured budget; retry with profile=deep",
+                        serde_json::json!({
+                            "run_id": run_id,
+                            "base_used": selection.bases,
+                            "base_fallback": selection.base_fallback,
+                            "caveats": selection.caveats,
+                            "retry_hint": {
+                                "profile": "deep",
+                                "reason": "quick exceeded its synchronous budget"
+                            }
+                        }),
                     ))
                 }
                 Ok(Err(e)) => Err(ToolError::new(

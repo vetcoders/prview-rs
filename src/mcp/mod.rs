@@ -42,7 +42,7 @@ pub struct RunReviewArgs {
     /// Base ref to diff against. Default: merge-base with the repo default branch.
     #[serde(default)]
     pub base: Option<String>,
-    /// "quick" (synchronous, <60s) or "deep" (async; poll verdict). Default quick.
+    /// "quick" (synchronous, 120s budget) or "deep" (async; poll verdict). Default quick.
     #[serde(default)]
     pub profile: Option<String>,
 }
@@ -212,7 +212,7 @@ impl PrviewMcp {
 
     #[tool(
         name = "run_review",
-        description = "Generate a review pack. profile=quick is synchronous (<60s budget). profile=deep returns immediately with run_id; poll verdict(run_id) for completion."
+        description = "Generate a review pack. profile=quick is synchronous (120s budget). profile=deep returns immediately with run_id; poll verdict(run_id) for completion."
     )]
     async fn run_review(&self, Parameters(args): Parameters<RunReviewArgs>) -> CallToolResult {
         let root = match read::resolve_repo_root(&args.repo) {

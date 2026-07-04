@@ -447,6 +447,44 @@ fn run_review_without_detectable_default_uses_fallback_with_caveat() {
 }
 
 #[test]
+fn run_review_quick_timeout_suggests_deep_and_does_not_stay_running() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = fixture_repo();
+    let mut s = McpSession::start(&[
+        ("PRVIEW_HOME", home.path().to_str().unwrap()),
+        ("PRVIEW_MCP_QUICK_BUDGET_MS", "1"),
+    ]);
+
+    let result = s.call_tool(
+        "run_review",
+        serde_json::json!({"repo": repo.path().to_str().unwrap(), "profile": "quick"}),
+    );
+    assert!(is_error(&result), "quick timeout must fail loud: {result}");
+    let body = tool_body(&result);
+    assert_eq!(body["error_class"], "run_timeout");
+    assert_eq!(body["retry_hint"]["profile"], "deep");
+    assert_eq!(body["base_used"], serde_json::json!(["main"]));
+    let run_id = body["run_id"].as_str().expect("run_id").to_string();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let final_status = loop {
+        let verdict = tool_body(&s.call_tool(
+            "verdict",
+            serde_json::json!({"repo": repo.path().to_str().unwrap(), "run_id": run_id}),
+        ));
+        let status = verdict["status"].as_str().unwrap_or("").to_string();
+        if status != "running" || std::time::Instant::now() >= deadline {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_ne!(
+        final_status, "running",
+        "timed-out quick run must not stay running forever"
+    );
+}
+
+#[test]
 fn run_review_deep_returns_running_then_completes() {
     let home = tempfile::tempdir().unwrap();
     let repo = fixture_repo();
