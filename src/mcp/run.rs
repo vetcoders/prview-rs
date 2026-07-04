@@ -257,12 +257,18 @@ pub(crate) fn select_bases(repo: &Path, base: Option<&str>) -> BaseSelection {
         };
     }
 
+    let mut caveats = Vec::new();
     if let Some(branch) = origin_head_branch(repo).or_else(|| configured_origin_head(repo)) {
-        return BaseSelection {
-            bases: vec![branch],
-            base_fallback: false,
-            caveats: Vec::new(),
-        };
+        if ref_exists(repo, &branch) {
+            return BaseSelection {
+                bases: vec![branch],
+                base_fallback: false,
+                caveats: Vec::new(),
+            };
+        }
+        caveats.push(format!(
+            "base_fallback: detected default branch '{branch}' does not exist locally; tried develop/main/master"
+        ));
     }
 
     let bases: Vec<String> = FALLBACK_BASES
@@ -280,10 +286,14 @@ pub(crate) fn select_bases(repo: &Path, base: Option<&str>) -> BaseSelection {
     BaseSelection {
         bases,
         base_fallback: true,
-        caveats: vec![
-            "base_fallback: default branch was not detectable; tried develop/main/master"
-                .to_string(),
-        ],
+        caveats: if caveats.is_empty() {
+            vec![
+                "base_fallback: default branch was not detectable; tried develop/main/master"
+                    .to_string(),
+            ]
+        } else {
+            caveats
+        },
     }
 }
 
@@ -639,6 +649,53 @@ mod tests {
         let fallback = select_bases(repo, None);
         assert!(fallback.base_fallback);
         assert_eq!(fallback.bases, vec!["main"]);
+    }
+
+    #[test]
+    fn detected_default_branch_must_exist_before_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        crate::git::git_cmd()
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
+        crate::git::git_cmd()
+            .args(["add", "-A"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["commit", "-m", "init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args([
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/missing",
+            ])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        let selection = select_bases(repo, None);
+
+        assert!(selection.base_fallback);
+        assert_eq!(selection.bases, vec!["main"]);
+        assert!(selection.caveats.iter().any(|c| c.contains("missing")));
     }
 
     #[test]
