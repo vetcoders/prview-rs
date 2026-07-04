@@ -2,9 +2,11 @@
 
 > **`prview mcp` is not a hang.** It starts a JSON-RPC server over **stdio** and
 > waits for a client to speak the protocol. Running it in a plain terminal looks
-> frozen because it is holding the connection open. For a manual smoke check use
-> `prview mcp --help` (prints and exits), or drive the server with a real MCP
-> client. Do not "wait for it to finish" — it finishes when the client
+> frozen because it is holding the connection open. For a manual smoke check run
+> `prview mcp --probe` first; it starts a child MCP server, performs
+> `initialize` → `tools/list` → `health`, and exits within a hard timeout.
+> `prview mcp --help` only proves CLI parsing. Do not "wait for it to finish" —
+> it finishes when the client
 > disconnects.
 
 This page is an operational smoke walkthrough for agents. The tool contract
@@ -12,6 +14,24 @@ This page is an operational smoke walkthrough for agents. The tool contract
 document links it rather than restating it.
 
 ## Client configuration
+
+First confirm the stdio server answers a real JSON-RPC handshake:
+
+```bash
+prview mcp --probe
+```
+
+Successful output is intentionally short:
+
+```text
+prview mcp probe ok
+version: 0.4.0
+schema_version: prview.mcp.v1
+tools: 6
+response_ms: 15
+```
+
+For automation use `prview mcp --probe --json`.
 
 Register the server with your MCP client (for example in an `mcp.json`):
 
