@@ -301,11 +301,11 @@ pub(crate) fn select_bases(repo: &Path, base: Option<&str>) -> BaseSelection {
     }
 }
 
-/// Positional args for the child prview: `[branch, base]` when a base is given
-/// (base is positional in the CLI, so target must precede it), else none.
+/// Positional args for the child prview. The leading `--` terminates options so
+/// branch names like `-dash` are always parsed as TARGET, never as flags.
 fn positional_args(repo: &Path, selection: &BaseSelection) -> Vec<String> {
     let branch = crate::config::current_branch_name(repo).unwrap_or_else(|| "HEAD".to_string());
-    let mut args = vec![branch];
+    let mut args = vec!["--".to_string(), branch];
     args.extend(selection.bases.iter().cloned());
     args
 }
@@ -740,6 +740,59 @@ mod tests {
 
         assert!(ref_exists(repo, "-dash"));
         assert!(!ref_exists(repo, "-missing"));
+    }
+
+    #[test]
+    fn positional_args_terminate_options_before_branch_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        crate::git::git_cmd()
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
+        crate::git::git_cmd()
+            .args(["add", "-A"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["commit", "-m", "init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["update-ref", "refs/heads/-dash", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["switch", "-q", "--", "-dash"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        let args = positional_args(
+            repo,
+            &BaseSelection {
+                bases: vec!["main".to_string()],
+                base_fallback: false,
+                caveats: Vec::new(),
+            },
+        );
+
+        assert_eq!(args, vec!["--", "-dash", "main"]);
     }
 
     /// PR #12 review: two allocations that collide on the same timestamp within
