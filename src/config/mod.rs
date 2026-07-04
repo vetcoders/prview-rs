@@ -502,6 +502,16 @@ pub(crate) fn allocate_run_dir_in(
     stamp: &str,
     commit: Option<&str>,
 ) -> Result<(PathBuf, String)> {
+    allocate_run_dir_in_with_post_create(repo_runs_root, branch_key, stamp, commit, |_| Ok(()))
+}
+
+fn allocate_run_dir_in_with_post_create(
+    repo_runs_root: &Path,
+    branch_key: &str,
+    stamp: &str,
+    commit: Option<&str>,
+    mut post_create: impl FnMut(&str) -> Result<()>,
+) -> Result<(PathBuf, String)> {
     let base = repo_runs_root.join(branch_key);
     std::fs::create_dir_all(&base)
         .with_context(|| format!("failed to create runs dir {}", base.display()))?;
@@ -513,7 +523,19 @@ pub(crate) fn allocate_run_dir_in(
         if !run_id_taken_in_repo(repo_runs_root, &run_id) {
             let run_dir = base.join(&run_id);
             match std::fs::create_dir(&run_dir) {
-                Ok(()) => return Ok((run_dir, run_id)),
+                Ok(()) => {
+                    post_create(&run_id)?;
+                    if run_id_taken_in_other_branch(repo_runs_root, branch_key, &run_id) {
+                        std::fs::remove_dir(&run_dir).with_context(|| {
+                            format!(
+                                "failed to remove duplicate fresh run dir {}",
+                                run_dir.display()
+                            )
+                        })?;
+                    } else {
+                        return Ok((run_dir, run_id));
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => bail!("failed to create run dir {}: {e}", run_dir.display()),
             }
@@ -524,6 +546,22 @@ pub(crate) fn allocate_run_dir_in(
             bail!("exhausted run-id suffixes allocating a run directory");
         }
     }
+}
+
+fn run_id_taken_in_other_branch(repo_runs_root: &Path, branch_key: &str, run_id: &str) -> bool {
+    let Ok(read) = std::fs::read_dir(repo_runs_root) else {
+        return false;
+    };
+    for branch in read.flatten() {
+        let bp = branch.path();
+        if branch.file_name().to_string_lossy() == branch_key {
+            continue;
+        }
+        if bp.is_dir() && bp.join(run_id).is_dir() {
+            return true;
+        }
+    }
+    false
 }
 
 /// True when `run_id` already names a directory under any `runs/<repo>/<branch>`
@@ -1950,6 +1988,40 @@ mod tests {
         assert!(feature_id.starts_with(stamp));
         assert!(main_dir.is_dir());
         assert!(feature_dir.is_dir());
+    }
+
+    #[test]
+    fn test_allocate_run_dir_retries_when_duplicate_appears_after_create() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_runs_root = home.path().join("runs").join("demo");
+        let branch_key = "feature%2Ftest";
+        let stamp = "20260704-123000";
+        let commit = "abcdef1234567890abcdef1234567890abcdef12";
+        let colliding_id = format!("{stamp}-{}", short_sha(commit));
+        let injected_dir = repo_runs_root.join("main").join(&colliding_id);
+        let mut injected = false;
+
+        let (run_dir, run_id) = allocate_run_dir_in_with_post_create(
+            &repo_runs_root,
+            branch_key,
+            stamp,
+            Some(commit),
+            |created_id| {
+                if !injected {
+                    assert_eq!(created_id, colliding_id);
+                    std::fs::create_dir_all(injected_dir.parent().unwrap()).unwrap();
+                    std::fs::create_dir(&injected_dir).unwrap();
+                    injected = true;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(run_id, format!("{colliding_id}-2"));
+        assert!(run_dir.is_dir());
+        assert!(injected_dir.is_dir());
+        assert!(!repo_runs_root.join(branch_key).join(colliding_id).exists());
     }
 
     #[test]
