@@ -329,6 +329,11 @@ pub(crate) fn build_merge_decision_view(
     blocking_issues: &[String],
     review_caveats: Vec<String>,
 ) -> MergeDecisionView {
+    let has_new_quality_failures = quality_failure_details
+        .iter()
+        .any(|detail| !matches!(detail.classification, QualityFailureClass::Preexisting))
+        || (quality_failure_details.is_empty() && !quality_failures.is_empty());
+
     let state = if !policy_allow_merge {
         MergeDecisionState::Block
     } else if recommended_merge {
@@ -337,9 +342,9 @@ pub(crate) fn build_merge_decision_view(
         } else {
             MergeDecisionState::AllowWithReview
         }
-    } else if !quality_failures.is_empty() {
-        // A real check failed (even if non-blocking / pre-existing): a human
-        // should look before merging, so this is a genuine HOLD.
+    } else if has_new_quality_failures {
+        // New or unclassified failures belong to the change and remain a HOLD.
+        // Pure pre-existing findings are advisory only.
         MergeDecisionState::Hold
     } else if !review_caveats.is_empty() {
         // Policy permits the merge and no check actually failed — only advisory
@@ -348,7 +353,7 @@ pub(crate) fn build_merge_decision_view(
         // like a stop sign when status is ALLOW and allow_merge is true.
         MergeDecisionState::AllowWithReview
     } else {
-        // Not an explicit approve and nothing concrete to show — stay
+        // Not an explicit approve and nothing concrete to show - stay
         // conservative and hold for human review.
         MergeDecisionState::Hold
     };
@@ -545,19 +550,41 @@ mod tests {
     }
 
     #[test]
-    fn real_failure_review_required_stays_hold() {
-        // A failing check (even non-blocking / pre-existing) keeps a true HOLD.
+    fn new_failure_review_required_stays_hold() {
+        // A failing check that belongs to this change keeps a true HOLD.
         let view = build_merge_decision_view(
             true,
             true,
             false,
             &["clippy".to_string()],
-            &[],
+            &[QualityFailureDetail {
+                name: "clippy".to_string(),
+                classification: QualityFailureClass::Introduced,
+            }],
             &[],
             vec!["clippy returned warnings".to_string()],
         );
         assert_eq!(view.state, MergeDecisionState::Hold);
         assert_eq!(view.state.gate_label(), "HOLD");
+    }
+
+    #[test]
+    fn preexisting_only_failure_is_allow_with_review_not_hold() {
+        let view = build_merge_decision_view(
+            true,
+            true,
+            false,
+            &["Semgrep scan".to_string()],
+            &[QualityFailureDetail {
+                name: "Semgrep scan".to_string(),
+                classification: QualityFailureClass::Preexisting,
+            }],
+            &[],
+            vec!["Pre-existing quality failures (not from this diff): Semgrep scan".to_string()],
+        );
+
+        assert_eq!(view.state, MergeDecisionState::AllowWithReview);
+        assert_eq!(view.state.gate_label(), "MERGE WITH REVIEW");
     }
 
     #[test]

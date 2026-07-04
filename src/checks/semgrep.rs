@@ -2,9 +2,11 @@
 
 use super::{Check, CheckEligibility, CheckResult, CheckStatus, ProvenanceBuilder, run_command};
 use crate::Config;
+use crate::git::Repository;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Local;
+use std::path::Path;
 
 pub struct SemgrepCheck;
 
@@ -39,9 +41,11 @@ impl Check for SemgrepCheck {
             "auto"
         };
 
-        let args = build_semgrep_args(config_arg);
+        let baseline_commit = semgrep_baseline_commit(config, cwd);
+        let args = build_semgrep_args(config_arg, baseline_commit.as_deref());
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
 
-        let output = run_command("semgrep", &args, cwd).await?;
+        let output = run_command("semgrep", &arg_refs, cwd).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -59,7 +63,7 @@ impl Check for SemgrepCheck {
             provenance: Some(
                 ProvenanceBuilder {
                     cmd: "semgrep",
-                    args: &args,
+                    args: &arg_refs,
                     cwd,
                     output: &output,
                     combined_output: &combined,
@@ -121,26 +125,70 @@ fn semgrep_has_scan_errors(stdout: &str) -> bool {
 /// unreviewable code that no PR author can fix (vendored `dagre.min.js`
 /// prototype-pollution, `public_dist` missing-integrity, …). Extracted as a
 /// pure helper so the exclude set is hermetically testable without invoking the
-/// semgrep binary, and so diff-aware (`--baseline-commit`) work has a tested
-/// seam to extend later.
-fn build_semgrep_args(config_arg: &'static str) -> Vec<&'static str> {
-    vec![
-        "scan",
-        "--config",
-        config_arg,
-        "--json",
-        "--error",
-        "--quiet",
-        ".",
-        "--exclude",
-        "target",
-        "--exclude",
-        "node_modules",
-        "--exclude",
-        "*.min.js",
-        "--exclude",
-        "public_dist",
-    ]
+/// semgrep binary.
+fn build_semgrep_args(config_arg: &str, baseline_commit: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "scan".to_string(),
+        "--config".to_string(),
+        config_arg.to_string(),
+        "--json".to_string(),
+        "--error".to_string(),
+        "--quiet".to_string(),
+    ];
+
+    if let Some(commit) = baseline_commit {
+        args.push("--baseline-commit".to_string());
+        args.push(commit.to_string());
+    }
+
+    args.extend(
+        [
+            ".",
+            "--exclude",
+            "target",
+            "--exclude",
+            "node_modules",
+            "--exclude",
+            "*.min.js",
+            "--exclude",
+            "public_dist",
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+
+    args
+}
+
+fn semgrep_baseline_commit(config: &Config, cwd: &Path) -> Option<String> {
+    if config.security_full || worktree_has_uncommitted_changes(cwd) {
+        return None;
+    }
+
+    let repo = Repository::open(cwd).ok()?;
+    let target = repo.resolve_target(config).ok()?;
+    let base = repo.resolve_bases(config).ok()?.into_iter().next()?;
+
+    if base.commit_id == target.commit_id {
+        return None;
+    }
+
+    repo.merge_base(&base.commit_id, &target.commit_id).ok()
+}
+
+fn worktree_has_uncommitted_changes(cwd: &Path) -> bool {
+    let Ok(repo) = git2::Repository::discover(cwd) else {
+        return true;
+    };
+
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .renames_head_to_index(true);
+
+    repo.statuses(Some(&mut opts))
+        .map(|statuses| !statuses.is_empty())
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -150,14 +198,39 @@ mod tests {
 
     #[test]
     fn build_semgrep_args_excludes_vendored_and_generated_and_emits_json() {
-        let args = build_semgrep_args("auto");
+        let args = build_semgrep_args("auto", None);
         let has_exclude = |val: &str| args.windows(2).any(|w| w == ["--exclude", val]);
-        assert!(args.contains(&"--json"), "structured parser expects JSON");
+        assert!(
+            args.iter().any(|arg| arg == "--json"),
+            "structured parser expects JSON"
+        );
         assert!(has_exclude("*.min.js"), "must exclude minified bundles");
         assert!(has_exclude("public_dist"), "must exclude generated site");
         assert!(has_exclude("node_modules"));
         assert!(has_exclude("target"));
-        assert!(args.contains(&"auto"), "config arg threaded through");
+        assert!(
+            args.iter().any(|arg| arg == "auto"),
+            "config arg threaded through"
+        );
+    }
+
+    #[test]
+    fn build_semgrep_args_adds_baseline_commit_when_available() {
+        let args = build_semgrep_args("auto", Some("abc123"));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--baseline-commit", "abc123"]),
+            "baseline commit must be threaded to semgrep"
+        );
+    }
+
+    #[test]
+    fn build_semgrep_args_omits_baseline_without_merge_base() {
+        let args = build_semgrep_args("auto", None);
+        assert!(
+            !args.iter().any(|arg| arg == "--baseline-commit"),
+            "full-tree fallback must not pass a bogus baseline"
+        );
     }
 
     #[test]

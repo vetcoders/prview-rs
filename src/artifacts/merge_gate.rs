@@ -3,8 +3,11 @@
 use super::*;
 
 pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
-    use crate::policy::engine::{AnalysisStatus, MergeRecommendation, PolicyEngine};
+    use crate::policy::engine::{
+        AnalysisStatus, MergeRecommendation, PolicyConclusion, PolicyEngine,
+    };
     use serde_json::json;
+    use std::collections::BTreeSet;
     let MergeGateInput {
         dir,
         config,
@@ -21,16 +24,37 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
 
     let engine = PolicyEngine::new(config);
     let policy_summary = engine.evaluate_all(checks, skipped_checks);
+    let quality_failures = build_quality_failure_summary(checks, &inline.dashboard_findings);
+    let preexisting_quality_failure_names = quality_failures
+        .preexisting_quality_failures
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     let mut gate_checks = Vec::new();
-    let mut blocking_issues = policy_summary.blocking_issues.clone();
-    let mut review_caveats = policy_summary.review_caveats.clone();
-    let mut worst_confidence = policy_summary.analysis_status;
-    let mut worst_merge = policy_summary.merge_recommendation;
+    let mut blocking_issues = Vec::new();
+    let mut review_caveats = Vec::new();
+    let mut worst_confidence = AnalysisStatus::Complete;
+    let mut worst_merge = MergeRecommendation::Approve;
 
     let inline_findings_path =
         (inline.findings_count > 0).then_some("30_context/INLINE_FINDINGS.sarif");
 
     for eval in &policy_summary.evaluations {
+        let preexisting_only = preexisting_quality_failure_names.contains(eval.name.as_str());
+        let effective_eval = effective_quality_gate_eval(eval, preexisting_only);
+        if !preexisting_only {
+            bump_effective_gate_axes(&mut worst_confidence, &mut worst_merge, &effective_eval);
+            if effective_eval.conclusion == PolicyConclusion::Blocked {
+                blocking_issues.push(format!(
+                    "{} ({})",
+                    eval.name,
+                    display_raw_status(&eval.raw_status)
+                ));
+            } else if effective_eval.conclusion == PolicyConclusion::Advisory {
+                review_caveats.push(describe_policy_advisory(eval));
+            }
+        }
+
         // Match the executed check by name, not by re-deriving an id: the policy
         // engine and the artifact writer spell a few ids differently (cargo
         // check→cargo, typescript→tsc, vitest→tests), so an id round-trip drops
@@ -49,10 +73,10 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             "outcome": eval.outcome,
             "class": gate_class_to_str(eval.gate_class),
             "severity": policy_severity_to_str(eval.severity),
-            "policy_conclusion": eval.conclusion,
-            "confidence_impact": eval.confidence_impact,
-            "merge_impact": eval.merge_impact,
-            "blocking": matches!(eval.merge_impact, MergeRecommendation::Block),
+            "policy_conclusion": effective_eval.conclusion,
+            "confidence_impact": effective_eval.confidence_impact,
+            "merge_impact": effective_eval.merge_impact,
+            "blocking": matches!(effective_eval.merge_impact, MergeRecommendation::Block),
             // Skipped/unavailable checks have no executed CheckResult, so they
             // carry no measured duration and no result.json. Emit contract-valid
             // placeholders (non-negative duration, non-empty evidence) instead of
@@ -62,7 +86,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
                 .map(|check| check.duration.as_secs_f32())
                 .unwrap_or(0.0),
             "cached": executed_check.map(|check| check.cached),
-            "reason": eval.reason,
+            "reason": effective_eval.reason,
             "evidence": match &artifact_id {
                 Some(id) => format!("20_quality/{}.result.json", id),
                 None => eval
@@ -106,7 +130,6 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
 
     let policy_allow_merge = blocking_issues.is_empty();
 
-    let quality_failures = build_quality_failure_summary(checks, &inline.dashboard_findings);
     let quality_pass = !quality_failures.has_new_failures();
 
     if !quality_pass && worst_merge == MergeRecommendation::Approve {
@@ -305,4 +328,209 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     }
     fs::write(dir.join("MERGE_GATE.md"), md)?;
     Ok(())
+}
+
+fn effective_quality_gate_eval(
+    eval: &crate::policy::engine::CheckEvaluation,
+    preexisting_only: bool,
+) -> crate::policy::engine::CheckEvaluation {
+    if !preexisting_only {
+        return eval.clone();
+    }
+
+    let mut effective = eval.clone();
+    effective.conclusion = crate::policy::engine::PolicyConclusion::Advisory;
+    effective.confidence_impact = crate::policy::engine::AnalysisStatus::Complete;
+    effective.merge_impact = crate::policy::engine::MergeRecommendation::Approve;
+    effective.reason = Some("pre-existing findings outside the change".to_string());
+    effective
+}
+
+fn bump_effective_gate_axes(
+    analysis_status: &mut crate::policy::engine::AnalysisStatus,
+    merge_recommendation: &mut crate::policy::engine::MergeRecommendation,
+    eval: &crate::policy::engine::CheckEvaluation,
+) {
+    use crate::policy::engine::{AnalysisStatus, MergeRecommendation};
+
+    if eval.confidence_impact == AnalysisStatus::Incomplete {
+        *analysis_status = AnalysisStatus::Incomplete;
+    } else if eval.confidence_impact == AnalysisStatus::Degraded
+        && *analysis_status == AnalysisStatus::Complete
+    {
+        *analysis_status = AnalysisStatus::Degraded;
+    }
+
+    if eval.merge_impact == MergeRecommendation::Block {
+        *merge_recommendation = MergeRecommendation::Block;
+    } else if eval.merge_impact == MergeRecommendation::ReviewRequired
+        && *merge_recommendation == MergeRecommendation::Approve
+    {
+        *merge_recommendation = MergeRecommendation::ReviewRequired;
+    }
+}
+
+fn describe_policy_advisory(eval: &crate::policy::engine::CheckEvaluation) -> String {
+    use crate::policy::engine::CheckExecutionState;
+
+    if eval.raw_status == "skipped" {
+        if let Some(reason) = &eval.reason {
+            return format!("{} skipped: {}", eval.name, reason);
+        }
+        return format!("{} was skipped", eval.name);
+    }
+
+    match eval.execution_state {
+        CheckExecutionState::Executed => format!("{} returned {}", eval.name, eval.raw_status),
+        CheckExecutionState::Skipped => format!("{} was skipped", eval.name),
+        CheckExecutionState::Unavailable => format!("{} was unavailable for this run", eval.name),
+        CheckExecutionState::Unknown => format!("{} needs manual review", eval.name),
+    }
+}
+
+fn display_raw_status(status: &str) -> String {
+    let mut chars = status.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => status.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checks::{CheckResult, CheckStatus};
+    use crate::config::test_config;
+    use crate::git::ResolvedRef;
+    use std::time::Duration;
+
+    fn semgrep_check() -> CheckResult {
+        CheckResult {
+            name: "Semgrep scan".to_string(),
+            status: CheckStatus::Failed,
+            duration: Duration::from_millis(25),
+            output: "{}".to_string(),
+            cached: false,
+            provenance: None,
+        }
+    }
+
+    fn semgrep_dashboard_finding(path: &str, in_diff: bool) -> DashboardFinding {
+        DashboardFinding {
+            level: "error",
+            check_name: "Semgrep scan".to_string(),
+            check_id: "semgrep_scan".to_string(),
+            message: format!("finding in {path}"),
+            in_diff: Some(in_diff),
+        }
+    }
+
+    fn empty_coverage() -> CoverageDelta {
+        CoverageDelta {
+            total_source: 0,
+            covered_count: 0,
+            pct: 0,
+            uncovered: Vec::new(),
+            covered: Vec::new(),
+            non_code_count: 0,
+            ghost_tests: Vec::new(),
+        }
+    }
+
+    fn resolved_refs() -> (ResolvedRef, Vec<ResolvedRef>) {
+        (
+            ResolvedRef {
+                name: "feature".to_string(),
+                commit_id: "2222222222222222222222222222222222222222".to_string(),
+                is_remote: false,
+            },
+            vec![ResolvedRef {
+                name: "main".to_string(),
+                commit_id: "1111111111111111111111111111111111111111".to_string(),
+                is_remote: false,
+            }],
+        )
+    }
+
+    fn run_gate_with_semgrep_finding(in_diff: bool, security_full: bool) -> serde_json::Value {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.security_full = security_full;
+        let checks = vec![semgrep_check()];
+        let inline = InlineFindingsSummary {
+            status: "failed".to_string(),
+            findings_count: 1,
+            dashboard_findings: vec![semgrep_dashboard_finding(
+                if in_diff { "src/b.rs" } else { "src/a.rs" },
+                in_diff,
+            )],
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            checks: &checks,
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+        })
+        .expect("merge gate");
+
+        let raw =
+            std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
+        serde_json::from_str(&raw).expect("parse gate json")
+    }
+
+    #[test]
+    fn preexisting_semgrep_finding_outside_diff_does_not_degrade_verdict() {
+        let gate = run_gate_with_semgrep_finding(false, false);
+
+        assert_eq!(gate["decision"]["verdict"].as_str(), Some("PASS"));
+        assert_eq!(gate["decision"]["quality_pass"].as_bool(), Some(true));
+        assert_eq!(
+            gate["decision"]["preexisting_quality_failures"][0].as_str(),
+            Some("Semgrep scan")
+        );
+        assert_eq!(
+            gate["checks"][0]["reason"].as_str(),
+            Some("pre-existing findings outside the change")
+        );
+        assert_eq!(gate["checks"][0]["blocking"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn introduced_semgrep_finding_in_diff_degrades_verdict() {
+        let gate = run_gate_with_semgrep_finding(true, false);
+
+        assert_eq!(gate["decision"]["verdict"].as_str(), Some("CONDITIONAL"));
+        assert_eq!(gate["decision"]["quality_pass"].as_bool(), Some(false));
+        assert_eq!(
+            gate["decision"]["introduced_quality_failures"][0].as_str(),
+            Some("Semgrep scan")
+        );
+    }
+
+    #[test]
+    fn security_full_preexisting_semgrep_finding_is_advisory_only() {
+        let gate = run_gate_with_semgrep_finding(false, true);
+
+        assert_eq!(gate["decision"]["verdict"].as_str(), Some("PASS"));
+        assert_eq!(gate["decision"]["quality_pass"].as_bool(), Some(true));
+        assert!(
+            gate["decision"]["review_caveats"]
+                .as_array()
+                .expect("review caveats")
+                .iter()
+                .any(|caveat| caveat
+                    .as_str()
+                    .is_some_and(|value| value.contains("Pre-existing quality failures")))
+        );
+    }
 }

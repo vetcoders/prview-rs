@@ -142,9 +142,17 @@ prview --help
 | `--skip-lint` | Skip linters |
 | `--with-bundle` | Enable the bundle build |
 | `--skip-bundle` | Skip the bundle build |
-| `--with-security` | Raise the heavy security posture (does not add cargo-geiger) |
+| `--with-security` | Raise the heavy security posture (does not add cargo-geiger or full-tree Semgrep) |
 | `--skip-security` | Skip heavy security checks |
-| `--security-full` | Full security tier: adds cargo-geiger's unsafe scan (slow; off even under `--deep`) |
+| `--security-full` | Full security tier: runs full-tree Semgrep and adds cargo-geiger's unsafe scan (slow; off even under `--deep`) |
+
+By default, Semgrep is scoped to the change when prview can resolve a clean git
+baseline: it passes Semgrep `--baseline-commit <merge-base>` so existing
+findings outside the diff do not degrade the merge verdict. If the worktree is
+dirty or the merge-base is unavailable, prview falls back to a full scan and the
+artifact classifier still separates introduced from pre-existing findings.
+Semgrep parse/scan errors remain surfaced even when no rule findings are
+introduced.
 
 ### Profiles
 

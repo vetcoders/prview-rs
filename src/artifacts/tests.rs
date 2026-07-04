@@ -1439,8 +1439,12 @@ fn merge_gate_reason_mentions_preexisting_failures_under_merge_with_review() {
     let raw = std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate");
     let gate: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
 
-    // Pre-existing failures no longer block, but they do require explicit review.
-    assert_eq!(gate["decision"]["recommended_label"].as_str(), Some("HOLD"));
+    // Pre-existing failures no longer block or degrade the verdict, but they do
+    // require explicit review.
+    assert_eq!(
+        gate["decision"]["recommended_label"].as_str(),
+        Some("MERGE WITH REVIEW")
+    );
     assert_eq!(gate["decision"]["quality_pass"].as_bool(), Some(true));
     // Pre-existing failures surface as a review caveat alongside the inline finding
     assert!(
@@ -1454,7 +1458,7 @@ fn merge_gate_reason_mentions_preexisting_failures_under_merge_with_review() {
         gate["decision"]["decision_reason"]
             .as_str()
             .is_some_and(|reason| {
-                reason.contains("1 pre-existing") && reason.contains("review required")
+                reason.contains("1 pre-existing") && reason.contains("review signal")
             })
     );
 }
@@ -3992,10 +3996,10 @@ fn preexisting_failures_do_not_block_gate() {
     let gate: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
     // Pre-existing failures: quality_pass=true, gate does not block
     assert_eq!(gate["decision"]["quality_pass"].as_bool(), Some(true));
-    assert_eq!(gate["decision"]["verdict"].as_str(), Some("CONDITIONAL"));
+    assert_eq!(gate["decision"]["verdict"].as_str(), Some("PASS"));
     assert_eq!(
         gate["decision"]["merge_recommendation"].as_str(),
-        Some("review_required")
+        Some("approve")
     );
     // Both appear in quality_failures (backward compat)
     assert_eq!(
