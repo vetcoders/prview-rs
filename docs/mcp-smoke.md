@@ -113,7 +113,10 @@ long before the next poll instead of hammering the server.
 // still running
 {
   "run_id": "20260704-120500",
-  "status": "running",
+  "status": "in_progress",
+  "run_status": "running",
+  "started_at": "2026-07-04T12:05:00+02:00",
+  "elapsed_s": 5,
   "retry_after_ms": 5000,
   "schema_version": "prview.mcp.v1"
 }
