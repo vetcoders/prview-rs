@@ -235,7 +235,7 @@ pub struct Cli {
     #[arg(long)]
     pub tui: bool,
 
-    /// Override the artifacts output directory (default: ~/.prview/<repo>/<timestamp>/)
+    /// Override the artifacts output directory (default: ~/.prview/runs/<repo>/<branch>/<run_id>/)
     #[arg(long = "output-dir", value_name = "PATH")]
     pub output_dir: Option<PathBuf>,
 

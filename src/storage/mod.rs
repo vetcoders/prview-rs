@@ -212,7 +212,7 @@ impl RunIndex {
             return Self { entries };
         }
 
-        // runs/<repo>/<branch>/<timestamp>/
+        // runs/<repo>/<branch>/<run_id>/
         let repos = read_subdirs(&runs_dir);
         for repo_dir in repos {
             let repo_name = dir_name(&repo_dir);

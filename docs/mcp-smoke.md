@@ -111,7 +111,7 @@ not report it as a result.
 
 // response
 {
-  "run_id": "20260704-120500",
+  "run_id": "20260704-120500-a1b2c3d",
   "status": "running",
   "commit": "a1b2c3d",
   "base_used": ["develop", "main", "master"],
@@ -132,7 +132,7 @@ long before the next poll instead of hammering the server.
 ```json
 // still running
 {
-  "run_id": "20260704-120500",
+  "run_id": "20260704-120500-a1b2c3d",
   "status": "in_progress",
   "run_status": "running",
   "started_at": "2026-07-04T12:05:00+02:00",
@@ -143,7 +143,7 @@ long before the next poll instead of hammering the server.
 
 // completed
 {
-  "run_id": "20260704-120500",
+  "run_id": "20260704-120500-a1b2c3d",
   "commit": "a1b2c3d",
   "status": "completed",
   "base_used": ["main"],
@@ -171,7 +171,7 @@ Requesting findings before completion is a fail-loud `stale_run`.
 
 ```json
 // request args
-{ "repo": "/abs/path/to/repo", "run_id": "20260704-120500", "severity": "error" }
+{ "repo": "/abs/path/to/repo", "run_id": "20260704-120500-a1b2c3d", "severity": "error" }
 
 // response
 {

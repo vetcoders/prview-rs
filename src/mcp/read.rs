@@ -243,11 +243,19 @@ fn find_index_entry_by_id<'a>(
     repo_name: &str,
     run_id: &str,
 ) -> Result<Option<&'a RunEntry>, ToolError> {
-    let matches: Vec<&RunEntry> = index
+    let mut matches: Vec<&RunEntry> = Vec::new();
+    for entry in index
         .entries()
         .iter()
         .filter(|e| e.repo == repo_name && e.id == run_id)
-        .collect();
+    {
+        if !matches
+            .iter()
+            .any(|existing| same_run_path(&existing.path, &entry.path))
+        {
+            matches.push(entry);
+        }
+    }
     if matches.len() > 1 {
         let paths: Vec<PathBuf> = matches.iter().map(|entry| entry.path.clone()).collect();
         return Err(ambiguous_run_id_error(repo_name, run_id, &paths));
@@ -1126,6 +1134,20 @@ mod tests {
         let found = find_index_entry_by_id(&index, "demo", id).unwrap().unwrap();
 
         assert_eq!(found.id, id);
+    }
+
+    #[test]
+    fn find_index_entry_by_id_dedupes_same_run_path() {
+        let id = "20260101-120000";
+        let first = entry(id, "aaaa111", "2026-01-01T00:00:00Z");
+        let duplicate = first.clone();
+        let entries = vec![first, duplicate];
+        let (_tmp, index) = index_from(&entries);
+
+        let found = find_index_entry_by_id(&index, "demo", id).unwrap().unwrap();
+
+        assert_eq!(found.id, id);
+        assert_eq!(found.path, PathBuf::from(format!("/tmp/demo/main/{id}")));
     }
 
     #[test]

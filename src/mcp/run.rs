@@ -60,17 +60,6 @@ pub(crate) struct BaseSelection {
     pub caveats: Vec<String>,
 }
 
-fn short_head(repo: &Path) -> String {
-    crate::git::git_cmd()
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
-}
-
 fn quick_budget() -> Duration {
     std::env::var("PRVIEW_MCP_QUICK_BUDGET_MS")
         .ok()
@@ -87,80 +76,12 @@ fn allocate_run_dir(
     branch_key: &str,
     commit: &str,
 ) -> Result<(PathBuf, String), ToolError> {
-    let repo_runs_root = crate::config::prview_home().join("runs").join(repo_name);
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    allocate_run_dir_in(&repo_runs_root, branch_key, &stamp, Some(commit))
-}
-
-/// Exclusive, race-free allocation of a run directory (PR #12 review).
-///
-/// `create_dir` is atomic and fails with `AlreadyExists` when the leaf already
-/// exists, unlike `create_dir_all`, which succeeds silently. That closes the
-/// TOCTOU window where two concurrent `run_review` calls pick the same
-/// timestamp directory and both write into it, corrupting a single pack — the
-/// loser now bumps to a fresh suffixed id instead of clobbering the winner.
-fn allocate_run_dir_in(
-    repo_runs_root: &Path,
-    branch_key: &str,
-    stamp: &str,
-    commit: Option<&str>,
-) -> Result<(PathBuf, String), ToolError> {
-    let base = repo_runs_root.join(branch_key);
-    std::fs::create_dir_all(&base).map_err(|e| {
+    crate::config::allocate_run_dir(repo_name, branch_key, commit).map_err(|e| {
         ToolError::new(
             error_class::RUN_FAILED,
-            format!("failed to create runs dir {}: {e}", base.display()),
+            format!("failed to allocate run dir: {e}"),
         )
-    })?;
-
-    let mut suffix = 2u32;
-    let id_base = match commit.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(commit) => format!("{stamp}-{commit}"),
-        None => stamp.to_string(),
-    };
-    let mut run_id = id_base.clone();
-    loop {
-        // Spec 4a: run_id must be globally unique within the repo storage, not
-        // just within a branch (PR #12 review). Reject an id already taken under
-        // ANY branch before claiming it, so verdict/read_artifact by explicit
-        // run_id never resolve to a same-second run from a different branch.
-        if !run_id_taken_in_repo(repo_runs_root, &run_id) {
-            let run_dir = base.join(&run_id);
-            match std::fs::create_dir(&run_dir) {
-                Ok(()) => return Ok((run_dir, run_id)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    return Err(ToolError::new(
-                        error_class::RUN_FAILED,
-                        format!("failed to create run dir {}: {e}", run_dir.display()),
-                    ));
-                }
-            }
-        }
-        run_id = format!("{id_base}-{suffix}");
-        suffix += 1;
-        if suffix > 10_000 {
-            return Err(ToolError::new(
-                error_class::RUN_FAILED,
-                "exhausted run-id suffixes allocating a run directory".to_string(),
-            ));
-        }
-    }
-}
-
-/// True when `run_id` already names a directory under any `runs/<repo>/<branch>`
-/// subtree — the repo-global uniqueness probe for `allocate_run_dir_in`.
-fn run_id_taken_in_repo(repo_runs_root: &Path, run_id: &str) -> bool {
-    let Ok(read) = std::fs::read_dir(repo_runs_root) else {
-        return false;
-    };
-    for branch in read.flatten() {
-        let bp = branch.path();
-        if bp.is_dir() && bp.join(run_id).exists() {
-            return true;
-        }
-    }
-    false
+    })
 }
 
 /// Detect a currently active run on this repo branch (live RUNNING marker).
@@ -378,7 +299,7 @@ pub async fn start(
         ));
     }
 
-    let commit = short_head(repo);
+    let commit = crate::config::short_head(repo);
     let (run_dir, run_id) = allocate_run_dir(&repo_name, &branch_key, &commit)?;
     let (out_file, err_file) = stdio_files(&run_dir)?;
     let selection = select_bases(repo, base.as_deref());
@@ -812,8 +733,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let stamp = "20260701-120000";
-        let (dir1, id1) = allocate_run_dir_in(root, "main", stamp, None).unwrap();
-        let (dir2, id2) = allocate_run_dir_in(root, "main", stamp, None).unwrap();
+        let (dir1, id1) = crate::config::allocate_run_dir_in(root, "main", stamp, None).unwrap();
+        let (dir2, id2) = crate::config::allocate_run_dir_in(root, "main", stamp, None).unwrap();
         assert_eq!(id1, stamp);
         assert_eq!(id2, "20260701-120000-2");
         assert_ne!(dir1, dir2);
@@ -829,8 +750,9 @@ mod tests {
         let root = tmp.path();
         let stamp = "20260701-120000";
         let (existing, existing_id) =
-            allocate_run_dir_in(root, "feature", stamp, Some("aaaa111")).unwrap();
-        let (fresh, fresh_id) = allocate_run_dir_in(root, "main", stamp, Some("bbbb222")).unwrap();
+            crate::config::allocate_run_dir_in(root, "feature", stamp, Some("aaaa111")).unwrap();
+        let (fresh, fresh_id) =
+            crate::config::allocate_run_dir_in(root, "main", stamp, Some("bbbb222")).unwrap();
         assert_eq!(existing_id, "20260701-120000-aaaa111");
         assert_eq!(fresh_id, "20260701-120000-bbbb222");
         assert_ne!(existing_id, fresh_id);
@@ -843,8 +765,9 @@ mod tests {
         let root = tmp.path();
         let stamp = "20260701-120000";
         let (_existing, existing_id) =
-            allocate_run_dir_in(root, "feature", stamp, Some("aaaa111")).unwrap();
-        let (_fresh, fresh_id) = allocate_run_dir_in(root, "main", stamp, Some("aaaa111")).unwrap();
+            crate::config::allocate_run_dir_in(root, "feature", stamp, Some("aaaa111")).unwrap();
+        let (_fresh, fresh_id) =
+            crate::config::allocate_run_dir_in(root, "main", stamp, Some("aaaa111")).unwrap();
 
         assert_eq!(existing_id, "20260701-120000-aaaa111");
         assert_eq!(fresh_id, "20260701-120000-aaaa111-2");
