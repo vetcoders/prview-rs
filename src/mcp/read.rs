@@ -224,21 +224,67 @@ fn validate_run_id(run_id: &str) -> Result<(), ToolError> {
     }
 }
 
+fn ambiguous_run_id_error(repo_name: &str, run_id: &str, paths: &[PathBuf]) -> ToolError {
+    ToolError::with_extra(
+        error_class::STORAGE_CORRUPT,
+        format!("ambiguous run_id {run_id} for {repo_name}; multiple runs match"),
+        serde_json::json!({
+            "run_id": run_id,
+            "matches": paths
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+        }),
+    )
+}
+
+fn find_index_entry_by_id<'a>(
+    index: &'a RunIndex,
+    repo_name: &str,
+    run_id: &str,
+) -> Result<Option<&'a RunEntry>, ToolError> {
+    let matches: Vec<&RunEntry> = index
+        .entries()
+        .iter()
+        .filter(|e| e.repo == repo_name && e.id == run_id)
+        .collect();
+    if matches.len() > 1 {
+        let paths: Vec<PathBuf> = matches.iter().map(|entry| entry.path.clone()).collect();
+        return Err(ambiguous_run_id_error(repo_name, run_id, &paths));
+    }
+    Ok(matches.into_iter().next())
+}
+
 /// Scan `runs/<repo>/*/<run_id>` for a run directory not (yet) in the index —
 /// e.g. a deep run still in flight, registered only on completion.
-fn find_run_dir_by_id(repo_name: &str, run_id: &str) -> Option<PathBuf> {
+fn find_run_dir_by_id(repo_name: &str, run_id: &str) -> Result<Option<PathBuf>, ToolError> {
     let base = crate::config::prview_home().join("runs").join(repo_name);
-    let read = std::fs::read_dir(&base).ok()?;
+    find_run_dir_by_id_in(&base, repo_name, run_id)
+}
+
+fn find_run_dir_by_id_in(
+    base: &Path,
+    repo_name: &str,
+    run_id: &str,
+) -> Result<Option<PathBuf>, ToolError> {
+    let read = match std::fs::read_dir(base) {
+        Ok(read) => read,
+        Err(_) => return Ok(None),
+    };
+    let mut matches = Vec::new();
     for branch in read.flatten() {
         if !branch.path().is_dir() {
             continue;
         }
         let candidate = branch.path().join(run_id);
         if candidate.is_dir() {
-            return Some(candidate);
+            matches.push(candidate);
         }
     }
-    None
+    if matches.len() > 1 {
+        return Err(ambiguous_run_id_error(repo_name, run_id, &matches));
+    }
+    Ok(matches.into_iter().next())
 }
 
 /// Resolve a run for `verdict`/`findings`/`read_artifact`.
@@ -254,18 +300,24 @@ pub fn resolve_run(root: &Path, run_id: Option<&str>) -> Result<ResolvedRun, Too
     match run_id {
         Some(id) => {
             validate_run_id(id)?;
-            if let Some(e) = index
-                .entries()
-                .iter()
-                .find(|e| e.repo == repo_name && e.id == id)
-            {
+            let disk_run = find_run_dir_by_id(&repo_name, id)?;
+            if let Some(e) = find_index_entry_by_id(&index, &repo_name, id)? {
+                if let Some(ref run_dir) = disk_run
+                    && *run_dir != e.path
+                {
+                    return Err(ambiguous_run_id_error(
+                        &repo_name,
+                        id,
+                        &[e.path.clone(), run_dir.clone()],
+                    ));
+                }
                 return Ok(ResolvedRun {
                     run_dir: e.path.clone(),
                     run_id: id.to_string(),
                     commit: e.commit.clone(),
                 });
             }
-            match find_run_dir_by_id(&repo_name, id) {
+            match disk_run {
                 Some(run_dir) => {
                     let commit = read_running_marker(&run_dir)
                         .map(|m| m.commit)
@@ -901,6 +953,35 @@ mod tests {
         assert!(validate_run_id("").is_err());
     }
 
+    #[test]
+    fn find_run_dir_by_id_accepts_legacy_timestamp_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = "20260101-120000";
+        let run_dir = tmp.path().join("main").join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let resolved = find_run_dir_by_id_in(tmp.path(), "demo", run_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved, run_dir);
+    }
+
+    #[test]
+    fn find_run_dir_by_id_fails_loud_on_cross_branch_ambiguity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = "20260101-120000";
+        std::fs::create_dir_all(tmp.path().join("main").join(run_id)).unwrap();
+        std::fs::create_dir_all(tmp.path().join("feature").join(run_id)).unwrap();
+
+        let err = find_run_dir_by_id_in(tmp.path(), "demo", run_id).unwrap_err();
+
+        assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+        assert!(err.message.contains("ambiguous run_id"));
+        assert_eq!(err.extra["run_id"], run_id);
+        assert_eq!(err.extra["matches"].as_array().unwrap().len(), 2);
+    }
+
     fn write_sarif(run_dir: &Path, sarif: &serde_json::Value) {
         let ctx = run_dir.join("30_context");
         std::fs::create_dir_all(&ctx).unwrap();
@@ -1027,6 +1108,33 @@ mod tests {
         f.flush().unwrap();
         let index = RunIndex::load_from(&path);
         (dir, index)
+    }
+
+    #[test]
+    fn find_index_entry_by_id_accepts_legacy_timestamp_id() {
+        let id = "20260101-120000";
+        let entries = vec![entry(id, "aaaa111", "2026-01-01T00:00:00Z")];
+        let (_tmp, index) = index_from(&entries);
+
+        let found = find_index_entry_by_id(&index, "demo", id).unwrap().unwrap();
+
+        assert_eq!(found.id, id);
+    }
+
+    #[test]
+    fn find_index_entry_by_id_fails_loud_on_duplicate_ids() {
+        let id = "20260101-120000";
+        let mut feature = entry(id, "bbbb222", "2026-01-01T00:00:01Z");
+        feature.branch = "feature".to_string();
+        feature.path = PathBuf::from(format!("/tmp/demo/feature/{id}"));
+        let entries = vec![entry(id, "aaaa111", "2026-01-01T00:00:00Z"), feature];
+        let (_tmp, index) = index_from(&entries);
+
+        let err = find_index_entry_by_id(&index, "demo", id).unwrap_err();
+
+        assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+        assert!(err.message.contains("ambiguous run_id"));
+        assert_eq!(err.extra["matches"].as_array().unwrap().len(), 2);
     }
 
     #[test]

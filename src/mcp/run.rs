@@ -82,10 +82,14 @@ fn quick_budget() -> Duration {
 
 /// Allocate a fresh, collision-free run directory under the standard storage
 /// layout so a later `verdict(run_id)` scan can find an in-flight deep run.
-fn allocate_run_dir(repo_name: &str, branch_key: &str) -> Result<(PathBuf, String), ToolError> {
+fn allocate_run_dir(
+    repo_name: &str,
+    branch_key: &str,
+    commit: &str,
+) -> Result<(PathBuf, String), ToolError> {
     let repo_runs_root = crate::config::prview_home().join("runs").join(repo_name);
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    allocate_run_dir_in(&repo_runs_root, branch_key, &stamp)
+    allocate_run_dir_in(&repo_runs_root, branch_key, &stamp, Some(commit))
 }
 
 /// Exclusive, race-free allocation of a run directory (PR #12 review).
@@ -99,6 +103,7 @@ fn allocate_run_dir_in(
     repo_runs_root: &Path,
     branch_key: &str,
     stamp: &str,
+    commit: Option<&str>,
 ) -> Result<(PathBuf, String), ToolError> {
     let base = repo_runs_root.join(branch_key);
     std::fs::create_dir_all(&base).map_err(|e| {
@@ -109,7 +114,11 @@ fn allocate_run_dir_in(
     })?;
 
     let mut suffix = 2u32;
-    let mut run_id = stamp.to_string();
+    let id_base = match commit.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(commit) => format!("{stamp}-{commit}"),
+        None => stamp.to_string(),
+    };
+    let mut run_id = id_base.clone();
     loop {
         // Spec 4a: run_id must be globally unique within the repo storage, not
         // just within a branch (PR #12 review). Reject an id already taken under
@@ -128,7 +137,7 @@ fn allocate_run_dir_in(
                 }
             }
         }
-        run_id = format!("{stamp}-{suffix}");
+        run_id = format!("{id_base}-{suffix}");
         suffix += 1;
         if suffix > 10_000 {
             return Err(ToolError::new(
@@ -369,8 +378,8 @@ pub async fn start(
         ));
     }
 
-    let (run_dir, run_id) = allocate_run_dir(&repo_name, &branch_key)?;
     let commit = short_head(repo);
+    let (run_dir, run_id) = allocate_run_dir(&repo_name, &branch_key, &commit)?;
     let (out_file, err_file) = stdio_files(&run_dir)?;
     let selection = select_bases(repo, base.as_deref());
 
@@ -803,8 +812,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let stamp = "20260701-120000";
-        let (dir1, id1) = allocate_run_dir_in(root, "main", stamp).unwrap();
-        let (dir2, id2) = allocate_run_dir_in(root, "main", stamp).unwrap();
+        let (dir1, id1) = allocate_run_dir_in(root, "main", stamp, None).unwrap();
+        let (dir2, id2) = allocate_run_dir_in(root, "main", stamp, None).unwrap();
         assert_eq!(id1, stamp);
         assert_eq!(id2, "20260701-120000-2");
         assert_ne!(dir1, dir2);
@@ -819,12 +828,26 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let stamp = "20260701-120000";
-        let (existing, existing_id) = allocate_run_dir_in(root, "feature", stamp).unwrap();
-        let (fresh, fresh_id) = allocate_run_dir_in(root, "main", stamp).unwrap();
-        assert_eq!(existing_id, stamp);
-        assert_eq!(fresh_id, "20260701-120000-2");
+        let (existing, existing_id) =
+            allocate_run_dir_in(root, "feature", stamp, Some("aaaa111")).unwrap();
+        let (fresh, fresh_id) = allocate_run_dir_in(root, "main", stamp, Some("bbbb222")).unwrap();
+        assert_eq!(existing_id, "20260701-120000-aaaa111");
+        assert_eq!(fresh_id, "20260701-120000-bbbb222");
         assert_ne!(existing_id, fresh_id);
         assert!(existing.is_dir() && fresh.is_dir());
+    }
+
+    #[test]
+    fn allocate_run_dir_keeps_commit_suffix_unique_when_same_commit_collides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let stamp = "20260701-120000";
+        let (_existing, existing_id) =
+            allocate_run_dir_in(root, "feature", stamp, Some("aaaa111")).unwrap();
+        let (_fresh, fresh_id) = allocate_run_dir_in(root, "main", stamp, Some("aaaa111")).unwrap();
+
+        assert_eq!(existing_id, "20260701-120000-aaaa111");
+        assert_eq!(fresh_id, "20260701-120000-aaaa111-2");
     }
 
     /// PR #12 review: a completed pack writes report.json at the pack root, so
