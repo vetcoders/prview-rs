@@ -85,6 +85,9 @@ Response:
 {
   "branch": "feature/x",
   "commit": "a1b2c3d",
+  "default_branch": "main",
+  "base_fallback": false,
+  "base_caveats": [],
   "dirty": false,
   "files_changed": 4,
   "latest_run_for_head": {
@@ -102,7 +105,14 @@ Response:
 ```
 
 Either run summary is `null` when no matching run exists. `profile` is reported
-as `null` because quick/deep is not persisted in the run index.
+as `null` because quick/deep is not persisted in the run index. If a run is
+currently active for HEAD, `latest_run_for_head` reports `status: "in_progress"`
+with factual `started_at` and `elapsed_s` fields; no ETA is fabricated.
+
+`default_branch` is the same base-selection path used by `run_review` when no
+explicit `base` is provided. `base_fallback: true` means prview could not detect
+the repo default branch and fell back to existing `develop` / `main` / `master`
+candidates; `base_caveats` explains that fallback.
 
 ### `run_review`
 
@@ -111,12 +121,12 @@ Generate a review pack.
 | Arg | Required | Description |
 |-----|----------|-------------|
 | `repo` | yes | Absolute path to the git repo to review. |
-| `base` | no | Base ref to diff against. Default: merge-base with the repo default branch (`develop`, then `main`, then `master`). |
+| `base` | no | Base ref to diff against. Default: detected repo default branch (`origin/HEAD`, then `remote.origin.HEAD`); if detection fails, falls back to existing `develop` / `main` / `master` candidates and marks `base_fallback: true`. |
 | `profile` | no | `"quick"` (default) or `"deep"`. An unknown value is a fail-loud `run_failed`. |
 
 **`quick` is synchronous.** It blocks until the pack is written, under a hard
-**60-second budget**. Exceeding the budget kills the whole review process tree
-and returns `run_timeout`. Success is defined by a finalized pack on disk, not by
+**120-second budget**. Exceeding the budget kills the whole review process tree
+and returns `run_timeout` with `retry_hint.profile: "deep"`. Success is defined by a finalized pack on disk, not by
 the child's exit code (prview exits non-zero on a `BLOCK` verdict, yet the run is
 a valid completed review). Response:
 
@@ -126,6 +136,7 @@ a valid completed review). Response:
   "status": "completed",
   "commit": "a1b2c3d",
   "base_used": ["main"],
+  "base_fallback": false,
   "verdict": "PASS",
   "merge_recommendation": "approve",
   "allow_merge": true,
@@ -155,7 +166,9 @@ exist for the run; `pack` is absolute, the rest are pack-relative.
   "run_id": "20260701-120500",
   "status": "running",
   "commit": "a1b2c3d",
-  "base_used": ["develop", "main", "master"],
+  "base_used": ["main"],
+  "base_fallback": false,
+  "caveats": [],
   "schema_version": "prview.mcp.v1"
 }
 ```
@@ -214,9 +227,13 @@ the run's `RUNNING.json` marker instead of a decision:
 
 | `status` | Meaning | Extra fields |
 |----------|---------|--------------|
-| `running` | The review process is alive. | `retry_after_ms: 5000` |
+| `in_progress` | The review process is alive. | `run_status: "running"`, `started_at`, `elapsed_s`, `retry_after_ms: 5000` |
 | `stale` | The marker's process died before finalizing. | `started_at` |
 | `failed` | The run produced no completed pack. | `base_used: []` |
+
+`elapsed_s` is computed from the marker timestamp at response time. prview does
+not invent ETA values; callers should poll `verdict(run_id)` until
+`status: "completed"`.
 
 ### `findings`
 
@@ -256,7 +273,8 @@ Response:
 Findings are ordered deterministically by `(file, line, rule)`. When more results
 remain, `next_cursor` is a string; pass it back as `cursor` for the next page.
 Requesting findings for a run that is not yet completed is a fail-loud
-`stale_run` (with `retry_after_ms` while running).
+`stale_run` (with `retry_after_ms` while running). The message points callers at
+`verdict(run_id)` as the polling target.
 
 ### `read_artifact`
 
@@ -288,6 +306,8 @@ directory, or a missing/non-UTF-8 file, collapses to `artifact_missing` — the
 server never reveals what exists outside the run. The two run logs
 (`run.log`, `run.stderr.log`) are always readable so a failed or stale run can
 expose its post-mortem; every other artifact requires a completed pack.
+Requesting a non-log artifact while a run is still active returns `stale_run`
+with a message pointing callers at `verdict(run_id)`.
 
 ## Error classes
 
@@ -300,7 +320,7 @@ fields (e.g. `retry_after_ms`, `active_run_id`, `run_id`).
 | `repo_not_found` | The `repo` path does not exist. |
 | `not_a_git_repo` | The path exists but is not a readable git repository. |
 | `run_failed` | The review process failed to produce a completed pack (or an unknown `profile` was requested). |
-| `run_timeout` | A `quick` review exceeded the 60s budget. |
+| `run_timeout` | A `quick` review exceeded the 120s budget. Carries `run_id` and `retry_hint.profile: "deep"`. |
 | `run_not_found` | No run matches the given `run_id` / HEAD; call `run_review`. |
 | `artifact_missing` | The requested artifact does not exist within the run, is not UTF-8 text, or would escape the run directory. |
 | `tool_missing` | A required external tool is unavailable. |
@@ -311,5 +331,5 @@ fields (e.g. `retry_after_ms`, `active_run_id`, `run_id`).
 ### Retrying
 
 When a response carries `retry_after_ms`, wait that long before retrying the same
-call. It appears on `storage_locked` (another run holds the branch), on a
-`running` `verdict`, and on a `stale_run` while a review is still in progress.
+call. It appears on `storage_locked` (another run holds the branch), on an
+`in_progress` `verdict`, and on a `stale_run` while a review is still in progress.
