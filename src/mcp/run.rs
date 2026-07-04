@@ -224,32 +224,28 @@ fn configured_origin_head(repo: &Path) -> Option<String> {
 }
 
 fn ref_exists(repo: &Path, name: &str) -> bool {
-    let local = crate::git::git_cmd()
-        .args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{name}^{{commit}}"),
-        ])
-        .current_dir(repo)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if local {
-        return true;
-    }
+    let refs = if name.starts_with("refs/") {
+        vec![name.to_string()]
+    } else {
+        vec![
+            format!("refs/heads/{name}"),
+            format!("refs/remotes/origin/{name}"),
+        ]
+    };
 
-    crate::git::git_cmd()
-        .args([
+    refs.into_iter().any(|reference| {
+        let mut cmd = crate::git::git_cmd();
+        cmd.args([
             "rev-parse",
             "--verify",
             "--quiet",
-            &format!("origin/{name}^{{commit}}"),
+            &format!("{reference}^{{commit}}"),
         ])
         .current_dir(repo)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    })
 }
 
 pub(crate) fn select_bases(repo: &Path, base: Option<&str>) -> BaseSelection {
@@ -643,6 +639,46 @@ mod tests {
         let fallback = select_bases(repo, None);
         assert!(fallback.base_fallback);
         assert_eq!(fallback.bases, vec!["main"]);
+    }
+
+    #[test]
+    fn ref_exists_handles_dash_prefixed_branch_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        crate::git::git_cmd()
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
+        crate::git::git_cmd()
+            .args(["add", "-A"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["commit", "-m", "init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        crate::git::git_cmd()
+            .args(["update-ref", "refs/heads/-dash", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        assert!(ref_exists(repo, "-dash"));
+        assert!(!ref_exists(repo, "-missing"));
     }
 
     /// PR #12 review: two allocations that collide on the same timestamp within
