@@ -535,22 +535,40 @@ fn running_run_summary(
         .join("runs")
         .join(repo_name)
         .join(branch_key);
+    running_run_summary_from_base(&base, head)
+}
+
+fn running_run_summary_from_base(
+    base: &std::path::Path,
+    head: Option<&str>,
+) -> Option<serde_json::Value> {
+    running_run_summary_from_base_with(base, head, read::run_status, read::read_running_marker)
+}
+
+fn running_run_summary_from_base_with(
+    base: &std::path::Path,
+    head: Option<&str>,
+    run_status: impl Fn(&std::path::Path) -> read::RunStatus,
+    read_marker: impl Fn(&std::path::Path) -> Option<read::RunningMarker>,
+) -> Option<serde_json::Value> {
     let mut candidates: Vec<(String, serde_json::Value)> = Vec::new();
-    for entry in std::fs::read_dir(&base).ok()?.flatten() {
+    for entry in std::fs::read_dir(base).ok()?.flatten() {
         let run_dir = entry.path();
-        if !run_dir.is_dir()
-            || !matches!(read::run_status(&run_dir), read::RunStatus::Running { .. })
-        {
+        if !run_dir.is_dir() || !matches!(run_status(&run_dir), read::RunStatus::Running { .. }) {
             continue;
         }
-        let run_id = run_dir.file_name()?.to_str()?.to_string();
-        let marker = read::read_running_marker(&run_dir)?;
+        let Some(run_id) = run_dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(marker) = read_marker(&run_dir) else {
+            continue;
+        };
         if let Some(head) = head
             && !read::commit_matches(&marker.commit, head)
         {
             continue;
         }
-        let body = in_progress_body(&run_id, &marker.commit, &marker);
+        let body = in_progress_body(run_id, &marker.commit, &marker);
         candidates.push((marker.started_at.clone(), body));
     }
     candidates
@@ -582,4 +600,49 @@ pub async fn serve() -> anyhow::Result<()> {
     let service = PrviewMcp::new().serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_running_marker(run_dir: &std::path::Path, run_id_commit: &str, started_at: &str) {
+        std::fs::write(
+            read::running_marker_path(run_dir),
+            serde_json::to_string(&read::RunningMarker {
+                pid: std::process::id(),
+                started_at: started_at.to_string(),
+                profile: "deep".to_string(),
+                commit: run_id_commit.to_string(),
+                base_used: vec!["main".to_string()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn running_summary_skips_missing_marker_and_reports_healthy_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let healthy = base.join("20260704-healthy");
+        std::fs::create_dir(&healthy).unwrap();
+        write_running_marker(&healthy, "abcdef123456", "2026-07-04T00:00:02+00:00");
+
+        let missing_marker = base.join("20260704-missing-marker");
+        std::fs::create_dir(&missing_marker).unwrap();
+
+        let summary = running_run_summary_from_base_with(
+            base,
+            None,
+            |_| read::RunStatus::Running {
+                pid: std::process::id(),
+            },
+            read::read_running_marker,
+        )
+        .unwrap();
+        assert_eq!(summary["run_id"], serde_json::json!("20260704-healthy"));
+        assert_eq!(summary["commit"], serde_json::json!("abcdef123456"));
+    }
 }
