@@ -119,6 +119,7 @@ macro_rules! generate_merge_gate_test {
             skipped_checks: $skipped_checks,
             resolved_target: $resolved_target,
             resolved_bases: $resolved_bases,
+            clean_comparison: true,
         })
     };
 }

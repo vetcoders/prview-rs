@@ -97,6 +97,7 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         out_dir,
         diffs,
         ownership_map,
+        clean_comparison,
     } = input;
     use crate::policy::engine::{AnalysisStatus, MergeRecommendation, PolicyEngine};
 
@@ -108,7 +109,8 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
     // never contradict MERGE_GATE.json. The classification of which failures are
     // purely pre-existing must be computed before the effective outcome, so it
     // is hoisted here (also reused for quality_pass below).
-    let quality_failures = build_quality_failure_summary(checks, &inline.dashboard_findings);
+    let quality_failures =
+        build_quality_failure_summary(checks, &inline.dashboard_findings, clean_comparison);
     let preexisting_quality_failure_names: std::collections::BTreeSet<&str> = quality_failures
         .preexisting_quality_failures
         .iter()

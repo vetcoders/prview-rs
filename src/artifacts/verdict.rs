@@ -444,9 +444,53 @@ pub(crate) fn check_id_is_baseline_signal(check_id: &str) -> bool {
     )
 }
 
+/// Whether the scan that produced the findings was a clean comparison, so an
+/// out-of-diff location genuinely proves a finding predates the change.
+///
+/// True when the analysed target is a fetched remote ref (semgrep scanned a
+/// clean ephemeral snapshot, R2-10) or when the local working tree has no
+/// uncommitted changes. False for a dirty local scan: uncommitted changes in an
+/// untracked/unstaged file can make a working-tree finding look out-of-diff, so
+/// its findings must not be downgraded to pre-existing (R2-9). On any inability
+/// to inspect the repo we default to `true`, preserving the pre-existing
+/// downgrade behaviour rather than distrusting a repo we cannot read.
+pub(crate) fn scan_was_clean_comparison(
+    config: &Config,
+    resolved_target: &crate::git::ResolvedRef,
+) -> bool {
+    let Ok(repo) = crate::git::Repository::open(&config.repo_root) else {
+        return true;
+    };
+    let Ok(head) = repo.head_commit_id() else {
+        return true;
+    };
+    if head != resolved_target.commit_id {
+        // Remote/snapshot target: the analysed tree is clean by construction.
+        return true;
+    }
+    !worktree_has_uncommitted_changes(&config.repo_root)
+}
+
+/// True when the working tree at `repo_root` has staged, unstaged, or untracked
+/// changes. Errors resolve to `false` (treat as clean) to preserve the existing
+/// downgrade behaviour when the repo cannot be inspected.
+fn worktree_has_uncommitted_changes(repo_root: &std::path::Path) -> bool {
+    let Ok(repo) = git2::Repository::discover(repo_root) else {
+        return false;
+    };
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .renames_head_to_index(true);
+    repo.statuses(Some(&mut opts))
+        .map(|statuses| !statuses.is_empty())
+        .unwrap_or(false)
+}
+
 pub(crate) fn classify_quality_failure(
     check_id: &str,
     dashboard_findings: &[DashboardFinding],
+    clean_comparison: bool,
 ) -> QualityFailureClass {
     let mut saw_in_diff = false;
     let mut saw_out_of_diff = false;
@@ -465,12 +509,16 @@ pub(crate) fn classify_quality_failure(
     match (saw_in_diff, saw_out_of_diff) {
         (true, true) => QualityFailureClass::Mixed,
         (true, false) => QualityFailureClass::Introduced,
-        // Only inline-findings-family checks may be downgraded to pre-existing
-        // on an all-out-of-diff location set. For whole-project gates
-        // (build/test/typecheck) the same location set does not prove the
-        // failure predates the diff, so keep it as an unclassified failure that
-        // still counts against the gate (`has_new_failures`).
-        (false, true) if check_id_is_baseline_signal(check_id) => QualityFailureClass::Preexisting,
+        // An all-out-of-diff location set may only be downgraded to pre-existing
+        // when the scan was a clean comparison (R2-9) AND the check's locations
+        // are an exhaustive baseline signal. A dirty local scan can make a
+        // working-tree finding look out-of-diff; and for whole-project gates
+        // (build/test/typecheck) an out-of-diff location never proves the
+        // failure predates the diff. Either way it stays an unclassified failure
+        // that still counts against the gate (`has_new_failures`).
+        (false, true) if clean_comparison && check_id_is_baseline_signal(check_id) => {
+            QualityFailureClass::Preexisting
+        }
         (false, true) => QualityFailureClass::Unclassified,
         (false, false) => QualityFailureClass::Unclassified,
     }
@@ -498,12 +546,16 @@ pub(crate) fn push_quality_failure(
 pub(crate) fn build_quality_failure_summary(
     checks: &[CheckResult],
     dashboard_findings: &[DashboardFinding],
+    clean_comparison: bool,
 ) -> QualityFailureSummary {
     let mut summary = QualityFailureSummary::default();
 
     for check in checks.iter().filter(|check| check.is_failure()) {
-        let classification =
-            classify_quality_failure(&check_id_from_name(&check.name), dashboard_findings);
+        let classification = classify_quality_failure(
+            &check_id_from_name(&check.name),
+            dashboard_findings,
+            clean_comparison,
+        );
         push_quality_failure(&mut summary, check.name.clone(), classification);
     }
 
@@ -737,8 +789,20 @@ mod tests {
         // findings outside the diff really means pre-existing debt.
         let findings = [out_of_diff_finding("semgrep_scan")];
         assert_eq!(
-            classify_quality_failure("semgrep_scan", &findings),
+            classify_quality_failure("semgrep_scan", &findings, true),
             QualityFailureClass::Preexisting
+        );
+    }
+
+    #[test]
+    fn dirty_scan_out_of_diff_baseline_signal_is_not_preexisting() {
+        // R2-9: on a dirty scan an out-of-diff location may be an uncommitted
+        // working-tree finding, so even a baseline-signal check must NOT be
+        // downgraded to pre-existing.
+        let findings = [out_of_diff_finding("semgrep_scan")];
+        assert_eq!(
+            classify_quality_failure("semgrep_scan", &findings, false),
+            QualityFailureClass::Unclassified
         );
     }
 
@@ -749,7 +813,7 @@ mod tests {
         // predates the diff, so it must not be downgraded to pre-existing.
         let findings = [out_of_diff_finding("cargo_test")];
         assert_eq!(
-            classify_quality_failure("cargo_test", &findings),
+            classify_quality_failure("cargo_test", &findings, true),
             QualityFailureClass::Unclassified
         );
     }
@@ -785,7 +849,7 @@ mod tests {
         // whose findings all sit outside the diff is NOT silently downgraded —
         // it stays a new failure that fails `has_new_failures`.
         let findings = [out_of_diff_finding("cargo_test")];
-        let summary = build_quality_failure_summary(&[failed_check("cargo test")], &findings);
+        let summary = build_quality_failure_summary(&[failed_check("cargo test")], &findings, true);
         assert!(summary.preexisting_quality_failures.is_empty());
         assert_eq!(summary.unclassified_quality_failures, vec!["cargo test"]);
         assert!(summary.has_new_failures());
@@ -794,16 +858,29 @@ mod tests {
     #[test]
     fn failed_semgrep_out_of_diff_is_preexisting_and_not_new() {
         let findings = [out_of_diff_finding("semgrep_scan")];
-        let summary = build_quality_failure_summary(&[failed_check("Semgrep scan")], &findings);
+        let summary =
+            build_quality_failure_summary(&[failed_check("Semgrep scan")], &findings, true);
         assert_eq!(summary.preexisting_quality_failures, vec!["Semgrep scan"]);
         assert!(!summary.has_new_failures());
+    }
+
+    #[test]
+    fn dirty_scan_keeps_out_of_diff_semgrep_failure_as_new() {
+        // R2-9 end-to-end: with a dirty scan the out-of-diff semgrep failure is
+        // not downgraded, so it stays a new failure that fails the gate.
+        let findings = [out_of_diff_finding("semgrep_scan")];
+        let summary =
+            build_quality_failure_summary(&[failed_check("Semgrep scan")], &findings, false);
+        assert!(summary.preexisting_quality_failures.is_empty());
+        assert_eq!(summary.unclassified_quality_failures, vec!["Semgrep scan"]);
+        assert!(summary.has_new_failures());
     }
 
     #[test]
     fn introduced_findings_stay_introduced_for_any_check() {
         let findings = [in_diff_finding("cargo_test")];
         assert_eq!(
-            classify_quality_failure("cargo_test", &findings),
+            classify_quality_failure("cargo_test", &findings, true),
             QualityFailureClass::Introduced
         );
     }

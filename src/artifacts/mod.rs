@@ -157,6 +157,10 @@ struct MergeGateInput<'a> {
     skipped_checks: &'a [crate::checks::SkippedCheck],
     resolved_target: &'a ResolvedRef,
     resolved_bases: &'a [ResolvedRef],
+    /// Whether the scan was a clean comparison, gating the pre-existing
+    /// downgrade (R2-9). Computed once per run for verdict parity with the
+    /// dashboard context.
+    clean_comparison: bool,
 }
 
 pub(crate) struct DashboardContextInput<'a> {
@@ -171,6 +175,9 @@ pub(crate) struct DashboardContextInput<'a> {
     out_dir: &'a Path,
     diffs: &'a [Diff],
     ownership_map: Vec<(String, String)>,
+    /// Mirrors `MergeGateInput::clean_comparison` — the same value feeds both so
+    /// the two verdict surfaces cannot disagree on the pre-existing downgrade.
+    clean_comparison: bool,
 }
 
 /// Build a synthetic CheckResult for heuristics_loctree so it appears in
@@ -380,6 +387,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
 
     // 00_summary/ — merge gate + failures summary
     let t = Instant::now();
+    // Whether out-of-diff findings may be trusted as pre-existing. Computed once
+    // and shared by the merge gate and the dashboard context so both verdict
+    // surfaces gate the pre-existing downgrade identically (R2-9).
+    let clean_comparison = verdict::scan_was_clean_comparison(config, resolved_target);
+
     generate_merge_gate(MergeGateInput {
         dir: &summary_dir,
         config,
@@ -392,6 +404,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         skipped_checks: &skipped_checks,
         resolved_target,
         resolved_bases,
+        clean_comparison,
     })?;
     generate_failures_summary(&summary_dir, &all_checks)?;
     stage_timings.push(finish_timing(
@@ -525,6 +538,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         out_dir: &out_dir,
         diffs,
         ownership_map,
+        clean_comparison,
     });
 
     // Root-level report.json (generated first so dashboard can embed it)

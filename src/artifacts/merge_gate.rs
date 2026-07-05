@@ -18,11 +18,13 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         skipped_checks,
         resolved_target,
         resolved_bases,
+        clean_comparison,
     } = input;
 
     let engine = PolicyEngine::new(config);
     let policy_summary = engine.evaluate_all(checks, skipped_checks);
-    let quality_failures = build_quality_failure_summary(checks, &inline.dashboard_findings);
+    let quality_failures =
+        build_quality_failure_summary(checks, &inline.dashboard_findings, clean_comparison);
     let preexisting_quality_failure_names = quality_failures
         .preexisting_quality_failures
         .iter()
@@ -501,6 +503,14 @@ mod tests {
     }
 
     fn run_gate_with_semgrep_finding(in_diff: bool, security_full: bool) -> serde_json::Value {
+        run_gate_with_semgrep_finding_scan(in_diff, security_full, true)
+    }
+
+    fn run_gate_with_semgrep_finding_scan(
+        in_diff: bool,
+        security_full: bool,
+        clean_comparison: bool,
+    ) -> serde_json::Value {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut config = test_config();
         config.security_full = security_full;
@@ -528,6 +538,7 @@ mod tests {
             skipped_checks: &[],
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
+            clean_comparison,
         })
         .expect("merge gate");
 
@@ -577,6 +588,7 @@ mod tests {
             skipped_checks: &[],
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
+            clean_comparison: true,
         })
         .expect("merge gate");
 
@@ -676,6 +688,27 @@ mod tests {
                 .any(|caveat| caveat
                     .as_str()
                     .is_some_and(|value| value.contains("Pre-existing quality failures")))
+        );
+    }
+
+    #[test]
+    fn dirty_scan_out_of_diff_semgrep_finding_does_not_pass() {
+        // R2-9: the same out-of-diff semgrep finding that is downgraded to
+        // pre-existing on a clean scan must NOT be downgraded when the scan
+        // analysed a dirty working tree — it could be an uncommitted change.
+        let gate = run_gate_with_semgrep_finding_scan(false, false, false);
+
+        assert_ne!(gate["decision"]["verdict"].as_str(), Some("PASS"));
+        assert_eq!(gate["decision"]["quality_pass"].as_bool(), Some(false));
+        assert!(
+            gate["decision"]["preexisting_quality_failures"]
+                .as_array()
+                .is_none_or(|arr| arr.is_empty()),
+            "a dirty-scan out-of-diff finding must not land in the pre-existing bucket"
+        );
+        assert_eq!(
+            gate["decision"]["unclassified_quality_failures"][0].as_str(),
+            Some("Semgrep scan")
         );
     }
 }
