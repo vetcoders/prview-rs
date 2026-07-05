@@ -1,5 +1,7 @@
 //! Static CSS and JavaScript assets embedded in the HTML dashboard.
 
+use std::sync::OnceLock;
+
 // ---------------------------------------------------------------------------
 // CSS
 // ---------------------------------------------------------------------------
@@ -1990,16 +1992,27 @@ body.author-mode .section-noise  { display: none; }
 
 const I18N_EN_JSON: &str = include_str!("../../../locales/en.json");
 const I18N_PL_JSON: &str = include_str!("../../../locales/pl.json");
+static DASHBOARD_JS: OnceLock<String> = OnceLock::new();
 
-pub(super) fn js() -> String {
-    [
-        JS_PREFIX,
-        I18N_EN_JSON,
-        JS_BETWEEN_LOCALES,
-        I18N_PL_JSON,
-        JS_SUFFIX,
-    ]
-    .concat()
+pub(super) fn js() -> &'static str {
+    DASHBOARD_JS
+        .get_or_init(|| {
+            let en_json = escape_embedded_json(I18N_EN_JSON);
+            let pl_json = escape_embedded_json(I18N_PL_JSON);
+            [
+                JS_PREFIX,
+                en_json.as_str(),
+                JS_BETWEEN_LOCALES,
+                pl_json.as_str(),
+                JS_SUFFIX,
+            ]
+            .concat()
+        })
+        .as_str()
+}
+
+fn escape_embedded_json(json: &str) -> String {
+    json.replace("</", "<\\/")
 }
 
 const JS_PREFIX: &str = r##"
@@ -2884,13 +2897,25 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_js_embeds_locale_json_verbatim() {
+    fn dashboard_js_embeds_escaped_locale_json() {
         let js = js();
-        let (en_source, pl_source) = embedded_locale_sources(&js);
+        let (en_source, pl_source) = embedded_locale_sources(js);
 
-        assert_eq!(en_source, I18N_EN_JSON);
-        assert_eq!(pl_source, I18N_PL_JSON);
         assert_eq!(locale_map(en_source), locale_map(I18N_EN_JSON));
         assert_eq!(locale_map(pl_source), locale_map(I18N_PL_JSON));
+    }
+
+    #[test]
+    fn embedded_locale_json_escapes_script_end_tags() {
+        let locale_json = r#"{"review.warning":"safe </script> text"}"#;
+        let escaped = escape_embedded_json(locale_json);
+        let html = format!("<script>var I18N = {{ pl: {escaped} }};</script>");
+
+        assert!(html.contains(r"safe <\/script> text"));
+        assert!(!html[..html.len() - "</script>".len()].contains("</script>"));
+        assert_eq!(
+            locale_map(&escaped)["review.warning"],
+            "safe </script> text"
+        );
     }
 }
