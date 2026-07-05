@@ -415,6 +415,28 @@ pub(crate) fn build_merge_decision_view(
     }
 }
 
+/// Whether a check's finding *locations* are an exhaustive baseline signal — so
+/// that "every reported location lies outside the diff" genuinely proves the
+/// failure is pre-existing debt and may be downgraded off the merge gate.
+///
+/// True only for the inline-findings family: per-location scanners and linters
+/// (semgrep, eslint, stylelint, clippy, ruff, cargo audit) where each finding is
+/// an independent, locally-scoped issue whose absence from the diff means it
+/// predates the change.
+///
+/// False (the safe default) for whole-project gates — `cargo test`, `cargo
+/// check`, `tsc`, `vitest`/`tests`, `pytest`, type checkers — where a single
+/// boolean failure can be *caused* by the diff even though the failing location
+/// (a broken test or a downstream type error) sits in an unchanged file. For
+/// those the location set is symptomatic, not exhaustive, so a pure
+/// out-of-diff failure must never be trusted as pre-existing.
+pub(crate) fn check_id_is_baseline_signal(check_id: &str) -> bool {
+    matches!(
+        check_id,
+        "semgrep_scan" | "eslint" | "stylelint" | "clippy" | "ruff" | "cargo_audit"
+    )
+}
+
 pub(crate) fn classify_quality_failure(
     check_id: &str,
     dashboard_findings: &[DashboardFinding],
@@ -436,7 +458,13 @@ pub(crate) fn classify_quality_failure(
     match (saw_in_diff, saw_out_of_diff) {
         (true, true) => QualityFailureClass::Mixed,
         (true, false) => QualityFailureClass::Introduced,
-        (false, true) => QualityFailureClass::Preexisting,
+        // Only inline-findings-family checks may be downgraded to pre-existing
+        // on an all-out-of-diff location set. For whole-project gates
+        // (build/test/typecheck) the same location set does not prove the
+        // failure predates the diff, so keep it as an unclassified failure that
+        // still counts against the gate (`has_new_failures`).
+        (false, true) if check_id_is_baseline_signal(check_id) => QualityFailureClass::Preexisting,
+        (false, true) => QualityFailureClass::Unclassified,
         (false, false) => QualityFailureClass::Unclassified,
     }
 }
@@ -663,5 +691,111 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn out_of_diff_finding(check_id: &str) -> DashboardFinding {
+        DashboardFinding {
+            level: "error",
+            check_name: check_id.to_string(),
+            check_id: check_id.to_string(),
+            message: "finding".to_string(),
+            in_diff: Some(false),
+        }
+    }
+
+    fn in_diff_finding(check_id: &str) -> DashboardFinding {
+        DashboardFinding {
+            level: "error",
+            check_name: check_id.to_string(),
+            check_id: check_id.to_string(),
+            message: "finding".to_string(),
+            in_diff: Some(true),
+        }
+    }
+
+    fn failed_check(name: &str) -> CheckResult {
+        CheckResult {
+            name: name.to_string(),
+            status: crate::checks::CheckStatus::Failed,
+            duration: std::time::Duration::from_millis(1),
+            output: String::new(),
+            cached: false,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn semgrep_out_of_diff_findings_are_preexisting() {
+        // A scanner whose locations are an exhaustive baseline signal: all
+        // findings outside the diff really means pre-existing debt.
+        let findings = [out_of_diff_finding("semgrep_scan")];
+        assert_eq!(
+            classify_quality_failure("semgrep_scan", &findings),
+            QualityFailureClass::Preexisting
+        );
+    }
+
+    #[test]
+    fn cargo_test_out_of_diff_findings_are_not_preexisting() {
+        // A whole-project gate: an API change in this PR can break a test in an
+        // unchanged file. The out-of-diff location does NOT prove the failure
+        // predates the diff, so it must not be downgraded to pre-existing.
+        let findings = [out_of_diff_finding("cargo_test")];
+        assert_eq!(
+            classify_quality_failure("cargo_test", &findings),
+            QualityFailureClass::Unclassified
+        );
+    }
+
+    #[test]
+    fn baseline_signal_membership_excludes_build_test_typecheck_gates() {
+        for id in [
+            "semgrep_scan",
+            "eslint",
+            "stylelint",
+            "clippy",
+            "ruff",
+            "cargo_audit",
+        ] {
+            assert!(
+                check_id_is_baseline_signal(id),
+                "{id} should be baseline signal"
+            );
+        }
+        for id in ["cargo_test", "cargo", "tsc", "tests", "pytest", "mypy"] {
+            assert!(
+                !check_id_is_baseline_signal(id),
+                "{id} is a whole-project gate, not a baseline signal"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_cargo_test_out_of_diff_still_counts_as_new_failure() {
+        // The end-to-end guarantee for THREAD 4: a failed whole-project gate
+        // whose findings all sit outside the diff is NOT silently downgraded —
+        // it stays a new failure that fails `has_new_failures`.
+        let findings = [out_of_diff_finding("cargo_test")];
+        let summary = build_quality_failure_summary(&[failed_check("cargo test")], &findings);
+        assert!(summary.preexisting_quality_failures.is_empty());
+        assert_eq!(summary.unclassified_quality_failures, vec!["cargo test"]);
+        assert!(summary.has_new_failures());
+    }
+
+    #[test]
+    fn failed_semgrep_out_of_diff_is_preexisting_and_not_new() {
+        let findings = [out_of_diff_finding("semgrep_scan")];
+        let summary = build_quality_failure_summary(&[failed_check("Semgrep scan")], &findings);
+        assert_eq!(summary.preexisting_quality_failures, vec!["Semgrep scan"]);
+        assert!(!summary.has_new_failures());
+    }
+
+    #[test]
+    fn introduced_findings_stay_introduced_for_any_check() {
+        let findings = [in_diff_finding("cargo_test")];
+        assert_eq!(
+            classify_quality_failure("cargo_test", &findings),
+            QualityFailureClass::Introduced
+        );
     }
 }

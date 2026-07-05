@@ -488,6 +488,75 @@ mod tests {
         serde_json::from_str(&raw).expect("parse gate json")
     }
 
+    fn cargo_test_check() -> CheckResult {
+        CheckResult {
+            name: "cargo test".to_string(),
+            status: CheckStatus::Failed,
+            duration: Duration::from_millis(25),
+            output: "{}".to_string(),
+            cached: false,
+            provenance: None,
+        }
+    }
+
+    fn run_gate_with_cargo_test_finding(in_diff: bool) -> serde_json::Value {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config();
+        let checks = vec![cargo_test_check()];
+        let inline = InlineFindingsSummary {
+            status: "failed".to_string(),
+            findings_count: 1,
+            dashboard_findings: vec![DashboardFinding {
+                level: "error",
+                check_name: "Cargo Test".to_string(),
+                check_id: "cargo_test".to_string(),
+                message: "test failed".to_string(),
+                in_diff: Some(in_diff),
+            }],
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            checks: &checks,
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+        })
+        .expect("merge gate");
+
+        let raw =
+            std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
+        serde_json::from_str(&raw).expect("parse gate json")
+    }
+
+    #[test]
+    fn failed_cargo_test_outside_diff_does_not_get_pass() {
+        // THREAD 4: a whole-project gate failing with an out-of-diff location
+        // must NOT be downgraded to pre-existing — the diff may have caused it.
+        let gate = run_gate_with_cargo_test_finding(false);
+
+        assert_ne!(gate["decision"]["verdict"].as_str(), Some("PASS"));
+        assert_eq!(gate["decision"]["quality_pass"].as_bool(), Some(false));
+        assert!(
+            gate["decision"]["preexisting_quality_failures"]
+                .as_array()
+                .is_none_or(|arr| arr.is_empty()),
+            "cargo test must not land in the pre-existing bucket"
+        );
+        assert_eq!(
+            gate["decision"]["unclassified_quality_failures"][0].as_str(),
+            Some("cargo test")
+        );
+    }
+
     #[test]
     fn preexisting_semgrep_finding_outside_diff_does_not_degrade_verdict() {
         let gate = run_gate_with_semgrep_finding(false, false);
