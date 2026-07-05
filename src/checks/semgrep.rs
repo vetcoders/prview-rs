@@ -254,7 +254,12 @@ fn semgrep_baseline_commit(config: &Config, cwd: &Path) -> Option<String> {
     let target_is_checkout = head == target.commit_id;
     let dirty = worktree_has_uncommitted_changes(cwd);
 
-    if !baseline_scan_allowed(config.security_full, dirty, target_is_checkout) {
+    if !baseline_scan_allowed(
+        config.security_full,
+        dirty,
+        target_is_checkout,
+        config.current_only,
+    ) {
         return None;
     }
 
@@ -271,7 +276,7 @@ fn snapshot_baseline_commit(
     target: &ResolvedRef,
 ) -> Option<String> {
     // In the snapshot the target IS the checkout and the tree is clean.
-    if !baseline_scan_allowed(config.security_full, false, true) {
+    if !baseline_scan_allowed(config.security_full, false, true, config.current_only) {
         return None;
     }
     merge_base_for_baseline(repo, config, target)
@@ -354,13 +359,16 @@ fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<WorktreeSn
 /// remote-only preset) the target is a fetched ref that is NOT checked out, so
 /// the working tree would diff empty and mask real findings — those runs must
 /// fall back to a full scan. A dirty worktree or an explicit `--security-full`
-/// also forces a full scan.
+/// also forces a full scan. `--current-only` deliberately drops the bases to
+/// scan the whole current state, so it must never be diff-scoped against a
+/// resolved default base.
 fn baseline_scan_allowed(
     security_full: bool,
     worktree_dirty: bool,
     target_is_checkout: bool,
+    current_only: bool,
 ) -> bool {
-    !security_full && !worktree_dirty && target_is_checkout
+    !security_full && !worktree_dirty && target_is_checkout && !current_only
 }
 
 /// First 8 hex chars of a commit id for human-readable logs (oids are ASCII).
@@ -477,22 +485,30 @@ mod tests {
     fn baseline_allowed_when_target_is_checkout_and_clean() {
         // Local run whose analysed target IS the checked-out commit: diffing the
         // working tree against the baseline is sound.
-        assert!(baseline_scan_allowed(false, false, true));
+        assert!(baseline_scan_allowed(false, false, true, false));
     }
 
     #[test]
     fn baseline_disallowed_when_target_not_checked_out() {
         // `--pr` / `--remote` / fast remote-only: the fetched target is not the
         // working tree, so a baseline diff would hide real findings → full scan.
-        assert!(!baseline_scan_allowed(false, false, false));
+        assert!(!baseline_scan_allowed(false, false, false, false));
     }
 
     #[test]
     fn baseline_disallowed_when_security_full_or_dirty() {
         // `--security-full` forces a full scan even on the checked-out target.
-        assert!(!baseline_scan_allowed(true, false, true));
+        assert!(!baseline_scan_allowed(true, false, true, false));
         // A dirty worktree cannot be trusted as a clean diff base.
-        assert!(!baseline_scan_allowed(false, true, true));
+        assert!(!baseline_scan_allowed(false, true, true, false));
+    }
+
+    #[test]
+    fn baseline_disallowed_when_current_only() {
+        // `--current-only` drops the bases to scan the whole current state, so
+        // semgrep must never diff-scope against a resolved default base — even on
+        // a clean, checked-out target.
+        assert!(!baseline_scan_allowed(false, false, true, true));
     }
 
     // ── R2-10: ephemeral worktree snapshot for remote targets ──────────
