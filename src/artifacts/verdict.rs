@@ -634,6 +634,7 @@ pub(crate) fn classify_quality_failure(
 ) -> QualityFailureClass {
     let mut saw_in_diff = false;
     let mut saw_out_of_diff = false;
+    let mut saw_unlocated = false;
 
     for finding in dashboard_findings
         .iter()
@@ -642,7 +643,11 @@ pub(crate) fn classify_quality_failure(
         match finding.in_diff {
             Some(true) => saw_in_diff = true,
             Some(false) => saw_out_of_diff = true,
-            None => {}
+            // An unlocated finding (`in_diff == None`) could not be resolved to a
+            // changed-file decision, so its causation is unknown. It must NOT be
+            // silently ignored: a check that mixes an unlocated row with
+            // out-of-diff rows cannot be proven purely pre-existing (R5-23).
+            None => saw_unlocated = true,
         }
     }
 
@@ -656,7 +661,16 @@ pub(crate) fn classify_quality_failure(
         // (build/test/typecheck) an out-of-diff location never proves the
         // failure predates the diff. Either way it stays an unclassified failure
         // that still counts against the gate (`has_new_failures`).
-        (false, true) if clean_comparison && check_id_is_baseline_signal(check_id) => {
+        //
+        // `!saw_unlocated` is the R5-23 guard: the downgrade requires EVERY
+        // finding for this check to be located and out-of-diff. A single
+        // unlocated row (a parse-blind or otherwise unclassifiable finding)
+        // means the pre-existing proof is incomplete, so the check stays
+        // Unclassified and keeps gating rather than approving on partial
+        // evidence.
+        (false, true)
+            if !saw_unlocated && clean_comparison && check_id_is_baseline_signal(check_id) =>
+        {
             QualityFailureClass::Preexisting
         }
         (false, true) => QualityFailureClass::Unclassified,
@@ -975,6 +989,46 @@ mod tests {
         assert_eq!(
             classify_quality_failure("semgrep_scan", &findings, false),
             QualityFailureClass::Unclassified
+        );
+    }
+
+    fn unlocated_finding(check_id: &str) -> DashboardFinding {
+        DashboardFinding {
+            level: "error",
+            check_name: check_id.to_string(),
+            check_id: check_id.to_string(),
+            message: "unlocated finding".to_string(),
+            in_diff: None,
+        }
+    }
+
+    #[test]
+    fn unlocated_plus_out_of_diff_baseline_signal_is_not_preexisting() {
+        // R5-23: one finding could not be located (in_diff == None) while the
+        // rest sit out-of-diff. The unlocated row must block the pre-existing
+        // downgrade — its causation is unknown, so the check cannot be proven
+        // purely pre-existing and stays Unclassified (keeps gating).
+        let findings = [
+            unlocated_finding("semgrep_scan"),
+            out_of_diff_finding("semgrep_scan"),
+        ];
+        assert_eq!(
+            classify_quality_failure("semgrep_scan", &findings, true),
+            QualityFailureClass::Unclassified
+        );
+    }
+
+    #[test]
+    fn all_out_of_diff_baseline_signal_is_preexisting() {
+        // R5-23 control: with every row located and out-of-diff (no unlocated
+        // rows) the downgrade to pre-existing still fires as before.
+        let findings = [
+            out_of_diff_finding("semgrep_scan"),
+            out_of_diff_finding("semgrep_scan"),
+        ];
+        assert_eq!(
+            classify_quality_failure("semgrep_scan", &findings, true),
+            QualityFailureClass::Preexisting
         );
     }
 
