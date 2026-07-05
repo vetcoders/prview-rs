@@ -22,11 +22,19 @@ pub(super) struct InlineFindingsSummary {
 /// Pre-existing rows (`in_diff == Some(false)`) never gate. This mirrors THREAD
 /// 4's pre-existing semantics so the inline gate agrees with the per-check
 /// downgrade.
+///
+/// An out-of-diff row is treated as pre-existing ONLY when the check's
+/// locations are an exhaustive baseline signal (`check_id_is_baseline_signal`).
+/// For whole-project parsers (e.g. `cargo_test`) an out-of-diff location is
+/// causation-unknown — the diff may have caused it — so it still gates, exactly
+/// as `classify_quality_failure` keeps it Unclassified (R2-8).
 pub(super) fn effective_inline_gate_class(inline: &InlineFindingsSummary) -> GateClass {
     let mut new_errors = 0usize;
     let mut new_warnings = 0usize;
     for finding in &inline.dashboard_findings {
-        if finding.in_diff == Some(false) {
+        let out_of_diff_preexisting =
+            finding.in_diff == Some(false) && check_id_is_baseline_signal(&finding.check_id);
+        if out_of_diff_preexisting {
             continue;
         }
         match finding.level {
@@ -775,6 +783,25 @@ mod tests {
         // Causation unknown (in_diff == None) is treated as new, never downgraded.
         let inline = summary(vec![err(None)]);
         assert_eq!(effective_inline_gate_class(&inline), GateClass::Fail);
+    }
+
+    #[test]
+    fn inline_gate_counts_out_of_diff_whole_project_parser_rows() {
+        // R2-8: a cargo_test out-of-diff row is causation-unknown (the diff may
+        // have broken a test in an unchanged file), not pre-existing, so it must
+        // still gate — unlike a baseline-signal semgrep out-of-diff row, which
+        // does not (proven by inline_gate_ignores_preexisting_only_errors).
+        let cargo_test_row = DashboardFinding {
+            level: "error",
+            check_name: "Cargo Test".to_string(),
+            check_id: "cargo_test".to_string(),
+            message: "test failed".to_string(),
+            in_diff: Some(false),
+        };
+        assert_eq!(
+            effective_inline_gate_class(&summary(vec![cargo_test_row])),
+            GateClass::Fail
+        );
     }
 
     #[test]
