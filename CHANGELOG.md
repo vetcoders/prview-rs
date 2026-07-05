@@ -11,8 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-05
+
 ### Added
 
+- `prview mcp --probe`: a fast stdio-server self-check that reports the server
+  version, schema version, tool count, and response time (`--json` for
+  automation). (#5)
+- Curl-pipe installer (`install.sh`) that downloads checksum-verified (SHA256)
+  release binaries, with a documented `cargo install --locked --force`
+  fallback. (#4)
 - `--security-full` flag: opt in to the full security tier, which adds
   `cargo geiger`'s unsafe-usage scan. Off by default (even under `--deep`).
 
@@ -29,12 +37,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the profile — not a skipped caveat — so it no longer affects the
   confidence or analysis status. `--with-security` still raises the heavy
   security posture but no longer pulls in geiger.
+- Semgrep now scans only changed code by default: remote targets are scanned in
+  an ephemeral worktree snapshot, with a full-scan fallback when the target is
+  not checked out or more than one base resolves. This cuts a representative
+  deep-run scan from ~24.5s to ~2.4s. (#8)
+- MCP server now reports contract-honest state: running reviews surface as
+  in-progress (not failed or complete), and the detected default base is
+  validated and honored for remote targets. (#4)
+- `run_id` allocation is shared between the CLI and MCP paths, uses the resolved
+  target suffix, and retries on repo-wide allocation races to stay unique. (#5)
+- Dashboard locale dictionaries are extracted to `locales/*.json` and loaded
+  from there instead of being inlined in the renderer. (#7)
+- crates.io publishing now uses OIDC trusted publishing instead of a stored
+  API token. (#6)
 
 ### Fixed
 
 - A missing `ruff` now reports as `Skipped` (with the spawn-failure reason)
   instead of `Failed`, matching `mypy`'s behavior. Previously any Python repo
   without ruff installed saw a false gate failure.
+- Merge-gate pre-existing downgrade semantics hardened: the downgrade is gated
+  on a clean-comparison signal and a resolved base diff, disabled under
+  `--current-only`, scoped per-check on remote targets, blocked when a finding
+  is unlocated or a tool's config is in the diff, and never applied to
+  whole-project gate failures. Worktree cleanliness is now frozen before checks
+  and artifact writes. (#8)
+- `cargo audit` baseline is keyed by version so a vulnerable-version swap is no
+  longer silently downgraded as pre-existing. (#8)
+- rustfmt Diff-header parsing so out-of-diff formatting findings downgrade
+  correctly. (#8)
+- Dashboard cached locale JavaScript is now escaped. (#7)
+- MCP hardening: probe child stderr is discarded, child review positionals are
+  terminated, run-path ambiguity is canonicalized, ref-existence probes are
+  qualified, and corrupt running entries are skipped. (#4/#5)
+- `install.sh` falls back correctly on musl Linux and honors the requested
+  install dir for the cargo fallback. (#4/#5)
 
 ### Removed
 
@@ -233,5 +270,6 @@ v0.1.2, consolidated from 183 commits on the development branch.
 - Cargo-geiger PascalCase output format for v0.13.0
 - Watch mode change detection using full git status hash
 
-[Unreleased]: https://github.com/vetcoders/prview-rs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/vetcoders/prview-rs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/vetcoders/prview-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/vetcoders/prview-rs/releases/tag/v0.4.0

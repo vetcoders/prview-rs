@@ -25,7 +25,7 @@ Successful output is intentionally short:
 
 ```text
 prview mcp probe ok
-version: 0.4.0
+version: 0.5.0
 schema_version: prview.mcp.v1
 tools: 6
 response_ms: 15
@@ -66,7 +66,7 @@ Confirm the server is operational at session start.
 
 // response
 {
-  "version": "0.4.0",
+  "version": "0.5.0",
   "protocol": "prview.mcp.v1",
   "deps_global": { "git": true },
   "deps_repo": {
