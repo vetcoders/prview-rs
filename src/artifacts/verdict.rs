@@ -419,21 +419,28 @@ pub(crate) fn build_merge_decision_view(
 /// that "every reported location lies outside the diff" genuinely proves the
 /// failure is pre-existing debt and may be downgraded off the merge gate.
 ///
-/// True only for the inline-findings family: per-location scanners and linters
-/// (semgrep, eslint, stylelint, clippy, ruff, cargo audit) where each finding is
-/// an independent, locally-scoped issue whose absence from the diff means it
-/// predates the change.
+/// True only for the inline-findings family: per-location scanners, linters and
+/// formatters (semgrep, eslint, stylelint, clippy, ruff, prettier, rustfmt,
+/// cargo audit) where each finding is an independent, locally-scoped issue whose
+/// absence from the diff means it predates the change.
 ///
 /// False (the safe default) for whole-project gates — `cargo test`, `cargo
-/// check`, `tsc`, `vitest`/`tests`, `pytest`, type checkers — where a single
-/// boolean failure can be *caused* by the diff even though the failing location
-/// (a broken test or a downstream type error) sits in an unchanged file. For
-/// those the location set is symptomatic, not exhaustive, so a pure
+/// check`, `tsc`, `vitest`/`tests`, `pytest`, type checkers (`mypy`) — where a
+/// single boolean failure can be *caused* by the diff even though the failing
+/// location (a broken test or a downstream type error) sits in an unchanged
+/// file. For those the location set is symptomatic, not exhaustive, so a pure
 /// out-of-diff failure must never be trusted as pre-existing.
 pub(crate) fn check_id_is_baseline_signal(check_id: &str) -> bool {
     matches!(
         check_id,
-        "semgrep_scan" | "eslint" | "stylelint" | "clippy" | "ruff" | "cargo_audit"
+        "semgrep_scan"
+            | "eslint"
+            | "stylelint"
+            | "clippy"
+            | "ruff"
+            | "prettier"
+            | "rustfmt"
+            | "cargo_audit"
     )
 }
 
@@ -755,6 +762,8 @@ mod tests {
             "stylelint",
             "clippy",
             "ruff",
+            "prettier",
+            "rustfmt",
             "cargo_audit",
         ] {
             assert!(
