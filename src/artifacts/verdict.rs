@@ -477,10 +477,22 @@ pub(crate) struct CleanComparison {
     /// `--current-only`: the run has no diff baseline, so no out-of-diff row can
     /// be proven pre-existing and the downgrade is disabled entirely (R3-14).
     current_only: bool,
+    /// Whether at least one resolved base differs from the target, i.e. a real
+    /// diff baseline exists. When no base resolves (a repo whose configured
+    /// trunk is absent, or the only base *is* the target) the diffs are empty
+    /// and every location sits out-of-diff trivially — from the missing
+    /// changed-file set, not from any proof it predates the target. Without a
+    /// baseline the pre-existing downgrade must never fire (R4-20).
+    has_base_diff: bool,
 }
 
 impl CleanComparison {
-    pub(crate) fn resolve(config: &Config, resolved_target: &crate::git::ResolvedRef) -> Self {
+    pub(crate) fn resolve(
+        config: &Config,
+        resolved_target: &crate::git::ResolvedRef,
+        resolved_bases: &[crate::git::ResolvedRef],
+    ) -> Self {
+        let has_base_diff = has_resolvable_base_diff(resolved_target, resolved_bases);
         let head = crate::git::Repository::open(&config.repo_root)
             .ok()
             .and_then(|repo| repo.head_commit_id().ok());
@@ -489,6 +501,7 @@ impl CleanComparison {
                 target_is_checkout: head == resolved_target.commit_id,
                 worktree_clean: !worktree_has_uncommitted_changes(&config.repo_root),
                 current_only: config.current_only,
+                has_base_diff,
             },
             // Repo unreadable: preserve the historical downgrade by treating it as
             // a clean local checkout.
@@ -496,12 +509,19 @@ impl CleanComparison {
                 target_is_checkout: true,
                 worktree_clean: true,
                 current_only: config.current_only,
+                has_base_diff,
             },
         }
     }
 
     /// Whether the pre-existing downgrade may fire for `check_id`'s findings.
     pub(crate) fn applies_to(&self, check_id: &str) -> bool {
+        if !self.has_base_diff {
+            // No resolved base differs from the target, so no diff baseline
+            // exists: every location is out-of-diff trivially from the empty
+            // changed-file set and nothing can be proven pre-existing (R4-20).
+            return false;
+        }
         if self.current_only {
             // No diff baseline exists, so nothing can be proven pre-existing: the
             // full-scan findings all sit "out of diff" trivially (R3-14).
@@ -524,6 +544,7 @@ impl CleanComparison {
             target_is_checkout,
             worktree_clean,
             current_only: false,
+            has_base_diff: true,
         }
     }
 
@@ -533,8 +554,32 @@ impl CleanComparison {
             target_is_checkout: true,
             worktree_clean: true,
             current_only: true,
+            has_base_diff: true,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_no_base_diff() -> Self {
+        CleanComparison {
+            target_is_checkout: true,
+            worktree_clean: true,
+            current_only: false,
+            has_base_diff: false,
+        }
+    }
+}
+
+/// Whether any resolved base differs from the target commit — i.e. a real diff
+/// baseline exists. An empty base set, or a base whose commit *is* the target,
+/// yields no baseline: the diffs are empty and every finding sits out-of-diff
+/// trivially, so the pre-existing downgrade must not fire (R4-20).
+fn has_resolvable_base_diff(
+    resolved_target: &crate::git::ResolvedRef,
+    resolved_bases: &[crate::git::ResolvedRef],
+) -> bool {
+    resolved_bases
+        .iter()
+        .any(|base| base.commit_id != resolved_target.commit_id)
 }
 
 /// Whether a check materialises and scans an ephemeral snapshot of the analysed
@@ -1064,6 +1109,60 @@ mod tests {
                 "{id} must not downgrade on a dirty local target"
             );
         }
+    }
+
+    fn resolved_ref(commit_id: &str) -> crate::git::ResolvedRef {
+        crate::git::ResolvedRef {
+            name: commit_id.to_string(),
+            commit_id: commit_id.to_string(),
+            is_remote: false,
+        }
+    }
+
+    #[test]
+    fn no_resolvable_base_diff_when_bases_empty_or_equal_to_target() {
+        // R4-20: an empty base set (a repo whose configured trunk never resolves)
+        // and a base whose commit IS the target both yield no diff baseline.
+        let target = resolved_ref("aaa111");
+        assert!(
+            !has_resolvable_base_diff(&target, &[]),
+            "no base resolved → no baseline"
+        );
+        assert!(
+            !has_resolvable_base_diff(&target, &[resolved_ref("aaa111")]),
+            "base == target → no baseline"
+        );
+        assert!(
+            has_resolvable_base_diff(&target, &[resolved_ref("bbb222")]),
+            "a base distinct from the target IS a real baseline"
+        );
+    }
+
+    #[test]
+    fn no_base_diff_blocks_downgrade_even_on_clean_local_checkout() {
+        // R4-20: without a resolved base different from the target the full scan
+        // has no diff to predate, so a clean local checkout must NOT downgrade —
+        // otherwise a baseless run would PASS on unproven "out-of-diff" rows.
+        let clean = CleanComparison::for_test_no_base_diff();
+        for id in ["semgrep_scan", "rustfmt", "ruff", "eslint"] {
+            assert!(
+                !clean.applies_to(id),
+                "{id} must not downgrade without a diff baseline"
+            );
+        }
+
+        let findings = [out_of_diff_finding("semgrep_scan")];
+        let summary = build_quality_failure_summary(
+            &[failed_check("Semgrep scan")],
+            &findings,
+            &CleanComparison::for_test_no_base_diff(),
+        );
+        assert!(
+            summary.preexisting_quality_failures.is_empty(),
+            "no baseline means nothing can be proven pre-existing"
+        );
+        assert_eq!(summary.unclassified_quality_failures, vec!["Semgrep scan"]);
+        assert!(summary.has_new_failures());
     }
 
     #[test]
