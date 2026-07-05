@@ -459,6 +459,10 @@ pub(crate) fn check_id_is_baseline_signal(check_id: &str) -> bool {
 ///   checkout, a *different* tree than the target — so its out-of-diff rows prove
 ///   nothing about the target diff and must NOT be downgraded (R3-16).
 ///
+/// `--current-only` deliberately drops the diff bases to analyse the whole
+/// current state, so there is no diff baseline a finding can "predate": the
+/// downgrade must never fire regardless of tree shape (R3-14).
+///
 /// On any inability to inspect the repo we default to the permissive "clean local
 /// checkout" shape, preserving the historical downgrade behaviour rather than
 /// distrusting a repo we cannot read.
@@ -470,6 +474,9 @@ pub(crate) struct CleanComparison {
     /// When the local checkout is the target, whether it is free of staged,
     /// unstaged, and untracked changes.
     worktree_clean: bool,
+    /// `--current-only`: the run has no diff baseline, so no out-of-diff row can
+    /// be proven pre-existing and the downgrade is disabled entirely (R3-14).
+    current_only: bool,
 }
 
 impl CleanComparison {
@@ -481,18 +488,25 @@ impl CleanComparison {
             Some(head) => CleanComparison {
                 target_is_checkout: head == resolved_target.commit_id,
                 worktree_clean: !worktree_has_uncommitted_changes(&config.repo_root),
+                current_only: config.current_only,
             },
             // Repo unreadable: preserve the historical downgrade by treating it as
             // a clean local checkout.
             None => CleanComparison {
                 target_is_checkout: true,
                 worktree_clean: true,
+                current_only: config.current_only,
             },
         }
     }
 
     /// Whether the pre-existing downgrade may fire for `check_id`'s findings.
     pub(crate) fn applies_to(&self, check_id: &str) -> bool {
+        if self.current_only {
+            // No diff baseline exists, so nothing can be proven pre-existing: the
+            // full-scan findings all sit "out of diff" trivially (R3-14).
+            return false;
+        }
         if self.target_is_checkout {
             // Local checkout is the target for every check; only a clean tree can
             // be trusted (R2-9).
@@ -509,6 +523,16 @@ impl CleanComparison {
         CleanComparison {
             target_is_checkout,
             worktree_clean,
+            current_only: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_current_only() -> Self {
+        CleanComparison {
+            target_is_checkout: true,
+            worktree_clean: true,
+            current_only: true,
         }
     }
 }
@@ -1040,6 +1064,33 @@ mod tests {
                 "{id} must not downgrade on a dirty local target"
             );
         }
+    }
+
+    #[test]
+    fn current_only_never_downgrades_to_preexisting() {
+        // R3-14: `--current-only` drops the diff bases, so every full-scan finding
+        // is trivially "out of diff". Without a baseline nothing can be proven
+        // pre-existing, so a failed semgrep must stay a new failure that gates —
+        // not a silent PASS-downgrade.
+        let clean = CleanComparison::for_test_current_only();
+        assert!(
+            !clean.applies_to("semgrep_scan"),
+            "current-only must never downgrade even a baseline signal"
+        );
+        assert!(!clean.applies_to("rustfmt"));
+
+        let findings = [out_of_diff_finding("semgrep_scan")];
+        let summary = build_quality_failure_summary(
+            &[failed_check("Semgrep scan")],
+            &findings,
+            &CleanComparison::for_test_current_only(),
+        );
+        assert!(
+            summary.preexisting_quality_failures.is_empty(),
+            "current-only has no baseline to prove a finding pre-existing"
+        );
+        assert_eq!(summary.unclassified_quality_failures, vec!["Semgrep scan"]);
+        assert!(summary.has_new_failures());
     }
 
     #[test]
