@@ -185,15 +185,11 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         });
     }
 
-    // Inline findings blocking
+    // Inline findings blocking — THREAD 7: gate on introduced/unclassified
+    // findings, not the raw error count, so the dashboard agrees with the merge
+    // gate and a pre-existing-only scan does not block.
     let inline_severity = config.policy.severity_for("inline_findings");
-    let inline_class = if inline.status == "failed" {
-        GateClass::Fail
-    } else if inline.status == "warnings" {
-        GateClass::Info
-    } else {
-        GateClass::Pass
-    };
+    let inline_class = effective_inline_gate_class(inline);
     let inline_blocking = config.policy.is_blocking(inline_severity, inline_class);
     if inline_blocking {
         blocking_issues.push(format!("INLINE_FINDINGS ({})", inline.status));

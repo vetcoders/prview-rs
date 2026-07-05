@@ -9,6 +9,41 @@ pub(super) struct InlineFindingsSummary {
     pub(super) dashboard_findings: Vec<DashboardFinding>,
 }
 
+/// Effective gate class for the aggregate INLINE_FINDINGS gate.
+///
+/// The raw `status` field counts *every* SARIF row, so a scan whose findings
+/// are all pre-existing (outside the diff) reports `failed` and — under
+/// `--policy-mode block` — used to block the merge even though every per-check
+/// evaluation classified those same findings as pre-existing and approved them.
+///
+/// Gate instead on the findings the PR is actually responsible for: an error or
+/// warning counts only when it is introduced (`in_diff == Some(true)`) or
+/// unclassified (`in_diff == None` — causation unknown, so treated as new).
+/// Pre-existing rows (`in_diff == Some(false)`) never gate. This mirrors THREAD
+/// 4's pre-existing semantics so the inline gate agrees with the per-check
+/// downgrade.
+pub(super) fn effective_inline_gate_class(inline: &InlineFindingsSummary) -> GateClass {
+    let mut new_errors = 0usize;
+    let mut new_warnings = 0usize;
+    for finding in &inline.dashboard_findings {
+        if finding.in_diff == Some(false) {
+            continue;
+        }
+        match finding.level {
+            "error" => new_errors += 1,
+            "warning" => new_warnings += 1,
+            _ => {}
+        }
+    }
+    if new_errors > 0 {
+        GateClass::Fail
+    } else if new_warnings > 0 {
+        GateClass::Info
+    } else {
+        GateClass::Pass
+    }
+}
+
 pub(super) fn gate_class_for_check(status: crate::checks::CheckStatus) -> GateClass {
     match status {
         crate::checks::CheckStatus::Passed => GateClass::Pass,
@@ -696,4 +731,64 @@ pub(super) fn should_skip_inline_fallback_line(is_geiger: bool, line: &str) -> b
         || (trimmed.chars().next().is_some_and(|c| c.is_ascii_digit())
             && trimmed.contains('/')
             && trimmed.contains("unsafe"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(in_diff: Option<bool>) -> DashboardFinding {
+        DashboardFinding {
+            level: "error",
+            check_name: "Semgrep".to_string(),
+            check_id: "semgrep_scan".to_string(),
+            message: "finding".to_string(),
+            in_diff,
+        }
+    }
+
+    fn summary(dashboard_findings: Vec<DashboardFinding>) -> InlineFindingsSummary {
+        InlineFindingsSummary {
+            status: "failed".to_string(),
+            findings_count: dashboard_findings.len(),
+            dashboard_findings,
+        }
+    }
+
+    #[test]
+    fn inline_gate_ignores_preexisting_only_errors() {
+        // THREAD 7: raw status is "failed" but every error is pre-existing, so
+        // the aggregate gate must not fire (it would block under policy-mode
+        // block despite every per-check evaluation approving these findings).
+        let inline = summary(vec![err(Some(false)), err(Some(false))]);
+        assert_eq!(effective_inline_gate_class(&inline), GateClass::Pass);
+    }
+
+    #[test]
+    fn inline_gate_blocks_on_introduced_errors() {
+        let inline = summary(vec![err(Some(false)), err(Some(true))]);
+        assert_eq!(effective_inline_gate_class(&inline), GateClass::Fail);
+    }
+
+    #[test]
+    fn inline_gate_blocks_on_unclassified_errors() {
+        // Causation unknown (in_diff == None) is treated as new, never downgraded.
+        let inline = summary(vec![err(None)]);
+        assert_eq!(effective_inline_gate_class(&inline), GateClass::Fail);
+    }
+
+    #[test]
+    fn inline_gate_warns_on_new_warnings_only() {
+        let warn = DashboardFinding {
+            level: "warning",
+            check_name: "Semgrep".to_string(),
+            check_id: "semgrep_scan".to_string(),
+            message: "w".to_string(),
+            in_diff: Some(true),
+        };
+        assert_eq!(
+            effective_inline_gate_class(&summary(vec![warn])),
+            GateClass::Info
+        );
+    }
 }

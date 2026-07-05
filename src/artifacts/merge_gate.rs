@@ -109,13 +109,9 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     }
 
     let inline_severity = config.policy.severity_for("inline_findings");
-    let inline_class = if inline.status == "failed" {
-        GateClass::Fail
-    } else if inline.status == "warnings" {
-        GateClass::Info
-    } else {
-        GateClass::Pass
-    };
+    // THREAD 7: gate on introduced/unclassified findings, not the raw error
+    // count — a scan with only pre-existing errors must not block the merge.
+    let inline_class = effective_inline_gate_class(inline);
     let inline_blocking = config.policy.is_blocking(inline_severity, inline_class);
     if inline_blocking {
         blocking_issues.push(format!("INLINE_FINDINGS ({})", inline.status));
