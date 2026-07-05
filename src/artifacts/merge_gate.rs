@@ -691,6 +691,84 @@ mod tests {
         );
     }
 
+    fn rustfmt_warnings_check() -> CheckResult {
+        CheckResult {
+            name: "Rustfmt".to_string(),
+            status: CheckStatus::Warnings,
+            duration: Duration::from_millis(25),
+            output: "Diff in src/a.rs".to_string(),
+            cached: false,
+            provenance: None,
+        }
+    }
+
+    fn run_gate_with_rustfmt_warning(in_diff: bool) -> serde_json::Value {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config();
+        let checks = vec![rustfmt_warnings_check()];
+        let inline = InlineFindingsSummary {
+            status: "warnings".to_string(),
+            findings_count: 1,
+            dashboard_findings: vec![DashboardFinding {
+                level: "warning",
+                check_name: "Rustfmt".to_string(),
+                check_id: "rustfmt".to_string(),
+                message: "needs formatting".to_string(),
+                in_diff: Some(in_diff),
+            }],
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            checks: &checks,
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+            clean_comparison: true,
+        })
+        .expect("merge gate");
+
+        let raw =
+            std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
+        serde_json::from_str(&raw).expect("parse gate json")
+    }
+
+    #[test]
+    fn preexisting_rustfmt_warning_out_of_diff_is_pass_with_caveat() {
+        // R2-13: a warning-level baseline-signal check (Rustfmt) whose findings
+        // all sit outside the diff is pre-existing debt and must get the same
+        // downgrade as a failure — PASS with a pre-existing caveat, not
+        // CONDITIONAL.
+        let gate = run_gate_with_rustfmt_warning(false);
+
+        assert_eq!(gate["decision"]["verdict"].as_str(), Some("PASS"));
+        assert_eq!(gate["decision"]["quality_pass"].as_bool(), Some(true));
+        assert_eq!(
+            gate["decision"]["preexisting_quality_failures"][0].as_str(),
+            Some("Rustfmt")
+        );
+    }
+
+    #[test]
+    fn introduced_rustfmt_warning_in_diff_is_not_downgraded() {
+        // In-diff formatting warnings belong to the change: no downgrade.
+        let gate = run_gate_with_rustfmt_warning(true);
+
+        assert_ne!(gate["decision"]["verdict"].as_str(), Some("PASS"));
+        assert_eq!(
+            gate["decision"]["introduced_quality_failures"][0].as_str(),
+            Some("Rustfmt")
+        );
+    }
+
     #[test]
     fn dirty_scan_out_of_diff_semgrep_finding_does_not_pass() {
         // R2-9: the same out-of-diff semgrep finding that is downgraded to

@@ -548,7 +548,10 @@ pub(crate) fn build_quality_failure_summary(
 ) -> QualityFailureSummary {
     let mut summary = QualityFailureSummary::default();
 
-    for check in checks.iter().filter(|check| check.is_failure()) {
+    for check in checks
+        .iter()
+        .filter(|check| quality_downgrade_eligible(check))
+    {
         let classification = classify_quality_failure(
             &check_id_from_name(&check.name),
             dashboard_findings,
@@ -558,6 +561,21 @@ pub(crate) fn build_quality_failure_summary(
     }
 
     summary
+}
+
+/// Whether a check is eligible for the pre-existing downgrade computation.
+///
+/// Failures (`Failed`/`Error`) always are. Warning-level baseline-signal checks
+/// are too (R2-13): a formatter like Rustfmt reporting `cargo fmt --check`
+/// deltas surfaces as `Warnings`, and when every reported location lies outside
+/// the diff it is purely pre-existing debt that should get the same
+/// preexisting-only downgrade as a failure — otherwise the verdict stays
+/// CONDITIONAL instead of PASS-with-caveat. An in-diff warning is classified
+/// `Introduced` and keeps its review weight (no downgrade).
+fn quality_downgrade_eligible(check: &CheckResult) -> bool {
+    check.is_failure()
+        || (matches!(check.status, crate::checks::CheckStatus::Warnings)
+            && check_id_is_baseline_signal(&check_id_from_name(&check.name)))
 }
 
 pub(crate) fn quality_failure_reason_text(
