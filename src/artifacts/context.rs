@@ -110,7 +110,7 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
     // purely pre-existing must be computed before the effective outcome, so it
     // is hoisted here (also reused for quality_pass below).
     let quality_failures =
-        build_quality_failure_summary(checks, &inline.dashboard_findings, clean_comparison);
+        build_quality_failure_summary(checks, &inline.dashboard_findings, &clean_comparison);
     let preexisting_quality_failure_names: std::collections::BTreeSet<&str> = quality_failures
         .preexisting_quality_failures
         .iter()

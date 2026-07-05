@@ -442,31 +442,86 @@ pub(crate) fn check_id_is_baseline_signal(check_id: &str) -> bool {
     )
 }
 
-/// Whether the scan that produced the findings was a clean comparison, so an
-/// out-of-diff location genuinely proves a finding predates the change.
+/// Per-check clean-comparison signal: whether an all-out-of-diff location set for
+/// a given check may be trusted as pre-existing debt and downgraded off the merge
+/// gate.
 ///
-/// True when the analysed target is a fetched remote ref (semgrep scanned a
-/// clean ephemeral snapshot, R2-10) or when the local working tree has no
-/// uncommitted changes. False for a dirty local scan: uncommitted changes in an
-/// untracked/unstaged file can make a working-tree finding look out-of-diff, so
-/// its findings must not be downgraded to pre-existing (R2-9). On any inability
-/// to inspect the repo we default to `true`, preserving the pre-existing
-/// downgrade behaviour rather than distrusting a repo we cannot read.
-pub(crate) fn scan_was_clean_comparison(
-    config: &Config,
-    resolved_target: &crate::git::ResolvedRef,
-) -> bool {
-    let Ok(repo) = crate::git::Repository::open(&config.repo_root) else {
-        return true;
-    };
-    let Ok(head) = repo.head_commit_id() else {
-        return true;
-    };
-    if head != resolved_target.commit_id {
-        // Remote/snapshot target: the analysed tree is clean by construction.
-        return true;
+/// The downgrade is only sound for a check whose findings came from the analysed
+/// *target* tree. Two shapes qualify:
+///
+/// * **Local target** (`head == target`): every baseline-signal check scans the
+///   working tree, which IS the target — provided the tree is clean. A dirty
+///   worktree can make an uncommitted finding look out-of-diff (R2-9), so a dirty
+///   local scan downgrades nothing.
+/// * **Remote/snapshot target** (`head != target`): only semgrep materialises and
+///   scans an ephemeral snapshot of the target (R2-10). Every other baseline
+///   signal (rustfmt/ruff/eslint/…) still scans `config.repo_root` — the local
+///   checkout, a *different* tree than the target — so its out-of-diff rows prove
+///   nothing about the target diff and must NOT be downgraded (R3-16).
+///
+/// On any inability to inspect the repo we default to the permissive "clean local
+/// checkout" shape, preserving the historical downgrade behaviour rather than
+/// distrusting a repo we cannot read.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CleanComparison {
+    /// `head == target`: the local working tree IS the analysed target, so every
+    /// check scanned the target directly.
+    target_is_checkout: bool,
+    /// When the local checkout is the target, whether it is free of staged,
+    /// unstaged, and untracked changes.
+    worktree_clean: bool,
+}
+
+impl CleanComparison {
+    pub(crate) fn resolve(config: &Config, resolved_target: &crate::git::ResolvedRef) -> Self {
+        let head = crate::git::Repository::open(&config.repo_root)
+            .ok()
+            .and_then(|repo| repo.head_commit_id().ok());
+        match head {
+            Some(head) => CleanComparison {
+                target_is_checkout: head == resolved_target.commit_id,
+                worktree_clean: !worktree_has_uncommitted_changes(&config.repo_root),
+            },
+            // Repo unreadable: preserve the historical downgrade by treating it as
+            // a clean local checkout.
+            None => CleanComparison {
+                target_is_checkout: true,
+                worktree_clean: true,
+            },
+        }
     }
-    !worktree_has_uncommitted_changes(&config.repo_root)
+
+    /// Whether the pre-existing downgrade may fire for `check_id`'s findings.
+    pub(crate) fn applies_to(&self, check_id: &str) -> bool {
+        if self.target_is_checkout {
+            // Local checkout is the target for every check; only a clean tree can
+            // be trusted (R2-9).
+            self.worktree_clean
+        } else {
+            // Remote target: only checks that scanned the target snapshot qualify;
+            // everything else scanned the local checkout, a different tree (R3-16).
+            check_scans_target_snapshot(check_id)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(target_is_checkout: bool, worktree_clean: bool) -> Self {
+        CleanComparison {
+            target_is_checkout,
+            worktree_clean,
+        }
+    }
+}
+
+/// Whether a check materialises and scans an ephemeral snapshot of the analysed
+/// *target* when that target is a fetched remote ref not checked out locally.
+///
+/// Only `semgrep_scan` does this (R2-10): it builds a detached worktree at the
+/// target commit and scans that clean tree, so its out-of-diff findings genuinely
+/// predate the target diff. Every other baseline-signal check scans the local
+/// checkout, which in a `--pr`/`--remote` run is a different tree than the target.
+fn check_scans_target_snapshot(check_id: &str) -> bool {
+    matches!(check_id, "semgrep_scan")
 }
 
 /// True when the working tree at `repo_root` has staged, unstaged, or untracked
@@ -544,7 +599,7 @@ pub(crate) fn push_quality_failure(
 pub(crate) fn build_quality_failure_summary(
     checks: &[CheckResult],
     dashboard_findings: &[DashboardFinding],
-    clean_comparison: bool,
+    clean_comparison: &CleanComparison,
 ) -> QualityFailureSummary {
     let mut summary = QualityFailureSummary::default();
 
@@ -552,10 +607,13 @@ pub(crate) fn build_quality_failure_summary(
         .iter()
         .filter(|check| quality_downgrade_eligible(check))
     {
+        let check_id = check_id_from_name(&check.name);
+        // The clean-comparison gate is per-check: only checks that scanned the
+        // analysed target may have out-of-diff findings downgraded (R3-16).
         let classification = classify_quality_failure(
-            &check_id_from_name(&check.name),
+            &check_id,
             dashboard_findings,
-            clean_comparison,
+            clean_comparison.applies_to(&check_id),
         );
         push_quality_failure(&mut summary, check.name.clone(), classification);
     }
@@ -799,6 +857,17 @@ mod tests {
         }
     }
 
+    fn warning_check(name: &str) -> CheckResult {
+        CheckResult {
+            name: name.to_string(),
+            status: crate::checks::CheckStatus::Warnings,
+            duration: std::time::Duration::from_millis(1),
+            output: String::new(),
+            cached: false,
+            provenance: None,
+        }
+    }
+
     #[test]
     fn semgrep_out_of_diff_findings_are_preexisting() {
         // A scanner whose locations are an exhaustive baseline signal: all
@@ -874,7 +943,11 @@ mod tests {
         // whose findings all sit outside the diff is NOT silently downgraded —
         // it stays a new failure that fails `has_new_failures`.
         let findings = [out_of_diff_finding("cargo_test")];
-        let summary = build_quality_failure_summary(&[failed_check("cargo test")], &findings, true);
+        let summary = build_quality_failure_summary(
+            &[failed_check("cargo test")],
+            &findings,
+            &CleanComparison::for_test(true, true),
+        );
         assert!(summary.preexisting_quality_failures.is_empty());
         assert_eq!(summary.unclassified_quality_failures, vec!["cargo test"]);
         assert!(summary.has_new_failures());
@@ -883,8 +956,11 @@ mod tests {
     #[test]
     fn failed_semgrep_out_of_diff_is_preexisting_and_not_new() {
         let findings = [out_of_diff_finding("semgrep_scan")];
-        let summary =
-            build_quality_failure_summary(&[failed_check("Semgrep scan")], &findings, true);
+        let summary = build_quality_failure_summary(
+            &[failed_check("Semgrep scan")],
+            &findings,
+            &CleanComparison::for_test(true, true),
+        );
         assert_eq!(summary.preexisting_quality_failures, vec!["Semgrep scan"]);
         assert!(!summary.has_new_failures());
     }
@@ -894,11 +970,76 @@ mod tests {
         // R2-9 end-to-end: with a dirty scan the out-of-diff semgrep failure is
         // not downgraded, so it stays a new failure that fails the gate.
         let findings = [out_of_diff_finding("semgrep_scan")];
-        let summary =
-            build_quality_failure_summary(&[failed_check("Semgrep scan")], &findings, false);
+        let summary = build_quality_failure_summary(
+            &[failed_check("Semgrep scan")],
+            &findings,
+            &CleanComparison::for_test(true, false),
+        );
         assert!(summary.preexisting_quality_failures.is_empty());
         assert_eq!(summary.unclassified_quality_failures, vec!["Semgrep scan"]);
         assert!(summary.has_new_failures());
+    }
+
+    #[test]
+    fn remote_target_downgrades_only_snapshot_scanned_checks() {
+        // R3-16: on a remote/snapshot target (head != target) only semgrep scanned
+        // the target snapshot. rustfmt scanned the local checkout — a different
+        // tree — so its out-of-diff rows must NOT be downgraded to pre-existing,
+        // while semgrep's still are.
+        let clean = CleanComparison::for_test(false, true);
+        assert!(
+            clean.applies_to("semgrep_scan"),
+            "semgrep scans the target snapshot, downgrade applies"
+        );
+        assert!(
+            !clean.applies_to("rustfmt"),
+            "rustfmt scanned the local checkout, downgrade must not apply"
+        );
+        assert!(!clean.applies_to("ruff"));
+        assert!(!clean.applies_to("eslint"));
+
+        let findings = [out_of_diff_finding("rustfmt")];
+        let summary = build_quality_failure_summary(
+            &[warning_check("Rustfmt")],
+            &findings,
+            &CleanComparison::for_test(false, true),
+        );
+        assert!(
+            summary.preexisting_quality_failures.is_empty(),
+            "a local-checkout rustfmt finding is not pre-existing on a remote target"
+        );
+        assert_eq!(summary.unclassified_quality_failures, vec!["Rustfmt"]);
+
+        let semgrep_findings = [out_of_diff_finding("semgrep_scan")];
+        let semgrep_summary = build_quality_failure_summary(
+            &[failed_check("Semgrep scan")],
+            &semgrep_findings,
+            &CleanComparison::for_test(false, true),
+        );
+        assert_eq!(
+            semgrep_summary.preexisting_quality_failures,
+            vec!["Semgrep scan"]
+        );
+    }
+
+    #[test]
+    fn local_target_downgrades_all_baseline_signals_when_clean() {
+        // head == target: the local checkout IS the target for every check, so a
+        // clean worktree downgrades any baseline-signal out-of-diff finding.
+        let clean = CleanComparison::for_test(true, true);
+        for id in ["semgrep_scan", "rustfmt", "ruff", "eslint"] {
+            assert!(
+                clean.applies_to(id),
+                "{id} should downgrade on a clean local target"
+            );
+        }
+        let dirty = CleanComparison::for_test(true, false);
+        for id in ["semgrep_scan", "rustfmt", "ruff", "eslint"] {
+            assert!(
+                !dirty.applies_to(id),
+                "{id} must not downgrade on a dirty local target"
+            );
+        }
     }
 
     #[test]

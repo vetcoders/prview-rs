@@ -24,7 +24,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     let engine = PolicyEngine::new(config);
     let policy_summary = engine.evaluate_all(checks, skipped_checks);
     let quality_failures =
-        build_quality_failure_summary(checks, &inline.dashboard_findings, clean_comparison);
+        build_quality_failure_summary(checks, &inline.dashboard_findings, &clean_comparison);
     let preexisting_quality_failure_names = quality_failures
         .preexisting_quality_failures
         .iter()
@@ -511,6 +511,9 @@ mod tests {
         security_full: bool,
         clean_comparison: bool,
     ) -> serde_json::Value {
+        // The gate tests exercise a local checkout target, so map the historical
+        // global `clean_comparison` bool onto the worktree-clean axis.
+        let clean_comparison = CleanComparison::for_test(true, clean_comparison);
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut config = test_config();
         config.security_full = security_full;
@@ -588,7 +591,7 @@ mod tests {
             skipped_checks: &[],
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
-            clean_comparison: true,
+            clean_comparison: CleanComparison::for_test(true, true),
         })
         .expect("merge gate");
 
@@ -732,7 +735,7 @@ mod tests {
             skipped_checks: &[],
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
-            clean_comparison: true,
+            clean_comparison: CleanComparison::for_test(true, true),
         })
         .expect("merge gate");
 
