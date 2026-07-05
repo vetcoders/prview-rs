@@ -161,12 +161,29 @@ fn build_semgrep_args(config_arg: &str, baseline_commit: Option<&str>) -> Vec<St
 }
 
 fn semgrep_baseline_commit(config: &Config, cwd: &Path) -> Option<String> {
-    if config.security_full || worktree_has_uncommitted_changes(cwd) {
+    let repo = Repository::open(cwd).ok()?;
+    let target = repo.resolve_target(config).ok()?;
+    let head = repo.head_commit_id().ok()?;
+    let target_is_checkout = head == target.commit_id;
+    let dirty = worktree_has_uncommitted_changes(cwd);
+
+    if !baseline_scan_allowed(config.security_full, dirty, target_is_checkout) {
+        // `--pr` / `--remote` / fast remote-only presets analyse a *fetched*
+        // ref that is not checked out. A `--baseline-commit` scan diffs the
+        // working tree against the baseline, so on a clean local checkout
+        // (e.g. `main`) it would diff empty and hide real findings in the
+        // target. Surface the reason and fall back to a full scan.
+        if !target_is_checkout && !config.security_full && !config.quiet {
+            eprintln!(
+                "semgrep: analysed target {} is not the checked-out commit {}; \
+                 running a full scan instead of a diff-scoped baseline",
+                short_oid(&target.commit_id),
+                short_oid(&head),
+            );
+        }
         return None;
     }
 
-    let repo = Repository::open(cwd).ok()?;
-    let target = repo.resolve_target(config).ok()?;
     let base = repo.resolve_bases(config).ok()?.into_iter().next()?;
 
     if base.commit_id == target.commit_id {
@@ -174,6 +191,28 @@ fn semgrep_baseline_commit(config: &Config, cwd: &Path) -> Option<String> {
     }
 
     repo.merge_base(&base.commit_id, &target.commit_id).ok()
+}
+
+/// Whether semgrep may run a diff-scoped `--baseline-commit` scan.
+///
+/// Baseline mode diffs the *working tree* against the baseline commit, so it is
+/// only sound when the analysed target is the commit currently checked out
+/// (`target_is_checkout`). In remote-target modes (`--pr`, `--remote`, the fast
+/// remote-only preset) the target is a fetched ref that is NOT checked out, so
+/// the working tree would diff empty and mask real findings — those runs must
+/// fall back to a full scan. A dirty worktree or an explicit `--security-full`
+/// also forces a full scan.
+fn baseline_scan_allowed(
+    security_full: bool,
+    worktree_dirty: bool,
+    target_is_checkout: bool,
+) -> bool {
+    !security_full && !worktree_dirty && target_is_checkout
+}
+
+/// First 8 hex chars of a commit id for human-readable logs (oids are ASCII).
+fn short_oid(id: &str) -> &str {
+    &id[..id.len().min(8)]
 }
 
 fn worktree_has_uncommitted_changes(cwd: &Path) -> bool {
@@ -285,5 +324,27 @@ mod tests {
         let config = test_config();
         let check = SemgrepCheck;
         let _ = check.check_eligibility(&config);
+    }
+
+    #[test]
+    fn baseline_allowed_when_target_is_checkout_and_clean() {
+        // Local run whose analysed target IS the checked-out commit: diffing the
+        // working tree against the baseline is sound.
+        assert!(baseline_scan_allowed(false, false, true));
+    }
+
+    #[test]
+    fn baseline_disallowed_when_target_not_checked_out() {
+        // `--pr` / `--remote` / fast remote-only: the fetched target is not the
+        // working tree, so a baseline diff would hide real findings → full scan.
+        assert!(!baseline_scan_allowed(false, false, false));
+    }
+
+    #[test]
+    fn baseline_disallowed_when_security_full_or_dirty() {
+        // `--security-full` forces a full scan even on the checked-out target.
+        assert!(!baseline_scan_allowed(true, false, true));
+        // A dirty worktree cannot be trusted as a clean diff base.
+        assert!(!baseline_scan_allowed(false, true, true));
     }
 }
