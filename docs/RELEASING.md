@@ -26,12 +26,12 @@ Configure crates.io before the next tag release:
 2. Sign in as an owner of the `prview` crate.
 3. Go to **Settings**.
 4. Open **Trusted Publishing**.
-5. Click **New**.
+5. Click **Add**.
 6. Select **GitHub Actions**.
-7. Set owner to `vetcoders`.
-8. Set repository to `prview-rs`.
-9. Set workflow file to `release.yml`.
-10. Set environment to `release`.
+7. Set **Repository owner** to `vetcoders`.
+8. Set **Repository name** to `prview-rs`.
+9. Set **Workflow filename** to `release.yml`.
+10. Set **Environment** to `release`.
 11. Save the trusted publisher configuration.
 
 After the first successful OIDC-based publish from `.github/workflows/release.yml`,
