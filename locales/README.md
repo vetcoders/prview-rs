@@ -11,7 +11,7 @@ Rules for editing:
 - Keep placeholders such as `{count}`, `{pct}`, `{passed}`, and `{total}` intact.
 - Keep product/tool names and common dev terms natural: `prview`, `PR`, `merge`,
   `review`, `runtime`, `dashboard`, `i18n`, `Loctree`, `Vibecrafted`.
-- Follow the local canon in `~/Git/vetcoders-agents/localization/`:
+- Follow the vetcoders-agents localization canon:
   `vibecrafted_glossary_rules-PL.md` and
   `vibecrafted-skill-PL-localization-spec.md`. A prview-specific glossary is
   planned there as `prview_glossary_rules-PL.md`; until it exists, use the
