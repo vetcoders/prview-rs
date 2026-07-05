@@ -184,6 +184,15 @@ impl<'a> PolicyEngine<'a> {
 
         let confidence_impact = if result.status == CheckStatus::Error {
             AnalysisStatus::Incomplete
+        } else if semgrep_scan_is_degraded(&id, result) {
+            // A semgrep scan that reports parse errors analysed the target only
+            // partially, so its finding set is incomplete: an introduced finding
+            // may hide in the spans semgrep could not parse. Mark the analysis
+            // Degraded so a later pre-existing downgrade (which neutralises the
+            // finding impact) cannot launder a partial scan into a clean PASS —
+            // the completeness signal survives independently of the findings
+            // (R5-24).
+            AnalysisStatus::Degraded
         } else {
             AnalysisStatus::Complete
         };
@@ -343,6 +352,15 @@ impl<'a> PolicyEngine<'a> {
             review_caveats,
         }
     }
+}
+
+/// Whether a check is a semgrep scan whose output reports scan/parse errors —
+/// meaning it analysed the target incompletely. Completeness is a policy signal
+/// (it feeds `confidence_impact`), so evaluating it here keeps the analysis
+/// status derived in one place; the detection itself lives in the semgrep module
+/// as the single source of truth for "what a degraded semgrep scan looks like".
+fn semgrep_scan_is_degraded(check_id: &str, result: &CheckResult) -> bool {
+    check_id == "semgrep_scan" && crate::checks::semgrep_output_reports_scan_errors(&result.output)
 }
 
 /// Map a skip's execution-state classification to its reported tool outcome.

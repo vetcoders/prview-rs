@@ -6,6 +6,7 @@ use crate::git::{Repository, ResolvedRef, git_cmd};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Local;
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 pub struct SemgrepCheck;
@@ -117,20 +118,28 @@ fn classify_semgrep_status(command_succeeded: bool, stdout: &str, combined: &str
         return CheckStatus::Failed;
     }
 
-    if semgrep_has_scan_errors(stdout) || combined.contains("warning") {
+    if output_reports_scan_errors(stdout) || combined.contains("warning") {
         return CheckStatus::Warnings;
     }
 
     CheckStatus::Passed
 }
 
-/// True when semgrep's JSON output reports any scan/parse errors (including
-/// `PartialParsing`) in its `errors[]` array.
-fn semgrep_has_scan_errors(stdout: &str) -> bool {
-    let Some(start) = stdout.find('{') else {
+/// True when semgrep's output reports any scan/parse errors (including
+/// `PartialParsing`) in its JSON `errors[]` array — i.e. part of the target
+/// could not be analysed, so the reported finding set is incomplete.
+///
+/// Robust to trailing bytes after the JSON object: the check stores stdout and
+/// stderr combined, so a stray progress/warning line may follow the JSON. A
+/// streaming deserializer reads the first JSON value and ignores the rest,
+/// rather than failing the whole parse the way `from_str` (which rejects
+/// trailing input) would.
+pub(crate) fn output_reports_scan_errors(output: &str) -> bool {
+    let Some(start) = output.find('{') else {
         return false;
     };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stdout[start..].trim()) else {
+    let mut de = serde_json::Deserializer::from_str(&output[start..]);
+    let Ok(parsed) = serde_json::Value::deserialize(&mut de) else {
         return false;
     };
     parsed
@@ -480,12 +489,21 @@ mod tests {
     }
 
     #[test]
-    fn semgrep_has_scan_errors_detects_partial_parsing() {
+    fn output_reports_scan_errors_detects_partial_parsing() {
         let with_errors = r#"{"results":[],"errors":[{"type":["PartialParsing",[]]}]}"#;
         let without_errors = r#"{"results":[],"errors":[]}"#;
-        assert!(semgrep_has_scan_errors(with_errors));
-        assert!(!semgrep_has_scan_errors(without_errors));
-        assert!(!semgrep_has_scan_errors("not json"));
+        assert!(output_reports_scan_errors(with_errors));
+        assert!(!output_reports_scan_errors(without_errors));
+        assert!(!output_reports_scan_errors("not json"));
+    }
+
+    #[test]
+    fn output_reports_scan_errors_tolerates_trailing_stderr() {
+        // The check stores stdout+stderr combined, so a stderr progress line may
+        // follow the JSON object. A strict `from_str` would reject the trailing
+        // bytes and miss the errors; the streaming reader must still see them.
+        let combined = "{\"results\":[],\"errors\":[{\"type\":[\"PartialParsing\",[]]}]}\nsome semgrep stderr noise\n";
+        assert!(output_reports_scan_errors(combined));
     }
 
     #[test]

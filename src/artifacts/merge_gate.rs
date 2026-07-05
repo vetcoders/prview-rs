@@ -356,8 +356,13 @@ pub(super) fn compute_effective_policy_outcome(
     for eval in evaluations {
         let preexisting_only = preexisting_quality_failure_names.contains(eval.name.as_str());
         let effective_eval = effective_quality_gate_eval(eval, preexisting_only);
+        // The confidence axis bumps for EVERY check, including pre-existing-only
+        // ones. The downgrade only neutralises the finding/merge impact — it must
+        // not launder a degraded/incomplete analysis into Complete (R5-24). Since
+        // a downgraded eval carries merge_impact = Approve, bumping the merge axis
+        // here is a no-op for it, so only its (preserved) confidence propagates.
+        bump_effective_gate_axes(&mut worst_confidence, &mut worst_merge, &effective_eval);
         if !preexisting_only {
-            bump_effective_gate_axes(&mut worst_confidence, &mut worst_merge, &effective_eval);
             if effective_eval.conclusion == PolicyConclusion::Blocked {
                 blocking_issues.push(format!(
                     "{} ({})",
@@ -390,7 +395,11 @@ fn effective_quality_gate_eval(
 
     let mut effective = eval.clone();
     effective.conclusion = crate::policy::engine::PolicyConclusion::Advisory;
-    effective.confidence_impact = crate::policy::engine::AnalysisStatus::Complete;
+    // Only the finding-derived impact is downgraded. `confidence_impact` is the
+    // orthogonal analysis-completeness axis and is preserved verbatim: a
+    // pre-existing-only check whose scan was degraded/incomplete (e.g. a semgrep
+    // partial parse) must keep that signal so the verdict cannot become a clean
+    // PASS on a scan that never analysed the whole target (R5-24).
     effective.merge_impact = crate::policy::engine::MergeRecommendation::Approve;
     effective.reason = Some("pre-existing findings outside the change".to_string());
     effective
@@ -550,6 +559,49 @@ mod tests {
         serde_json::from_str(&raw).expect("parse gate json")
     }
 
+    fn run_gate_with_semgrep_output(output: &str, in_diff: bool) -> serde_json::Value {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config();
+        let checks = vec![CheckResult {
+            name: "Semgrep scan".to_string(),
+            status: CheckStatus::Failed,
+            duration: Duration::from_millis(25),
+            output: output.to_string(),
+            cached: false,
+            provenance: None,
+        }];
+        let inline = InlineFindingsSummary {
+            status: "failed".to_string(),
+            findings_count: 1,
+            dashboard_findings: vec![semgrep_dashboard_finding(
+                if in_diff { "src/b.rs" } else { "src/a.rs" },
+                in_diff,
+            )],
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            checks: &checks,
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+        })
+        .expect("merge gate");
+
+        let raw =
+            std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
+        serde_json::from_str(&raw).expect("parse gate json")
+    }
+
     fn cargo_test_check() -> CheckResult {
         CheckResult {
             name: "cargo test".to_string(),
@@ -663,6 +715,67 @@ mod tests {
             Some("pre-existing findings outside the change")
         );
         assert_eq!(gate["checks"][0]["blocking"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn preexisting_semgrep_with_scan_errors_does_not_get_clean_pass() {
+        // R5-24: a full scan whose findings all sit out-of-diff is downgraded off
+        // the finding axis, but its errors[] mean part of the target was never
+        // parsed. The degraded-analysis signal must survive the downgrade so the
+        // verdict is CONDITIONAL, not a clean PASS that hides the partial
+        // coverage — an introduced finding could hide in the unparsed spans.
+        let gate = run_gate_with_semgrep_output(
+            r#"{"results":[],"errors":[{"type":["PartialParsing",[]],"level":"warn"}]}"#,
+            false,
+        );
+
+        assert_ne!(gate["decision"]["verdict"].as_str(), Some("PASS"));
+        assert_eq!(
+            gate["decision"]["analysis_status"].as_str(),
+            Some("degraded")
+        );
+        // The finding impact is still downgraded: it lands in the pre-existing
+        // bucket, not as a new failure that blocks.
+        assert_eq!(
+            gate["decision"]["preexisting_quality_failures"][0].as_str(),
+            Some("Semgrep scan")
+        );
+    }
+
+    #[test]
+    fn downgrade_of_degraded_scan_keeps_confidence_but_drops_finding_impact() {
+        use crate::policy::engine::{AnalysisStatus, MergeRecommendation, PolicyEngine};
+
+        // R5-24 at the shared-outcome level: the engine degrades a partial
+        // semgrep scan's confidence, and the pre-existing downgrade preserves it
+        // while neutralising the finding/merge impact.
+        let config = test_config();
+        let engine = PolicyEngine::new(&config);
+        let degraded = CheckResult {
+            name: "Semgrep scan".to_string(),
+            status: CheckStatus::Failed,
+            duration: Duration::from_millis(1),
+            output: r#"{"results":[],"errors":[{"type":["PartialParsing",[]]}]}"#.to_string(),
+            cached: false,
+            provenance: None,
+        };
+        let summary = engine.evaluate_all(std::slice::from_ref(&degraded), &[]);
+        assert_eq!(
+            summary.evaluations[0].confidence_impact,
+            AnalysisStatus::Degraded,
+            "a partial semgrep scan degrades the analysis confidence"
+        );
+
+        let mut preexisting = std::collections::BTreeSet::new();
+        preexisting.insert("Semgrep scan");
+        let outcome = compute_effective_policy_outcome(&summary.evaluations, &preexisting);
+        assert_eq!(outcome.worst_merge, MergeRecommendation::Approve);
+        assert!(outcome.blocking_issues.is_empty());
+        assert_eq!(
+            outcome.worst_confidence,
+            AnalysisStatus::Degraded,
+            "the downgrade must not launder a degraded scan back to Complete"
+        );
     }
 
     #[test]
