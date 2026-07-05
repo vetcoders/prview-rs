@@ -419,28 +419,26 @@ pub(crate) fn build_merge_decision_view(
 /// that "every reported location lies outside the diff" genuinely proves the
 /// failure is pre-existing debt and may be downgraded off the merge gate.
 ///
-/// True only for the inline-findings family: per-location scanners, linters and
-/// formatters (semgrep, eslint, stylelint, clippy, ruff, prettier, rustfmt,
-/// cargo audit) where each finding is an independent, locally-scoped issue whose
-/// absence from the diff means it predates the change.
+/// True only for per-location scanners, linters and formatters (semgrep,
+/// eslint, stylelint, ruff, prettier, rustfmt, cargo audit) where each finding
+/// is an independent, locally-scoped issue whose absence from the diff means it
+/// predates the change. Formatters qualify because `cargo fmt --check` /
+/// `prettier --check` report per-file format deltas that do not depend on
+/// compiling the whole project.
 ///
 /// False (the safe default) for whole-project gates — `cargo test`, `cargo
-/// check`, `tsc`, `vitest`/`tests`, `pytest`, type checkers (`mypy`) — where a
-/// single boolean failure can be *caused* by the diff even though the failing
-/// location (a broken test or a downstream type error) sits in an unchanged
-/// file. For those the location set is symptomatic, not exhaustive, so a pure
-/// out-of-diff failure must never be trusted as pre-existing.
+/// check`, `clippy`, `tsc`, `vitest`/`tests`, `pytest`, type checkers (`mypy`)
+/// — where a single boolean failure can be *caused* by the diff even though the
+/// failing location sits in an unchanged file. `clippy` belongs here, NOT with
+/// the formatters: `cargo clippy -- -D warnings` is also a whole-project
+/// compile gate, so a public-API change in the diff can break compilation of a
+/// downstream module outside the diff. For these the location set is
+/// symptomatic, not exhaustive, so a pure out-of-diff failure must never be
+/// trusted as pre-existing.
 pub(crate) fn check_id_is_baseline_signal(check_id: &str) -> bool {
     matches!(
         check_id,
-        "semgrep_scan"
-            | "eslint"
-            | "stylelint"
-            | "clippy"
-            | "ruff"
-            | "prettier"
-            | "rustfmt"
-            | "cargo_audit"
+        "semgrep_scan" | "eslint" | "stylelint" | "ruff" | "prettier" | "rustfmt" | "cargo_audit"
     )
 }
 
@@ -824,7 +822,6 @@ mod tests {
             "semgrep_scan",
             "eslint",
             "stylelint",
-            "clippy",
             "ruff",
             "prettier",
             "rustfmt",
@@ -835,7 +832,17 @@ mod tests {
                 "{id} should be baseline signal"
             );
         }
-        for id in ["cargo_test", "cargo", "tsc", "tests", "pytest", "mypy"] {
+        // clippy is a whole-project compile gate (`cargo clippy -- -D warnings`),
+        // not a per-location formatter, so it must NOT be a baseline signal.
+        for id in [
+            "cargo_test",
+            "cargo",
+            "clippy",
+            "tsc",
+            "tests",
+            "pytest",
+            "mypy",
+        ] {
             assert!(
                 !check_id_is_baseline_signal(id),
                 "{id} is a whole-project gate, not a baseline signal"
