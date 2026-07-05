@@ -34,6 +34,12 @@ pub struct App {
     pub config: Config,
     pub repo: git::Repository,
     pub(crate) start_time: Instant,
+    /// Working-tree cleanliness captured at construction — before ref refresh,
+    /// checks, or artifact writes touch the tree (R4-19). Frozen so the
+    /// pre-existing downgrade judges the scanned source state, not tool output
+    /// (an in-repo `--output-dir` or an untracked check cache) that appears
+    /// later in the run.
+    pub(crate) worktree_clean_at_start: bool,
 }
 
 impl App {
@@ -54,11 +60,15 @@ impl App {
     /// Create new App instance from Config
     pub fn from_config(config: Config) -> Result<Self> {
         let repo = git::Repository::open(&config.repo_root)?;
+        // Freeze cleanliness now — before any check runs or artifact is written
+        // (R4-19).
+        let worktree_clean_at_start = artifacts::capture_worktree_clean(&config.repo_root);
 
         Ok(Self {
             config,
             repo,
             start_time: Instant::now(),
+            worktree_clean_at_start,
         })
     }
 
@@ -172,6 +182,7 @@ impl App {
             resolved_bases: &bases,
             run_start: self.start_time,
             skipped_checks,
+            worktree_clean: self.worktree_clean_at_start,
         })?;
 
         // 8. Build report
@@ -435,6 +446,7 @@ impl App {
             resolved_bases: &bases,
             run_start: run_started_at,
             skipped_checks: vec![],
+            worktree_clean: self.worktree_clean_at_start,
         })?;
 
         Ok(output::Report {

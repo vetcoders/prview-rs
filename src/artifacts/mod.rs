@@ -127,6 +127,11 @@ pub struct GenerateInput<'a> {
     pub resolved_bases: &'a [ResolvedRef],
     pub run_start: Instant,
     pub skipped_checks: Vec<crate::checks::SkippedCheck>,
+    /// Working-tree cleanliness captured BEFORE checks ran and before any
+    /// artifact was written (R4-19). Frozen here so an in-repo `--output-dir` or
+    /// an untracked check cache cannot flip a clean source scan to "dirty" and
+    /// suppress the pre-existing downgrade.
+    pub worktree_clean: bool,
 }
 
 struct RunJsonInput<'a> {
@@ -238,6 +243,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         resolved_bases,
         run_start,
         skipped_checks,
+        worktree_clean,
     } = input;
     let t_total = Instant::now();
     let mut stage_timings = Vec::new();
@@ -390,7 +396,8 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     // Whether out-of-diff findings may be trusted as pre-existing. Computed once
     // and shared by the merge gate and the dashboard context so both verdict
     // surfaces gate the pre-existing downgrade identically (R2-9).
-    let clean_comparison = CleanComparison::resolve(config, resolved_target, resolved_bases);
+    let clean_comparison =
+        CleanComparison::resolve(config, resolved_target, resolved_bases, worktree_clean);
 
     generate_merge_gate(MergeGateInput {
         dir: &summary_dir,

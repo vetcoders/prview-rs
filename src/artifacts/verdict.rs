@@ -487,10 +487,17 @@ pub(crate) struct CleanComparison {
 }
 
 impl CleanComparison {
+    /// Build the comparison from a `worktree_clean` value **frozen before the
+    /// run touched the tree** (R4-19). Cleanliness must be captured once, before
+    /// checks run and before any artifact is written, otherwise an in-repo
+    /// `--output-dir` or a check that drops an untracked cache makes a clean
+    /// source scan look "dirty" and blocks the pre-existing downgrade. See
+    /// [`capture_worktree_clean`].
     pub(crate) fn resolve(
         config: &Config,
         resolved_target: &crate::git::ResolvedRef,
         resolved_bases: &[crate::git::ResolvedRef],
+        worktree_clean: bool,
     ) -> Self {
         let has_base_diff = has_resolvable_base_diff(resolved_target, resolved_bases);
         let head = crate::git::Repository::open(&config.repo_root)
@@ -499,15 +506,16 @@ impl CleanComparison {
         match head {
             Some(head) => CleanComparison {
                 target_is_checkout: head == resolved_target.commit_id,
-                worktree_clean: !worktree_has_uncommitted_changes(&config.repo_root),
+                worktree_clean,
                 current_only: config.current_only,
                 has_base_diff,
             },
-            // Repo unreadable: preserve the historical downgrade by treating it as
-            // a clean local checkout.
+            // Repo unreadable: preserve the historical downgrade by treating the
+            // target as the local checkout. `worktree_clean` was itself captured
+            // permissively (errors resolve to clean), so it stays consistent.
             None => CleanComparison {
                 target_is_checkout: true,
-                worktree_clean: true,
+                worktree_clean,
                 current_only: config.current_only,
                 has_base_diff,
             },
@@ -591,6 +599,16 @@ fn has_resolvable_base_diff(
 /// checkout, which in a `--pr`/`--remote` run is a different tree than the target.
 fn check_scans_target_snapshot(check_id: &str) -> bool {
     matches!(check_id, "semgrep_scan")
+}
+
+/// Capture whether the working tree at `repo_root` is clean, for freezing the
+/// value BEFORE any check runs or artifact is written (R4-19). Cleanliness read
+/// after the run reflects prview/tool-generated files (an in-repo `--output-dir`
+/// or an untracked check cache), not the source state that was scanned — which
+/// would wrongly mark a clean run "dirty" and suppress the pre-existing
+/// downgrade. Errors resolve to clean to keep the permissive default.
+pub(crate) fn capture_worktree_clean(repo_root: &std::path::Path) -> bool {
+    !worktree_has_uncommitted_changes(repo_root)
 }
 
 /// True when the working tree at `repo_root` has staged, unstaged, or untracked
@@ -1198,6 +1216,45 @@ mod tests {
         assert_eq!(
             classify_quality_failure("cargo_test", &findings, true),
             QualityFailureClass::Introduced
+        );
+    }
+
+    #[test]
+    fn capture_worktree_clean_reflects_tree_at_capture_time() {
+        // R4-19: cleanliness is read from the live tree, so capturing BEFORE
+        // tool output (clean) and AFTER it (an untracked artifact/cache) yield
+        // different answers — the reason the value must be frozen up front
+        // rather than re-read once artifacts 10/20/30 have been written.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git2::Repository::init(tmp.path()).expect("init repo");
+        assert!(
+            capture_worktree_clean(tmp.path()),
+            "a freshly initialised repo has a clean tree"
+        );
+
+        // A file dropped after capture (an in-repo --output-dir or a check
+        // cache) makes a *later* read dirty; the frozen early value must not.
+        std::fs::write(tmp.path().join("prview-output.txt"), b"artifact").expect("write");
+        assert!(
+            !capture_worktree_clean(tmp.path()),
+            "an untracked file makes a fresh read dirty"
+        );
+    }
+
+    #[test]
+    fn frozen_clean_value_keeps_downgrade_after_later_writes() {
+        // R4-19: the downgrade uses the cleanliness frozen before the run, not a
+        // live re-read. Captured clean, the local-target downgrade stays enabled
+        // even though tool output later dirties the tree — whereas a late read
+        // would have seen the untracked artifact and suppressed it.
+        let frozen_clean = CleanComparison::for_test(true, true);
+        assert!(frozen_clean.applies_to("rustfmt"));
+        assert!(frozen_clean.applies_to("semgrep_scan"));
+
+        let read_late_dirty = CleanComparison::for_test(true, false);
+        assert!(
+            !read_late_dirty.applies_to("rustfmt"),
+            "a late dirty read would wrongly kill the downgrade"
         );
     }
 }

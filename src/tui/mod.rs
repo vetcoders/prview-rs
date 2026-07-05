@@ -271,8 +271,10 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
     let t_start = std::time::Instant::now();
 
     // --- Sync phase: all git2 (non-Send) work happens here ---
-    let (config, diffs, target, bases, target_snap, base_snap) = {
+    let (config, diffs, target, bases, target_snap, base_snap, worktree_clean) = {
         let app = App::from_config(config)?;
+        // Freeze cleanliness before any check runs or artifact is written (R4-19).
+        let worktree_clean = app.worktree_clean_at_start;
         app.repo.prepare_refs(&app.config)?;
         let target = app.repo.resolve_target(&app.config)?;
         let bases = app.repo.resolve_bases(&app.config)?;
@@ -294,7 +296,15 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
 
         let config = app.config.clone();
         // app (with git2::Repository) is dropped here
-        (config, diffs, target, bases, target_snap, base_snap)
+        (
+            config,
+            diffs,
+            target,
+            bases,
+            target_snap,
+            base_snap,
+            worktree_clean,
+        )
     };
 
     // --- Async phase: all work below is Send-safe ---
@@ -352,6 +362,7 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
         resolved_bases: &bases,
         run_start: t_start,
         skipped_checks,
+        worktree_clean,
     })?;
     let _ = tx.send(TuiEvent::ArtifactsReady {
         dir: artifacts_dir.clone(),
