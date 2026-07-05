@@ -43,9 +43,8 @@ impl Check for SemgrepCheck {
 
         let baseline_commit = semgrep_baseline_commit(config, cwd);
         let args = build_semgrep_args(config_arg, baseline_commit.as_deref());
-        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
 
-        let output = run_command("semgrep", &arg_refs, cwd).await?;
+        let output = run_command("semgrep", &args, cwd).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -63,7 +62,7 @@ impl Check for SemgrepCheck {
             provenance: Some(
                 ProvenanceBuilder {
                     cmd: "semgrep",
-                    args: &arg_refs,
+                    args: &args,
                     cwd,
                     output: &output,
                     combined_output: &combined,
@@ -126,36 +125,27 @@ fn semgrep_has_scan_errors(stdout: &str) -> bool {
 /// prototype-pollution, `public_dist` missing-integrity, …). Extracted as a
 /// pure helper so the exclude set is hermetically testable without invoking the
 /// semgrep binary.
-fn build_semgrep_args(config_arg: &str, baseline_commit: Option<&str>) -> Vec<String> {
+fn build_semgrep_args<'a>(config_arg: &'a str, baseline_commit: Option<&'a str>) -> Vec<&'a str> {
     let mut args = vec![
-        "scan".to_string(),
-        "--config".to_string(),
-        config_arg.to_string(),
-        "--json".to_string(),
-        "--error".to_string(),
-        "--quiet".to_string(),
+        "scan", "--config", config_arg, "--json", "--error", "--quiet",
     ];
 
     if let Some(commit) = baseline_commit {
-        args.push("--baseline-commit".to_string());
-        args.push(commit.to_string());
+        args.push("--baseline-commit");
+        args.push(commit);
     }
 
-    args.extend(
-        [
-            ".",
-            "--exclude",
-            "target",
-            "--exclude",
-            "node_modules",
-            "--exclude",
-            "*.min.js",
-            "--exclude",
-            "public_dist",
-        ]
-        .into_iter()
-        .map(String::from),
-    );
+    args.extend([
+        ".",
+        "--exclude",
+        "target",
+        "--exclude",
+        "node_modules",
+        "--exclude",
+        "*.min.js",
+        "--exclude",
+        "public_dist",
+    ]);
 
     args
 }
@@ -238,19 +228,13 @@ mod tests {
     #[test]
     fn build_semgrep_args_excludes_vendored_and_generated_and_emits_json() {
         let args = build_semgrep_args("auto", None);
-        let has_exclude = |val: &str| args.windows(2).any(|w| w == ["--exclude", val]);
-        assert!(
-            args.iter().any(|arg| arg == "--json"),
-            "structured parser expects JSON"
-        );
+        let has_exclude = |val: &str| args.windows(2).any(|w| w[0] == "--exclude" && w[1] == val);
+        assert!(args.contains(&"--json"), "structured parser expects JSON");
         assert!(has_exclude("*.min.js"), "must exclude minified bundles");
         assert!(has_exclude("public_dist"), "must exclude generated site");
         assert!(has_exclude("node_modules"));
         assert!(has_exclude("target"));
-        assert!(
-            args.iter().any(|arg| arg == "auto"),
-            "config arg threaded through"
-        );
+        assert!(args.contains(&"auto"), "config arg threaded through");
     }
 
     #[test]
@@ -258,7 +242,7 @@ mod tests {
         let args = build_semgrep_args("auto", Some("abc123"));
         assert!(
             args.windows(2)
-                .any(|window| window == ["--baseline-commit", "abc123"]),
+                .any(|w| w[0] == "--baseline-commit" && w[1] == "abc123"),
             "baseline commit must be threaded to semgrep"
         );
     }
@@ -267,7 +251,7 @@ mod tests {
     fn build_semgrep_args_omits_baseline_without_merge_base() {
         let args = build_semgrep_args("auto", None);
         assert!(
-            !args.iter().any(|arg| arg == "--baseline-commit"),
+            !args.contains(&"--baseline-commit"),
             "full-tree fallback must not pass a bogus baseline"
         );
     }
