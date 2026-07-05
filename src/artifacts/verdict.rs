@@ -466,7 +466,7 @@ pub(crate) fn check_id_is_baseline_signal(check_id: &str) -> bool {
 /// On any inability to inspect the repo we default to the permissive "clean local
 /// checkout" shape, preserving the historical downgrade behaviour rather than
 /// distrusting a repo we cannot read.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct CleanComparison {
     /// `head == target`: the local working tree IS the analysed target, so every
     /// check scanned the target directly.
@@ -484,6 +484,12 @@ pub(crate) struct CleanComparison {
     /// changed-file set, not from any proof it predates the target. Without a
     /// baseline the pre-existing downgrade must never fire (R4-20).
     has_base_diff: bool,
+    /// check_ids whose OWN config file is part of the diff. A changed
+    /// formatter/linter config can make a stricter rule flag previously-clean,
+    /// UNCHANGED files, so an out-of-diff finding for that tool is no longer
+    /// provably pre-existing. The downgrade is suppressed for these check_ids
+    /// (R5-21).
+    configs_changed: std::collections::BTreeSet<&'static str>,
 }
 
 impl CleanComparison {
@@ -498,8 +504,10 @@ impl CleanComparison {
         resolved_target: &crate::git::ResolvedRef,
         resolved_bases: &[crate::git::ResolvedRef],
         worktree_clean: bool,
+        diffs: &[crate::git::Diff],
     ) -> Self {
         let has_base_diff = has_resolvable_base_diff(resolved_target, resolved_bases);
+        let configs_changed = changed_tool_config_owners(diffs);
         let head = crate::git::Repository::open(&config.repo_root)
             .ok()
             .and_then(|repo| repo.head_commit_id().ok());
@@ -509,6 +517,7 @@ impl CleanComparison {
                 worktree_clean,
                 current_only: config.current_only,
                 has_base_diff,
+                configs_changed,
             },
             // Repo unreadable: preserve the historical downgrade by treating the
             // target as the local checkout. `worktree_clean` was itself captured
@@ -518,12 +527,20 @@ impl CleanComparison {
                 worktree_clean,
                 current_only: config.current_only,
                 has_base_diff,
+                configs_changed,
             },
         }
     }
 
     /// Whether the pre-existing downgrade may fire for `check_id`'s findings.
     pub(crate) fn applies_to(&self, check_id: &str) -> bool {
+        if self.configs_changed.iter().any(|owner| *owner == check_id) {
+            // The tool's own config changed in this diff, so a newly-stricter
+            // rule may flag UNCHANGED files: an out-of-diff finding is no longer
+            // provably pre-existing. Suppress the downgrade conservatively so the
+            // finding stays Unclassified and keeps gating (R5-21).
+            return false;
+        }
         if !self.has_base_diff {
             // No resolved base differs from the target, so no diff baseline
             // exists: every location is out-of-diff trivially from the empty
@@ -553,6 +570,7 @@ impl CleanComparison {
             worktree_clean,
             current_only: false,
             has_base_diff: true,
+            configs_changed: std::collections::BTreeSet::new(),
         }
     }
 
@@ -563,6 +581,7 @@ impl CleanComparison {
             worktree_clean: true,
             current_only: true,
             has_base_diff: true,
+            configs_changed: std::collections::BTreeSet::new(),
         }
     }
 
@@ -573,8 +592,78 @@ impl CleanComparison {
             worktree_clean: true,
             current_only: false,
             has_base_diff: false,
+            configs_changed: std::collections::BTreeSet::new(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_config_changed(owners: &[&'static str]) -> Self {
+        CleanComparison {
+            target_is_checkout: true,
+            worktree_clean: true,
+            current_only: false,
+            has_base_diff: true,
+            configs_changed: owners.iter().copied().collect(),
+        }
+    }
+}
+
+/// Map a changed config file's basename to the baseline-signal check_id whose
+/// out-of-diff findings must NOT be downgraded when that config is in the diff
+/// (R5-21). A stricter formatter/linter rule can start flagging files the PR
+/// never touched, so those out-of-diff findings are no longer provably
+/// pre-existing.
+///
+/// `Cargo.toml` is deliberately NOT mapped: it carries `[lints]` for
+/// rustc/clippy — whole-project gates that are never eligible for the downgrade
+/// anyway — not rustfmt config (which lives in `rustfmt.toml`). `pyproject.toml`
+/// IS mapped to ruff because it carries the `[tool.ruff]` section; the mapping
+/// is deliberately conservative, so an unrelated `pyproject.toml` edit
+/// suppressing the ruff downgrade is an accepted false-CONDITIONAL over a
+/// false-PASS.
+fn config_file_owner(basename: &str) -> Option<&'static str> {
+    match basename {
+        "rustfmt.toml" | ".rustfmt.toml" => Some("rustfmt"),
+        "ruff.toml" | ".ruff.toml" | "pyproject.toml" => Some("ruff"),
+        ".eslintrc" | ".eslintrc.js" | ".eslintrc.cjs" | ".eslintrc.json" | ".eslintrc.yaml"
+        | ".eslintrc.yml" | "eslint.config.js" | "eslint.config.mjs" | "eslint.config.cjs" => {
+            Some("eslint")
+        }
+        ".stylelintrc"
+        | ".stylelintrc.json"
+        | ".stylelintrc.js"
+        | ".stylelintrc.yaml"
+        | ".stylelintrc.yml"
+        | "stylelint.config.js"
+        | "stylelint.config.cjs" => Some("stylelint"),
+        ".prettierrc"
+        | ".prettierrc.json"
+        | ".prettierrc.js"
+        | ".prettierrc.cjs"
+        | ".prettierrc.yaml"
+        | ".prettierrc.yml"
+        | "prettier.config.js"
+        | "prettier.config.cjs" => Some("prettier"),
+        "semgrep.yml" | "semgrep.yaml" | ".semgrep.yml" | ".semgrep.yaml" => Some("semgrep_scan"),
+        _ => None,
+    }
+}
+
+/// The set of baseline-signal check_ids whose config file appears in `diffs`.
+fn changed_tool_config_owners(
+    diffs: &[crate::git::Diff],
+) -> std::collections::BTreeSet<&'static str> {
+    let mut owners = std::collections::BTreeSet::new();
+    for file in diffs.iter().flat_map(|diff| diff.files.iter()) {
+        let basename = std::path::Path::new(&file.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(file.path.as_str());
+        if let Some(owner) = config_file_owner(basename) {
+            owners.insert(owner);
+        }
+    }
+    owners
 }
 
 /// Whether any resolved base differs from the target commit — i.e. a real diff
@@ -1181,6 +1270,95 @@ mod tests {
                 "{id} must not downgrade on a dirty local target"
             );
         }
+    }
+
+    fn config_diff(path: &str) -> crate::git::Diff {
+        crate::git::Diff {
+            base: "main".to_string(),
+            target: "feature".to_string(),
+            base_commit_id: "base".to_string(),
+            target_commit_id: "target".to_string(),
+            files: vec![crate::git::FileChange {
+                path: path.to_string(),
+                status: crate::git::FileStatus::Modified,
+                additions: 1,
+                deletions: 0,
+            }],
+            stats: crate::git::DiffStats {
+                files_changed: 1,
+                additions: 1,
+                deletions: 0,
+                copied: 0,
+            },
+            commits: vec![],
+        }
+    }
+
+    #[test]
+    fn config_file_owner_maps_known_config_basenames() {
+        assert_eq!(config_file_owner("rustfmt.toml"), Some("rustfmt"));
+        assert_eq!(config_file_owner(".rustfmt.toml"), Some("rustfmt"));
+        assert_eq!(config_file_owner("pyproject.toml"), Some("ruff"));
+        assert_eq!(config_file_owner("ruff.toml"), Some("ruff"));
+        assert_eq!(config_file_owner(".eslintrc.json"), Some("eslint"));
+        assert_eq!(config_file_owner("eslint.config.mjs"), Some("eslint"));
+        assert_eq!(config_file_owner(".stylelintrc"), Some("stylelint"));
+        assert_eq!(config_file_owner(".prettierrc"), Some("prettier"));
+        assert_eq!(config_file_owner("semgrep.yml"), Some("semgrep_scan"));
+        // Cargo.toml is intentionally unmapped: it configures whole-project
+        // gates (clippy/rustc lints), which are never eligible for the downgrade.
+        assert_eq!(config_file_owner("Cargo.toml"), None);
+        assert_eq!(config_file_owner("src/main.rs"), None);
+    }
+
+    #[test]
+    fn changed_tool_config_owners_matches_nested_config_path() {
+        // A config file anywhere in the tree is matched by basename.
+        let diffs = [config_diff("crates/foo/rustfmt.toml")];
+        let owners = changed_tool_config_owners(&diffs);
+        assert!(owners.contains("rustfmt"));
+        assert_eq!(owners.len(), 1);
+        // A plain source change owns no config.
+        assert!(changed_tool_config_owners(&[config_diff("src/lib.rs")]).is_empty());
+    }
+
+    #[test]
+    fn changed_tool_config_suppresses_only_that_tools_downgrade() {
+        // R5-21: rustfmt.toml is in the diff, so a stricter format rule may flag
+        // unchanged files — rustfmt's out-of-diff findings must NOT be downgraded.
+        let clean = CleanComparison::for_test_config_changed(&["rustfmt"]);
+        assert!(
+            !clean.applies_to("rustfmt"),
+            "a changed rustfmt config suppresses the rustfmt downgrade"
+        );
+        // Tools whose config did not change keep the downgrade.
+        assert!(clean.applies_to("ruff"));
+        assert!(clean.applies_to("semgrep_scan"));
+
+        // End-to-end: the out-of-diff rustfmt warning stays Unclassified.
+        let findings = [out_of_diff_finding("rustfmt")];
+        let summary = build_quality_failure_summary(
+            &[warning_check("Rustfmt")],
+            &findings,
+            &CleanComparison::for_test_config_changed(&["rustfmt"]),
+        );
+        assert!(summary.preexisting_quality_failures.is_empty());
+        assert_eq!(summary.unclassified_quality_failures, vec!["Rustfmt"]);
+        assert!(summary.has_new_failures());
+    }
+
+    #[test]
+    fn without_config_change_downgrade_still_fires() {
+        // R5-21 control: no config file in the diff, so the rustfmt out-of-diff
+        // downgrade to pre-existing works exactly as before.
+        let findings = [out_of_diff_finding("rustfmt")];
+        let summary = build_quality_failure_summary(
+            &[warning_check("Rustfmt")],
+            &findings,
+            &CleanComparison::for_test(true, true),
+        );
+        assert_eq!(summary.preexisting_quality_failures, vec!["Rustfmt"]);
+        assert!(!summary.has_new_failures());
     }
 
     fn resolved_ref(commit_id: &str) -> crate::git::ResolvedRef {

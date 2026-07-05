@@ -396,8 +396,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     // Whether out-of-diff findings may be trusted as pre-existing. Computed once
     // and shared by the merge gate and the dashboard context so both verdict
     // surfaces gate the pre-existing downgrade identically (R2-9).
-    let clean_comparison =
-        CleanComparison::resolve(config, resolved_target, resolved_bases, worktree_clean);
+    let clean_comparison = CleanComparison::resolve(
+        config,
+        resolved_target,
+        resolved_bases,
+        worktree_clean,
+        diffs,
+    );
 
     generate_merge_gate(MergeGateInput {
         dir: &summary_dir,
@@ -411,7 +416,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         skipped_checks: &skipped_checks,
         resolved_target,
         resolved_bases,
-        clean_comparison,
+        clean_comparison: clean_comparison.clone(),
     })?;
     generate_failures_summary(&summary_dir, &all_checks)?;
     stage_timings.push(finish_timing(
