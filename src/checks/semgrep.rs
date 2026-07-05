@@ -282,14 +282,28 @@ fn snapshot_baseline_commit(
     merge_base_for_baseline(repo, config, target)
 }
 
-/// Shared merge-base resolution: the merge-base of the first resolved base and
-/// the target, or `None` when there is no distinct base.
+/// Shared merge-base resolution: the merge-base of the single resolved base and
+/// the target, or `None` when a diff-scoped scan would be unsound.
+///
+/// `semgrep --baseline-commit` diffs against exactly ONE commit. With more than
+/// one resolved base (the default probe resolves develop/main/master, and
+/// `generate_diffs` builds a diff for each) baselining only the first base would
+/// silently suppress a finding that is pre-existing versus that base but NEW
+/// versus another — even though the artifact pack contains the other base's diff
+/// (R3-15). Rather than baseline the wrong single base, fall back to a full scan
+/// whenever the run resolved anything other than exactly one base. Reconciling a
+/// true multi-baseline scan is deliberately out of scope here.
 fn merge_base_for_baseline(
     repo: &Repository,
     config: &Config,
     target: &ResolvedRef,
 ) -> Option<String> {
-    let base = repo.resolve_bases(config).ok()?.into_iter().next()?;
+    let bases = repo.resolve_bases(config).ok()?;
+    // Exactly one resolved base is the only sound shape for a single
+    // `--baseline-commit`; 0 or 2+ fall back to a full scan.
+    let [base] = bases.as_slice() else {
+        return None;
+    };
     if base.commit_id == target.commit_id {
         return None;
     }
@@ -605,6 +619,71 @@ mod tests {
             worktree_count(tmp.path()),
             before,
             "a failed worktree add must not leave a registered worktree"
+        );
+    }
+
+    // ── R3-15: diff-scoped baseline only with exactly one resolved base ──
+
+    #[test]
+    fn merge_base_is_diff_scoped_with_a_single_base() {
+        use crate::config::{test_config_builder, test_generic_profile};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let base_commit = write_commit(tmp.path(), "a.txt", "one\n");
+        run_git(tmp.path(), &["checkout", "-q", "-b", "feature"]);
+        let _target = write_commit(tmp.path(), "b.txt", "two\n");
+
+        let config = test_config_builder()
+            .repo_root(tmp.path())
+            .target(Some("feature"))
+            .bases(&["main"])
+            .profile(test_generic_profile())
+            .build();
+
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        let resolved_target = repo.resolve_target(&config).expect("resolve target");
+
+        let baseline = merge_base_for_baseline(&repo, &config, &resolved_target);
+        assert_eq!(
+            baseline.as_deref(),
+            Some(base_commit.as_str()),
+            "a single resolved base must diff-scope against its merge-base"
+        );
+    }
+
+    #[test]
+    fn merge_base_falls_back_to_full_scan_with_multiple_bases() {
+        use crate::config::{test_config_builder, test_generic_profile};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let _base_commit = write_commit(tmp.path(), "a.txt", "one\n");
+        // A second base ref pointing at the same commit as `main`; both resolve.
+        run_git(tmp.path(), &["branch", "develop", "main"]);
+        run_git(tmp.path(), &["checkout", "-q", "-b", "feature"]);
+        let _target = write_commit(tmp.path(), "b.txt", "two\n");
+
+        let config = test_config_builder()
+            .repo_root(tmp.path())
+            .target(Some("feature"))
+            .bases(&["main", "develop"])
+            .profile(test_generic_profile())
+            .build();
+
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        let resolved_target = repo.resolve_target(&config).expect("resolve target");
+        // Sanity: both bases really do resolve, so this is a genuine multi-base run.
+        assert_eq!(
+            repo.resolve_bases(&config).expect("resolve bases").len(),
+            2,
+            "fixture must resolve two bases"
+        );
+
+        assert_eq!(
+            merge_base_for_baseline(&repo, &config, &resolved_target),
+            None,
+            "more than one resolved base must fall back to a full scan (R3-15)"
         );
     }
 
