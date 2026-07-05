@@ -383,8 +383,10 @@ pub(super) fn generate_inline_findings(
                     }
 
                     let current_audit_in_diff = if let Some(cache) = &base_audit_cache {
-                        !cache
-                            .contains(&(finding.advisory_id.clone(), finding.package_name.clone()))
+                        // Version is part of the key (R5-22): a swap between two
+                        // vulnerable versions under the same advisory is NEW, not
+                        // a base finding, so it stays in_diff and keeps gating.
+                        !cache.contains(&cargo_audit_finding_key(finding))
                     } else if let Some(deps) = deps_delta {
                         deps.added.contains(&finding.package_name)
                             || deps.changed.contains(&finding.package_name)
