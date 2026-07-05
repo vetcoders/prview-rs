@@ -659,6 +659,25 @@ pub(super) fn extract_file_line_from_output(output: &str) -> Option<(String, u32
     for line in output.lines() {
         let trimmed = line.trim();
 
+        // rustfmt `--check`: `Diff in <path>:<line>:`. The path is emitted before
+        // a generic `<path>:<line>` token, but the `Diff in ` prefix contains
+        // whitespace, so the generic path check below rejects the whole line as a
+        // code fragment and the finding stays unclassified (in_diff = None). Parse
+        // the header explicitly so R2-13's out-of-diff downgrade can actually fire
+        // (R3-17).
+        if let Some(rest) = trimmed.strip_prefix("Diff in ") {
+            // `<path>:<line>:` — drop the trailing colon, then split off the line.
+            let rest = rest.trim_end_matches(':');
+            if let Some((file, line_str)) = rest.rsplit_once(':')
+                && let Ok(ln) = line_str.parse::<u32>()
+                && !file.is_empty()
+                && ln > 0
+            {
+                return Some((file.to_string(), ln));
+            }
+            continue;
+        }
+
         // Rust compiler: `  --> path/file.rs:42:5`
         if let Some(rest) = trimmed.strip_prefix("-->") {
             let rest = rest.trim();
@@ -801,6 +820,90 @@ mod tests {
         assert_eq!(
             effective_inline_gate_class(&summary(vec![cargo_test_row])),
             GateClass::Fail
+        );
+    }
+
+    #[test]
+    fn extract_parses_rustfmt_diff_header_absolute_path() {
+        // Real `cargo fmt --check` output (rustfmt 1.8): `Diff in <abs>:<line>:`.
+        let output =
+            "Diff in /home/u/proj/src/main.rs:1:\n fn main() {\n-let x=1;\n+    let x = 1;\n }\n";
+        let (file, line) = extract_file_line_from_output(output).expect("rustfmt header parses");
+        assert_eq!(file, "/home/u/proj/src/main.rs");
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn extract_parses_rustfmt_diff_header_relative_path() {
+        let output = "Diff in src/foo.rs:42:\n-old\n+new\n";
+        assert_eq!(
+            extract_file_line_from_output(output),
+            Some(("src/foo.rs".to_string(), 42))
+        );
+    }
+
+    fn rustfmt_check(output: &str) -> crate::checks::CheckResult {
+        crate::checks::CheckResult {
+            name: "Rustfmt".to_string(),
+            status: crate::checks::CheckStatus::Warnings,
+            duration: std::time::Duration::from_millis(1),
+            output: output.to_string(),
+            cached: false,
+            provenance: None,
+        }
+    }
+
+    fn one_file_diff(path: &str) -> crate::git::Diff {
+        crate::git::Diff {
+            base: "main".to_string(),
+            target: "feature".to_string(),
+            base_commit_id: "def456".to_string(),
+            target_commit_id: "abc123".to_string(),
+            files: vec![crate::git::FileChange {
+                path: path.to_string(),
+                status: crate::git::FileStatus::Modified,
+                additions: 1,
+                deletions: 0,
+            }],
+            stats: crate::git::DiffStats {
+                files_changed: 1,
+                additions: 1,
+                deletions: 0,
+                copied: 0,
+            },
+            commits: vec![],
+        }
+    }
+
+    #[test]
+    fn rustfmt_in_diff_finding_is_classified_introduced() {
+        // R3-17: a rustfmt warning whose file is inside the diff resolves to
+        // in_diff = Some(true), not the old None that stayed unclassified.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = vec![rustfmt_check("Diff in src/changed.rs:3:\n-old\n+new\n")];
+        let diffs = vec![one_file_diff("src/changed.rs")];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &diffs, None, None).expect("findings");
+        assert_eq!(
+            summary.dashboard_findings[0].in_diff,
+            Some(true),
+            "rustfmt header must parse so an in-diff file is classified introduced"
+        );
+    }
+
+    #[test]
+    fn rustfmt_out_of_diff_finding_enables_preexisting_downgrade() {
+        // R3-17: a rustfmt warning whose file is OUTSIDE the diff resolves to
+        // in_diff = Some(false) — the signal R2-13's out-of-diff downgrade needs.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = vec![rustfmt_check("Diff in src/untouched.rs:9:\n-old\n+new\n")];
+        let diffs = vec![one_file_diff("src/changed.rs")];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &diffs, None, None).expect("findings");
+        assert_eq!(
+            summary.dashboard_findings[0].in_diff,
+            Some(false),
+            "rustfmt header must parse so an out-of-diff file can be downgraded"
         );
     }
 
