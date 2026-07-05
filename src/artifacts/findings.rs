@@ -24,16 +24,29 @@ pub(super) struct InlineFindingsSummary {
 /// downgrade.
 ///
 /// An out-of-diff row is treated as pre-existing ONLY when the check's
-/// locations are an exhaustive baseline signal (`check_id_is_baseline_signal`).
+/// locations are an exhaustive baseline signal (`check_id_is_baseline_signal`)
+/// AND the clean-comparison gate trusts that check's out-of-diff rows as
+/// pre-existing for this run (`clean.applies_to`). The latter is what the
+/// per-check path already applies (R3-16): on a remote/snapshot target a
+/// rustfmt/ruff/eslint row came from the local checkout — a different tree than
+/// the target — so it must gate, not skip; a dirty local scan (R2-9) and a run
+/// with no resolved base diff (R4-20) likewise gate. Without this condition the
+/// aggregate gate skipped by check id alone and disagreed with the per-check
+/// classification, letting an out-of-diff blocking row PASS.
+///
 /// For whole-project parsers (e.g. `cargo_test`) an out-of-diff location is
 /// causation-unknown — the diff may have caused it — so it still gates, exactly
 /// as `classify_quality_failure` keeps it Unclassified (R2-8).
-pub(super) fn effective_inline_gate_class(inline: &InlineFindingsSummary) -> GateClass {
+pub(super) fn effective_inline_gate_class(
+    inline: &InlineFindingsSummary,
+    clean: &CleanComparison,
+) -> GateClass {
     let mut new_errors = 0usize;
     let mut new_warnings = 0usize;
     for finding in &inline.dashboard_findings {
-        let out_of_diff_preexisting =
-            finding.in_diff == Some(false) && check_id_is_baseline_signal(&finding.check_id);
+        let out_of_diff_preexisting = finding.in_diff == Some(false)
+            && check_id_is_baseline_signal(&finding.check_id)
+            && clean.applies_to(&finding.check_id);
         if out_of_diff_preexisting {
             continue;
         }
@@ -782,26 +795,55 @@ mod tests {
         }
     }
 
+    /// A clean local-checkout comparison with a resolved base diff: baseline
+    /// signals downgrade, matching the default shape the pre-R4-18 gate assumed.
+    fn clean() -> CleanComparison {
+        CleanComparison::for_test(true, true)
+    }
+
+    fn baseline_row(
+        check_id: &str,
+        level: &'static str,
+        in_diff: Option<bool>,
+    ) -> DashboardFinding {
+        DashboardFinding {
+            level,
+            check_name: check_id.to_string(),
+            check_id: check_id.to_string(),
+            message: "finding".to_string(),
+            in_diff,
+        }
+    }
+
     #[test]
     fn inline_gate_ignores_preexisting_only_errors() {
         // THREAD 7: raw status is "failed" but every error is pre-existing, so
         // the aggregate gate must not fire (it would block under policy-mode
         // block despite every per-check evaluation approving these findings).
         let inline = summary(vec![err(Some(false)), err(Some(false))]);
-        assert_eq!(effective_inline_gate_class(&inline), GateClass::Pass);
+        assert_eq!(
+            effective_inline_gate_class(&inline, &clean()),
+            GateClass::Pass
+        );
     }
 
     #[test]
     fn inline_gate_blocks_on_introduced_errors() {
         let inline = summary(vec![err(Some(false)), err(Some(true))]);
-        assert_eq!(effective_inline_gate_class(&inline), GateClass::Fail);
+        assert_eq!(
+            effective_inline_gate_class(&inline, &clean()),
+            GateClass::Fail
+        );
     }
 
     #[test]
     fn inline_gate_blocks_on_unclassified_errors() {
         // Causation unknown (in_diff == None) is treated as new, never downgraded.
         let inline = summary(vec![err(None)]);
-        assert_eq!(effective_inline_gate_class(&inline), GateClass::Fail);
+        assert_eq!(
+            effective_inline_gate_class(&inline, &clean()),
+            GateClass::Fail
+        );
     }
 
     #[test]
@@ -818,8 +860,50 @@ mod tests {
             in_diff: Some(false),
         };
         assert_eq!(
-            effective_inline_gate_class(&summary(vec![cargo_test_row])),
+            effective_inline_gate_class(&summary(vec![cargo_test_row]), &clean()),
             GateClass::Fail
+        );
+    }
+
+    #[test]
+    fn inline_gate_gates_remote_target_local_checkout_baseline_row() {
+        // R4-18: on a remote/snapshot target a rustfmt out-of-diff row came from
+        // the local checkout — a different tree than the target — so the
+        // clean-comparison gate refuses its downgrade. The aggregate gate must
+        // agree with the per-check path and NOT skip it.
+        let remote = CleanComparison::for_test(false, true);
+        let row = baseline_row("rustfmt", "error", Some(false));
+        assert_eq!(
+            effective_inline_gate_class(&summary(vec![row]), &remote),
+            GateClass::Fail,
+            "a local-checkout rustfmt row on a remote target must gate, not skip"
+        );
+    }
+
+    #[test]
+    fn inline_gate_skips_remote_target_snapshot_scanned_baseline_row() {
+        // R4-18: semgrep scans the target snapshot, so on a remote target its
+        // out-of-diff row IS trusted as pre-existing and skips — unlike rustfmt.
+        let remote = CleanComparison::for_test(false, true);
+        let row = baseline_row("semgrep_scan", "error", Some(false));
+        assert_eq!(
+            effective_inline_gate_class(&summary(vec![row]), &remote),
+            GateClass::Pass,
+            "a snapshot-scanned semgrep row is pre-existing and skips"
+        );
+    }
+
+    #[test]
+    fn inline_gate_gates_dirty_scan_baseline_row() {
+        // R4-18 / R2-9: a dirty local scan cannot trust an out-of-diff row as
+        // pre-existing (it may be an uncommitted finding), so the aggregate gate
+        // must gate even a baseline signal.
+        let dirty = CleanComparison::for_test(true, false);
+        let row = baseline_row("semgrep_scan", "error", Some(false));
+        assert_eq!(
+            effective_inline_gate_class(&summary(vec![row]), &dirty),
+            GateClass::Fail,
+            "a dirty-scan out-of-diff row must gate"
         );
     }
 
@@ -917,7 +1001,7 @@ mod tests {
             in_diff: Some(true),
         };
         assert_eq!(
-            effective_inline_gate_class(&summary(vec![warn])),
+            effective_inline_gate_class(&summary(vec![warn]), &clean()),
             GateClass::Info
         );
     }
