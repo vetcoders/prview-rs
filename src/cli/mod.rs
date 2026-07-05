@@ -123,13 +123,14 @@ pub struct Cli {
     #[arg(long = "skip-security", conflicts_with = "with_security")]
     pub skip_security: bool,
 
-    /// Run the full security tier including cargo-geiger (slow: minutes on large trees)
+    /// Run the full security tier including full-tree semgrep and cargo-geiger
     #[arg(
         long = "security-full",
-        long_help = "Opt in to the full security tier, which adds cargo-geiger's unsafe-usage \
-                     scan. Geiger can take several minutes on large dependency trees, so it is \
-                     off by default even under --deep; source-side unsafe is already audited \
-                     in-process. Without this flag geiger is simply absent from the profile."
+        long_help = "Opt in to the full security tier. Without this flag semgrep is scoped to \
+                     findings introduced after the merge-base when a clean git baseline is \
+                     available. With this flag semgrep scans the full tree and cargo-geiger's \
+                     unsafe-usage scan is added. Geiger can take several minutes on large \
+                     dependency trees, so it is off by default even under --deep."
     )]
     pub security_full: bool,
 

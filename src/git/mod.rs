@@ -154,6 +154,17 @@ impl Repository {
         Ok(())
     }
 
+    /// Commit id currently checked out (`HEAD`).
+    ///
+    /// Used to decide whether a diff-scoped tool that reads the working tree
+    /// (e.g. semgrep `--baseline-commit`) may trust that tree as the analysed
+    /// target: baseline scans only make sense when the analysed target is the
+    /// commit actually checked out.
+    pub fn head_commit_id(&self) -> Result<String> {
+        let commit = self.inner.head()?.peel_to_commit()?;
+        Ok(commit.id().to_string())
+    }
+
     /// Resolve target branch/ref
     pub fn resolve_target(&self, config: &Config) -> Result<ResolvedRef> {
         let name = config.target.clone().unwrap_or_else(|| {

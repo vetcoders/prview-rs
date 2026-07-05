@@ -192,10 +192,25 @@ pub(crate) fn cargo_audit_severity(advisory: &serde_json::Value) -> (String, &'s
     ("unknown".to_string(), "error")
 }
 
+/// Fingerprint a cargo-audit finding for baseline comparison. The locked
+/// package VERSION is part of the key (R5-22): a dependency update that swaps one
+/// vulnerable version for another under the same advisory is a NEW finding, not
+/// pre-existing debt. Keying by `(advisory_id, package_name)` alone treated the
+/// bumped version as already-present in the base and downgraded a failed
+/// security check to pre-existing — approving a PR that re-introduces the
+/// vulnerability with a different locked version.
+pub(crate) fn cargo_audit_finding_key(finding: &CargoAuditFinding) -> (String, String, String) {
+    (
+        finding.advisory_id.clone(),
+        finding.package_name.clone(),
+        finding.package_version.clone(),
+    )
+}
+
 pub(crate) fn get_base_cargo_audit_findings(
     repo: Option<&crate::git::Repository>,
     diffs: &[crate::git::Diff],
-) -> Option<std::collections::HashSet<(String, String)>> {
+) -> Option<std::collections::HashSet<(String, String, String)>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -226,12 +241,7 @@ pub(crate) fn get_base_cargo_audit_findings(
     let output = child.wait_with_output().ok()?;
     if let Ok(out_str) = String::from_utf8(output.stdout) {
         let findings = parse_cargo_audit_findings(&out_str);
-        Some(
-            findings
-                .into_iter()
-                .map(|f| (f.advisory_id, f.package_name))
-                .collect(),
-        )
+        Some(findings.iter().map(cargo_audit_finding_key).collect())
     } else {
         None
     }
@@ -452,5 +462,46 @@ pub(crate) fn append_cargo_audit_findings(
             "- ... plus {} more advisory findings in `30_context/INLINE_FINDINGS.sarif`\n",
             findings.len() - display_count
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finding(advisory_id: &str, package_name: &str, package_version: &str) -> CargoAuditFinding {
+        CargoAuditFinding {
+            advisory_id: advisory_id.to_string(),
+            package_name: package_name.to_string(),
+            package_version: package_version.to_string(),
+            title: "vuln".to_string(),
+            severity: "high".to_string(),
+            sarif_level: "error",
+            patched_versions: None,
+            help_url: None,
+        }
+    }
+
+    #[test]
+    fn version_swap_under_same_advisory_is_a_new_finding() {
+        // R5-22: the base has foo@1.0.0 flagged by RUSTSEC-0001. The PR bumps foo
+        // to 2.0.0, still flagged by the same advisory. Keyed WITH the version,
+        // the bumped version is not in the base set, so it is a new (in-diff)
+        // finding — not pre-existing debt that would be silently approved.
+        let base = finding("RUSTSEC-0001", "foo", "1.0.0");
+        let bumped = finding("RUSTSEC-0001", "foo", "2.0.0");
+        let unchanged = finding("RUSTSEC-0001", "foo", "1.0.0");
+
+        let base_set: std::collections::HashSet<(String, String, String)> =
+            std::iter::once(cargo_audit_finding_key(&base)).collect();
+
+        assert!(
+            !base_set.contains(&cargo_audit_finding_key(&bumped)),
+            "a different vulnerable version under the same advisory must be new"
+        );
+        assert!(
+            base_set.contains(&cargo_audit_finding_key(&unchanged)),
+            "an identical (advisory, package, version) stays pre-existing"
+        );
     }
 }

@@ -9,6 +9,62 @@ pub(super) struct InlineFindingsSummary {
     pub(super) dashboard_findings: Vec<DashboardFinding>,
 }
 
+/// Effective gate class for the aggregate INLINE_FINDINGS gate.
+///
+/// The raw `status` field counts *every* SARIF row, so a scan whose findings
+/// are all pre-existing (outside the diff) reports `failed` and — under
+/// `--policy-mode block` — used to block the merge even though every per-check
+/// evaluation classified those same findings as pre-existing and approved them.
+///
+/// Gate instead on the findings the PR is actually responsible for: an error or
+/// warning counts only when it is introduced (`in_diff == Some(true)`) or
+/// unclassified (`in_diff == None` — causation unknown, so treated as new).
+/// Pre-existing rows (`in_diff == Some(false)`) never gate. This mirrors THREAD
+/// 4's pre-existing semantics so the inline gate agrees with the per-check
+/// downgrade.
+///
+/// An out-of-diff row is treated as pre-existing ONLY when the check's
+/// locations are an exhaustive baseline signal (`check_id_is_baseline_signal`)
+/// AND the clean-comparison gate trusts that check's out-of-diff rows as
+/// pre-existing for this run (`clean.applies_to`). The latter is what the
+/// per-check path already applies (R3-16): on a remote/snapshot target a
+/// rustfmt/ruff/eslint row came from the local checkout — a different tree than
+/// the target — so it must gate, not skip; a dirty local scan (R2-9) and a run
+/// with no resolved base diff (R4-20) likewise gate. Without this condition the
+/// aggregate gate skipped by check id alone and disagreed with the per-check
+/// classification, letting an out-of-diff blocking row PASS.
+///
+/// For whole-project parsers (e.g. `cargo_test`) an out-of-diff location is
+/// causation-unknown — the diff may have caused it — so it still gates, exactly
+/// as `classify_quality_failure` keeps it Unclassified (R2-8).
+pub(super) fn effective_inline_gate_class(
+    inline: &InlineFindingsSummary,
+    clean: &CleanComparison,
+) -> GateClass {
+    let mut new_errors = 0usize;
+    let mut new_warnings = 0usize;
+    for finding in &inline.dashboard_findings {
+        let out_of_diff_preexisting = finding.in_diff == Some(false)
+            && check_id_is_baseline_signal(&finding.check_id)
+            && clean.applies_to(&finding.check_id);
+        if out_of_diff_preexisting {
+            continue;
+        }
+        match finding.level {
+            "error" => new_errors += 1,
+            "warning" => new_warnings += 1,
+            _ => {}
+        }
+    }
+    if new_errors > 0 {
+        GateClass::Fail
+    } else if new_warnings > 0 {
+        GateClass::Info
+    } else {
+        GateClass::Pass
+    }
+}
+
 pub(super) fn gate_class_for_check(status: crate::checks::CheckStatus) -> GateClass {
     match status {
         crate::checks::CheckStatus::Passed => GateClass::Pass,
@@ -327,8 +383,10 @@ pub(super) fn generate_inline_findings(
                     }
 
                     let current_audit_in_diff = if let Some(cache) = &base_audit_cache {
-                        !cache
-                            .contains(&(finding.advisory_id.clone(), finding.package_name.clone()))
+                        // Version is part of the key (R5-22): a swap between two
+                        // vulnerable versions under the same advisory is NEW, not
+                        // a base finding, so it stays in_diff and keeps gating.
+                        !cache.contains(&cargo_audit_finding_key(finding))
                     } else if let Some(deps) = deps_delta {
                         deps.added.contains(&finding.package_name)
                             || deps.changed.contains(&finding.package_name)
@@ -616,6 +674,25 @@ pub(super) fn extract_file_line_from_output(output: &str) -> Option<(String, u32
     for line in output.lines() {
         let trimmed = line.trim();
 
+        // rustfmt `--check`: `Diff in <path>:<line>:`. The path is emitted before
+        // a generic `<path>:<line>` token, but the `Diff in ` prefix contains
+        // whitespace, so the generic path check below rejects the whole line as a
+        // code fragment and the finding stays unclassified (in_diff = None). Parse
+        // the header explicitly so R2-13's out-of-diff downgrade can actually fire
+        // (R3-17).
+        if let Some(rest) = trimmed.strip_prefix("Diff in ") {
+            // `<path>:<line>:` — drop the trailing colon, then split off the line.
+            let rest = rest.trim_end_matches(':');
+            if let Some((file, line_str)) = rest.rsplit_once(':')
+                && let Ok(ln) = line_str.parse::<u32>()
+                && !file.is_empty()
+                && ln > 0
+            {
+                return Some((file.to_string(), ln));
+            }
+            continue;
+        }
+
         // Rust compiler: `  --> path/file.rs:42:5`
         if let Some(rest) = trimmed.strip_prefix("-->") {
             let rest = rest.trim();
@@ -696,4 +773,238 @@ pub(super) fn should_skip_inline_fallback_line(is_geiger: bool, line: &str) -> b
         || (trimmed.chars().next().is_some_and(|c| c.is_ascii_digit())
             && trimmed.contains('/')
             && trimmed.contains("unsafe"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(in_diff: Option<bool>) -> DashboardFinding {
+        DashboardFinding {
+            level: "error",
+            check_name: "Semgrep".to_string(),
+            check_id: "semgrep_scan".to_string(),
+            message: "finding".to_string(),
+            in_diff,
+        }
+    }
+
+    fn summary(dashboard_findings: Vec<DashboardFinding>) -> InlineFindingsSummary {
+        InlineFindingsSummary {
+            status: "failed".to_string(),
+            findings_count: dashboard_findings.len(),
+            dashboard_findings,
+        }
+    }
+
+    /// A clean local-checkout comparison with a resolved base diff: baseline
+    /// signals downgrade, matching the default shape the pre-R4-18 gate assumed.
+    fn clean() -> CleanComparison {
+        CleanComparison::for_test(true, true)
+    }
+
+    fn baseline_row(
+        check_id: &str,
+        level: &'static str,
+        in_diff: Option<bool>,
+    ) -> DashboardFinding {
+        DashboardFinding {
+            level,
+            check_name: check_id.to_string(),
+            check_id: check_id.to_string(),
+            message: "finding".to_string(),
+            in_diff,
+        }
+    }
+
+    #[test]
+    fn inline_gate_ignores_preexisting_only_errors() {
+        // THREAD 7: raw status is "failed" but every error is pre-existing, so
+        // the aggregate gate must not fire (it would block under policy-mode
+        // block despite every per-check evaluation approving these findings).
+        let inline = summary(vec![err(Some(false)), err(Some(false))]);
+        assert_eq!(
+            effective_inline_gate_class(&inline, &clean()),
+            GateClass::Pass
+        );
+    }
+
+    #[test]
+    fn inline_gate_blocks_on_introduced_errors() {
+        let inline = summary(vec![err(Some(false)), err(Some(true))]);
+        assert_eq!(
+            effective_inline_gate_class(&inline, &clean()),
+            GateClass::Fail
+        );
+    }
+
+    #[test]
+    fn inline_gate_blocks_on_unclassified_errors() {
+        // Causation unknown (in_diff == None) is treated as new, never downgraded.
+        let inline = summary(vec![err(None)]);
+        assert_eq!(
+            effective_inline_gate_class(&inline, &clean()),
+            GateClass::Fail
+        );
+    }
+
+    #[test]
+    fn inline_gate_counts_out_of_diff_whole_project_parser_rows() {
+        // R2-8: a cargo_test out-of-diff row is causation-unknown (the diff may
+        // have broken a test in an unchanged file), not pre-existing, so it must
+        // still gate — unlike a baseline-signal semgrep out-of-diff row, which
+        // does not (proven by inline_gate_ignores_preexisting_only_errors).
+        let cargo_test_row = DashboardFinding {
+            level: "error",
+            check_name: "Cargo Test".to_string(),
+            check_id: "cargo_test".to_string(),
+            message: "test failed".to_string(),
+            in_diff: Some(false),
+        };
+        assert_eq!(
+            effective_inline_gate_class(&summary(vec![cargo_test_row]), &clean()),
+            GateClass::Fail
+        );
+    }
+
+    #[test]
+    fn inline_gate_gates_remote_target_local_checkout_baseline_row() {
+        // R4-18: on a remote/snapshot target a rustfmt out-of-diff row came from
+        // the local checkout — a different tree than the target — so the
+        // clean-comparison gate refuses its downgrade. The aggregate gate must
+        // agree with the per-check path and NOT skip it.
+        let remote = CleanComparison::for_test(false, true);
+        let row = baseline_row("rustfmt", "error", Some(false));
+        assert_eq!(
+            effective_inline_gate_class(&summary(vec![row]), &remote),
+            GateClass::Fail,
+            "a local-checkout rustfmt row on a remote target must gate, not skip"
+        );
+    }
+
+    #[test]
+    fn inline_gate_skips_remote_target_snapshot_scanned_baseline_row() {
+        // R4-18: semgrep scans the target snapshot, so on a remote target its
+        // out-of-diff row IS trusted as pre-existing and skips — unlike rustfmt.
+        let remote = CleanComparison::for_test(false, true);
+        let row = baseline_row("semgrep_scan", "error", Some(false));
+        assert_eq!(
+            effective_inline_gate_class(&summary(vec![row]), &remote),
+            GateClass::Pass,
+            "a snapshot-scanned semgrep row is pre-existing and skips"
+        );
+    }
+
+    #[test]
+    fn inline_gate_gates_dirty_scan_baseline_row() {
+        // R4-18 / R2-9: a dirty local scan cannot trust an out-of-diff row as
+        // pre-existing (it may be an uncommitted finding), so the aggregate gate
+        // must gate even a baseline signal.
+        let dirty = CleanComparison::for_test(true, false);
+        let row = baseline_row("semgrep_scan", "error", Some(false));
+        assert_eq!(
+            effective_inline_gate_class(&summary(vec![row]), &dirty),
+            GateClass::Fail,
+            "a dirty-scan out-of-diff row must gate"
+        );
+    }
+
+    #[test]
+    fn extract_parses_rustfmt_diff_header_absolute_path() {
+        // Real `cargo fmt --check` output (rustfmt 1.8): `Diff in <abs>:<line>:`.
+        let output =
+            "Diff in /home/u/proj/src/main.rs:1:\n fn main() {\n-let x=1;\n+    let x = 1;\n }\n";
+        let (file, line) = extract_file_line_from_output(output).expect("rustfmt header parses");
+        assert_eq!(file, "/home/u/proj/src/main.rs");
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn extract_parses_rustfmt_diff_header_relative_path() {
+        let output = "Diff in src/foo.rs:42:\n-old\n+new\n";
+        assert_eq!(
+            extract_file_line_from_output(output),
+            Some(("src/foo.rs".to_string(), 42))
+        );
+    }
+
+    fn rustfmt_check(output: &str) -> crate::checks::CheckResult {
+        crate::checks::CheckResult {
+            name: "Rustfmt".to_string(),
+            status: crate::checks::CheckStatus::Warnings,
+            duration: std::time::Duration::from_millis(1),
+            output: output.to_string(),
+            cached: false,
+            provenance: None,
+        }
+    }
+
+    fn one_file_diff(path: &str) -> crate::git::Diff {
+        crate::git::Diff {
+            base: "main".to_string(),
+            target: "feature".to_string(),
+            base_commit_id: "def456".to_string(),
+            target_commit_id: "abc123".to_string(),
+            files: vec![crate::git::FileChange {
+                path: path.to_string(),
+                status: crate::git::FileStatus::Modified,
+                additions: 1,
+                deletions: 0,
+            }],
+            stats: crate::git::DiffStats {
+                files_changed: 1,
+                additions: 1,
+                deletions: 0,
+                copied: 0,
+            },
+            commits: vec![],
+        }
+    }
+
+    #[test]
+    fn rustfmt_in_diff_finding_is_classified_introduced() {
+        // R3-17: a rustfmt warning whose file is inside the diff resolves to
+        // in_diff = Some(true), not the old None that stayed unclassified.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = vec![rustfmt_check("Diff in src/changed.rs:3:\n-old\n+new\n")];
+        let diffs = vec![one_file_diff("src/changed.rs")];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &diffs, None, None).expect("findings");
+        assert_eq!(
+            summary.dashboard_findings[0].in_diff,
+            Some(true),
+            "rustfmt header must parse so an in-diff file is classified introduced"
+        );
+    }
+
+    #[test]
+    fn rustfmt_out_of_diff_finding_enables_preexisting_downgrade() {
+        // R3-17: a rustfmt warning whose file is OUTSIDE the diff resolves to
+        // in_diff = Some(false) — the signal R2-13's out-of-diff downgrade needs.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = vec![rustfmt_check("Diff in src/untouched.rs:9:\n-old\n+new\n")];
+        let diffs = vec![one_file_diff("src/changed.rs")];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &diffs, None, None).expect("findings");
+        assert_eq!(
+            summary.dashboard_findings[0].in_diff,
+            Some(false),
+            "rustfmt header must parse so an out-of-diff file can be downgraded"
+        );
+    }
+
+    #[test]
+    fn inline_gate_warns_on_new_warnings_only() {
+        let warn = DashboardFinding {
+            level: "warning",
+            check_name: "Semgrep".to_string(),
+            check_id: "semgrep_scan".to_string(),
+            message: "w".to_string(),
+            in_diff: Some(true),
+        };
+        assert_eq!(
+            effective_inline_gate_class(&summary(vec![warn]), &clean()),
+            GateClass::Info
+        );
+    }
 }
