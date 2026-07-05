@@ -102,17 +102,38 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
 
     let engine = PolicyEngine::new(config);
     let policy_summary = engine.evaluate_all(checks, &skipped_checks);
-    let mut check_gates = Vec::new();
-    let mut blocking_issues = policy_summary.blocking_issues.clone();
-    let mut review_caveats = policy_summary.review_caveats.clone();
-    let mut worst_confidence = policy_summary.analysis_status;
-    let mut worst_merge = policy_summary.merge_recommendation;
 
-    for eval in &policy_summary.evaluations {
+    // THREAD 5: derive the SAME pre-existing-aware effective outcome the merge
+    // gate uses, from the SAME shared function, so the dashboard verdict can
+    // never contradict MERGE_GATE.json. The classification of which failures are
+    // purely pre-existing must be computed before the effective outcome, so it
+    // is hoisted here (also reused for quality_pass below).
+    let quality_failures = build_quality_failure_summary(checks, &inline.dashboard_findings);
+    let preexisting_quality_failure_names: std::collections::BTreeSet<&str> = quality_failures
+        .preexisting_quality_failures
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let outcome = compute_effective_policy_outcome(
+        &policy_summary.evaluations,
+        &preexisting_quality_failure_names,
+    );
+
+    let mut check_gates = Vec::new();
+    let mut blocking_issues = outcome.blocking_issues.clone();
+    let mut review_caveats = outcome.advisory_caveats.clone();
+    let mut worst_confidence = outcome.worst_confidence;
+    let mut worst_merge = outcome.worst_merge;
+
+    for (eval, effective_eval) in policy_summary
+        .evaluations
+        .iter()
+        .zip(&outcome.effective_evals)
+    {
         check_gates.push(CheckGateEntry {
             name: eval.name.clone(),
             id: eval.check_id.clone(),
-            blocking: matches!(eval.merge_impact, MergeRecommendation::Block),
+            blocking: matches!(effective_eval.merge_impact, MergeRecommendation::Block),
             class: gate_class_to_str(eval.gate_class),
             severity: policy_severity_to_str(eval.severity),
         });
@@ -182,7 +203,8 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
 
     // quality_pass: only new/indeterminate failures count — pre-existing ones
     // are not introduced by this diff and should not block the gate.
-    let quality_failures = build_quality_failure_summary(checks, &inline.dashboard_findings);
+    // (`quality_failures` is computed once, above, and shared with the effective
+    // outcome.)
     let quality_pass = !quality_failures.has_new_failures();
 
     if !quality_pass && worst_merge == MergeRecommendation::Approve {

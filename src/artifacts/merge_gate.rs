@@ -3,9 +3,7 @@
 use super::*;
 
 pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
-    use crate::policy::engine::{
-        AnalysisStatus, MergeRecommendation, PolicyConclusion, PolicyEngine,
-    };
+    use crate::policy::engine::{AnalysisStatus, MergeRecommendation, PolicyEngine};
     use serde_json::json;
     use std::collections::BTreeSet;
     let MergeGateInput {
@@ -30,31 +28,27 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
+    // Shared effective evaluation: the pre-existing downgrade plus axis/issue
+    // computation lives in ONE place so the dashboard context derives the exact
+    // same verdict from the exact same result (THREAD 5 — verdict parity).
+    let outcome = compute_effective_policy_outcome(
+        &policy_summary.evaluations,
+        &preexisting_quality_failure_names,
+    );
+    let mut worst_confidence = outcome.worst_confidence;
+    let mut worst_merge = outcome.worst_merge;
+    let mut blocking_issues = outcome.blocking_issues;
+    let mut review_caveats = outcome.advisory_caveats;
     let mut gate_checks = Vec::new();
-    let mut blocking_issues = Vec::new();
-    let mut review_caveats = Vec::new();
-    let mut worst_confidence = AnalysisStatus::Complete;
-    let mut worst_merge = MergeRecommendation::Approve;
 
     let inline_findings_path =
         (inline.findings_count > 0).then_some("30_context/INLINE_FINDINGS.sarif");
 
-    for eval in &policy_summary.evaluations {
-        let preexisting_only = preexisting_quality_failure_names.contains(eval.name.as_str());
-        let effective_eval = effective_quality_gate_eval(eval, preexisting_only);
-        if !preexisting_only {
-            bump_effective_gate_axes(&mut worst_confidence, &mut worst_merge, &effective_eval);
-            if effective_eval.conclusion == PolicyConclusion::Blocked {
-                blocking_issues.push(format!(
-                    "{} ({})",
-                    eval.name,
-                    display_raw_status(&eval.raw_status)
-                ));
-            } else if effective_eval.conclusion == PolicyConclusion::Advisory {
-                review_caveats.push(describe_policy_advisory(eval));
-            }
-        }
-
+    for (eval, effective_eval) in policy_summary
+        .evaluations
+        .iter()
+        .zip(&outcome.effective_evals)
+    {
         // Match the executed check by name, not by re-deriving an id: the policy
         // engine and the artifact writer spell a few ids differently (cargo
         // check→cargo, typescript→tsc, vitest→tests), so an id round-trip drops
@@ -330,6 +324,64 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Merge-gate axes and issue lists after the pre-existing downgrade has been
+/// applied to every evaluation. Shared verbatim by the merge gate and the
+/// dashboard context so the two artifacts can never disagree on the verdict: a
+/// pre-existing-only blocked check downgraded in one path but not the other
+/// used to yield `MERGE_GATE=PASS` beside `report.json=CONDITIONAL/BLOCK`.
+pub(super) struct EffectivePolicyOutcome {
+    pub worst_confidence: crate::policy::engine::AnalysisStatus,
+    pub worst_merge: crate::policy::engine::MergeRecommendation,
+    pub blocking_issues: Vec<String>,
+    pub advisory_caveats: Vec<String>,
+    /// Per-evaluation effective view, index-aligned with the input `evaluations`.
+    pub effective_evals: Vec<crate::policy::engine::CheckEvaluation>,
+}
+
+/// Compute the effective merge-gate outcome from the raw policy evaluations plus
+/// the set of checks whose failures are purely pre-existing (all findings
+/// outside the diff). Pre-existing-only checks are downgraded to advisory/approve
+/// and excluded from the blocking axes; every other check bumps the axes as
+/// normal. This is the single source of truth for THREAD 5's verdict parity.
+pub(super) fn compute_effective_policy_outcome(
+    evaluations: &[crate::policy::engine::CheckEvaluation],
+    preexisting_quality_failure_names: &std::collections::BTreeSet<&str>,
+) -> EffectivePolicyOutcome {
+    use crate::policy::engine::{AnalysisStatus, MergeRecommendation, PolicyConclusion};
+
+    let mut worst_confidence = AnalysisStatus::Complete;
+    let mut worst_merge = MergeRecommendation::Approve;
+    let mut blocking_issues = Vec::new();
+    let mut advisory_caveats = Vec::new();
+    let mut effective_evals = Vec::with_capacity(evaluations.len());
+
+    for eval in evaluations {
+        let preexisting_only = preexisting_quality_failure_names.contains(eval.name.as_str());
+        let effective_eval = effective_quality_gate_eval(eval, preexisting_only);
+        if !preexisting_only {
+            bump_effective_gate_axes(&mut worst_confidence, &mut worst_merge, &effective_eval);
+            if effective_eval.conclusion == PolicyConclusion::Blocked {
+                blocking_issues.push(format!(
+                    "{} ({})",
+                    eval.name,
+                    display_raw_status(&eval.raw_status)
+                ));
+            } else if effective_eval.conclusion == PolicyConclusion::Advisory {
+                advisory_caveats.push(describe_policy_advisory(eval));
+            }
+        }
+        effective_evals.push(effective_eval);
+    }
+
+    EffectivePolicyOutcome {
+        worst_confidence,
+        worst_merge,
+        blocking_issues,
+        advisory_caveats,
+        effective_evals,
+    }
+}
+
 fn effective_quality_gate_eval(
     eval: &crate::policy::engine::CheckEvaluation,
     preexisting_only: bool,
@@ -535,6 +587,34 @@ mod tests {
         let raw =
             std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
         serde_json::from_str(&raw).expect("parse gate json")
+    }
+
+    #[test]
+    fn effective_outcome_is_the_single_shared_verdict_source() {
+        use crate::policy::engine::{MergeRecommendation, PolicyEngine};
+
+        // THREAD 5: both the merge gate and the dashboard context feed the same
+        // evaluations through this one function, so their verdicts cannot drift.
+        let config = test_config();
+        let engine = PolicyEngine::new(&config);
+        let checks = vec![semgrep_check()];
+        let summary = engine.evaluate_all(&checks, &[]);
+
+        // Pre-existing-only: the failing check is downgraded off the axes.
+        let mut preexisting = std::collections::BTreeSet::new();
+        preexisting.insert("Semgrep scan");
+        let downgraded = compute_effective_policy_outcome(&summary.evaluations, &preexisting);
+        assert!(downgraded.blocking_issues.is_empty());
+        assert!(downgraded.advisory_caveats.is_empty());
+        assert_eq!(downgraded.worst_merge, MergeRecommendation::Approve);
+
+        // Not pre-existing: the same failure keeps its policy impact.
+        let kept = compute_effective_policy_outcome(
+            &summary.evaluations,
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(kept.worst_merge, MergeRecommendation::ReviewRequired);
+        assert_eq!(kept.advisory_caveats.len(), 1);
     }
 
     #[test]
