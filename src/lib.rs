@@ -9,6 +9,7 @@ pub mod check_id;
 pub mod checks;
 pub mod cli;
 pub mod config;
+pub mod gate;
 pub mod git;
 pub mod heuristics;
 pub mod mcp;
@@ -23,7 +24,9 @@ pub mod state;
 pub mod storage;
 pub mod tui;
 
-pub use cli::{Cli, CliCommand, CompletionsArgs, OpenArgs, RunsArgs, ScopeArgs, StateArgs};
+pub use cli::{
+    Cli, CliCommand, CompletionsArgs, GateArgs, OpenArgs, RunsArgs, ScopeArgs, StateArgs,
+};
 pub use config::Config;
 
 use anyhow::Result;
@@ -140,7 +143,9 @@ impl App {
         }
 
         // 4. Generate diffs
-        let diffs = self.repo.generate_diffs(&target, &bases)?;
+        let diffs = self
+            .repo
+            .generate_diffs(&target, &bases, self.config.quiet)?;
 
         // 5. Run checks (reduced set in update mode)
         let (check_results, skipped_checks) = if self.config.update_mode {
@@ -434,7 +439,9 @@ impl App {
         } else {
             self.repo.resolve_bases(&self.config)?
         };
-        let diffs = self.repo.generate_diffs(&target, &bases)?;
+        let diffs = self
+            .repo
+            .generate_diffs(&target, &bases, self.config.quiet)?;
 
         // Skip checks and heuristics in quick mode
         let artifacts_dir = artifacts::generate(artifacts::GenerateInput {

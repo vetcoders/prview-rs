@@ -61,6 +61,28 @@ To review a specific GitHub PR:
 prview --pr 23 --quick
 ```
 
+### Gate mode
+
+```bash
+prview gate
+prview gate --strict
+prview gate --json
+```
+
+`prview gate` runs the standard fast gate profile, consumes the existing
+policy/merge-gate verdict, and exits with a stable automation contract. It does
+not compute a second verdict path.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | `PASS`, or `CONDITIONAL` without `--strict` |
+| `1` | `BLOCK` |
+| `2` | `CONDITIONAL` with `--strict` |
+| `3` | Gate execution failed before a trustworthy verdict was available |
+
+`--json` makes stdout machine-readable (`schema_version: "gate-json/v1"`) with
+the verdict, caveats, blocking issues, and artifact paths.
+
 ### Specific branch and base
 
 ```bash
@@ -94,10 +116,13 @@ prview --pr 23 --deep
 # 4) Compact JSON for automation (stdout = JSON only)
 prview --pr 23 --quick --json --quiet
 
-# 5) Pick up new commits without a full run
+# 5) Automation gate with contractual exit codes
+prview gate --json
+
+# 6) Pick up new commits without a full run
 prview --update
 
-# 6) Fast machine-readable repo state (branch, HEAD, dirty, latest run)
+# 7) Fast machine-readable repo state (branch, HEAD, dirty, latest run)
 prview state --json --fast
 ```
 

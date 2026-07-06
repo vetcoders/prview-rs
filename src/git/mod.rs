@@ -261,19 +261,26 @@ impl Repository {
 
     /// Generate diffs between target and all bases
     /// Skips bases that have the same commit as target (would produce empty diff)
-    pub fn generate_diffs(&self, target: &ResolvedRef, bases: &[ResolvedRef]) -> Result<Vec<Diff>> {
+    pub fn generate_diffs(
+        &self,
+        target: &ResolvedRef,
+        bases: &[ResolvedRef],
+        quiet: bool,
+    ) -> Result<Vec<Diff>> {
         use colored::Colorize;
         let mut diffs = Vec::new();
 
         for base in bases {
             // Skip if base and target point to same commit (empty diff)
             if base.commit_id == target.commit_id {
-                eprintln!(
-                    "  {} Skipping '{}' - same commit as target ({})",
-                    "ℹ".blue(),
-                    base.name,
-                    short_sha(&base.commit_id)
-                );
+                if !quiet {
+                    eprintln!(
+                        "  {} Skipping '{}' - same commit as target ({})",
+                        "ℹ".blue(),
+                        base.name,
+                        short_sha(&base.commit_id)
+                    );
+                }
                 continue;
             }
             let diff = self.diff_refs(base, target)?;

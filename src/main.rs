@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use colored::Colorize;
-use prview::cli::McpArgs;
+use prview::cli::{GateArgs, McpArgs};
 use prview::git::git_cmd;
 use prview::{App, Cli, CliCommand, Config, OpenArgs, RunsArgs, ScopeArgs, StateArgs};
 use std::path::{Path, PathBuf};
@@ -67,6 +67,13 @@ async fn run() -> Result<()> {
 
     if let Some(command) = &cli.command {
         return match command {
+            CliCommand::Gate(args) => match run_gate_command(&cli, args).await {
+                Ok(exit_code) => std::process::exit(exit_code),
+                Err(err) => {
+                    display_error(&err);
+                    std::process::exit(prview::gate::GATE_EXECUTION_ERROR_EXIT_CODE);
+                }
+            },
             CliCommand::State(args) => {
                 run_state_command(Config::from_cli(&cli).ok().as_ref(), args).await
             }
@@ -121,6 +128,68 @@ async fn run() -> Result<()> {
     };
 
     std::process::exit(exit_code);
+}
+
+async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
+    let mut run_cli = cli.clone();
+    run_cli.command = None;
+    run_cli.quick = true;
+    run_cli.deep = false;
+    run_cli.ci = false;
+    run_cli.ai_only = false;
+    run_cli.update = false;
+    run_cli.watch = false;
+    run_cli.tui = false;
+    run_cli.shell_setup = false;
+    run_cli.quiet = true;
+    run_cli.json = false;
+    run_cli.soft_exit = false;
+
+    let config = Config::from_cli(&run_cli)?;
+    let app = App::from_config(config)?;
+    let report = app.run().await.context("gate review run failed")?;
+    let cli_summary = prview::output::build_cli_json_summary(&app.config, &report);
+    let merge_gate_path = report
+        .artifacts_dir
+        .join("00_summary")
+        .join("MERGE_GATE.json");
+    let summary =
+        prview::gate::build_gate_json_output(&cli_summary, &merge_gate_path, args.strict)?;
+
+    if args.json || cli.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        print_gate_summary(&summary);
+    }
+
+    Ok(summary.exit_code)
+}
+
+fn print_gate_summary(summary: &prview::gate::GateJsonOutput) {
+    println!(
+        "prview gate: {} (exit {})",
+        summary.verdict.as_str(),
+        summary.exit_code
+    );
+    println!("output: {}", summary.output_dir);
+
+    if !summary.blocking_issues.is_empty() {
+        println!("blocking issues:");
+        for issue in &summary.blocking_issues {
+            println!("  - {issue}");
+        }
+    }
+
+    if !summary.caveats.is_empty() {
+        println!("caveats:");
+        for caveat in &summary.caveats {
+            println!("  - {caveat}");
+        }
+    }
+
+    if let Some(reason) = &summary.decision_reason {
+        println!("reason: {reason}");
+    }
 }
 
 async fn run_fix_command() -> Result<()> {
