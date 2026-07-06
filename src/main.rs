@@ -145,7 +145,8 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     run_cli.json = false;
     run_cli.soft_exit = false;
 
-    let config = Config::from_cli(&run_cli)?;
+    let mut config = Config::from_cli(&run_cli)?;
+    config.apply_gate_profile();
     let app = App::from_config(config)?;
     let report = app.run().await.context("gate review run failed")?;
     let cli_summary = prview::output::build_cli_json_summary(&app.config, &report);

@@ -83,6 +83,30 @@ not compute a second verdict path.
 `--json` makes stdout machine-readable (`schema_version: "gate-json/v1"`) with
 the verdict, caveats, blocking issues, and artifact paths.
 
+#### Gate profile and measured pre-push budget
+
+`prview gate` applies its own deterministic pre-push profile. It runs as a
+quick, quiet review and does not inherit global step opt-ins such as
+`--with-tests`, `--with-lint`, `--with-security`, or `--security-full`.
+
+Effective profile:
+
+| Surface | Gate behavior |
+|---------|---------------|
+| Rust / Cargo | `Cargo check` runs; `Clippy`, `Rustfmt`, `Cargo test`, and `Cargo audit` stay visible as skipped checks |
+| Security | Semgrep runs when the `semgrep` binary is available |
+| Geiger | `Cargo geiger` is out of the gate profile |
+| Tests, lint, bundle, heuristics | Disabled for the pre-push gate budget |
+| JS/TS | Existing JS checks only run when repo-local `node_modules` tools exist; they are not part of the measured budget below |
+
+Measured on 2026-07-06 with a prebuilt release binary
+(`target/release/prview`); compile time is excluded.
+
+| Repo checkout | State | Runs | Wall times | Mean | Verdicts | Dominant measured check |
+|---------------|-------|------|------------|------|----------|--------------------------|
+| `prview-rs` | `feat/gate-core`, W1-B worktree dirty | 2 | 8.73s, 7.36s | 8.05s | `CONDITIONAL` / exit 0 | Semgrep 4.41s; `Cargo check` cached |
+| `pensieve` | `chore/deprivatize`, clean checkout, 14 commits behind origin | 2 | 48.27s, 45.95s | 47.11s | `CONDITIONAL` / exit 0 | Semgrep 32.78s |
+
 ### Specific branch and base
 
 ```bash

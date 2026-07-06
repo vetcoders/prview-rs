@@ -1137,6 +1137,54 @@ mod tests {
     }
 
     #[test]
+    fn test_gate_profile_keeps_rust_gate_fast_and_geiger_out() {
+        let mut config = rust_config(true, true, true);
+        config.execution_mode = ExecutionMode::Deep;
+        config.security_full = true;
+        config.apply_gate_profile();
+
+        let checks = get_checks_for_profile(&config);
+        let check_names: Vec<String> = checks
+            .iter()
+            .map(|check| check.name().to_string())
+            .collect();
+
+        assert_eq!(config.execution_mode, ExecutionMode::Quick);
+        assert!(!config.run_tests);
+        assert!(!config.run_lint);
+        assert!(!config.run_security);
+        assert!(!config.run_heuristics);
+        assert!(!config.security_full);
+
+        assert!(check_names.iter().any(|name| name == "Cargo check"));
+        assert!(check_names.iter().any(|name| name == "Clippy"));
+        assert!(check_names.iter().any(|name| name == "Rustfmt"));
+        assert!(check_names.iter().any(|name| name == "Cargo test"));
+        assert!(check_names.iter().any(|name| name == "Cargo audit"));
+        assert!(!check_names.iter().any(|name| name == "Cargo geiger"));
+
+        let cargo_check = checks
+            .iter()
+            .find(|check| check.name() == "Cargo check")
+            .expect("cargo check configured");
+        assert!(matches!(
+            cargo_check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+
+        for name in ["Clippy", "Rustfmt", "Cargo test", "Cargo audit"] {
+            let check = checks
+                .iter()
+                .find(|check| check.name() == name)
+                .expect("rust check configured");
+            assert!(matches!(
+                check.check_eligibility(&config),
+                CheckEligibility::Skip(_)
+            ));
+        }
+    }
+
+    #[test]
     fn test_get_checks_for_profile_mixed_geiger_follows_security_full() {
         use crate::config::{DetectedProfile, ProfileKind, test_config_builder};
         use std::path::PathBuf;
