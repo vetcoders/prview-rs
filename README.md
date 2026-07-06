@@ -127,6 +127,9 @@ generated merge-gate artifact, and exits with the automation contract:
 Use `prview gate --json` for schema-friendly stdout with the verdict, caveats,
 blocking issues, and artifact paths.
 
+For local pre-push recipes and the recommended Shadow -> Warn -> Block rollout,
+see [`docs/gate-playbook.md`](docs/gate-playbook.md).
+
 ### GitHub Action
 
 External repositories can run the gate with one composite Action step:
@@ -235,6 +238,7 @@ prview completions fish > $HOME/.config/fish/completions/prview.fish
 - [`docs/INSTALL.md`](docs/INSTALL.md) — installation details
 - [`docs/usage.md`](docs/usage.md) — full usage guide
 - [`docs/configuration.md`](docs/configuration.md) — policy & config
+- [`docs/gate-playbook.md`](docs/gate-playbook.md) — hook recipes and gate rollout
 - [`docs/mcp.md`](docs/mcp.md) — MCP server for agents
 - [`docs/mcp-smoke.md`](docs/mcp-smoke.md) — MCP smoke walkthrough for agents
 - [`docs/architecture.md`](docs/architecture.md) — how it works

@@ -83,6 +83,9 @@ not compute a second verdict path.
 `--json` makes stdout machine-readable (`schema_version: "gate-json/v1"`) with
 the verdict, caveats, blocking issues, and artifact paths.
 
+Local pre-push hook recipes and the recommended Shadow -> Warn -> Block rollout
+are in [`docs/gate-playbook.md`](gate-playbook.md).
+
 #### Gate profile and measured pre-push budget
 
 `prview gate` applies its own deterministic pre-push profile. It runs as a
