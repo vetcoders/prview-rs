@@ -273,17 +273,26 @@ impl<'a> PolicyEngine<'a> {
             )
         } else if severity == PolicySeverity::Block {
             if reason.contains("fast remote-only preset") && self.config.remote_only {
-                // Strictly required check skipped by the fast remote preset: a
-                // degraded signal that requires review, not an outright block.
+                // Preserve the existing fast remote-only contract: the check is
+                // intentionally omitted by the preset, so the signal is
+                // degraded and review-required rather than blocking.
                 (
                     PolicyConclusion::Advisory,
                     AnalysisStatus::Degraded,
                     MergeRecommendation::ReviewRequired,
                 )
+            } else if is_mode_skip_reason(reason) {
+                // Strictly required check skipped by the selected mode: the run
+                // is incomplete, but this is a declared caveat rather than a
+                // missing tool/runtime failure.
+                (
+                    PolicyConclusion::Advisory,
+                    AnalysisStatus::Incomplete,
+                    MergeRecommendation::ReviewRequired,
+                )
             } else {
                 // Required but skipped for any other reason (missing tool,
-                // explicitly disabled, runtime spawn failure): the gate cannot
-                // be trusted, so block.
+                // runtime spawn failure): the gate cannot be trusted, so block.
                 (
                     PolicyConclusion::Blocked,
                     AnalysisStatus::Incomplete,
@@ -352,6 +361,13 @@ impl<'a> PolicyEngine<'a> {
             review_caveats,
         }
     }
+}
+
+fn is_mode_skip_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "security disabled" | "lint disabled" | "tests disabled" | "requires --security-full"
+    )
 }
 
 /// Whether a check is a semgrep scan whose output reports scan/parse errors —

@@ -458,7 +458,7 @@ fn display_raw_status(status: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checks::{CheckResult, CheckStatus};
+    use crate::checks::{CheckResult, CheckStatus, SkippedCheck};
     use crate::config::test_config;
     use crate::git::ResolvedRef;
     use std::time::Duration;
@@ -652,6 +652,58 @@ mod tests {
         serde_json::from_str(&raw).expect("parse gate json")
     }
 
+    fn run_gate_with_skipped_policy_check(
+        check_id: &str,
+        name: &str,
+        reason: &str,
+        severity: crate::policy::PolicySeverity,
+    ) -> serde_json::Value {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.policy.checks.insert(check_id.to_string(), severity);
+        let inline = InlineFindingsSummary {
+            status: "passed".to_string(),
+            findings_count: 0,
+            dashboard_findings: vec![],
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+        let skipped_checks = vec![SkippedCheck {
+            id: check_id.to_string(),
+            name: name.to_string(),
+            reason: reason.to_string(),
+        }];
+
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            checks: &[],
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &skipped_checks,
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+        })
+        .expect("merge gate");
+
+        let raw =
+            std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
+        serde_json::from_str(&raw).expect("parse gate json")
+    }
+
+    fn find_gate_check<'a>(gate: &'a serde_json::Value, check_id: &str) -> &'a serde_json::Value {
+        gate["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|check| check["id"].as_str() == Some(check_id))
+            .expect("gate check")
+    }
+
     #[test]
     fn effective_outcome_is_the_single_shared_verdict_source() {
         use crate::policy::engine::{MergeRecommendation, PolicyEngine};
@@ -697,6 +749,68 @@ mod tests {
         assert_eq!(
             gate["decision"]["unclassified_quality_failures"][0].as_str(),
             Some("cargo test")
+        );
+    }
+
+    #[test]
+    fn mode_skip_required_check_is_caveat_not_blocking_issue() {
+        let gate = run_gate_with_skipped_policy_check(
+            "cargo_audit",
+            "Cargo audit",
+            "security disabled",
+            crate::policy::PolicySeverity::Block,
+        );
+        let check = find_gate_check(&gate, "cargo_audit");
+
+        assert_eq!(check["status"].as_str(), Some("skipped"));
+        assert_eq!(check["policy_conclusion"].as_str(), Some("advisory"));
+        assert_eq!(check["confidence_impact"].as_str(), Some("incomplete"));
+        assert_eq!(check["merge_impact"].as_str(), Some("review_required"));
+        assert_eq!(check["blocking"].as_bool(), Some(false));
+        assert_eq!(gate["decision"]["verdict"].as_str(), Some("CONDITIONAL"));
+        assert_eq!(gate["decision"]["policy_allow_merge"].as_bool(), Some(true));
+        assert!(
+            gate["decision"]["blocking_issues"]
+                .as_array()
+                .is_some_and(|items| items.is_empty()),
+            "mode-skip must not land in blocking_issues"
+        );
+        assert!(
+            gate["decision"]["review_caveats"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item
+                    .as_str()
+                    .is_some_and(|text| text == "Cargo audit skipped: security disabled"))),
+            "mode-skip should remain visible as a review caveat"
+        );
+    }
+
+    #[test]
+    fn missing_required_tool_skip_remains_blocking_issue() {
+        let gate = run_gate_with_skipped_policy_check(
+            "cargo_audit",
+            "Cargo audit",
+            "tool not installed (cargo-audit is missing)",
+            crate::policy::PolicySeverity::Block,
+        );
+        let check = find_gate_check(&gate, "cargo_audit");
+
+        assert_eq!(check["policy_conclusion"].as_str(), Some("blocked"));
+        assert_eq!(check["confidence_impact"].as_str(), Some("incomplete"));
+        assert_eq!(check["merge_impact"].as_str(), Some("block"));
+        assert_eq!(check["blocking"].as_bool(), Some(true));
+        assert_eq!(gate["decision"]["verdict"].as_str(), Some("BLOCK"));
+        assert_eq!(
+            gate["decision"]["policy_allow_merge"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            gate["decision"]["blocking_issues"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item
+                    .as_str()
+                    .is_some_and(|text| text == "Cargo audit (Skipped)"))),
+            "tool-missing skip must keep today's blocking behavior"
         );
     }
 
