@@ -1,0 +1,174 @@
+name: prview gate
+description: Install prview and run the contractual prview gate automation check.
+
+inputs:
+  strict:
+    description: Treat CONDITIONAL as a failing gate exit code.
+    required: false
+    default: "false"
+  version:
+    description: prview crate version to install. Use a version that includes the gate command.
+    required: false
+    default: "0.6.0"
+  args:
+    description: Additional whitespace-separated arguments passed to prview gate.
+    required: false
+    default: ""
+
+outputs:
+  exit-code:
+    description: Raw prview gate process exit code.
+    value: ${{ steps.gate.outputs.exit-code }}
+  json-path:
+    description: Path to the captured prview gate JSON output.
+    value: ${{ steps.gate.outputs.json-path }}
+  sarif-path:
+    description: Path to INLINE_FINDINGS.sarif when the run produced one.
+    value: ${{ steps.gate.outputs.sarif-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Add Cargo bin directory to PATH
+      shell: bash
+      run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+    - name: Install prview
+      id: install
+      shell: bash
+      env:
+        PRVIEW_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        if ! command -v cargo >/dev/null 2>&1; then
+          echo "cargo is required to install prview" >&2
+          exit 3
+        fi
+
+        if [ "$PRVIEW_VERSION" = "latest" ]; then
+          BINSTALL_SPEC="prview"
+          CARGO_VERSION_ARGS=()
+        else
+          BINSTALL_SPEC="prview@${PRVIEW_VERSION}"
+          CARGO_VERSION_ARGS=(--version "$PRVIEW_VERSION")
+        fi
+
+        if command -v cargo-binstall >/dev/null 2>&1; then
+          if cargo binstall --no-confirm --force "$BINSTALL_SPEC"; then
+            echo "method=cargo-binstall" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "cargo-binstall could not install ${BINSTALL_SPEC}; falling back to cargo install" >&2
+        fi
+
+        cargo install prview "${CARGO_VERSION_ARGS[@]}" --locked --force
+        echo "method=cargo-install" >> "$GITHUB_OUTPUT"
+
+    - name: Run prview gate
+      id: gate
+      shell: bash
+      env:
+        PRVIEW_STRICT: ${{ inputs.strict }}
+        PRVIEW_ARGS: ${{ inputs.args }}
+        INSTALL_METHOD: ${{ steps.install.outputs.method }}
+      run: |
+        set -euo pipefail
+
+        case "$PRVIEW_STRICT" in
+          true|false) ;;
+          *)
+            echo "strict must be 'true' or 'false', got '${PRVIEW_STRICT}'" >&2
+            exit 3
+            ;;
+        esac
+
+        JSON_PATH="${RUNNER_TEMP}/prview-gate-${GITHUB_RUN_ID:-local}.json"
+        cmd=(prview gate --json)
+
+        if [ "$PRVIEW_STRICT" = "true" ]; then
+          cmd+=(--strict)
+        fi
+
+        if [ -n "$PRVIEW_ARGS" ]; then
+          read -r -a extra_args <<< "$PRVIEW_ARGS"
+          cmd+=("${extra_args[@]}")
+        fi
+
+        set +e
+        "${cmd[@]}" > "$JSON_PATH"
+        status=$?
+        set -e
+
+        verdict=""
+        output_dir=""
+        merge_gate_json=""
+        sarif_path=""
+
+        if command -v jq >/dev/null 2>&1 && [ -s "$JSON_PATH" ]; then
+          verdict="$(jq -r '.verdict // empty' "$JSON_PATH" 2>/dev/null || true)"
+          output_dir="$(jq -r '.output_dir // empty' "$JSON_PATH" 2>/dev/null || true)"
+          merge_gate_json="$(jq -r '.merge_gate_json // empty' "$JSON_PATH" 2>/dev/null || true)"
+        fi
+
+        if [ -n "$output_dir" ] && [ -f "${output_dir}/30_context/INLINE_FINDINGS.sarif" ]; then
+          sarif_path="${output_dir}/30_context/INLINE_FINDINGS.sarif"
+        fi
+
+        case "$status" in
+          0)
+            result="PASS or CONDITIONAL accepted by non-strict mode"
+            action_exit=0
+            ;;
+          1)
+            result="BLOCK"
+            action_exit=1
+            ;;
+          2)
+            result="CONDITIONAL rejected by strict mode"
+            action_exit=2
+            ;;
+          3)
+            result="internal gate execution error"
+            action_exit=3
+            ;;
+          *)
+            result="unexpected non-contract exit code"
+            action_exit=3
+            ;;
+        esac
+
+        {
+          echo "exit-code=${status}"
+          echo "json-path=${JSON_PATH}"
+          echo "sarif-path=${sarif_path}"
+        } >> "$GITHUB_OUTPUT"
+
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          {
+            echo "## prview gate"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Decision source | exit code only |"
+            echo "| Exit code | \`${status}\` |"
+            echo "| Result | ${result} |"
+            echo "| Strict | \`${PRVIEW_STRICT}\` |"
+            echo "| Install method | \`${INSTALL_METHOD:-unknown}\` |"
+            if [ -n "$verdict" ]; then
+              echo "| JSON verdict | \`${verdict}\` |"
+            fi
+            if [ -n "$merge_gate_json" ]; then
+              echo "| MERGE_GATE.json | \`${merge_gate_json}\` |"
+            fi
+            if [ -n "$sarif_path" ]; then
+              echo "| SARIF | \`${sarif_path}\` |"
+            else
+              echo "| SARIF | not produced for this run |"
+            fi
+            echo
+            echo "JSON is parsed only for summary details and artifact paths; pass/fail is mapped from the prview gate exit code contract."
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        exit "$action_exit"
