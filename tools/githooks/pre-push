@@ -43,11 +43,11 @@ if ! command -v prview >/dev/null 2>&1; then
 fi
 
 set +e
-if [ -n "$STRICT_FLAG" ]; then
-  prview gate "$STRICT_FLAG"
-else
-  prview gate
-fi
+# Intentional word-splitting: empty STRICT_FLAG must expand to nothing,
+# a set value to a single flag. STRICT_FLAG is always defined, so set -u
+# is not a concern here.
+# shellcheck disable=SC2086
+prview gate $STRICT_FLAG
 STATUS=$?
 set -e
 
