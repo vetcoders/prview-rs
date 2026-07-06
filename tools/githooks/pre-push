@@ -1,136 +1,77 @@
 #!/bin/sh
-set -e
+set -eu
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 
-# Resolve GNU Make once. On BSD systems GNU Make ships as `gmake`; on Linux/mac
-# it is `make`. Prefer `gmake` when present, fall back to `make`, and bail with
-# a clear message if neither exists rather than dying on command-not-found.
-MAKE=$(command -v gmake || command -v make || true)
-if [ -z "$MAKE" ]; then
-  echo "make (or gmake) is required to run the pre-push hook." >&2
-  exit 1
+MODE="${PRVIEW_GATE_HOOK_MODE:-advisory}"
+
+# GUI git clients (Tower, SourceTree, Fork, IDE VCS) run hooks with a
+# stripped PATH that often omits ~/.cargo/bin, hiding the prview binary.
+if [ -d "$HOME/.cargo/bin" ] && ! echo "$PATH" | grep -q "$HOME/.cargo/bin"; then
+  export PATH="$PATH:$HOME/.cargo/bin"
 fi
 
-remote="$1"
-url="$2"
+STRICT_FLAG=""
+BLOCKING=1
 
-echo "=== Pre-push validation ==="
-echo "Pushing to: $remote ($url)"
+case "$MODE" in
+  advisory|shadow)
+    BLOCKING=0
+    ;;
+  warn)
+    ;;
+  strict|block)
+    STRICT_FLAG="--strict"
+    ;;
+  *)
+    echo "PRVIEW_GATE_HOOK_MODE must be one of: advisory, shadow, warn, strict, block" >&2
+    exit 3
+    ;;
+esac
 
-# Resolve the default branch dynamically instead of hardcoding it. Prefer the
-# symbolic ref that `git remote set-head` records; fall back to the first
-# conventional branch that actually exists on the remote. This keeps the merge-base
-# diff correct regardless of whether the trunk is main/master/develop.
-DEFAULT_BRANCH=$(git symbolic-ref --short "refs/remotes/$remote/HEAD" 2>/dev/null | sed "s|^$remote/||")
-if [ -z "$DEFAULT_BRANCH" ]; then
-  for cand in main master develop; do
-    if git show-ref --verify --quiet "refs/remotes/$remote/$cand"; then
-      DEFAULT_BRANCH="$cand"
-      break
-    fi
-  done
-fi
-[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
-echo "Default branch: $remote/$DEFAULT_BRANCH"
+echo "=== prview pre-push gate ==="
+echo "Mode: $MODE"
 
-# Decide whether this push touches Rust/Cargo files. If it does not (docs,
-# markdown, shell, CI yaml, etc.), the heavy clippy+test gates are skipped —
-# they cannot be affected and running the full suite on a README edit is pure
-# friction. Manifest, format, and semgrep stay unconditional (fast / security).
-RUST_TOUCHED=0
-HAVE_RANGE=0
-while read -r _lref lsha _rref rsha; do
-  [ -z "$lsha" ] && continue
-  case "$lsha" in *[!0]*) : ;; *) continue ;; esac  # ref deletion: nothing to test
-  HAVE_RANGE=1
-  if printf '%s' "$rsha" | grep -qE '^0+$' || ! git cat-file -e "$rsha" 2>/dev/null; then
-    base=$(git merge-base "$lsha" "$remote/$DEFAULT_BRANCH" 2>/dev/null || true)
-    if [ -n "$base" ]; then
-      files=$(git diff --name-only "$base" "$lsha")
-    else
-      # No common ancestor found (e.g. remote default branch not fetched).
-      # Diffing a single commit would miss the rest of the pushed branch, so
-      # run the full gate to be safe rather than guessing a narrow file set.
-      RUST_TOUCHED=1
-      files=""
-    fi
-  else
-    files=$(git diff --name-only "$rsha" "$lsha")
+if ! command -v prview >/dev/null 2>&1; then
+  echo "prview is required for this hook. Run 'make install-bin' or 'cargo install prview --locked --force'." >&2
+  if [ "$BLOCKING" -eq 0 ]; then
+    echo "Advisory mode: allowing push despite missing prview." >&2
+    exit 0
   fi
-  if printf '%s\n' "$files" | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain'; then
-    RUST_TOUCHED=1
-  fi
-done
-# No parseable range (manual run / edge): be safe and run the full gate.
-[ "$HAVE_RANGE" = "0" ] && RUST_TOUCHED=1
-if [ "$RUST_TOUCHED" = "1" ]; then
-  echo "Rust/Cargo changes detected -> full gate."
-else
-  echo "No Rust/Cargo changes -> light gate (manifest + fmt + semgrep)."
+  exit 3
 fi
 
-echo ""
-echo "[1/5] Manifest portability..."
-python3 - <<'PY'
-try:
-    import tomllib
-except ModuleNotFoundError:
-    try:
-        import tomli as tomllib
-    except ModuleNotFoundError:
-        print("Warning: manifest portability check skipped (needs Python 3.11+ or tomli)")
-        raise SystemExit(0)
+set +e
+# Intentional word-splitting: empty STRICT_FLAG must expand to nothing,
+# a set value to a single flag. STRICT_FLAG is always defined, so set -u
+# is not a concern here.
+# shellcheck disable=SC2086
+prview gate $STRICT_FLAG
+STATUS=$?
+set -e
 
-with open("Cargo.toml", "rb") as fh:
-    data = tomllib.load(fh)
+case "$STATUS" in
+  0)
+    echo "prview gate: PASS or accepted CONDITIONAL (exit 0)."
+    ;;
+  1)
+    echo "prview gate: BLOCK (exit 1)." >&2
+    ;;
+  2)
+    echo "prview gate: CONDITIONAL rejected by strict mode (exit 2)." >&2
+    ;;
+  3)
+    echo "prview gate: internal/tooling error (exit 3)." >&2
+    ;;
+  *)
+    echo "prview gate: unexpected exit code $STATUS." >&2
+    ;;
+esac
 
-# Path deps are portable as long as they carry a registry `version` —
-# cargo strips the path on publish and consumers resolve the version.
-# The unportable (and publish-breaking) form is a path dep WITHOUT a
-# version: it cannot be uploaded and silently pins the build to this
-# checkout. Flag only that form.
-bad = [
-    (section, name, spec["path"])
-    for section in ("dependencies", "dev-dependencies", "build-dependencies")
-    for name, spec in data.get(section, {}).items()
-    if isinstance(spec, dict) and "path" in spec and "version" not in spec
-]
-
-if bad:
-    raise SystemExit(
-        "Manifest portability check failed:\n"
-        + "\n".join(
-            f"  - {section}.{name} is a local path dependency without a registry version: {path}"
-            for section, name, path in bad
-        )
-    )
-
-print("Manifest portability: ok (path dependencies carry registry versions)")
-PY
-
-echo ""
-echo "[2/5] Format check ($MAKE fmt-check)..."
-$MAKE fmt-check
-
-if [ "$RUST_TOUCHED" = "1" ]; then
-  echo ""
-  echo "[3/5] Clippy ($MAKE clippy)..."
-  $MAKE clippy
-
-  echo ""
-  echo "[4/5] Tests ($MAKE test)..."
-  $MAKE test
-else
-  echo ""
-  echo "[3/5] Clippy... skipped (no Rust/Cargo changes)"
-  echo "[4/5] Tests... skipped (no Rust/Cargo changes)"
+if [ "$BLOCKING" -eq 0 ]; then
+  echo "Advisory mode: reporting only; push is not blocked."
+  exit 0
 fi
 
-echo ""
-echo "[5/5] Semgrep ($MAKE semgrep)..."
-$MAKE semgrep
-
-echo ""
-echo "=== All pre-push checks passed ==="
+exit "$STATUS"

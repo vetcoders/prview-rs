@@ -21,6 +21,6 @@ chmod +x tools/githooks/pre-push
 
 echo "Git hooks installed:"
 echo "  - pre-commit -> fmt check + cargo check (staged Rust)"
-echo "  - pre-push   -> path-gated gate (manifest + fmt + clippy + test + semgrep)"
+echo "  - pre-push   -> prview gate (default advisory; mode via PRVIEW_GATE_HOOK_MODE)"
 echo
 echo "Done!"

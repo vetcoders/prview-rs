@@ -83,6 +83,9 @@ not compute a second verdict path.
 `--json` makes stdout machine-readable (`schema_version: "gate-json/v1"`) with
 the verdict, caveats, blocking issues, and artifact paths.
 
+Local pre-push hook recipes and the recommended Shadow -> Warn -> Block rollout
+are in [`docs/gate-playbook.md`](gate-playbook.md).
+
 #### Gate profile and measured pre-push budget
 
 `prview gate` applies its own deterministic pre-push profile. It runs as a
@@ -106,6 +109,59 @@ Measured on 2026-07-06 with a prebuilt release binary
 |---------------|-------|------|------------|------|----------|--------------------------|
 | `prview-rs` | `feat/gate-core`, W1-B worktree dirty | 2 | 8.73s, 7.36s | 8.05s | `CONDITIONAL` / exit 0 | Semgrep 4.41s; `Cargo check` cached |
 | `pensieve` | `chore/deprivatize`, clean checkout, 14 commits behind origin | 2 | 48.27s, 45.95s | 47.11s | `CONDITIONAL` / exit 0 | Semgrep 32.78s |
+
+### GitHub Actions
+
+This repository ships a composite Action at `action.yml` for external CI usage.
+It installs `prview`, runs `prview gate --json`, and maps the step result only
+from the gate exit-code contract:
+
+| Exit code | Action result |
+|-----------|---------------|
+| `0` | success (`PASS`, or `CONDITIONAL` without strict mode) |
+| `1` | failure (`BLOCK`) |
+| `2` | failure (`CONDITIONAL` with strict mode) |
+| `3` | failure (gate execution error) |
+
+Minimal blocking gate:
+
+```yaml
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  prview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: vetcoders/prview-rs@v0.6.0
+        id: prview
+        with:
+          strict: "true"
+          version: "0.6.0"
+      - uses: github/codeql-action/upload-sarif@v3
+        if: ${{ steps.prview.outputs['sarif-path'] != '' }}
+        with:
+          sarif_file: ${{ steps.prview.outputs['sarif-path'] }}
+```
+
+Use `strict: "false"` for advisory rollout: `CONDITIONAL` remains exit `0`,
+while `BLOCK` still exits `1`. Extra CLI flags can be passed as whitespace-
+separated `args`.
+
+The Action prefers `cargo-binstall` when that binary is already available on the
+runner and falls back to `cargo install prview --locked --force`. Set `version`
+to a release that contains `prview gate`; the gate command starts with the 0.6
+release line.
+
+SARIF upload requires `permissions: security-events: write`. prview writes
+`30_context/INLINE_FINDINGS.sarif` only when there are inline findings or
+advisories. GitHub code scanning limits matter for large diffs: SARIF uploads
+must be at most 10 MB after gzip compression, and GitHub displays at most 50
+annotations per workflow step.
 
 ### Specific branch and base
 

@@ -1,0 +1,91 @@
+name: prview gate
+
+on:
+  push:
+    branches: [main, feat/gate-core, feat/gate-packaging]
+  pull_request:
+    branches: [main, feat/gate-core]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.94"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  gate-shadow:
+    name: Gate Shadow
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build prview from source
+        run: cargo build --locked --release
+      - name: Run prview gate
+        id: gate
+        shell: bash
+        run: |
+          set +e
+          ./target/release/prview gate --json > "$RUNNER_TEMP/prview-gate.json"
+          status=$?
+          set -e
+
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
+          echo "json_path=${RUNNER_TEMP}/prview-gate.json" >> "$GITHUB_OUTPUT"
+
+          verdict=""
+          output_dir=""
+          sarif_path=""
+          if command -v jq >/dev/null 2>&1 && [ -s "$RUNNER_TEMP/prview-gate.json" ]; then
+            verdict="$(jq -r '.verdict // empty' "$RUNNER_TEMP/prview-gate.json" 2>/dev/null || true)"
+            output_dir="$(jq -r '.output_dir // empty' "$RUNNER_TEMP/prview-gate.json" 2>/dev/null || true)"
+          fi
+
+          if [ -n "$output_dir" ] && [ -f "${output_dir}/30_context/INLINE_FINDINGS.sarif" ]; then
+            sarif_path="${output_dir}/30_context/INLINE_FINDINGS.sarif"
+          fi
+          echo "sarif_path=${sarif_path}" >> "$GITHUB_OUTPUT"
+
+          case "$status" in
+            0) result="PASS or non-strict CONDITIONAL" ;;
+            1) result="BLOCK" ;;
+            2) result="strict CONDITIONAL" ;;
+            3) result="internal gate execution error" ;;
+            *) result="unexpected exit code" ;;
+          esac
+
+          {
+            echo "## prview gate shadow"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Mode | shadow / non-strict |"
+            echo "| Decision source | exit code only |"
+            echo "| Exit code | \`${status}\` |"
+            echo "| Result | ${result} |"
+            if [ -n "$verdict" ]; then
+              echo "| JSON verdict | \`${verdict}\` |"
+            fi
+            if [ -n "$sarif_path" ]; then
+              echo "| SARIF | \`${sarif_path}\` |"
+            else
+              echo "| SARIF | not produced for this run |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit 0
+      - name: Upload SARIF
+        if: ${{ steps.gate.outputs.sarif_path != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: ${{ steps.gate.outputs.sarif_path }}

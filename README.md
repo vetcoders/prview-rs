@@ -127,6 +127,47 @@ generated merge-gate artifact, and exits with the automation contract:
 Use `prview gate --json` for schema-friendly stdout with the verdict, caveats,
 blocking issues, and artifact paths.
 
+For local pre-push recipes and the recommended Shadow -> Warn -> Block rollout,
+see [`docs/gate-playbook.md`](docs/gate-playbook.md).
+
+### GitHub Action
+
+External repositories can run the gate with one composite Action step:
+
+```yaml
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  prview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: vetcoders/prview-rs@v0.6.0
+        id: prview
+        with:
+          strict: "true"
+          version: "0.6.0"
+      - uses: github/codeql-action/upload-sarif@v3
+        if: ${{ steps.prview.outputs['sarif-path'] != '' }}
+        with:
+          sarif_file: ${{ steps.prview.outputs['sarif-path'] }}
+```
+
+The Action maps pass/fail only from the `prview gate` exit-code contract. JSON
+stdout is used for step-summary details and artifact paths, not for deciding
+whether the check passed. `cargo-binstall` is used when available, with
+`cargo install prview` as the fallback. Use a `version` that includes
+`prview gate`; the command starts with the 0.6 release line.
+
+GitHub code scanning accepts SARIF uploads through
+`github/codeql-action/upload-sarif`. Keep SARIF under GitHub's ingestion limits:
+10 MB gzip-compressed upload size and 50 displayed annotations per workflow
+step.
+
 ## The review pack
 
 | File | What it's for |
@@ -197,6 +238,7 @@ prview completions fish > $HOME/.config/fish/completions/prview.fish
 - [`docs/INSTALL.md`](docs/INSTALL.md) — installation details
 - [`docs/usage.md`](docs/usage.md) — full usage guide
 - [`docs/configuration.md`](docs/configuration.md) — policy & config
+- [`docs/gate-playbook.md`](docs/gate-playbook.md) — hook recipes and gate rollout
 - [`docs/mcp.md`](docs/mcp.md) — MCP server for agents
 - [`docs/mcp-smoke.md`](docs/mcp-smoke.md) — MCP smoke walkthrough for agents
 - [`docs/architecture.md`](docs/architecture.md) — how it works
