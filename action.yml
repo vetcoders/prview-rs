@@ -83,7 +83,7 @@ runs:
             ;;
         esac
 
-        JSON_PATH="${RUNNER_TEMP}/prview-gate-${GITHUB_RUN_ID:-local}.json"
+        JSON_PATH="${RUNNER_TEMP:-/tmp}/prview-gate-${GITHUB_RUN_ID:-local}.json"
         cmd=(prview gate --json)
 
         if [ "$PRVIEW_STRICT" = "true" ]; then
