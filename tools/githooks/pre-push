@@ -5,6 +5,13 @@ REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 
 MODE="${PRVIEW_GATE_HOOK_MODE:-advisory}"
+
+# GUI git clients (Tower, SourceTree, Fork, IDE VCS) run hooks with a
+# stripped PATH that often omits ~/.cargo/bin, hiding the prview binary.
+if [ -d "$HOME/.cargo/bin" ] && ! echo "$PATH" | grep -q "$HOME/.cargo/bin"; then
+  export PATH="$PATH:$HOME/.cargo/bin"
+fi
+
 STRICT_FLAG=""
 BLOCKING=1
 
