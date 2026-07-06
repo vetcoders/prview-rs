@@ -148,6 +148,20 @@ fn eval_skipped_block_check_is_incomplete() {
 }
 
 #[test]
+fn eval_required_mode_skip_is_incomplete_caveat() {
+    let mut policy = PolicyConfig::default();
+    policy
+        .checks
+        .insert("cargo_audit".to_string(), PolicySeverity::Block);
+
+    let checks = vec![make_check("Cargo check", CheckStatus::Passed)];
+    let skipped = vec![make_skipped("Cargo audit", "security disabled")];
+    let (status, rec) = eval_scenario(policy, &checks, &skipped, false);
+    assert_eq!(status, AnalysisStatus::Incomplete);
+    assert_eq!(rec, MergeRecommendation::ReviewRequired);
+}
+
+#[test]
 fn eval_required_check_skipped_at_runtime_blocks() {
     // PR #12 review #1: a check REQUIRED by policy that RAN but returned
     // Skipped (e.g. a tool that spawned then failed and was downgraded) must
