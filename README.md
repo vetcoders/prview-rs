@@ -70,6 +70,9 @@ prview --quick
 # Review a GitHub PR with stricter presets
 prview --pr 23 --deep
 
+# Run the automation gate with contractual exit codes
+prview gate
+
 # Open the latest generated dashboard
 prview open
 ```
@@ -100,11 +103,29 @@ prview --profile python --with-tests --with-lint
 # Compact JSON for CI / agents (stdout = JSON only)
 prview --pr 23 --quick --json --quiet
 
+# Gate JSON for automation
+prview gate --json
+
 # Interactive TUI for browsing results
 prview --tui
 ```
 
 The full flag reference is always one command away: `prview --help`. A written guide lives in [`docs/usage.md`](docs/usage.md).
+
+## Quality gate
+
+`prview gate` runs the standard fast gate profile, reads the verdict from the
+generated merge-gate artifact, and exits with the automation contract:
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | `PASS`, or `CONDITIONAL` without `--strict` |
+| `1` | `BLOCK` |
+| `2` | `CONDITIONAL` with `--strict` |
+| `3` | Gate execution failed before a trustworthy verdict was available |
+
+Use `prview gate --json` for schema-friendly stdout with the verdict, caveats,
+blocking issues, and artifact paths.
 
 ## The review pack
 

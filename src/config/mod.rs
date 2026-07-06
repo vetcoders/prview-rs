@@ -773,6 +773,29 @@ impl Config {
         Ok(config)
     }
 
+    /// Apply the deterministic pre-push gate profile.
+    ///
+    /// The `gate` subcommand owns its check budget: global step opt-ins such as
+    /// `--with-tests`, `--with-lint`, or `--security-full` must not accidentally
+    /// turn the pre-push gate into a deep review.
+    pub fn apply_gate_profile(&mut self) {
+        self.execution_mode = ExecutionMode::Quick;
+        self.update_mode = false;
+        self.tui_mode = false;
+
+        self.run_tests = false;
+        self.run_lint = false;
+        self.lint_forced = false;
+        self.run_bundle = false;
+        self.run_security = false;
+        self.run_heuristics = false;
+        self.security_full = false;
+
+        self.quiet = true;
+        self.json = false;
+        self.soft_exit = false;
+    }
+
     /// Create a minimal Config for state-only TUI viewer.
     /// Does not parse CLI args — avoids re-parsing issues.
     pub fn for_state_viewer(repo_root: &std::path::Path) -> Result<Self> {

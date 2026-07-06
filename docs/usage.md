@@ -61,6 +61,52 @@ To review a specific GitHub PR:
 prview --pr 23 --quick
 ```
 
+### Gate mode
+
+```bash
+prview gate
+prview gate --strict
+prview gate --json
+```
+
+`prview gate` runs the standard fast gate profile, consumes the existing
+policy/merge-gate verdict, and exits with a stable automation contract. It does
+not compute a second verdict path.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | `PASS`, or `CONDITIONAL` without `--strict` |
+| `1` | `BLOCK` |
+| `2` | `CONDITIONAL` with `--strict` |
+| `3` | Gate execution failed before a trustworthy verdict was available |
+
+`--json` makes stdout machine-readable (`schema_version: "gate-json/v1"`) with
+the verdict, caveats, blocking issues, and artifact paths.
+
+#### Gate profile and measured pre-push budget
+
+`prview gate` applies its own deterministic pre-push profile. It runs as a
+quick, quiet review and does not inherit global step opt-ins such as
+`--with-tests`, `--with-lint`, `--with-security`, or `--security-full`.
+
+Effective profile:
+
+| Surface | Gate behavior |
+|---------|---------------|
+| Rust / Cargo | `Cargo check` runs; `Clippy`, `Rustfmt`, `Cargo test`, and `Cargo audit` stay visible as skipped checks |
+| Security | Semgrep runs when the `semgrep` binary is available |
+| Geiger | `Cargo geiger` is out of the gate profile |
+| Tests, lint, bundle, heuristics | Disabled for the pre-push gate budget |
+| JS/TS | Existing JS checks only run when repo-local `node_modules` tools exist; they are not part of the measured budget below |
+
+Measured on 2026-07-06 with a prebuilt release binary
+(`target/release/prview`); compile time is excluded.
+
+| Repo checkout | State | Runs | Wall times | Mean | Verdicts | Dominant measured check |
+|---------------|-------|------|------------|------|----------|--------------------------|
+| `prview-rs` | `feat/gate-core`, W1-B worktree dirty | 2 | 8.73s, 7.36s | 8.05s | `CONDITIONAL` / exit 0 | Semgrep 4.41s; `Cargo check` cached |
+| `pensieve` | `chore/deprivatize`, clean checkout, 14 commits behind origin | 2 | 48.27s, 45.95s | 47.11s | `CONDITIONAL` / exit 0 | Semgrep 32.78s |
+
 ### Specific branch and base
 
 ```bash
@@ -94,10 +140,13 @@ prview --pr 23 --deep
 # 4) Compact JSON for automation (stdout = JSON only)
 prview --pr 23 --quick --json --quiet
 
-# 5) Pick up new commits without a full run
+# 5) Automation gate with contractual exit codes
+prview gate --json
+
+# 6) Pick up new commits without a full run
 prview --update
 
-# 6) Fast machine-readable repo state (branch, HEAD, dirty, latest run)
+# 7) Fast machine-readable repo state (branch, HEAD, dirty, latest run)
 prview state --json --fast
 ```
 

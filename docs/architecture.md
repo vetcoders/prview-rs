@@ -169,7 +169,7 @@ pub struct Repository {
 impl Repository {
     pub fn resolve_target(&self, config: &Config) -> Result<ResolvedRef>;
     pub fn resolve_bases(&self, config: &Config) -> Result<Vec<ResolvedRef>>;
-    pub fn generate_diffs(&self, target: &ResolvedRef, bases: &[ResolvedRef]) -> Result<Vec<Diff>>;
+    pub fn generate_diffs(&self, target: &ResolvedRef, bases: &[ResolvedRef], quiet: bool) -> Result<Vec<Diff>>;
     pub fn commit_patch(&self, commit_id: &str) -> Result<String>;
 }
 ```

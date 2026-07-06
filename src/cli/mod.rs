@@ -48,6 +48,8 @@ Generates Artifact Pack v1 with structured, verifiable PR review artifacts:\n\n\
   prview --pr 42                      Analyze GitHub PR #42
   prview --pr 42 --gh-repo owner/repo PR from specific repository
   prview --update feat/x main         Incremental update after new commits
+  prview gate                         Quality gate with contractual exit codes
+  prview gate --strict --json         Machine-readable gate verdict
   prview --json --quiet               Compact JSON summary for CI and agents
   prview --ci                         CI mode: all checks, strict exit codes
   prview runs                         List previous runs for the current repository
@@ -251,6 +253,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
+    /// Run the quality gate and exit with contractual status codes
+    Gate(GateArgs),
     /// Inspect repository state
     State(StateArgs),
     /// Check system dependencies and missing toolchains
@@ -272,6 +276,22 @@ pub enum CliCommand {
         #[command(flatten)]
         args: McpArgs,
     },
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+#[command(after_help = "Exit codes:
+  0 = PASS, or CONDITIONAL without --strict
+  1 = BLOCK
+  2 = CONDITIONAL with --strict
+  3 = gate could not execute (internal/tooling error)")]
+pub struct GateArgs {
+    /// Treat CONDITIONAL as exit code 2 instead of advisory exit 0
+    #[arg(long)]
+    pub strict: bool,
+
+    /// Emit machine-readable gate JSON to stdout
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -995,6 +1015,20 @@ mod tests {
                 hot: false,
                 tui: false,
                 repo_path: Some(PathBuf::from(".")),
+            }))
+        );
+        assert_eq!(cli.target, None);
+    }
+
+    #[test]
+    fn test_parse_gate_subcommand() {
+        let cli = Cli::try_parse_from(["prview", "gate", "--strict", "--json"]).unwrap();
+
+        assert_eq!(
+            cli.command,
+            Some(CliCommand::Gate(GateArgs {
+                strict: true,
+                json: true,
             }))
         );
         assert_eq!(cli.target, None);

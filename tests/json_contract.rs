@@ -56,6 +56,59 @@ fn run_json_quiet(repo: &Path, extra_args: &[&str]) -> serde_json::Value {
 }
 
 #[test]
+fn gate_help_documents_exit_code_contract() {
+    Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .args(["gate", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Exit codes:"))
+        .stdout(predicate::str::contains("0 = PASS"))
+        .stdout(predicate::str::contains("1 = BLOCK"))
+        .stdout(predicate::str::contains("2 = CONDITIONAL with --strict"))
+        .stdout(predicate::str::contains("3 = gate could not execute"));
+}
+
+#[test]
+fn gate_json_emits_verdict_and_caveats_from_merge_gate() {
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+
+    let assert = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(repo)
+        .args(["gate", "--json"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let payload: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout should be valid JSON");
+
+    assert_eq!(payload["schema_version"], "gate-json/v1");
+    assert_eq!(payload["strict"].as_bool(), Some(false));
+    assert!(matches!(
+        payload["verdict"].as_str(),
+        Some("PASS" | "CONDITIONAL" | "BLOCK")
+    ));
+    assert!(payload["exit_code"].as_i64().is_some());
+    assert!(payload["caveats"].as_array().is_some());
+    assert!(payload["blocking_issues"].as_array().is_some());
+    assert!(payload["merge_gate_json"].as_str().is_some());
+
+    let output_dir = Path::new(
+        payload["output_dir"]
+            .as_str()
+            .expect("output_dir should be a string"),
+    );
+    let merge_gate = output_dir.join("00_summary/MERGE_GATE.json");
+    assert!(merge_gate.exists(), "gate should generate MERGE_GATE.json");
+
+    let gate: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&merge_gate).expect("read gate")).expect("parse");
+    assert_eq!(payload["verdict"], gate["decision"]["verdict"]);
+    assert_eq!(payload["caveats"], gate["decision"]["review_caveats"]);
+}
+
+#[test]
 fn json_without_quiet_still_writes_only_json_to_stdout() {
     let temp = create_fixture_repo();
     let repo = temp.path();
