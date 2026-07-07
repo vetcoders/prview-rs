@@ -11,8 +11,9 @@
 //! contract branch. They are deterministic without depending on which quality
 //! tools happen to be installed on the runner:
 //!
-//! * The gate profile disables tests/lint/security/heuristics, so the
-//!   `heuristics_loctree` check is always *skipped* regardless of environment.
+//! * The gate profile disables tests/lint/heuristics, and the fixture PATH
+//!   exposes git but not semgrep, so the `Semgrep scan` check is always skipped
+//!   regardless of runner tooling.
 //! * Under the default policy that skip is advisory → CONDITIONAL (exit 0, or
 //!   exit 2 with `--strict`).
 //! * Under a `default_severity: block` policy the same skip becomes blocking →
@@ -22,6 +23,7 @@
 
 use assert_cmd::prelude::*;
 use prview::git::git_cmd;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -60,14 +62,32 @@ fn create_gate_fixture() -> TempDir {
     temp
 }
 
+fn path_without_semgrep(repo: &Path) -> OsString {
+    let bin_dir = repo.join(".test-bin");
+    fs::create_dir_all(&bin_dir).expect("create fixture bin dir");
+
+    let git_path = which::which("git").expect("git must be available for gate fixtures");
+    let git_file_name = git_path.file_name().expect("git path has file name");
+    fs::copy(&git_path, bin_dir.join(git_file_name)).expect("copy git into fixture PATH");
+
+    OsString::from(bin_dir)
+}
+
+fn prview_gate_command(repo: &Path) -> Command {
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("prview"));
+    command
+        .current_dir(repo)
+        .env("PATH", path_without_semgrep(repo));
+    command
+}
+
 #[test]
 fn gate_exits_zero_for_non_strict_conditional() {
     let temp = create_gate_fixture();
 
-    // Default policy: the skipped heuristics check is advisory → CONDITIONAL,
+    // Default policy: the skipped Semgrep check is advisory → CONDITIONAL,
     // which is accepted (exit 0) without --strict.
-    Command::new(assert_cmd::cargo::cargo_bin!("prview"))
-        .current_dir(temp.path())
+    prview_gate_command(temp.path())
         .arg("gate")
         .assert()
         .code(0);
@@ -80,8 +100,7 @@ fn gate_exits_two_for_strict_conditional() {
     // Same CONDITIONAL verdict, but --strict rejects it with exit 2. This is the
     // exact code clap also uses for usage errors, which is why the action must
     // distinguish the two (see action.yml) — here we pin the contract value.
-    Command::new(assert_cmd::cargo::cargo_bin!("prview"))
-        .current_dir(temp.path())
+    prview_gate_command(temp.path())
         .args(["gate", "--strict"])
         .assert()
         .code(2);
@@ -101,11 +120,7 @@ fn gate_exits_one_for_block_verdict() {
     run_git(repo, &["add", ".prview-policy.yml"]);
     run_git(repo, &["commit", "-m", "block policy"]);
 
-    Command::new(assert_cmd::cargo::cargo_bin!("prview"))
-        .current_dir(repo)
-        .arg("gate")
-        .assert()
-        .code(1);
+    prview_gate_command(repo).arg("gate").assert().code(1);
 }
 
 #[test]
