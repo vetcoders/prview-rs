@@ -302,6 +302,48 @@ fn same_run_path(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// Scan `runs/<repo>/<branch>/` for an in-flight run matching HEAD that the
+/// index does not know about yet — a deep run is only registered on completion,
+/// so it is invisible to the index-only lookup. Marker-bearing run dirs are
+/// exactly the ones the index misses (completed runs are already registered).
+/// Returns the most recently started match. Mirrors the `state` tool's
+/// `running_run_summary` so `verdict` and `state` agree on "the current run".
+fn find_on_disk_run_for_head(repo_name: &str, branch_key: &str, head: &str) -> Option<ResolvedRun> {
+    let base = crate::config::prview_home()
+        .join("runs")
+        .join(repo_name)
+        .join(branch_key);
+    let mut best: Option<(String, ResolvedRun)> = None;
+    for entry in std::fs::read_dir(&base).ok()?.flatten() {
+        let run_dir = entry.path();
+        if !run_dir.is_dir() {
+            continue;
+        }
+        let Some(marker) = read_running_marker(&run_dir) else {
+            continue;
+        };
+        if !commit_matches(&marker.commit, head) {
+            continue;
+        }
+        let Some(run_id) = run_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let candidate = ResolvedRun {
+            run_dir: run_dir.clone(),
+            run_id: run_id.to_string(),
+            commit: marker.commit.clone(),
+        };
+        let newer = best
+            .as_ref()
+            .map(|(started, _)| marker.started_at > *started)
+            .unwrap_or(true);
+        if newer {
+            best = Some((marker.started_at.clone(), candidate));
+        }
+    }
+    best.map(|(_, run)| run)
+}
+
 /// Resolve a run for `verdict`/`findings`/`read_artifact`.
 ///
 /// With `run_id`: look it up in the index (completed runs), else scan storage
@@ -374,10 +416,18 @@ pub fn resolve_run(root: &Path, run_id: Option<&str>) -> Result<ResolvedRun, Too
                     run_id: e.id.clone(),
                     commit: e.commit.clone(),
                 }),
-                None => Err(ToolError::new(
-                    error_class::RUN_NOT_FOUND,
-                    "no run for current HEAD; call run_review",
-                )),
+                // The index only knows COMPLETED, registered runs. Before failing
+                // loud, scan the on-disk tree for an in-flight (or completed but
+                // not-yet-registered) run for HEAD — otherwise a client polling
+                // `verdict` without a run_id gets a silent "no runs" while a deep
+                // run is actively producing its pack.
+                None => match find_on_disk_run_for_head(&repo_name, &branch_key, &state.head) {
+                    Some(run) => Ok(run),
+                    None => Err(ToolError::new(
+                        error_class::RUN_NOT_FOUND,
+                        "no run for current HEAD; call run_review",
+                    )),
+                },
             }
         }
     }

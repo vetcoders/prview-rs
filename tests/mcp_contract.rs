@@ -727,6 +727,42 @@ fn polling_running_run_reports_in_progress_and_points_to_verdict() {
     );
 }
 
+/// mcp-1: `verdict` with NO run_id used to be index-only, so an in-flight deep
+/// run (registered only on completion) was invisible — the client got a silent
+/// `run_not_found` while a review was actively producing its pack. Resolution
+/// now scans the on-disk tree for HEAD, matching the `state` tool.
+#[test]
+fn verdict_without_run_id_sees_in_flight_deep_run() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(); // branch "feature"
+    let repo_name = repo_basename(repo.path());
+    let commit = git_short_head(repo.path());
+    // A live deep run for HEAD, present on disk but NOT in the index.
+    plant_running_run(
+        home.path(),
+        &repo_name,
+        "feature",
+        "20260101-020202",
+        &commit,
+        &["main"],
+    );
+
+    let mut s = McpSession::start(&[("PRVIEW_HOME", home.path().to_str().unwrap())]);
+    let repo_arg = repo.path().to_str().unwrap();
+
+    // No run_id: must resolve the on-disk in-flight run, never a silent no-run.
+    let result = s.call_tool("verdict", serde_json::json!({"repo": repo_arg}));
+    assert!(
+        !is_error(&result),
+        "verdict without run_id must not fail loud while a run is in flight: {result}"
+    );
+    let body = tool_body(&result);
+    assert_eq!(body["status"], "in_progress");
+    assert_eq!(body["run_status"], "running");
+    assert_eq!(body["run_id"], "20260101-020202");
+    assert_eq!(body["schema_version"], "prview.mcp.v1");
+}
+
 #[test]
 fn findings_and_read_artifact_on_completed_run() {
     let home = tempfile::tempdir().unwrap();
