@@ -100,8 +100,10 @@ fn create_zip_rejects_pack_missing_metadata() {
 use crate::artifacts::signal::{BreakingKind, BreakingRisk};
 use crate::checks::{CheckProvenance, CheckStatus};
 use crate::cli::ExecutionMode;
-use crate::config::{test_config_builder, test_js_profile, test_rust_profile};
-use crate::git::{CommitInfo, DiffStats, FileChange, FileStatus, ResolvedRef};
+use crate::config::{
+    test_config_builder, test_generic_profile, test_js_profile, test_rust_profile,
+};
+use crate::git::{CommitInfo, DiffStats, FileChange, FileStatus, Repository, ResolvedRef, git_cmd};
 use crate::policy::{PolicyConfig, PolicyMode, PolicySeverity};
 use std::time::Duration;
 
@@ -157,6 +159,134 @@ fn create_test_config(policy: PolicyConfig) -> Config {
         .create_zip(false)
         .policy(policy)
         .build()
+}
+
+fn run_git_fixture(repo: &Path, args: &[&str]) {
+    let status = git_cmd()
+        .args(args)
+        .current_dir(repo)
+        .status()
+        .expect("git command");
+    assert!(status.success(), "git {args:?} failed with {status}");
+}
+
+fn write_commit_fixture(repo: &Path, name: &str, body: &str) -> String {
+    fs::write(repo.join(name), body).expect("write fixture");
+    run_git_fixture(repo, &["add", name]);
+    run_git_fixture(
+        repo,
+        &[
+            "-c",
+            "user.name=prview test",
+            "-c",
+            "user.email=prview@example.test",
+            "commit",
+            "-m",
+            name,
+        ],
+    );
+    let output = git_cmd()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("rev-parse");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("utf8 rev-parse")
+        .trim()
+        .to_string()
+}
+
+fn init_advanced_base_fixture() -> (tempfile::TempDir, String, String) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_git_fixture(tmp.path(), &["init", "-q", "-b", "main"]);
+    let merge_base = write_commit_fixture(tmp.path(), "own.rs", "pub fn own() -> u8 { 1 }\n");
+    run_git_fixture(tmp.path(), &["checkout", "-q", "-b", "feature"]);
+    let target = write_commit_fixture(tmp.path(), "own.rs", "pub fn own() -> u8 { 2 }\n");
+    run_git_fixture(tmp.path(), &["checkout", "-q", "main"]);
+    let _advance_one = write_commit_fixture(
+        tmp.path(),
+        "unrelated.rs",
+        "pub fn unrelated_one() -> u8 { 1 }\n",
+    );
+    let _advance_two = write_commit_fixture(
+        tmp.path(),
+        "unrelated.rs",
+        "pub fn unrelated_one() -> u8 { 1 }\npub fn unrelated_two() -> u8 { 2 }\n",
+    );
+    run_git_fixture(tmp.path(), &["checkout", "-q", "feature"]);
+    (tmp, merge_base, target)
+}
+
+#[tokio::test]
+async fn artifact_pipeline_diffs_from_merge_base_when_base_advanced() {
+    let (repo_tmp, merge_base, _target) = init_advanced_base_fixture();
+    let output_tmp = tempfile::tempdir().expect("output tempdir");
+    let output_dir = output_tmp.path().join("pack");
+
+    let mut config = test_config_builder()
+        .repo_root(repo_tmp.path())
+        .target(Some("feature"))
+        .bases(&["main"])
+        .profile(test_generic_profile())
+        .execution_mode(ExecutionMode::Standard)
+        .run_tests(false)
+        .run_lint(false)
+        .do_fetch(false)
+        .use_cache(false)
+        .create_zip(false)
+        .build();
+    config.run_bundle = false;
+    config.run_security = false;
+    config.run_heuristics = false;
+    config.create_dashboard = false;
+    config.quiet = true;
+    config.output_dir = Some(output_dir.clone());
+
+    let app = crate::App::from_config(config).expect("app");
+    let report = app.run().await.expect("run prview");
+    assert_eq!(report.artifacts_dir, output_dir);
+
+    let full_patch =
+        fs::read_to_string(output_dir.join("10_diff/full.patch")).expect("read full.patch");
+    assert!(
+        full_patch.contains("own.rs"),
+        "target-owned change must be present:\n{full_patch}"
+    );
+    assert!(
+        !full_patch.contains("unrelated.rs"),
+        "advanced base-only file must not leak into three-dot diff:\n{full_patch}"
+    );
+
+    let raw_report = fs::read_to_string(output_dir.join("report.json")).expect("read report.json");
+    let report_json: serde_json::Value =
+        serde_json::from_str(&raw_report).expect("parse report.json");
+    assert_eq!(
+        report_json["meta"]["range"]["merge_base"].as_str(),
+        Some(merge_base.as_str())
+    );
+    assert_eq!(report_json["meta"]["range"]["base"].as_str(), Some("main"));
+    assert_eq!(
+        report_json["meta"]["range"]["head"].as_str(),
+        Some("feature")
+    );
+    assert_eq!(
+        report_json["diff"]["stats"]["files_changed"].as_u64(),
+        Some(1)
+    );
+
+    let repo = Repository::open(repo_tmp.path()).expect("open repo");
+    let resolved_target = repo
+        .resolve_target(&app.config)
+        .expect("resolve target after run");
+    let resolved_bases = repo
+        .resolve_bases(&app.config)
+        .expect("resolve bases after run");
+    let diff_bases = repo.resolve_diff_bases(&resolved_target, &resolved_bases, true);
+    assert_eq!(
+        diff_bases.first().map(|base| base.commit_id.as_str()),
+        Some(merge_base.as_str())
+    );
 }
 
 fn sample_cargo_audit_output() -> String {

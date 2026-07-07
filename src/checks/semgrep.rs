@@ -671,6 +671,50 @@ mod tests {
     }
 
     #[test]
+    fn merge_base_baseline_matches_artifact_diff_base_after_base_advances() {
+        use crate::config::{test_config_builder, test_generic_profile};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let merge_base = write_commit(tmp.path(), "own.rs", "pub fn own() -> u8 { 1 }\n");
+        run_git(tmp.path(), &["checkout", "-q", "-b", "feature"]);
+        let _target = write_commit(tmp.path(), "own.rs", "pub fn own() -> u8 { 2 }\n");
+        run_git(tmp.path(), &["checkout", "-q", "main"]);
+        let _advance_one = write_commit(
+            tmp.path(),
+            "unrelated.rs",
+            "pub fn unrelated_one() -> u8 { 1 }\n",
+        );
+        let _advance_two = write_commit(
+            tmp.path(),
+            "unrelated.rs",
+            "pub fn unrelated_one() -> u8 { 1 }\npub fn unrelated_two() -> u8 { 2 }\n",
+        );
+        run_git(tmp.path(), &["checkout", "-q", "feature"]);
+
+        let config = test_config_builder()
+            .repo_root(tmp.path())
+            .target(Some("feature"))
+            .bases(&["main"])
+            .profile(test_generic_profile())
+            .build();
+
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        let resolved_target = repo.resolve_target(&config).expect("resolve target");
+        let resolved_bases = repo.resolve_bases(&config).expect("resolve bases");
+        let diff_bases = repo.resolve_diff_bases(&resolved_target, &resolved_bases, true);
+
+        assert_eq!(
+            merge_base_for_baseline(&repo, &config, &resolved_target).as_deref(),
+            diff_bases.first().map(|base| base.commit_id.as_str())
+        );
+        assert_eq!(
+            diff_bases.first().map(|base| base.commit_id.as_str()),
+            Some(merge_base.as_str())
+        );
+    }
+
+    #[test]
     fn merge_base_falls_back_to_full_scan_with_multiple_bases() {
         use crate::config::{test_config_builder, test_generic_profile};
 
