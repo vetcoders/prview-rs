@@ -21,13 +21,17 @@ pub struct LintConfig {
 
 impl PrviewManifest {
     pub fn load_from(repo_root: &Path) -> Option<Self> {
+        Self::load_from_with_warning_sink(repo_root, |warning| eprintln!("{warning}"))
+    }
+
+    fn load_from_with_warning_sink(repo_root: &Path, mut warn: impl FnMut(String)) -> Option<Self> {
         let path = repo_root.join("prview.toml");
 
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => {
-                eprintln!("warning: failed to read {}: {}", path.display(), e);
+                warn(format!("warning: failed to read {}: {}", path.display(), e));
                 return None;
             }
         };
@@ -35,7 +39,11 @@ impl PrviewManifest {
         match toml::from_str(&content) {
             Ok(manifest) => Some(manifest),
             Err(e) => {
-                eprintln!("warning: failed to parse {}: {}", path.display(), e);
+                warn(format!(
+                    "warning: failed to parse {}: {}",
+                    path.display(),
+                    e
+                ));
                 None
             }
         }
@@ -90,74 +98,33 @@ ignore_patterns = ["*.generated.ts"]
 
     #[test]
     fn test_load_missing_file_returns_none() {
-        const CHILD_ENV: &str = "PRVIEW_MANIFEST_MISSING_CHILD";
-        if std::env::var_os(CHILD_ENV).is_some() {
-            let tmp = TempDir::new().unwrap();
-            let manifest = PrviewManifest::load_from(tmp.path());
-            assert!(manifest.is_none());
-            return;
-        }
-
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "config::manifest::tests::test_load_missing_file_returns_none",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, "1")
-            .output()
-            .unwrap();
-
-        assert!(
-            output.status.success(),
-            "child test failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            output.stderr.is_empty(),
-            "missing manifest should stay quiet, got stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
         let tmp = TempDir::new().unwrap();
-        // No prview.toml created
-        let manifest = PrviewManifest::load_from(tmp.path());
+        let mut warnings = Vec::new();
+
+        let manifest = PrviewManifest::load_from_with_warning_sink(tmp.path(), |warning| {
+            warnings.push(warning)
+        });
+
         assert!(manifest.is_none());
+        assert!(warnings.is_empty(), "missing manifest should stay quiet");
     }
 
     #[test]
     fn test_load_unreadable_manifest_warns_and_returns_none() {
-        const CHILD_ENV: &str = "PRVIEW_MANIFEST_WARN_CHILD";
-        if std::env::var_os(CHILD_ENV).is_some() {
-            let tmp = TempDir::new().unwrap();
-            fs::create_dir(tmp.path().join("prview.toml")).unwrap();
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("prview.toml")).unwrap();
+        let mut warnings = Vec::new();
 
-            let manifest = PrviewManifest::load_from(tmp.path());
-            assert!(manifest.is_none());
-            return;
-        }
+        let manifest = PrviewManifest::load_from_with_warning_sink(tmp.path(), |warning| {
+            warnings.push(warning)
+        });
 
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "config::manifest::tests::test_load_unreadable_manifest_warns_and_returns_none",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, "1")
-            .output()
-            .unwrap();
-
+        assert!(manifest.is_none());
         assert!(
-            output.status.success(),
-            "child test failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("warning: failed to read"),
-            "expected manifest read warning on stderr, got:\n{stderr}"
+            warnings
+                .iter()
+                .any(|warning| warning.contains("warning: failed to read")),
+            "expected manifest read warning, got: {warnings:?}"
         );
     }
 
