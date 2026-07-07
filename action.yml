@@ -7,9 +7,14 @@ inputs:
     required: false
     default: "false"
   version:
-    description: prview crate version to install. Use a version that includes the gate command.
+    description: >-
+      prview crate version to install (for example "0.5.0"), or "latest" for the
+      newest published release. The gate command ships from the release line that
+      first introduced `prview gate`; pin to that release once it is published.
+      "latest" is a resilient default: it never fails to resolve a pinned version
+      that does not yet exist on crates.io.
     required: false
-    default: "0.6.0"
+    default: "latest"
   args:
     description: Additional whitespace-separated arguments passed to prview gate.
     required: false
