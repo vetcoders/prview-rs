@@ -130,8 +130,21 @@ runs:
             action_exit=1
             ;;
           2)
-            result="CONDITIONAL rejected by strict mode"
-            action_exit=2
+            # Exit 2 is ambiguous: the gate contract uses it for CONDITIONAL
+            # under --strict, but clap ALSO exits 2 on a CLI usage error (e.g.
+            # a typo or unknown flag in the `args` input). A real verdict always
+            # emits its gate JSON to stdout (captured in JSON_PATH); a usage
+            # error writes nothing to stdout (clap prints to stderr). Use that
+            # sentinel so an argument typo surfaces as a usage error, not a
+            # phantom "CONDITIONAL rejected" verdict.
+            if [ "$verdict" = "CONDITIONAL" ] || { [ -z "$verdict" ] && [ -s "$JSON_PATH" ]; }; then
+              result="CONDITIONAL rejected by strict mode"
+              action_exit=2
+            else
+              echo "prview gate exited 2 without emitting a gate verdict; treating as a CLI usage error (check the 'args' input), not a CONDITIONAL verdict" >&2
+              result="usage error: prview gate rejected its arguments (exit 2, no verdict emitted)"
+              action_exit=3
+            fi
             ;;
           3)
             result="internal gate execution error"
