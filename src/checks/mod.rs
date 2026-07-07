@@ -1593,7 +1593,16 @@ test result: ok. 2 passed; 0 failed
         let bindir = tmp.path().join("node_modules/.bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let toolpath = bindir.join("faketool");
-        std::fs::write(&toolpath, "#!/bin/sh\necho LOCAL_BIN_RAN\n").unwrap();
+        // Close and fsync the write fd in its own scope BEFORE chmod + spawn, so
+        // the file is fully flushed and no writable descriptor to it lingers in
+        // this thread when execve runs (first half of the ETXTBSY hardening).
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&toolpath).expect("create faketool");
+            f.write_all(b"#!/bin/sh\necho LOCAL_BIN_RAN\n")
+                .expect("write faketool");
+            f.sync_all().expect("sync faketool");
+        }
         let mut perms = std::fs::metadata(&toolpath).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&toolpath, perms).unwrap();
@@ -1607,9 +1616,24 @@ test result: ok. 2 passed; 0 failed
             "absent tool must not resolve (caller falls back to npx)"
         );
 
-        let output = run_js_command_with_timeout("faketool", &[], tmp.path(), 10)
-            .await
-            .expect("local bin should run");
+        // On Linux a parallel test's fork can transiently inherit the write fd to
+        // this freshly written executable, so execve races with "Text file busy"
+        // (os error 26). Retry the spawn a few times; the racing child exec's and
+        // drops the inherited fd almost immediately.
+        let mut output = None;
+        for attempt in 0..8u32 {
+            match run_js_command_with_timeout("faketool", &[], tmp.path(), 10).await {
+                Ok(o) => {
+                    output = Some(o);
+                    break;
+                }
+                Err(e) if attempt < 7 && e.to_string().contains("os error 26") => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("local bin should run: {e}"),
+            }
+        }
+        let output = output.expect("local bin should run within the ETXTBSY retry budget");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("LOCAL_BIN_RAN"),
