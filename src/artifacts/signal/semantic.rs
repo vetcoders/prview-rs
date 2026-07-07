@@ -138,7 +138,7 @@ pub fn detect_orphaned_resource_delete(diffs: &[Diff]) -> Vec<SemanticFinding> {
             // in its name, it's a candidate for orphaned resource detection
             if is_service_file {
                 for indicator in DELETE_INDICATORS {
-                    if lower.contains(indicator) {
+                    if contains_identifier_token(&lower, indicator) {
                         delete_evidence.push((
                             file.path.clone(),
                             0,
@@ -207,6 +207,22 @@ pub fn detect_orphaned_resource_delete(diffs: &[Diff]) -> Vec<SemanticFinding> {
     findings
 }
 
+fn contains_identifier_token(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+
+    haystack.match_indices(needle).any(|(start, _)| {
+        let before = haystack[..start].chars().next_back();
+        let after = haystack[start + needle.len()..].chars().next();
+        is_identifier_token_boundary(before) && is_identifier_token_boundary(after)
+    })
+}
+
+fn is_identifier_token_boundary(ch: Option<char>) -> bool {
+    ch.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +255,23 @@ mod tests {
         assert_eq!(findings[0].rule_id, "orphaned-resource-after-delete");
         assert_eq!(findings[0].confidence, "hypothesis");
         assert!(!findings[0].evidence.is_empty());
+    }
+
+    #[test]
+    fn artifact_consistency_dropdown_filename_does_not_match_drop_indicator() {
+        let diff = mock_diff(vec![
+            mock_file_change(
+                "src/services/dropdown_service.rs",
+                FileStatus::Modified,
+                20,
+                5,
+            ),
+            mock_file_change("src/models/menu_model.rs", FileStatus::Modified, 10, 2),
+        ]);
+
+        let findings = detect_orphaned_resource_delete(&[diff]);
+
+        assert!(findings.is_empty(), "dropdown must not trigger drop");
     }
 
     #[test]
