@@ -682,12 +682,16 @@ fn has_resolvable_base_diff(
 /// Whether a check materialises and scans an ephemeral snapshot of the analysed
 /// *target* when that target is a fetched remote ref not checked out locally.
 ///
-/// Only `semgrep_scan` does this (R2-10): it builds a detached worktree at the
-/// target commit and scans that clean tree, so its out-of-diff findings genuinely
-/// predate the target diff. Every other baseline-signal check scans the local
-/// checkout, which in a `--pr`/`--remote` run is a different tree than the target.
+/// `semgrep_scan` builds its own detached worktree at the target commit (R2-10).
+/// Since A2, the other file-scoped linters (`ruff`, `eslint`, `stylelint`) run
+/// through `plan_check_run`, which materialises a worktree snapshot of the target
+/// and scans there in `--pr`/`--remote` mode — so their out-of-diff findings also
+/// genuinely predate the target diff and may be downgraded. `rustfmt` and
+/// `cargo_audit` are deliberately excluded: they run at `cargo_cache_root` (the
+/// local checkout), a *different* tree than the target, so their out-of-diff rows
+/// prove nothing about the target diff and must NOT be downgraded (R3-16).
 fn check_scans_target_snapshot(check_id: &str) -> bool {
-    matches!(check_id, "semgrep_scan")
+    matches!(check_id, "semgrep_scan" | "ruff" | "eslint" | "stylelint")
 }
 
 /// Capture whether the working tree at `repo_root` is clean, for freezing the
@@ -1212,21 +1216,36 @@ mod tests {
 
     #[test]
     fn remote_target_downgrades_only_snapshot_scanned_checks() {
-        // R3-16: on a remote/snapshot target (head != target) only semgrep scanned
-        // the target snapshot. rustfmt scanned the local checkout — a different
-        // tree — so its out-of-diff rows must NOT be downgraded to pre-existing,
-        // while semgrep's still are.
+        // R3-16: on a remote/snapshot target (head != target) the snapshot-backed
+        // checks (semgrep + the plan_check_run linters ruff/eslint/stylelint)
+        // scanned the target snapshot, so their out-of-diff rows may downgrade.
+        // rustfmt/cargo_audit scanned the local checkout — a different tree — so
+        // their out-of-diff rows must NOT be downgraded to pre-existing.
         let clean = CleanComparison::for_test(false, true);
         assert!(
             clean.applies_to("semgrep_scan"),
             "semgrep scans the target snapshot, downgrade applies"
         );
         assert!(
+            clean.applies_to("ruff"),
+            "ruff scans the target snapshot via plan_check_run, downgrade applies"
+        );
+        assert!(
+            clean.applies_to("eslint"),
+            "eslint scans the target snapshot via plan_check_run, downgrade applies"
+        );
+        assert!(
+            clean.applies_to("stylelint"),
+            "stylelint scans the target snapshot via plan_check_run, downgrade applies"
+        );
+        assert!(
             !clean.applies_to("rustfmt"),
             "rustfmt scanned the local checkout, downgrade must not apply"
         );
-        assert!(!clean.applies_to("ruff"));
-        assert!(!clean.applies_to("eslint"));
+        assert!(
+            !clean.applies_to("cargo_audit"),
+            "cargo_audit scanned the local checkout, downgrade must not apply"
+        );
 
         let findings = [out_of_diff_finding("rustfmt")];
         let summary = build_quality_failure_summary(
