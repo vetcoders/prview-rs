@@ -158,11 +158,15 @@ pub fn python_hash(repo_root: &Path) -> String {
 
 fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
     let mut hasher = Sha256::new();
+    let escaped_root = escape_glob_literal(&repo_root.display().to_string());
 
     for pattern in patterns {
-        if let Ok(entries) = glob::glob(&format!("{}/{}", repo_root.display(), pattern)) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                if let Ok(content) = fs::read(&entry) {
+        if let Ok(entries) = glob::glob(&format!("{escaped_root}/{pattern}")) {
+            let mut paths: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+            paths.sort();
+
+            for path in paths {
+                if let Ok(content) = fs::read(&path) {
                     hasher.update(&content);
                 }
             }
@@ -171,6 +175,22 @@ fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
 
     let result = hasher.finalize();
     hex::encode(&result[..4]) // First 8 chars
+}
+
+fn escape_glob_literal(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for ch in path.chars() {
+        match ch {
+            '*' => escaped.push_str("[*]"),
+            '?' => escaped.push_str("[?]"),
+            '[' => escaped.push_str("[[]"),
+            ']' => escaped.push_str("[]]"),
+            '{' => escaped.push_str("[{]"),
+            '}' => escaped.push_str("[}]"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -392,6 +412,33 @@ mod tests {
         // At minimum, the file hash part should differ
         assert!(!hash1.is_empty());
         assert!(!hash2.is_empty());
+    }
+
+    #[test]
+    fn test_hash_files_escapes_repo_root_glob_metacharacters() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("repo[old]")
+            .tempdir()
+            .unwrap();
+
+        fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        let first = rust_hash(temp_dir.path());
+
+        fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let second = rust_hash(temp_dir.path());
+
+        assert_ne!(
+            first, second,
+            "repo roots with glob metacharacters must still hash matched files"
+        );
     }
 
     fn init_git_repo_with_commit() -> TempDir {
