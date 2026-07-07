@@ -59,16 +59,30 @@ runs:
           CARGO_VERSION_ARGS=(--version "$PRVIEW_VERSION")
         fi
 
+        install_method=""
         if command -v cargo-binstall >/dev/null 2>&1; then
           if cargo binstall --no-confirm --force "$BINSTALL_SPEC"; then
-            echo "method=cargo-binstall" >> "$GITHUB_OUTPUT"
-            exit 0
+            install_method="cargo-binstall"
+          else
+            echo "cargo-binstall could not install ${BINSTALL_SPEC}; falling back to cargo install" >&2
           fi
-          echo "cargo-binstall could not install ${BINSTALL_SPEC}; falling back to cargo install" >&2
         fi
 
-        cargo install prview ${CARGO_VERSION_ARGS[@]+"${CARGO_VERSION_ARGS[@]}"} --locked --force
-        echo "method=cargo-install" >> "$GITHUB_OUTPUT"
+        if [ -z "$install_method" ]; then
+          cargo install prview ${CARGO_VERSION_ARGS[@]+"${CARGO_VERSION_ARGS[@]}"} --locked --force
+          install_method="cargo-install"
+        fi
+
+        if ! prview gate --help >/dev/null 2>&1; then
+          installed_version="$(prview --version 2>/dev/null || true)"
+          if [ -z "$installed_version" ]; then
+            installed_version="unknown version"
+          fi
+          echo "installed ${installed_version} has no \`gate\` subcommand; pin a source build / wait for 0.6.0" >&2
+          exit 3
+        fi
+
+        echo "method=${install_method}" >> "$GITHUB_OUTPUT"
 
     - name: Run prview gate
       id: gate
