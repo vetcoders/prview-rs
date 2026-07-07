@@ -1009,6 +1009,20 @@ mod tests {
         assert_eq!(run_status(dir.path()), RunStatus::Failed);
     }
 
+    /// mcp-5 delivery-verifier (b): a `RUNNING.json` with pid 0 (the unknown-pid
+    /// sentinel) must never read as an immortal `Running`. `kill(0, 0)` targets
+    /// the caller's whole process group and always succeeds, so pid 0 has to be
+    /// special-cased as dead → the marker is `Stale`, not eternally alive.
+    #[test]
+    fn run_status_pid_zero_is_stale_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        write_marker(dir.path(), 0);
+        match run_status(dir.path()) {
+            RunStatus::Stale { pid, .. } => assert_eq!(pid, 0),
+            other => panic!("pid 0 must be Stale, never Running; got {other:?}"),
+        }
+    }
+
     #[test]
     fn validate_run_id_rejects_traversal() {
         assert!(validate_run_id("20260101-120000").is_ok());

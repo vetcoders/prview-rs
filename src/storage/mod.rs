@@ -489,6 +489,12 @@ fn lock_is_stale(content: &str) -> bool {
 /// Shared with the MCP run-liveness reader (`mcp::read::run_status`) which
 /// derives deep-run status deterministically from a pid marker.
 pub(crate) fn is_process_alive(pid: u32) -> bool {
+    // pid 0 is never a real owner: it is our unknown-pid sentinel, and
+    // `kill(0, 0)` targets the *caller's whole process group* — always
+    // succeeding, which would make a pid-0 marker an immortal "running".
+    if pid == 0 {
+        return false;
+    }
     // kill(pid, 0) checks if process exists without sending signal
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
