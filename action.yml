@@ -67,7 +67,7 @@ runs:
           echo "cargo-binstall could not install ${BINSTALL_SPEC}; falling back to cargo install" >&2
         fi
 
-        cargo install prview "${CARGO_VERSION_ARGS[@]}" --locked --force
+        cargo install prview ${CARGO_VERSION_ARGS[@]+"${CARGO_VERSION_ARGS[@]}"} --locked --force
         echo "method=cargo-install" >> "$GITHUB_OUTPUT"
 
     - name: Run prview gate
@@ -97,7 +97,7 @@ runs:
 
         if [ -n "$PRVIEW_ARGS" ]; then
           read -r -a extra_args <<< "$PRVIEW_ARGS"
-          cmd+=("${extra_args[@]}")
+          cmd+=(${extra_args[@]+"${extra_args[@]}"})
         fi
 
         set +e
