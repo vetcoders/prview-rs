@@ -26,6 +26,29 @@ fn cargo_cache_root(config: &Config) -> &Path {
         .unwrap_or(config.repo_root.as_path())
 }
 
+/// Content hash for dependency-sensitive cargo checks (check/clippy/geiger).
+///
+/// `rust_hash` keys on files under `cargo_cache_root`. When that root is a
+/// workspace member distinct from the repo root, Cargo still resolves the
+/// dependency set from the workspace-root `Cargo.lock` — and a member usually
+/// has no lockfile of its own. Hashing only member files therefore lets a
+/// root-lockfile-only dependency bump reuse a stale cached result. Fold the
+/// repo-root lockfile in whenever the cargo root differs from the repo root so
+/// such a bump invalidates the member key.
+fn cargo_content_hash(config: &Config) -> String {
+    let cargo_root = cargo_cache_root(config);
+    let base = cache::rust_hash(cargo_root);
+    if cargo_root == config.repo_root.as_path() {
+        base
+    } else {
+        format!(
+            "{}-root:{}",
+            base,
+            cache::cargo_lock_hash(&config.repo_root)
+        )
+    }
+}
+
 #[async_trait]
 impl Check for CargoCheck {
     fn name(&self) -> &str {
@@ -43,7 +66,7 @@ impl Check for CargoCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(cache::rust_hash(cargo_cache_root(config)))
+        Some(cargo_content_hash(config))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -115,10 +138,7 @@ impl Check for ClippyCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!(
-            "clippy-{}",
-            cache::rust_hash(cargo_cache_root(config))
-        ))
+        Some(format!("clippy-{}", cargo_content_hash(config)))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -576,10 +596,7 @@ impl Check for CargoGeigerCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!(
-            "geiger-{}",
-            cache::rust_hash(cargo_cache_root(config))
-        ))
+        Some(format!("geiger-{}", cargo_content_hash(config)))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -978,6 +995,49 @@ mod tests {
             "{} cache key must hash the configured cargo_root manifest set",
             check.name()
         );
+    }
+
+    /// A workspace member with no lockfile of its own must still invalidate its
+    /// cache key when the workspace-root `Cargo.lock` is bumped — Cargo resolves
+    /// deps from the root lock, so a root-only dependency change alters what is
+    /// compiled even though no member file moved.
+    fn assert_cache_key_changes_after_root_lock_bump(check: &dyn Check, run_lint: bool) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let member = root.join("member");
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.join("Cargo.lock"), "# root lock v1\n").unwrap();
+        // Member has NO Cargo.lock of its own (the realistic workspace shape).
+        std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"m\"\n").unwrap();
+        std::fs::write(member.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+
+        let config = config_with_cargo_root(root, &member, run_lint);
+        let before = check.cache_key(&config).expect("cache key before");
+        // Bump ONLY the workspace-root lockfile — no member file changes.
+        std::fs::write(root.join("Cargo.lock"), "# root lock v2 bumped dep\n").unwrap();
+        let after = check.cache_key(&config).expect("cache key after");
+        assert_ne!(
+            before,
+            after,
+            "{} cache key must fold the workspace-root lockfile for member cargo roots",
+            check.name()
+        );
+    }
+
+    #[test]
+    fn test_cargo_check_cache_key_reflects_workspace_root_lock_bump() {
+        assert_cache_key_changes_after_root_lock_bump(&CargoCheck, false);
+    }
+
+    #[test]
+    fn test_clippy_cache_key_reflects_workspace_root_lock_bump() {
+        assert_cache_key_changes_after_root_lock_bump(&ClippyCheck, true);
+    }
+
+    #[test]
+    fn test_geiger_cache_key_reflects_workspace_root_lock_bump() {
+        assert_cache_key_changes_after_root_lock_bump(&CargoGeigerCheck, false);
     }
 
     #[test]
