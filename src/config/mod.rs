@@ -74,6 +74,13 @@ pub struct Config {
     // Bridge rollout metadata (bash->rust migration)
     pub bridge_stage: u8,
     pub lint_ignore_patterns: Vec<String>,
+
+    /// Directory the file-scoped checks should scan, when the dispatcher has
+    /// already materialised a shared target snapshot for the run. `None` = each
+    /// check resolves its own scan dir via `plan_check_run`. Set once per run by
+    /// `checks::run_all`/`run_all_with_events` so every snapshot-backed check
+    /// shares one ephemeral worktree instead of creating its own.
+    pub scan_dir_override: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -630,6 +637,7 @@ impl Config {
             policy,
             bridge_stage: 0,
             lint_ignore_patterns,
+            scan_dir_override: None,
         }
     }
 

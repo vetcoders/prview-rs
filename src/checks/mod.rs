@@ -222,10 +222,19 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
             let _ = std::io::stdout().flush();
         }
 
+        // Materialise ONE shared target snapshot for the whole run so every
+        // snapshot-backed check reuses it instead of creating (and cleaning up)
+        // its own worktree (thread 1). On failure, leave the override unset so
+        // each check falls back to resolving its own plan — the original
+        // per-check behaviour. `_shared_snapshot` stays alive until every check
+        // has finished.
+        let mut config = config.clone();
+        let _shared_snapshot = share_target_snapshot(&mut config, &runnable_checks);
+
         // Launch all checks in parallel, stream results as they complete.
         // Cargo checks share one target/ build lock, so they serialize on a
         // single-permit semaphore while non-cargo checks stay parallel (PV-17).
-        let config = Arc::new(config.clone());
+        let config = Arc::new(config);
         let cargo_lock = Arc::new(Semaphore::new(1));
         let mut futs: FuturesUnordered<_> = runnable_checks
             .into_iter()
@@ -413,7 +422,11 @@ where
             });
         }
 
-        let config = Arc::new(config.clone());
+        // One shared target snapshot for the whole run (thread 1); see run_all.
+        let mut config = config.clone();
+        let _shared_snapshot = share_target_snapshot(&mut config, &runnable_checks);
+
+        let config = Arc::new(config);
         let cache = Arc::new(cache);
         // Cargo checks share one target/ build lock, so they serialize on a
         // single-permit semaphore while non-cargo checks stay parallel (PV-17).
@@ -639,6 +652,42 @@ fn is_cargo_target_check(name: &str) -> bool {
     )
 }
 
+/// Checks that resolve their scan directory through [`plan_check_run`] and so
+/// benefit from the run-wide shared target snapshot (thread 1). Cargo checks run
+/// at `cargo_cache_root` and semgrep manages its own worktree, so neither is
+/// listed here.
+fn uses_shared_scan_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "Ruff" | "Mypy" | "TypeScript" | "ESLint" | "Vitest" | "Stylelint"
+    )
+}
+
+/// Materialise ONE target snapshot for the whole run and point `config` at it, so
+/// every snapshot-backed check reuses a single worktree instead of creating its
+/// own (thread 1). Returns the snapshot handle for the caller to keep alive until
+/// all checks finish; `None` (leaving `scan_dir_override` unset) when no runnable
+/// check needs a snapshot, or when snapshot creation fails — in which case each
+/// check falls back to resolving its own plan, the original per-check behaviour.
+fn share_target_snapshot(
+    config: &mut Config,
+    runnable_checks: &[Box<dyn Check>],
+) -> Option<crate::git::WorktreeSnapshot> {
+    if !runnable_checks
+        .iter()
+        .any(|c| uses_shared_scan_dir(c.name()))
+    {
+        return None;
+    }
+    match plan_check_run(config) {
+        Ok(plan) => {
+            config.scan_dir_override = Some(plan.scan_dir.clone());
+            plan._snapshot
+        }
+        Err(_) => None,
+    }
+}
+
 /// Security checks stay loud: a spawn failure here is NOT downgraded to Skipped
 /// (PV-01), so a broken or half-installed security tool can't silently vanish
 /// from the gate. They pass which::which() at eligibility, but a runtime spawn
@@ -838,7 +887,21 @@ pub struct CheckPlan {
 /// Plan check execution path: if we are in a remote/PR mode (meaning resolved target
 /// commit is different from the checked-out HEAD commit), create an ephemeral worktree
 /// snapshot of the target commit and run there. Otherwise, scan the working tree in place.
+///
+/// When the dispatcher has already materialised ONE shared snapshot for the run
+/// (`config.scan_dir_override`), reuse its directory instead of creating a
+/// per-check worktree. The dispatcher owns and keeps that snapshot alive, so the
+/// returned plan carries no snapshot of its own — avoiding N concurrent
+/// `git worktree add/remove` calls (one per check) that contend on the git index
+/// lock and re-check-out the whole tree repeatedly.
 pub fn plan_check_run(config: &Config) -> Result<CheckPlan> {
+    if let Some(scan_dir) = &config.scan_dir_override {
+        return Ok(CheckPlan {
+            scan_dir: scan_dir.clone(),
+            _snapshot: None,
+        });
+    }
+
     let repo_root = config.repo_root.clone();
     let repo = match crate::git::Repository::open(&repo_root) {
         Ok(repo) => repo,
@@ -896,6 +959,36 @@ mod tests {
         config.use_cache = false;
         config.create_zip = false;
         config
+    }
+
+    #[test]
+    fn plan_check_run_reuses_shared_scan_dir_without_new_worktree() {
+        // Once the dispatcher has set a run-wide shared snapshot, every check's
+        // plan_check_run must reuse that directory and create NO worktree of its
+        // own — so N snapshot-backed checks add 0 extra worktrees (thread 1).
+        let shared = std::path::PathBuf::from("/tmp/prview-shared-snapshot");
+        let mut config = test_config();
+        config.scan_dir_override = Some(shared.clone());
+
+        for _ in 0..6 {
+            let plan = plan_check_run(&config).expect("override path never fails");
+            assert_eq!(plan.scan_dir, shared);
+            assert!(
+                plan._snapshot.is_none(),
+                "a shared override must be reused, never re-materialised as a new worktree",
+            );
+        }
+    }
+
+    #[test]
+    fn share_target_snapshot_is_a_noop_without_snapshot_backed_checks() {
+        // Cargo-only / no snapshot-backed checks: no shared worktree is created
+        // and the override stays unset so nothing changes for those checks.
+        let mut config = rust_config(true, true, true);
+        let cargo_only: Vec<Box<dyn Check>> = vec![Box::new(crate::checks::cargo::CargoCheck)];
+        let snapshot = share_target_snapshot(&mut config, &cargo_only);
+        assert!(snapshot.is_none());
+        assert!(config.scan_dir_override.is_none());
     }
 
     #[test]
