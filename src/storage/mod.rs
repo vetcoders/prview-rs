@@ -473,17 +473,40 @@ pub fn acquire_lock_at(path: &Path) -> Result<LockGuard> {
     );
 }
 
-fn lock_is_stale(content: &str) -> bool {
-    let pid = content
-        .trim()
-        .split(':')
-        .next()
-        .and_then(|part| part.parse::<u32>().ok());
+/// A lock older than any legitimate hold is treated as abandoned even if some
+/// process now owns its recorded pid. One hour is far above the longest real
+/// hold (a quick review's ~120s budget) yet catches a pid-recycling zombie.
+const LOCK_STALE_MAX_AGE_NANOS: u128 = 3600 * 1_000_000_000;
 
-    match pid {
-        Some(pid) => !is_process_alive(pid),
-        None => true,
+fn lock_is_stale(content: &str) -> bool {
+    let mut parts = content.trim().split(':');
+    let pid = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let created_nanos = parts.next().and_then(|part| part.parse::<u128>().ok());
+
+    // No parseable pid → ownership is unattributable → stale.
+    let Some(pid) = pid else {
+        return true;
+    };
+
+    // Primary signal: the owning process is gone.
+    if !is_process_alive(pid) {
+        return true;
     }
+
+    // Second signal (PID-recycling guard): pid liveness alone can be fooled by a
+    // *different* process that recycled the id. A lock older than any legitimate
+    // hold is stale regardless of who currently owns that pid.
+    if let Some(created) = created_nanos {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        if now.saturating_sub(created) > LOCK_STALE_MAX_AGE_NANOS {
+            return true;
+        }
+    }
+
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,6 +1123,25 @@ mod tests {
         let reloaded = RunIndex::load_from(&out_path);
         let ids2: Vec<&str> = reloaded.entries().iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids2, vec!["001", "003"]);
+    }
+
+    #[test]
+    fn lock_is_stale_flags_ancient_lock_even_with_live_pid() {
+        // A live pid (our own) but an ancient creation timestamp reads as stale:
+        // the pid may have been recycled and a lock this old is abandoned.
+        let ancient = format!("{}:1", std::process::id());
+        assert!(lock_is_stale(&ancient));
+
+        // A fresh lock owned by a live pid is NOT stale.
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fresh = format!("{}:{}", std::process::id(), now_nanos);
+        assert!(!lock_is_stale(&fresh));
+
+        // pid 0 is the unknown-pid sentinel: never a live owner.
+        assert!(lock_is_stale("0:1"));
     }
 
     #[test]
