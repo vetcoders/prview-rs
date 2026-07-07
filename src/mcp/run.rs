@@ -85,6 +85,29 @@ fn allocate_run_dir(
 }
 
 /// Detect a currently active run on this repo branch (live RUNNING marker).
+/// Path to the per-branch activation lock that serializes concurrent `start`s.
+/// A file (not a directory), so it is ignored by the run-dir scans in
+/// `active_run`/`rebuild`, and lives alongside the branch's run directories.
+fn branch_activation_lock_path(repo_name: &str, branch_key: &str) -> PathBuf {
+    crate::config::prview_home()
+        .join("runs")
+        .join(repo_name)
+        .join(branch_key)
+        .join(".active.lock")
+}
+
+/// Build the R2b `storage_locked` error, surfacing the active run id when known.
+fn locked(active_run_id: Option<&str>) -> ToolError {
+    ToolError::with_extra(
+        error_class::STORAGE_LOCKED,
+        "another review is already running for this repo branch",
+        serde_json::json!({
+            "active_run_id": active_run_id,
+            "retry_after_ms": 5000,
+        }),
+    )
+}
+
 fn active_run(repo_name: &str, branch_key: &str) -> Option<String> {
     let base = crate::config::prview_home()
         .join("runs")
@@ -287,16 +310,25 @@ pub async fn start(
     let repo_name = crate::config::repo_name_from_root(repo);
     let branch_key = crate::config::storage_branch_key(repo);
 
-    // R2b: one active run per repo branch.
+    // mcp-3/TOCTOU: the R2b "one active run" rule was a check-then-act — two
+    // concurrent starts could both see no active run and both proceed. Serialize
+    // activation for this repo branch behind an O_EXCL lock file (reusing the
+    // storage lock's atomic create-new + stale/PID-recycling handling). Held for
+    // the whole quick run and until a deep run's marker is on disk, so the
+    // window between "check" and "marker visible to `active_run`" is closed.
+    let _activation = match crate::storage::acquire_lock_at(&branch_activation_lock_path(
+        &repo_name,
+        &branch_key,
+    )) {
+        Ok(guard) => guard,
+        // Another activation is in flight; surface the current run id if its
+        // marker already landed, else a bare storage_locked.
+        Err(_) => return Err(locked(active_run(&repo_name, &branch_key).as_deref())),
+    };
+
+    // R2b: one active run per repo branch (now race-free under the lock above).
     if let Some(active_run_id) = active_run(&repo_name, &branch_key) {
-        return Err(ToolError::with_extra(
-            error_class::STORAGE_LOCKED,
-            "another review is already running for this repo branch",
-            serde_json::json!({
-                "active_run_id": active_run_id,
-                "retry_after_ms": 5000,
-            }),
-        ));
+        return Err(locked(Some(&active_run_id)));
     }
 
     let commit = crate::config::short_head(repo);
