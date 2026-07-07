@@ -467,23 +467,23 @@ fn classify_cargo_audit_status(
             return CheckStatus::Failed;
         }
 
-        if command_succeeded {
-            return CheckStatus::Passed;
+        if cargo_audit_has_warnings(stdout, combined) {
+            return CheckStatus::Warnings;
         }
 
-        if cargo_audit_has_warnings(combined) {
-            return CheckStatus::Warnings;
+        if command_succeeded {
+            return CheckStatus::Passed;
         }
 
         return CheckStatus::Failed;
     }
 
-    if command_succeeded {
-        return CheckStatus::Passed;
+    if cargo_audit_has_warnings(stdout, combined) {
+        return CheckStatus::Warnings;
     }
 
-    if cargo_audit_has_warnings(combined) {
-        return CheckStatus::Warnings;
+    if command_succeeded {
+        return CheckStatus::Passed;
     }
 
     if combined.contains("RUSTSEC-") {
@@ -514,8 +514,32 @@ fn cargo_audit_vulnerability_count(stdout: &str) -> Option<usize> {
     Some(0)
 }
 
-fn cargo_audit_has_warnings(output: &str) -> bool {
-    output.to_ascii_lowercase().contains("warning")
+fn cargo_audit_has_warnings(stdout: &str, output: &str) -> bool {
+    cargo_audit_warning_count(stdout).is_some_and(|count| count > 0)
+        || output
+            .lines()
+            .any(|line| line.to_ascii_lowercase().contains("warning:"))
+}
+
+fn cargo_audit_warning_count(stdout: &str) -> Option<usize> {
+    let parsed = serde_json::from_str::<serde_json::Value>(stdout).ok()?;
+    let warnings = parsed.get("warnings")?;
+    Some(count_cargo_audit_warning_items(warnings))
+}
+
+fn count_cargo_audit_warning_items(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(items) => items.len(),
+        serde_json::Value::Object(map) => {
+            if let Some(count) = map.get("count").and_then(|value| value.as_u64()) {
+                return count as usize;
+            }
+
+            map.values().map(count_cargo_audit_warning_items).sum()
+        }
+        serde_json::Value::Bool(true) => 1,
+        _ => 0,
+    }
 }
 
 #[async_trait]
@@ -1083,6 +1107,27 @@ mod tests {
         let combined = format!("{}\n{}", stdout, stderr);
 
         let status = classify_cargo_audit_status(false, stdout, &combined);
+        assert_eq!(status, CheckStatus::Warnings);
+    }
+
+    #[test]
+    fn test_cargo_audit_informational_warning_exit_zero_is_warnings() {
+        let stdout = r#"{
+  "vulnerabilities": {
+    "found": false,
+    "count": 0,
+    "list": []
+  },
+  "warnings": {
+    "unmaintained": [
+      {"advisory": {"id": "RUSTSEC-2024-0001"}}
+    ],
+    "yanked": [],
+    "notice": []
+  }
+}"#;
+
+        let status = classify_cargo_audit_status(true, stdout, stdout);
         assert_eq!(status, CheckStatus::Warnings);
     }
 
