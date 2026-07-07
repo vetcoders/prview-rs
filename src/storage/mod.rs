@@ -160,8 +160,12 @@ impl RunIndex {
                 writeln!(f, "{}", line)?;
             }
             f.flush()?;
+            // fsync the data before the rename publishes it: a bare buffered
+            // flush + rename can leave a renamed-but-empty file after power loss.
+            f.sync_all()?;
         }
         fs::rename(&tmp, &resolved)?;
+        fsync_parent_dir(&resolved);
         Ok(())
     }
 
@@ -181,8 +185,10 @@ impl RunIndex {
                 writeln!(f, "{}", line)?;
             }
             f.flush()?;
+            f.sync_all()?;
         }
         fs::rename(&tmp, &path)?;
+        fsync_parent_dir(&path);
         Ok(())
     }
 
@@ -505,6 +511,21 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::EPERM)
     )
+}
+
+/// Best-effort directory fsync so a just-published rename survives power loss.
+/// On unix the parent directory entry must itself be synced for the rename to
+/// be durable; elsewhere this is a no-op. Failures are non-fatal (the data is
+/// already fsynced) so callers stay infallible.
+fn fsync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Ok(dirf) = fs::File::open(dir)
+    {
+        let _ = dirf.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
