@@ -116,6 +116,7 @@ fn gate_exits_three_when_it_cannot_execute() {
 
     Command::new(assert_cmd::cargo::cargo_bin!("prview"))
         .current_dir(temp.path())
+        .env("GIT_CEILING_DIRECTORIES", temp.path())
         .arg("gate")
         .assert()
         .code(3);
