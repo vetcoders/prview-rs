@@ -84,20 +84,44 @@ fn resolve_explicit_index_path(path: &Path) -> Result<PathBuf> {
     crate::paths::resolve_file_name_within(parent, file_name)
 }
 
+/// Parse index entries line-by-line, skipping (never truncating on) bad lines.
+///
+/// `map_while(Result::ok)` used to stop at the first line `BufRead::lines`
+/// returns an `Err` for (e.g. non-UTF-8): every later run vanished from the
+/// view, and the next `register_and_prune` save persisted that loss — permanent
+/// data loss from one bad byte. Here an unreadable line is skipped with a warn
+/// and iteration continues; an invalid-JSON line is skipped silently as before.
+fn read_entries_skipping_bad_lines(file: fs::File, path: &Path) -> Vec<RunEntry> {
+    let reader = std::io::BufReader::new(file);
+    let mut entries = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!(
+                    "prview: skipping unreadable index line {} in {}: {err}",
+                    idx + 1,
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<RunEntry>(&line) {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
 impl RunIndex {
     /// Load index from `~/.prview/index.jsonl`. Missing/corrupt lines are skipped.
     pub fn load() -> Self {
         let path = index_path();
         let entries = match fs::File::open(&path) {
-            Ok(file) => {
-                let reader = std::io::BufReader::new(file);
-                reader
-                    .lines()
-                    .map_while(Result::ok)
-                    .filter(|line| !line.trim().is_empty())
-                    .filter_map(|line| serde_json::from_str::<RunEntry>(&line).ok())
-                    .collect()
-            }
+            Ok(file) => read_entries_skipping_bad_lines(file, &path),
             Err(_) => Vec::new(),
         };
         Self { entries }
@@ -114,15 +138,7 @@ impl RunIndex {
             }
         };
         let entries = match fs::File::open(&resolved) {
-            Ok(file) => {
-                let reader = std::io::BufReader::new(file);
-                reader
-                    .lines()
-                    .map_while(Result::ok)
-                    .filter(|line| !line.trim().is_empty())
-                    .filter_map(|line| serde_json::from_str::<RunEntry>(&line).ok())
-                    .collect()
-            }
+            Ok(file) => read_entries_skipping_bad_lines(file, &resolved),
             Err(_) => Vec::new(),
         };
         Self { entries }
@@ -1022,6 +1038,41 @@ mod tests {
         assert_eq!(loaded.entries().len(), 2);
         assert_eq!(loaded.entries()[0].id, "001");
         assert_eq!(loaded.entries()[1].id, "002");
+    }
+
+    #[test]
+    fn load_skips_corrupt_line_without_truncating_and_save_preserves_survivors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx_path = tmp.path().join("index.jsonl");
+
+        // Three JSONL records; the middle line is a non-UTF-8 byte sequence that
+        // `BufRead::lines` returns as `Err`. The old `map_while(Result::ok)`
+        // stopped there, dropping record 3 — and the next save persisted the loss.
+        let e1 = serde_json::to_string(&make_entry("001", "repo", "main", 1000)).unwrap();
+        let e3 = serde_json::to_string(&make_entry("003", "repo", "main", 3000)).unwrap();
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(e1.as_bytes());
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[0xff, 0xfe, 0xfd]); // invalid UTF-8 line
+        bytes.push(b'\n');
+        bytes.extend_from_slice(e3.as_bytes());
+        bytes.push(b'\n');
+        fs::write(&idx_path, &bytes).unwrap();
+
+        let loaded = RunIndex::load_from(&idx_path);
+        let ids: Vec<&str> = loaded.entries().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["001", "003"],
+            "a corrupt line must skip only itself, not truncate the rest"
+        );
+
+        // Re-save the survivors and reload: no silent loss on the round-trip.
+        let out_path = tmp.path().join("index2.jsonl");
+        loaded.save_to(&out_path).unwrap();
+        let reloaded = RunIndex::load_from(&out_path);
+        let ids2: Vec<&str> = reloaded.entries().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids2, vec!["001", "003"]);
     }
 
     #[test]
