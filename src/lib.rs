@@ -143,9 +143,12 @@ impl App {
         }
 
         // 4. Generate diffs
+        let diff_bases = self
+            .repo
+            .resolve_diff_bases(&target, &bases, self.config.quiet);
         let diffs = self
             .repo
-            .generate_diffs(&target, &bases, self.config.quiet)?;
+            .generate_diffs(&target, &diff_bases, self.config.quiet)?;
 
         // 5. Run checks (reduced set in update mode)
         let (check_results, skipped_checks) = if self.config.update_mode {
@@ -439,9 +442,12 @@ impl App {
         } else {
             self.repo.resolve_bases(&self.config)?
         };
+        let diff_bases = self
+            .repo
+            .resolve_diff_bases(&target, &bases, self.config.quiet);
         let diffs = self
             .repo
-            .generate_diffs(&target, &bases, self.config.quiet)?;
+            .generate_diffs(&target, &diff_bases, self.config.quiet)?;
 
         // Skip checks and heuristics in quick mode
         let artifacts_dir = artifacts::generate(artifacts::GenerateInput {

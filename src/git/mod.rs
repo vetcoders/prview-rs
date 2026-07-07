@@ -290,6 +290,50 @@ impl Repository {
         Ok(diffs)
     }
 
+    /// Resolve the commits that should anchor target diffs.
+    ///
+    /// Base display metadata stays intact, but `commit_id` is moved from the
+    /// base tip to the merge-base with the target. When histories are unrelated,
+    /// fall back to the original base tip so callers still get the best local
+    /// comparison available.
+    pub fn resolve_diff_bases(
+        &self,
+        target: &ResolvedRef,
+        bases: &[ResolvedRef],
+        quiet: bool,
+    ) -> Vec<ResolvedRef> {
+        use colored::Colorize;
+
+        bases
+            .iter()
+            .map(|base| {
+                if base.commit_id == target.commit_id {
+                    return base.clone();
+                }
+
+                match self.merge_base(&base.commit_id, &target.commit_id) {
+                    Ok(merge_base) => {
+                        let mut diff_base = base.clone();
+                        diff_base.commit_id = merge_base;
+                        diff_base
+                    }
+                    Err(err) => {
+                        if !quiet {
+                            eprintln!(
+                                "  {} Could not resolve merge-base for '{}' and target {}; using base tip ({})",
+                                "⚠".yellow(),
+                                base.name,
+                                short_sha(&target.commit_id),
+                                err
+                            );
+                        }
+                        base.clone()
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Generate diff between two refs
     pub(crate) fn diff_refs(&self, base: &ResolvedRef, target: &ResolvedRef) -> Result<Diff> {
         let base_commit = self
@@ -918,6 +962,27 @@ mod tests {
         (tmp, head_oid, github_base_oid)
     }
 
+    fn init_repo_with_advanced_base() -> (tempfile::TempDir, String, String, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let merge_base = write_commit(tmp.path(), "own.rs", "pub fn own() -> u8 { 1 }\n");
+        run_git(tmp.path(), &["checkout", "-q", "-b", "feature"]);
+        let target = write_commit(tmp.path(), "own.rs", "pub fn own() -> u8 { 2 }\n");
+        run_git(tmp.path(), &["checkout", "-q", "main"]);
+        let _advance_one = write_commit(
+            tmp.path(),
+            "unrelated.rs",
+            "pub fn unrelated_one() -> u8 { 1 }\n",
+        );
+        let base_tip = write_commit(
+            tmp.path(),
+            "unrelated.rs",
+            "pub fn unrelated_one() -> u8 { 1 }\npub fn unrelated_two() -> u8 { 2 }\n",
+        );
+        run_git(tmp.path(), &["checkout", "-q", "feature"]);
+        (tmp, merge_base, target, base_tip)
+    }
+
     fn commit(id_suffix: usize) -> CommitInfo {
         let full_id = format!("{id_suffix:040x}");
         CommitInfo {
@@ -940,6 +1005,35 @@ mod tests {
         assert_eq!(resolved.name, "feature/test");
         assert_eq!(resolved.commit_id, "abc123def456");
         assert!(!resolved.is_remote);
+    }
+
+    #[test]
+    fn resolve_diff_bases_uses_merge_base_and_preserves_display_base() {
+        let (tmp, merge_base, _target, base_tip) = init_repo_with_advanced_base();
+        let config = test_config_builder()
+            .repo_root(tmp.path())
+            .target(Some("feature"))
+            .bases(&["main"])
+            .profile(test_generic_profile())
+            .build();
+
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        let resolved_target = repo.resolve_target(&config).expect("resolve target");
+        let resolved_bases = repo.resolve_bases(&config).expect("resolve bases");
+        assert_eq!(resolved_bases[0].commit_id, base_tip);
+
+        let diff_bases = repo.resolve_diff_bases(&resolved_target, &resolved_bases, true);
+
+        assert_eq!(diff_bases[0].name, "main");
+        assert_eq!(diff_bases[0].commit_id, merge_base);
+        let diffs = repo
+            .generate_diffs(&resolved_target, &diff_bases, true)
+            .expect("generate diffs");
+        let files: Vec<_> = diffs
+            .iter()
+            .flat_map(|diff| diff.files.iter().map(|file| file.path.as_str()))
+            .collect();
+        assert_eq!(files, vec!["own.rs"]);
     }
 
     #[test]

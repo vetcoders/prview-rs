@@ -169,10 +169,15 @@ pub struct Repository {
 impl Repository {
     pub fn resolve_target(&self, config: &Config) -> Result<ResolvedRef>;
     pub fn resolve_bases(&self, config: &Config) -> Result<Vec<ResolvedRef>>;
+    pub fn resolve_diff_bases(&self, target: &ResolvedRef, bases: &[ResolvedRef], quiet: bool) -> Vec<ResolvedRef>;
     pub fn generate_diffs(&self, target: &ResolvedRef, bases: &[ResolvedRef], quiet: bool) -> Result<Vec<Diff>>;
     pub fn commit_patch(&self, commit_id: &str) -> Result<String>;
 }
 ```
+
+Artifact diffs use `resolve_diff_bases()` before `generate_diffs()`, so the
+review pack matches GitHub's three-dot "Files changed" model: branch names stay
+displayable as bases, while each diff is anchored at the target/base merge-base.
 
 Advantages of git2 over the `git` CLI:
 - much faster for batch operations
