@@ -109,16 +109,16 @@ impl Check for SemgrepCheck {
 /// errors, so a degraded scan was reported as a clean PASS — hiding the fact
 /// that part of the tree was never analysed.
 ///
-/// Now any non-empty `errors[]` (parse errors / partial parsing) downgrades a
-/// successful scan to `Warnings`, making the degraded coverage a visible
-/// review signal instead of a silent pass. A non-zero exit (real findings with
+/// Any non-empty `errors[]` (parse errors / partial parsing) downgrades a
+/// successful scan to `Warnings`, making degraded coverage a visible review
+/// signal instead of a silent pass. A non-zero exit (real findings with
 /// `--error`, or a tool crash) remains a `Failed`.
-fn classify_semgrep_status(command_succeeded: bool, stdout: &str, combined: &str) -> CheckStatus {
+fn classify_semgrep_status(command_succeeded: bool, stdout: &str, _combined: &str) -> CheckStatus {
     if !command_succeeded {
         return CheckStatus::Failed;
     }
 
-    if output_reports_scan_errors(stdout) || combined.contains("warning") {
+    if output_reports_scan_errors(stdout) {
         return CheckStatus::Warnings;
     }
 
@@ -472,6 +472,16 @@ mod tests {
     fn clean_scan_with_no_errors_passes() {
         let stdout = r#"{"version":"1.135.0","results":[],"errors":[]}"#;
         let combined = format!("{stdout}\n");
+        assert_eq!(
+            classify_semgrep_status(true, stdout, &combined),
+            CheckStatus::Passed
+        );
+    }
+
+    #[test]
+    fn clean_scan_with_warning_word_in_stderr_passes() {
+        let stdout = r#"{"version":"1.135.0","results":[],"errors":[]}"#;
+        let combined = format!("{stdout}\nscanned /tmp/warning-fixture/src/lib.rs\n");
         assert_eq!(
             classify_semgrep_status(true, stdout, &combined),
             CheckStatus::Passed
