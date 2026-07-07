@@ -344,12 +344,70 @@ fn find_on_disk_run_for_head(repo_name: &str, branch_key: &str, head: &str) -> O
     best.map(|(_, run)| run)
 }
 
+/// Newest LIVE in-flight run for HEAD (by `started_at`).
+///
+/// Filters to `RunStatus::Running` (a live pid, no completion marker), exactly
+/// what the `state` tool reports as "the current run", so `verdict` and `state`
+/// agree. Unlike [`find_on_disk_run_for_head`], a stale marker or a
+/// completed-but-marker-left run does not qualify here.
+fn running_run_for_head(repo_name: &str, branch_key: &str, head: &str) -> Option<ResolvedRun> {
+    let base = crate::config::prview_home()
+        .join("runs")
+        .join(repo_name)
+        .join(branch_key);
+    let mut best: Option<(String, ResolvedRun)> = None;
+    for entry in std::fs::read_dir(&base).ok()?.flatten() {
+        let run_dir = entry.path();
+        if !run_dir.is_dir() || !matches!(run_status(&run_dir), RunStatus::Running { .. }) {
+            continue;
+        }
+        let Some(marker) = read_running_marker(&run_dir) else {
+            continue;
+        };
+        if !commit_matches(&marker.commit, head) {
+            continue;
+        }
+        let Some(run_id) = run_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let candidate = ResolvedRun {
+            run_dir: run_dir.clone(),
+            run_id: run_id.to_string(),
+            commit: marker.commit.clone(),
+        };
+        let newer = best
+            .as_ref()
+            .map(|(started, _)| marker.started_at > *started)
+            .unwrap_or(true);
+        if newer {
+            best = Some((marker.started_at.clone(), candidate));
+        }
+    }
+    best.map(|(_, run)| run)
+}
+
+/// Pick between the newest indexed COMPLETED run and the newest LIVE in-flight
+/// run for HEAD.
+///
+/// A live in-flight run wins whenever one exists: it is what `state` reports as
+/// the current run, and `verdict` reports it as `in_progress` (so a poller keeps
+/// polling) instead of stopping early on a stale completed pack from a prior run
+/// on the same HEAD. With no live run, the indexed completed run is returned;
+/// `None` only when neither exists, so the caller can fall back to any
+/// unregistered on-disk run.
+fn choose_head_run(
+    indexed: Option<ResolvedRun>,
+    running: Option<ResolvedRun>,
+) -> Option<ResolvedRun> {
+    running.or(indexed)
+}
+
 /// Resolve a run for `verdict`/`findings`/`read_artifact`.
 ///
 /// With `run_id`: look it up in the index (completed runs), else scan storage
 /// for an in-flight deep run. Without: the latest run for the current HEAD
-/// (R3). A missing run is a fail-loud `run_not_found` — the agent then calls
-/// `run_review`.
+/// (R3), preferring a live in-flight run over a stale completed pack. A missing
+/// run is a fail-loud `run_not_found` — the agent then calls `run_review`.
 pub fn resolve_run(root: &Path, run_id: Option<&str>) -> Result<ResolvedRun, ToolError> {
     let repo_name = crate::config::repo_name_from_root(root);
     let index = RunIndex::load();
@@ -410,17 +468,24 @@ pub fn resolve_run(root: &Path, run_id: Option<&str>) -> Result<ResolvedRun, Too
             // HEAD (display `HEAD (detached)`, stored under `HEAD`) resolves
             // instead of missing its own just-completed run (PR #12 review).
             let branch_key = crate::config::storage_branch_key(root);
-            match latest_for_head(&index, &repo_name, &branch_key, &state.head) {
-                Some(e) => Ok(ResolvedRun {
+            // The index only knows COMPLETED, registered runs; `state` reports the
+            // live in-flight run. Prefer a live run for HEAD so a `verdict` poll
+            // without a run_id does not stop early on a stale completed pack while a
+            // fresh deep run on the same HEAD is still producing its own (A4).
+            let indexed = latest_for_head(&index, &repo_name, &branch_key, &state.head).map(|e| {
+                ResolvedRun {
                     run_dir: e.path.clone(),
                     run_id: e.id.clone(),
                     commit: e.commit.clone(),
-                }),
-                // The index only knows COMPLETED, registered runs. Before failing
-                // loud, scan the on-disk tree for an in-flight (or completed but
-                // not-yet-registered) run for HEAD — otherwise a client polling
-                // `verdict` without a run_id gets a silent "no runs" while a deep
-                // run is actively producing its pack.
+                }
+            });
+            let running = running_run_for_head(&repo_name, &branch_key, &state.head);
+            match choose_head_run(indexed, running) {
+                Some(run) => Ok(run),
+                // Neither an indexed nor a live run matched HEAD. Before failing
+                // loud, scan the on-disk tree for a completed-but-not-yet-registered
+                // run for HEAD — otherwise a client gets a silent "no runs" while
+                // its just-finished pack is not yet in the index.
                 None => match find_on_disk_run_for_head(&repo_name, &branch_key, &state.head) {
                     Some(run) => Ok(run),
                     None => Err(ToolError::new(
@@ -1283,6 +1348,36 @@ mod tests {
             "20260101-000001"
         );
         assert!(latest_for_head(&index, "demo", "other-branch", "aaaa111").is_none());
+    }
+
+    #[test]
+    fn choose_head_run_prefers_live_in_flight_over_indexed() {
+        let indexed = ResolvedRun {
+            run_dir: PathBuf::from("/runs/completed"),
+            run_id: "completed".to_string(),
+            commit: "aaaa111".to_string(),
+        };
+        let running = ResolvedRun {
+            run_dir: PathBuf::from("/runs/in-flight"),
+            run_id: "in-flight".to_string(),
+            commit: "aaaa111".to_string(),
+        };
+
+        // A fresh in-flight run on the same HEAD wins over the stale completed
+        // pack — verdict then reports in_progress instead of stopping the poller.
+        let chosen = choose_head_run(Some(indexed.clone()), Some(running.clone())).unwrap();
+        assert_eq!(chosen.run_id, "in-flight");
+
+        // With no live run, the indexed completed run is the answer.
+        let only_completed = choose_head_run(Some(indexed.clone()), None).unwrap();
+        assert_eq!(only_completed.run_id, "completed");
+
+        // With only a live run, it is returned.
+        let only_running = choose_head_run(None, Some(running)).unwrap();
+        assert_eq!(only_running.run_id, "in-flight");
+
+        // Neither → None, so the caller falls back to the on-disk scan.
+        assert!(choose_head_run(None, None).is_none());
     }
 
     #[test]
