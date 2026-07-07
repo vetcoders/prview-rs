@@ -393,7 +393,7 @@ pub async fn start(
                     // Completed: the child already registered the run; drop the
                     // marker so status readers see a clean completion.
                     let _ = std::fs::remove_file(read::running_marker_path(&run_dir));
-                    let mut body = completed_body(&run_dir, &run_id, &commit);
+                    let mut body = completed_body(&run_dir, &run_id, &commit)?;
                     add_base_metadata(&mut body, &selection);
                     Ok(body)
                 }
@@ -458,26 +458,27 @@ fn spawn_detached(
 }
 
 /// Build the completed-run response body (quick sync path).
-fn completed_body(run_dir: &Path, run_id: &str, commit: &str) -> serde_json::Value {
-    let decision = read::read_decision(run_dir);
-    let (verdict, merge_rec, allow_merge, base_used, blocking, caveats) = match &decision {
-        Ok(d) => (
-            d.verdict.clone(),
-            d.merge_recommendation.clone(),
-            d.allow_merge,
-            d.base_used.clone(),
-            d.blocking_issues.clone(),
-            d.caveats.clone(),
-        ),
-        Err(_) => (
-            "UNKNOWN".to_string(),
-            "review_required".to_string(),
-            false,
-            read::read_bases(run_dir),
-            Vec::new(),
-            Vec::new(),
-        ),
-    };
+///
+/// A completed pack with an unreadable/corrupt `MERGE_GATE.json` is a fail-loud
+/// `storage_corrupt` — the SAME contract the `verdict` tool honours on the
+/// identical state (mod.rs `verdict` returns `read_decision`'s error). The old
+/// path silently substituted `verdict=UNKNOWN, blocking=[], caveats=[]` and
+/// returned a `status=completed` success, an "empty success" the MCP contract
+/// (types.rs) forbids and a signal the `verdict` tool would reject.
+fn completed_body(
+    run_dir: &Path,
+    run_id: &str,
+    commit: &str,
+) -> Result<serde_json::Value, ToolError> {
+    let d = read::read_decision(run_dir)?;
+    let (verdict, merge_rec, allow_merge, base_used, blocking, caveats) = (
+        d.verdict.clone(),
+        d.merge_recommendation.clone(),
+        d.allow_merge,
+        d.base_used.clone(),
+        d.blocking_issues.clone(),
+        d.caveats.clone(),
+    );
 
     let (checks_passed, checks_failed, files_changed) = run_stats(run_id, run_dir);
 
@@ -499,7 +500,7 @@ fn completed_body(run_dir: &Path, run_id: &str, commit: &str) -> serde_json::Val
         artifact_paths["report"] = serde_json::json!("report.json");
     }
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "run_id": run_id,
         "status": "completed",
         "commit": commit,
@@ -516,7 +517,7 @@ fn completed_body(run_dir: &Path, run_id: &str, commit: &str) -> serde_json::Val
             "checks_failed": checks_failed,
             "files_changed": files_changed,
         },
-    })
+    }))
 }
 
 /// Pull run stats from the freshly-registered index entry (falls back to zeros).
@@ -798,11 +799,28 @@ mod tests {
         // Root-level report.json — where the pack actually writes it.
         std::fs::write(run_dir.join("report.json"), "{}").unwrap();
 
-        let body = completed_body(run_dir, "20260701-120000", "abc1234");
+        let body = completed_body(run_dir, "20260701-120000", "abc1234").unwrap();
         assert_eq!(
             body["artifact_paths"]["report"],
             serde_json::json!("report.json")
         );
+    }
+
+    /// mcp-2 delivery-verifier (c): a completed pack whose `MERGE_GATE.json` is
+    /// unreadable must fail loud (`storage_corrupt`) instead of returning a
+    /// `status=completed` body with `verdict=UNKNOWN, caveats=[]`. This mirrors
+    /// the `verdict` tool, which rejects the identical state.
+    #[test]
+    fn completed_body_fails_loud_on_corrupt_merge_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path();
+        let summary = run_dir.join("00_summary");
+        std::fs::create_dir_all(&summary).unwrap();
+        // Present but not valid JSON — read_decision must reject it.
+        std::fs::write(summary.join("MERGE_GATE.json"), "{ not json ").unwrap();
+
+        let err = completed_body(run_dir, "20260701-120000", "abc1234").unwrap_err();
+        assert_eq!(err.class, error_class::STORAGE_CORRUPT);
     }
 
     // The quick-timeout process-group kill uses crate::proc::sigkill_process_group,
