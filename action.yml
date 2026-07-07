@@ -137,7 +137,7 @@ runs:
             # error writes nothing to stdout (clap prints to stderr). Use that
             # sentinel so an argument typo surfaces as a usage error, not a
             # phantom "CONDITIONAL rejected" verdict.
-            if [ "$verdict" = "CONDITIONAL" ] || { [ -z "$verdict" ] && [ -s "$JSON_PATH" ]; }; then
+            if [ -s "$JSON_PATH" ]; then
               result="CONDITIONAL rejected by strict mode"
               action_exit=2
             else
