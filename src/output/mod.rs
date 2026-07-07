@@ -148,6 +148,27 @@ impl Report {
     }
 }
 
+fn failure_summary_heading(
+    report: &Report,
+    gate: Option<&MergeGateSummary>,
+) -> Option<&'static str> {
+    if !report.has_failures() {
+        return None;
+    }
+    if gate.is_some_and(failures_degraded_to_advisory) {
+        Some("Check failures downgraded to advisory/pre-existing:")
+    } else {
+        Some("Some checks failed:")
+    }
+}
+
+fn failures_degraded_to_advisory(gate: &MergeGateSummary) -> bool {
+    gate.verdict == "PASS"
+        && gate.allow_merge
+        && gate.quality_pass
+        && gate.merge_recommendation == crate::policy::engine::MergeRecommendation::Approve
+}
+
 pub fn build_cli_json_summary(config: &Config, report: &Report) -> CliJsonSummary {
     let gate = read_merge_gate_summary(&report.artifacts_dir)
         .unwrap_or_else(|| fallback_merge_gate_summary(config, report));
@@ -835,9 +856,10 @@ pub fn print_summary(report: &Report) {
         }
     }
 
-    if report.has_failures() {
+    let gate = read_merge_gate_summary(&report.artifacts_dir);
+    if let Some(heading) = failure_summary_heading(report, gate.as_ref()) {
         println!();
-        println!("{} Some checks failed:", "⚠".yellow());
+        println!("{} {heading}", "⚠".yellow());
         for check in &report.checks {
             if check.is_failure() {
                 println!(
@@ -852,7 +874,7 @@ pub fn print_summary(report: &Report) {
     // Final authoritative line: the merge-gate verdict, in the same vocabulary
     // as `--json` (PV-03). Never print a bare "all checks passed" that could
     // contradict a BLOCK/CONDITIONAL gate — the stdout summary must not lie.
-    if let Some(gate) = read_merge_gate_summary(&report.artifacts_dir) {
+    if let Some(gate) = gate {
         println!();
         let (icon, label) = match gate.verdict.as_str() {
             "PASS" => ("✓".green(), "PASS".green().bold()),
@@ -1574,6 +1596,40 @@ api-router/app/core/cache.py
     #[test]
     fn test_format_duration_large() {
         assert_eq!(format_duration(Duration::from_secs(3600)), "60m 0s");
+    }
+
+    #[test]
+    fn artifact_consistency_degraded_pass_summary_avoids_failed_heading() {
+        let report = Report {
+            target: "feature".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![CheckResult {
+                name: "Semgrep scan".to_string(),
+                status: CheckStatus::Failed,
+                duration: Duration::from_secs(1),
+                output: "{}".to_string(),
+                cached: false,
+                provenance: None,
+            }],
+            heuristics: None,
+            artifacts_dir: PathBuf::from("."),
+            duration: Duration::from_secs(1),
+            unchanged: false,
+        };
+        let gate = MergeGateSummary {
+            verdict: "PASS".to_string(),
+            analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
+            allow_merge: true,
+            quality_pass: true,
+            reason: Some("pre-existing findings outside the change".to_string()),
+        };
+
+        let heading = failure_summary_heading(&report, Some(&gate)).expect("heading");
+
+        assert!(!heading.contains("Some checks failed"));
+        assert!(heading.contains("advisory") || heading.contains("pre-existing"));
     }
 
     #[test]
