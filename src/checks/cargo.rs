@@ -18,6 +18,14 @@ pub struct RustfmtCheck;
 pub struct CargoAuditCheck;
 pub struct CargoGeigerCheck;
 
+fn cargo_cache_root(config: &Config) -> &Path {
+    config
+        .profile
+        .cargo_root
+        .as_deref()
+        .unwrap_or(config.repo_root.as_path())
+}
+
 #[async_trait]
 impl Check for CargoCheck {
     fn name(&self) -> &str {
@@ -35,18 +43,14 @@ impl Check for CargoCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(cache::rust_hash(&config.repo_root))
+        Some(cache::rust_hash(cargo_cache_root(config)))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         let args = &["check", "--message-format=short"];
         let output = run_command("cargo", args, cwd).await?;
@@ -111,18 +115,17 @@ impl Check for ClippyCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("clippy-{}", cache::rust_hash(&config.repo_root)))
+        Some(format!(
+            "clippy-{}",
+            cache::rust_hash(cargo_cache_root(config))
+        ))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         let args = &["clippy", "--message-format=short", "--", "-D", "warnings"];
         let output = run_command("cargo", args, cwd).await?;
@@ -227,11 +230,7 @@ impl Check for CargoTestCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         let args = &["test", "--all-targets", "--no-fail-fast"];
         let output = run_command_with_timeout("cargo", args, cwd, TEST_TIMEOUT_SECS).await?;
@@ -296,18 +295,17 @@ impl Check for RustfmtCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("rustfmt-{}", cache::rust_hash(&config.repo_root)))
+        Some(format!(
+            "rustfmt-{}",
+            cache::rust_hash(cargo_cache_root(config))
+        ))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         let args = &["fmt", "--check"];
         let output = run_command("cargo", args, cwd).await?;
@@ -384,11 +382,7 @@ impl Check for CargoAuditCheck {
         // root. Keying on the root lock while executing in a member meant a
         // member Cargo.lock change never invalidated the cache and a stale audit
         // was served (PR #12 review #22).
-        let cargo_root = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cargo_root = cargo_cache_root(config);
         Some(format!(
             "audit-{}-{}",
             cache::cargo_lock_hash(cargo_root),
@@ -400,11 +394,7 @@ impl Check for CargoAuditCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         let args = &["audit", "--json"];
         let output = run_command("cargo", args, cwd).await?;
@@ -533,18 +523,17 @@ impl Check for CargoGeigerCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("geiger-{}", cache::rust_hash(&config.repo_root)))
+        Some(format!(
+            "geiger-{}",
+            cache::rust_hash(cargo_cache_root(config))
+        ))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         if cargo_metadata_is_virtual_manifest(cwd).await {
             return Ok(CheckResult {
@@ -903,6 +892,59 @@ mod tests {
         let key = check.cache_key(&config);
         assert!(key.is_some());
         assert!(key.unwrap().starts_with("clippy-"));
+    }
+
+    fn config_with_cargo_root(repo_root: &Path, cargo_root: &Path, run_lint: bool) -> Config {
+        let mut profile = test_rust_profile(true);
+        profile.cargo_root = Some(cargo_root.to_path_buf());
+        test_config_builder()
+            .repo_root(repo_root)
+            .profile(profile)
+            .run_lint(run_lint)
+            .build()
+    }
+
+    fn assert_cache_key_changes_after_member_lock_bump(check: &dyn Check, run_lint: bool) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let member = root.join("member");
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.join("Cargo.lock"), "# root lock\n").unwrap();
+        std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"m\"\n").unwrap();
+        std::fs::write(member.join("Cargo.lock"), "# member lock v1\n").unwrap();
+        std::fs::write(member.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+
+        let config = config_with_cargo_root(root, &member, run_lint);
+        let before = check.cache_key(&config).expect("cache key before");
+        std::fs::write(member.join("Cargo.lock"), "# member lock v2\n").unwrap();
+        let after = check.cache_key(&config).expect("cache key after");
+        assert_ne!(
+            before,
+            after,
+            "{} cache key must hash the configured cargo_root manifest set",
+            check.name()
+        );
+    }
+
+    #[test]
+    fn test_cargo_check_cache_key_follows_cargo_root_not_repo_root() {
+        assert_cache_key_changes_after_member_lock_bump(&CargoCheck, false);
+    }
+
+    #[test]
+    fn test_clippy_check_cache_key_follows_cargo_root_not_repo_root() {
+        assert_cache_key_changes_after_member_lock_bump(&ClippyCheck, true);
+    }
+
+    #[test]
+    fn test_rustfmt_cache_key_follows_cargo_root_not_repo_root() {
+        assert_cache_key_changes_after_member_lock_bump(&RustfmtCheck, true);
+    }
+
+    #[test]
+    fn test_cargo_geiger_cache_key_follows_cargo_root_not_repo_root() {
+        assert_cache_key_changes_after_member_lock_bump(&CargoGeigerCheck, true);
     }
 
     #[test]
