@@ -34,20 +34,23 @@ jobs:
         id: gate
         shell: bash
         run: |
+          runner_temp="${RUNNER_TEMP:-/tmp}"
+          json_path="${runner_temp}/prview-gate.json"
+
           set +e
-          ./target/release/prview gate --json > "$RUNNER_TEMP/prview-gate.json"
+          ./target/release/prview gate --json > "$json_path"
           status=$?
           set -e
 
           echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
-          echo "json_path=${RUNNER_TEMP}/prview-gate.json" >> "$GITHUB_OUTPUT"
+          echo "json_path=${json_path}" >> "$GITHUB_OUTPUT"
 
           verdict=""
           output_dir=""
           sarif_path=""
-          if command -v jq >/dev/null 2>&1 && [ -s "$RUNNER_TEMP/prview-gate.json" ]; then
-            verdict="$(jq -r '.verdict // empty' "$RUNNER_TEMP/prview-gate.json" 2>/dev/null || true)"
-            output_dir="$(jq -r '.output_dir // empty' "$RUNNER_TEMP/prview-gate.json" 2>/dev/null || true)"
+          if command -v jq >/dev/null 2>&1 && [ -s "$json_path" ]; then
+            verdict="$(jq -r '.verdict // empty' "$json_path" 2>/dev/null || true)"
+            output_dir="$(jq -r '.output_dir // empty' "$json_path" 2>/dev/null || true)"
           fi
 
           if [ -n "$output_dir" ] && [ -f "${output_dir}/30_context/INLINE_FINDINGS.sarif" ]; then
