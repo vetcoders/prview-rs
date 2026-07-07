@@ -2,7 +2,7 @@
 
 use super::{
     Check, CheckProvenance, CheckResult, CheckStatus, TEST_TIMEOUT_SECS, find_hard_fail_signatures,
-    run_command, run_command_with_timeout, tool_spawn_failure_in_output,
+    plan_check_run, run_command, run_command_with_timeout, tool_spawn_failure_in_output,
 };
 use crate::Config;
 use crate::cache;
@@ -52,18 +52,28 @@ impl Check for RuffCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("ruff-{}", cache::python_hash(&config.repo_root)))
+        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
+        let target = repo.resolve_target(config).ok()?;
+        let head = repo.head_commit_id().ok()?;
+        if head == target.commit_id {
+            Some(format!("ruff-{}", cache::python_hash(&config.repo_root)))
+        } else {
+            Some(format!("ruff-{}", target.commit_id))
+        }
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
+        let plan = plan_check_run(config)?;
+        let run_dir = &plan.scan_dir;
+
         let use_uv = which::which("uv").is_ok();
         let output = if use_uv {
-            run_command("uv", &["run", "ruff", "check", "."], &config.repo_root).await?
+            run_command("uv", &["run", "ruff", "check", "."], run_dir).await?
         } else {
-            run_command("ruff", &["check", "."], &config.repo_root).await?
+            run_command("ruff", &["check", "."], run_dir).await?
         };
         let finished_at = Local::now().to_rfc3339();
 
@@ -87,7 +97,7 @@ impl Check for RuffCheck {
             provenance: Some(CheckProvenance {
                 command: cmd_str.to_string(),
                 tool_version: None,
-                cwd: config.repo_root.display().to_string(),
+                cwd: run_dir.display().to_string(),
                 exit_code: output.status.code(),
                 started_at,
                 finished_at,
@@ -139,18 +149,28 @@ impl Check for MypyCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("mypy-{}", cache::python_hash(&config.repo_root)))
+        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
+        let target = repo.resolve_target(config).ok()?;
+        let head = repo.head_commit_id().ok()?;
+        if head == target.commit_id {
+            Some(format!("mypy-{}", cache::python_hash(&config.repo_root)))
+        } else {
+            Some(format!("mypy-{}", target.commit_id))
+        }
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
+        let plan = plan_check_run(config)?;
+        let run_dir = &plan.scan_dir;
+
         let use_uv = which::which("uv").is_ok();
         let output = if use_uv {
-            run_command("uv", &["run", "mypy", "."], &config.repo_root).await?
+            run_command("uv", &["run", "mypy", "."], run_dir).await?
         } else {
-            run_command("mypy", &["."], &config.repo_root).await?
+            run_command("mypy", &["."], run_dir).await?
         };
         let finished_at = Local::now().to_rfc3339();
 
@@ -170,7 +190,7 @@ impl Check for MypyCheck {
             provenance: Some(CheckProvenance {
                 command: cmd_str.to_string(),
                 tool_version: None,
-                cwd: config.repo_root.display().to_string(),
+                cwd: run_dir.display().to_string(),
                 exit_code: output.status.code(),
                 started_at,
                 finished_at,
@@ -492,6 +512,107 @@ mod tests {
         assert_eq!(
             mypy_status(true, "Success: no issues found"),
             CheckStatus::Passed
+        );
+    }
+
+    use std::path::Path;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = crate::git::git_cmd()
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("git command");
+        assert!(status.success(), "git {args:?} failed with {status}");
+    }
+
+    fn write_commit(repo: &Path, name: &str, body: &str) -> String {
+        std::fs::write(repo.join(name), body).expect("write fixture");
+        run_git(repo, &["add", name]);
+        run_git(
+            repo,
+            &[
+                "-c",
+                "user.name=prview test",
+                "-c",
+                "user.email=prview@example.test",
+                "commit",
+                "-m",
+                name,
+            ],
+        );
+        let output = crate::git::git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .expect("rev-parse");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_ruff_runs_on_fetched_target_in_remote_mode() {
+        if which::which("ruff").is_err() && which::which("uv").is_err() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_path = tmp.path();
+        run_git(repo_path, &["init", "-q", "-b", "main"]);
+
+        // Write pyproject.toml so Ruff eligibility passes
+        std::fs::write(
+            repo_path.join("pyproject.toml"),
+            "[project]\nname = \"test\"\nversion = \"0.1.0\"\n\n[tool.ruff]",
+        )
+        .unwrap();
+        run_git(repo_path, &["add", "pyproject.toml"]);
+
+        // 1. Commit clean state
+        let clean_content = "def hello():\n    print('hello')\n";
+        let clean_commit = write_commit(repo_path, "main.py", clean_content);
+
+        // 2. Commit dirty state with unused import
+        let dirty_content = "import os\n\ndef hello():\n    print('hello')\n";
+        let dirty_commit = write_commit(repo_path, "main.py", dirty_content);
+
+        // Scenario A: HEAD is checked out at clean_commit (working tree clean),
+        // but target is dirty_commit. Ruff must analyze dirty_commit and report failure.
+        run_git(repo_path, &["checkout", "-q", "-f", &clean_commit]);
+
+        let config_a = test_config_builder()
+            .profile(test_python_profile(true))
+            .run_lint(true)
+            .target(Some(dirty_commit.as_str()))
+            .repo_root(repo_path.to_path_buf())
+            .build();
+
+        let check = RuffCheck;
+        let result_a = check.run(&config_a).await.expect("ruff run scenario A");
+        assert_eq!(
+            result_a.status,
+            CheckStatus::Failed,
+            "Ruff must fail because fetched target commit has an unused import. Output: {}",
+            result_a.output
+        );
+
+        // Scenario B: HEAD is checked out at dirty_commit (working tree dirty),
+        // but target is clean_commit. Ruff must analyze clean_commit and pass.
+        run_git(repo_path, &["checkout", "-q", "-f", &dirty_commit]);
+
+        let config_b = test_config_builder()
+            .profile(test_python_profile(true))
+            .run_lint(true)
+            .target(Some(clean_commit.as_str()))
+            .repo_root(repo_path.to_path_buf())
+            .build();
+
+        let result_b = check.run(&config_b).await.expect("ruff run scenario B");
+        assert_eq!(
+            result_b.status,
+            CheckStatus::Passed,
+            "Ruff must pass because fetched target commit is clean. Output: {}",
+            result_b.output
         );
     }
 }

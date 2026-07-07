@@ -2,7 +2,7 @@
 
 use super::{Check, CheckEligibility, CheckResult, CheckStatus, ProvenanceBuilder, run_command};
 use crate::Config;
-use crate::git::{Repository, ResolvedRef, git_cmd};
+use crate::git::{Repository, ResolvedRef, WorktreeSnapshot, create_worktree_snapshot};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Local;
@@ -319,61 +319,6 @@ fn merge_base_for_baseline(
     repo.merge_base(&base.commit_id, &target.commit_id).ok()
 }
 
-/// An ephemeral detached `git worktree` checked out at a specific commit. Kept
-/// alive for the duration of a scan; the worktree is deregistered and its files
-/// removed on drop, on every path (scan success or error).
-struct WorktreeSnapshot {
-    repo_root: PathBuf,
-    worktree_path: PathBuf,
-    // Owns the enclosing temp dir; dropped after the worktree is deregistered so
-    // the directory removal is the backstop for the `git worktree remove` call.
-    _tmp: tempfile::TempDir,
-}
-
-impl Drop for WorktreeSnapshot {
-    fn drop(&mut self) {
-        // Deregister the worktree from the main repo, then prune bookkeeping.
-        // `--force` is required because the checkout is detached. Errors are
-        // swallowed: cleanup must be best-effort and never panic in a
-        // destructor (the temp-dir removal is the backstop).
-        let _ = git_cmd()
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.worktree_path)
-            .current_dir(&self.repo_root)
-            .output();
-        let _ = git_cmd()
-            .args(["worktree", "prune"])
-            .current_dir(&self.repo_root)
-            .output();
-    }
-}
-
-/// Create an ephemeral detached worktree of `commit` under a fresh temp dir.
-fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<WorktreeSnapshot> {
-    let tmp = tempfile::tempdir()?;
-    // `git worktree add` wants a path it can create, so point it at a fresh
-    // subdirectory of the temp dir rather than the (already-created) temp root.
-    let worktree_path = tmp.path().join("snapshot");
-
-    let output = git_cmd()
-        .args(["worktree", "add", "--detach", "--force"])
-        .arg(&worktree_path)
-        .arg(commit)
-        .current_dir(repo_root)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git worktree add failed: {}", stderr.trim());
-    }
-
-    Ok(WorktreeSnapshot {
-        repo_root: repo_root.to_path_buf(),
-        worktree_path,
-        _tmp: tmp,
-    })
-}
-
 /// Whether semgrep may run a diff-scoped `--baseline-commit` scan.
 ///
 /// Baseline mode diffs the *working tree* against the baseline commit, so it is
@@ -418,6 +363,7 @@ fn worktree_has_uncommitted_changes(cwd: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::config::test_config;
+    use crate::git::git_cmd;
 
     #[test]
     fn build_semgrep_args_excludes_vendored_and_generated_and_emits_json() {

@@ -8,6 +8,9 @@ pub use cmd::git_cmd;
 mod snapshot;
 pub use snapshot::AnalysisSnapshot;
 
+mod worktree;
+pub use worktree::{WorktreeSnapshot, create_worktree_snapshot};
+
 use crate::Config;
 use anyhow::{Context, Result};
 use git2::{DiffOptions, Repository as Git2Repo};

@@ -827,6 +827,51 @@ pub fn js_tool_available(tool: &str, cwd: &Path) -> bool {
     local_js_bin(tool, cwd).is_some()
 }
 
+/// A resolved plan for running a check.
+pub struct CheckPlan {
+    /// Directory to run the check command in.
+    pub scan_dir: std::path::PathBuf,
+    /// Ephemeral worktree snapshot, kept alive until the check finishes.
+    pub _snapshot: Option<crate::git::WorktreeSnapshot>,
+}
+
+/// Plan check execution path: if we are in a remote/PR mode (meaning resolved target
+/// commit is different from the checked-out HEAD commit), create an ephemeral worktree
+/// snapshot of the target commit and run there. Otherwise, scan the working tree in place.
+pub fn plan_check_run(config: &Config) -> Result<CheckPlan> {
+    let repo_root = config.repo_root.clone();
+    let repo = match crate::git::Repository::open(&repo_root) {
+        Ok(repo) => repo,
+        Err(_) => {
+            return Ok(CheckPlan {
+                scan_dir: repo_root,
+                _snapshot: None,
+            });
+        }
+    };
+
+    let (Ok(target), Ok(head)) = (repo.resolve_target(config), repo.head_commit_id()) else {
+        return Ok(CheckPlan {
+            scan_dir: repo_root,
+            _snapshot: None,
+        });
+    };
+
+    if head == target.commit_id {
+        return Ok(CheckPlan {
+            scan_dir: repo_root,
+            _snapshot: None,
+        });
+    }
+
+    // Ephemeral worktree
+    let snapshot = crate::git::create_worktree_snapshot(&repo_root, &target.commit_id)?;
+    Ok(CheckPlan {
+        scan_dir: snapshot.worktree_path.clone(),
+        _snapshot: Some(snapshot),
+    })
+}
+
 impl CheckResult {
     pub fn is_failure(&self) -> bool {
         matches!(self.status, CheckStatus::Failed | CheckStatus::Error)
