@@ -29,6 +29,7 @@ use tempfile::TempDir;
 
 fn run_git(repo: &Path, args: &[&str]) {
     let status = git_cmd()
+        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
         .args(args)
         .current_dir(repo)
         .status()
