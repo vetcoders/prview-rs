@@ -158,7 +158,11 @@ pub fn python_hash(repo_root: &Path) -> String {
 
 fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
     let mut hasher = Sha256::new();
-    let escaped_root = escape_glob_literal(&repo_root.display().to_string());
+    // Escape glob metacharacters in the repo root so a path like `repo[old]` is
+    // matched literally, not parsed as a glob pattern. `glob::Pattern::escape`
+    // brackets exactly the chars glob treats as special (`? * [ ]`); braces are
+    // literal to this crate (no brace expansion), so no extra handling is needed.
+    let escaped_root = glob::Pattern::escape(&repo_root.display().to_string());
 
     for pattern in patterns {
         if let Ok(entries) = glob::glob(&format!("{escaped_root}/{pattern}")) {
@@ -175,22 +179,6 @@ fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
 
     let result = hasher.finalize();
     hex::encode(&result[..16])
-}
-
-fn escape_glob_literal(path: &str) -> String {
-    let mut escaped = String::with_capacity(path.len());
-    for ch in path.chars() {
-        match ch {
-            '*' => escaped.push_str("[*]"),
-            '?' => escaped.push_str("[?]"),
-            '[' => escaped.push_str("[[]"),
-            ']' => escaped.push_str("[]]"),
-            '{' => escaped.push_str("[{]"),
-            '}' => escaped.push_str("[}]"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
 }
 
 #[cfg(test)]
