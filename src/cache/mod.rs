@@ -174,7 +174,7 @@ fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
     }
 
     let result = hasher.finalize();
-    hex::encode(&result[..4]) // First 8 chars
+    hex::encode(&result[..16])
 }
 
 fn escape_glob_literal(path: &str) -> String {
@@ -342,6 +342,18 @@ mod tests {
         // Format: cargo_hash-src_hash
         let parts: Vec<_> = hash.split('-').collect();
         assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn test_hash_functions_use_16_byte_digest_segments() {
+        let temp_dir = TempDir::new().unwrap();
+        let ts_hash = ts_hash(temp_dir.path());
+        assert_eq!(ts_hash.len(), 32);
+
+        let rust_hash = rust_hash(temp_dir.path());
+        let parts: Vec<_> = rust_hash.split('-').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts.iter().all(|part| part.len() == 32));
     }
 
     #[test]

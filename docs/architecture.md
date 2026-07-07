@@ -456,8 +456,8 @@ impl Cache {
 }
 
 // Key generation
-pub fn rust_hash(repo_root: &PathBuf) -> String {
-    // git_head_short + cargo_files_hash + src_files_hash
+pub fn rust_hash(root: &Path) -> String {
+    // Cargo.toml/Cargo.lock hash + Rust source hash, 16-byte digest segments
 }
 ```
 
