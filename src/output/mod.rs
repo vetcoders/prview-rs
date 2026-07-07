@@ -332,6 +332,7 @@ fn read_merge_gate_summary(output_dir: &Path) -> Option<MergeGateSummary> {
     let analysis_status = match decision.get("analysis_status").and_then(Value::as_str) {
         Some("complete") => crate::policy::engine::AnalysisStatus::Complete,
         Some("degraded") => crate::policy::engine::AnalysisStatus::Degraded,
+        Some("incomplete") => crate::policy::engine::AnalysisStatus::Incomplete,
         _ if allow_merge && quality_pass => crate::policy::engine::AnalysisStatus::Complete,
         _ => crate::policy::engine::AnalysisStatus::Incomplete,
     };
@@ -1586,6 +1587,32 @@ api-router/app/core/cache.py
         assert_eq!(failure.id, "semgrep_scan");
         assert_eq!(failure.summary, "149 code findings");
         assert!(!failure.summary.contains("┌"));
+    }
+
+    #[test]
+    fn artifact_consistency_explicit_incomplete_status_stays_incomplete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("00_summary")).expect("summary dir");
+        std::fs::write(
+            temp.path().join("00_summary").join("MERGE_GATE.json"),
+            r#"{
+  "decision": {
+    "verdict": "PASS",
+    "analysis_status": "incomplete",
+    "merge_recommendation": "approve",
+    "allow_merge": true,
+    "quality_pass": true
+  }
+}"#,
+        )
+        .expect("write gate");
+
+        let gate = read_merge_gate_summary(temp.path()).expect("gate");
+
+        assert_eq!(
+            gate.analysis_status,
+            crate::policy::engine::AnalysisStatus::Incomplete
+        );
     }
 
     #[test]
