@@ -315,18 +315,22 @@ impl Check for RustfmtCheck {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}\n{}", stdout, stderr);
 
-        let status = if output.status.success() {
-            CheckStatus::Passed
+        let status = classify_rustfmt_status(output.status.success(), &combined);
+        let result_output = if status == CheckStatus::Skipped {
+            format!(
+                "Rustfmt skipped: rustfmt component is not installed or cargo fmt is unavailable.\n{combined}"
+            )
+        } else if status == CheckStatus::Error {
+            format!("Rustfmt error: cargo fmt failed unexpectedly.\n{combined}")
         } else {
-            // rustfmt --check exits non-zero if files need formatting
-            CheckStatus::Warnings
+            combined.clone()
         };
 
         Ok(CheckResult {
             name: self.name().to_string(),
             status,
             duration: start.elapsed(),
-            output: combined.clone(),
+            output: result_output.clone(),
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
@@ -334,7 +338,7 @@ impl Check for RustfmtCheck {
                     args,
                     cwd,
                     output: &output,
-                    combined_output: &combined,
+                    combined_output: &result_output,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
@@ -343,6 +347,31 @@ impl Check for RustfmtCheck {
             ),
         })
     }
+}
+
+fn classify_rustfmt_status(command_succeeded: bool, output: &str) -> CheckStatus {
+    if command_succeeded {
+        return CheckStatus::Passed;
+    }
+
+    if rustfmt_tool_unavailable(output) {
+        return CheckStatus::Skipped;
+    }
+
+    if has_tool_crash(output) {
+        return CheckStatus::Error;
+    }
+
+    // `cargo fmt --check` exits non-zero when files need formatting.
+    CheckStatus::Warnings
+}
+
+fn rustfmt_tool_unavailable(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    (lower.contains("rustfmt") || lower.contains("cargo-fmt"))
+        && (lower.contains("is not installed")
+            || lower.contains("component") && lower.contains("missing")
+            || lower.contains("no such command") && lower.contains("fmt"))
 }
 
 #[async_trait]
@@ -945,6 +974,13 @@ mod tests {
     #[test]
     fn test_cargo_geiger_cache_key_follows_cargo_root_not_repo_root() {
         assert_cache_key_changes_after_member_lock_bump(&CargoGeigerCheck, true);
+    }
+
+    #[test]
+    fn test_rustfmt_missing_component_is_skipped_not_warnings() {
+        let output =
+            "error: 'rustfmt' is not installed for the toolchain 'stable-aarch64-apple-darwin'\n";
+        assert_eq!(classify_rustfmt_status(false, output), CheckStatus::Skipped);
     }
 
     #[test]
