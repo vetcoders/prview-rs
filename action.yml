@@ -7,9 +7,14 @@ inputs:
     required: false
     default: "false"
   version:
-    description: prview crate version to install. Use a version that includes the gate command.
+    description: >-
+      prview crate version to install (for example "0.5.0"), or "latest" for the
+      newest published release. The gate command ships from the release line that
+      first introduced `prview gate`; pin to that release once it is published.
+      "latest" is a resilient default: it never fails to resolve a pinned version
+      that does not yet exist on crates.io.
     required: false
-    default: "0.6.0"
+    default: "latest"
   args:
     description: Additional whitespace-separated arguments passed to prview gate.
     required: false
@@ -54,16 +59,30 @@ runs:
           CARGO_VERSION_ARGS=(--version "$PRVIEW_VERSION")
         fi
 
+        install_method=""
         if command -v cargo-binstall >/dev/null 2>&1; then
           if cargo binstall --no-confirm --force "$BINSTALL_SPEC"; then
-            echo "method=cargo-binstall" >> "$GITHUB_OUTPUT"
-            exit 0
+            install_method="cargo-binstall"
+          else
+            echo "cargo-binstall could not install ${BINSTALL_SPEC}; falling back to cargo install" >&2
           fi
-          echo "cargo-binstall could not install ${BINSTALL_SPEC}; falling back to cargo install" >&2
         fi
 
-        cargo install prview "${CARGO_VERSION_ARGS[@]}" --locked --force
-        echo "method=cargo-install" >> "$GITHUB_OUTPUT"
+        if [ -z "$install_method" ]; then
+          cargo install prview ${CARGO_VERSION_ARGS[@]+"${CARGO_VERSION_ARGS[@]}"} --locked --force
+          install_method="cargo-install"
+        fi
+
+        if ! prview gate --help >/dev/null 2>&1; then
+          installed_version="$(prview --version 2>/dev/null || true)"
+          if [ -z "$installed_version" ]; then
+            installed_version="unknown version"
+          fi
+          echo "installed ${installed_version} has no \`gate\` subcommand; pin a source build / wait for 0.6.0" >&2
+          exit 3
+        fi
+
+        echo "method=${install_method}" >> "$GITHUB_OUTPUT"
 
     - name: Run prview gate
       id: gate
@@ -92,7 +111,7 @@ runs:
 
         if [ -n "$PRVIEW_ARGS" ]; then
           read -r -a extra_args <<< "$PRVIEW_ARGS"
-          cmd+=("${extra_args[@]}")
+          cmd+=(${extra_args[@]+"${extra_args[@]}"})
         fi
 
         set +e
@@ -125,8 +144,21 @@ runs:
             action_exit=1
             ;;
           2)
-            result="CONDITIONAL rejected by strict mode"
-            action_exit=2
+            # Exit 2 is ambiguous: the gate contract uses it for CONDITIONAL
+            # under --strict, but clap ALSO exits 2 on a CLI usage error (e.g.
+            # a typo or unknown flag in the `args` input). A real verdict always
+            # emits its gate JSON to stdout (captured in JSON_PATH); a usage
+            # error writes nothing to stdout (clap prints to stderr). Use that
+            # sentinel so an argument typo surfaces as a usage error, not a
+            # phantom "CONDITIONAL rejected" verdict.
+            if [ -s "$JSON_PATH" ]; then
+              result="CONDITIONAL rejected by strict mode"
+              action_exit=2
+            else
+              echo "prview gate exited 2 without emitting a gate verdict; treating as a CLI usage error (check the 'args' input), not a CONDITIONAL verdict" >&2
+              result="usage error: prview gate rejected its arguments (exit 2, no verdict emitted)"
+              action_exit=3
+            fi
             ;;
           3)
             result="internal gate execution error"

@@ -226,11 +226,11 @@ prview gate --strict
 Use the composite Action for the final required stage:
 
 ```yaml
-- uses: vetcoders/prview-rs@v0.6.0
+- uses: vetcoders/prview-rs@main # pin to a released tag once one ships `prview gate`
   id: prview
   with:
     strict: "true"
-    version: "0.6.0"
+    version: "latest"
 ```
 
 Use `strict: "false"` during advisory CI rollout. `CONDITIONAL` remains exit

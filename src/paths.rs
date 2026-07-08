@@ -66,8 +66,10 @@ pub fn normalize_to_repo_relative(path: &str, repo_root: &Path) -> NormalizedPat
     }
 
     // Outside repo.
+    let cleaned = clean_path(p);
+    let cleaned = cleaned.trim_start_matches(['/', '\\']);
     NormalizedPath {
-        display: format!("[external]{}", path),
+        display: format!("[external]/{}", cleaned),
         is_external: true,
     }
 }
@@ -302,7 +304,20 @@ mod tests {
     fn normalize_outside_repo_gets_external_marker() {
         let repo = tempdir().unwrap();
         let result = normalize_to_repo_relative("/usr/local/bin/tool", repo.path());
-        assert!(result.display.starts_with("[external]"));
+        assert_eq!(result.display, "[external]/usr/local/bin/tool");
+        assert_eq!(
+            result.display.strip_prefix("[external]/"),
+            Some("usr/local/bin/tool")
+        );
+        assert!(result.is_external);
+    }
+
+    #[test]
+    fn normalize_absolute_outside_repo_uses_single_external_separator() {
+        let repo = tempdir().unwrap();
+        let result =
+            normalize_to_repo_relative("/tmp/../definitely-outside-prview-tool", repo.path());
+        assert_eq!(result.display, "[external]/definitely-outside-prview-tool");
         assert!(result.is_external);
     }
 

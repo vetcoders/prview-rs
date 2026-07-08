@@ -21,16 +21,29 @@ pub struct LintConfig {
 
 impl PrviewManifest {
     pub fn load_from(repo_root: &Path) -> Option<Self> {
-        let path = repo_root.join("prview.toml");
-        if !path.exists() {
-            return None;
-        }
+        Self::load_from_with_warning_sink(repo_root, |warning| eprintln!("{warning}"))
+    }
 
-        let content = std::fs::read_to_string(&path).ok()?;
+    fn load_from_with_warning_sink(repo_root: &Path, mut warn: impl FnMut(String)) -> Option<Self> {
+        let path = repo_root.join("prview.toml");
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                warn(format!("warning: failed to read {}: {}", path.display(), e));
+                return None;
+            }
+        };
+
         match toml::from_str(&content) {
             Ok(manifest) => Some(manifest),
             Err(e) => {
-                eprintln!("warning: failed to parse {}: {}", path.display(), e);
+                warn(format!(
+                    "warning: failed to parse {}: {}",
+                    path.display(),
+                    e
+                ));
                 None
             }
         }
@@ -86,9 +99,33 @@ ignore_patterns = ["*.generated.ts"]
     #[test]
     fn test_load_missing_file_returns_none() {
         let tmp = TempDir::new().unwrap();
-        // No prview.toml created
-        let manifest = PrviewManifest::load_from(tmp.path());
+        let mut warnings = Vec::new();
+
+        let manifest = PrviewManifest::load_from_with_warning_sink(tmp.path(), |warning| {
+            warnings.push(warning)
+        });
+
         assert!(manifest.is_none());
+        assert!(warnings.is_empty(), "missing manifest should stay quiet");
+    }
+
+    #[test]
+    fn test_load_unreadable_manifest_warns_and_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("prview.toml")).unwrap();
+        let mut warnings = Vec::new();
+
+        let manifest = PrviewManifest::load_from_with_warning_sink(tmp.path(), |warning| {
+            warnings.push(warning)
+        });
+
+        assert!(manifest.is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("warning: failed to read")),
+            "expected manifest read warning, got: {warnings:?}"
+        );
     }
 
     #[test]
