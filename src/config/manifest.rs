@@ -7,6 +7,8 @@ pub struct PrviewManifest {
     pub project: ProjectConfig,
     #[serde(default)]
     pub lint: LintConfig,
+    #[serde(default)]
+    pub gate: GateConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -17,6 +19,16 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LintConfig {
     pub ignore_patterns: Option<Vec<String>>,
+}
+
+/// `[gate]` section of `prview.toml`. Controls merge-gate verdict behaviour.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GateConfig {
+    /// Whether a detected breaking API change escalates the merge verdict from
+    /// PASS to CONDITIONAL (never BLOCK). `None` → default on. Set to `false`
+    /// to keep the breaking findings visible as an informational caveat only,
+    /// with no effect on the verdict.
+    pub breaking_escalation: Option<bool>,
 }
 
 impl PrviewManifest {
@@ -126,6 +138,28 @@ ignore_patterns = ["*.generated.ts"]
                 .any(|warning| warning.contains("warning: failed to read")),
             "expected manifest read warning, got: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn test_load_gate_breaking_escalation_knob() {
+        let tmp = TempDir::new().unwrap();
+        let toml_content = r#"
+[gate]
+breaking_escalation = false
+"#;
+        fs::write(tmp.path().join("prview.toml"), toml_content).unwrap();
+
+        let manifest = PrviewManifest::load_from(tmp.path()).expect("manifest loads");
+        assert_eq!(manifest.gate.breaking_escalation, Some(false));
+    }
+
+    #[test]
+    fn test_gate_section_defaults_to_none_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("prview.toml"), "[project]\n").unwrap();
+
+        let manifest = PrviewManifest::load_from(tmp.path()).expect("manifest loads");
+        assert_eq!(manifest.gate.breaking_escalation, None);
     }
 
     #[test]
