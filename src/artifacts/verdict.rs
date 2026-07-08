@@ -259,6 +259,47 @@ pub(crate) fn breaking_change_breakdown(breaking: &[BreakingFinding]) -> Breakin
     }
 }
 
+/// Escalate the merge axis when the diff carries genuine breaking API changes.
+///
+/// Real breaking findings (removed public symbols, changed signatures, new env
+/// requirements — relocations are excluded, they are non-breaking) raise the
+/// merge recommendation from `Approve` to `ReviewRequired`, which turns the
+/// verdict PASS → CONDITIONAL. It NEVER produces a `Block` and NEVER downgrades
+/// an axis that is already `ReviewRequired`/`Block` for another reason: the axis
+/// only ratchets upward.
+///
+/// Gated by the `[gate] breaking_escalation` knob (default on). When the knob is
+/// off this is a no-op and returns `None`, so the breaking findings still surface
+/// as an informational caveat (via `build_review_caveats`) with no verdict impact.
+///
+/// Returns the explicit escalation reason caveat when it fired, so every artifact
+/// surface (console, report.json, MERGE_GATE.json) can show the identical reason.
+pub(crate) fn apply_breaking_escalation(
+    enabled: bool,
+    breaking: &[BreakingFinding],
+    worst_merge: &mut crate::policy::engine::MergeRecommendation,
+) -> Option<String> {
+    use crate::policy::engine::MergeRecommendation;
+
+    if !enabled {
+        return None;
+    }
+    let breakdown = breaking_change_breakdown(breaking);
+    if !breakdown.has_any() {
+        return None;
+    }
+    let count =
+        breakdown.removed_symbols + breakdown.signature_changes + breakdown.new_env_requirements;
+    if *worst_merge == MergeRecommendation::Approve {
+        *worst_merge = MergeRecommendation::ReviewRequired;
+    }
+    Some(format!(
+        "breaking API change detected: {} finding{}",
+        count,
+        if count == 1 { "" } else { "s" }
+    ))
+}
+
 pub(crate) fn build_review_caveats(
     breaking: &[BreakingFinding],
     coverage: &CoverageDelta,
@@ -885,6 +926,93 @@ pub(crate) fn quality_failure_reason_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::artifacts::signal::BreakingRisk;
+
+    fn removed_symbol_finding() -> BreakingFinding {
+        BreakingFinding {
+            file: "src/lib.rs".to_string(),
+            kind: BreakingKind::RemovedSymbol {
+                symbol_type: "fn".to_string(),
+            },
+            line: "pub fn old_api()".to_string(),
+            risk_level: BreakingRisk::High,
+        }
+    }
+
+    fn relocated_symbol_finding() -> BreakingFinding {
+        BreakingFinding {
+            file: "src/lib.rs".to_string(),
+            kind: BreakingKind::RelocatedSymbol {
+                symbol_type: "fn".to_string(),
+            },
+            line: "pub fn moved_api()".to_string(),
+            risk_level: BreakingRisk::Low,
+        }
+    }
+
+    #[test]
+    fn breaking_escalation_raises_approve_to_review_required() {
+        use crate::policy::engine::MergeRecommendation;
+
+        let mut axis = MergeRecommendation::Approve;
+        let reason = apply_breaking_escalation(true, &[removed_symbol_finding()], &mut axis);
+        assert_eq!(axis, MergeRecommendation::ReviewRequired);
+        assert_eq!(
+            reason.as_deref(),
+            Some("breaking API change detected: 1 finding")
+        );
+    }
+
+    #[test]
+    fn breaking_escalation_never_produces_block() {
+        use crate::policy::engine::MergeRecommendation;
+
+        // Two real breaking findings — escalation still tops out at ReviewRequired.
+        let mut axis = MergeRecommendation::Approve;
+        let reason = apply_breaking_escalation(
+            true,
+            &[removed_symbol_finding(), removed_symbol_finding()],
+            &mut axis,
+        );
+        assert_eq!(axis, MergeRecommendation::ReviewRequired);
+        assert_eq!(
+            reason.as_deref(),
+            Some("breaking API change detected: 2 findings")
+        );
+    }
+
+    #[test]
+    fn breaking_escalation_disabled_is_noop() {
+        use crate::policy::engine::MergeRecommendation;
+
+        let mut axis = MergeRecommendation::Approve;
+        let reason = apply_breaking_escalation(false, &[removed_symbol_finding()], &mut axis);
+        assert_eq!(axis, MergeRecommendation::Approve);
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn breaking_escalation_ignores_relocations_only() {
+        use crate::policy::engine::MergeRecommendation;
+
+        // Relocated/re-exported symbols are non-breaking: no escalation.
+        let mut axis = MergeRecommendation::Approve;
+        let reason = apply_breaking_escalation(true, &[relocated_symbol_finding()], &mut axis);
+        assert_eq!(axis, MergeRecommendation::Approve);
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn breaking_escalation_does_not_downgrade_a_higher_axis() {
+        use crate::policy::engine::MergeRecommendation;
+
+        // Already Block for another reason — escalation must not lower it.
+        let mut axis = MergeRecommendation::Block;
+        let reason = apply_breaking_escalation(true, &[removed_symbol_finding()], &mut axis);
+        assert_eq!(axis, MergeRecommendation::Block);
+        assert!(reason.is_some());
+    }
 
     #[test]
     fn advisory_only_review_required_is_allow_with_review_not_hold() {
