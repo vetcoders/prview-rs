@@ -62,6 +62,31 @@ fn create_gate_fixture() -> TempDir {
     temp
 }
 
+/// A repo whose feature branch removes a public Rust function — a genuine
+/// breaking API change the gate must surface. Used to prove the breaking-change
+/// escalation holds at the process boundary under `--strict`.
+fn create_breaking_gate_fixture() -> TempDir {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test User"]);
+    run_git(repo, &["config", "user.email", "test@example.com"]);
+
+    fs::write(repo.join("lib.rs"), "pub fn old_api() -> u32 {\n    1\n}\n").expect("write lib.rs");
+    run_git(repo, &["add", "lib.rs"]);
+    run_git(repo, &["commit", "-m", "initial"]);
+    run_git(repo, &["branch", "-M", "main"]);
+
+    run_git(repo, &["checkout", "-b", "feature/remove-public-api"]);
+    // Remove the public function: a RemovedSymbol breaking finding.
+    fs::write(repo.join("lib.rs"), "// old_api removed\n").expect("update lib.rs");
+    run_git(repo, &["add", "lib.rs"]);
+    run_git(repo, &["commit", "-m", "remove public api"]);
+
+    temp
+}
+
 fn path_without_semgrep(repo: &Path) -> OsString {
     let bin_dir = repo.join(".test-bin");
     fs::create_dir_all(&bin_dir).expect("create fixture bin dir");
@@ -100,6 +125,21 @@ fn gate_exits_two_for_strict_conditional() {
     // Same CONDITIONAL verdict, but --strict rejects it with exit 2. This is the
     // exact code clap also uses for usage errors, which is why the action must
     // distinguish the two (see action.yml) — here we pin the contract value.
+    prview_gate_command(temp.path())
+        .args(["gate", "--strict"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn gate_exits_two_for_strict_conditional_with_breaking_change() {
+    let temp = create_breaking_gate_fixture();
+
+    // A diff that removes a public Rust function is a breaking API change. With
+    // the default `[gate] breaking_escalation` knob on, that escalates the
+    // verdict to CONDITIONAL, which `--strict` rejects with the contract exit 2.
+    // (The skipped Semgrep check is also advisory here; either way the process
+    // must exit 2 with a real breaking finding present in the pack.)
     prview_gate_command(temp.path())
         .args(["gate", "--strict"])
         .assert()
