@@ -25,6 +25,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LOCTREE` heuristics stats (`total_files`, `total_loc`, `by_language`) report
   higher, broader numbers than under 0.8 for the same tree.
 
+## [0.6.0] - 2026-07-07
+
+### Added
+- add composite gate action
+- add measured pre-push profile
+- add gate subcommand with exit-code contract
+
+### Changed
+- test(checks): harden run_js_command local-bin test against ETXTBSY race
+- test(gate): hide semgrep from exit-code fixtures
+- test(gate): keep exit-three fixture outside parent repos
+- test(gate): disable signing in git fixtures
+- test(config): avoid manifest test self-spawn
+- perf(checks): share one target snapshot across all checks in a run
+- refactor(cache): use glob::Pattern::escape for repo-root glob escaping
+- chore: declare rust-version (MSRV)
+- test(gate): add end-to-end exit-code contract test
+- refactor(githooks): collapse pre-push gate invocation to one line
+- docs(gate): add rollout playbook and hook recipes
+- docs(changelog): record loctree 0.13 adaptation
+- build(deps): bump loctree 0.8 → 0.13.0
+
+### Fixed
+- fail fast without gate subcommand
+- trust gate JSON sentinel for exit two
+- prefer the live in-flight run for HEAD over a stale completed pack
+- trust snapshot-backed linters in the pre-existing downgrade
+- compute snapshot regression from the merge base
+- fold workspace-root lockfile into member cargo cache keys
+- warn on manifest read errors other than not-found
+- unify [external]/ prefix across branches
+- stop degrading clean semgrep scan on warning substring
+- default RUNNER_TEMP in shadow gate workflow
+- bash 3.2 safe array expansion
+- distinguish usage error from conditional verdict
+- point install/action defaults at released version
+- handle analysis_status=incomplete explicitly
+- clarify summary when failures degraded to advisory
+- use identifier-boundary match for orphaned resources
+- require module match in coverage stem strategy
+- keep report.json verdict in sync with merge gate
+- serialize run activation to close R2b TOCTOU
+- add age signal to stale-lock detection
+- fsync before rename in index save
+- treat pid 0 as dead in liveness checks
+- fail loud on unreadable MERGE_GATE in quick path
+- surface in-flight runs in verdict without run_id
+- skip corrupt index lines instead of truncating
+- widen cache key hash to 16 bytes
+- surface cargo audit informational warnings
+- escape repo path in glob patterns
+- distinguish rustfmt missing from formatting diff
+- key rust checks by cargo_root manifest set
+- run ruff/mypy/js checks against fetched target in remote mode
+- populate range merge_base from diff base
+- diff artifacts from merge-base
+- default RUNNER_TEMP to /tmp in composite gate action
+- add ~/.cargo/bin to PATH in pre-push
+- fail-fast init phase in pre-push with set -eu
+- treat mode-skip as caveat instead of blocking issue
+
 ## [0.5.0] - 2026-07-05
 
 ### Added
@@ -284,6 +345,7 @@ v0.1.2, consolidated from 183 commits on the development branch.
 - Cargo-geiger PascalCase output format for v0.13.0
 - Watch mode change detection using full git status hash
 
-[Unreleased]: https://github.com/vetcoders/prview-rs/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/vetcoders/prview-rs/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/vetcoders/prview-rs/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/vetcoders/prview-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/vetcoders/prview-rs/releases/tag/v0.4.0
