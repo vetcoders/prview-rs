@@ -588,6 +588,11 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         ..
     } = input;
 
+    let diff_merge_base = diffs
+        .first()
+        .map(|diff| diff.base_commit_id.clone())
+        .or_else(|| resolved_bases.first().map(|base| base.commit_id.clone()));
+
     // -- meta --
     let meta = Meta {
         generated_at: run_started_at.to_string(),
@@ -605,7 +610,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         range: RangeMeta {
             base: resolved_bases.first().map(|b| b.name.clone()),
             head: resolved_target.name.clone(),
-            merge_base: resolved_bases.first().map(|b| b.commit_id.clone()),
+            merge_base: diff_merge_base,
         },
     };
 

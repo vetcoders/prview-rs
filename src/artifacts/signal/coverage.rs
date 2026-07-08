@@ -496,7 +496,7 @@ fn find_matching_test<'a>(
         .and_then(|p| p.to_str())
         .unwrap_or("");
 
-    // Strategy 1: Exact stem match (strip test prefix/suffix) → High
+    // Strategy 1: Exact stem match (strip test prefix/suffix)
     for test in test_files {
         let test_stem = Path::new(&test.path)
             .file_stem()
@@ -511,11 +511,16 @@ fn find_matching_test<'a>(
             .unwrap_or(test_stem);
 
         if test_base == src_stem {
-            return Some((test, CoverageMatchTier::High));
+            let tier = if same_coverage_module(&source.path, &test.path) {
+                CoverageMatchTier::High
+            } else {
+                CoverageMatchTier::Low
+            };
+            return Some((test, tier));
         }
     }
 
-    // Strategy 2: Path-mirrored (tests/foo/bar.rs <-> src/foo/bar.rs) → High
+    // Strategy 2: Path-mirrored (tests/foo/bar.rs <-> src/foo/bar.rs)
     for test in test_files {
         if test.path.contains("tests/") || test.path.contains("__tests__/") {
             let test_filename = Path::new(&test.path)
@@ -523,7 +528,12 @@ fn find_matching_test<'a>(
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
             if test_filename == src_stem {
-                return Some((test, CoverageMatchTier::High));
+                let tier = if same_coverage_module(&source.path, &test.path) {
+                    CoverageMatchTier::High
+                } else {
+                    CoverageMatchTier::Low
+                };
+                return Some((test, tier));
             }
         }
     }
@@ -599,6 +609,37 @@ fn find_matching_test<'a>(
     }
 
     None
+}
+
+fn same_coverage_module(source_path: &str, test_path: &str) -> bool {
+    coverage_module_key(source_path) == coverage_module_key(test_path)
+}
+
+fn coverage_module_key(path: &str) -> Vec<String> {
+    let mut components = Path::new(path)
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .filter(|component| !component.is_empty())
+        .map(|component| component.to_string())
+        .collect::<Vec<_>>();
+
+    if components
+        .first()
+        .is_some_and(|component| matches!(component.as_str(), "src" | "tests" | "__tests__"))
+    {
+        components.remove(0);
+    }
+
+    components.pop();
+
+    while components
+        .last()
+        .is_some_and(|component| matches!(component.as_str(), "tests" | "__tests__"))
+    {
+        components.pop();
+    }
+
+    components
 }
 
 /// Strategy 5 (import recovery): find a test file that imports the source module.
@@ -821,6 +862,27 @@ mod tests {
 
         let signal = compute_coverage_signal(&[diff], None, None);
         assert_eq!(signal.confidence, "high");
+    }
+
+    #[test]
+    fn artifact_consistency_stem_match_across_different_modules_is_low_confidence() {
+        let diff = mock_diff(vec![
+            mock_file_change("src/a/util.rs", FileStatus::Modified, 10, 5),
+            mock_file_change("tests/b/util_test.rs", FileStatus::Modified, 5, 2),
+        ]);
+
+        let signal = compute_coverage_signal(&[diff], None, None);
+
+        assert_eq!(signal.covered_count, 1);
+        assert_eq!(
+            signal.covered_files[0],
+            (
+                "src/a/util.rs".to_string(),
+                "tests/b/util_test.rs".to_string(),
+                CoverageMatchTier::Low,
+            )
+        );
+        assert_eq!(signal.confidence, "medium");
     }
 
     #[test]

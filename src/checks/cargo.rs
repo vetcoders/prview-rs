@@ -18,6 +18,37 @@ pub struct RustfmtCheck;
 pub struct CargoAuditCheck;
 pub struct CargoGeigerCheck;
 
+fn cargo_cache_root(config: &Config) -> &Path {
+    config
+        .profile
+        .cargo_root
+        .as_deref()
+        .unwrap_or(config.repo_root.as_path())
+}
+
+/// Content hash for dependency-sensitive cargo checks (check/clippy/geiger).
+///
+/// `rust_hash` keys on files under `cargo_cache_root`. When that root is a
+/// workspace member distinct from the repo root, Cargo still resolves the
+/// dependency set from the workspace-root `Cargo.lock` — and a member usually
+/// has no lockfile of its own. Hashing only member files therefore lets a
+/// root-lockfile-only dependency bump reuse a stale cached result. Fold the
+/// repo-root lockfile in whenever the cargo root differs from the repo root so
+/// such a bump invalidates the member key.
+fn cargo_content_hash(config: &Config) -> String {
+    let cargo_root = cargo_cache_root(config);
+    let base = cache::rust_hash(cargo_root);
+    if cargo_root == config.repo_root.as_path() {
+        base
+    } else {
+        format!(
+            "{}-root:{}",
+            base,
+            cache::cargo_lock_hash(&config.repo_root)
+        )
+    }
+}
+
 #[async_trait]
 impl Check for CargoCheck {
     fn name(&self) -> &str {
@@ -35,18 +66,14 @@ impl Check for CargoCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(cache::rust_hash(&config.repo_root))
+        Some(cargo_content_hash(config))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         let args = &["check", "--message-format=short"];
         let output = run_command("cargo", args, cwd).await?;
@@ -111,18 +138,14 @@ impl Check for ClippyCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("clippy-{}", cache::rust_hash(&config.repo_root)))
+        Some(format!("clippy-{}", cargo_content_hash(config)))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         let args = &["clippy", "--message-format=short", "--", "-D", "warnings"];
         let output = run_command("cargo", args, cwd).await?;
@@ -227,11 +250,7 @@ impl Check for CargoTestCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         let args = &["test", "--all-targets", "--no-fail-fast"];
         let output = run_command_with_timeout("cargo", args, cwd, TEST_TIMEOUT_SECS).await?;
@@ -296,18 +315,17 @@ impl Check for RustfmtCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("rustfmt-{}", cache::rust_hash(&config.repo_root)))
+        Some(format!(
+            "rustfmt-{}",
+            cache::rust_hash(cargo_cache_root(config))
+        ))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         let args = &["fmt", "--check"];
         let output = run_command("cargo", args, cwd).await?;
@@ -317,18 +335,22 @@ impl Check for RustfmtCheck {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}\n{}", stdout, stderr);
 
-        let status = if output.status.success() {
-            CheckStatus::Passed
+        let status = classify_rustfmt_status(output.status.success(), &combined);
+        let result_output = if status == CheckStatus::Skipped {
+            format!(
+                "Rustfmt skipped: rustfmt component is not installed or cargo fmt is unavailable.\n{combined}"
+            )
+        } else if status == CheckStatus::Error {
+            format!("Rustfmt error: cargo fmt failed unexpectedly.\n{combined}")
         } else {
-            // rustfmt --check exits non-zero if files need formatting
-            CheckStatus::Warnings
+            combined.clone()
         };
 
         Ok(CheckResult {
             name: self.name().to_string(),
             status,
             duration: start.elapsed(),
-            output: combined.clone(),
+            output: result_output.clone(),
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
@@ -336,7 +358,7 @@ impl Check for RustfmtCheck {
                     args,
                     cwd,
                     output: &output,
-                    combined_output: &combined,
+                    combined_output: &result_output,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
@@ -345,6 +367,31 @@ impl Check for RustfmtCheck {
             ),
         })
     }
+}
+
+fn classify_rustfmt_status(command_succeeded: bool, output: &str) -> CheckStatus {
+    if command_succeeded {
+        return CheckStatus::Passed;
+    }
+
+    if rustfmt_tool_unavailable(output) {
+        return CheckStatus::Skipped;
+    }
+
+    if has_tool_crash(output) {
+        return CheckStatus::Error;
+    }
+
+    // `cargo fmt --check` exits non-zero when files need formatting.
+    CheckStatus::Warnings
+}
+
+fn rustfmt_tool_unavailable(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    (lower.contains("rustfmt") || lower.contains("cargo-fmt"))
+        && (lower.contains("is not installed")
+            || lower.contains("component") && lower.contains("missing")
+            || lower.contains("no such command") && lower.contains("fmt"))
 }
 
 #[async_trait]
@@ -384,11 +431,7 @@ impl Check for CargoAuditCheck {
         // root. Keying on the root lock while executing in a member meant a
         // member Cargo.lock change never invalidated the cache and a stale audit
         // was served (PR #12 review #22).
-        let cargo_root = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cargo_root = cargo_cache_root(config);
         Some(format!(
             "audit-{}-{}",
             cache::cargo_lock_hash(cargo_root),
@@ -400,11 +443,7 @@ impl Check for CargoAuditCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         let args = &["audit", "--json"];
         let output = run_command("cargo", args, cwd).await?;
@@ -448,23 +487,23 @@ fn classify_cargo_audit_status(
             return CheckStatus::Failed;
         }
 
-        if command_succeeded {
-            return CheckStatus::Passed;
+        if cargo_audit_has_warnings(stdout, combined) {
+            return CheckStatus::Warnings;
         }
 
-        if cargo_audit_has_warnings(combined) {
-            return CheckStatus::Warnings;
+        if command_succeeded {
+            return CheckStatus::Passed;
         }
 
         return CheckStatus::Failed;
     }
 
-    if command_succeeded {
-        return CheckStatus::Passed;
+    if cargo_audit_has_warnings(stdout, combined) {
+        return CheckStatus::Warnings;
     }
 
-    if cargo_audit_has_warnings(combined) {
-        return CheckStatus::Warnings;
+    if command_succeeded {
+        return CheckStatus::Passed;
     }
 
     if combined.contains("RUSTSEC-") {
@@ -495,8 +534,32 @@ fn cargo_audit_vulnerability_count(stdout: &str) -> Option<usize> {
     Some(0)
 }
 
-fn cargo_audit_has_warnings(output: &str) -> bool {
-    output.to_ascii_lowercase().contains("warning")
+fn cargo_audit_has_warnings(stdout: &str, output: &str) -> bool {
+    cargo_audit_warning_count(stdout).is_some_and(|count| count > 0)
+        || output
+            .lines()
+            .any(|line| line.to_ascii_lowercase().contains("warning:"))
+}
+
+fn cargo_audit_warning_count(stdout: &str) -> Option<usize> {
+    let parsed = serde_json::from_str::<serde_json::Value>(stdout).ok()?;
+    let warnings = parsed.get("warnings")?;
+    Some(count_cargo_audit_warning_items(warnings))
+}
+
+fn count_cargo_audit_warning_items(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(items) => items.len(),
+        serde_json::Value::Object(map) => {
+            if let Some(count) = map.get("count").and_then(|value| value.as_u64()) {
+                return count as usize;
+            }
+
+            map.values().map(count_cargo_audit_warning_items).sum()
+        }
+        serde_json::Value::Bool(true) => 1,
+        _ => 0,
+    }
 }
 
 #[async_trait]
@@ -533,18 +596,14 @@ impl Check for CargoGeigerCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("geiger-{}", cache::rust_hash(&config.repo_root)))
+        Some(format!("geiger-{}", cargo_content_hash(config)))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root);
+        let cwd = cargo_cache_root(config);
 
         if cargo_metadata_is_virtual_manifest(cwd).await {
             return Ok(CheckResult {
@@ -905,6 +964,109 @@ mod tests {
         assert!(key.unwrap().starts_with("clippy-"));
     }
 
+    fn config_with_cargo_root(repo_root: &Path, cargo_root: &Path, run_lint: bool) -> Config {
+        let mut profile = test_rust_profile(true);
+        profile.cargo_root = Some(cargo_root.to_path_buf());
+        test_config_builder()
+            .repo_root(repo_root)
+            .profile(profile)
+            .run_lint(run_lint)
+            .build()
+    }
+
+    fn assert_cache_key_changes_after_member_lock_bump(check: &dyn Check, run_lint: bool) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let member = root.join("member");
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.join("Cargo.lock"), "# root lock\n").unwrap();
+        std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"m\"\n").unwrap();
+        std::fs::write(member.join("Cargo.lock"), "# member lock v1\n").unwrap();
+        std::fs::write(member.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+
+        let config = config_with_cargo_root(root, &member, run_lint);
+        let before = check.cache_key(&config).expect("cache key before");
+        std::fs::write(member.join("Cargo.lock"), "# member lock v2\n").unwrap();
+        let after = check.cache_key(&config).expect("cache key after");
+        assert_ne!(
+            before,
+            after,
+            "{} cache key must hash the configured cargo_root manifest set",
+            check.name()
+        );
+    }
+
+    /// A workspace member with no lockfile of its own must still invalidate its
+    /// cache key when the workspace-root `Cargo.lock` is bumped — Cargo resolves
+    /// deps from the root lock, so a root-only dependency change alters what is
+    /// compiled even though no member file moved.
+    fn assert_cache_key_changes_after_root_lock_bump(check: &dyn Check, run_lint: bool) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let member = root.join("member");
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.join("Cargo.lock"), "# root lock v1\n").unwrap();
+        // Member has NO Cargo.lock of its own (the realistic workspace shape).
+        std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"m\"\n").unwrap();
+        std::fs::write(member.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+
+        let config = config_with_cargo_root(root, &member, run_lint);
+        let before = check.cache_key(&config).expect("cache key before");
+        // Bump ONLY the workspace-root lockfile — no member file changes.
+        std::fs::write(root.join("Cargo.lock"), "# root lock v2 bumped dep\n").unwrap();
+        let after = check.cache_key(&config).expect("cache key after");
+        assert_ne!(
+            before,
+            after,
+            "{} cache key must fold the workspace-root lockfile for member cargo roots",
+            check.name()
+        );
+    }
+
+    #[test]
+    fn test_cargo_check_cache_key_reflects_workspace_root_lock_bump() {
+        assert_cache_key_changes_after_root_lock_bump(&CargoCheck, false);
+    }
+
+    #[test]
+    fn test_clippy_cache_key_reflects_workspace_root_lock_bump() {
+        assert_cache_key_changes_after_root_lock_bump(&ClippyCheck, true);
+    }
+
+    #[test]
+    fn test_geiger_cache_key_reflects_workspace_root_lock_bump() {
+        assert_cache_key_changes_after_root_lock_bump(&CargoGeigerCheck, false);
+    }
+
+    #[test]
+    fn test_cargo_check_cache_key_follows_cargo_root_not_repo_root() {
+        assert_cache_key_changes_after_member_lock_bump(&CargoCheck, false);
+    }
+
+    #[test]
+    fn test_clippy_check_cache_key_follows_cargo_root_not_repo_root() {
+        assert_cache_key_changes_after_member_lock_bump(&ClippyCheck, true);
+    }
+
+    #[test]
+    fn test_rustfmt_cache_key_follows_cargo_root_not_repo_root() {
+        assert_cache_key_changes_after_member_lock_bump(&RustfmtCheck, true);
+    }
+
+    #[test]
+    fn test_cargo_geiger_cache_key_follows_cargo_root_not_repo_root() {
+        assert_cache_key_changes_after_member_lock_bump(&CargoGeigerCheck, true);
+    }
+
+    #[test]
+    fn test_rustfmt_missing_component_is_skipped_not_warnings() {
+        let output =
+            "error: 'rustfmt' is not installed for the toolchain 'stable-aarch64-apple-darwin'\n";
+        assert_eq!(classify_rustfmt_status(false, output), CheckStatus::Skipped);
+    }
+
     #[test]
     fn test_cargo_audit_cache_key_is_day_scoped() {
         // The audit key must carry the current day so a freshly published
@@ -1005,6 +1167,27 @@ mod tests {
         let combined = format!("{}\n{}", stdout, stderr);
 
         let status = classify_cargo_audit_status(false, stdout, &combined);
+        assert_eq!(status, CheckStatus::Warnings);
+    }
+
+    #[test]
+    fn test_cargo_audit_informational_warning_exit_zero_is_warnings() {
+        let stdout = r#"{
+  "vulnerabilities": {
+    "found": false,
+    "count": 0,
+    "list": []
+  },
+  "warnings": {
+    "unmaintained": [
+      {"advisory": {"id": "RUSTSEC-2024-0001"}}
+    ],
+    "yanked": [],
+    "notice": []
+  }
+}"#;
+
+        let status = classify_cargo_audit_status(true, stdout, stdout);
         assert_eq!(status, CheckStatus::Warnings);
     }
 

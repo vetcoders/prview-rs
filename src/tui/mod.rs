@@ -278,7 +278,12 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
         app.repo.prepare_refs(&app.config)?;
         let target = app.repo.resolve_target(&app.config)?;
         let bases = app.repo.resolve_bases(&app.config)?;
-        let diffs = app.repo.generate_diffs(&target, &bases, app.config.quiet)?;
+        let diff_bases = app
+            .repo
+            .resolve_diff_bases(&target, &bases, app.config.quiet);
+        let diffs = app
+            .repo
+            .generate_diffs(&target, &diff_bases, app.config.quiet)?;
 
         // Create snapshots synchronously (for remote/remote-only mode)
         let target_snap = if app.config.remote_mode || app.config.remote_only {

@@ -2,7 +2,7 @@
 
 use super::{
     Check, CheckProvenance, CheckResult, CheckStatus, TEST_TIMEOUT_SECS, find_hard_fail_signatures,
-    js_tool_available, run_js_command, run_js_command_with_timeout,
+    js_tool_available, plan_check_run, run_js_command, run_js_command_with_timeout,
 };
 use crate::Config;
 use crate::cache;
@@ -228,14 +228,24 @@ impl Check for TypeScriptCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("tsc-{}", cache::ts_hash(&config.repo_root)))
+        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
+        let target = repo.resolve_target(config).ok()?;
+        let head = repo.head_commit_id().ok()?;
+        if head == target.commit_id {
+            Some(format!("tsc-{}", cache::ts_hash(&config.repo_root)))
+        } else {
+            Some(format!("tsc-{}", target.commit_id))
+        }
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let output = run_js_command("tsc", &["--noEmit"], &config.repo_root).await?;
+        let plan = plan_check_run(config)?;
+        let run_dir = &plan.scan_dir;
+
+        let output = run_js_command("tsc", &["--noEmit"], run_dir).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -262,7 +272,7 @@ impl Check for TypeScriptCheck {
             provenance: Some(CheckProvenance {
                 command: format!("{} tsc --noEmit", js_runner),
                 tool_version: None,
-                cwd: config.repo_root.display().to_string(),
+                cwd: run_dir.display().to_string(),
                 exit_code: output.status.code(),
                 started_at,
                 finished_at,
@@ -301,16 +311,26 @@ impl Check for ESLintCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("eslint-{}", cache::ts_hash(&config.repo_root)))
+        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
+        let target = repo.resolve_target(config).ok()?;
+        let head = repo.head_commit_id().ok()?;
+        if head == target.commit_id {
+            Some(format!("eslint-{}", cache::ts_hash(&config.repo_root)))
+        } else {
+            Some(format!("eslint-{}", target.commit_id))
+        }
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
+        let plan = plan_check_run(config)?;
+        let run_dir = &plan.scan_dir;
+
         let args = eslint_args(config);
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let output = run_js_command("eslint", &args_ref, &config.repo_root).await?;
+        let output = run_js_command("eslint", &args_ref, run_dir).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -334,7 +354,7 @@ impl Check for ESLintCheck {
             provenance: Some(CheckProvenance {
                 command: format!("{} eslint {}", js_runner, args.join(" ")),
                 tool_version: None,
-                cwd: config.repo_root.display().to_string(),
+                cwd: run_dir.display().to_string(),
                 exit_code: output.status.code(),
                 started_at,
                 finished_at,
@@ -433,6 +453,9 @@ impl Check for VitestCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
+        let plan = plan_check_run(config)?;
+        let run_dir = &plan.scan_dir;
+
         // Build args
         let mut args = vec!["run"];
 
@@ -445,8 +468,7 @@ impl Check for VitestCheck {
 
         // Use longer timeout for tests
         let output =
-            run_js_command_with_timeout("vitest", &args, &config.repo_root, TEST_TIMEOUT_SECS)
-                .await?;
+            run_js_command_with_timeout("vitest", &args, run_dir, TEST_TIMEOUT_SECS).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -474,7 +496,7 @@ impl Check for VitestCheck {
             provenance: Some(CheckProvenance {
                 command: cmd_str,
                 tool_version: None,
-                cwd: config.repo_root.display().to_string(),
+                cwd: run_dir.display().to_string(),
                 exit_code: output.status.code(),
                 started_at,
                 finished_at,
@@ -513,19 +535,29 @@ impl Check for StylelintCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!(
-            "stylelint-{}",
-            cache::stylelint_hash(&config.repo_root)
-        ))
+        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
+        let target = repo.resolve_target(config).ok()?;
+        let head = repo.head_commit_id().ok()?;
+        if head == target.commit_id {
+            Some(format!(
+                "stylelint-{}",
+                cache::stylelint_hash(&config.repo_root)
+            ))
+        } else {
+            Some(format!("stylelint-{}", target.commit_id))
+        }
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
+        let plan = plan_check_run(config)?;
+        let run_dir = &plan.scan_dir;
+
         let args = stylelint_args(config);
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let output = run_js_command("stylelint", &args_ref, &config.repo_root).await?;
+        let output = run_js_command("stylelint", &args_ref, run_dir).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -559,7 +591,7 @@ impl Check for StylelintCheck {
             provenance: Some(CheckProvenance {
                 command: format!("{} stylelint {}", js_runner, args.join(" ")),
                 tool_version: None,
-                cwd: config.repo_root.display().to_string(),
+                cwd: run_dir.display().to_string(),
                 exit_code: output.status.code(),
                 started_at,
                 finished_at,

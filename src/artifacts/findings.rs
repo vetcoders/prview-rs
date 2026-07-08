@@ -65,6 +65,40 @@ pub(super) fn effective_inline_gate_class(
     }
 }
 
+pub(super) struct InlineGateOutcome {
+    pub severity: crate::policy::PolicySeverity,
+    pub blocking: bool,
+}
+
+pub(super) fn record_blocking_issue(
+    blocking_issues: &mut Vec<String>,
+    worst_merge: &mut crate::policy::engine::MergeRecommendation,
+    issue: impl Into<String>,
+) {
+    blocking_issues.push(issue.into());
+    *worst_merge = crate::policy::engine::MergeRecommendation::Block;
+}
+
+pub(super) fn apply_inline_gate_outcome(
+    config: &Config,
+    inline: &InlineFindingsSummary,
+    clean: &CleanComparison,
+    blocking_issues: &mut Vec<String>,
+    worst_merge: &mut crate::policy::engine::MergeRecommendation,
+) -> InlineGateOutcome {
+    let severity = config.policy.severity_for("inline_findings");
+    let class = effective_inline_gate_class(inline, clean);
+    let blocking = config.policy.is_blocking(severity, class);
+    if blocking {
+        record_blocking_issue(
+            blocking_issues,
+            worst_merge,
+            format!("INLINE_FINDINGS ({})", inline.status),
+        );
+    }
+    InlineGateOutcome { severity, blocking }
+}
+
 pub(super) fn gate_class_for_check(status: crate::checks::CheckStatus) -> GateClass {
     match status {
         crate::checks::CheckStatus::Passed => GateClass::Pass,

@@ -143,9 +143,12 @@ impl App {
         }
 
         // 4. Generate diffs
+        let diff_bases = self
+            .repo
+            .resolve_diff_bases(&target, &bases, self.config.quiet);
         let diffs = self
             .repo
-            .generate_diffs(&target, &bases, self.config.quiet)?;
+            .generate_diffs(&target, &diff_bases, self.config.quiet)?;
 
         // 5. Run checks (reduced set in update mode)
         let (check_results, skipped_checks) = if self.config.update_mode {
@@ -170,9 +173,15 @@ impl App {
         };
 
         // 6. Run heuristics (loctree-suite)
-        // In remote/remote-only mode, use git snapshots for deterministic analysis
+        // In remote/remote-only mode, use git snapshots for deterministic analysis.
+        // Feed the SAME merge-base range the artifact diff uses (`diff_bases`), not
+        // the raw base tips: when the base branch has advanced with unrelated work,
+        // snapshotting the tip would compute the regression delta against base-only
+        // files the patch excludes, fabricating regressions/caveats. All signals
+        // must share one range.
         let heuristics_result = if self.config.remote_mode || self.config.remote_only {
-            self.run_heuristics_with_snapshots(&target, &bases).await?
+            self.run_heuristics_with_snapshots(&target, &diff_bases)
+                .await?
         } else {
             heuristics::run_all(&self.config, None).await?
         };
@@ -439,9 +448,12 @@ impl App {
         } else {
             self.repo.resolve_bases(&self.config)?
         };
+        let diff_bases = self
+            .repo
+            .resolve_diff_bases(&target, &bases, self.config.quiet);
         let diffs = self
             .repo
-            .generate_diffs(&target, &bases, self.config.quiet)?;
+            .generate_diffs(&target, &diff_bases, self.config.quiet)?;
 
         // Skip checks and heuristics in quick mode
         let artifacts_dir = artifacts::generate(artifacts::GenerateInput {
@@ -763,5 +775,110 @@ mod tests {
         assert!(commit_ids_match("abc1234def56789", "abc1234"));
         assert!(commit_ids_match("abc1234def56789", "abc1234def56789"));
         assert!(!commit_ids_match("abc1234", "def5678"));
+    }
+
+    fn git_run(repo: &std::path::Path, args: &[&str]) {
+        let status = crate::git::git_cmd()
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn rev_parse(repo: &std::path::Path, rev: &str) -> String {
+        let out = crate::git::git_cmd()
+            .args(["rev-parse", rev])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse {} failed", rev);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn resolved(sha: &str) -> crate::git::ResolvedRef {
+        crate::git::ResolvedRef {
+            name: sha[..7.min(sha.len())].to_string(),
+            commit_id: sha.to_string(),
+            is_remote: false,
+        }
+    }
+
+    /// The snapshot-regression base must be exactly the base ref handed to
+    /// `run_heuristics_with_snapshots`. `run()` now feeds it the merge-base
+    /// (`diff_bases`), not the base tip, so that when the base branch advances
+    /// with unrelated work the regression is computed over the same range as the
+    /// artifact diff — not against base-only files the patch excludes.
+    #[tokio::test]
+    async fn snapshot_regression_is_anchored_to_the_base_ref_passed_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git_run(repo, &["init", "-q", "-b", "main"]);
+        git_run(repo, &["config", "user.email", "t@t.t"]);
+        git_run(repo, &["config", "user.name", "T"]);
+
+        // Merge-base commit M: a valid, loctree-analysable crate.
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn keep() {}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "base"]);
+        let merge_base = rev_parse(repo, "HEAD");
+
+        // Target branch T forks from M with an unrelated source tweak.
+        git_run(repo, &["checkout", "-q", "-b", "target"]);
+        std::fs::write(repo.join("src/lib.rs"), "pub fn keep() {}\n// t\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "target"]);
+        let target_sha = rev_parse(repo, "HEAD");
+
+        // Base branch B advances beyond the merge-base with its own unrelated file.
+        git_run(repo, &["checkout", "-q", "main"]);
+        git_run(repo, &["checkout", "-q", "-b", "advanced-base"]);
+        std::fs::write(repo.join("src/extra.rs"), "pub fn other() {}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "advance base"]);
+        let base_tip = rev_parse(repo, "HEAD");
+        assert_ne!(merge_base, base_tip);
+
+        let mut config = test_config();
+        config.repo_root = repo.to_path_buf();
+        config.run_heuristics = true;
+        config.execution_mode = ExecutionMode::Deep;
+        config.quiet = true;
+        let app = crate::App::from_config(config).unwrap();
+
+        let target_ref = resolved(&target_sha);
+
+        // Handed the merge-base: regression anchors to it (what `run()` now does).
+        let via_merge_base = app
+            .run_heuristics_with_snapshots(&target_ref, &[resolved(&merge_base)])
+            .await
+            .unwrap();
+        let reg_mb = via_merge_base
+            .regression
+            .expect("loctree signal available on both merge-base and target snapshots");
+        assert_eq!(
+            reg_mb.base_sha, merge_base,
+            "regression base snapshot must be the merge-base commit"
+        );
+
+        // Handed the base tip: it would anchor there instead — the pre-fix bug.
+        let via_tip = app
+            .run_heuristics_with_snapshots(&target_ref, &[resolved(&base_tip)])
+            .await
+            .unwrap();
+        let reg_tip = via_tip
+            .regression
+            .expect("loctree signal available on both base-tip and target snapshots");
+        assert_eq!(reg_tip.base_sha, base_tip);
+        assert_ne!(
+            reg_mb.base_sha, reg_tip.base_sha,
+            "the chosen base ref changes which tree the regression is computed against"
+        );
     }
 }

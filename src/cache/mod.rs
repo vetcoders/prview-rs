@@ -158,11 +158,19 @@ pub fn python_hash(repo_root: &Path) -> String {
 
 fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
     let mut hasher = Sha256::new();
+    // Escape glob metacharacters in the repo root so a path like `repo[old]` is
+    // matched literally, not parsed as a glob pattern. `glob::Pattern::escape`
+    // brackets exactly the chars glob treats as special (`? * [ ]`); braces are
+    // literal to this crate (no brace expansion), so no extra handling is needed.
+    let escaped_root = glob::Pattern::escape(&repo_root.display().to_string());
 
     for pattern in patterns {
-        if let Ok(entries) = glob::glob(&format!("{}/{}", repo_root.display(), pattern)) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                if let Ok(content) = fs::read(&entry) {
+        if let Ok(entries) = glob::glob(&format!("{escaped_root}/{pattern}")) {
+            let mut paths: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+            paths.sort();
+
+            for path in paths {
+                if let Ok(content) = fs::read(&path) {
                     hasher.update(&content);
                 }
             }
@@ -170,7 +178,7 @@ fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
     }
 
     let result = hasher.finalize();
-    hex::encode(&result[..4]) // First 8 chars
+    hex::encode(&result[..16])
 }
 
 #[cfg(test)]
@@ -325,6 +333,18 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_functions_use_16_byte_digest_segments() {
+        let temp_dir = TempDir::new().unwrap();
+        let ts_hash = ts_hash(temp_dir.path());
+        assert_eq!(ts_hash.len(), 32);
+
+        let rust_hash = rust_hash(temp_dir.path());
+        let parts: Vec<_> = rust_hash.split('-').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts.iter().all(|part| part.len() == 32));
+    }
+
+    #[test]
     fn test_python_hash_format() {
         let temp_dir = TempDir::new().unwrap();
         let hash = python_hash(temp_dir.path());
@@ -392,6 +412,33 @@ mod tests {
         // At minimum, the file hash part should differ
         assert!(!hash1.is_empty());
         assert!(!hash2.is_empty());
+    }
+
+    #[test]
+    fn test_hash_files_escapes_repo_root_glob_metacharacters() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("repo[old]")
+            .tempdir()
+            .unwrap();
+
+        fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        let first = rust_hash(temp_dir.path());
+
+        fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let second = rust_hash(temp_dir.path());
+
+        assert_ne!(
+            first, second,
+            "repo roots with glob metacharacters must still hash matched files"
+        );
     }
 
     fn init_git_repo_with_commit() -> TempDir {

@@ -165,10 +165,14 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         };
         let blocking = config.policy.is_blocking(severity, status_class);
         if blocking {
-            blocking_issues.push(format!(
-                "Loctree heuristics (dead_exports={}, cycles={})",
-                dead, cycles
-            ));
+            record_blocking_issue(
+                &mut blocking_issues,
+                &mut worst_merge,
+                format!(
+                    "Loctree heuristics (dead_exports={}, cycles={})",
+                    dead, cycles
+                ),
+            );
         }
         let name = if let Some(h) = heuristics {
             format!(
@@ -190,12 +194,13 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
     // Inline findings blocking — THREAD 7: gate on introduced/unclassified
     // findings, not the raw error count, so the dashboard agrees with the merge
     // gate and a pre-existing-only scan does not block.
-    let inline_severity = config.policy.severity_for("inline_findings");
-    let inline_class = effective_inline_gate_class(inline, &clean_comparison);
-    let inline_blocking = config.policy.is_blocking(inline_severity, inline_class);
-    if inline_blocking {
-        blocking_issues.push(format!("INLINE_FINDINGS ({})", inline.status));
-    }
+    apply_inline_gate_outcome(
+        config,
+        inline,
+        &clean_comparison,
+        &mut blocking_issues,
+        &mut worst_merge,
+    );
 
     let policy_allow_merge = blocking_issues.is_empty();
 

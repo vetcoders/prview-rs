@@ -104,21 +104,22 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     if !has_heuristics {
         let (heuristics_check, heuristics_issue) = build_heuristics_gate_check(config, heuristics);
         if let Some(issue) = heuristics_issue {
-            blocking_issues.push(issue);
-            worst_merge = MergeRecommendation::Block;
+            record_blocking_issue(&mut blocking_issues, &mut worst_merge, issue);
         }
         gate_checks.push(heuristics_check);
     }
 
-    let inline_severity = config.policy.severity_for("inline_findings");
     // THREAD 7: gate on introduced/unclassified findings, not the raw error
     // count — a scan with only pre-existing errors must not block the merge.
-    let inline_class = effective_inline_gate_class(inline, &clean_comparison);
-    let inline_blocking = config.policy.is_blocking(inline_severity, inline_class);
-    if inline_blocking {
-        blocking_issues.push(format!("INLINE_FINDINGS ({})", inline.status));
-        worst_merge = MergeRecommendation::Block;
-    }
+    let inline_gate = apply_inline_gate_outcome(
+        config,
+        inline,
+        &clean_comparison,
+        &mut blocking_issues,
+        &mut worst_merge,
+    );
+    let inline_severity = inline_gate.severity;
+    let inline_blocking = inline_gate.blocking;
 
     let policy_allow_merge = blocking_issues.is_empty();
 
@@ -702,6 +703,75 @@ mod tests {
             .iter()
             .find(|check| check["id"].as_str() == Some(check_id))
             .expect("gate check")
+    }
+
+    #[test]
+    fn artifact_consistency_inline_blocking_verdict_matches_report_and_gate() {
+        use crate::policy::engine::MergeRecommendation;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.policy.checks.insert(
+            "inline_findings".to_string(),
+            crate::policy::PolicySeverity::Block,
+        );
+        let inline = InlineFindingsSummary {
+            status: "failed".to_string(),
+            findings_count: 1,
+            dashboard_findings: vec![DashboardFinding {
+                level: "error",
+                check_name: "Semgrep scan".to_string(),
+                check_id: "semgrep_scan".to_string(),
+                message: "introduced finding".to_string(),
+                in_diff: Some(true),
+            }],
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            checks: &[],
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+        })
+        .expect("merge gate");
+
+        let raw =
+            std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
+        let gate: serde_json::Value = serde_json::from_str(&raw).expect("parse gate json");
+        let dashboard = build_dashboard_context(DashboardContextInput {
+            config: &config,
+            checks: &[],
+            heuristics: None,
+            inline: &inline,
+            breaking: Vec::new(),
+            coverage,
+            diff_dir: tmp.path(),
+            skipped_checks: Vec::new(),
+            out_dir: tmp.path(),
+            diffs: &[],
+            ownership_map: Vec::new(),
+            clean_comparison: CleanComparison::for_test(true, true),
+        });
+
+        assert_eq!(
+            gate["decision"]["merge_recommendation"].as_str(),
+            Some("block")
+        );
+        assert_eq!(dashboard.merge_recommendation, MergeRecommendation::Block);
+        assert_eq!(
+            dashboard.verdict,
+            gate["decision"]["verdict"].as_str().expect("gate verdict")
+        );
     }
 
     #[test]
