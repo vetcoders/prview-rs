@@ -37,6 +37,11 @@ ignore_patterns = [
     "**/.next/**",
     "**/build/**"
 ]
+
+[gate]
+# Whether a detected breaking API change escalates the merge verdict.
+# Default: true (escalation on out-of-the-box).
+breaking_escalation = true
 ```
 
 ### Options
@@ -58,6 +63,20 @@ project-specific artifacts (for example bundler output).
 * **`ignore_patterns`**: a list of `glob` paths that keep ESLint/Stylelint from
   reporting errors in machine-generated code. Applied **in addition to** the
   built-in exclusion list.
+
+#### `[gate]`
+
+Tunes how the merge-gate verdict reacts to structural signals.
+
+* **`breaking_escalation`** (default `true`): when a genuine breaking API change
+  is detected (a removed public symbol, a changed public signature, or a new
+  required environment variable), the verdict is raised to at least
+  `CONDITIONAL`. It never forces a `BLOCK` on its own and never lowers a verdict
+  that is already `CONDITIONAL`/`BLOCK` for another reason. Set to `false` to
+  keep the breaking findings visible as an **informational caveat only**, with
+  no effect on the verdict. The escalation and its reason
+  (`breaking API change detected: <n> finding(s)`) appear identically on the
+  console summary, `report.json`'s gate block, and `MERGE_GATE.json`'s decision.
 
 ---
 

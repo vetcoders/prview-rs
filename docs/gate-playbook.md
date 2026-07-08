@@ -17,6 +17,23 @@ they must not parse stdout.
 Use `prview gate --json` when CI needs a machine-readable summary, artifact
 paths, or SARIF path discovery. Pass/fail still comes from the process exit code.
 
+## Breaking-change escalation
+
+A genuine breaking API change in the diff — a removed public symbol, a changed
+public signature, or a newly required environment variable — escalates the
+verdict to at least `CONDITIONAL` (never `BLOCK` on its own, and never lowering a
+verdict already raised for another reason). Under `--strict` a `CONDITIONAL`
+verdict exits `2`, so a breaking change fails a Required gate until an owner
+acknowledges it.
+
+The escalation is on by default and controlled by the `[gate]
+breaking_escalation` knob in `prview.toml` (see `docs/configuration.md`). Set it
+to `false` to keep breaking findings as an **informational caveat only**, with no
+effect on the verdict — useful for repositories that intentionally ship breaking
+changes on a cadence. Whether on or off, the reason
+(`breaking API change detected: <n> finding(s)`) is reported identically on the
+console, in `report.json`, and in `MERGE_GATE.json`.
+
 ## Rollout ladder: Shadow -> Warn -> Block
 
 Start advisory. A gate that blocks too early trains people to bypass it.
