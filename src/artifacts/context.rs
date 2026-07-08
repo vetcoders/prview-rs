@@ -347,6 +347,17 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         }
     }
 
+    // Breaking-change escalation (critic-1): a genuine breaking API change must
+    // raise the verdict to at least CONDITIONAL. This mirrors the identical bump
+    // in `generate_merge_gate` so report.json and MERGE_GATE.json can never
+    // disagree on the verdict. Gated by the `breaking_escalation` knob; when off
+    // the breaking findings stay visible as an informational caveat only.
+    if let Some(reason) =
+        apply_breaking_escalation(config.breaking_escalation, &breaking, &mut worst_merge)
+    {
+        review_caveats.push(reason);
+    }
+
     // B2: Compute i18n parity delta
     let i18n_delta = signal::compute_i18n_delta(diffs, &config.repo_root);
     // Derive the scalar decision fields from the FINAL axes (after every

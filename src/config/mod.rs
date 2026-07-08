@@ -75,6 +75,12 @@ pub struct Config {
     pub bridge_stage: u8,
     pub lint_ignore_patterns: Vec<String>,
 
+    /// Whether a detected breaking API change escalates the merge verdict from
+    /// PASS to CONDITIONAL (never BLOCK). Sourced from `[gate] breaking_escalation`
+    /// in `prview.toml`; defaults to `true` (escalation on out-of-the-box). When
+    /// `false`, breaking findings stay visible as an informational caveat only.
+    pub breaking_escalation: bool,
+
     /// Directory the file-scoped checks should scan, when the dispatcher has
     /// already materialised a shared target snapshot for the run. `None` = each
     /// check resolves its own scan dir via `plan_check_run`. Set once per run by
@@ -594,9 +600,14 @@ impl Config {
         policy: PolicyConfig,
         manifest: Option<PrviewManifest>,
     ) -> Self {
-        let lint_ignore_patterns = manifest
-            .and_then(|m| m.lint.ignore_patterns)
-            .unwrap_or_default();
+        let (lint_ignore_patterns, breaking_escalation) = match manifest {
+            Some(m) => (
+                m.lint.ignore_patterns.unwrap_or_default(),
+                // Absent `[gate]` section or key → escalation on by default.
+                m.gate.breaking_escalation.unwrap_or(true),
+            ),
+            None => (Vec::new(), true),
+        };
 
         Self {
             repo_root,
@@ -637,6 +648,7 @@ impl Config {
             policy,
             bridge_stage: 0,
             lint_ignore_patterns,
+            breaking_escalation,
             scan_dir_override: None,
         }
     }
@@ -2204,6 +2216,7 @@ mod tests {
                 cargo_root: Some("custom_backend".to_string()),
             },
             lint: Default::default(),
+            gate: Default::default(),
         };
 
         let (has_cargo, cargo_root, rust_dirs, _) =

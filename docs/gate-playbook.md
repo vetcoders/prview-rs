@@ -17,6 +17,39 @@ they must not parse stdout.
 Use `prview gate --json` when CI needs a machine-readable summary, artifact
 paths, or SARIF path discovery. Pass/fail still comes from the process exit code.
 
+## Breaking-change escalation
+
+A genuine breaking API change in the diff — a removed public symbol, a changed
+public signature, or a newly required environment variable — escalates the
+verdict to at least `CONDITIONAL` (never `BLOCK` on its own, and never lowering a
+verdict already raised for another reason). Under `--strict` a `CONDITIONAL`
+verdict exits `2`, so a breaking change fails a Required gate until an owner
+acknowledges it.
+
+The escalation is on by default and controlled by the `[gate]
+breaking_escalation` knob in `prview.toml` (see `docs/configuration.md`). Set it
+to `false` to keep breaking findings as an **informational caveat only**, with no
+effect on the verdict — useful for repositories that intentionally ship breaking
+changes on a cadence. Whether on or off, the reason
+(`breaking API change detected: <n> finding(s)`) is reported identically on the
+console, in `report.json`, and in `MERGE_GATE.json`.
+
+### Which command enforces it
+
+Escalation raises the *verdict*; whether that verdict fails your CI depends on
+which command you run. Two contract lines, deliberately distinct:
+
+* **`prview --ci`** — the legacy advisory review exit. It exits `1` only on a
+  hard failure (`BLOCK` or a broken quality gate); a `CONDITIONAL` verdict —
+  including a breaking-only `CONDITIONAL` — exits `0`, exactly as it does for any
+  other `CONDITIONAL` cause. This is the historical review contract and does not
+  change with breaking-change escalation.
+* **`prview gate`** — the contractual enforcement path. `CONDITIONAL` exits `1`,
+  and `prview gate --strict` exits `2` (see the exit-code contract above).
+
+So a breaking change never fails `prview --ci` on its own — to block CI on a
+breaking change, run **`prview gate --strict`** as the Required check.
+
 ## Rollout ladder: Shadow -> Warn -> Block
 
 Start advisory. A gate that blocks too early trains people to bypass it.

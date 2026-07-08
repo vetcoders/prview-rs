@@ -1293,11 +1293,21 @@ fn merge_gate_surfaces_review_caveats_when_merge_needs_review() {
         gate["decision"]["recommended_label"].as_str(),
         Some("MERGE WITH REVIEW")
     );
+    // Three descriptive caveats (breaking breakdown, coverage, inline finding)
+    // plus the breaking-change escalation reason caveat (critic-1).
     assert_eq!(
         gate["decision"]["review_caveats"]
             .as_array()
             .map(|items| items.len()),
-        Some(3)
+        Some(4)
+    );
+    assert!(
+        gate["decision"]["review_caveats"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item
+                .as_str()
+                .is_some_and(|text| text == "breaking API change detected: 1 finding"))),
+        "breaking change must escalate with an explicit reason caveat"
     );
 }
 

@@ -178,6 +178,17 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             }
         }
     }
+    // Breaking-change escalation (critic-1): a genuine breaking API change must
+    // raise the verdict to at least CONDITIONAL. Identical bump to the one in
+    // `build_dashboard_context`, so MERGE_GATE.json and report.json can never
+    // disagree on the verdict. Gated by the `breaking_escalation` knob; when off
+    // the breaking findings stay visible as an informational caveat only.
+    if let Some(reason) =
+        apply_breaking_escalation(config.breaking_escalation, breaking, &mut worst_merge)
+    {
+        review_caveats.push(reason);
+    }
+
     // Derive the scalar decision fields from the FINAL axes (after every
     // review/risk bump above) through the single coherent source. `allow_merge`
     // is owned here and never set independently, so it cannot contradict the
@@ -775,6 +786,70 @@ mod tests {
     }
 
     #[test]
+    fn breaking_escalation_verdict_matches_across_gate_and_dashboard() {
+        // Parity: the breaking-change escalation must land identically on
+        // MERGE_GATE.json (this path) and the dashboard context that backs
+        // report.json + the console verdict.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config();
+        let inline = InlineFindingsSummary {
+            status: "passed".to_string(),
+            findings_count: 0,
+            dashboard_findings: vec![],
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+        let breaking = vec![breaking_removed_symbol()];
+
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            checks: &[],
+            heuristics: None,
+            inline: &inline,
+            breaking: &breaking,
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+        })
+        .expect("merge gate");
+        let raw =
+            std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
+        let gate: serde_json::Value = serde_json::from_str(&raw).expect("parse gate json");
+
+        let dashboard = build_dashboard_context(DashboardContextInput {
+            config: &config,
+            checks: &[],
+            heuristics: None,
+            inline: &inline,
+            breaking: breaking.clone(),
+            coverage,
+            diff_dir: tmp.path(),
+            skipped_checks: Vec::new(),
+            out_dir: tmp.path(),
+            diffs: &[],
+            ownership_map: Vec::new(),
+            clean_comparison: CleanComparison::for_test(true, true),
+        });
+
+        assert_eq!(gate["decision"]["verdict"].as_str(), Some("CONDITIONAL"));
+        assert_eq!(
+            dashboard.verdict,
+            gate["decision"]["verdict"].as_str().expect("gate verdict")
+        );
+        assert!(
+            dashboard
+                .review_caveats
+                .iter()
+                .any(|caveat| caveat == "breaking API change detected: 1 finding"),
+            "dashboard context must carry the same escalation reason caveat"
+        );
+    }
+
+    #[test]
     fn effective_outcome_is_the_single_shared_verdict_source() {
         use crate::policy::engine::{MergeRecommendation, PolicyEngine};
 
@@ -1066,6 +1141,101 @@ mod tests {
         assert_eq!(
             gate["decision"]["introduced_quality_failures"][0].as_str(),
             Some("Rustfmt")
+        );
+    }
+
+    fn breaking_removed_symbol() -> BreakingFinding {
+        use crate::artifacts::signal::BreakingRisk;
+        BreakingFinding {
+            file: "src/lib.rs".to_string(),
+            kind: BreakingKind::RemovedSymbol {
+                symbol_type: "fn".to_string(),
+            },
+            line: "pub fn old_api()".to_string(),
+            risk_level: BreakingRisk::High,
+        }
+    }
+
+    fn run_gate_with_breaking(escalation: bool) -> serde_json::Value {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.breaking_escalation = escalation;
+        // No failing checks and no inline findings: without escalation this is a
+        // clean PASS, so any CONDITIONAL comes solely from the breaking change.
+        let inline = InlineFindingsSummary {
+            status: "passed".to_string(),
+            findings_count: 0,
+            dashboard_findings: vec![],
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+        let breaking = vec![breaking_removed_symbol()];
+
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            checks: &[],
+            heuristics: None,
+            inline: &inline,
+            breaking: &breaking,
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+        })
+        .expect("merge gate");
+
+        let raw =
+            std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
+        serde_json::from_str(&raw).expect("parse gate json")
+    }
+
+    #[test]
+    fn breaking_change_escalates_verdict_to_conditional_when_knob_on() {
+        // critic-1: a genuine breaking API change must raise PASS → CONDITIONAL.
+        let gate = run_gate_with_breaking(true);
+
+        assert_eq!(gate["decision"]["verdict"].as_str(), Some("CONDITIONAL"));
+        assert_eq!(
+            gate["decision"]["merge_recommendation"].as_str(),
+            Some("review_required")
+        );
+        assert_eq!(gate["decision"]["allow_merge"].as_bool(), Some(false));
+        assert!(
+            gate["decision"]["review_caveats"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item
+                    .as_str()
+                    .is_some_and(|text| text == "breaking API change detected: 1 finding"))),
+            "escalation reason must be surfaced as a review caveat"
+        );
+    }
+
+    #[test]
+    fn breaking_change_stays_pass_with_informational_caveat_when_knob_off() {
+        // Knob off: no verdict escalation, but the breaking change is still
+        // visible as an informational caveat (from build_review_caveats).
+        let gate = run_gate_with_breaking(false);
+
+        assert_eq!(gate["decision"]["verdict"].as_str(), Some("PASS"));
+        assert_eq!(gate["decision"]["allow_merge"].as_bool(), Some(true));
+        assert!(
+            gate["decision"]["review_caveats"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item
+                    .as_str()
+                    .is_some_and(|text| text.contains("removed public symbol")))),
+            "breaking change must remain visible as an informational caveat"
+        );
+        assert!(
+            gate["decision"]["review_caveats"]
+                .as_array()
+                .is_some_and(|items| items.iter().all(|item| item
+                    .as_str()
+                    .is_none_or(|text| !text.starts_with("breaking API change detected")))),
+            "no escalation reason caveat when the knob is off"
         );
     }
 
