@@ -242,7 +242,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - CLI flag `--why-blocked` to explicitly explain merge gate decisions in the terminal.
-- Enhanced `prview doctor` with unified branding (vetcoders), monorepo detection, and profile-aware toolchain checks (pnpm, ruff, etc.).
+- Enhanced `prview doctor` with unified branding (Vetcoders), monorepo detection, and profile-aware toolchain checks (pnpm, ruff, etc.).
 - New security and quality rules to `semgrep.yml` (avoid-unwrap, path-safety).
 - `make smoke-test` target to verify installation and binary health.
 - `SemgrepCheck` integrated into `prview` checks, utilizing local `semgrep.yml` configuration.

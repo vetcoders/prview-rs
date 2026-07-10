@@ -7,7 +7,7 @@ use clap_complete::{Shell, generate};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// PR Review & Artifact Generator by vetcoders - cross-language PR analysis tool
+/// PR Review & Artifact Generator by Vetcoders - cross-language PR analysis tool
 ///
 /// Generates Artifact Pack v1: structured, verifiable PR review artifacts
 /// including per-gate quality reports, provenance tracking, hard fail
@@ -16,11 +16,11 @@ use std::path::PathBuf;
 #[command(name = "prview")]
 #[command(author = "vetcoders <hello@vetcoders.io>")]
 #[command(version)]
-#[command(about = "PR Review & Artifact Generator by vetcoders")]
+#[command(about = "PR Review & Artifact Generator by Vetcoders")]
 #[command(args_conflicts_with_subcommands = true)]
 #[command(subcommand_precedence_over_arg = true)]
 #[command(
-    long_about = "PR Review & Artifact Generator by vetcoders - cross-language PR analysis tool\n\n\
+    long_about = "PR Review & Artifact Generator by Vetcoders - cross-language PR analysis tool\n\n\
 Generates Artifact Pack v1 with structured, verifiable PR review artifacts:\n\n\
   Artifact layout:\n\
     00_summary/   RUN.json, MANIFEST.json, SANITY.json, MERGE_GATE,\n\
