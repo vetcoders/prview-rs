@@ -5148,6 +5148,63 @@ fn provenance_json_base_sha_is_the_commit_the_diff_used() {
 }
 
 #[test]
+fn provenance_json_records_every_baseline_of_a_multi_base_run() {
+    // `--base a --base b` produces one patch per base, each with its own merge
+    // base. Recording only the first left the second patch unplaceable: the
+    // pack contains a diff whose baseline the manifest never names.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let diff = |base: &str, base_commit: &str| Diff {
+        target: "feature/provenance".to_string(),
+        base: base.to_string(),
+        target_commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        base_commit_id: base_commit.to_string(),
+        files: vec![],
+        stats: DiffStats {
+            files_changed: 0,
+            additions: 0,
+            deletions: 0,
+            copied: 0,
+        },
+        commits: vec![],
+    };
+    let first = "1111111111111111111111111111111111111111";
+    let second = "2222222222222222222222222222222222222222";
+    let diffs = vec![diff("origin/main", first), diff("origin/release", second)];
+
+    let json = write_provenance_fixture_with_diffs(repo_tmp.path(), out.path(), &[], &diffs);
+
+    let bases = json["bases"].as_array().expect("bases array");
+    assert_eq!(bases.len(), 2, "one row per patch in the pack");
+    assert_eq!(bases[0]["name"], "origin/main");
+    assert_eq!(bases[0]["sha"], first);
+    assert_eq!(bases[1]["name"], "origin/release");
+    assert_eq!(bases[1]["sha"], second);
+    assert_eq!(
+        json["base_sha"], first,
+        "the scalar stays the first baseline, so older consumers keep reading it",
+    );
+}
+
+#[test]
+fn provenance_json_bases_fall_back_to_resolved_refs_without_a_diff() {
+    // No diff at all (`--current-only`, or a base pointing at the target): the
+    // resolved refs are then the only baselines there are, and the array must
+    // still agree with the scalar.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let json = write_provenance_fixture_with_diffs(repo_tmp.path(), out.path(), &[], &[]);
+
+    let bases = json["bases"].as_array().expect("bases array");
+    assert_eq!(bases.len(), 1);
+    assert_eq!(bases[0]["name"], "origin/main");
+    assert_eq!(bases[0]["sha"], PROVENANCE_BASE_TIP);
+    assert_eq!(json["base_sha"], PROVENANCE_BASE_TIP);
+}
+
+#[test]
 fn provenance_json_worktree_reflects_dirty_tree() {
     let (repo_tmp, _head) = provenance_fixture_repo();
     let out = tempfile::tempdir().expect("out tempdir");

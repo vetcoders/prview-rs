@@ -455,13 +455,17 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
 "what did *this pack* judge", once, for a reviewer holding only the artifacts:
 
 - `target_sha` — commit whose tree the pack judges;
-- `base_sha` — the baseline the diff was actually generated from, i.e. the
-  **merge base** taken from the first diff (`Diff.base_commit_id`), not the tip
-  of the base branch. The two differ whenever the base moved ahead of the branch
-  point, and the patch, the changed-file list and every diff-scoped gate are all
-  computed against the merge base — so recording the tip would describe a
-  comparison the pack never made. It falls back to the first resolved base ref
-  only when there is no diff at all;
+- `bases[]` — every baseline the pack's patches were generated from, as
+  `{name, sha}` in diff order. Each `sha` is the **merge base** taken from its
+  diff (`Diff.base_commit_id`), not the tip of the base branch. The two differ
+  whenever the base moved ahead of the branch point, and the patch, the
+  changed-file list and every diff-scoped gate are all computed against the merge
+  base — so recording the tip would describe a comparison the pack never made. A
+  multi-base run (`--base a --base b`) produces one patch per base, so it gets
+  one row per base; with no diff at all the resolved base refs are the only
+  baselines there are and fill the array instead;
+- `base_sha` — the first entry's `sha`, kept for consumers that predate
+  `bases[]`. It is derived from that array, so the two cannot disagree;
 - `head_sha` — commit checked out locally (equal to `target_sha` for an ordinary
   local review, different under `--pr`/`--remote`);
 - `worktree.clean` — whether the local tree had uncommitted changes, frozen

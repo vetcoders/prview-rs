@@ -33,7 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`docs/contracts/ai_index.md`) and the artifact-pack inventory in `README.md`,
   so a consumer implementing the contract can discover that the file is required
   and where it belongs. `worktree.clean` is nullable: a status that could not be
-  read is reported as unknown rather than as a clean tree. A reviewer holding
+  read is reported as unknown rather than as a clean tree. `bases[]` names every
+  baseline the pack's patches were produced from as `{name, sha}`: a multi-base
+  run (`--base a --base b`) generates one patch per base, each with its own merge
+  base, and a single scalar left every patch after the first unplaceable.
+  `base_sha` remains, derived from that array's first entry, so existing
+  consumers keep working and the two cannot disagree. A reviewer holding
   only the artifacts no longer has to reconstruct the run's substrate from
   scattered gate files. Purely additive: no existing pack file changed shape,
   the manifest hashes it like any other artifact, and the sanity
