@@ -1047,15 +1047,15 @@ mod tests {
         // every other Python/JS check, so it must be listed here — otherwise a
         // Python-only run would materialise a second worktree, and Pytest could
         // drift back to running against the local checkout.
-        for name in ["Ruff", "Mypy", "Pytest", "Vitest"] {
+        for name in ["Ruff", "Mypy", "Pytest", "Vitest", "Cargo test"] {
             assert!(
                 uses_shared_scan_dir(name),
                 "{name} resolves via plan_check_run and must share the run-wide snapshot",
             );
         }
         assert!(
-            !uses_shared_scan_dir("Cargo test"),
-            "cargo checks run at cargo_cache_root and must stay out of the shared snapshot",
+            !uses_shared_scan_dir("Semgrep"),
+            "semgrep manages its own worktree (needs a baseline commit) and must stay out",
         );
     }
 
