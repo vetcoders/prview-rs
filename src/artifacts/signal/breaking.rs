@@ -890,6 +890,20 @@ fn gates_the_item(attribute: &str) -> bool {
 /// Delimiters inside a string literal are text, not structure: `#[doc = "a ("]`
 /// closes on its own line. Escapes are honoured so a `\"` does not end the
 /// string early.
+///
+/// ACCEPTED LIMIT (measured, do not re-litigate). A block comment's contents are
+/// NOT resolved here, so `/* ) */` inside a multi-line `#[cfg(…)]` predicate
+/// counts as syntax. Enough stray closers in such a comment would balance the
+/// attribute early, the real continuation would then read as a new item and
+/// clear the pending guard, and differently guarded declarations could pair as
+/// if both were unguarded. Resolving it needs what the other trackers use — a
+/// [`SourceScanner`](crate::rust_source::SourceScanner) per side, reset with
+/// this guard, plus a SECOND view because the guard's identity must keep the
+/// literals a delimiter view drops. That machinery buys nothing measurable: over
+/// the local crates.io registry (59,974 files, 2,025 crates) a block comment
+/// opens inside a `cfg` predicate exactly ZERO times. The 12 nearby hits are the
+/// reverse shape — a whole `#[cfg(…)]` commented OUT, `/* #[cfg(test)]` — which
+/// never enters this counter because the line does not start with `#[`.
 fn delimiter_depth(line: &str, depth: usize) -> usize {
     let mut depth = depth;
     let mut in_string = false;
