@@ -413,8 +413,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/*` inside a string literal stays data: `format!("{}/*.{}", dir, ext)` is a
   glob pattern, and reading it as a comment opener would swallow the rest of the
   hunk — a far more common line in real diffs than a block comment is. A *string*
-  literal spanning several diff lines is still out of scope for this per-line
-  scanner.
+  literal spanning several diff lines is carried the same way a block comment is:
+  the scanner keeps one open across lines, so a brace inside a multi-line
+  template or JSON fixture never reaches a delimiter tracker as syntax. What ends
+  the carrying is the hunk boundary, where the text stops being contiguous.
 - Breaking-change detection pairs duplicate declarations one-to-one. `cfg`-gated
   variants share (file, kind, name), and the pairing search never consumed its
   match, so every removal cancelled against the same unchanged re-add: the
