@@ -26,6 +26,7 @@ pub(super) fn run_sanity_checks(out_dir: &Path) -> Result<SanityResult> {
     let required = [
         "00_summary/RUN.json",
         "00_summary/MANIFEST.json",
+        "00_summary/PROVENANCE.json",
         "00_summary/system_meta.txt",
         "00_summary/git_meta.txt",
     ];
@@ -237,6 +238,7 @@ pub(super) fn expected_outputs_for_timing(label: &str) -> &'static [&'static str
     match label {
         "full.patch" => &["10_diff/full.patch"],
         "00_summary" => &["00_summary/system_meta.txt", "00_summary/git_meta.txt"],
+        "PROVENANCE.json" => &["00_summary/PROVENANCE.json"],
         "20_quality" => &[
             "20_quality/full-checks.log",
             "20_quality/coverage-delta.txt",

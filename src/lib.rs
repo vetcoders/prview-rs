@@ -43,6 +43,10 @@ pub struct App {
     /// (an in-repo `--output-dir` or an untracked check cache) that appears
     /// later in the run.
     pub(crate) worktree_clean_at_start: bool,
+    /// Fingerprint of what was uncommitted at that same moment, from the same
+    /// status read. Recorded in `00_summary/PROVENANCE.json` so a reviewer can
+    /// tell two dirty runs apart instead of only knowing "dirty".
+    pub(crate) worktree_status_digest_at_start: Option<String>,
 }
 
 impl App {
@@ -65,13 +69,14 @@ impl App {
         let repo = git::Repository::open(&config.repo_root)?;
         // Freeze cleanliness now — before any check runs or artifact is written
         // (R4-19).
-        let worktree_clean_at_start = artifacts::capture_worktree_clean(&config.repo_root);
+        let worktree = artifacts::capture_worktree_provenance(&config.repo_root);
 
         Ok(Self {
             config,
             repo,
             start_time: Instant::now(),
-            worktree_clean_at_start,
+            worktree_clean_at_start: worktree.clean,
+            worktree_status_digest_at_start: worktree.status_digest,
         })
     }
 
@@ -197,6 +202,7 @@ impl App {
             run_start: self.start_time,
             skipped_checks,
             worktree_clean: self.worktree_clean_at_start,
+            worktree_status_digest: self.worktree_status_digest_at_start.clone(),
         })?;
 
         // 8. Build report
@@ -466,6 +472,7 @@ impl App {
             run_start: run_started_at,
             skipped_checks: vec![],
             worktree_clean: self.worktree_clean_at_start,
+            worktree_status_digest: self.worktree_status_digest_at_start.clone(),
         })?;
 
         Ok(output::Report {

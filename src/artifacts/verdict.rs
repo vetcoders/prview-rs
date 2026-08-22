@@ -539,7 +539,7 @@ impl CleanComparison {
     /// checks run and before any artifact is written, otherwise an in-repo
     /// `--output-dir` or a check that drops an untracked cache makes a clean
     /// source scan look "dirty" and blocks the pre-existing downgrade. See
-    /// [`capture_worktree_clean`].
+    /// [`capture_worktree_provenance`].
     pub(crate) fn resolve(
         config: &Config,
         resolved_target: &crate::git::ResolvedRef,
@@ -738,30 +738,109 @@ fn check_scans_target_snapshot(check_id: &str) -> bool {
     matches!(check_id, "semgrep_scan" | "ruff" | "eslint" | "stylelint")
 }
 
-/// Capture whether the working tree at `repo_root` is clean, for freezing the
-/// value BEFORE any check runs or artifact is written (R4-19). Cleanliness read
-/// after the run reflects prview/tool-generated files (an in-repo `--output-dir`
-/// or an untracked check cache), not the source state that was scanned — which
-/// would wrongly mark a clean run "dirty" and suppress the pre-existing
-/// downgrade. Errors resolve to clean to keep the permissive default.
-pub(crate) fn capture_worktree_clean(repo_root: &std::path::Path) -> bool {
-    !worktree_has_uncommitted_changes(repo_root)
+/// Working-tree state frozen at the start of a run: whether the tree was clean,
+/// and a fingerprint of exactly what was dirty.
+///
+/// Both halves come from ONE status read, so the pack can never claim a clean
+/// tree next to a digest of uncommitted changes.
+#[derive(Debug, Clone, Default)]
+pub struct WorktreeProvenance {
+    /// No staged, unstaged, or untracked changes at capture time.
+    pub clean: bool,
+    /// `sha256:<hex>` over the canonical `XY <path>` rendering of the status
+    /// (see [`render_status_porcelain`]). `None` when the repository could not
+    /// be inspected — an unknown fingerprint stays visibly unknown.
+    pub status_digest: Option<String>,
 }
 
-/// True when the working tree at `repo_root` has staged, unstaged, or untracked
-/// changes. Errors resolve to `false` (treat as clean) to preserve the existing
-/// downgrade behaviour when the repo cannot be inspected.
-fn worktree_has_uncommitted_changes(repo_root: &std::path::Path) -> bool {
+/// Read the working tree at `repo_root` once and derive both the cleanliness
+/// flag and the status digest.
+///
+/// Called to freeze the value BEFORE any check runs or artifact is written
+/// (R4-19). Cleanliness read after the run reflects prview/tool-generated files
+/// (an in-repo `--output-dir` or an untracked check cache), not the source state
+/// that was scanned — which would wrongly mark a clean run "dirty" and suppress
+/// the pre-existing downgrade. Errors resolve to clean with an unknown digest,
+/// preserving that permissive default.
+pub(crate) fn capture_worktree_provenance(repo_root: &std::path::Path) -> WorktreeProvenance {
+    use sha2::{Digest, Sha256};
+
     let Ok(repo) = git2::Repository::discover(repo_root) else {
-        return false;
+        return WorktreeProvenance {
+            clean: true,
+            status_digest: None,
+        };
     };
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .renames_head_to_index(true);
-    repo.statuses(Some(&mut opts))
-        .map(|statuses| !statuses.is_empty())
-        .unwrap_or(false)
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+        return WorktreeProvenance {
+            clean: true,
+            status_digest: None,
+        };
+    };
+
+    let porcelain = render_status_porcelain(&statuses);
+    let mut hasher = Sha256::new();
+    hasher.update(porcelain.as_bytes());
+
+    WorktreeProvenance {
+        clean: statuses.is_empty(),
+        status_digest: Some(format!("sha256:{:x}", hasher.finalize())),
+    }
+}
+
+/// Render the status entries in the shape of `git status --porcelain`: one
+/// sorted `XY <path>` line per entry, index status first, worktree status
+/// second, untracked entries as `??`.
+///
+/// This is a canonical *rendering*, not a capture of the CLI's stdout — it is a
+/// fingerprint of what was dirty, so it must be stable across git versions and
+/// locales rather than byte-identical to any one `git status` invocation.
+fn render_status_porcelain(statuses: &git2::Statuses<'_>) -> String {
+    use git2::Status;
+
+    let mut lines: Vec<String> = statuses
+        .iter()
+        .map(|entry| {
+            let status = entry.status();
+            let path = entry.path().unwrap_or("<non-utf8>").to_string();
+            if status.contains(Status::WT_NEW) && !status.intersects(Status::INDEX_NEW) {
+                return format!("?? {path}");
+            }
+            let index = if status.contains(Status::INDEX_NEW) {
+                'A'
+            } else if status.contains(Status::INDEX_MODIFIED) {
+                'M'
+            } else if status.contains(Status::INDEX_DELETED) {
+                'D'
+            } else if status.contains(Status::INDEX_RENAMED) {
+                'R'
+            } else if status.contains(Status::INDEX_TYPECHANGE) {
+                'T'
+            } else {
+                ' '
+            };
+            let worktree = if status.contains(Status::WT_NEW) {
+                'A'
+            } else if status.contains(Status::WT_MODIFIED) {
+                'M'
+            } else if status.contains(Status::WT_DELETED) {
+                'D'
+            } else if status.contains(Status::WT_RENAMED) {
+                'R'
+            } else if status.contains(Status::WT_TYPECHANGE) {
+                'T'
+            } else {
+                ' '
+            };
+            format!("{index}{worktree} {path}")
+        })
+        .collect();
+    lines.sort();
+    lines.join("\n")
 }
 
 pub(crate) fn classify_quality_failure(
@@ -1602,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_worktree_clean_reflects_tree_at_capture_time() {
+    fn capture_worktree_provenance_reflects_tree_at_capture_time() {
         // R4-19: cleanliness is read from the live tree, so capturing BEFORE
         // tool output (clean) and AFTER it (an untracked artifact/cache) yield
         // different answers — the reason the value must be frozen up front
@@ -1610,7 +1689,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         git2::Repository::init(tmp.path()).expect("init repo");
         assert!(
-            capture_worktree_clean(tmp.path()),
+            capture_worktree_provenance(tmp.path()).clean,
             "a freshly initialised repo has a clean tree"
         );
 
@@ -1618,7 +1697,7 @@ mod tests {
         // cache) makes a *later* read dirty; the frozen early value must not.
         std::fs::write(tmp.path().join("prview-output.txt"), b"artifact").expect("write");
         assert!(
-            !capture_worktree_clean(tmp.path()),
+            !capture_worktree_provenance(tmp.path()).clean,
             "an untracked file makes a fresh read dirty"
         );
     }

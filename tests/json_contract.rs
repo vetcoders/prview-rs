@@ -537,6 +537,87 @@ fn no_dashboard_flag_skips_dashboard_file_and_surfaces_in_run_json() {
 }
 
 #[test]
+fn generated_pack_carries_pack_level_provenance() {
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+
+    let payload = run_json_quiet(repo, &["feature/json-contract", "main"]);
+    let output_dir = Path::new(
+        payload["output_dir"]
+            .as_str()
+            .expect("output_dir should be a string"),
+    );
+
+    let provenance_path = output_dir.join("00_summary/PROVENANCE.json");
+    let provenance: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&provenance_path).expect("PROVENANCE.json must be written"),
+    )
+    .expect("PROVENANCE.json must be valid JSON");
+
+    assert_eq!(provenance["schema_version"].as_str(), Some("1.0"));
+
+    // The pack-level record must agree with RUN.json about what was analysed —
+    // two truths about the substrate is exactly the failure mode it prevents.
+    let run: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("00_summary/RUN.json")).expect("read RUN.json"),
+    )
+    .expect("parse RUN.json");
+    assert_eq!(provenance["target_sha"], run["refs"]["target_sha"]);
+    assert!(
+        provenance["head_sha"].is_string(),
+        "the locally checked-out commit must be recorded"
+    );
+    assert!(
+        provenance["base_sha"].is_string(),
+        "the diff baseline must be recorded"
+    );
+
+    // The fixture repo is committed clean before the run; the digest is present
+    // either way, so an audit can distinguish two differently-dirty runs.
+    assert_eq!(provenance["worktree"]["clean"].as_bool(), Some(true));
+    assert!(
+        provenance["worktree"]["status_digest"]
+            .as_str()
+            .expect("status digest")
+            .starts_with("sha256:")
+    );
+
+    // One row per check, matching RUN.json's checks[] exactly.
+    let rows = provenance["checks"].as_array().expect("checks array");
+    let run_checks = run["checks"].as_array().expect("RUN.json checks");
+    assert_eq!(rows.len(), run_checks.len());
+    for (row, run_check) in rows.iter().zip(run_checks) {
+        assert_eq!(row["id"], run_check["gate"]);
+        assert_eq!(row["cached"], run_check["cached"]);
+    }
+
+    // Additive, but not invisible: the manifest hashes it and sanity requires it.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("00_summary/MANIFEST.json")).expect("read MANIFEST"),
+    )
+    .expect("parse MANIFEST");
+    assert!(
+        manifest["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .any(|f| f["path"].as_str() == Some("00_summary/PROVENANCE.json")),
+        "PROVENANCE.json must be hashed in MANIFEST.json"
+    );
+
+    let sanity: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("00_summary/SANITY.json")).expect("read SANITY"),
+    )
+    .expect("parse SANITY");
+    assert_eq!(
+        sanity["valid"].as_bool(),
+        Some(true),
+        "sanity must stay valid with the new required file: {}",
+        sanity["failures"]
+    );
+}
+
+#[test]
 fn doctor_surfaces_config_error_cause_instead_of_blanket_message() {
     // Outside a git repo, Config::from_cli fails. Doctor must report the real
     // reason with a colon, not the old blanket "(maybe not in a project?)".

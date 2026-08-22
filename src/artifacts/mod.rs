@@ -132,6 +132,10 @@ pub struct GenerateInput<'a> {
     /// an untracked check cache cannot flip a clean source scan to "dirty" and
     /// suppress the pre-existing downgrade.
     pub worktree_clean: bool,
+    /// Digest of the working-tree status captured in the SAME read as
+    /// `worktree_clean`. Recorded in `00_summary/PROVENANCE.json`; `None` when
+    /// the repository could not be inspected.
+    pub worktree_status_digest: Option<String>,
 }
 
 struct RunJsonInput<'a> {
@@ -244,6 +248,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         run_start,
         skipped_checks,
         worktree_clean,
+        worktree_status_digest,
     } = input;
     let t_total = Instant::now();
     let mut stage_timings = Vec::new();
@@ -612,6 +617,20 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         "REVIEW_SUMMARY + review.html + AI_INDEX",
         t,
     ));
+
+    // 00_summary/PROVENANCE.json — pack-level substrate record. Written before
+    // RUN.json/MANIFEST so the manifest hashes it like any other pack file.
+    let t = Instant::now();
+    generate_provenance_json(ProvenanceJsonInput {
+        dir: &summary_dir,
+        repo: &repo,
+        checks: &all_checks,
+        resolved_target,
+        resolved_bases,
+        worktree_clean,
+        worktree_status_digest: worktree_status_digest.as_deref(),
+    })?;
+    stage_timings.push(finish_timing(emit_human_stdout, "PROVENANCE.json", t));
 
     // 00_summary/RUN.json — after all generators complete for accurate timing
     let t = Instant::now();
@@ -1076,6 +1095,79 @@ fn generate_heuristics_gate_result(
     };
 
     fs::write(dir.join("heuristics_loctree.log"), log)?;
+    Ok(())
+}
+
+struct ProvenanceJsonInput<'a> {
+    dir: &'a Path,
+    repo: &'a Repository,
+    checks: &'a [CheckResult],
+    resolved_target: &'a ResolvedRef,
+    resolved_bases: &'a [ResolvedRef],
+    worktree_clean: bool,
+    worktree_status_digest: Option<&'a str>,
+}
+
+/// PROVENANCE.json — pack-level record of WHAT was analysed.
+///
+/// Per-check provenance already lives in `20_quality/<gate>.result.json` and
+/// `RUN.json`, but a reviewer holding only the pack still had to reconstruct the
+/// run's substrate from those rows. This file states it once: the commits
+/// involved, the state of the local working tree at the moment the run started,
+/// and one row per check naming the tree that check actually read.
+///
+/// Purely additive: no existing pack file changes shape because of it.
+fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
+    use serde_json::json;
+    let ProvenanceJsonInput {
+        dir,
+        repo,
+        checks,
+        resolved_target,
+        resolved_bases,
+        worktree_clean,
+        worktree_status_digest,
+    } = input;
+
+    let check_rows: Vec<serde_json::Value> = checks
+        .iter()
+        .map(|c| {
+            let prov = c.provenance.as_ref();
+            json!({
+                "id": check_id_from_name(&c.name),
+                "cwd": prov.map(|p| p.cwd.as_str()),
+                "target_sha": prov.and_then(|p| p.target_sha.as_deref()),
+                "tree_state": prov.and_then(|p| p.tree_state).map(|s| s.as_str()),
+                "started_at": prov.map(|p| p.started_at.as_str()),
+                // A replayed cache hit carries the ORIGINAL execution's
+                // provenance; this flag is what separates it from a fresh run.
+                "cached": c.cached,
+            })
+        })
+        .collect();
+
+    let provenance = json!({
+        "schema_version": "1.0",
+        "generated_at": chrono::Local::now().to_rfc3339(),
+        // Commit whose tree the pack judges.
+        "target_sha": resolved_target.commit_id,
+        "base_sha": resolved_bases.first().map(|b| b.commit_id.as_str()),
+        // Commit checked out locally. Equal to target_sha for an ordinary local
+        // review; different when a fetched ref is analysed (`--pr`/`--remote`).
+        "head_sha": repo.head_commit_id().ok(),
+        "worktree": {
+            // Frozen before checks ran and before any artifact was written
+            // (R4-19), so tool output cannot flip a clean scan to "dirty".
+            "clean": worktree_clean,
+            "status_digest": worktree_status_digest,
+        },
+        "checks": check_rows,
+    });
+
+    fs::write(
+        dir.join("PROVENANCE.json"),
+        serde_json::to_string_pretty(&provenance)?,
+    )?;
     Ok(())
 }
 
