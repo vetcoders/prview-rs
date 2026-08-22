@@ -72,6 +72,15 @@ const PUB_SYMBOL_TYPES: &[(&str, &str)] = &[
     ("pub static ", "static"),
 ];
 
+/// Symbol-type label of a `pub <kw> ` declaration line (mirrors
+/// `PUB_SYMBOL_TYPES`). Distinguishes namespaces that may share an identifier.
+fn symbol_kind(line: &str) -> Option<&'static str> {
+    PUB_SYMBOL_TYPES
+        .iter()
+        .find(|(prefix, _)| line.starts_with(prefix))
+        .map(|(_, symbol_type)| *symbol_type)
+}
+
 /// Extract the identifier following a `pub <kw> ` prefix (best-effort, mirrors
 /// `PUB_SYMBOL_TYPES`). Returns the symbol name for move-pairing.
 fn symbol_name(line: &str) -> Option<String> {
@@ -89,17 +98,135 @@ fn symbol_name(line: &str) -> Option<String> {
     None
 }
 
-/// Classify an added NON-function public declaration as `(symbol_type, name)`.
+/// Classify a public declaration line as `(symbol_type, name)`.
 ///
-/// `pub fn` is excluded on purpose: added functions go through the multi-line
-/// signature accumulator instead, which reconstructs the full signature before
-/// recording it.
-fn classify_added_pub_symbol(line: &str) -> Option<(&'static str, String)> {
+/// Covers every kind in `PUB_SYMBOL_TYPES`, `pub fn` included: all of them go
+/// through the same multi-line accumulator, so the recorded text is the full
+/// declaration rather than its truncated opening line.
+fn classify_pub_declaration(line: &str) -> Option<(&'static str, String)> {
     PUB_SYMBOL_TYPES
         .iter()
-        .filter(|(prefix, _)| *prefix != "pub fn ")
         .find(|(prefix, _)| line.starts_with(prefix))
         .and_then(|(_, symbol_type)| symbol_name(line).map(|name| (*symbol_type, name)))
+}
+
+/// Which side of the unified diff a declaration came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffSide {
+    Removed,
+    Added,
+}
+
+/// A public declaration collected from one side of the diff.
+#[derive(Debug)]
+struct SymbolDecl {
+    file: String,
+    symbol_type: String,
+    name: String,
+    /// Full declaration text — continuation lines joined, not just the opener.
+    text: String,
+    /// Hunk-local inline-module path (`""` when the diff never showed one).
+    scope: String,
+    side: DiffSide,
+    /// Continuation lines absorbed so far, capped by
+    /// [`MAX_DECL_CONTINUATION_LINES`].
+    continuation_lines: usize,
+}
+
+/// Continuation lines a single declaration may absorb before it is finalized
+/// as-is. Bounds both runaway accumulation (a `Lazy::new(|| { .. })` static
+/// body) and the width of a `BREAKING_CHANGES.md` table cell.
+const MAX_DECL_CONTINUATION_LINES: usize = 8;
+
+/// Inline-module nesting for ONE side of a unified diff.
+///
+/// Context lines feed both sides, `-` lines only the "before" side and `+` lines
+/// only the "after" side, so a rename or a moved block cannot unbalance the
+/// tracker. State is hunk-local: it resets at every `@@` header because hunks
+/// are not contiguous, and an unseen module opener simply leaves the scope
+/// unknown (`""`) rather than inventing one.
+#[derive(Default)]
+struct ModScope {
+    /// `(module name, brace depth the module was opened at)`.
+    stack: Vec<(String, i32)>,
+    depth: i32,
+}
+
+impl ModScope {
+    fn reset(&mut self) {
+        self.stack.clear();
+        self.depth = 0;
+    }
+
+    fn feed(&mut self, payload: &str) {
+        let opened = mod_opening_name(payload.trim());
+        let start_depth = self.depth;
+        for ch in payload.chars() {
+            match ch {
+                '{' => self.depth += 1,
+                '}' => self.depth -= 1,
+                _ => {}
+            }
+        }
+        if let Some(name) = opened
+            && self.depth > start_depth
+        {
+            self.stack.push((name, start_depth));
+        }
+        while let Some((_, opened_at)) = self.stack.last() {
+            if self.depth <= *opened_at {
+                self.stack.pop();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn path(&self) -> String {
+        self.stack
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join("::")
+    }
+}
+
+/// Name of the inline module opened by `mod name {` / `pub mod name {` /
+/// `pub(crate) mod name {`, if this line opens one.
+fn mod_opening_name(trimmed: &str) -> Option<String> {
+    if !trimmed.contains('{') {
+        return None;
+    }
+    let mut rest = trimmed;
+    if let Some(after_pub) = rest.strip_prefix("pub") {
+        match after_pub.chars().next() {
+            Some('(') => rest = &after_pub[after_pub.find(')')? + 1..],
+            Some(c) if c.is_whitespace() => rest = after_pub,
+            _ => return None,
+        }
+    }
+    let rest = rest.trim_start().strip_prefix("mod")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let name: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// May a removal in `removed_scope` and an addition in `added_scope` describe
+/// the same declaration site?
+///
+/// Scopes are hunk-local and often unknown, so an unknown scope stays
+/// compatible with anything — that keeps today's pairing everywhere the diff
+/// does not show a module boundary. Two *known and different* module paths mean
+/// two different namespaces: `a::Config` disappearing while `b::Config` appears
+/// is a real removal, not a no-op re-add.
+fn scopes_may_pair(removed_scope: &str, added_scope: &str) -> bool {
+    removed_scope.is_empty() || added_scope.is_empty() || removed_scope == added_scope
 }
 
 /// Collect added public symbols across a patch as `(file, type, name)`.
@@ -222,19 +349,29 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
 
     // Track removed/added public symbol declarations (ALL kinds in
     // `PUB_SYMBOL_TYPES`, not just `pub fn`) for remove+re-add pairing and
-    // signature change detection: (file, symbol_type, name, full_line).
-    let mut removed_syms: Vec<(String, String, String, String)> = Vec::new();
-    let mut added_syms: Vec<(String, String, String, String)> = Vec::new();
+    // signature change detection.
+    let mut removed_syms: Vec<SymbolDecl> = Vec::new();
+    let mut added_syms: Vec<SymbolDecl> = Vec::new();
 
-    // When an added `pub fn` signature spans multiple diff lines, accumulate the
-    // continuation lines so the "After" is the FULL signature, not just the
-    // truncated opening `pub fn name(` line (BUG-4 / TOOLING-15).
-    // (file, name, accumulated signature so far)
-    let mut pending_added_fn: Option<(String, String, String)> = None;
+    // A public declaration may span several diff lines — `pub fn name(` with the
+    // parameters below it (BUG-4 / TOOLING-15), but equally `pub struct Name<`
+    // with its bounds below it. Accumulate continuation lines on BOTH sides so
+    // remove+re-add pairing compares full declarations: a change confined to a
+    // continuation line used to hide behind an identical opening line.
+    let mut pending_removed: Option<SymbolDecl> = None;
+    let mut pending_added: Option<SymbolDecl> = None;
+
+    // Inline-module nesting, tracked per diff side (see `ModScope`).
+    let mut before_scope = ModScope::default();
+    let mut after_scope = ModScope::default();
 
     for line in patch.lines() {
         // Track current file from diff headers
         if let Some(rest) = line.strip_prefix("diff --git a/") {
+            finalize_decl(&mut pending_removed, &mut removed_syms, &mut findings);
+            finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
+            before_scope.reset();
+            after_scope.reset();
             if let Some(space_idx) = rest.find(" b/") {
                 current_file = rest[space_idx + 3..].to_string();
                 should_scan_current_file = should_scan_for_breaking_changes(&current_file);
@@ -246,40 +383,44 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             continue;
         }
 
-        // A pending multi-line signature is finalized by any non-added line.
-        let is_added_line = line.starts_with('+') && !line.starts_with("+++");
-        if !is_added_line && let Some((f, n, sig)) = pending_added_fn.take() {
-            added_syms.push((f, "function".to_string(), n, sig));
+        // Hunks are not contiguous: a boundary ends any pending declaration and
+        // invalidates the brace depth both scope trackers were carrying.
+        if line.starts_with("@@") {
+            finalize_decl(&mut pending_removed, &mut removed_syms, &mut findings);
+            finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
+            before_scope.reset();
+            after_scope.reset();
+            continue;
         }
 
+        let removed_content = if line.starts_with("---") {
+            None
+        } else {
+            line.strip_prefix('-')
+        };
+        let added_content = if line.starts_with("+++") {
+            None
+        } else {
+            line.strip_prefix('+')
+        };
+
         // Removed lines
-        if let Some(content) = line.strip_prefix('-') {
+        if let Some(content) = removed_content {
+            finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
             let trimmed = content.trim();
 
-            for (pattern, symbol_type) in PUB_SYMBOL_TYPES {
-                if trimmed.starts_with(pattern) {
-                    // Record EVERY public symbol kind for remove+re-add pairing,
-                    // not only `pub fn` — a non-fn declaration re-emitted
-                    // unchanged by the diff used to leak a phantom removal.
-                    if let Some(name) = symbol_name(trimmed) {
-                        removed_syms.push((
-                            current_file.clone(),
-                            (*symbol_type).to_string(),
-                            name,
-                            trimmed.to_string(),
-                        ));
-                    }
-                    findings.push(BreakingFinding {
-                        file: current_file.clone(),
-                        kind: BreakingKind::RemovedSymbol {
-                            symbol_type: symbol_type.to_string(),
-                        },
-                        line: trimmed.to_string(),
-                        risk_level: compute_breaking_risk(&current_file),
-                    });
-                    break;
-                }
-            }
+            // Record EVERY public symbol kind for remove+re-add pairing, not
+            // only `pub fn` — a non-fn declaration re-emitted unchanged by the
+            // diff used to leak a phantom removal.
+            accumulate_decl(
+                &mut pending_removed,
+                &mut removed_syms,
+                &mut findings,
+                trimmed,
+                &current_file,
+                &before_scope,
+                DiffSide::Removed,
+            );
 
             // JS/TS exports
             if trimmed.starts_with("export ") || trimmed.starts_with("export default") {
@@ -292,49 +433,29 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                     risk_level: compute_breaking_risk(&current_file),
                 });
             }
+
+            before_scope.feed(content);
+            continue;
         }
 
-        // Added lines — track public functions for signature comparison + env requirements
-        if let Some(content) = line.strip_prefix('+')
-            && !line.starts_with("+++")
-        {
+        // A pending declaration is finalized by any line from the other side.
+        finalize_decl(&mut pending_removed, &mut removed_syms, &mut findings);
+
+        // Added lines — track public declarations for signature comparison + env requirements
+        if let Some(content) = added_content {
             let trimmed = content.trim();
 
-            // Continuation of a multi-line signature already in progress.
-            if let Some((_, _, sig)) = pending_added_fn.as_mut() {
-                if !sig.ends_with('(') && !trimmed.is_empty() {
-                    sig.push(' ');
-                }
-                sig.push_str(trimmed);
-                if signature_complete(sig)
-                    && let Some((f, n, s)) = pending_added_fn.take()
-                {
-                    added_syms.push((f, "function".to_string(), n, s));
-                }
-            } else if trimmed.starts_with("pub fn ")
-                && let Some(name) = extract_fn_name(trimmed)
-            {
-                if signature_complete(trimmed) {
-                    added_syms.push((
-                        current_file.clone(),
-                        "function".to_string(),
-                        name,
-                        trimmed.to_string(),
-                    ));
-                } else {
-                    // Signature spans multiple lines — start accumulating.
-                    pending_added_fn = Some((current_file.clone(), name, trimmed.to_string()));
-                }
-            } else if let Some((symbol_type, name)) = classify_added_pub_symbol(trimmed) {
-                // Non-fn public declarations are single-line: record them
-                // directly so the pairing below can cancel a matching removal.
-                added_syms.push((
-                    current_file.clone(),
-                    symbol_type.to_string(),
-                    name,
-                    trimmed.to_string(),
-                ));
-            }
+            accumulate_decl(
+                &mut pending_added,
+                &mut added_syms,
+                &mut findings,
+                trimmed,
+                &current_file,
+                &after_scope,
+                DiffSide::Added,
+            );
+
+            after_scope.feed(content);
 
             // New env requirements
             if trimmed.contains("REQUIRED_ENV") || trimmed.contains(".env") {
@@ -371,47 +492,61 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                     }
                 }
             }
+            continue;
         }
+
+        // Context (or non-hunk) line: it belongs to both sides, and it ends any
+        // declaration that was still accumulating on the added side.
+        finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
+        let content = line.strip_prefix(' ').unwrap_or(line);
+        before_scope.feed(content);
+        after_scope.feed(content);
     }
 
-    // Finalize a signature still being accumulated at end of patch.
-    if let Some((f, n, s)) = pending_added_fn.take() {
-        added_syms.push((f, "function".to_string(), n, s));
-    }
+    // Finalize declarations still being accumulated at end of patch.
+    finalize_decl(&mut pending_removed, &mut removed_syms, &mut findings);
+    finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
 
     // Pair removed + added public symbols of the SAME kind and name in the same
     // file — every kind in `PUB_SYMBOL_TYPES`, not just `pub fn` (P1-09/10):
-    //   - identical declaration line -> no-op remove+readd, drop the removal
+    //   - identical declaration -> no-op remove+readd, drop the removal
     //     (e.g. a fn body rewritten to delegate, or a struct whose fields
     //     changed below an unchanged `pub struct` line, emitted as -/+ by the
     //     diff)
-    //   - different declaration line -> a signature change, not a removal
-    for (r_file, r_type, r_name, r_line) in &removed_syms {
-        let Some((_, _, _, a_line)) = added_syms.iter().find(|(a_file, a_type, a_name, _)| {
-            a_file == r_file && a_type == r_type && a_name == r_name
+    //   - different declaration -> a signature change, not a removal
+    //
+    // Pairing additionally requires compatible inline-module scopes, so a
+    // removal in one module is not cancelled by an unrelated same-named
+    // declaration added in another module of the same file.
+    for removed in &removed_syms {
+        let Some(added) = added_syms.iter().find(|added| {
+            added.file == removed.file
+                && added.symbol_type == removed.symbol_type
+                && added.name == removed.name
+                && scopes_may_pair(&removed.scope, &added.scope)
         }) else {
             continue;
         };
 
         // Either way the removed-symbol finding is a false positive: drop it.
         findings.retain(|f| {
-            !(f.file == *r_file
+            !(f.file == removed.file
                 && matches!(
                     &f.kind,
-                    BreakingKind::RemovedSymbol { symbol_type } if symbol_type == r_type
+                    BreakingKind::RemovedSymbol { symbol_type } if *symbol_type == removed.symbol_type
                 )
-                && f.line == *r_line)
+                && f.line == removed.text)
         });
 
-        if a_line != r_line {
+        if added.text != removed.text {
             findings.push(BreakingFinding {
-                file: r_file.clone(),
+                file: removed.file.clone(),
                 kind: BreakingKind::ChangedSignature {
-                    before: r_line.clone(),
-                    after: a_line.clone(),
+                    before: removed.text.clone(),
+                    after: added.text.clone(),
                 },
                 line: String::new(),
-                risk_level: compute_breaking_risk(r_file),
+                risk_level: compute_breaking_risk(&removed.file),
             });
         }
     }
@@ -419,19 +554,97 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     findings
 }
 
+/// Start or continue accumulating a public declaration on one diff side.
+///
+/// A declaration in progress absorbs `trimmed` as a continuation line; otherwise
+/// `trimmed` may open a new one. Either way the declaration is emitted as soon
+/// as it is complete (or once it has absorbed [`MAX_DECL_CONTINUATION_LINES`]).
+fn accumulate_decl(
+    pending: &mut Option<SymbolDecl>,
+    collected: &mut Vec<SymbolDecl>,
+    findings: &mut Vec<BreakingFinding>,
+    trimmed: &str,
+    file: &str,
+    scope: &ModScope,
+    side: DiffSide,
+) {
+    if let Some(decl) = pending.as_mut() {
+        if !decl.text.ends_with('(') && !trimmed.is_empty() {
+            decl.text.push(' ');
+        }
+        decl.text.push_str(trimmed);
+        decl.continuation_lines += 1;
+        if declaration_complete(&decl.text)
+            || decl.continuation_lines >= MAX_DECL_CONTINUATION_LINES
+        {
+            finalize_decl(pending, collected, findings);
+        }
+        return;
+    }
+
+    let Some((symbol_type, name)) = classify_pub_declaration(trimmed) else {
+        return;
+    };
+    let decl = SymbolDecl {
+        file: file.to_string(),
+        symbol_type: symbol_type.to_string(),
+        name,
+        text: trimmed.to_string(),
+        scope: scope.path(),
+        side,
+        continuation_lines: 0,
+    };
+    if declaration_complete(trimmed) {
+        emit_decl(decl, collected, findings);
+    } else {
+        *pending = Some(decl);
+    }
+}
+
+/// Emit a declaration that is no longer accumulating, if any.
+fn finalize_decl(
+    pending: &mut Option<SymbolDecl>,
+    collected: &mut Vec<SymbolDecl>,
+    findings: &mut Vec<BreakingFinding>,
+) {
+    if let Some(decl) = pending.take() {
+        emit_decl(decl, collected, findings);
+    }
+}
+
+/// Record a finished declaration; removals also become a `RemovedSymbol`
+/// finding, which the pairing pass may later drop or upgrade.
+fn emit_decl(
+    decl: SymbolDecl,
+    collected: &mut Vec<SymbolDecl>,
+    findings: &mut Vec<BreakingFinding>,
+) {
+    if decl.side == DiffSide::Removed {
+        findings.push(BreakingFinding {
+            file: decl.file.clone(),
+            kind: BreakingKind::RemovedSymbol {
+                symbol_type: decl.symbol_type.clone(),
+            },
+            line: decl.text.clone(),
+            risk_level: compute_breaking_risk(&decl.file),
+        });
+    }
+    collected.push(decl);
+}
+
 fn should_scan_for_breaking_changes(path: &str) -> bool {
     matches!(classify_review_file(path), ReviewFileCategory::Code)
 }
 
-/// Has this (possibly partial) `pub fn` signature reached its end?
+/// Has this (possibly partial) public declaration reached its end?
 ///
-/// A signature is complete once its parameter parens are balanced and it has
-/// reached the body opener `{` or a `;` (trait method / declaration). Used to
-/// decide whether to keep accumulating continuation lines for the "After"
-/// reconstruction (BUG-4 / TOOLING-15).
-fn signature_complete(sig: &str) -> bool {
+/// A declaration is complete once its parens are balanced and it has reached the
+/// body opener `{` or a `;` (trait method, type alias, const, static). Used to
+/// decide whether to keep accumulating continuation lines so both "Before" and
+/// "After" are full declarations (BUG-4 / TOOLING-15).
+fn declaration_complete(decl: &str) -> bool {
     let mut depth: i32 = 0;
-    for ch in sig.chars() {
+    for ch in decl.chars() {
         match ch {
             '(' => depth += 1,
             ')' => depth -= 1,
@@ -452,6 +665,10 @@ fn extract_fn_name(line: &str) -> Option<String> {
     let name = name.split('<').next().unwrap_or(name);
     Some(name.trim().to_string())
 }
+
+/// Grouping identity of a `ChangedSignature` row: `(file, symbol kind, name)`.
+/// The kind separates namespaces that may legally share an identifier.
+type ChangedSignatureKey = (String, &'static str, String);
 
 /// Format breaking changes as markdown.
 fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
@@ -519,10 +736,13 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
         md.push_str("|------|--------|-------|\n");
         // Collapse feature-gated duplicates: the same logical signature change
         // is often emitted once per `#[cfg(feature = ...)]` variant. Group by
-        // (file, fn name), render one row, and note the variant count
-        // (BUG-4 / TOOLING-15).
-        let mut order: Vec<(String, String)> = Vec::new();
-        let mut groups: std::collections::HashMap<(String, String), Vec<(&String, &String)>> =
+        // (file, symbol kind, name), render one row, and note the variant count
+        // (BUG-4 / TOOLING-15). The kind is part of the key because non-fn
+        // declarations also land here: `pub struct Limit` and `pub const Limit`
+        // live in different namespaces, so sharing an identifier must not
+        // collapse them into a single row.
+        let mut order: Vec<ChangedSignatureKey> = Vec::new();
+        let mut groups: std::collections::HashMap<ChangedSignatureKey, Vec<(&String, &String)>> =
             std::collections::HashMap::new();
         for f in &changed {
             if let BreakingKind::ChangedSignature { before, after } = &f.kind {
@@ -530,7 +750,10 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
                     .or_else(|| extract_fn_name(after))
                     .or_else(|| symbol_name(before))
                     .unwrap_or_else(|| before.clone());
-                let key = (f.file.clone(), name);
+                let kind = symbol_kind(before)
+                    .or_else(|| symbol_kind(after))
+                    .unwrap_or("");
+                let key = (f.file.clone(), kind, name);
                 if !groups.contains_key(&key) {
                     order.push(key.clone());
                 }
@@ -1046,6 +1269,158 @@ mod tests {
         assert!(
             md.contains("variant"),
             "collapsed row should note the variant count, got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn changed_signatures_of_different_kinds_do_not_collapse() {
+        // Once non-fn declarations produce ChangedSignature findings, a name can
+        // repeat across namespaces in one file (`pub struct Limit` +
+        // `pub const Limit`). Grouping by (file, name) alone rendered one of
+        // them as a "feature-gated variant" of the other and dropped its row.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub struct Limit {",
+                "+pub struct Limit<T> {",
+                "-pub const Limit: usize = 8;",
+                "+pub const Limit: usize = 16;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        let md = format_breaking_changes(&findings);
+
+        assert!(
+            md.contains("pub struct Limit<T> {"),
+            "struct change must have its own row, got:\n{md}"
+        );
+        assert!(
+            md.contains("pub const Limit: usize = 16;"),
+            "const change must not be collapsed into the struct row, got:\n{md}"
+        );
+        assert!(
+            !md.contains("variant"),
+            "two different symbol kinds are not feature-gated variants, got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn same_name_in_different_inline_modules_is_not_a_no_op_pair() {
+        // `a::Config` is deleted while a same-named `b::Config` is added in the
+        // same file. Pairing on (file, kind, name) alone cancelled a genuine
+        // removal: the `a::Config` path is gone for every downstream consumer.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " pub mod a {",
+                "-    pub struct Config {",
+                "-        pub x: u32,",
+                "-    }",
+                " }",
+                " pub mod b {",
+                "+    pub struct Config {",
+                "+        pub x: u32,",
+                "+    }",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "removal from mod a must survive an unrelated add in mod b, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn same_name_in_the_same_inline_module_still_pairs() {
+        // Guard against the module tracker over-reaching: a remove+re-add inside
+        // ONE module is still the phantom-removal case it always was.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " pub mod a {",
+                "-    pub struct Config {",
+                "-        pub x: u32,",
+                "+    pub struct Config {",
+                "+        pub x: u64,",
+                "     }",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "same-module remove+re-add must stay a no-op, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn multiline_non_fn_declaration_change_is_not_swallowed() {
+        // Pairing compared only the opening line, so a bound change on a
+        // continuation line vanished behind an identical `pub struct Config<`.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub struct Config<",
+                "-    T: Clone,",
+                "-> {",
+                "+pub struct Config<",
+                "+    T: Clone + Send,",
+                "+> {",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::ChangedSignature { before, after }
+                    if before.contains("T: Clone,") && after.contains("T: Clone + Send,")
+            )),
+            "a changed bound on a continuation line must surface, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            removed_symbol_types(&findings).is_empty(),
+            "the change must not also report a removal, got: {:?}",
+            removed_symbol_types(&findings)
+        );
+    }
+
+    #[test]
+    fn multiline_non_fn_declaration_reemitted_unchanged_is_not_breaking() {
+        // Same accumulation, opposite direction: an unchanged multi-line
+        // declaration re-emitted by the diff stays a no-op.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub struct Config<",
+                "-    T: Clone,",
+                "-> {",
+                "-    old_detail: u8,",
+                "+pub struct Config<",
+                "+    T: Clone,",
+                "+> {",
+                "+    new_detail: u8,",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "identical multi-line remove+re-add must produce no finding, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }
 

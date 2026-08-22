@@ -44,7 +44,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   suspects). Test context now opens at its marker and closes when the braces
   opened after it balance out, commented-out markers no longer open it, and any
   ambiguity resolves toward production — a false positive costs a reviewer a
-  glance, a false negative hides a real regression.
+  glance, a false negative hides a real regression. The scope is read from the
+  patch's **target state** only: a `#[cfg(test)]` that the patch *deletes* no
+  longer opens test context over the added production code, and a renamed test
+  function no longer leaves the scope permanently open (its removed and added
+  declaration lines each contributed an opening brace while sharing one closing
+  brace). A hit is now also paired only with a nearby loop in the *same*
+  context, so a production statement cannot borrow a loop from an adjacent test
+  module — or the reverse.
+- Breaking-change detection no longer loses a removal to a same-named symbol in
+  another inline module. `pub mod a { pub struct Config }` deleted while
+  `pub mod b { pub struct Config }` is added in the same file was cancelled as a
+  no-op remove+re-add; the pairing now also requires compatible inline-module
+  scopes (tracked per diff side, hunk-local — an unseen `mod` opener leaves the
+  scope unknown and pairs as before).
+- Multi-line public declarations are compared in full. `pub struct Config<` with
+  a changed bound on the next line used to hide behind its identical opening
+  line, because only that line was compared. Continuation lines are now
+  accumulated on both diff sides — for every symbol kind, not just `pub fn` —
+  up to 8 lines, and `BREAKING_CHANGES.md` shows the full declaration.
+- `BREAKING_CHANGES.md` no longer collapses two different symbol kinds into one
+  row. Changed signatures were grouped by (file, name); now that non-fn
+  declarations also produce signature changes, a `pub struct Limit` and a
+  `pub const Limit` in one file were rendered as one row plus a bogus
+  "feature-gated variant" note. The grouping key now carries the symbol kind.
 - Coverage no longer reports an unmeasured scan as perfect. A diff with zero
   changed source files produced `0/0 (100%)` in `AI_INDEX.md`,
   `coverage-delta.txt`, and the dashboard; it now reads `not measured`, and the

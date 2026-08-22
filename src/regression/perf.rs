@@ -13,7 +13,11 @@
 //! shares a hunk with a trailing test module still counts as a production
 //! signal. When the context of a hit is ambiguous it is classified as
 //! production — a false positive costs a reviewer a glance, a false negative
-//! hides a real regression.
+//! hides a real regression. The context is read from the patch's **target
+//! state** only (added and context lines); removed lines describe what the
+//! patch replaces and never open or close a scope. A hit is paired only with a
+//! nearby loop in the *same* context, so a production statement cannot borrow a
+//! loop from an adjacent test module (or the reverse).
 
 use super::RegressionContext;
 use regex::Regex;
@@ -283,12 +287,21 @@ impl ProximityHits {
 /// `test_context[i]` describes `added_lines[i]`. A hit counts as test context
 /// only when **its own line** sits in test context; anything else — including a
 /// missing or unknown classification — counts as production.
+///
+/// The nearby loop must share the hit's context. A production statement sitting
+/// just above a trailing `#[cfg(test)]` module is not "in" the loop of a test
+/// that happens to be within [`PROXIMITY_WINDOW`] lines of it — pairing across
+/// the boundary invents a loop that exists in neither context. Unknown context
+/// still resolves to production on both sides, so ambiguity keeps pairing.
 fn check_proximity(added_lines: &[&str], test_context: &[bool]) -> ProximityHits {
-    let loop_lines: Vec<usize> = added_lines
+    // Missing context data means "unknown" — treat it as production.
+    let context_of = |i: usize| test_context.get(i).copied().unwrap_or(false);
+
+    let loop_lines: Vec<(usize, bool)> = added_lines
         .iter()
         .enumerate()
         .filter(|(_, l)| is_loop_line(l))
-        .map(|(i, _)| i)
+        .map(|(i, _)| (i, context_of(i)))
         .collect();
 
     let mut hits = ProximityHits::default();
@@ -303,15 +316,14 @@ fn check_proximity(added_lines: &[&str], test_context: &[bool]) -> ProximityHits
             continue;
         }
 
+        let in_test = context_of(i);
+
         let near_loop = loop_lines
             .iter()
-            .any(|&l| i.abs_diff(l) <= PROXIMITY_WINDOW);
+            .any(|&(l, loop_in_test)| loop_in_test == in_test && i.abs_diff(l) <= PROXIMITY_WINDOW);
         if !near_loop {
             continue;
         }
-
-        // Missing context data means "unknown" — treat it as production.
-        let in_test = test_context.get(i).copied().unwrap_or(false);
 
         if is_query {
             hits.query_prod |= !in_test;
@@ -358,6 +370,13 @@ fn is_diff_metadata_line(line: &str) -> bool {
 ///
 /// Ambiguity resolves toward production: non-Rust files, unrecognised braces
 /// and commented-out markers all leave the line classified as production.
+///
+/// Only the **target state** shapes the scope: added (`+`) and context (` `)
+/// lines. Removed (`-`) lines describe the state being replaced and are ignored
+/// wholesale — both for markers and for brace tracking. A `#[cfg(test)]` deleted
+/// by the patch does not exist afterwards, and a renamed declaration whose old
+/// and new lines both open a brace would otherwise leave the test scope
+/// permanently open and mute every production hit below it.
 fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
     let added_lines = hunk
         .lines()
@@ -377,10 +396,14 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
             continue;
         }
 
+        // Removed lines are not part of the state this patch produces.
+        if line.starts_with('-') {
+            continue;
+        }
+
         let is_added = line.starts_with('+');
         let payload = line
             .strip_prefix('+')
-            .or_else(|| line.strip_prefix('-'))
             .or_else(|| line.strip_prefix(' '))
             .unwrap_or(line);
         let trimmed = payload.trim();
@@ -1030,6 +1053,149 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         assert_eq!(result.query_in_loop_count, 0);
         assert_eq!(result.skipped_test_hits_count, 1);
         assert!(result.suspected_files.is_empty());
+    }
+
+    // ---- target-state only: removed lines never shape the scope ----
+
+    #[test]
+    fn test_removed_test_marker_does_not_open_test_context() {
+        // The diff DELETES `#[cfg(test)]`, promoting the module to production.
+        // A marker that exists only on a removed line describes the *before*
+        // state and must not classify added lines as test context.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,6 +1,10 @@
+-#[cfg(test)]
+ pub mod helpers {
++    pub fn verify_all(candidates: &[Candidate]) {
++        for candidate in candidates.iter() {
++            let stored = db.query("SELECT hash FROM users WHERE id = ?");
++        }
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a removed #[cfg(test)] marker must not mute the added production hit"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_removed_declaration_does_not_unbalance_test_scope() {
+        // Renaming a fn inside `mod tests` emits `-fn old_name() {` and
+        // `+fn new_name() {`. Counting braces on BOTH sides leaves one extra
+        // opening brace, so the test scope never closes and every production
+        // hit later in the hunk was muted.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,10 +1,14 @@
+ #[cfg(test)]
+ mod tests {
+-    fn old_name() {
++    fn new_name() {
+         assert!(true);
+     }
+ }
++
++pub fn verify_all(candidates: &[Candidate]) {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT hash FROM users WHERE id = ?");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a renamed test fn must not leave the test scope open over prod code"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    // ---- proximity pairing respects the context of the loop ----
+
+    #[test]
+    fn test_prod_hit_is_not_paired_with_a_loop_inside_a_test_module() {
+        // The only loop in range lives in the trailing test module; pairing it
+        // with a production statement invented a query-in-loop that does not
+        // exist in either context.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
++let stored = db.query("SELECT hash FROM users WHERE id = ?");
++
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn roundtrip() {
++        for candidate in candidates.iter() {
++            assert!(candidate.ok);
++        }
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a production statement must not borrow a loop from the test module"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files.is_empty());
+    }
+
+    #[test]
+    fn test_test_hit_is_not_paired_with_a_production_loop() {
+        // Mirror direction: a `collect()` inside the test module has no test
+        // loop nearby, so the production loop above must not manufacture a
+        // test-context suspect either.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
++for candidate in candidates.iter() {
++    verify(candidate);
++}
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn roundtrip() {
++        let ids: Vec<_> = candidate.ids.iter().collect();
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.perf_regression_suspected);
+        assert_eq!(result.clone_collect_in_loop_count, 0);
+        assert!(
+            result.suspected_files.is_empty(),
+            "a test-context hit must not borrow a production loop, got: {:?}",
+            result.suspected_files
+        );
+        assert_eq!(result.skipped_test_hits_count, 0);
     }
 
     #[test]
