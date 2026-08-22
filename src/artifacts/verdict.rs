@@ -504,17 +504,20 @@ pub(crate) fn check_id_is_baseline_signal(check_id: &str) -> bool {
 /// current state, so there is no diff baseline a finding can "predate": the
 /// downgrade must never fire regardless of tree shape (R3-14).
 ///
-/// On any inability to inspect the repo we default to the permissive "clean local
-/// checkout" shape, preserving the historical downgrade behaviour rather than
-/// distrusting a repo we cannot read.
+/// On any inability to inspect the repo we default to the permissive "local
+/// checkout is the target" shape, preserving the historical downgrade behaviour
+/// rather than distrusting a repo we cannot read. That default does NOT extend to
+/// cleanliness: a tree whose status could not be read is unknown, not clean, and
+/// an unknown tree never unlocks the downgrade.
 #[derive(Debug, Clone)]
 pub(crate) struct CleanComparison {
     /// `head == target`: the local working tree IS the analysed target, so every
     /// check scanned the target directly.
     target_is_checkout: bool,
     /// When the local checkout is the target, whether it is free of staged,
-    /// unstaged, and untracked changes.
-    worktree_clean: bool,
+    /// unstaged, and untracked changes. `None` means the status could not be
+    /// read: not a licence to trust the tree, so the downgrade stays off.
+    worktree_clean: Option<bool>,
     /// `--current-only`: the run has no diff baseline, so no out-of-diff row can
     /// be proven pre-existing and the downgrade is disabled entirely (R3-14).
     current_only: bool,
@@ -544,7 +547,7 @@ impl CleanComparison {
         config: &Config,
         resolved_target: &crate::git::ResolvedRef,
         resolved_bases: &[crate::git::ResolvedRef],
-        worktree_clean: bool,
+        worktree_clean: Option<bool>,
         diffs: &[crate::git::Diff],
     ) -> Self {
         let has_base_diff = has_resolvable_base_diff(resolved_target, resolved_bases);
@@ -561,8 +564,9 @@ impl CleanComparison {
                 configs_changed,
             },
             // Repo unreadable: preserve the historical downgrade by treating the
-            // target as the local checkout. `worktree_clean` was itself captured
-            // permissively (errors resolve to clean), so it stays consistent.
+            // target as the local checkout. Whether the downgrade actually fires
+            // is then decided by `worktree_clean`, which is `Some(true)` only for
+            // a tree whose status was really read.
             None => CleanComparison {
                 target_is_checkout: true,
                 worktree_clean,
@@ -594,9 +598,9 @@ impl CleanComparison {
             return false;
         }
         if self.target_is_checkout {
-            // Local checkout is the target for every check; only a clean tree can
-            // be trusted (R2-9).
-            self.worktree_clean
+            // Local checkout is the target for every check; only a tree PROVEN
+            // clean can be trusted (R2-9). An unread status is not proof.
+            self.worktree_clean == Some(true)
         } else {
             // Remote target: only checks that scanned the target snapshot qualify;
             // everything else scanned the local checkout, a different tree (R3-16).
@@ -608,7 +612,7 @@ impl CleanComparison {
     pub(crate) fn for_test(target_is_checkout: bool, worktree_clean: bool) -> Self {
         CleanComparison {
             target_is_checkout,
-            worktree_clean,
+            worktree_clean: Some(worktree_clean),
             current_only: false,
             has_base_diff: true,
             configs_changed: std::collections::BTreeSet::new(),
@@ -619,7 +623,7 @@ impl CleanComparison {
     pub(crate) fn for_test_current_only() -> Self {
         CleanComparison {
             target_is_checkout: true,
-            worktree_clean: true,
+            worktree_clean: Some(true),
             current_only: true,
             has_base_diff: true,
             configs_changed: std::collections::BTreeSet::new(),
@@ -630,7 +634,7 @@ impl CleanComparison {
     pub(crate) fn for_test_no_base_diff() -> Self {
         CleanComparison {
             target_is_checkout: true,
-            worktree_clean: true,
+            worktree_clean: Some(true),
             current_only: false,
             has_base_diff: false,
             configs_changed: std::collections::BTreeSet::new(),
@@ -641,7 +645,7 @@ impl CleanComparison {
     pub(crate) fn for_test_config_changed(owners: &[&'static str]) -> Self {
         CleanComparison {
             target_is_checkout: true,
-            worktree_clean: true,
+            worktree_clean: Some(true),
             current_only: false,
             has_base_diff: true,
             configs_changed: owners.iter().copied().collect(),
@@ -745,8 +749,9 @@ fn check_scans_target_snapshot(check_id: &str) -> bool {
 /// tree next to a digest of uncommitted changes.
 #[derive(Debug, Clone, Default)]
 pub struct WorktreeProvenance {
-    /// No staged, unstaged, or untracked changes at capture time.
-    pub clean: bool,
+    /// No staged, unstaged, or untracked changes at capture time. `None` when
+    /// the status could not be read — cleanliness unestablished, never assumed.
+    pub clean: Option<bool>,
     /// `sha256:<hex>` over the canonical `XY <path>` rendering of the status
     /// PLUS the current bytes of every dirty path (see
     /// [`render_status_fingerprint`]). `None` when the repository could not be
@@ -761,14 +766,25 @@ pub struct WorktreeProvenance {
 /// (R4-19). Cleanliness read after the run reflects prview/tool-generated files
 /// (an in-repo `--output-dir` or an untracked check cache), not the source state
 /// that was scanned — which would wrongly mark a clean run "dirty" and suppress
-/// the pre-existing downgrade. Errors resolve to clean with an unknown digest,
-/// preserving that permissive default.
+/// the pre-existing downgrade.
+///
+/// The two failure modes are NOT the same and must not resolve alike:
+///
+/// - no git repository at all: nothing can be uncommitted, and a run without a
+///   repo has no diff baseline either, so the downgrade is already disabled by
+///   `has_base_diff`. `Some(true)` preserves the historical permissive shape;
+/// - a repository whose status cannot be read (unreadable or malformed index):
+///   cleanliness was NOT established. Reporting `true` there certifies a tree
+///   nobody inspected — it reaches `PROVENANCE.json.worktree.clean` as a fact
+///   and lets `CleanComparison` downgrade out-of-diff failures to pre-existing.
+///   That is the one direction this record exists to prevent, so it stays
+///   `None`: unknown, and treated as untrusted.
 pub(crate) fn capture_worktree_provenance(repo_root: &std::path::Path) -> WorktreeProvenance {
     use sha2::{Digest, Sha256};
 
     let Ok(repo) = git2::Repository::discover(repo_root) else {
         return WorktreeProvenance {
-            clean: true,
+            clean: Some(true),
             status_digest: None,
         };
     };
@@ -778,7 +794,7 @@ pub(crate) fn capture_worktree_provenance(repo_root: &std::path::Path) -> Worktr
         .renames_head_to_index(true);
     let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
         return WorktreeProvenance {
-            clean: true,
+            clean: None,
             status_digest: None,
         };
     };
@@ -789,7 +805,7 @@ pub(crate) fn capture_worktree_provenance(repo_root: &std::path::Path) -> Worktr
     hasher.update(fingerprint.as_bytes());
 
     WorktreeProvenance {
-        clean: statuses.is_empty(),
+        clean: Some(statuses.is_empty()),
         status_digest: Some(format!("sha256:{:x}", hasher.finalize())),
     }
 }
@@ -1793,17 +1809,53 @@ mod tests {
         // rather than re-read once artifacts 10/20/30 have been written.
         let tmp = tempfile::tempdir().expect("tempdir");
         git2::Repository::init(tmp.path()).expect("init repo");
-        assert!(
+        assert_eq!(
             capture_worktree_provenance(tmp.path()).clean,
+            Some(true),
             "a freshly initialised repo has a clean tree"
         );
 
         // A file dropped after capture (an in-repo --output-dir or a check
         // cache) makes a *later* read dirty; the frozen early value must not.
         std::fs::write(tmp.path().join("prview-output.txt"), b"artifact").expect("write");
-        assert!(
-            !capture_worktree_provenance(tmp.path()).clean,
+        assert_eq!(
+            capture_worktree_provenance(tmp.path()).clean,
+            Some(false),
             "an untracked file makes a fresh read dirty"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_worktree_status_is_never_certified_clean() {
+        // A repository whose index cannot be parsed answers NOTHING about
+        // cleanliness. Reporting `clean: true` there put a fact in
+        // PROVENANCE.json that nobody established, and unlocked the pre-existing
+        // downgrade on a tree that was never inspected.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git2::Repository::init(tmp.path()).expect("init repo");
+        std::fs::write(tmp.path().join(".git/index"), b"definitely not an index")
+            .expect("corrupt the index");
+
+        let provenance = capture_worktree_provenance(tmp.path());
+        assert_eq!(
+            provenance.clean, None,
+            "an unreadable status is unknown, not clean",
+        );
+        assert!(
+            provenance.status_digest.is_none(),
+            "no status was read, so there is nothing to fingerprint",
+        );
+
+        let unknown = CleanComparison {
+            target_is_checkout: true,
+            worktree_clean: None,
+            current_only: false,
+            has_base_diff: true,
+            configs_changed: std::collections::BTreeSet::new(),
+        };
+        assert!(
+            !unknown.applies_to("clippy"),
+            "an unverified tree must not downgrade out-of-diff failures to pre-existing",
         );
     }
 
