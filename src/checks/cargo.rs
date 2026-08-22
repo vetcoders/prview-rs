@@ -56,6 +56,12 @@ struct CargoRun {
 ///   graph from zero, because the snapshot is a fresh temp dir thrown away at
 ///   the end of the run — which is the reason the checks were pinned to the
 ///   local root in the first place.
+///
+/// A cargo root configured OUTSIDE the repo has no third case: a snapshot of
+/// this repo can never contain it, so the reviewed tree cannot be analysed at
+/// all. That combination is refused by [`CargoCheck::check_eligibility`] and
+/// friends before a command is built; reaching it here is a bug, and the error
+/// is loud rather than a silent fallback onto the operator's local tree.
 fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
     let local_root = cargo_cache_root(config).to_path_buf();
     let plan = plan_check_run(config)?;
@@ -68,15 +74,12 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
         });
     }
 
-    let Some(cwd) = snapshot_cargo_root(&local_root, &config.repo_root, &plan.scan_dir) else {
-        // A cargo root configured outside the repo cannot exist inside a
-        // snapshot of that repo, so there is nothing to redirect to: keep the
-        // previous local-tree behaviour rather than invent a path.
-        return Ok(CargoRun {
-            cwd: local_root,
-            env: Vec::new(),
-            _snapshot: plan._snapshot,
-        });
+    let Some(mapped) = snapshot_cargo_root(&local_root, &config.repo_root, &plan.scan_dir) else {
+        anyhow::bail!(
+            "cargo root {} lies outside the repository, so the reviewed commit's tree cannot be \
+             analysed; configure a cargo_root inside the repo or review the local checkout",
+            local_root.display()
+        );
     };
 
     // Cargo creates the target directory itself, so nothing is materialised
@@ -84,7 +87,7 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
     let target_dir = config.cargo_build_cache_dir();
 
     Ok(CargoRun {
-        cwd,
+        cwd: reviewed_cargo_root(mapped, &plan.scan_dir),
         env: vec![(
             "CARGO_TARGET_DIR".to_string(),
             target_dir.display().to_string(),
@@ -93,11 +96,42 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
     })
 }
 
+/// Validate the mapped cargo root against the reviewed snapshot.
+///
+/// `config.profile.cargo_root` describes the LOCAL checkout. When the reviewed
+/// branch moved the crate (a root crate pushed into `backend/`, a member renamed)
+/// that path does not exist in the snapshot, and projecting it blindly makes
+/// cargo fail on a missing manifest — an execution error reported as the reviewed
+/// crate's verdict. Fall back to the snapshot root when it carries a manifest of
+/// its own: a workspace root still checks its members, and provenance records the
+/// directory actually used. With no manifest anywhere, keep the mapped path so
+/// cargo's own error names the real problem instead of prview inventing one.
+fn reviewed_cargo_root(mapped: PathBuf, scan_dir: &Path) -> PathBuf {
+    if mapped.join("Cargo.toml").exists() || !scan_dir.join("Cargo.toml").exists() {
+        return mapped;
+    }
+    scan_dir.to_path_buf()
+}
+
 /// Map the local cargo root onto the same relative location inside `scan_dir`.
 ///
 /// Returns `None` when the cargo root is not inside the repo, which a snapshot
 /// of that repo can never contain.
 fn snapshot_cargo_root(local_root: &Path, repo_root: &Path, scan_dir: &Path) -> Option<PathBuf> {
+    let relative = repo_relative_cargo_root(local_root, repo_root)?;
+    Some(
+        relative
+            .components()
+            .fold(scan_dir.to_path_buf(), |acc, c| acc.join(c)),
+    )
+}
+
+/// The cargo root as a path relative to the repo root — the discriminator that
+/// says WHICH tree inside the reviewed commit cargo will read.
+///
+/// `None` when the configured root is not inside the repo (an absolute path
+/// elsewhere, or one escaping through `..`).
+fn repo_relative_cargo_root(local_root: &Path, repo_root: &Path) -> Option<PathBuf> {
     // A relative cargo root (`.`) is repo-root-relative by construction.
     let relative = if local_root.is_relative() {
         local_root
@@ -105,20 +139,41 @@ fn snapshot_cargo_root(local_root: &Path, repo_root: &Path, scan_dir: &Path) -> 
         local_root.strip_prefix(repo_root).ok()?
     };
 
-    if relative.components().all(|c| {
+    if !relative.components().all(|c| {
         matches!(
             c,
             std::path::Component::CurDir | std::path::Component::Normal(_)
         )
     }) {
-        let joined = relative
+        return None;
+    }
+
+    Some(
+        relative
             .components()
             .filter(|c| !matches!(c, std::path::Component::CurDir))
-            .fold(scan_dir.to_path_buf(), |acc, c| acc.join(c));
-        Some(joined)
-    } else {
-        None
+            .collect(),
+    )
+}
+
+/// Skip reason when the reviewed commit's cargo tree cannot be reached at all.
+///
+/// A `cargo_root` outside the repository cannot be materialised from a snapshot
+/// of that repository. The pre-fix code quietly ran cargo at the local path
+/// instead — scanning a tree the review does not describe and filing the verdict
+/// under the reviewed commit. The honest answer is no verdict: skip with a reason
+/// the pack records, rather than a green light earned by a different tree.
+fn unreachable_reviewed_cargo_root(config: &Config) -> Option<String> {
+    let commit = off_head_target_commit(config)?;
+    let local_root = cargo_cache_root(config);
+    if repo_relative_cargo_root(local_root, &config.repo_root).is_some() {
+        return None;
     }
+    Some(format!(
+        "cargo root {} is outside the repo — commit {} cannot be checked there",
+        local_root.display(),
+        &commit[..commit.len().min(8)]
+    ))
 }
 
 /// Content hash for dependency-sensitive cargo checks (check/clippy/geiger).
@@ -154,8 +209,30 @@ fn cargo_content_hash(config: &Config) -> String {
 /// IS the content key — no file hashing needed, and no chance of colliding with
 /// a local-tree key written by an earlier local run (which would serve the local
 /// checkout's verdict for a PR).
+///
+/// The commit alone is not the whole substrate though: the same commit checked
+/// from the workspace root and from a configured member yields different
+/// check/clippy/audit/rustfmt results, so the cargo root travels in the key too
+/// — the same discriminator the local hash path already carries.
+///
+/// `None` when the configured cargo root lies outside the repo: then no reviewed
+/// tree is analysed at all (the check is skipped, see
+/// [`unreachable_reviewed_cargo_root`]) and a commit-shaped key would promise a
+/// result about a commit nothing scanned.
 fn reviewed_substrate_key(config: &Config) -> Option<String> {
-    off_head_target_commit(config).map(|commit| format!("commit-{commit}"))
+    let commit = off_head_target_commit(config)?;
+    reviewed_substrate_key_for(&commit, cargo_cache_root(config), &config.repo_root)
+}
+
+/// Pure half of [`reviewed_substrate_key`].
+fn reviewed_substrate_key_for(commit: &str, local_root: &Path, repo_root: &Path) -> Option<String> {
+    let relative = repo_relative_cargo_root(local_root, repo_root)?;
+    let root = if relative.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        relative.display().to_string()
+    };
+    Some(format!("commit-{commit}-root:{root}"))
 }
 
 /// Source hash for source-only cargo checks (rustfmt): the reviewed commit when
@@ -176,6 +253,9 @@ impl Check for CargoCheck {
                 "profile {}",
                 config.profile.kind.as_str().to_lowercase()
             ));
+        }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -250,6 +330,9 @@ impl Check for ClippyCheck {
         }
         if !config.should_run_heavy_rust_lint() {
             return super::CheckEligibility::Skip("lint disabled".to_string());
+        }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -357,6 +440,9 @@ impl Check for CargoTestCheck {
         if !config.run_tests {
             return super::CheckEligibility::Skip("tests disabled".to_string());
         }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
         super::CheckEligibility::Run
     }
 
@@ -433,6 +519,9 @@ impl Check for RustfmtCheck {
         }
         if !config.should_run_heavy_rust_lint() {
             return super::CheckEligibility::Skip("lint disabled".to_string());
+        }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -536,6 +625,9 @@ impl Check for CargoAuditCheck {
             return super::CheckEligibility::Skip(
                 "tool not installed (cargo-audit is missing)".to_string(),
             );
+        }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -714,6 +806,9 @@ impl Check for CargoGeigerCheck {
             return super::CheckEligibility::Skip(
                 "tool not installed (cargo-geiger is missing)".to_string(),
             );
+        }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -1483,6 +1578,7 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
     /// Write a minimal, dependency-free binary crate whose `main.rs` is either
     /// rustfmt-clean or deliberately mangled.
     fn write_crate(dir: &Path, formatted: bool) {
+        std::fs::create_dir_all(dir).unwrap();
         std::fs::write(
             dir.join("Cargo.toml"),
             "[package]\nname = \"substrate-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"substrate-fixture\"\npath = \"src/main.rs\"\n",
@@ -1609,6 +1705,207 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         assert!(
             run.env.is_empty(),
             "a local run must not redirect the build directory",
+        );
+    }
+
+    /// Two commits in a fresh repo; returns the temp dir and the FIRST commit,
+    /// so a config targeting it is off-HEAD.
+    fn repo_with_two_commits() -> (tempfile::TempDir, String) {
+        use crate::git::cmd::git_cmd;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "prview@example.test"]);
+        run_git(&["config", "user.name", "prview test"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        run_git(&["add", "a.txt"]);
+        run_git(&["commit", "-q", "-m", "one"]);
+        let first = String::from_utf8(
+            git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        run_git(&["commit", "-qam", "two"]);
+        (tmp, first)
+    }
+
+    /// A cargo root OUTSIDE the repository cannot be materialised from a
+    /// snapshot of that repository. The pre-fix code silently ran cargo there
+    /// anyway — scanning the operator's unrelated checkout and filing the result
+    /// under the reviewed commit. No verdict beats a foreign tree's verdict.
+    #[test]
+    fn cargo_checks_skip_when_cargo_root_is_outside_the_repo() {
+        let (repo, first) = repo_with_two_commits();
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+
+        let mut profile = test_rust_profile(true);
+        profile.cargo_root = Some(outside.path().to_path_buf());
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(profile)
+            .target(Some(&first))
+            .run_lint(true)
+            .run_tests(true)
+            .build();
+
+        assert!(
+            unreachable_reviewed_cargo_root(&config).is_some(),
+            "an external cargo root cannot host the reviewed commit",
+        );
+        for check in [
+            &CargoCheck as &dyn Check,
+            &ClippyCheck,
+            &RustfmtCheck,
+            &CargoTestCheck,
+        ] {
+            match check.check_eligibility(&config) {
+                super::super::CheckEligibility::Skip(reason) => assert!(
+                    reason.contains("outside the repo"),
+                    "{} skip reason must name the unreachable root, got: {reason}",
+                    check.name()
+                ),
+                super::super::CheckEligibility::Run => panic!(
+                    "{} must not run against a tree the review does not describe",
+                    check.name()
+                ),
+            }
+        }
+    }
+
+    /// An in-repo cargo root keeps running off-HEAD — the skip above must be
+    /// narrow, not a blanket disable of cargo checks in `--pr` mode.
+    #[test]
+    fn cargo_checks_still_run_off_head_for_an_in_repo_cargo_root() {
+        let (repo, first) = repo_with_two_commits();
+        let mut profile = test_rust_profile(true);
+        profile.cargo_root = Some(repo.path().join("crates/core"));
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(profile)
+            .target(Some(&first))
+            .build();
+
+        assert!(unreachable_reviewed_cargo_root(&config).is_none());
+        assert_eq!(
+            CargoCheck.check_eligibility(&config),
+            super::super::CheckEligibility::Run
+        );
+    }
+
+    /// The same commit checked from the workspace root and from a configured
+    /// member produces different results, so the cargo root must travel in the
+    /// cache key beside the commit. Keying on the commit alone let a later run
+    /// serve the other root's verdict.
+    #[test]
+    fn reviewed_substrate_key_discriminates_the_cargo_root() {
+        let repo_root = Path::new("/repo");
+        let commit = "abc123";
+
+        let root_key = reviewed_substrate_key_for(commit, repo_root, repo_root).expect("root key");
+        let member_key =
+            reviewed_substrate_key_for(commit, Path::new("/repo/crates/core"), repo_root)
+                .expect("member key");
+
+        assert_ne!(
+            root_key, member_key,
+            "workspace root and member must not share one reviewed-substrate key",
+        );
+        assert!(root_key.contains(commit) && member_key.contains(commit));
+        assert!(
+            member_key.ends_with("root:crates/core"),
+            "unexpected member key: {member_key}",
+        );
+        // A relative `.` root is the repo root itself — same substrate, same key.
+        assert_eq!(
+            reviewed_substrate_key_for(commit, Path::new("."), repo_root),
+            Some(root_key),
+        );
+    }
+
+    /// An external cargo root scans no reviewed tree at all, so it must not
+    /// produce a commit-shaped key promising a result about that commit.
+    #[test]
+    fn reviewed_substrate_key_is_absent_for_an_external_cargo_root() {
+        assert_eq!(
+            reviewed_substrate_key_for("abc123", Path::new("/elsewhere/crate"), Path::new("/repo")),
+            None,
+        );
+    }
+
+    /// The reviewed branch may have moved the crate (root crate pushed into
+    /// `backend/`, member renamed). The locally detected root does not exist in
+    /// the snapshot then, and running cargo in a missing directory reports an
+    /// execution error as the reviewed crate's verdict.
+    #[tokio::test]
+    async fn cargo_run_falls_back_to_the_snapshot_root_when_the_manifest_moved() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        // Local layout: the crate lives in crates/core.
+        write_crate(&repo_root.path().join("crates/core"), true);
+        // Reviewed layout: the crate moved back to the repo root.
+        write_crate(scan_dir.path(), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().join("crates/core"));
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let run = plan_cargo_run(&config).expect("plan");
+        assert_eq!(
+            run.cwd,
+            scan_dir.path(),
+            "a stale member path must not be projected into the snapshot verbatim",
+        );
+
+        // When the mapped root DOES exist in the snapshot, it still wins.
+        write_crate(&scan_dir.path().join("crates/core"), true);
+        let run = plan_cargo_run(&config).expect("plan");
+        assert_eq!(run.cwd, scan_dir.path().join("crates/core"));
+    }
+
+    /// Defence in depth for the eligibility skip: if a cargo check is ever run
+    /// directly with an external root off-HEAD, it must fail loudly instead of
+    /// quietly analysing the operator's own tree.
+    #[tokio::test]
+    async fn cargo_run_refuses_an_external_cargo_root_off_head() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(outside.path(), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(outside.path().to_path_buf());
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let err = match plan_cargo_run(&config) {
+            Ok(run) => panic!(
+                "external root off-HEAD must not resolve, got cwd {}",
+                run.cwd.display()
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("outside the repository"),
+            "unexpected error: {err}",
         );
     }
 
