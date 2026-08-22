@@ -714,6 +714,67 @@ impl Repository {
         Ok(tree.get_path(safe_path).is_ok())
     }
 
+    /// Directories of `commit_ref` that contain `file_name`, repo-relative and
+    /// sorted, searching at most `max_depth` levels below the root (the root
+    /// itself is depth 0, reported as an empty string).
+    ///
+    /// Used to find where the reviewed commit keeps a manifest the local
+    /// checkout has somewhere else. Walking the TREE rather than a materialised
+    /// worktree is what makes this safe: git trees are not traversed through
+    /// symlinks, so a directory the reviewed commit replaced with a symlink to
+    /// somewhere outside the repository simply has no entries here.
+    pub fn dirs_containing_at_commit(
+        &self,
+        commit_ref: &str,
+        file_name: &str,
+        max_depth: usize,
+    ) -> Result<Vec<String>> {
+        let tree = self.inner.revparse_single(commit_ref)?.peel_to_tree()?;
+        let mut found = Vec::new();
+        self.collect_dirs_containing(&tree, "", file_name, max_depth, &mut found)?;
+        found.sort();
+        Ok(found)
+    }
+
+    fn collect_dirs_containing(
+        &self,
+        tree: &git2::Tree<'_>,
+        prefix: &str,
+        file_name: &str,
+        depth_left: usize,
+        found: &mut Vec<String>,
+    ) -> Result<()> {
+        for entry in tree.iter() {
+            let Some(name) = entry.name() else { continue };
+            match entry.kind() {
+                // A symlink is stored as a blob with a link filemode; it names a
+                // file only in the checkout, never in the tree.
+                Some(git2::ObjectType::Blob)
+                    if name == file_name && entry.filemode() != i32::from(git2::FileMode::Link) =>
+                {
+                    found.push(prefix.to_string());
+                }
+                Some(git2::ObjectType::Tree) if depth_left > 0 => {
+                    let child = entry.to_object(&self.inner)?.peel_to_tree()?;
+                    let child_prefix = if prefix.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{prefix}/{name}")
+                    };
+                    self.collect_dirs_containing(
+                        &child,
+                        &child_prefix,
+                        file_name,
+                        depth_left - 1,
+                        found,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Read file content at a specific commit/ref
     pub fn file_at_commit(&self, commit_ref: &str, file_path: &str) -> Result<String> {
         let obj = self.inner.revparse_single(commit_ref)?;

@@ -273,13 +273,17 @@ single-permit semaphore (`is_cargo_target_check()`), so they never contend for
 that cache within a run; two concurrent prview runs on different commits rely on
 cargo's own build-directory locking.
 
-Which directory inside the snapshot is resolved in two steps.
-`config.profile.cargo_root` describes the LOCAL checkout, so it is mapped onto
-the same relative path inside the snapshot and then validated: if the reviewed
-branch moved the crate (a root crate pushed into `backend/`, a member renamed)
-that path does not exist there, and `reviewed_cargo_root()` falls back to the
-snapshot root when it carries a manifest of its own, rather than letting cargo
-fail on a missing directory and reporting it as the crate's verdict.
+Which directory inside the snapshot is resolved from the **reviewed commit's
+tree**, not from the local layout. `config.profile.cargo_root` describes the
+LOCAL checkout, so `resolve_reviewed_cargo_root()` takes it only as the first
+candidate and tries three in order: the mapped root, the repo root (a workspace
+root still checks its members), and — for a crate the reviewed branch moved (a
+root crate pushed into `backend/`, a member renamed) — exactly one directory
+within two levels that carries a manifest of its own. Several such directories
+resolve to nothing, with a reason naming what could not be chosen between: which
+crate a review is about is not something to guess. Without this, a moved crate
+left the run with nowhere to go and cargo's "could not find `Cargo.toml`" became
+the reviewed crate's verdict.
 
 A `cargo_root` configured **outside** the repository has no such mapping — a
 snapshot of this repo can never contain it. Off-`HEAD` runs then **skip** the
@@ -288,16 +292,25 @@ cargo checks with a reason naming the unreachable root
 operator's unrelated checkout and filing the result under the reviewed commit.
 No verdict is the honest answer where a foreign tree's verdict was the bug.
 
+That refusal is lexical, and the reviewed commit controls the tree: it can turn
+an in-repo root such as `backend/` into a **symlink** to an external directory,
+which carries no `..` and passes the component check. Resolving from the git
+tree closes that by construction — trees are not traversed through symlinks, so
+such a root simply has no entries to find — and `contained_in_snapshot()` settles
+containment on the resolved paths for the cases git cannot answer (an injected
+scan dir, an unreadable repo), refusing rather than earning a verdict outside
+the reviewed tree. Canonicalisation is the test only; the path itself is passed
+through unchanged, so provenance keeps reporting the directory as the run saw it.
+
 Whether cargo applies at all is decided by the **reviewed** commit, not by the
 local profile. `config.profile.has_cargo` describes the checkout, so reviewing a
 branch that dropped its last `Cargo.toml` from a Rust checkout used to run every
 cargo gate and report cargo's own "could not find `Cargo.toml`" as the target's
-verdict. `missing_reviewed_cargo_manifest()` asks the target commit's tree
-instead — the snapshot carries exactly that tree, so no worktree is materialised
-to answer it — and skips with a reason when neither the mapped cargo root nor
-the repo root has a manifest there. When git cannot answer at all (unreadable
-repo, unresolvable ref) nothing is skipped: an unverifiable claim may no more
-become a skip than a verdict.
+verdict. Eligibility asks the same resolver — the snapshot carries exactly the
+target commit's tree, so no worktree is materialised to answer it — and skips
+with a reason when no candidate resolves. When git cannot answer at all
+(unreadable repo, unresolvable ref) nothing is skipped: an unverifiable claim
+may no more become a skip than a verdict.
 
 Cache keys follow the same substrate. Cached results are looked up **before**
 the shared snapshot exists, so cargo cache keys resolve the target commit

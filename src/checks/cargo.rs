@@ -86,14 +86,61 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
     // here — resolving the path stays free of filesystem side effects.
     let target_dir = config.cargo_build_cache_dir();
 
+    let cwd = match resolve_reviewed_cargo_root(config) {
+        // The reviewed commit's own tree said where its manifest is.
+        ReviewedCargoRoot::Resolved(relative) => relative
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .fold(plan.scan_dir.clone(), |acc, part| acc.join(part)),
+        // Eligibility skips this case, so reaching it means a check ran anyway.
+        ReviewedCargoRoot::Unavailable(reason) => anyhow::bail!(
+            "the reviewed commit has no cargo root to run in ({reason}), so no cargo verdict can \
+             be earned for it"
+        ),
+        // Git could not answer (an injected scan dir, an unreadable repo): fall
+        // back to inspecting the materialised snapshot.
+        ReviewedCargoRoot::Unknown => reviewed_cargo_root(mapped, &plan.scan_dir),
+    };
+    let cwd = contained_in_snapshot(cwd, &plan.scan_dir)?;
+
     Ok(CargoRun {
-        cwd: reviewed_cargo_root(mapped, &plan.scan_dir),
+        cwd,
         env: vec![(
             "CARGO_TARGET_DIR".to_string(),
             target_dir.display().to_string(),
         )],
         _snapshot: plan._snapshot,
     })
+}
+
+/// Refuse a cargo root that leaves the reviewed snapshot.
+///
+/// The lexical check in [`repo_relative_cargo_root`] only sees the path the
+/// OPERATOR configured. The reviewed commit controls the tree, and a directory
+/// it replaced with a symlink to somewhere else resolves to a path with no `..`
+/// in it — so cargo would run on a foreign tree and the verdict would be cached
+/// under the reviewed commit, exactly the hole the external-root refusal closed.
+/// Containment is therefore settled on the real, resolved paths, after the
+/// snapshot exists.
+///
+/// A path that cannot be canonicalised (nothing there yet) is left alone: cargo
+/// reporting a missing directory is a truthful local failure, not a foreign
+/// tree's verdict. The path itself is returned unchanged — canonicalisation is
+/// the test, not the answer, and resolving it would rewrite the directory
+/// provenance reports (`/var` → `/private/var` on macOS).
+fn contained_in_snapshot(cwd: PathBuf, scan_dir: &Path) -> Result<PathBuf> {
+    let (Ok(resolved), Ok(root)) = (cwd.canonicalize(), scan_dir.canonicalize()) else {
+        return Ok(cwd);
+    };
+    if !resolved.starts_with(&root) {
+        anyhow::bail!(
+            "cargo root {} resolves outside the reviewed snapshot ({}), so a verdict earned there \
+             would describe another tree",
+            cwd.display(),
+            scan_dir.display(),
+        );
+    }
+    Ok(cwd)
 }
 
 /// Validate the mapped cargo root against the reviewed snapshot.
@@ -176,49 +223,105 @@ fn unreachable_reviewed_cargo_root(config: &Config) -> Option<String> {
     ))
 }
 
-/// Skip reason when the REVIEWED commit is not a cargo project at all.
-///
-/// Eligibility reads `config.profile`, which describes the LOCAL checkout. A
-/// branch that drops its last `Cargo.toml` is still reviewed from a Rust
-/// checkout, so every cargo gate ran, found no manifest in the snapshot and
-/// filed cargo's own "could not find `Cargo.toml`" as the reviewed commit's
-/// verdict — a failure invented by the tool for a target that is simply not a
-/// cargo project.
-///
-/// The reviewed tree is the target commit's tree, so the manifest question is
-/// answered from git directly: no snapshot is materialised to find out. Both
-/// places [`reviewed_cargo_root`] would run count — the mapped cargo root and
-/// the snapshot root it falls back to. When git cannot answer (unreadable repo,
-/// unresolvable ref) nothing is skipped: an unverifiable claim must not become a
-/// skip any more than it may become a verdict.
-fn missing_reviewed_cargo_manifest(config: &Config) -> Option<String> {
-    let commit = off_head_target_commit(config)?;
-    let relative = repo_relative_cargo_root(cargo_cache_root(config), &config.repo_root)?;
-    let repo = crate::git::Repository::open(&config.repo_root).ok()?;
+/// Where the reviewed commit keeps the cargo project this run must judge.
+#[derive(Debug, PartialEq, Eq)]
+enum ReviewedCargoRoot {
+    /// Repo-relative directory inside the reviewed tree (empty = repo root).
+    Resolved(String),
+    /// The reviewed commit offers no single cargo root to run in; the string is
+    /// the skip reason recorded in the pack.
+    Unavailable(String),
+    /// The question does not apply or could not be asked: a local review, or a
+    /// repository git cannot read.
+    Unknown,
+}
 
-    let root_path = cargo_root_path(&relative);
-    let mut candidates = vec!["Cargo.toml".to_string()];
-    if !root_path.is_empty() {
-        candidates.push(format!("{root_path}/Cargo.toml"));
-    }
-    for candidate in &candidates {
-        match repo.path_exists_at_commit(&commit, candidate) {
-            Ok(true) => return None,
+/// How far below the repo root a moved manifest is looked for.
+///
+/// A crate that moved is moved a level or two (`backend/`, `crates/core`), and
+/// every extra level widens the chance of matching an unrelated fixture crate
+/// deep in the tree. Two levels covers the realistic moves; anything further is
+/// treated as "not found" rather than guessed at.
+const CARGO_ROOT_DISCOVERY_DEPTH: usize = 2;
+
+/// Resolve the cargo root from the REVIEWED commit's tree.
+///
+/// Eligibility used to read `config.profile`, which describes the LOCAL
+/// checkout: a branch that dropped or moved its last `Cargo.toml` was still
+/// reviewed from a Rust checkout, so the cargo gates ran and filed cargo's own
+/// "could not find `Cargo.toml`" as the reviewed commit's verdict — a failure
+/// invented by the tool.
+///
+/// The reviewed tree IS the target commit's tree, so the question is answered
+/// from git and no snapshot is materialised to ask it. Three candidates, in the
+/// order [`reviewed_cargo_root`] would try them:
+///
+/// 1. the mapped cargo root — the local root at the same relative path;
+/// 2. the repo root — a workspace root still checks its members;
+/// 3. exactly one directory within [`CARGO_ROOT_DISCOVERY_DEPTH`] carrying a
+///    manifest, for a crate the reviewed commit moved somewhere else.
+///
+/// Several candidates in step 3 resolve to nothing: which crate the review is
+/// about is not a thing to guess. Walking the tree also settles containment for
+/// free — git trees are not traversed through symlinks, so a root the reviewed
+/// commit replaced with a symlink to an external directory has no entries here
+/// and simply does not resolve.
+fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
+    let (Some(commit), Some(relative)) = (
+        off_head_target_commit(config),
+        repo_relative_cargo_root(cargo_cache_root(config), &config.repo_root),
+    ) else {
+        return ReviewedCargoRoot::Unknown;
+    };
+    let Ok(repo) = crate::git::Repository::open(&config.repo_root) else {
+        return ReviewedCargoRoot::Unknown;
+    };
+
+    let mapped = cargo_root_path(&relative);
+    for candidate in [mapped.as_str(), ""] {
+        let path = if candidate.is_empty() {
+            "Cargo.toml".to_string()
+        } else {
+            format!("{candidate}/Cargo.toml")
+        };
+        match repo.path_exists_at_commit(&commit, &path) {
+            Ok(true) => return ReviewedCargoRoot::Resolved(candidate.to_string()),
             Ok(false) => {}
             // The question could not be asked — do not answer it.
-            Err(_) => return None,
+            Err(_) => return ReviewedCargoRoot::Unknown,
         }
     }
 
-    Some(format!(
-        "commit {} has no Cargo.toml at {} or the repo root — not a cargo project",
-        &commit[..commit.len().min(8)],
-        if root_path.is_empty() {
-            "the repo root".to_string()
-        } else {
-            root_path
-        },
-    ))
+    let Ok(moved) =
+        repo.dirs_containing_at_commit(&commit, "Cargo.toml", CARGO_ROOT_DISCOVERY_DEPTH)
+    else {
+        return ReviewedCargoRoot::Unknown;
+    };
+    let short = &commit[..commit.len().min(8)];
+    let aimed_at = if mapped.is_empty() {
+        "the repo root".to_string()
+    } else {
+        mapped
+    };
+    match moved.as_slice() {
+        [only] => ReviewedCargoRoot::Resolved(only.clone()),
+        [] => ReviewedCargoRoot::Unavailable(format!(
+            "commit {short} has no Cargo.toml at {aimed_at} or the repo root — not a cargo project",
+        )),
+        many => ReviewedCargoRoot::Unavailable(format!(
+            "commit {short} has no Cargo.toml at {aimed_at}, and several elsewhere ({}) — \
+             cannot tell which crate this review is about",
+            many.join(", "),
+        )),
+    }
+}
+
+/// Skip reason when the reviewed commit offers no cargo root to run in.
+fn missing_reviewed_cargo_manifest(config: &Config) -> Option<String> {
+    match resolve_reviewed_cargo_root(config) {
+        ReviewedCargoRoot::Unavailable(reason) => Some(reason),
+        ReviewedCargoRoot::Resolved(_) | ReviewedCargoRoot::Unknown => None,
+    }
 }
 
 /// Content hash for dependency-sensitive cargo checks (check/clippy/geiger).
@@ -1968,6 +2071,112 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
                 ),
             }
         }
+    }
+
+    /// The reviewed commit may have moved the crate somewhere else entirely
+    /// (root workspace pushed into `backend/`). Neither the mapped path nor the
+    /// snapshot root has a manifest then, so the run had nowhere to go: the
+    /// commit IS a cargo project, and reporting "not a cargo project" is as
+    /// false as the missing-manifest failure that reporting replaced.
+    #[test]
+    fn a_cargo_root_moved_to_another_directory_is_rediscovered() {
+        // Target commit: the only manifest lives in `backend/`.
+        let (repo, target) = repo_with_two_commits_containing(&["backend/Cargo.toml"]);
+        // HEAD (the local checkout): the crate is back at the repo root.
+        std::fs::remove_file(repo.path().join("backend/Cargo.toml")).unwrap();
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(repo.path(), "move the crate back to the root");
+
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        assert!(
+            missing_reviewed_cargo_manifest(&config).is_none(),
+            "the reviewed commit is a cargo project — just not where it used to be",
+        );
+        assert_eq!(
+            resolve_reviewed_cargo_root(&config),
+            ReviewedCargoRoot::Resolved("backend".to_string()),
+            "the run must go where the reviewed manifest actually is",
+        );
+        assert_eq!(
+            CargoCheck.check_eligibility(&config),
+            super::super::CheckEligibility::Run
+        );
+    }
+
+    /// Discovery only helps when it has ONE answer. A tree with several
+    /// candidate roots and no manifest where the run was aimed cannot be
+    /// resolved by guessing which crate the review is about.
+    #[test]
+    fn an_ambiguous_moved_cargo_root_is_not_guessed() {
+        let (repo, target) =
+            repo_with_two_commits_containing(&["backend/Cargo.toml", "frontend/Cargo.toml"]);
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        let reason = missing_reviewed_cargo_manifest(&config).expect("ambiguity must not run");
+        assert!(
+            reason.contains("backend") && reason.contains("frontend"),
+            "the skip reason must name what it could not choose between: {reason}",
+        );
+    }
+
+    /// The reviewed commit can turn an in-repo cargo root into a symlink
+    /// pointing outside the repository. The lexical component check accepts it
+    /// (no `..` in the path), and following it runs cargo on the operator's
+    /// unrelated tree while the verdict is cached under the reviewed commit —
+    /// the external-root hole, reopened by a target-controlled symlink.
+    #[tokio::test]
+    async fn a_symlinked_cargo_root_never_escapes_the_snapshot() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(scan_dir.path(), true);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), scan_dir.path().join("backend")).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(&repo_root.path().join("backend"), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().join("backend"));
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let cwd = match plan_cargo_run(&config) {
+            Ok(run) => run.cwd,
+            // Refusing outright is equally honest — what must never happen is a
+            // verdict earned outside the reviewed tree.
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("outside"),
+                    "unexpected error: {err}"
+                );
+                return;
+            }
+        };
+        let inside = cwd
+            .canonicalize()
+            .expect("cwd")
+            .starts_with(scan_dir.path().canonicalize().expect("scan_dir"));
+        assert!(
+            inside,
+            "cargo must not follow a symlink out of the reviewed tree, got {}",
+            cwd.display(),
+        );
     }
 
     /// A member root that the reviewed commit does not have still counts as a
