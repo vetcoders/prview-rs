@@ -177,7 +177,11 @@ schema is built around. A missing or non-object `decision` there is a corrupt
 artifact, not a normalization: the CLI exits `3` and the MCP adapter returns
 `storage_corrupt`, matching `tools/validate_merge_gate.py`, which requires
 `decision` at every version. Only a pack with NO `schema_version` keeps the
-legacy tolerance of reading its root as the decision.
+legacy tolerance of reading its root as the decision — and that tolerance is
+whole: a legacy pack shaped `{"verdict": "ALLOW", "allow_merge": true}` is read
+by BOTH readers, not accepted by one and called corrupt by the other. The rule
+lives in one place (`gate::select_decision_object`) so the two surfaces cannot
+answer it differently again.
 
 A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
 never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with

@@ -322,38 +322,23 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     })?;
 
     let mut caveats = Vec::new();
-    // A readable `schema_version` also settles the pack's SHAPE below: from 2.1
-    // the contract has a `decision` object, and a pack that states its version
-    // is claiming that contract.
-    let schema_stated = value.get("schema_version").is_some();
     if let Some(caveat) = crate::gate::check_merge_gate_schema_field(value.get("schema_version"))
         .with_context(|| format!("merge gate artifact {}", gate_path.display()))?
     {
         caveats.push(caveat);
     }
 
-    let decision = match value.get("decision") {
-        Some(decision) if decision.is_object() => decision,
-        // Packs with no `schema_version` predate the field, and reading their
-        // root as the decision is the documented legacy read-back surface.
-        _ if !schema_stated => &value,
-        // A pack that names its schema and then omits (or mistypes) the object
-        // that schema is built around is structurally broken. Reading the root
-        // instead produced a verdict nothing in the pack stated — a
-        // re-derivation wearing a reader's clothes, which is exactly what the
-        // fail-loud contract removed. `tools/validate_merge_gate.py` rejects
-        // such a pack and the MCP adapter calls it `storage_corrupt`; the CLI
-        // must not be the one surface that shrugs.
-        _ => anyhow::bail!(
-            "merge gate artifact {} states schema_version {} but carries no `decision` object — \
-             the pack is corrupt and no verdict can be read from it",
+    // Legacy root-as-decision vs. mandatory `decision` object: one rule, shared
+    // with the MCP adapter, because the two readers answering it differently is
+    // exactly how the same pack became readable from one surface and corrupt
+    // from the other.
+    let decision = crate::gate::select_decision_object(&value).map_err(|schema| {
+        anyhow::anyhow!(
+            "merge gate artifact {} states schema_version {schema} but carries no `decision` \
+             object — the pack is corrupt and no verdict can be read from it",
             gate_path.display(),
-            value
-                .get("schema_version")
-                .and_then(Value::as_str)
-                .unwrap_or("?"),
-        ),
-    };
+        )
+    })?;
     // A decision signal present with the WRONG JSON type is not an absent one.
     // Reading each through `as_str()` / `as_bool()` collapsed the two, and
     // "absent" is the state this reader forgives: `merge_recommendation: 7`

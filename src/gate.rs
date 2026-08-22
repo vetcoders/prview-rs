@@ -193,6 +193,32 @@ pub fn readable_signal<'v>(
     None
 }
 
+/// Select the object a gate pack's decision is read from.
+///
+/// Two documented shapes, and the rule that separates them is the presence of
+/// `schema_version`, not the presence of `decision`:
+///
+/// * no `schema_version` — a pack predating the field. Its ROOT is the decision;
+///   this is the legacy read-back surface every reader keeps.
+/// * `schema_version` stated — the `decision` object that schema is built around
+///   is mandatory. Falling back to the root there would publish a verdict
+///   nothing in the pack stated, which is a re-derivation wearing a reader's
+///   clothes. `tools/validate_merge_gate.py` requires `decision` at every
+///   version, so a reader that shrugs disagrees with the contract validator.
+///
+/// `Err` carries the schema string for the caller to put in its own message.
+pub fn select_decision_object(value: &serde_json::Value) -> Result<&serde_json::Value, String> {
+    match value.get("decision") {
+        Some(decision) if decision.is_object() => Ok(decision),
+        _ if value.get("schema_version").is_none() => Ok(value),
+        _ => Err(value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .to_string()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GateVerdict {
     #[serde(rename = "PASS")]

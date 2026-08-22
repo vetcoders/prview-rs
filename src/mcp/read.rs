@@ -700,10 +700,17 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     let schema_caveat = crate::gate::check_merge_gate_schema_field(value.get("schema_version"))
         .map_err(|e| ToolError::new(error_class::STORAGE_CORRUPT, e.to_string()))?;
 
-    let decision = value.get("decision").ok_or_else(|| {
+    // A pack with no `schema_version` predates the field and its ROOT is the
+    // decision — the same legacy tolerance the CLI reader and the contract keep.
+    // Demanding a nested `decision` at every version made the one shape the
+    // contract explicitly tolerates come back `storage_corrupt` from this
+    // surface while the CLI read it fine.
+    let decision = crate::gate::select_decision_object(&value).map_err(|schema| {
         ToolError::new(
             error_class::STORAGE_CORRUPT,
-            "MERGE_GATE.json missing `decision` object",
+            format!(
+                "MERGE_GATE.json states schema_version {schema} but carries no `decision` object"
+            ),
         )
     })?;
 
@@ -1157,6 +1164,49 @@ mod tests {
                 "{} for {bad}",
                 err.message
             );
+        }
+    }
+
+    #[test]
+    fn a_legacy_root_shaped_pack_is_read_not_called_corrupt() {
+        // A pack with no `schema_version` predates the field, and reading its
+        // ROOT as the decision is the documented legacy read-back surface — the
+        // CLI reader and `docs/contracts/merge_gate.md` both keep it. This
+        // adapter demanded a nested `decision` object at every version, so the
+        // one pack shape the contract explicitly tolerates came back
+        // `storage_corrupt`.
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({ "verdict": "ALLOW", "allow_merge": true }),
+        );
+
+        let d = read_decision(dir.path()).expect("a legacy root-shaped pack is readable");
+        assert_eq!(d.verdict, "PASS");
+        assert!(d.allow_merge, "{d:?}");
+    }
+
+    #[test]
+    fn a_versioned_pack_without_a_decision_object_stays_corrupt() {
+        // The other half of the same rule: once a pack names its schema, the
+        // object that schema is built around is mandatory. Reading the root
+        // there would publish a verdict nothing in the pack stated.
+        for decision in [None, Some(serde_json::json!("PASS"))] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gate = serde_json::json!({
+                "schema_version": "2.2",
+                "verdict": "ALLOW",
+                "allow_merge": true
+            });
+            if let Some(decision) = decision.clone() {
+                gate["decision"] = decision;
+            }
+            write_gate(dir.path(), &gate);
+
+            let err = read_decision(dir.path())
+                .expect_err("a versioned pack with no decision object is corrupt");
+            assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+            assert!(err.message.contains("decision"), "{}", err.message);
         }
     }
 

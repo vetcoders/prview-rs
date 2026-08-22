@@ -208,6 +208,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at every version) and the `prview mcp` adapter (which already returned
   `storage_corrupt`). A pack with NO `schema_version` predates the field and
   keeps the legacy tolerance: its root is still read as the decision.
+- **The legacy tolerance is now whole on both readers.** The `prview mcp` adapter
+  required a `decision` object unconditionally, so a genuine pre-2.1 pack — no
+  `schema_version`, signals at the root — was answered `storage_corrupt` by the
+  MCP surface while the CLI read the very same file and printed a verdict. One
+  artifact cannot be simultaneously readable and corrupt depending on which
+  surface asks. Both readers now select the decision object through a single
+  `gate::select_decision_object`: `decision` when it is an object, the root when
+  the pack states no `schema_version`, and fail-loud otherwise. The corruption
+  rule for versioned packs is unchanged; only the disagreement is gone.
 - **A wrongly typed decision signal is a normalization, not an absent field.**
   `verdict: "PASS"` beside `merge_recommendation: 7` used to collapse through
   `as_str()` into "no recommendation", so the `prview mcp` adapter returned a
