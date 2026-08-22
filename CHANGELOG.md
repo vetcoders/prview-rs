@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where it forgets an open comment. The residual cost of carrying is a hunk that
   STARTS mid-literal, measured at 1 in 872 over the same history, and it cannot
   outlive the hunk.
+- **The `cfg` guard of a declaration is the whole stack of attributes above it.**
+  Stacked `#[cfg(…)]` attributes are Rust's `AND`, but only the last one was
+  recorded, so `#[cfg(unix)] #[cfg(feature = "x")] pub struct Config;` replaced
+  by the same struct under `#[cfg(windows)] #[cfg(feature = "x")]` compared equal
+  on the shared feature alone: the removal paired with the re-add and the API
+  that disappeared for Unix builds was never reported. The guard is now the
+  complete conjunction, sorted — reordering two attributes gates the item
+  identically and is not an API change.
 - A warning is no longer reported as a failed quality check. A baseline-signal
   check that reports `Warnings` (cargo-audit raising an unmaintained-crate
   advisory, `rustfmt`, `eslint`, `ruff`, `prettier`, `stylelint`, `semgrep`) is

@@ -287,6 +287,14 @@ silent re-addition. A re-add in a *different* file is a module move and becomes
 `RelocatedSymbol`, which is reported but deliberately excluded from breaking
 escalation.
 
+Pairing is scoped: two declarations pair only when their inline `mod` path and
+their `#[cfg(…)]` guard may be the same. The guard is the WHOLE conjunction of
+the attributes stacked above the declaration, sorted — `#[cfg(unix)]
+#[cfg(feature = "x")]` and `#[cfg(windows)] #[cfg(feature = "x")]` are different
+guards, while reordering the same two is not. An unseen scope or guard is
+`None`, which pairs with anything: the diff may simply not have re-emitted the
+context line on that side.
+
 Both the module path and the perf tracker's test-context scope are counted over
 CODE only, via the shared scanner in `src/rust_source.rs`. It resolves comments
 and literals in ONE pass — `"http://x"` is a string and `format!("{}/*.{}")` is
