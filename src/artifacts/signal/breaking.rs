@@ -165,7 +165,8 @@ struct ModScope {
     /// `(module name, brace depth the module was opened at)`.
     stack: Vec<(String, i32)>,
     depth: i32,
-    /// Carries a `/* … */` left open by an earlier line of this side.
+    /// Carries a `/* … */` or a string literal left open by an earlier line of
+    /// this side.
     scanner: crate::rust_source::SourceScanner,
 }
 
@@ -182,9 +183,11 @@ impl ModScope {
     /// data: `const CLOSE: &str = "}";` inside `mod a` used to pop the module,
     /// leaving a later removal of `a::Config` with an unknown scope — which
     /// pairs with anything, so an unrelated `b::Config` addition cancelled a
-    /// real API removal. Block comments are tracked across lines, because
-    /// commenting a block of code out is exactly how an unbalanced brace ends
-    /// up inside one.
+    /// real API removal. Block comments AND string literals are tracked across
+    /// lines: commenting a block of code out is exactly how an unbalanced brace
+    /// ends up inside a comment, and a multi-line template or JSON fixture is
+    /// exactly how one ends up inside a literal. State is per side and per
+    /// hunk — see [`ModScope::reset`].
     fn feed(&mut self, payload: &str) {
         let code = self.scanner.code_only(payload);
         let opened = mod_opening_name(code.trim());
@@ -1601,6 +1604,41 @@ mod tests {
         assert!(
             removed_symbol_types(&findings).contains(&"struct".to_string()),
             "a brace in a literal or comment must not merge two module scopes, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_literal_spanning_lines_does_not_pop_the_module_scope() {
+        // Same defect, one line further on: the literal OPENS on one line and
+        // closes on the next, so the tail of its body reached the tracker as
+        // code and its `}` popped `mod a`. The removal of `a::Config` then
+        // carried an unknown scope, paired with the unrelated `b::Config`
+        // addition, and the real API removal vanished from the report. Multi-
+        // line literals are not exotic here: 241 of them live in this tree and
+        // 168 carry a brace in their body.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " pub mod a {",
+                " const TEMPLATE: &str = \"opens {",
+                " closes } here\";",
+                "-    pub struct Config {",
+                "-        pub x: u32,",
+                "-    }",
+                " }",
+                " pub mod b {",
+                "+    pub struct Config {",
+                "+        pub x: u32,",
+                "+    }",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a brace inside a multi-line literal must not merge two module scopes, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

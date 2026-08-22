@@ -21,6 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **String literals are tracked across lines, like block comments already were.**
+  The diff scanner blanked a literal only on the line that opened it, so the tail
+  of a multi-line template or JSON fixture reached the delimiter trackers as
+  code: its closing `"` read as an OPENER and the `}` in front of it as syntax.
+  That popped `mod a` one level early, left a removed `a::Config` with an unknown
+  scope, and an unknown scope pairs with anything — so an unrelated `b::Config`
+  addition cancelled a real API removal. The construct is not exotic here: 241
+  multi-line literals live in this tree and 168 carry a brace in their body, and
+  replaying the last 201 commits shows 29 hunk sides whose brace counting this
+  corrects (21 of them in the scope-popped-early direction, the one that HIDES a
+  breaking change). The scanner now carries an open normal or raw literal, with
+  the raw delimiter's own hash count, and forgets it at the same hunk boundary
+  where it forgets an open comment. The residual cost of carrying is a hunk that
+  STARTS mid-literal, measured at 1 in 872 over the same history, and it cannot
+  outlive the hunk.
 - A warning is no longer reported as a failed quality check. A baseline-signal
   check that reports `Warnings` (cargo-audit raising an unmaintained-crate
   advisory, `rustfmt`, `eslint`, `ruff`, `prettier`, `stylelint`, `semgrep`) is

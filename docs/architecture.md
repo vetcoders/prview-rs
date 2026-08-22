@@ -287,6 +287,14 @@ silent re-addition. A re-add in a *different* file is a module move and becomes
 `RelocatedSymbol`, which is reported but deliberately excluded from breaking
 escalation.
 
+Both the module path and the perf tracker's test-context scope are counted over
+CODE only, via the shared scanner in `src/rust_source.rs`. It resolves comments
+and literals in ONE pass — `"http://x"` is a string and `format!("{}/*.{}")` is
+a glob, not a comment — and carries an open `/* … */` **or an open string
+literal** across lines, so a brace inside a multi-line template or JSON fixture
+never reaches a delimiter tracker as syntax. That state is per side and per
+hunk: a hunk boundary is where contiguity ends, and every consumer resets there.
+
 #### signal/coverage.rs — coverage delta computation
 
 Cross-references changed source files with test files to estimate test coverage:

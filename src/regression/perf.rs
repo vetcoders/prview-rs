@@ -391,9 +391,10 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
     let mut in_test = false;
     let mut depth: i32 = 0;
     let mut seen_open = false;
-    // A block comment spans lines, so the reader is stateful for this hunk.
-    // Hunks are not contiguous, and this function is called per hunk, so the
-    // scanner starts clean here and is never carried past the hunk boundary.
+    // Block comments and string literals span lines, so the reader is stateful
+    // for this hunk. Hunks are not contiguous, and this function is called per
+    // hunk, so the scanner starts clean here and is never carried past the
+    // hunk boundary.
     let mut scanner = SourceScanner::default();
 
     for line in hunk.lines() {
