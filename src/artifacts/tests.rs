@@ -5133,3 +5133,37 @@ fn worktree_digest_separates_runs_that_differ_only_in_content() {
         "the same tree state must fingerprint identically",
     );
 }
+
+/// A nested repository is ONE status entry: git never recurses into another
+/// repository, so the digest saw only "a directory is there". Two very different
+/// nested trees — a submodule sitting on another commit, or carrying edits —
+/// fingerprinted identically, which is exactly the collision the content digest
+/// exists to prevent.
+#[test]
+fn worktree_digest_separates_nested_repositories_by_their_own_state() {
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let repo = repo_tmp.path();
+
+    let nested = repo.join("vendor");
+    fs::create_dir_all(&nested).expect("nested dir");
+    run_git_fixture(&nested, &["init", "-q", "-b", "main"]);
+    write_commit_fixture(&nested, "lib.rs", "pub fn v1() {}\n");
+    let first = capture_worktree_provenance(repo);
+
+    // The nested repository moves to another commit; the superproject sees the
+    // same single entry with the same status code.
+    write_commit_fixture(&nested, "lib.rs", "pub fn v2() {}\n");
+    let moved = capture_worktree_provenance(repo);
+    assert_ne!(
+        first.status_digest, moved.status_digest,
+        "a nested repository on another commit is another substrate",
+    );
+
+    // Uncommitted work inside it does not move its HEAD, and must still count.
+    fs::write(nested.join("scratch.rs"), "pub fn draft() {}\n").expect("nested edit");
+    let dirty = capture_worktree_provenance(repo);
+    assert_ne!(
+        moved.status_digest, dirty.status_digest,
+        "edits inside a nested repository change what a scan would read",
+    );
+}
