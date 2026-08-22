@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Perf regression detection now resolves inline Rust test context (`#[cfg(test)]`,
+  `mod tests`, `#[test]`) **per hit line** instead of per hunk. A production hot
+  path that merely shared a hunk with a test module was classified as
+  `test_context_only` and silently dropped from the reviewer-facing signal
+  (`perf_regression_suspected` and the risk score both ignore test-only
+  suspects). Test context now opens at its marker and closes when the braces
+  opened after it balance out, commented-out markers no longer open it, and any
+  ambiguity resolves toward production — a false positive costs a reviewer a
+  glance, a false negative hides a real regression.
+
 ### Changed
 
 - Bumped the bundled `loctree` structural-analysis crate from `0.8` to `0.13.0`.

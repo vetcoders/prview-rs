@@ -7,6 +7,13 @@
 //! Non-code files (docs, scripts, configs, assets) are skipped entirely.
 //! Test/e2e files are also skipped — a query-in-loop in a Playwright test
 //! is not a production performance regression signal.
+//!
+//! Inline Rust test context (`#[cfg(test)]` / `mod tests` / `#[test]`) is
+//! resolved **per hit line**, not per hunk: a production hot path that merely
+//! shares a hunk with a trailing test module still counts as a production
+//! signal. When the context of a hit is ambiguous it is classified as
+//! production — a false positive costs a reviewer a glance, a false negative
+//! hides a real regression.
 
 use super::RegressionContext;
 use regex::Regex;
@@ -171,56 +178,30 @@ pub fn analyze(ctx: &RegressionContext) -> PerfRegression {
             .map(|l| &l[1..]) // strip leading '+'
             .collect();
 
+        // Per-added-line inline test context, aligned index-by-index with
+        // `added_lines`, so each hit is classified by its own line.
+        let test_context = added_line_test_context(&file, &hunk);
+
         // Proximity-based detection: patterns must appear within PROXIMITY_WINDOW
         // added lines of each other, not just anywhere in the same hunk.
-        let (has_query_near_loop, has_clone_near_loop) = check_proximity(&added_lines);
-        let is_inline_test_context = is_inline_test_context(&file, &hunk);
+        let hits = check_proximity(&added_lines, &test_context);
 
-        if has_query_near_loop {
+        if hits.query_prod || hits.query_test || hits.clone_prod || hits.clone_test {
             let reasons = file_reasons.entry(file.clone()).or_default();
-            if is_inline_test_context {
-                if !reasons
-                    .test_reasons
-                    .iter()
-                    .any(|r| r.contains("query in loop"))
-                {
-                    reasons.test_reasons.push("query in loop".to_string());
-                }
-            } else {
+
+            if hits.query_prod {
                 query_in_loop += 1;
-                if !reasons
-                    .prod_reasons
-                    .iter()
-                    .any(|r| r.contains("query in loop"))
-                {
-                    reasons.prod_reasons.push("query in loop".to_string());
-                }
+                push_reason(&mut reasons.prod_reasons, "query in loop");
             }
-        }
-
-        if has_clone_near_loop {
-            let reasons = file_reasons.entry(file.clone()).or_default();
-            if is_inline_test_context {
-                if !reasons
-                    .test_reasons
-                    .iter()
-                    .any(|r| r.contains("clone/collect"))
-                {
-                    reasons
-                        .test_reasons
-                        .push("clone/collect in loop".to_string());
-                }
-            } else {
+            if hits.query_test {
+                push_reason(&mut reasons.test_reasons, "query in loop");
+            }
+            if hits.clone_prod {
                 clone_in_loop += 1;
-                if !reasons
-                    .prod_reasons
-                    .iter()
-                    .any(|r| r.contains("clone/collect"))
-                {
-                    reasons
-                        .prod_reasons
-                        .push("clone/collect in loop".to_string());
-                }
+                push_reason(&mut reasons.prod_reasons, "clone/collect in loop");
+            }
+            if hits.clone_test {
+                push_reason(&mut reasons.test_reasons, "clone/collect in loop");
             }
         }
     }
@@ -274,9 +255,35 @@ pub fn analyze(ctx: &RegressionContext) -> PerfRegression {
     }
 }
 
+/// Append `reason` unless it is already recorded.
+fn push_reason(reasons: &mut Vec<String>, reason: &str) {
+    if !reasons.iter().any(|r| r == reason) {
+        reasons.push(reason.to_string());
+    }
+}
+
+/// Proximity hits of one hunk, split by the context of the hit itself.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ProximityHits {
+    query_prod: bool,
+    query_test: bool,
+    clone_prod: bool,
+    clone_test: bool,
+}
+
+impl ProximityHits {
+    fn is_saturated(&self) -> bool {
+        self.query_prod && self.query_test && self.clone_prod && self.clone_test
+    }
+}
+
 /// Check if query/clone patterns appear within [`PROXIMITY_WINDOW`] added lines
-/// of a loop pattern. Returns `(query_near_loop, clone_near_loop)`.
-fn check_proximity(added_lines: &[&str]) -> (bool, bool) {
+/// of a loop pattern, classifying **each hit** as production or test context.
+///
+/// `test_context[i]` describes `added_lines[i]`. A hit counts as test context
+/// only when **its own line** sits in test context; anything else — including a
+/// missing or unknown classification — counts as production.
+fn check_proximity(added_lines: &[&str], test_context: &[bool]) -> ProximityHits {
     let loop_lines: Vec<usize> = added_lines
         .iter()
         .enumerate()
@@ -284,53 +291,141 @@ fn check_proximity(added_lines: &[&str]) -> (bool, bool) {
         .map(|(i, _)| i)
         .collect();
 
+    let mut hits = ProximityHits::default();
     if loop_lines.is_empty() {
-        return (false, false);
+        return hits;
     }
 
-    let mut query_near_loop = false;
-    let mut clone_near_loop = false;
-
     for (i, line) in added_lines.iter().enumerate() {
+        let is_query = QUERY_PATTERN.is_match(line);
+        let is_clone = CLONE_COLLECT_PATTERN.is_match(line);
+        if !is_query && !is_clone {
+            continue;
+        }
+
         let near_loop = loop_lines
             .iter()
             .any(|&l| i.abs_diff(l) <= PROXIMITY_WINDOW);
         if !near_loop {
             continue;
         }
-        if !query_near_loop && QUERY_PATTERN.is_match(line) {
-            query_near_loop = true;
+
+        // Missing context data means "unknown" — treat it as production.
+        let in_test = test_context.get(i).copied().unwrap_or(false);
+
+        if is_query {
+            hits.query_prod |= !in_test;
+            hits.query_test |= in_test;
         }
-        if !clone_near_loop && CLONE_COLLECT_PATTERN.is_match(line) {
-            clone_near_loop = true;
+        if is_clone {
+            hits.clone_prod |= !in_test;
+            hits.clone_test |= in_test;
         }
-        if query_near_loop && clone_near_loop {
+        if hits.is_saturated() {
             break;
         }
     }
 
-    (query_near_loop, clone_near_loop)
+    hits
 }
 
 fn is_loop_line(line: &str) -> bool {
     EXPLICIT_LOOP_PATTERN.is_match(line) || ITERATOR_LOOP_PATTERN.is_match(line)
 }
 
-fn is_inline_test_context(file: &str, hunk: &str) -> bool {
+/// Returns `true` for hunk lines that are diff bookkeeping rather than source.
+fn is_diff_metadata_line(line: &str) -> bool {
+    line.starts_with("@@")
+        || line.starts_with("diff --git")
+        || line.starts_with("+++")
+        || line.starts_with("--- a/")
+        || line == "---"
+        || line.starts_with("index ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("rename ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+}
+
+/// Map each added line of `hunk` to "is this line inside inline Rust test
+/// context?", in the same order as the added-line vector used for detection.
+///
+/// A test-context marker (`#[cfg(test)]`, `mod tests`, `#[test]`, `#[rstest]`)
+/// opens the context; it closes again once the braces opened after that marker
+/// balance out. Lines *before* the marker stay production — that is the whole
+/// point of per-hit classification: a hot path sharing a hunk with a trailing
+/// test module is still production code.
+///
+/// Ambiguity resolves toward production: non-Rust files, unrecognised braces
+/// and commented-out markers all leave the line classified as production.
+fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
+    let added_lines = hunk
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"));
+
     if !file.ends_with(".rs") {
-        return false;
+        return added_lines.map(|_| false).collect();
     }
 
-    hunk.lines().any(|line| {
-        let trimmed = line
+    let mut flags = Vec::new();
+    let mut in_test = false;
+    let mut depth: i32 = 0;
+    let mut seen_open = false;
+
+    for line in hunk.lines() {
+        if is_diff_metadata_line(line) {
+            continue;
+        }
+
+        let is_added = line.starts_with('+');
+        let payload = line
             .strip_prefix('+')
             .or_else(|| line.strip_prefix('-'))
             .or_else(|| line.strip_prefix(' '))
-            .unwrap_or(line)
-            .trim();
+            .unwrap_or(line);
+        let trimmed = payload.trim();
 
-        INLINE_RUST_TEST_CONTEXT_PATTERN.is_match(trimmed)
-    })
+        // Comments (including doc comments) never open test context — a doc
+        // comment mentioning `#[cfg(test)]` must not mute a production hit.
+        if trimmed.starts_with("//") {
+            if is_added {
+                flags.push(in_test);
+            }
+            continue;
+        }
+
+        // Only the outermost marker opens the context, so nested `#[test]`
+        // attributes do not reset the enclosing `mod tests` brace tracking.
+        if !in_test && INLINE_RUST_TEST_CONTEXT_PATTERN.is_match(trimmed) {
+            in_test = true;
+            depth = 0;
+            seen_open = false;
+        }
+
+        if is_added {
+            flags.push(in_test);
+        }
+
+        if in_test {
+            for ch in payload.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        seen_open = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if seen_open && depth <= 0 {
+                in_test = false;
+                depth = 0;
+                seen_open = false;
+            }
+        }
+    }
+
+    flags
 }
 
 /// Split patch text into hunks (each starting with @@ or diff --git).
@@ -732,6 +827,223 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         assert_eq!(
             result.suspected_files[0].reasons,
             vec!["query in loop".to_string()]
+        );
+    }
+
+    // ---- per-hit (not per-hunk) test-context classification ----
+
+    #[test]
+    fn test_prod_hit_in_mixed_hunk_is_not_muted_by_trailing_test_module() {
+        // Single hunk: production hot path first, test module afterwards.
+        // Per-hunk classification marked the whole hunk as test context and
+        // hid the production signal entirely.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -10,4 +10,18 @@
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT hash FROM users WHERE id = ?");
++    argon2.verify_password(password, &stored)?;
++}
+
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn verify_roundtrip() {
++        for candidate in candidates.iter() {
++            let ids: Vec<_> = candidate.ids.iter().collect();
++        }
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "production hot path sharing a hunk with a test module must stay a signal"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert_eq!(result.suspected_files[0].file, "src/auth.rs");
+        assert!(!result.suspected_files[0].test_context_only);
+        assert!(result.suspected_files[0].mixed_context);
+        assert_eq!(
+            result.suspected_files[0].reasons,
+            vec!["query in loop".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_prod_hit_after_closed_test_module_in_same_hunk_is_prod() {
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -10,4 +10,20 @@
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn roundtrip() {
++        for candidate in candidates.iter() {
++            let ids: Vec<_> = candidate.ids.iter().collect();
++        }
++    }
+ }
++
++pub fn verify_all(candidates: &[Candidate]) {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT hash FROM users WHERE id = ?");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "code after the test module closes is production again"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+        assert!(result.suspected_files[0].mixed_context);
+    }
+
+    #[test]
+    fn test_commented_test_marker_does_not_mute_prod_hit() {
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -10,4 +10,8 @@
++// covered by #[cfg(test)] mod tests below
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT hash FROM users WHERE id = ?");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a comment mentioning test attributes is not test context"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_same_reason_in_both_contexts_counts_once_as_prod() {
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -10,4 +10,18 @@
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT hash FROM users WHERE id = ?");
++}
+
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn roundtrip() {
++        for candidate in candidates.iter() {
++            let stored = db.query("SELECT 1");
++        }
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(result.perf_regression_suspected);
+        assert_eq!(
+            result.query_in_loop_count, 1,
+            "the test-context hit must not inflate the production counter"
+        );
+        assert!(!result.suspected_files[0].test_context_only);
+        assert!(
+            result.suspected_files[0].mixed_context,
+            "the same reason in both contexts is still a mixed-context file"
+        );
+        assert_eq!(
+            result.suspected_files[0].reasons,
+            vec!["query in loop".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_pure_test_hunk_stays_test_context_only() {
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -40,3 +40,10 @@
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn roundtrip() {
++        for candidate in candidates.iter() {
++            let stored = db.query("SELECT 1");
++        }
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.perf_regression_suspected);
+        assert_eq!(result.query_in_loop_count, 0);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert!(result.suspected_files[0].test_context_only);
+        assert!(!result.suspected_files[0].mixed_context);
+        assert_eq!(result.skipped_test_hits_count, 1);
+    }
+
+    #[test]
+    fn test_hit_in_rust_test_file_is_skipped_by_path() {
+        let patch = r#"diff --git a/src/auth_test.rs b/src/auth_test.rs
++++ b/src/auth_test.rs
+@@ -1,1 +1,5 @@
++pub fn helper(candidates: &[Candidate]) {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a hit in a test file is not a production signal, even outside #[cfg(test)]"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert_eq!(result.skipped_test_hits_count, 1);
+        assert!(result.suspected_files.is_empty());
+    }
+
+    #[test]
+    fn test_added_line_test_context_is_aligned_with_added_lines() {
+        let hunk = "@@ -1,4 +1,9 @@\n+let prod = 1;\n-let removed = 2;\n #[cfg(test)]\n mod tests {\n+    let inside = 3;\n }\n+let after = 4;\n";
+        assert_eq!(
+            added_line_test_context("src/auth.rs", hunk),
+            vec![false, true, false],
+            "flags must line up with added lines only, in order"
+        );
+        assert_eq!(
+            added_line_test_context("src/auth.ts", hunk),
+            vec![false, false, false],
+            "inline Rust test context does not apply to non-Rust files"
         );
     }
 }
