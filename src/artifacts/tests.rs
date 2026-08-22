@@ -1029,6 +1029,76 @@ fn checks_status_includes_loctree_heuristics_when_available() {
 }
 
 #[test]
+fn synthetic_heuristics_check_records_the_tree_it_scanned() {
+    // heuristics_loctree gates the pack like any other check, so PROVENANCE.json
+    // must be able to name the tree behind it. In snapshot mode that is the
+    // extracted target tree — `git archive` writes the commit and nothing else,
+    // so the scan really is exactly that commit.
+    use crate::checks::TreeState;
+    use crate::heuristics::{HeuristicsResult, HeuristicsSummary, LoctreeAnalysis};
+
+    let heuristics = HeuristicsResult {
+        loctree: Some(LoctreeAnalysis {
+            available: true,
+            ..Default::default()
+        }),
+        summary: HeuristicsSummary {
+            total_files: 12,
+            ..Default::default()
+        },
+        analysis_root: Some("/tmp/prview/repo/abc1234-1".to_string()),
+        analysis_sha: Some("abc1234abc1234abc1234abc1234abc1234abc12".to_string()),
+        started_at: Some("2026-08-22T10:00:00+02:00".to_string()),
+        finished_at: Some("2026-08-22T10:00:04+02:00".to_string()),
+        ..Default::default()
+    };
+
+    let config = create_test_config(PolicyConfig::default());
+    let prov = build_heuristics_check(Some(&heuristics), &config)
+        .provenance
+        .expect("a gating signal must name its substrate");
+
+    assert_eq!(prov.cwd, "/tmp/prview/repo/abc1234-1");
+    assert_eq!(
+        prov.target_sha.as_deref(),
+        Some("abc1234abc1234abc1234abc1234abc1234abc12"),
+    );
+    assert_eq!(prov.tree_state, Some(TreeState::Snapshot));
+    assert_eq!(prov.started_at, "2026-08-22T10:00:00+02:00");
+}
+
+#[test]
+fn synthetic_heuristics_check_leaves_an_unnamed_snapshot_unknown() {
+    // A pack written before the analysis commit was recorded still has its
+    // analysis root. Report the directory, and stop there: guessing that it
+    // holds the target commit is exactly the false certification the manifest
+    // exists to prevent.
+    use crate::heuristics::{HeuristicsResult, HeuristicsSummary, LoctreeAnalysis};
+
+    let heuristics = HeuristicsResult {
+        loctree: Some(LoctreeAnalysis {
+            available: true,
+            ..Default::default()
+        }),
+        summary: HeuristicsSummary {
+            total_files: 12,
+            ..Default::default()
+        },
+        analysis_root: Some("/tmp/prview/repo/older-pack".to_string()),
+        ..Default::default()
+    };
+
+    let config = create_test_config(PolicyConfig::default());
+    let prov = build_heuristics_check(Some(&heuristics), &config)
+        .provenance
+        .expect("the scanned directory is known even when its commit is not");
+
+    assert_eq!(prov.cwd, "/tmp/prview/repo/older-pack");
+    assert_eq!(prov.target_sha, None);
+    assert_eq!(prov.tree_state, None);
+}
+
+#[test]
 fn synthetic_heuristics_check_skips_zero_file_scan() {
     use crate::heuristics::{HeuristicsResult, HeuristicsSummary, LoctreeAnalysis};
 
@@ -1044,7 +1114,8 @@ fn synthetic_heuristics_check_skips_zero_file_scan() {
         ..Default::default()
     };
 
-    let check = build_heuristics_check(Some(&heuristics));
+    let config = create_test_config(PolicyConfig::default());
+    let check = build_heuristics_check(Some(&heuristics), &config);
 
     assert_eq!(check.name, "heuristics_loctree");
     assert_eq!(check.status, CheckStatus::Skipped);
@@ -1419,6 +1490,8 @@ fn merge_gate_splits_preexisting_quality_failures_from_inline_findings() {
                 finished_at: "2026-01-01T00:00:01Z".to_string(),
                 hard_fail_signatures: vec![],
                 cache_key: None,
+                target_sha: None,
+                tree_state: None,
             }),
         },
         // Satisfy required Rust quality signals so they don't add unclassified gaps
@@ -2136,6 +2209,55 @@ fn failures_summary_is_written_when_no_checks_failed() {
 }
 
 #[test]
+fn gate_result_json_carries_the_scanned_tree_provenance() {
+    // The substrate a gate ran on must survive into the artifact: without
+    // target_sha + tree_state a reader cannot tell whether the gate saw the
+    // reviewed commit or an uncommitted local tree. Absent fields stay absent
+    // (older packs and non-git substrates must not grow null keys).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = CheckResult {
+        name: "Ruff".to_string(),
+        status: CheckStatus::Passed,
+        duration: Duration::from_secs(1),
+        output: String::new(),
+        cached: false,
+        provenance: Some(CheckProvenance {
+            command: "ruff check .".to_string(),
+            tool_version: None,
+            cwd: "[external]/tmp/snapshot".to_string(),
+            exit_code: Some(0),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            finished_at: "2026-01-01T00:00:01Z".to_string(),
+            hard_fail_signatures: vec![],
+            cache_key: None,
+            target_sha: Some("a".repeat(40)),
+            tree_state: Some(crate::checks::TreeState::Snapshot),
+        }),
+    };
+
+    generate_gate_results(tmp.path(), std::slice::from_ref(&base)).expect("gate results");
+    let value: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("ruff.result.json")).expect("read json"),
+    )
+    .expect("parse json");
+    assert_eq!(value["target_sha"].as_str(), Some("a".repeat(40).as_str()));
+    assert_eq!(value["tree_state"].as_str(), Some("snapshot"));
+
+    let mut unknown = base;
+    if let Some(prov) = unknown.provenance.as_mut() {
+        prov.target_sha = None;
+        prov.tree_state = None;
+    }
+    generate_gate_results(tmp.path(), &[unknown]).expect("gate results");
+    let value: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("ruff.result.json")).expect("read json"),
+    )
+    .expect("parse json");
+    assert!(value.get("target_sha").is_none());
+    assert!(value.get("tree_state").is_none());
+}
+
+#[test]
 fn gate_result_json_has_failed_tests_for_cargo_test() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let checks = vec![CheckResult {
@@ -2167,6 +2289,8 @@ test result: FAILED. 0 passed; 1 failed
             finished_at: "2026-01-01T00:00:01Z".to_string(),
             hard_fail_signatures: vec!["SIGABRT".to_string()],
             cache_key: None,
+            target_sha: None,
+            tree_state: None,
         }),
     }];
 
@@ -2218,6 +2342,8 @@ test result: FAILED. 0 passed; 1 failed
             finished_at: "2026-01-01T00:00:01Z".to_string(),
             hard_fail_signatures: vec!["SIGABRT".to_string()],
             cache_key: None,
+            target_sha: None,
+            tree_state: None,
         }),
     }];
 
@@ -2296,6 +2422,8 @@ fn inline_findings_emits_one_sarif_result_per_cargo_audit_advisory() {
             finished_at: "2026-01-01T00:00:01Z".to_string(),
             hard_fail_signatures: vec![],
             cache_key: None,
+            target_sha: None,
+            tree_state: None,
         }),
     }];
 
@@ -4845,4 +4973,395 @@ Trailing <script>alert('xss')</script> injection.
         "script tag leaked into review.html"
     );
     assert!(!html.contains("alert('xss')"), "script body leaked");
+}
+
+// ── 00_summary/PROVENANCE.json ─────────────────────────────────────────────
+
+fn provenance_fixture_repo() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_git_fixture(tmp.path(), &["init", "-q", "-b", "main"]);
+    let head = write_commit_fixture(tmp.path(), "own.rs", "pub fn own() -> u8 { 1 }\n");
+    (tmp, head)
+}
+
+fn provenance_check(name: &str, cached: bool, provenance: Option<CheckProvenance>) -> CheckResult {
+    CheckResult {
+        name: name.to_string(),
+        status: CheckStatus::Passed,
+        duration: Duration::from_secs(1),
+        output: String::new(),
+        cached,
+        provenance,
+    }
+}
+
+fn snapshot_provenance(target_sha: &str) -> CheckProvenance {
+    CheckProvenance {
+        command: "cargo check".to_string(),
+        tool_version: None,
+        cwd: "[external]/snapshot".to_string(),
+        target_sha: Some(target_sha.to_string()),
+        tree_state: Some(crate::checks::TreeState::Snapshot),
+        exit_code: Some(0),
+        started_at: "2026-08-22T10:00:00+02:00".to_string(),
+        finished_at: "2026-08-22T10:00:01+02:00".to_string(),
+        hard_fail_signatures: vec![],
+        cache_key: Some("commit-deadbeef".to_string()),
+    }
+}
+
+fn write_provenance_fixture(
+    repo_root: &Path,
+    out: &Path,
+    checks: &[CheckResult],
+) -> serde_json::Value {
+    write_provenance_fixture_with_diffs(repo_root, out, checks, &[])
+}
+
+/// Base tip the operator names, distinct from the merge base a diverged branch
+/// is actually diffed against.
+const PROVENANCE_BASE_TIP: &str = "def5678def5678def5678def5678def5678de";
+
+fn write_provenance_fixture_with_diffs(
+    repo_root: &Path,
+    out: &Path,
+    checks: &[CheckResult],
+    diffs: &[Diff],
+) -> serde_json::Value {
+    write_provenance_fixture_with_skips(repo_root, out, checks, &[], diffs)
+}
+
+fn write_provenance_fixture_with_skips(
+    repo_root: &Path,
+    out: &Path,
+    checks: &[CheckResult],
+    skipped_checks: &[crate::checks::SkippedCheck],
+    diffs: &[Diff],
+) -> serde_json::Value {
+    let repo = Repository::open(repo_root).expect("open repo");
+    let worktree = capture_worktree_provenance(repo_root);
+    let resolved_target = ResolvedRef {
+        name: "feature/provenance".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let resolved_bases = vec![ResolvedRef {
+        name: "origin/main".to_string(),
+        commit_id: PROVENANCE_BASE_TIP.to_string(),
+        is_remote: true,
+    }];
+
+    generate_provenance_json(ProvenanceJsonInput {
+        dir: out,
+        repo: &repo,
+        checks,
+        skipped_checks,
+        diffs,
+        resolved_target: &resolved_target,
+        resolved_bases: &resolved_bases,
+        worktree_clean: worktree.clean,
+        worktree_status_digest: worktree.status_digest.as_deref(),
+    })
+    .expect("generate_provenance_json");
+
+    serde_json::from_str(
+        &fs::read_to_string(out.join("PROVENANCE.json")).expect("read PROVENANCE.json"),
+    )
+    .expect("parse PROVENANCE.json")
+}
+
+#[test]
+fn provenance_json_records_pack_level_substrate() {
+    let (repo_tmp, head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let checks = [
+        provenance_check("Cargo check", false, Some(snapshot_provenance("abc1234"))),
+        // A cache hit replays the ORIGINAL execution's provenance; only the
+        // cached flag separates it from a fresh run.
+        provenance_check("Clippy", true, Some(snapshot_provenance("abc1234"))),
+        // A check with no provenance at all must still appear, with nulls —
+        // silence about a gate is exactly what this file exists to prevent.
+        provenance_check("heuristics_loctree", false, None),
+    ];
+
+    let json = write_provenance_fixture(repo_tmp.path(), out.path(), &checks);
+
+    assert_eq!(json["schema_version"], "1.0");
+    assert_eq!(json["target_sha"], "abc1234abc1234abc1234abc1234abc1234ab");
+    assert_eq!(json["base_sha"], "def5678def5678def5678def5678def5678de");
+    assert_eq!(json["head_sha"], head);
+    assert_eq!(json["worktree"]["clean"], true);
+    assert!(
+        json["worktree"]["status_digest"]
+            .as_str()
+            .expect("digest")
+            .starts_with("sha256:"),
+        "clean tree must still carry a digest of its (empty) status"
+    );
+
+    let rows = json["checks"].as_array().expect("checks array");
+    assert_eq!(rows.len(), 3, "every check gets a row");
+
+    let cargo = &rows[0];
+    assert_eq!(cargo["id"], check_id_from_name("Cargo check"));
+    assert_eq!(cargo["cwd"], "[external]/snapshot");
+    assert_eq!(cargo["target_sha"], "abc1234");
+    assert_eq!(cargo["tree_state"], "snapshot");
+    assert_eq!(cargo["started_at"], "2026-08-22T10:00:00+02:00");
+    assert_eq!(cargo["cached"], false);
+
+    let clippy = &rows[1];
+    assert_eq!(clippy["cached"], true);
+    assert_eq!(
+        clippy["tree_state"], "snapshot",
+        "a cache hit must carry the substrate it was produced on"
+    );
+
+    let heuristics = &rows[2];
+    assert!(heuristics["cwd"].is_null());
+    assert!(heuristics["tree_state"].is_null());
+}
+
+#[test]
+fn provenance_json_base_sha_is_the_commit_the_diff_used() {
+    // Diverged branches: the patch is generated from the merge base, while
+    // `resolved_bases` still holds the base TIP the operator named. Recording
+    // the tip would name a commit no diff in the pack was computed against.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+    let merge_base = "1111111111111111111111111111111111111111";
+
+    let diffs = vec![Diff {
+        target: "feature/provenance".to_string(),
+        base: "origin/main".to_string(),
+        target_commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        base_commit_id: merge_base.to_string(),
+        files: vec![],
+        stats: DiffStats {
+            files_changed: 0,
+            additions: 0,
+            deletions: 0,
+            copied: 0,
+        },
+        commits: vec![],
+    }];
+
+    let json = write_provenance_fixture_with_diffs(repo_tmp.path(), out.path(), &[], &diffs);
+    assert_eq!(
+        json["base_sha"], merge_base,
+        "base_sha must name the baseline the patch was produced from",
+    );
+    assert_ne!(
+        json["base_sha"], PROVENANCE_BASE_TIP,
+        "the base tip is not what the diff compared against",
+    );
+}
+
+#[test]
+fn provenance_json_records_checks_that_never_ran() {
+    // A gate ruled out before it ran — tests disabled, a tool absent — used to
+    // vanish from the manifest entirely, leaving a consumer unable to tell a
+    // deliberate skip from a check that was never part of this run. The row is
+    // all nulls because nothing was read; the reason is what it is there for.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let checks = [provenance_check(
+        "Cargo check",
+        false,
+        Some(snapshot_provenance("abc1234")),
+    )];
+    let skipped = [crate::checks::SkippedCheck {
+        id: "cargo_test".to_string(),
+        name: "Cargo test".to_string(),
+        reason: "tests disabled".to_string(),
+    }];
+
+    let json =
+        write_provenance_fixture_with_skips(repo_tmp.path(), out.path(), &checks, &skipped, &[]);
+
+    let rows = json["checks"].as_array().expect("checks array");
+    assert_eq!(rows.len(), 2, "a configured gate has a row either way");
+    assert!(
+        rows[0]["skipped"].is_null(),
+        "a check that ran is marked by the absence of a reason",
+    );
+
+    let row = &rows[1];
+    assert_eq!(row["id"], "cargo_test");
+    assert_eq!(row["skipped"], "tests disabled");
+    assert!(row["cwd"].is_null(), "a skip read no tree");
+    assert!(row["target_sha"].is_null());
+    assert!(row["tree_state"].is_null());
+    assert!(row["started_at"].is_null());
+    assert_eq!(row["cached"], false);
+}
+
+#[test]
+fn provenance_json_records_every_baseline_of_a_multi_base_run() {
+    // `--base a --base b` produces one patch per base, each with its own merge
+    // base. Recording only the first left the second patch unplaceable: the
+    // pack contains a diff whose baseline the manifest never names.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let diff = |base: &str, base_commit: &str| Diff {
+        target: "feature/provenance".to_string(),
+        base: base.to_string(),
+        target_commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        base_commit_id: base_commit.to_string(),
+        files: vec![],
+        stats: DiffStats {
+            files_changed: 0,
+            additions: 0,
+            deletions: 0,
+            copied: 0,
+        },
+        commits: vec![],
+    };
+    let first = "1111111111111111111111111111111111111111";
+    let second = "2222222222222222222222222222222222222222";
+    let diffs = vec![diff("origin/main", first), diff("origin/release", second)];
+
+    let json = write_provenance_fixture_with_diffs(repo_tmp.path(), out.path(), &[], &diffs);
+
+    let bases = json["bases"].as_array().expect("bases array");
+    assert_eq!(bases.len(), 2, "one row per patch in the pack");
+    assert_eq!(bases[0]["name"], "origin/main");
+    assert_eq!(bases[0]["sha"], first);
+    assert_eq!(bases[1]["name"], "origin/release");
+    assert_eq!(bases[1]["sha"], second);
+    assert_eq!(
+        json["base_sha"], first,
+        "the scalar stays the first baseline, so older consumers keep reading it",
+    );
+}
+
+#[test]
+fn provenance_json_bases_fall_back_to_resolved_refs_without_a_diff() {
+    // No diff at all (`--current-only`, or a base pointing at the target): the
+    // resolved refs are then the only baselines there are, and the array must
+    // still agree with the scalar.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let json = write_provenance_fixture_with_diffs(repo_tmp.path(), out.path(), &[], &[]);
+
+    let bases = json["bases"].as_array().expect("bases array");
+    assert_eq!(bases.len(), 1);
+    assert_eq!(bases[0]["name"], "origin/main");
+    assert_eq!(bases[0]["sha"], PROVENANCE_BASE_TIP);
+    assert_eq!(json["base_sha"], PROVENANCE_BASE_TIP);
+}
+
+#[test]
+fn provenance_json_worktree_reflects_dirty_tree() {
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let clean = write_provenance_fixture(repo_tmp.path(), out.path(), &[]);
+    assert_eq!(clean["worktree"]["clean"], true);
+
+    fs::write(repo_tmp.path().join("uncommitted.rs"), "pub fn oops() {}\n").expect("dirty file");
+
+    let dirty = write_provenance_fixture(repo_tmp.path(), out.path(), &[]);
+    assert_eq!(
+        dirty["worktree"]["clean"], false,
+        "an untracked file makes the tree dirty"
+    );
+    assert_ne!(
+        dirty["worktree"]["status_digest"], clean["worktree"]["status_digest"],
+        "the digest must fingerprint WHAT is dirty, not just that something is"
+    );
+}
+
+#[test]
+fn worktree_digest_separates_runs_that_differ_only_in_content() {
+    // Two runs can dirty exactly the same paths with exactly the same status
+    // codes and still have judged different bytes. A status-set-only digest
+    // collides there, so the fingerprint promises more than it delivers.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let repo = repo_tmp.path();
+
+    // `own.rs` is the fixture's committed file — editing it yields an `M` entry.
+    let tracked = repo.join("own.rs");
+    fs::write(&tracked, "pub fn v1() {}\n").expect("write tracked");
+    let untracked = repo.join("scratch.rs");
+    fs::write(&untracked, "pub fn a() {}\n").expect("write untracked");
+    let first = capture_worktree_provenance(repo);
+
+    // Same paths, same `M`/`??` codes — different bytes.
+    fs::write(&tracked, "pub fn v2_completely_different() {}\n").expect("rewrite tracked");
+    fs::write(&untracked, "pub fn b() {}\n").expect("rewrite untracked");
+    let second = capture_worktree_provenance(repo);
+
+    assert_eq!(first.clean, second.clean, "both runs are dirty");
+    assert_ne!(
+        first.status_digest, second.status_digest,
+        "differently-dirty runs must be distinguishable, which is what the digest claims",
+    );
+
+    // Restoring the exact bytes restores the exact fingerprint: the digest is a
+    // function of the tree, not of time or run order.
+    fs::write(&tracked, "pub fn v1() {}\n").expect("restore tracked");
+    fs::write(&untracked, "pub fn a() {}\n").expect("restore untracked");
+    assert_eq!(
+        capture_worktree_provenance(repo).status_digest,
+        first.status_digest,
+        "the same tree state must fingerprint identically",
+    );
+}
+
+/// A nested repository is ONE status entry: git never recurses into another
+/// repository, so the digest saw only "a directory is there". Two very different
+/// nested trees — a submodule sitting on another commit, or carrying edits —
+/// fingerprinted identically, which is exactly the collision the content digest
+/// exists to prevent.
+#[test]
+fn worktree_digest_separates_nested_repositories_by_their_own_state() {
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let repo = repo_tmp.path();
+
+    let nested = repo.join("vendor");
+    fs::create_dir_all(&nested).expect("nested dir");
+    run_git_fixture(&nested, &["init", "-q", "-b", "main"]);
+    write_commit_fixture(&nested, "lib.rs", "pub fn v1() {}\n");
+    let first = capture_worktree_provenance(repo);
+
+    // The nested repository moves to another commit; the superproject sees the
+    // same single entry with the same status code.
+    write_commit_fixture(&nested, "lib.rs", "pub fn v2() {}\n");
+    let moved = capture_worktree_provenance(repo);
+    assert_ne!(
+        first.status_digest, moved.status_digest,
+        "a nested repository on another commit is another substrate",
+    );
+
+    // Uncommitted work inside it does not move its HEAD, and must still count.
+    fs::write(nested.join("scratch.rs"), "pub fn draft() {}\n").expect("nested edit");
+    let dirty = capture_worktree_provenance(repo);
+    assert_ne!(
+        moved.status_digest, dirty.status_digest,
+        "edits inside a nested repository change what a scan would read",
+    );
+
+    // Same HEAD, same dirty paths, different bytes: a clean/dirty flag says
+    // these are the same substrate, and cargo (or any other check that compiles
+    // the vendored tree) reads different code in each.
+    fs::write(nested.join("scratch.rs"), "pub fn something_else() {}\n").expect("nested rewrite");
+    let differently_dirty = capture_worktree_provenance(repo);
+    assert_ne!(
+        dirty.status_digest, differently_dirty.status_digest,
+        "a nested repository dirtied differently is a different substrate",
+    );
+
+    // And it is still a function of the tree: restoring the bytes restores the
+    // fingerprint.
+    fs::write(nested.join("scratch.rs"), "pub fn draft() {}\n").expect("nested restore");
+    assert_eq!(
+        capture_worktree_provenance(repo).status_digest,
+        dirty.status_digest,
+        "the same nested tree must fingerprint identically",
+    );
 }

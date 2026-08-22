@@ -84,6 +84,7 @@ Every run writes an artifact pack:
 - `report.json` — machine-readable output
 - `dashboard.html` — interactive exploration
 - `00_summary/MERGE_GATE.json` — gate automation
+- `00_summary/PROVENANCE.json` — what the pack judged, and which tree each check read
 
 ## Usage
 
@@ -178,6 +179,7 @@ step.
 | `report.json` | Machine-readable findings |
 | `dashboard.html` | Visual summary of the analysis |
 | `00_summary/MERGE_GATE.json` | Pass/fail gate for automation |
+| `00_summary/PROVENANCE.json` | Commits, working-tree state, and the tree each check scanned |
 | `INLINE_FINDINGS.sarif` | Per-finding annotations (optional) |
 
 The merge decision is a single enum — `PASS`, `CONDITIONAL`, or `BLOCK` — so both humans and automation read one truth. See [`docs/contracts/merge_gate.md`](docs/contracts/merge_gate.md).

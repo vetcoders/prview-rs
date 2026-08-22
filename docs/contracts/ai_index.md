@@ -42,7 +42,15 @@ The reading order must always include references to:
 
 - `00_summary/MERGE_GATE.md`
 - `00_summary/MERGE_GATE.json`
+- `00_summary/PROVENANCE.json`
 - `PR_REVIEW.md`
+
+`PROVENANCE.json` follows the gate data directly: a verdict is only as good as
+the substrate it was computed on, so the reading order places what was judged
+(target and base commits, working-tree state, the tree each check actually
+scanned) next to the judgement itself. It is written after `AI_INDEX.md` and is
+mandatory for every pack, so the reference is unconditional rather than
+existence-guarded.
 
 The deeper-context section must always include references to:
 

@@ -504,17 +504,20 @@ pub(crate) fn check_id_is_baseline_signal(check_id: &str) -> bool {
 /// current state, so there is no diff baseline a finding can "predate": the
 /// downgrade must never fire regardless of tree shape (R3-14).
 ///
-/// On any inability to inspect the repo we default to the permissive "clean local
-/// checkout" shape, preserving the historical downgrade behaviour rather than
-/// distrusting a repo we cannot read.
+/// On any inability to inspect the repo we default to the permissive "local
+/// checkout is the target" shape, preserving the historical downgrade behaviour
+/// rather than distrusting a repo we cannot read. That default does NOT extend to
+/// cleanliness: a tree whose status could not be read is unknown, not clean, and
+/// an unknown tree never unlocks the downgrade.
 #[derive(Debug, Clone)]
 pub(crate) struct CleanComparison {
     /// `head == target`: the local working tree IS the analysed target, so every
     /// check scanned the target directly.
     target_is_checkout: bool,
     /// When the local checkout is the target, whether it is free of staged,
-    /// unstaged, and untracked changes.
-    worktree_clean: bool,
+    /// unstaged, and untracked changes. `None` means the status could not be
+    /// read: not a licence to trust the tree, so the downgrade stays off.
+    worktree_clean: Option<bool>,
     /// `--current-only`: the run has no diff baseline, so no out-of-diff row can
     /// be proven pre-existing and the downgrade is disabled entirely (R3-14).
     current_only: bool,
@@ -539,12 +542,12 @@ impl CleanComparison {
     /// checks run and before any artifact is written, otherwise an in-repo
     /// `--output-dir` or a check that drops an untracked cache makes a clean
     /// source scan look "dirty" and blocks the pre-existing downgrade. See
-    /// [`capture_worktree_clean`].
+    /// [`capture_worktree_provenance`].
     pub(crate) fn resolve(
         config: &Config,
         resolved_target: &crate::git::ResolvedRef,
         resolved_bases: &[crate::git::ResolvedRef],
-        worktree_clean: bool,
+        worktree_clean: Option<bool>,
         diffs: &[crate::git::Diff],
     ) -> Self {
         let has_base_diff = has_resolvable_base_diff(resolved_target, resolved_bases);
@@ -561,8 +564,9 @@ impl CleanComparison {
                 configs_changed,
             },
             // Repo unreadable: preserve the historical downgrade by treating the
-            // target as the local checkout. `worktree_clean` was itself captured
-            // permissively (errors resolve to clean), so it stays consistent.
+            // target as the local checkout. Whether the downgrade actually fires
+            // is then decided by `worktree_clean`, which is `Some(true)` only for
+            // a tree whose status was really read.
             None => CleanComparison {
                 target_is_checkout: true,
                 worktree_clean,
@@ -594,9 +598,9 @@ impl CleanComparison {
             return false;
         }
         if self.target_is_checkout {
-            // Local checkout is the target for every check; only a clean tree can
-            // be trusted (R2-9).
-            self.worktree_clean
+            // Local checkout is the target for every check; only a tree PROVEN
+            // clean can be trusted (R2-9). An unread status is not proof.
+            self.worktree_clean == Some(true)
         } else {
             // Remote target: only checks that scanned the target snapshot qualify;
             // everything else scanned the local checkout, a different tree (R3-16).
@@ -608,7 +612,7 @@ impl CleanComparison {
     pub(crate) fn for_test(target_is_checkout: bool, worktree_clean: bool) -> Self {
         CleanComparison {
             target_is_checkout,
-            worktree_clean,
+            worktree_clean: Some(worktree_clean),
             current_only: false,
             has_base_diff: true,
             configs_changed: std::collections::BTreeSet::new(),
@@ -619,7 +623,7 @@ impl CleanComparison {
     pub(crate) fn for_test_current_only() -> Self {
         CleanComparison {
             target_is_checkout: true,
-            worktree_clean: true,
+            worktree_clean: Some(true),
             current_only: true,
             has_base_diff: true,
             configs_changed: std::collections::BTreeSet::new(),
@@ -630,7 +634,7 @@ impl CleanComparison {
     pub(crate) fn for_test_no_base_diff() -> Self {
         CleanComparison {
             target_is_checkout: true,
-            worktree_clean: true,
+            worktree_clean: Some(true),
             current_only: false,
             has_base_diff: false,
             configs_changed: std::collections::BTreeSet::new(),
@@ -641,7 +645,7 @@ impl CleanComparison {
     pub(crate) fn for_test_config_changed(owners: &[&'static str]) -> Self {
         CleanComparison {
             target_is_checkout: true,
-            worktree_clean: true,
+            worktree_clean: Some(true),
             current_only: false,
             has_base_diff: true,
             configs_changed: owners.iter().copied().collect(),
@@ -727,38 +731,451 @@ fn has_resolvable_base_diff(
 /// Since A2, the other file-scoped linters (`ruff`, `eslint`, `stylelint`) run
 /// through `plan_check_run`, which materialises a worktree snapshot of the target
 /// and scans there in `--pr`/`--remote` mode — so their out-of-diff findings also
-/// genuinely predate the target diff and may be downgraded. `rustfmt` and
-/// `cargo_audit` are deliberately excluded: they run at `cargo_cache_root` (the
-/// local checkout), a *different* tree than the target, so their out-of-diff rows
-/// prove nothing about the target diff and must NOT be downgraded (R3-16).
+/// genuinely predate the target diff and may be downgraded.
+///
+/// `rustfmt` and `cargo_audit` were originally excluded because they ran at the
+/// local checkout (R3-16). They now scan the snapshot too, but stay off this
+/// list: widening the pre-existing downgrade is a gate-semantics decision, not a
+/// side effect of moving a check onto the reviewed substrate. Keeping them out
+/// is the conservative side — findings surface instead of being suppressed.
 fn check_scans_target_snapshot(check_id: &str) -> bool {
     matches!(check_id, "semgrep_scan" | "ruff" | "eslint" | "stylelint")
 }
 
-/// Capture whether the working tree at `repo_root` is clean, for freezing the
-/// value BEFORE any check runs or artifact is written (R4-19). Cleanliness read
-/// after the run reflects prview/tool-generated files (an in-repo `--output-dir`
-/// or an untracked check cache), not the source state that was scanned — which
-/// would wrongly mark a clean run "dirty" and suppress the pre-existing
-/// downgrade. Errors resolve to clean to keep the permissive default.
-pub(crate) fn capture_worktree_clean(repo_root: &std::path::Path) -> bool {
-    !worktree_has_uncommitted_changes(repo_root)
+/// Working-tree state frozen at the start of a run: whether the tree was clean,
+/// and a fingerprint of exactly what was dirty.
+///
+/// Both halves come from ONE status read, so the pack can never claim a clean
+/// tree next to a digest of uncommitted changes.
+#[derive(Debug, Clone, Default)]
+pub struct WorktreeProvenance {
+    /// No staged, unstaged, or untracked changes at capture time. `None` when
+    /// the status could not be read — cleanliness unestablished, never assumed.
+    pub clean: Option<bool>,
+    /// `sha256:<hex>` over the canonical `XY <path>` rendering of the status
+    /// PLUS the current bytes of every dirty path (see
+    /// [`render_status_fingerprint`]). `None` when the repository could not be
+    /// inspected — an unknown fingerprint stays visibly unknown.
+    pub status_digest: Option<String>,
 }
 
-/// True when the working tree at `repo_root` has staged, unstaged, or untracked
-/// changes. Errors resolve to `false` (treat as clean) to preserve the existing
-/// downgrade behaviour when the repo cannot be inspected.
-fn worktree_has_uncommitted_changes(repo_root: &std::path::Path) -> bool {
+/// Read the working tree at `repo_root` once and derive both the cleanliness
+/// flag and the status digest.
+///
+/// Called to freeze the value BEFORE any check runs or artifact is written
+/// (R4-19). Cleanliness read after the run reflects prview/tool-generated files
+/// (an in-repo `--output-dir` or an untracked check cache), not the source state
+/// that was scanned — which would wrongly mark a clean run "dirty" and suppress
+/// the pre-existing downgrade.
+///
+/// The two failure modes are NOT the same and must not resolve alike:
+///
+/// - no git repository at all: nothing can be uncommitted, and a run without a
+///   repo has no diff baseline either, so the downgrade is already disabled by
+///   `has_base_diff`. `Some(true)` preserves the historical permissive shape;
+/// - a repository whose status cannot be read (unreadable or malformed index):
+///   cleanliness was NOT established. Reporting `true` there certifies a tree
+///   nobody inspected — it reaches `PROVENANCE.json.worktree.clean` as a fact
+///   and lets `CleanComparison` downgrade out-of-diff failures to pre-existing.
+///   That is the one direction this record exists to prevent, so it stays
+///   `None`: unknown, and treated as untrusted.
+pub(crate) fn capture_worktree_provenance(repo_root: &std::path::Path) -> WorktreeProvenance {
+    use sha2::{Digest, Sha256};
+
     let Ok(repo) = git2::Repository::discover(repo_root) else {
-        return false;
+        return WorktreeProvenance {
+            clean: Some(true),
+            status_digest: None,
+        };
     };
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .renames_head_to_index(true);
-    repo.statuses(Some(&mut opts))
-        .map(|statuses| !statuses.is_empty())
-        .unwrap_or(false)
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+        return WorktreeProvenance {
+            clean: None,
+            status_digest: None,
+        };
+    };
+
+    let workdir = repo.workdir().map(|dir| dir.to_path_buf());
+    let mut budget = FingerprintBudget::new(FINGERPRINT_BYTE_BUDGET);
+    let fingerprint = render_status_fingerprint(&statuses, workdir.as_deref(), 0, &mut budget);
+    let mut hasher = Sha256::new();
+    hasher.update(fingerprint.as_bytes());
+
+    WorktreeProvenance {
+        clean: Some(statuses.is_empty()),
+        status_digest: Some(format!("sha256:{:x}", hasher.finalize())),
+    }
+}
+
+/// The status rendering plus the current CONTENT of every dirty path.
+///
+/// The status set alone cannot tell two runs apart: editing the same tracked
+/// file to different text leaves the same `M <path>` line, so a status-only
+/// digest claimed two materially different substrates were the same one. Each
+/// entry therefore carries a fingerprint of the bytes on disk right now:
+/// `blob:<len>:<sha256>` for a regular file, the hashed target for a symlink,
+/// `dir` for an ordinary directory, `gitlink:…` for a nested repository (see
+/// [`nested_repo_fingerprint`]), `absent` for a deleted path and `unreadable`
+/// when the bytes cannot be read.
+///
+/// Only the dirty subset is read — a clean tree hashes nothing, and every scan
+/// prview runs afterwards (semgrep, loctree, the language checks) reads far more
+/// of the tree than this does.
+fn render_status_fingerprint(
+    statuses: &git2::Statuses<'_>,
+    workdir: Option<&Path>,
+    depth: usize,
+    budget: &mut FingerprintBudget,
+) -> String {
+    // Sort BEFORE reading. The budget is spent in iteration order, so which
+    // entries are hashed and which are stat-fingerprinted must not depend on
+    // the order git happens to hand them over: the same tree has to produce the
+    // same digest every time. The key is the status pair plus the path, both
+    // unique per entry, so the resulting order is the one sorting the rendered
+    // lines produced before.
+    let mut entries: Vec<(String, Option<std::path::PathBuf>)> = statuses
+        .iter()
+        .map(|entry| {
+            // Git stores names as bytes. `path()` gives up on anything that is
+            // not UTF-8, which rendered every such entry as one literal
+            // placeholder and looked up its content at a path that does not
+            // exist: two runs dirtying different unrepresentable names, or the
+            // same one differently, produced the same digest.
+            let bytes = entry.path_bytes();
+            let key = format!(
+                "{} {}",
+                status_codes(entry.status()),
+                status_path_label(bytes)
+            );
+            let path = match (workdir, os_relative_path(bytes)) {
+                (Some(dir), Some(relative)) => Some(dir.join(relative)),
+                _ => None,
+            };
+            (key, path)
+        })
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    entries
+        .into_iter()
+        .map(|(key, path)| {
+            let content = match path {
+                Some(path) => content_fingerprint(&path, depth, budget),
+                None => "unknown".to_string(),
+            };
+            format!("{key}\0{content}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How many bytes one capture may read to fingerprint dirty content.
+///
+/// The read used to be unbounded, and `recurse_untracked_dirs` means an
+/// untracked directory is expanded entry by entry: one forgotten dataset, model
+/// checkpoint or vendored bundle in the working tree and prview hashed gigabytes
+/// before the first check even started — and this capture is deliberately taken
+/// before any of them run, so nobody is doing anything else meanwhile.
+///
+/// Measured on this crate's release build, 256 MiB of `sha256` takes ~1 s
+/// (0.94 s / 1.55 s / 1.14 s over three passes on a warm cache) and ~15 s in a
+/// debug build. A second of ceiling for a step nobody waits on deliberately is
+/// the trade: ordinary review-sized dirt (a handful of edited sources) is
+/// nowhere near it, so no existing digest changes, and everything past it is
+/// described rather than read.
+const FINGERPRINT_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// The read allowance left in one capture, shared across every dirty entry and
+/// every nested repository the walk descends into — the bound is on the whole
+/// digest, not on each file.
+struct FingerprintBudget {
+    remaining: u64,
+}
+
+impl FingerprintBudget {
+    fn new(bytes: u64) -> Self {
+        Self { remaining: bytes }
+    }
+
+    /// Reserve `len` bytes, or refuse. A file too large for what is left is
+    /// never read *partially*: a half-hashed file would be rendered as a whole
+    /// one, which is precisely the collision this digest exists to avoid.
+    /// Refusing also leaves the allowance intact, so the small files that follow
+    /// a huge one are still fingerprinted by content.
+    fn take(&mut self, len: u64) -> bool {
+        match self.remaining.checked_sub(len) {
+            Some(left) => {
+                self.remaining = left;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// How a dirty path is written into the digest.
+///
+/// UTF-8 names appear as themselves. A name that is not UTF-8 appears as the
+/// hash of its bytes, so two different unrepresentable names stay two different
+/// lines — the placeholder they used to share made them one.
+fn status_path_label(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    match std::str::from_utf8(bytes) {
+        Ok(path) => path.to_string(),
+        Err(_) => {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            format!("<non-utf8:{:x}>", hasher.finalize())
+        }
+    }
+}
+
+/// A status entry's path as the OS names it, so a name git cannot render as
+/// UTF-8 still resolves to the file it points at.
+///
+/// Windows paths are UTF-16 with no byte-oriented API to rebuild them from, so
+/// an unrepresentable name there stays unreadable rather than guessed at — the
+/// path still contributes to the digest through its hashed bytes.
+fn os_relative_path(bytes: &[u8]) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes)
+            .ok()
+            .map(std::path::PathBuf::from)
+    }
+}
+
+/// Fingerprint the bytes currently at `path`, without loading the file whole.
+///
+/// `budget` is the run-wide allowance for bytes actually read (see
+/// [`FingerprintBudget`]); a file that does not fit is described from its
+/// metadata instead.
+fn content_fingerprint(path: &Path, depth: usize, budget: &mut FingerprintBudget) -> String {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        // The path is gone (a deletion) — that IS its state.
+        return "absent".to_string();
+    };
+
+    if meta.is_symlink() {
+        return symlink_fingerprint(path, budget);
+    }
+    if meta.is_dir() {
+        return nested_repo_fingerprint(path, depth, budget);
+    }
+    if !meta.is_file() {
+        // A fifo, socket or device node in the worktree. Git lists it like any
+        // other untracked entry, and opening it is at best meaningless and at
+        // worst a permanent block on a reader that never gets a writer.
+        return "special".to_string();
+    }
+
+    file_fingerprint(path, meta.len(), budget)
+}
+
+/// Fingerprint a symlink by both halves of what it is.
+///
+/// The link's own content — as git stores it — is the target *path*, and a link
+/// retargeted at identical bytes is still a different tree. But everything the
+/// checks read through it lives at the far end, and hashing the pathname alone
+/// let all of that change between two runs under one unchanged digest.
+///
+/// The target is resolved exactly one logical hop, through the link itself:
+/// `metadata` follows the whole chain, and a loop or a dangling link comes back
+/// as an error rather than a walk. Only a regular file is read; a directory is
+/// recorded as such without descending (an absolute link can leave the repo
+/// entirely), and a device or fifo is never opened.
+fn symlink_fingerprint(path: &Path, budget: &mut FingerprintBudget) -> String {
+    use sha2::{Digest, Sha256};
+
+    let Ok(target) = std::fs::read_link(path) else {
+        return "unreadable".to_string();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(target.as_os_str().as_encoded_bytes());
+    let link = format!("{:x}", hasher.finalize());
+
+    let reached = match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => file_fingerprint(path, meta.len(), budget),
+        Ok(meta) if meta.is_dir() => "dir".to_string(),
+        Ok(_) => "special".to_string(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => "absent".to_string(),
+        Err(_) => "unreadable".to_string(),
+    };
+
+    format!("symlink:{link}:{reached}")
+}
+
+/// Hash a regular file's bytes, or describe it from its metadata when reading
+/// it would blow the run's [`FingerprintBudget`].
+///
+/// `stat:` is deliberately a different word from `blob:`: it is not a content
+/// hash and must never be read as one. Two runs where an over-budget file
+/// changed while keeping both its size and its mtime do collide — a far
+/// narrower window than the constant "too big" marker an alternative would
+/// have used, which would have made *every* oversized file equal to every
+/// other.
+fn file_fingerprint(path: &Path, len: u64, budget: &mut FingerprintBudget) -> String {
+    use sha2::{Digest, Sha256};
+
+    if !budget.take(len) {
+        return stat_fingerprint(path, len);
+    }
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return "unreadable".to_string();
+    };
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut read: u64 = 0;
+    loop {
+        match std::io::Read::read(&mut file, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                read += n as u64;
+                hasher.update(&buf[..n]);
+                if read > len {
+                    // The file grew under the reader. Stop at what the budget
+                    // was granted for rather than following it indefinitely; a
+                    // partial hash would be labelled as a whole one.
+                    return stat_fingerprint(path, read);
+                }
+            }
+            Err(_) => return "unreadable".to_string(),
+        }
+    }
+    format!("blob:{read}:{:x}", hasher.finalize())
+}
+
+/// Describe a file that was not read: its size and modification time.
+fn stat_fingerprint(path: &Path, len: u64) -> String {
+    let mtime = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(|| "unknown".to_string(), |age| age.as_nanos().to_string());
+    format!("stat:{len}:{mtime}")
+}
+
+/// Fingerprint a directory that the status walk did not descend into.
+///
+/// Git never recurses into another repository: a submodule (or an embedded
+/// checkout) is ONE status entry, so the digest used to record nothing but "a
+/// directory is there". A submodule sitting on a different commit, or carrying
+/// uncommitted work, is a materially different tree for every scan that follows
+/// — and it fingerprinted identically, the collision this digest exists to
+/// prevent.
+///
+/// Its own repository answers both questions cheaply: `HEAD` names the commit,
+/// and one status walk says whether anything is uncommitted. That walk is only
+/// ever run for a directory the superproject ALREADY reported as dirty, so it
+/// costs nothing on a clean tree. Anything unreadable degrades to a coarser
+/// marker rather than a false match.
+///
+/// A dirty nested repository is fingerprinted the same way the superproject is,
+/// recursively: `HEAD` plus a clean/dirty flag still collides, because a
+/// submodule parked on one commit with two different sets of uncommitted edits
+/// is two different trees for every scan that follows. The recursion reads only
+/// the nested repository's own dirty subset, so the bound is the same one that
+/// makes the top-level walk affordable, and it stops at
+/// [`NESTED_REPO_MAX_DEPTH`] — beyond that the coarse `dirty` marker returns,
+/// which is exactly what this function reported before, never something weaker.
+fn nested_repo_fingerprint(path: &Path, depth: usize, budget: &mut FingerprintBudget) -> String {
+    use sha2::{Digest, Sha256};
+
+    // `open`, not `discover`: a plain directory must not resolve to the
+    // superproject and report ITS head as the directory's content.
+    let Ok(repo) = git2::Repository::open(path) else {
+        // Not a repository — an ordinary directory carries no content of its
+        // own, and the status walk lists whatever is inside it separately.
+        return "dir".to_string();
+    };
+
+    let head = repo
+        .head()
+        .ok()
+        .and_then(|head| head.target())
+        .map_or_else(|| "unborn".to_string(), |oid| oid.to_string());
+
+    let mut opts = git2::StatusOptions::new();
+    // Untracked directories ARE expanded, as at the top level: the entries are
+    // what gets hashed, so an unexpanded directory would hide exactly the
+    // difference this fingerprint is here to catch.
+    opts.include_untracked(true).recurse_untracked_dirs(true);
+    let statuses = match repo.statuses(Some(&mut opts)) {
+        Ok(statuses) => statuses,
+        Err(_) => return format!("gitlink:{head}:unknown"),
+    };
+    if statuses.is_empty() {
+        return format!("gitlink:{head}:clean");
+    }
+    if depth >= NESTED_REPO_MAX_DEPTH {
+        return format!("gitlink:{head}:dirty");
+    }
+
+    // The nested walk spends the SAME allowance as the top level: the bound is
+    // on one capture's total reading, not on each repository it descends into.
+    let inner = render_status_fingerprint(&statuses, repo.workdir(), depth + 1, budget);
+    let mut hasher = Sha256::new();
+    hasher.update(inner.as_bytes());
+    format!("gitlink:{head}:dirty:{:x}", hasher.finalize())
+}
+
+/// How many levels of nested repository the digest descends into.
+///
+/// A submodule holding a submodule is ordinary; a chain deep enough to matter
+/// for cost is not, and a cap keeps a pathological (or symlink-looped) nesting
+/// from turning one status read into an unbounded walk.
+const NESTED_REPO_MAX_DEPTH: usize = 3;
+
+/// The `XY` status pair in the shape of `git status --porcelain`: index status
+/// first, worktree status second, an untracked entry as `??`.
+///
+/// This is a canonical *rendering*, not a capture of the CLI's stdout — it is
+/// part of a fingerprint, so it must be stable across git versions and locales
+/// rather than byte-identical to any one `git status` invocation.
+fn status_codes(status: git2::Status) -> String {
+    use git2::Status;
+
+    if status.contains(Status::WT_NEW) && !status.intersects(Status::INDEX_NEW) {
+        return "??".to_string();
+    }
+    let index = if status.contains(Status::INDEX_NEW) {
+        'A'
+    } else if status.contains(Status::INDEX_MODIFIED) {
+        'M'
+    } else if status.contains(Status::INDEX_DELETED) {
+        'D'
+    } else if status.contains(Status::INDEX_RENAMED) {
+        'R'
+    } else if status.contains(Status::INDEX_TYPECHANGE) {
+        'T'
+    } else {
+        ' '
+    };
+    let worktree = if status.contains(Status::WT_NEW) {
+        'A'
+    } else if status.contains(Status::WT_MODIFIED) {
+        'M'
+    } else if status.contains(Status::WT_DELETED) {
+        'D'
+    } else if status.contains(Status::WT_RENAMED) {
+        'R'
+    } else if status.contains(Status::WT_TYPECHANGE) {
+        'T'
+    } else {
+        ' '
+    };
+    format!("{index}{worktree}")
 }
 
 pub(crate) fn classify_quality_failure(
@@ -1599,24 +2016,257 @@ mod tests {
     }
 
     #[test]
-    fn capture_worktree_clean_reflects_tree_at_capture_time() {
+    fn capture_worktree_provenance_reflects_tree_at_capture_time() {
         // R4-19: cleanliness is read from the live tree, so capturing BEFORE
         // tool output (clean) and AFTER it (an untracked artifact/cache) yield
         // different answers — the reason the value must be frozen up front
         // rather than re-read once artifacts 10/20/30 have been written.
         let tmp = tempfile::tempdir().expect("tempdir");
         git2::Repository::init(tmp.path()).expect("init repo");
-        assert!(
-            capture_worktree_clean(tmp.path()),
+        assert_eq!(
+            capture_worktree_provenance(tmp.path()).clean,
+            Some(true),
             "a freshly initialised repo has a clean tree"
         );
 
         // A file dropped after capture (an in-repo --output-dir or a check
         // cache) makes a *later* read dirty; the frozen early value must not.
         std::fs::write(tmp.path().join("prview-output.txt"), b"artifact").expect("write");
-        assert!(
-            !capture_worktree_clean(tmp.path()),
+        assert_eq!(
+            capture_worktree_provenance(tmp.path()).clean,
+            Some(false),
             "an untracked file makes a fresh read dirty"
+        );
+    }
+
+    /// Git names files in bytes. A name that is not UTF-8 used to render as one
+    /// literal placeholder whose content lookup resolved to `absent`, so two
+    /// runs dirtying different such names — or the same name with different
+    /// bytes in it — claimed the same substrate.
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_dirty_paths_are_told_apart() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // Labels are told apart everywhere, including on filesystems that
+        // refuse such names outright (APFS rejects them with EILSEQ).
+        assert_ne!(
+            status_path_label(b"bad-\xff.txt"),
+            status_path_label(b"bad-\xfe.txt"),
+            "two different unrepresentable names must not share one line",
+        );
+        assert_eq!(
+            status_path_label(b"src/main.rs"),
+            "src/main.rs",
+            "a representable path is written as itself",
+        );
+
+        let digest_for = |name: &[u8], body: &[u8]| -> Option<String> {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            git2::Repository::init(tmp.path()).expect("init repo");
+            let path = tmp.path().join(std::ffi::OsStr::from_bytes(name));
+            // The filesystem may reject the name (APFS enforces UTF-8); the
+            // digest question only exists where it does not.
+            std::fs::write(&path, body).ok()?;
+            capture_worktree_provenance(tmp.path()).status_digest
+        };
+
+        let (Some(first), Some(second), Some(recontented)) = (
+            digest_for(b"bad-\xff.txt", b"one"),
+            digest_for(b"bad-\xfe.txt", b"one"),
+            digest_for(b"bad-\xff.txt", b"two"),
+        ) else {
+            return;
+        };
+        assert_ne!(
+            first, second,
+            "two different unrepresentable names are two different substrates",
+        );
+        assert_ne!(
+            first, recontented,
+            "the same unrepresentable name with different content is a different substrate",
+        );
+    }
+
+    /// A dirty symlink used to be fingerprinted by the *pathname* it points at,
+    /// so everything the checks would actually read through it — the bytes at
+    /// the far end — could change between two runs while the digest stayed
+    /// identical. Two materially different substrates, one fingerprint: exactly
+    /// the collision this digest exists to prevent.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_is_fingerprinted_by_what_it_reaches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("target.txt");
+        let link = tmp.path().join("link.txt");
+        std::fs::write(&target, b"one").expect("write target");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let mut budget = FingerprintBudget::new(FINGERPRINT_BYTE_BUDGET);
+        let before = content_fingerprint(&link, 0, &mut budget);
+        std::fs::write(&target, b"two").expect("rewrite target");
+        let after = content_fingerprint(&link, 0, &mut budget);
+        assert_ne!(
+            before, after,
+            "content reached through the link is part of the substrate",
+        );
+
+        // The link's own identity still counts: a link of the same name
+        // pointing somewhere else is a different tree even when the two targets
+        // happen to hold the same bytes.
+        let other = tmp.path().join("other.txt");
+        std::fs::write(&other, b"two").expect("write other");
+        std::fs::remove_file(&link).expect("drop link");
+        std::os::unix::fs::symlink(&other, &link).expect("relink");
+        assert_ne!(
+            after,
+            content_fingerprint(&link, 0, &mut budget),
+            "a link retargeted at identical bytes is still a different link",
+        );
+
+        // A dangling link is a state of its own, and nothing is read for it.
+        std::fs::remove_file(&other).expect("drop other");
+        assert!(
+            content_fingerprint(&link, 0, &mut budget).ends_with("absent"),
+            "a link with nothing at the far end must say so",
+        );
+    }
+
+    /// A symlink's fingerprint used to be the hash of the path it names, so
+    /// the bytes a scan actually reads through it could change completely while
+    /// the digest swore the substrate was identical.
+    #[test]
+    #[cfg(unix)]
+    fn a_dirty_symlinks_content_is_part_of_the_substrate() {
+        let outside = tempfile::tempdir().expect("target tempdir");
+        let target = outside.path().join("payload.txt");
+        let tmp = tempfile::tempdir().expect("repo tempdir");
+        git2::Repository::init(tmp.path()).expect("init repo");
+
+        std::fs::write(&target, b"one").expect("write target");
+        std::os::unix::fs::symlink(&target, tmp.path().join("link")).expect("symlink");
+        let first = capture_worktree_provenance(tmp.path())
+            .status_digest
+            .expect("digest");
+
+        // Same link, same name, same length — only the bytes behind it differ.
+        std::fs::write(&target, b"two").expect("rewrite target");
+        let second = capture_worktree_provenance(tmp.path())
+            .status_digest
+            .expect("digest");
+
+        assert_ne!(
+            first, second,
+            "the content reached through a dirty symlink is what the checks read",
+        );
+    }
+
+    /// The digest is taken before any check runs, so its reading is the review's
+    /// own latency. It used to be unbounded: one untracked dataset or vendored
+    /// bundle in the dirty subset and prview hashed it whole before starting.
+    #[test]
+    fn fingerprinting_stops_reading_once_the_budget_is_spent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let big = tmp.path().join("big.bin");
+        std::fs::write(&big, vec![7u8; 4096]).expect("write big");
+
+        // Budget below the file's size: it is described, not read.
+        let mut spent = FingerprintBudget::new(1024);
+        let described = content_fingerprint(&big, 0, &mut spent);
+        assert!(
+            described.starts_with("stat:4096:"),
+            "an over-budget file is described from its metadata, got {described}",
+        );
+        assert_eq!(
+            spent.remaining, 1024,
+            "a refused read must leave the allowance intact",
+        );
+
+        // A small file after it still gets a real content hash — the refusal
+        // bounds the reading, it does not blind the rest of the capture.
+        let small = tmp.path().join("small.txt");
+        std::fs::write(&small, b"hello").expect("write small");
+        assert!(
+            content_fingerprint(&small, 0, &mut spent).starts_with("blob:5:"),
+            "the entries after an oversized one are still hashed",
+        );
+
+        // With room, the same file is hashed as before — no existing digest
+        // changes because of the bound.
+        let mut ample = FingerprintBudget::new(FINGERPRINT_BYTE_BUDGET);
+        assert!(
+            content_fingerprint(&big, 0, &mut ample).starts_with("blob:4096:"),
+            "a file that fits the budget is still fingerprinted by content",
+        );
+        assert_eq!(
+            ample.remaining,
+            FINGERPRINT_BYTE_BUDGET - 4096,
+            "a granted read must be charged to the allowance",
+        );
+
+        // `stat:` is not a constant marker: two oversized files of different
+        // sizes stay distinguishable, where one "too big" token would have made
+        // every large file equal to every other.
+        let bigger = tmp.path().join("bigger.bin");
+        std::fs::write(&bigger, vec![7u8; 8192]).expect("write bigger");
+        assert_ne!(
+            described,
+            content_fingerprint(&bigger, 0, &mut spent),
+            "two different oversized files must not collapse into one line",
+        );
+    }
+
+    /// The budget is spent entry by entry, so which files get hashed and which
+    /// get described depends on the order they are visited — and the digest of
+    /// one unchanged tree must not depend on the order git happens to report.
+    #[test]
+    fn one_tree_digests_the_same_way_on_every_capture() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git2::Repository::init(tmp.path()).expect("init repo");
+        for name in ["a.bin", "b.bin", "c.bin", "d.bin"] {
+            std::fs::write(tmp.path().join(name), vec![1u8; 4096]).expect("write");
+        }
+
+        let first = capture_worktree_provenance(tmp.path()).status_digest;
+        let second = capture_worktree_provenance(tmp.path()).status_digest;
+        assert!(first.is_some());
+        assert_eq!(
+            first, second,
+            "the same tree must fingerprint identically on every capture",
+        );
+    }
+
+    #[test]
+    fn an_unreadable_worktree_status_is_never_certified_clean() {
+        // A repository whose index cannot be parsed answers NOTHING about
+        // cleanliness. Reporting `clean: true` there put a fact in
+        // PROVENANCE.json that nobody established, and unlocked the pre-existing
+        // downgrade on a tree that was never inspected.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git2::Repository::init(tmp.path()).expect("init repo");
+        std::fs::write(tmp.path().join(".git/index"), b"definitely not an index")
+            .expect("corrupt the index");
+
+        let provenance = capture_worktree_provenance(tmp.path());
+        assert_eq!(
+            provenance.clean, None,
+            "an unreadable status is unknown, not clean",
+        );
+        assert!(
+            provenance.status_digest.is_none(),
+            "no status was read, so there is nothing to fingerprint",
+        );
+
+        let unknown = CleanComparison {
+            target_is_checkout: true,
+            worktree_clean: None,
+            current_only: false,
+            has_base_diff: true,
+            configs_changed: std::collections::BTreeSet::new(),
+        };
+        assert!(
+            !unknown.applies_to("clippy"),
+            "an unverified tree must not downgrade out-of-diff failures to pre-existing",
         );
     }
 
