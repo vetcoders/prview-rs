@@ -68,7 +68,7 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
 
     if plan.scan_dir == config.repo_root {
         return Ok(CargoRun {
-            cwd: local_root,
+            cwd: manifest_stays_in_root(local_root)?,
             env: Vec::new(),
             _snapshot: plan._snapshot,
         });
@@ -113,6 +113,68 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
     })
 }
 
+/// The directory a cargo check would have run in, given a scan dir that already
+/// exists.
+///
+/// Shares its resolution with [`plan_cargo_run`] rather than repeating it, and
+/// materialises nothing: the caller is the error path in the dispatcher, which
+/// has the run-wide snapshot (or the local root) in hand and only needs to know
+/// where within it the command was headed. Collapsing every cargo run to the
+/// snapshot root there would report a directory the command did not run in —
+/// wrong in exactly the workspace-member case the cache key already learned to
+/// distinguish.
+///
+/// Best effort by construction: a root the reviewed tree cannot offer falls back
+/// to the scan dir, which is the closest true statement available.
+pub(super) fn planned_cargo_cwd(config: &Config, scan_dir: &Path) -> PathBuf {
+    if scan_dir == config.repo_root {
+        return cargo_cache_root(config).to_path_buf();
+    }
+    match resolve_reviewed_cargo_root(config) {
+        ReviewedCargoRoot::Resolved(relative) => relative
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .fold(scan_dir.to_path_buf(), |acc, part| acc.join(part)),
+        ReviewedCargoRoot::Unavailable(_) => scan_dir.to_path_buf(),
+        ReviewedCargoRoot::Unknown => {
+            match snapshot_cargo_root(cargo_cache_root(config), &config.repo_root, scan_dir) {
+                Some(mapped) => reviewed_cargo_root(mapped, scan_dir),
+                None => scan_dir.to_path_buf(),
+            }
+        }
+    }
+}
+
+/// Refuse a manifest that is a link out of the directory cargo will run in.
+///
+/// [`contained_in_snapshot`] documents that it also covers a local review, but
+/// it never sees one: the local plan returns before reaching it. A checkout that
+/// tracks `Cargo.toml` as a link to an external manifest therefore had cargo
+/// build a foreign project while provenance recorded `local-clean` — the same
+/// escape the reviewed-tree guard closes for off-`HEAD` runs.
+///
+/// Containment is judged against the cargo root itself, not the repository. An
+/// externally configured `cargo_root` is a legitimate local setup (recorded as a
+/// `foreign` substrate, and refused only for off-`HEAD` reviews); what must not
+/// happen is cargo being walked out of the project it was pointed at.
+fn manifest_stays_in_root(cwd: PathBuf) -> Result<PathBuf> {
+    let manifest = cwd.join("Cargo.toml");
+    let (Ok(resolved), Ok(root)) = (manifest.canonicalize(), cwd.canonicalize()) else {
+        // Nothing there yet: cargo reporting a missing manifest is a truthful
+        // local failure, not a foreign project's verdict.
+        return Ok(cwd);
+    };
+    if !resolved.starts_with(&root) {
+        anyhow::bail!(
+            "the manifest at {} resolves outside the cargo root ({}), so a verdict earned there \
+             would describe another project",
+            manifest.display(),
+            cwd.display(),
+        );
+    }
+    Ok(cwd)
+}
+
 /// Refuse a cargo root that leaves the reviewed snapshot.
 ///
 /// The lexical check in [`repo_relative_cargo_root`] only sees the path the
@@ -128,8 +190,9 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
 /// and cargo reads the manifest, not the directory. Both are therefore resolved.
 /// The tree-level guard in [`resolve_reviewed_cargo_root`] already rejects such a
 /// manifest for an off-HEAD review; this is the same refusal on the materialised
-/// bytes, for the paths that guard cannot reach (a local review, or a repo whose
-/// tree git could not be asked about).
+/// bytes, for the paths that guard cannot reach (a repo whose tree git could not
+/// be asked about). A LOCAL review never reaches this function — it returns from
+/// `plan_cargo_run` earlier — and is covered by [`manifest_stays_in_root`].
 ///
 /// A path that cannot be canonicalised (nothing there yet) is left alone: cargo
 /// reporting a missing directory is a truthful local failure, not a foreign
@@ -2339,6 +2402,56 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             err.to_string().contains("outside the reviewed snapshot"),
             "unexpected error: {err}",
         );
+    }
+
+    /// A LOCAL review reaches none of the reviewed-tree guards: `plan_cargo_run`
+    /// returns before them. A checkout tracking `Cargo.toml` as a link to an
+    /// external manifest therefore had cargo build a foreign project while
+    /// provenance recorded the cwd as the local checkout.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_local_manifest_link_out_of_the_root_is_refused() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        std::fs::create_dir_all(repo_root.path().join("src")).expect("src");
+        std::fs::write(repo_root.path().join("src/main.rs"), "fn main() {}\n").expect("main");
+        std::os::unix::fs::symlink(
+            outside.path().join("Cargo.toml"),
+            repo_root.path().join("Cargo.toml"),
+        )
+        .expect("symlink");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a local manifest resolving outside its root must not be built");
+        };
+        assert!(
+            err.to_string().contains("outside the cargo root"),
+            "unexpected error: {err}",
+        );
+    }
+
+    /// The guard must not refuse an ordinary local project, nor an externally
+    /// configured `cargo_root` whose own manifest sits inside it — that is a
+    /// legitimate local setup, recorded as a `foreign` substrate.
+    #[tokio::test]
+    async fn a_local_manifest_inside_its_root_is_accepted() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        assert_eq!(plan_cargo_run(&config).expect("plan").cwd, repo_root.path());
+
+        let external = tempfile::tempdir().expect("external tempdir");
+        write_crate(external.path(), true);
+        config.profile.cargo_root = Some(external.path().to_path_buf());
+        assert_eq!(plan_cargo_run(&config).expect("plan").cwd, external.path());
     }
 
     /// A member root that the reviewed commit does not have still counts as a

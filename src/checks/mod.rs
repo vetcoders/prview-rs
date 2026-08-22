@@ -730,16 +730,22 @@ const NO_COMMAND_RECORDED: &str = "<no command recorded>";
 /// own worktree, which is gone by the time the error surfaces, and inventing a
 /// path for it would put a fabricated substrate in the manifest.
 ///
-/// For a cargo member the answer is the snapshot root rather than the member
-/// subdirectory. `target_sha` and `tree_state` are identical either way, and
-/// round 4 guarantees the member sits inside that root.
+/// A cargo check does not run at the scan root: a workspace member, or a crate
+/// the reviewed commit moved, sits in a subdirectory of it. That resolution is
+/// shared with `plan_cargo_run` rather than approximated here, so the manifest
+/// names the directory the command was actually headed for.
 fn errored_check_scan_dir(name: &str, config: &Config) -> Option<std::path::PathBuf> {
-    if let Some(scan_dir) = &config.scan_dir_override {
-        return uses_shared_scan_dir(name).then(|| scan_dir.clone());
-    }
-    off_head_target_commit(config)
-        .is_none()
-        .then(|| config.repo_root.clone())
+    let scan_dir = if let Some(scan_dir) = &config.scan_dir_override {
+        uses_shared_scan_dir(name).then(|| scan_dir.clone())?
+    } else {
+        off_head_target_commit(config)
+            .is_none()
+            .then(|| config.repo_root.clone())?
+    };
+    Some(match is_cargo_target_check(name) {
+        true => cargo::planned_cargo_cwd(config, &scan_dir),
+        false => scan_dir,
+    })
 }
 
 /// Provenance for a check that errored: no command, but the substrate it was
@@ -2389,6 +2395,66 @@ test result: ok. 2 passed; 0 failed
         assert_eq!(
             prov.command, NO_COMMAND_RECORDED,
             "the absence of a command must be stated, not invented",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_errored_cargo_check_reports_the_member_it_was_headed_for() {
+        // Reconstructing the substrate from the shared scan dir is right for a
+        // check that runs at the snapshot root, but a cargo workspace member
+        // runs one directory down. Collapsing every cargo run to the root
+        // reported a directory the command never entered.
+        use async_trait::async_trait;
+
+        struct TimingOutCargo;
+
+        #[async_trait]
+        impl Check for TimingOutCargo {
+            fn name(&self) -> &str {
+                "Cargo check"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                anyhow::bail!("cargo {TIMEOUT_MARKER} 600s")
+            }
+            fn cache_key(&self, _config: &Config) -> Option<String> {
+                None
+            }
+        }
+
+        let write_member = |root: &std::path::Path| {
+            let member = root.join("crates/core");
+            std::fs::create_dir_all(member.join("src")).expect("member");
+            std::fs::write(
+                member.join("Cargo.toml"),
+                "[package]\nname = \"m\"\nversion = \"0.0.0\"\n",
+            )
+            .expect("manifest");
+        };
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_member(repo_root.path());
+        write_member(scan_dir.path());
+
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().join("crates/core"));
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(tmp.path().to_path_buf(), true);
+        let result = execute_live_check(Box::new(TimingOutCargo), &config, &cache).await;
+
+        let prov = result
+            .provenance
+            .expect("an errored cargo check keeps its substrate");
+        assert_eq!(
+            prov.cwd,
+            scan_dir.path().join("crates/core").display().to_string(),
+            "the member the command was headed for, not the snapshot root",
         );
     }
 

@@ -72,7 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   materialising anything, while stating what it does not know — `command` reads
   `<no command recorded>`, and an off-`HEAD` check whose own worktree is already
   gone keeps no provenance rather than naming the local checkout it was not
-  reading.
+  reading. Cargo checks report the directory they were actually headed for
+  rather than the scan root: a workspace member, or a crate the reviewed commit
+  moved, runs one directory down, and that resolution is now shared with the
+  planner instead of collapsed away.
 - `Pytest` now runs in the reviewed target snapshot instead of `config.repo_root`.
   When reviewing a PR or a remote branch, `repo_root` still points at whatever is
   checked out locally, so pytest executed the *local* branch's tests and reported
@@ -146,6 +149,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest: git stores a symlink as a blob, so a plain tree lookup accepted it.
   A manifest must now be a regular file, and the containment check resolves the
   manifest alongside the directory for the cases the tree lookup cannot cover.
+  A **local** review is one of those cases and was reached by neither guard —
+  the local plan returns before the containment check runs — so a checkout
+  tracking `Cargo.toml` as a link to an external manifest had cargo build a
+  foreign project while provenance recorded the local checkout. The manifest is
+  now resolved against the cargo root before a local plan is returned; an
+  externally configured `cargo_root` whose own manifest sits inside it is still
+  a legitimate local setup and is unaffected.
 - A cargo root that the reviewed branch moved (a root crate pushed into
   `backend/`, a member renamed) is no longer projected into the snapshot
   verbatim. The locally detected path does not exist there, so cargo failed on a
