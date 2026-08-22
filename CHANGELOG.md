@@ -97,7 +97,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unrelated same-named addition landed in the same phantom scope and cancelled
   each other — the breaking change vanished from the report. The literal/comment
   scanner is shared with perf-regression test-context tracking (`rust_source`),
-  so both brace trackers agree on what counts as syntax.
+  so both brace trackers agree on what counts as syntax, block comments spanning
+  lines included.
+- Breaking-change detection no longer cancels a removal against a re-add under a
+  DIFFERENT `cfg`. `#[cfg(feature = "a")] pub struct Config;` replaced by the
+  same struct under feature `b` is an exact text match, so the pairing dropped
+  the removal — but `Config` really did disappear for anyone building with
+  feature `a`. The guard standing above a declaration is now part of its pairing
+  identity (whitespace-insensitive, so a reformatted attribute is not a
+  different predicate). A guard the diff never showed on one side stays unknown
+  and pairs as before, the same tolerance an unseen `mod` opener gets: the
+  attribute often sits on a context line, and reading "not shown" as "no cfg"
+  would turn ordinary re-adds into phantom removals.
+- A public declaration no longer ends at a delimiter inside its own literal.
+  `pub const TEMPLATE: &str = r#"{` opens a multi-line raw string, and reading
+  that `{` as the declaration's body opener finalized a truncated declaration —
+  identical on both diff sides, so the removal was cancelled and the literal
+  change the patch actually made produced no finding at all. Completion is now
+  judged on code only, and the accumulated text is scanned as a whole, so a
+  literal spanning continuation lines closes the declaration where it really
+  ends.
 - Multi-line public declarations are compared in full. `pub struct Config<` with
   a changed bound on the next line used to hide behind its identical opening
   line, because only that line was compared. Continuation lines are now

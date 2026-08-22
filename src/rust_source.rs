@@ -28,7 +28,8 @@ pub(crate) fn code_only(line: &str) -> Cow<'_, str> {
 /// A block comment is the one construct a per-line scanner cannot resolve on
 /// its own: `/* } */` spread over three lines hides a brace that never reaches
 /// the tracker as syntax. Consumers that walk a hunk in order keep one scanner
-/// for that walk, and start a fresh one where the text is not contiguous.
+/// for that walk and [`reset`](Self::reset) it at boundaries where the text is
+/// no longer contiguous.
 #[derive(Default)]
 pub(crate) struct SourceScanner {
     block_comment_depth: u32,
@@ -38,6 +39,12 @@ impl SourceScanner {
     /// The code part of `line`, continuing any block comment still open.
     pub(crate) fn code_only<'a>(&mut self, line: &'a str) -> Cow<'a, str> {
         scan(line, &mut self.block_comment_depth)
+    }
+
+    /// Forget a block comment left open: the next line is not contiguous with
+    /// the last one (a new hunk, a new file).
+    pub(crate) fn reset(&mut self) {
+        self.block_comment_depth = 0;
     }
 }
 
@@ -263,5 +270,16 @@ mod tests {
         );
         // Nothing is open any more, so the next line is ordinary code.
         assert_eq!(scanner.code_only("}"), "}");
+    }
+
+    #[test]
+    fn reset_forgets_a_comment_left_open() {
+        let mut scanner = SourceScanner::default();
+        assert_eq!(scanner.code_only("/* opened and never closed"), "");
+        scanner.reset();
+        assert_eq!(
+            scanner.code_only("pub struct Config {"),
+            "pub struct Config {"
+        );
     }
 }
