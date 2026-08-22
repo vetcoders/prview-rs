@@ -178,10 +178,20 @@ struct GateReason {
     message: String,
 }
 
+/// One quality-summary entry, mirroring `MERGE_GATE.json`'s `decision`.
+///
+/// `origin` carries the same truth here as it does there, and for the same
+/// reason: the entry arrays mix hard failures with warning-level baseline
+/// signals, so a consumer reading `introduced_quality_failures: ["Rustfmt"]`
+/// next to `quality_pass: true` sees a pack that contradicts itself unless the
+/// detail says which status produced the entry. Emitting it in one artifact and
+/// not the other left the two readers of the same run disagreeing about what
+/// "failure" means.
 #[derive(Serialize)]
 struct GateQualityFailureDetail {
     name: String,
     classification: &'static str,
+    origin: &'static str,
 }
 
 #[derive(Serialize)]
@@ -702,6 +712,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             .map(|detail| GateQualityFailureDetail {
                 name: detail.name.clone(),
                 classification: detail.classification.as_str(),
+                origin: detail.origin.as_str(),
             })
             .collect(),
         policy_mode: ctx.policy_mode.to_string(),
@@ -1476,6 +1487,116 @@ test result: FAILED. 0 passed; 1 failed
                 .as_str()
                 .is_some_and(|summary| summary.contains("1 pre-existing"))
         );
+    }
+
+    #[test]
+    fn report_gate_names_the_origin_of_every_quality_failure_detail() {
+        // Without the origin, `introduced_quality_failures: ["Rustfmt"]` next to
+        // `quality_pass: true` reads as a contradiction: the array says the
+        // check failed, the flag says it never gated. `MERGE_GATE.json` has
+        // named the producing status since schema 2.2; `report.json` carried the
+        // same array without it, so the two artifacts of ONE run disagreed about
+        // what "failure" meant.
+        use crate::artifacts::signal::CoverageDelta;
+        use crate::artifacts::{
+            CheckGateEntry, DashboardContext, QualityFailureClass, QualityFailureDetail,
+            QualityFailureOrigin,
+        };
+        use crate::cli::ExecutionMode;
+        use crate::config::test_config;
+        use crate::git::ResolvedRef;
+
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Standard;
+
+        let ctx = DashboardContext {
+            verdict: "CONDITIONAL",
+            analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            merge_recommendation: crate::policy::engine::MergeRecommendation::ReviewRequired,
+            allow_merge: true,
+            // A warning-origin entry never fails the quality gate.
+            quality_pass: true,
+            policy_allow_merge: true,
+            recommended_merge: true,
+            review_caveats: vec![],
+            quality_failures: vec!["Rustfmt".to_string()],
+            introduced_quality_failures: vec!["Rustfmt".to_string()],
+            preexisting_quality_failures: vec![],
+            mixed_quality_failures: vec![],
+            unclassified_quality_failures: vec![],
+            quality_failure_details: vec![QualityFailureDetail {
+                name: "Rustfmt".to_string(),
+                classification: QualityFailureClass::Introduced,
+                origin: QualityFailureOrigin::Warning,
+            }],
+            policy_mode: "warn",
+            blocking_issues: vec![],
+            check_gates: vec![CheckGateEntry {
+                name: "Rustfmt".to_string(),
+                id: "rustfmt".to_string(),
+                blocking: false,
+                class: "WARN",
+                severity: "warn",
+            }],
+            breaking: vec![],
+            coverage: CoverageDelta {
+                total_source: 0,
+                covered_count: 0,
+                pct: None,
+                uncovered: vec![],
+                covered: vec![],
+                non_code_count: 0,
+                ghost_tests: vec![],
+            },
+            findings: vec![],
+            per_file_diff_files: vec![],
+            skipped_checks: vec![],
+            previous_run: None,
+            run_history: vec![],
+            flaky_scores: vec![],
+            lint_metrics: vec![],
+            ownership_map: vec![],
+            risk_scores: vec![],
+            i18n_delta: None,
+        };
+        let target = ResolvedRef {
+            name: "feature/report".to_string(),
+            commit_id: "deadbeef".to_string(),
+            is_remote: false,
+        };
+        let bases = vec![ResolvedRef {
+            name: "main".to_string(),
+            commit_id: "cafebabe".to_string(),
+            is_remote: false,
+        }];
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = ReportInput {
+            dir: tmp.path(),
+            config: &config,
+            diffs: &[],
+            checks: &[],
+            resolved_target: &target,
+            resolved_bases: &bases,
+            ctx: &ctx,
+            run_started_at: "2026-03-09T00:00:00Z",
+            heuristics: None,
+            regression: None,
+        };
+
+        let report = build_report(&input);
+        let json = serde_json::to_value(&report).expect("serialize report");
+
+        let detail = &json["gate"]["quality_failure_details"][0];
+        assert_eq!(detail["name"].as_str(), Some("Rustfmt"));
+        assert_eq!(detail["classification"].as_str(), Some("introduced"));
+        assert_eq!(
+            detail["origin"].as_str(),
+            Some("warning"),
+            "report.json must name the status that produced the entry, got: {}",
+            json["gate"]["quality_failure_details"]
+        );
+        assert_eq!(json["gate"]["quality_pass"].as_bool(), Some(true));
     }
 
     #[test]

@@ -429,8 +429,8 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     // with its bounds below it. Accumulate continuation lines on BOTH sides so
     // remove+re-add pairing compares full declarations: a change confined to a
     // continuation line used to hide behind an identical opening line.
-    let mut pending_removed: Option<SymbolDecl> = None;
-    let mut pending_added: Option<SymbolDecl> = None;
+    let mut pending_removed: Option<PendingDecl> = None;
+    let mut pending_added: Option<PendingDecl> = None;
 
     // Inline-module nesting, tracked per diff side (see `ModScope`).
     let mut before_scope = ModScope::default();
@@ -617,6 +617,17 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     // replaced one of them was left unpaired and its change went unreported.
     // Exact matches are claimed first (pass 1) so an unchanged re-add is never
     // spent on a removal that a different addition replaces.
+    //
+    // ACCEPTED LIMIT (deferred to 0.8, do not re-litigate). Pairing sees only
+    // the declaration LINES the diff emitted. An enum variant, a trait method or
+    // a struct field removed below an unchanged `pub enum` / `pub trait` /
+    // `pub struct` opener is a breaking change this scanner does not report:
+    // the opener was never emitted as -/+, so nothing enters `removed_syms` to
+    // pair at all. Closing it needs the item's body from BOTH commits, which a
+    // diff-only scanner does not have; the fix is the repo-backed breaking
+    // analysis planned for 0.8, not a deeper heuristic here. The limit was
+    // reviewed and accepted deliberately — widening it here would trade a known
+    // blind spot for guesses about text the scanner never saw.
     let mut added_used = vec![false; added_syms.len()];
     let mut unpaired_removed = Vec::new();
 
@@ -815,7 +826,7 @@ impl CfgGuard {
     /// an API change. Any other attribute keeps the run alive but adds nothing:
     /// a `#[derive(…)]` between the `cfg` and its item does not change the gate.
     fn record(&mut self, attribute: String) {
-        if !attribute.starts_with("#[cfg(") {
+        if !gates_the_item(&attribute) {
             return;
         }
         let guards = self.guards.get_or_insert_with(Vec::new);
@@ -823,6 +834,28 @@ impl CfgGuard {
         guards.sort();
         guards.dedup();
     }
+}
+
+/// Does this whitespace-stripped attribute decide whether the item exists?
+///
+/// `#[cfg(…)]` obviously does. So does `#[cfg_attr(feature = "a", cfg(unix))]`:
+/// it applies a `cfg` under a condition, so the item is gated just as surely —
+/// reading only the literal `#[cfg(` spelling dropped BOTH sides' guards, the
+/// identical declaration text then paired, and a struct that really left the
+/// Unix build produced no finding at all.
+///
+/// The rest of the `cfg_attr` family — `#[cfg_attr(unix, derive(Debug))]`,
+/// `#[cfg_attr(docsrs, doc(cfg(…)))]` — decides an attribute ON the item, not
+/// the item, and must stay out: a gate invented there would split an ordinary
+/// re-add into a phantom removal, which is the error direction that costs
+/// trust. `,cfg(` is the whole distinction, applied to text whitespace has
+/// already been stripped from, and it separates the two families exactly across
+/// the 44,562 `cfg_attr` attributes in the local registry: 189 apply a `cfg`
+/// (12 crates, the `portable-atomic` idiom), and in none of them does the
+/// substring fall inside a string literal.
+fn gates_the_item(attribute: &str) -> bool {
+    attribute.starts_with("#[cfg(")
+        || (attribute.starts_with("#[cfg_attr(") && attribute.contains(",cfg("))
 }
 
 /// How many delimiters `line` leaves open, starting from `depth`.
@@ -874,26 +907,47 @@ fn drop_removal_finding(findings: &mut Vec<BreakingFinding>, removed: &SymbolDec
     }
 }
 
+/// A declaration still absorbing continuation lines.
+///
+/// `decl.text` is the verbatim join used for identity and for the
+/// `BREAKING_CHANGES.md` row. Completeness is decided on `code` instead, which
+/// is the same lines read through a [`SourceScanner`] — one call per PHYSICAL
+/// line, which is what makes a `//` end where it really ends. Joining first and
+/// scanning the result once cannot: the join has no line breaks, so a comment on
+/// any continuation line commented out every line appended after it, the closing
+/// `)` and body `{` were never seen, and the accumulator ran on into the body
+/// until the cap — turning a body-only rewrite into a phantom signature change.
+///
+/// The scanner is what keeps the other direction right too: it carries an open
+/// literal or `/* … */` from one continuation line to the next, so a brace
+/// inside a multi-line string still does not end the declaration.
+struct PendingDecl {
+    decl: SymbolDecl,
+    code: String,
+    scanner: crate::rust_source::SourceScanner,
+}
+
 /// Start or continue accumulating a public declaration on one diff side.
 ///
 /// A declaration in progress absorbs `trimmed` as a continuation line; otherwise
 /// `trimmed` may open a new one. Either way the declaration is emitted as soon
 /// as it is complete (or once it has absorbed [`MAX_DECL_CONTINUATION_LINES`]).
 fn accumulate_decl(
-    pending: &mut Option<SymbolDecl>,
+    pending: &mut Option<PendingDecl>,
     collected: &mut Vec<SymbolDecl>,
     findings: &mut Vec<BreakingFinding>,
     trimmed: &str,
     site: &DeclSite<'_>,
 ) {
-    if let Some(decl) = pending.as_mut() {
-        if !decl.text.ends_with('(') && !trimmed.is_empty() {
-            decl.text.push(' ');
+    if let Some(open) = pending.as_mut() {
+        if !open.decl.text.ends_with('(') && !trimmed.is_empty() {
+            open.decl.text.push(' ');
         }
-        decl.text.push_str(trimmed);
-        decl.continuation_lines += 1;
-        if declaration_complete(&decl.text)
-            || decl.continuation_lines >= MAX_DECL_CONTINUATION_LINES
+        open.decl.text.push_str(trimmed);
+        open.push_code(trimmed);
+        open.decl.continuation_lines += 1;
+        if declaration_complete(&open.code)
+            || open.decl.continuation_lines >= MAX_DECL_CONTINUATION_LINES
         {
             finalize_decl(pending, collected, findings);
         }
@@ -913,21 +967,37 @@ fn accumulate_decl(
         side: site.side,
         continuation_lines: 0,
     };
-    if declaration_complete(trimmed) {
-        emit_decl(decl, collected, findings);
+    let mut open = PendingDecl {
+        decl,
+        code: String::new(),
+        scanner: crate::rust_source::SourceScanner::default(),
+    };
+    open.push_code(trimmed);
+    if declaration_complete(&open.code) {
+        emit_decl(open.decl, collected, findings);
     } else {
-        *pending = Some(decl);
+        *pending = Some(open);
+    }
+}
+
+impl PendingDecl {
+    /// Read one more physical line into the completeness view.
+    fn push_code(&mut self, trimmed: &str) {
+        self.code.push_str(&self.scanner.code_only(trimmed));
+        // The line ended: whatever the scanner still carries is a literal or a
+        // block comment, never a line comment.
+        self.code.push(' ');
     }
 }
 
 /// Emit a declaration that is no longer accumulating, if any.
 fn finalize_decl(
-    pending: &mut Option<SymbolDecl>,
+    pending: &mut Option<PendingDecl>,
     collected: &mut Vec<SymbolDecl>,
     findings: &mut Vec<BreakingFinding>,
 ) {
-    if let Some(decl) = pending.take() {
-        emit_decl(decl, collected, findings);
+    if let Some(open) = pending.take() {
+        emit_decl(open.decl, collected, findings);
     }
 }
 
@@ -962,15 +1032,15 @@ fn should_scan_for_breaking_changes(path: &str) -> bool {
 /// decide whether to keep accumulating continuation lines so both "Before" and
 /// "After" are full declarations (BUG-4 / TOOLING-15).
 ///
-/// Only real delimiters count. `pub const TEMPLATE: &str = r#"{` opens a
-/// multi-line literal, and reading that `{` as the body opener finalized a
-/// TRUNCATED declaration — identical on both diff sides, so the removal was
-/// cancelled and the literal change that the patch actually made went
-/// unreported. The accumulated text is scanned as a whole, so a literal
-/// spanning continuation lines closes the declaration exactly where it really
-/// ends.
-fn declaration_complete(decl: &str) -> bool {
-    let code = crate::rust_source::code_only(decl);
+/// Only real delimiters count, and `code` has already had them resolved: it is
+/// the declaration's lines read through the pending declaration's own
+/// [`SourceScanner`], one call per physical line. `pub const TEMPLATE: &str =
+/// r#"{` opens a multi-line literal, and reading that `{` as the body opener
+/// finalized a TRUNCATED declaration — identical on both diff sides, so the
+/// removal was cancelled and the literal change the patch actually made went
+/// unreported. The scanner carries that literal across the continuation lines,
+/// and ends a `//` comment at the line that wrote it.
+fn declaration_complete(code: &str) -> bool {
     let mut depth: i32 = 0;
     for ch in code.chars() {
         match ch {
@@ -2074,6 +2144,57 @@ mod tests {
     }
 
     #[test]
+    fn a_cfg_attr_that_applies_a_cfg_is_part_of_the_guard() {
+        // `#[cfg_attr(feature = "a", cfg(unix))]` gates the item exactly like a
+        // `#[cfg(…)]` does — it just decides, per feature, whether to apply one.
+        // Recognizing only the literal `#[cfg(` spelling discarded both sides'
+        // guards, so the identical struct text paired and the struct that really
+        // disappeared from Unix builds with feature `a` left no finding.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg_attr(feature = \"a\", cfg(unix))]",
+                "-pub struct Config;",
+                "+#[cfg_attr(feature = \"a\", cfg(windows))]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a re-add under a different cfg_attr guard must not cancel the removal, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_cfg_attr_that_applies_no_cfg_is_not_a_guard() {
+        // Guard the other direction: `#[cfg_attr(unix, derive(Debug))]` decides
+        // a derive, not whether the item exists. Reading it as a gate would
+        // split an ordinary re-add into a phantom removal.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg_attr(unix, derive(Debug))]",
+                "-pub struct Config;",
+                "+#[cfg_attr(windows, derive(Debug))]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a cfg_attr applying a derive is not a gate, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn an_unseen_cfg_guard_pairs_as_before() {
         // The attribute may sit on a context line the hunk never re-emitted on
         // one side. Unknown must pair with anything, exactly as an unseen
@@ -2221,6 +2342,70 @@ mod tests {
             removed_symbol_types(&findings).is_empty(),
             "the change must not also report a removal, got: {:?}",
             removed_symbol_types(&findings)
+        );
+    }
+
+    #[test]
+    fn a_trailing_comment_does_not_swallow_the_rest_of_a_declaration() {
+        // Continuation lines are joined with a space, so a `//` on one of them
+        // commented out everything appended after it: `declaration_complete`
+        // never saw the closing `)` or the body `{`, the accumulator ran on
+        // into the body, and a body-only rewrite came out as a phantom
+        // signature change.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn build(",
+                "-    a: u8, // how many",
+                "-    b: u8,",
+                "-) -> u8 {",
+                "-    old_body();",
+                "+pub fn build(",
+                "+    a: u8, // how many",
+                "+    b: u8,",
+                "+) -> u8 {",
+                "+    new_body();",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a body-only rewrite under a commented signature is not breaking, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_real_change_below_a_trailing_comment_still_surfaces() {
+        // The other direction: ending the comment at its own line must not cost
+        // the change that follows it.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn build(",
+                "-    a: u8, // how many",
+                "-    b: u8,",
+                "-) -> u8 {",
+                "+pub fn build(",
+                "+    a: u8, // how many",
+                "+    b: u16,",
+                "+) -> u8 {",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::ChangedSignature { before, after }
+                    if before.contains("b: u8") && after.contains("b: u16")
+            )),
+            "a parameter change below a trailing comment must surface, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }
 

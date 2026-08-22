@@ -10,23 +10,6 @@
 
 use std::borrow::Cow;
 
-/// The code part of `line`: comments dropped, literal contents blanked.
-///
-/// This is what a delimiter tracker should walk. `const CLOSE: &str = "}";`,
-/// `// closes with }` and `/* } */` all reduce to text carrying no brace.
-///
-/// Stateless, so a `/*` or a `"` left open at the end of `line` simply ends the
-/// code on that line. Use [`SourceScanner`] to carry an open construct across
-/// consecutive lines.
-///
-/// Text that is itself multi-line (an accumulated declaration) may be passed
-/// whole: the scan runs over it in one piece, so a literal spanning its lines
-/// closes where it really closes.
-pub(crate) fn code_only(line: &str) -> Cow<'_, str> {
-    let mut state = ScanState::default();
-    scan(line, &mut state)
-}
-
 /// Line-by-line source reader that remembers a construct left open.
 ///
 /// Block comments and string literals are the two things a per-line scanner
@@ -285,6 +268,16 @@ fn char_literal_end(code: &str, start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One line read by a scanner that carries nothing in from before it.
+    ///
+    /// Every consumer keeps a scanner across the lines of one hunk or one
+    /// declaration; these cases are about what a SINGLE line reduces to, so
+    /// each starts clean. What a scanner carries between lines is covered by
+    /// the `SourceScanner` cases below.
+    fn code_only(line: &str) -> Cow<'_, str> {
+        SourceScanner::default().code_only(line)
+    }
 
     #[test]
     fn line_comments_are_not_code_but_a_url_is_not_a_comment() {

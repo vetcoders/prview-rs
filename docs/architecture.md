@@ -725,6 +725,15 @@ silent re-addition. A re-add in a *different* file is a module move and becomes
 `RelocatedSymbol`, which is reported but deliberately excluded from breaking
 escalation.
 
+**Accepted limit (deferred to 0.8).** The scan sees only the declaration LINES a
+diff emitted. An enum variant, a trait method or a struct field removed below an
+unchanged `pub enum` / `pub trait` / `pub struct` opener is a breaking change
+prview does not report: the opener was never emitted as `-`/`+`, so nothing
+enters pairing to begin with. Reporting it needs the item's body from BOTH
+commits, which a diff-only scanner does not have — the fix is the repo-backed
+breaking analysis planned for 0.8, and this limit was reviewed and accepted
+deliberately rather than papered over with a deeper heuristic.
+
 Declarations are compared on their FULL text, continuation lines joined, up to
 `MAX_DECL_CONTINUATION_LINES` (32) — a runaway bound for static bodies and
 generated data tables, not a display width. The bound used to be eight lines,
@@ -732,6 +741,15 @@ which cut inside the real distribution of `pub` signatures: two long
 declarations agreeing on their opener and first eight lines finalized to the
 same truncated text and paired as an unchanged re-add, so a parameter, bound or
 return type changed below the cut produced no finding at all.
+
+Where a declaration ENDS is decided on a separate, comment-resolved view of the
+same lines, fed through the pending declaration's own `SourceScanner` one
+physical line at a time. The joined text has no line breaks, so scanning it as a
+whole let a `//` on any continuation line comment out every line appended after
+it: the closing `)` and the body `{` were never seen and the accumulator ran on
+into the body, so a body-only rewrite came out as a phantom `ChangedSignature`.
+Feeding line by line ends a `//` where it really ends while the scanner still
+carries an open literal or `/* … */` across the continuation lines.
 
 Pairing is scoped: two declarations pair only when their inline `mod` path and
 their `#[cfg(…)]` guard may be the same. The guard is the WHOLE conjunction of
@@ -750,6 +768,15 @@ for one configuration pair with its re-add under another. Any other wrapped
 attribute (`#[derive(…)]`) is carried the same way so it cannot take the `cfg`
 above it down with it; an attribute that never closes within
 `MAX_ATTRIBUTE_CONTINUATION_LINES` falls back to the tolerant `None`.
+
+`cfg_attr` counts as a guard exactly when it applies a `cfg`:
+`#[cfg_attr(feature = "a", cfg(unix))]` gates the item as surely as `#[cfg(unix)]`
+does, so it joins the conjunction, while `#[cfg_attr(unix, derive(Debug))]` decides
+an attribute ON the item and stays out — inventing a gate there would split an
+ordinary re-add into a phantom removal. The two families separate cleanly on the
+whitespace-stripped substring `,cfg(`: of the 44,562 `cfg_attr` attributes in the
+local crates.io registry, 189 apply a `cfg` (12 crates, the `portable-atomic`
+idiom) and none of them carry that substring inside a string literal.
 
 Both the module path and the perf tracker's test-context scope are counted over
 CODE only, via the shared scanner in `src/rust_source.rs`. It resolves comments
@@ -791,6 +818,17 @@ paired with `measured: false` + `not_measured_reason`. That nullability — with
 the loctree counters becoming omittable for the same reason — is why
 `report.json` carries `schema_version: "2.0"`: a decoder written against `1.0`,
 where the ratio was always a number, does not parse every pack.
+
+`report.json`'s `gate.quality_failure_details[]` mirrors `MERGE_GATE.json`'s
+`decision.quality_failure_details[]` field for field — `name`, `classification`
+and `origin` (`"failure"` or `"warning"`). The origin is what makes
+`introduced_quality_failures: ["Rustfmt"]` and `quality_pass: true` readable
+together: the arrays admit warning-level baseline signals so the pre-existing
+downgrade can be computed for them, and only a `"failure"` origin can fail the
+quality gate. Emitting it in the gate artifact but not in `report.json` left the
+two artifacts of one run disagreeing about what "failure" meant. The field is
+additive and `report.json` stays `schema_version: "2.0"` — that major is
+unreleased, so no consumer has ever seen a 2.0 without it.
 
 Four-strategy filename heuristic matching:
 1. Exact stem match: `foo.rs` <-> `foo_test.rs` / `test_foo.rs` / `foo.test.ts`
