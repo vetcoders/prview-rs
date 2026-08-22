@@ -135,7 +135,20 @@ struct SymbolDecl {
     symbol_type: String,
     name: String,
     /// Full declaration text — continuation lines joined, not just the opener.
+    ///
+    /// Verbatim, comments included: this is what a reader sees in
+    /// `BREAKING_CHANGES.md` and in a `ChangedSignature`. Comparisons use
+    /// [`identity`](Self::identity) instead.
     text: String,
+    /// The same declaration with its comments resolved away.
+    ///
+    /// What pairing COMPARES. A comment inside a declaration is not part of the
+    /// API: rewording one used to make a remove+re-add of a byte-identical
+    /// signature come out as a `ChangedSignature` — a breaking-change claim
+    /// about text no consumer can observe. Literals are kept, because a literal
+    /// IS code: `pub const GREETING: &str = "hello";` and the same line ending
+    /// `"bye";` are different declarations.
+    identity: String,
     /// Hunk-local inline-module path (`""` when the diff never showed one).
     scope: String,
     /// Every `#[cfg(…)]` predicate guarding this declaration, whitespace
@@ -651,7 +664,10 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
         // The removed-symbol finding is a false positive either way: drop it.
         drop_removal_finding(&mut findings, removed);
 
-        if added.text != removed.text {
+        // Compared on the comment-free identity, REPORTED verbatim: a reworded
+        // comment is not a signature change, but a reader shown the change
+        // should see the declaration as it is actually written.
+        if added.identity != removed.identity {
             findings.push(BreakingFinding {
                 file: removed.file.clone(),
                 kind: BreakingKind::ChangedSignature {
@@ -669,14 +685,16 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
 
 /// Index of the first not-yet-consumed addition that may pair with `removed`.
 ///
-/// `require_identical_text` restricts the search to a declaration re-emitted
-/// verbatim, which is what makes the two-pass pairing stable when several
-/// declarations share (file, kind, name).
+/// `require_identical_code` restricts the search to a declaration re-emitted
+/// unchanged, which is what makes the two-pass pairing stable when several
+/// declarations share (file, kind, name). "Unchanged" is judged on
+/// [`SymbolDecl::identity`], so a re-emission that only reworded a comment is
+/// still the exact match it looks like to a compiler.
 fn find_pairable_addition(
     added_syms: &[SymbolDecl],
     added_used: &[bool],
     removed: &SymbolDecl,
-    require_identical_text: bool,
+    require_identical_code: bool,
 ) -> Option<usize> {
     added_syms.iter().enumerate().find_map(|(index, added)| {
         (!added_used[index]
@@ -685,7 +703,7 @@ fn find_pairable_addition(
             && added.name == removed.name
             && scopes_may_pair(&removed.scope, &added.scope)
             && cfgs_may_pair(&removed.cfg_guard, &added.cfg_guard)
-            && (!require_identical_text || added.text == removed.text))
+            && (!require_identical_code || added.identity == removed.identity))
             .then_some(index)
     })
 }
@@ -924,7 +942,13 @@ fn drop_removal_finding(findings: &mut Vec<BreakingFinding>, removed: &SymbolDec
 struct PendingDecl {
     decl: SymbolDecl,
     code: String,
-    scanner: crate::rust_source::SourceScanner,
+    /// Feeds `code`: literal bodies dropped, because this view counts delimiters.
+    completeness: crate::rust_source::SourceScanner,
+    /// Feeds `decl.identity`: literals kept, because this view compares source.
+    /// Two scanners rather than one because the two views want different output
+    /// from the same resolution; both see the same lines in the same order, so
+    /// their carried state never diverges.
+    identity: crate::rust_source::SourceScanner,
 }
 
 /// Start or continue accumulating a public declaration on one diff side.
@@ -962,6 +986,7 @@ fn accumulate_decl(
         symbol_type: symbol_type.to_string(),
         name,
         text: trimmed.to_string(),
+        identity: String::new(),
         scope: site.scope.path(),
         cfg_guard: site.cfg_guard.map(<[String]>::to_vec),
         side: site.side,
@@ -970,7 +995,8 @@ fn accumulate_decl(
     let mut open = PendingDecl {
         decl,
         code: String::new(),
-        scanner: crate::rust_source::SourceScanner::default(),
+        completeness: crate::rust_source::SourceScanner::default(),
+        identity: crate::rust_source::SourceScanner::default(),
     };
     open.push_code(trimmed);
     if declaration_complete(&open.code) {
@@ -981,12 +1007,26 @@ fn accumulate_decl(
 }
 
 impl PendingDecl {
-    /// Read one more physical line into the completeness view.
+    /// Read one more physical line into both derived views.
     fn push_code(&mut self, trimmed: &str) {
-        self.code.push_str(&self.scanner.code_only(trimmed));
+        self.code.push_str(&self.completeness.code_only(trimmed));
         // The line ended: whatever the scanner still carries is a literal or a
         // block comment, never a line comment.
         self.code.push(' ');
+
+        // A line that is nothing but a comment contributes nothing to the
+        // identity, and a line whose code ends where its comment begins must not
+        // contribute the whitespace between them either — otherwise `a: u8, //x`
+        // and `a: u8,// y` would read as different declarations.
+        let line = self.identity.code_with_literals(trimmed);
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        if !self.decl.identity.is_empty() {
+            self.decl.identity.push(' ');
+        }
+        self.decl.identity.push_str(line);
     }
 }
 
@@ -2405,6 +2445,61 @@ mod tests {
                     if before.contains("b: u8") && after.contains("b: u16")
             )),
             "a parameter change below a trailing comment must surface, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rewording_a_comment_inside_a_declaration_is_not_a_signature_change() {
+        // The Rust API here is byte-identical; only a note to the next reader
+        // changed. Comparing the verbatim join made that a `ChangedSignature`,
+        // which is a breaking-change claim about text no consumer can observe.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn build(",
+                "-    a: u8, // how many",
+                "-    b: u8,",
+                "-) -> u8 {",
+                "+pub fn build(",
+                "+    a: u8, // how many of them",
+                "+    b: u8,",
+                "+) -> u8 {",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "rewording a comment is not an API change, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_changed_string_literal_is_still_a_signature_change() {
+        // The direction the comment-free identity must NOT buy: a literal is
+        // code. Comparing declarations on a view that drops literal bodies would
+        // pair a real value change away as an unchanged re-add.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const GREETING: &str = \"hello\";",
+                "+pub const GREETING: &str = \"goodbye\";",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::ChangedSignature { before, after }
+                    if before.contains("hello") && after.contains("goodbye")
+            )),
+            "a changed public constant must still surface, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

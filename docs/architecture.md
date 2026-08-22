@@ -751,6 +751,18 @@ into the body, so a body-only rewrite came out as a phantom `ChangedSignature`.
 Feeding line by line ends a `//` where it really ends while the scanner still
 carries an open literal or `/* … */` across the continuation lines.
 
+Display text and comparison identity are separate. `BREAKING_CHANGES.md` and a
+`ChangedSignature` show the declaration verbatim, comments included, because a
+reader shown a change should see the source as written; pairing COMPARES a
+comment-free view of the same lines. A comment inside a declaration is not part
+of the API, and rewording one used to come out as a `ChangedSignature` — a
+breaking-change claim about text no consumer can observe. That view keeps string
+and char literals verbatim: a literal is code, so `pub const GREETING: &str =
+"hello";` and the same line ending `"bye";` must stay different declarations.
+`SourceScanner` therefore offers both resolutions — `code_only` for the
+delimiter trackers, which want a brace inside a string silenced, and
+`code_with_literals` for callers comparing source.
+
 Pairing is scoped: two declarations pair only when their inline `mod` path and
 their `#[cfg(…)]` guard may be the same. The guard is the WHOLE conjunction of
 the attributes stacked above the declaration, sorted — `#[cfg(unix)]
