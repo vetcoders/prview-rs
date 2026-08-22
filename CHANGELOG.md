@@ -66,6 +66,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which normalized to `BLOCK` and returned a successful summary — for an artifact
   the MCP reader rejected as `storage_corrupt`. Both now fail loud (`exit 3` /
   `storage_corrupt`) with a message that names the actual defect.
+- **`--ci --fail-on-warnings` counts the warnings it promised to count.** The
+  flag read `Report.checks` — the list the CLI itself executed — while the
+  artifact run appends `public_api_diff`, `unsafe_audit`, `ghost_refs` and the
+  synthetic `heuristics_loctree` to the list `MERGE_GATE.json` is built from, and
+  none of those ever returns to the CLI. A run whose only warning came from one
+  of them exited `0` under a flag that promises to fail when any check warns. The
+  exit now keys off the pack's canonical `checks[]`, and the `--json` summary
+  states both numbers: `checks_summary.warned` (what the CLI ran) and the new
+  additive `checks_summary.warned_in_pack` (the complete count), which is never
+  smaller. A pack with no readable `checks` array falls back to the CLI tally and
+  says so with an `unreadable_checks:` caveat.
 - A warning is no longer reported as a failed quality check. A baseline-signal
   check that reports `Warnings` (cargo-audit raising an unmaintained-crate
   advisory, `rustfmt`, `eslint`, `ruff`, `prettier`, `stylelint`, `semgrep`) is

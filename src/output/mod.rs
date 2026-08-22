@@ -85,6 +85,16 @@ pub struct CliJsonChecksSummary {
     pub warned: usize,
     pub skipped: usize,
     pub cached: usize,
+    /// Warning-status checks in the artifact pack's canonical check list.
+    ///
+    /// `warned` counts only the checks the CLI itself ran. The artifact run
+    /// appends more — `public_api_diff`, `unsafe_audit`, `ghost_refs`,
+    /// `heuristics_loctree` — and those reach `MERGE_GATE.json` and the
+    /// dashboard but never the in-memory `Report`. This is the complete
+    /// number, so it is always `>= warned`, and it is what
+    /// `--ci --fail-on-warnings` keys off.
+    #[serde(default)]
+    pub warned_in_pack: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +136,8 @@ struct MergeGateSummary {
     quality_pass: bool,
     reason: Option<String>,
     caveats: Vec<String>,
+    /// Warning-status entries in the pack's canonical `checks[]` list.
+    warned_checks: usize,
 }
 
 mod duration_serde {
@@ -186,7 +198,12 @@ fn failures_degraded_to_advisory(gate: &MergeGateSummary) -> bool {
 /// execution error (exit 3), not a guess.
 pub fn build_cli_json_summary(config: &Config, report: &Report) -> anyhow::Result<CliJsonSummary> {
     let gate = read_merge_gate_summary(&report.artifacts_dir)?;
-    let checks_summary = CliJsonChecksSummary::from_checks(&report.checks);
+    let mut checks_summary = CliJsonChecksSummary::from_checks(&report.checks);
+    // The pack's list is the canonical one; the CLI's own tally is a subset of
+    // it. Taking the larger keeps a legacy pack (or one whose `checks` this
+    // build could not read) from reporting FEWER warnings than the CLI already
+    // knows about.
+    checks_summary.warned_in_pack = gate.warned_checks.max(checks_summary.warned);
 
     Ok(CliJsonSummary {
         schema_version: "cli-json/v1",
@@ -237,7 +254,11 @@ pub fn build_cli_json_summary(config: &Config, report: &Report) -> anyhow::Resul
 ///   codes" contract of `--ci` (`block || !quality_pass → 1`).
 /// - `--ci --fail-on-warnings` is the opt-in escape hatch: warning-level checks
 ///   no longer break `quality_pass` (a warning is not a failure), so a team that
-///   wants a warnings-clean trunk asks for that exit explicitly.
+///   wants a warnings-clean trunk asks for that exit explicitly. It counts the
+///   PACK's checks, not the CLI's own list: the signal checks the artifact run
+///   generates (`public_api_diff`, `unsafe_audit`, `ghost_refs`,
+///   `heuristics_loctree`) warn like any other check, and a flag that promises
+///   to fail on any warning cannot be blind to four of them.
 pub fn compute_exit_code(summary: &CliJsonSummary, fail_on_warnings: bool) -> i32 {
     use crate::policy::engine::MergeRecommendation;
 
@@ -248,7 +269,7 @@ pub fn compute_exit_code(summary: &CliJsonSummary, fail_on_warnings: bool) -> i3
     if strict && !summary.quality_pass {
         return 1;
     }
-    if strict && fail_on_warnings && summary.checks_summary.warned > 0 {
+    if strict && fail_on_warnings && summary.checks_summary.warned_in_pack > 0 {
         return 1;
     }
     0
@@ -490,6 +511,34 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         _ if allow_merge && quality_pass => crate::policy::engine::AnalysisStatus::Complete,
         _ => crate::policy::engine::AnalysisStatus::Incomplete,
     };
+    // `checks[]` sits at the pack ROOT, beside `decision`, and it is the only
+    // complete list of what ran: the artifact stage appends its own signal
+    // checks (`public_api_diff`, `unsafe_audit`, `ghost_refs`,
+    // `heuristics_loctree`) to the list the gate is built from, and none of
+    // them ever reaches the in-memory `Report` the CLI tallies.
+    let warned_checks = match value.get("checks") {
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .filter(|entry| entry.get("status").and_then(Value::as_str) == Some("warnings"))
+            .count(),
+        Some(other) => {
+            caveats.push(format!(
+                "unreadable_checks: MERGE_GATE.json checks is {}, not an array; the warning tally \
+                 falls back to the checks this run executed",
+                match other {
+                    Value::Null => "null",
+                    Value::Bool(_) => "a boolean",
+                    Value::Number(_) => "a number",
+                    Value::String(_) => "a string",
+                    Value::Object(_) => "an object",
+                    Value::Array(_) => unreachable!("matched above"),
+                }
+            ));
+            0
+        }
+        None => 0,
+    };
+
     Ok(MergeGateSummary {
         verdict: verdict.to_string(),
         analysis_status,
@@ -498,6 +547,7 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         quality_pass,
         reason,
         caveats,
+        warned_checks,
     })
 }
 
@@ -1464,6 +1514,7 @@ mod tests {
                 warned: 0,
                 skipped: 0,
                 cached: 1,
+                warned_in_pack: 0,
             }
         );
         assert_eq!(summary.top_failures.len(), 2);
@@ -2197,6 +2248,111 @@ api-router/app/core/cache.py
     }
 
     #[test]
+    fn fail_on_warnings_counts_the_checks_the_artifact_run_generated() {
+        // `--fail-on-warnings` promises to fail when ANY check warns, but it
+        // read `Report.checks` — the list the CLI itself executed. The artifact
+        // stage appends `public_api_diff`, `unsafe_audit`, `ghost_refs` and the
+        // synthetic heuristics check to the list `MERGE_GATE.json` is built
+        // from, and none of them ever returns to the CLI. A run whose only
+        // warning came from one of those exited 0 under the flag.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        std::fs::write(
+            temp.path().join("00_summary/MERGE_GATE.json"),
+            r#"{"schema_version":"2.2",
+                "checks":[
+                  {"name":"Cargo check","status":"passed"},
+                  {"name":"public_api_diff","status":"warnings"}
+                ],
+                "decision":{"verdict":"PASS","merge_recommendation":"approve",
+                            "allow_merge":true,"quality_pass":true,
+                            "analysis_status":"complete"}}"#,
+        )
+        .unwrap();
+
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Ci;
+        let report = Report {
+            target: "feature/generated-warning".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![CheckResult {
+                name: "Cargo check".to_string(),
+                status: CheckStatus::Passed,
+                duration: Duration::from_secs(1),
+                output: String::new(),
+                cached: false,
+                provenance: None,
+            }],
+            heuristics: None,
+            artifacts_dir: temp.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: false,
+        };
+
+        let cli = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
+        assert_eq!(
+            cli.checks_summary.warned, 0,
+            "the CLI's own list genuinely has no warning: {:?}",
+            cli.checks_summary
+        );
+        assert_eq!(
+            cli.checks_summary.warned_in_pack, 1,
+            "the pack's canonical list has one: {:?}",
+            cli.checks_summary
+        );
+        assert_eq!(
+            compute_exit_code(&cli, true),
+            1,
+            "--ci --fail-on-warnings must fail on a warning only the pack knows about"
+        );
+        assert_eq!(
+            compute_exit_code(&cli, false),
+            0,
+            "without the flag a warning still does not fail the run"
+        );
+    }
+
+    #[test]
+    fn a_pack_without_a_checks_list_keeps_the_cli_warning_tally() {
+        // Guard the fallback: a legacy pack with no `checks` array must not
+        // report FEWER warnings than the CLI already counted itself.
+        let pack = pack_with_gate(
+            r#"{"verdict":"CONDITIONAL","merge_recommendation":"review_required",
+                "allow_merge":false,"quality_pass":true,
+                "analysis_status":"complete"}"#,
+        );
+
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Ci;
+        let report = Report {
+            target: "feature/legacy-pack".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![CheckResult {
+                name: "Semgrep scan".to_string(),
+                status: CheckStatus::Warnings,
+                duration: Duration::from_secs(1),
+                output: String::new(),
+                cached: false,
+                provenance: None,
+            }],
+            heuristics: None,
+            artifacts_dir: pack.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: false,
+        };
+
+        let cli = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
+        assert_eq!(
+            cli.checks_summary.warned_in_pack, 1,
+            "{:?}",
+            cli.checks_summary
+        );
+        assert_eq!(compute_exit_code(&cli, true), 1);
+    }
+
+    #[test]
     fn a_mistyped_recommendation_is_not_read_as_an_absent_one() {
         // `merge_recommendation: 7` collapsed through `as_str()` into "no
         // recommendation", and the fallback then RECONSTRUCTED `Approve` from
@@ -2433,6 +2589,7 @@ api-router/app/core/cache.py
             quality_pass: true,
             reason: Some("pre-existing findings outside the change".to_string()),
             caveats: Vec::new(),
+            warned_checks: 0,
         };
 
         let heading = failure_summary_heading(&report, Some(&gate)).expect("heading");
