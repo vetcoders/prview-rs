@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `coverage-delta.txt`, and the dashboard; it now reads `not measured`, and the
   coverage card/chip/section is omitted instead of showing a fabricated 100%.
   A real `0/N` (N > 0) is still a genuine `0%` measurement.
+- `report.json` no longer zero-fills skipped analysis. `quality.heuristics` now
+  carries `status` (`"measured"` / `"skipped"`), an optional `skip_reason`, and
+  `total_files`; a loctree run that scanned no files (or never ran) omits
+  `dead_exports`, `cycles`, `twins`, and `unused_symbols` instead of emitting
+  zeros indistinguishable from a clean scan. This matches the SKIP semantics
+  `MERGE_GATE.json` and `heuristics_loctree.result.json` already used.
 
 ### Changed
 

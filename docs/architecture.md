@@ -450,6 +450,13 @@ Structural code analysis:
 - `loctree.rs` — universal heuristic (works with any profile): cycles, dead
   exports, unused symbols, exact twins across Rust/JS/TS/Python
 
+**A zero-file scan is a skip, not a clean run.** Loctree can report
+`available: true` while `summary.total_files == 0`. Every consumer treats that
+as SKIP: `MERGE_GATE.json` and `20_quality/heuristics_loctree.result.json` emit
+status `skipped`/`SKIP`, and `report.json`'s `quality.heuristics` emits
+`status: "skipped"` with a `skip_reason` and omits `dead_exports`, `cycles`,
+`twins`, and `unused_symbols` rather than writing zeros that read as results.
+
 ### cache/mod.rs
 
 Hash-based caching:
