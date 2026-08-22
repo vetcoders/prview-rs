@@ -1133,6 +1133,45 @@ mod tests {
     }
 
     #[test]
+    fn preexisting_only_rustfmt_keeps_strict_gate_exit_zero() {
+        // Regression guard for the warning→failure cut: the gate exit contract is
+        // unchanged. The pre-existing-only rustfmt pack is a PASS, and `prview
+        // gate --strict` must still exit 0 on it — the same artifact the adapter
+        // in `gate.rs` reads, run through the same verdict → exit mapping.
+        use crate::gate::{GateVerdict, gate_exit_code};
+
+        let gate = run_gate_with_rustfmt_warning(false);
+        let verdict = GateVerdict::try_from(
+            gate["decision"]["verdict"]
+                .as_str()
+                .expect("verdict is a string"),
+        )
+        .expect("verdict is contract vocabulary");
+
+        assert_eq!(verdict, GateVerdict::Pass);
+        assert_eq!(gate_exit_code(verdict, true), 0);
+        assert_eq!(gate_exit_code(verdict, false), 0);
+    }
+
+    #[test]
+    fn introduced_warning_keeps_strict_gate_exit_two() {
+        // The other half of the contract: an in-diff warning stays CONDITIONAL,
+        // so `--strict` still exits 2. Warnings became honest, not toothless.
+        use crate::gate::{GateVerdict, gate_exit_code};
+
+        let gate = run_gate_with_rustfmt_warning(true);
+        let verdict = GateVerdict::try_from(
+            gate["decision"]["verdict"]
+                .as_str()
+                .expect("verdict is a string"),
+        )
+        .expect("verdict is contract vocabulary");
+
+        assert_eq!(verdict, GateVerdict::Conditional);
+        assert_eq!(gate_exit_code(verdict, true), 2);
+    }
+
+    #[test]
     fn introduced_rustfmt_warning_in_diff_is_not_downgraded() {
         // In-diff formatting warnings belong to the change: no downgrade.
         let gate = run_gate_with_rustfmt_warning(true);

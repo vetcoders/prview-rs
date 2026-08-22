@@ -11,7 +11,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--fail-on-warnings`: opt-in escape hatch that makes `--ci` exit `1` when any
+  check reports warnings. It is only meaningful together with `--ci` (clap
+  rejects it otherwise) and it restores the pre-change CI behaviour for teams
+  that want a warnings-clean trunk. `prview gate` is untouched — its exit codes
+  come from the verdict contract, not from this flag.
+
 ### Fixed
+
+- A warning is no longer reported as a failed quality check. A baseline-signal
+  check that reports `Warnings` (cargo-audit raising an unmaintained-crate
+  advisory, `rustfmt`, `eslint`, `ruff`, `prettier`, `stylelint`, `semgrep`) is
+  admitted to the quality summary so the pre-existing downgrade can be computed
+  for it — but when it produced no locatable finding it classified as
+  `unclassified`, which flipped `quality_pass` to `false` and printed
+  "N quality checks failed" for output that never contained a failure. Warning
+  entries now carry their origin and are excluded from the failure gate whatever
+  they classify as: `quality_pass` stays `true`, `decision.analysis_status` stays
+  `complete` instead of being degraded, the dashboard hero reads
+  `ALLOW WITH REVIEW` instead of `HOLD`, and the gate reason gets a separate
+  honest sentence (`2 warning signals: 1 pre-existing, 1 introduced`). Real
+  failures (`Failed`/`Error`) are unchanged and still fail closed on
+  `introduced`, `mixed`, and `unclassified`.
 
 - Perf regression detection now resolves inline Rust test context (`#[cfg(test)]`,
   `mod tests`, `#[test]`) **per hit line** instead of per hunk. A production hot
@@ -35,6 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MERGE_GATE.json` and `heuristics_loctree.result.json` already used.
 
 ### Changed
+
+- **`--ci` exit code for a warnings-only run: `1` → `0`.** Warning-level checks
+  no longer break `quality_pass`, and `--ci` still exits `1` only on `BLOCK` or a
+  broken quality gate — so a run whose worst signal is a warning now exits `0`.
+  Pass `--ci --fail-on-warnings` to keep the old exit. Runs with a real failure,
+  and every `prview gate` exit code, are unchanged.
 
 - **report.json schema (additive, one field now nullable).**
   `quality.coverage.heuristic_ratio` is `null` when nothing was measured

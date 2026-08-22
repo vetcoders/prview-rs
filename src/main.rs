@@ -124,7 +124,7 @@ async fn run() -> Result<()> {
     let exit_code = if report.unchanged || cli.soft_exit {
         0
     } else {
-        prview::output::compute_exit_code(&cli_summary)
+        prview::output::compute_exit_code(&cli_summary, cli.fail_on_warnings)
     };
 
     std::process::exit(exit_code);
@@ -144,6 +144,9 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     run_cli.quiet = true;
     run_cli.json = false;
     run_cli.soft_exit = false;
+    // `gate` forces `ci = false` and derives its exit from the gate contract, so
+    // the `--ci`-scoped warnings escape hatch must not leak into it.
+    run_cli.fail_on_warnings = false;
 
     let mut config = Config::from_cli(&run_cli)?;
     config.apply_gate_profile();

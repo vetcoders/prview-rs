@@ -42,10 +42,26 @@ impl QualityFailureClass {
     }
 }
 
+/// Which check status produced a quality-summary entry.
+///
+/// The summary deliberately mixes two kinds of signal: hard failures
+/// (`Failed`/`Error`) and warning-level baseline signals (`Warnings`) that are
+/// admitted so the pre-existing downgrade can be computed for them. Only the
+/// first kind may fail the quality gate — a warning is an advisory signal by
+/// definition, and calling it a failure was the "warning→failure" lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QualityFailureOrigin {
+    /// The check reported `Failed` or `Error`.
+    Failure,
+    /// The check reported `Warnings`.
+    Warning,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct QualityFailureDetail {
     pub name: String,
     pub classification: QualityFailureClass,
+    pub origin: QualityFailureOrigin,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -59,16 +75,29 @@ pub(crate) struct QualityFailureSummary {
 }
 
 impl QualityFailureSummary {
-    /// Returns true when there are failures that are new or indeterminate.
+    /// Returns true when there are FAILURES that are new or indeterminate.
     ///
-    /// Purely pre-existing failures do NOT count — they existed before this
-    /// diff and should not block the gate.  Introduced, mixed, and
-    /// unclassified failures are all considered "new" because they either
-    /// definitely or possibly originate from the current change.
+    /// Two independent filters apply, and both are load-bearing:
+    ///
+    /// * **Origin.** Only entries whose check actually failed
+    ///   (`QualityFailureOrigin::Failure`) can fail the quality gate. Entries
+    ///   admitted from `Warnings` checks are here purely so the pre-existing
+    ///   downgrade can be computed for them; a warning is advisory by
+    ///   definition and must never be reported as a failed quality check —
+    ///   regardless of how it classifies, `Unclassified` included. It still
+    ///   reaches the verdict through the policy engine (Warnings → Advisory →
+    ///   ReviewRequired), which keeps a CONDITIONAL verdict; what changes is
+    ///   the truth of the label, not the verdict.
+    /// * **Classification.** Purely pre-existing failures do NOT count — they
+    ///   existed before this diff and should not block the gate. Introduced,
+    ///   mixed, and unclassified failures are all considered "new" because they
+    ///   either definitely or possibly originate from the current change
+    ///   (fail-closed).
     pub(crate) fn has_new_failures(&self) -> bool {
-        !self.introduced_quality_failures.is_empty()
-            || !self.mixed_quality_failures.is_empty()
-            || !self.unclassified_quality_failures.is_empty()
+        self.details.iter().any(|detail| {
+            detail.origin == QualityFailureOrigin::Failure
+                && !matches!(detail.classification, QualityFailureClass::Preexisting)
+        })
     }
 }
 
@@ -372,10 +401,15 @@ pub(crate) fn build_merge_decision_view(
     blocking_issues: &[String],
     review_caveats: Vec<String>,
 ) -> MergeDecisionView {
-    let has_new_quality_failures = quality_failure_details
-        .iter()
-        .any(|detail| !matches!(detail.classification, QualityFailureClass::Preexisting))
-        || (quality_failure_details.is_empty() && !quality_failures.is_empty());
+    // Mirrors `QualityFailureSummary::has_new_failures`: only a real failure
+    // (not a warning-level signal) that is new or indeterminate holds the merge.
+    // Keeping the two predicates aligned is what stops the hero label from
+    // reading HOLD while `quality_pass` is true.
+    let has_new_quality_failures = quality_failure_details.iter().any(|detail| {
+        detail.origin == QualityFailureOrigin::Failure
+            && !matches!(detail.classification, QualityFailureClass::Preexisting)
+    }) || (quality_failure_details.is_empty()
+        && !quality_failures.is_empty());
 
     let state = if !policy_allow_merge {
         MergeDecisionState::Block
@@ -818,11 +852,13 @@ pub(crate) fn push_quality_failure(
     summary: &mut QualityFailureSummary,
     name: String,
     classification: QualityFailureClass,
+    origin: QualityFailureOrigin,
 ) {
     summary.quality_failures.push(name.clone());
     summary.details.push(QualityFailureDetail {
         name: name.clone(),
         classification,
+        origin,
     });
 
     match classification {
@@ -852,7 +888,15 @@ pub(crate) fn build_quality_failure_summary(
             dashboard_findings,
             clean_comparison.applies_to(&check_id),
         );
-        push_quality_failure(&mut summary, check.name.clone(), classification);
+        // The origin is recorded alongside the classification: warning-level
+        // entries take part in the pre-existing downgrade (that is why they are
+        // admitted at all) but never fail the gate — see `has_new_failures`.
+        let origin = if check.is_failure() {
+            QualityFailureOrigin::Failure
+        } else {
+            QualityFailureOrigin::Warning
+        };
+        push_quality_failure(&mut summary, check.name.clone(), classification, origin);
     }
 
     summary
@@ -865,8 +909,17 @@ pub(crate) fn build_quality_failure_summary(
 /// deltas surfaces as `Warnings`, and when every reported location lies outside
 /// the diff it is purely pre-existing debt that should get the same
 /// preexisting-only downgrade as a failure — otherwise the verdict stays
-/// CONDITIONAL instead of PASS-with-caveat. An in-diff warning is classified
-/// `Introduced` and keeps its review weight (no downgrade).
+/// CONDITIONAL instead of PASS-with-caveat.
+///
+/// Eligibility is NOT the same thing as gating (R2-13 re-adjudicated). Entering
+/// the summary is what lets a warning be classified and downgraded; it never
+/// makes the warning a failure. The origin recorded in
+/// [`QualityFailureDetail::origin`] keeps every `Warnings` entry out of
+/// [`QualityFailureSummary::has_new_failures`], whatever it classifies as — so
+/// an in-diff warning is still reported as `Introduced` and keeps its review
+/// weight through the policy engine, and a warning that produced no locatable
+/// finding at all (`Unclassified`) no longer counterfeits "N quality checks
+/// failed" and no longer flips `quality_pass` to false.
 fn quality_downgrade_eligible(check: &CheckResult) -> bool {
     check.is_failure()
         || (matches!(check.status, crate::checks::CheckStatus::Warnings)
@@ -885,18 +938,71 @@ pub(crate) fn quality_failure_reason_text(
         return None;
     }
 
+    // Failures and warnings get SEPARATE sentences: only a check that actually
+    // failed may be described with the word "failed". A warning-level baseline
+    // signal is reported as what it is — a warning signal — so the gate text can
+    // no longer manufacture "N quality checks failed" out of advisory output.
+    let mut sentences = Vec::new();
+    if let Some(breakdown) = classification_breakdown(quality_failure_details, |detail| {
+        detail.origin == QualityFailureOrigin::Failure
+    }) {
+        sentences.push(format!(
+            "{} quality check{} failed ({})",
+            breakdown.count,
+            if breakdown.count == 1 { "" } else { "s" },
+            breakdown.parts.join(", ")
+        ));
+    }
+    if let Some(breakdown) = classification_breakdown(quality_failure_details, |detail| {
+        detail.origin == QualityFailureOrigin::Warning
+    }) {
+        sentences.push(format!(
+            "{} warning signal{}: {}",
+            breakdown.count,
+            if breakdown.count == 1 { "" } else { "s" },
+            breakdown.parts.join(", ")
+        ));
+    }
+
+    if sentences.is_empty() {
+        return None;
+    }
+
+    Some(sentences.join("; "))
+}
+
+struct ClassificationBreakdown {
+    count: usize,
+    parts: Vec<String>,
+}
+
+/// Count the selected details per classification, rendering the same
+/// `N introduced, M pre-existing, …` breakdown used by both sentences.
+fn classification_breakdown(
+    quality_failure_details: &[QualityFailureDetail],
+    select: impl Fn(&QualityFailureDetail) -> bool,
+) -> Option<ClassificationBreakdown> {
     let mut introduced = 0usize;
     let mut preexisting = 0usize;
     let mut mixed = 0usize;
     let mut unclassified = 0usize;
+    let mut count = 0usize;
 
-    for detail in quality_failure_details {
+    for detail in quality_failure_details
+        .iter()
+        .filter(|detail| select(detail))
+    {
+        count += 1;
         match detail.classification {
             QualityFailureClass::Introduced => introduced += 1,
             QualityFailureClass::Preexisting => preexisting += 1,
             QualityFailureClass::Mixed => mixed += 1,
             QualityFailureClass::Unclassified => unclassified += 1,
         }
+    }
+
+    if count == 0 {
+        return None;
     }
 
     let mut parts = Vec::new();
@@ -913,16 +1019,7 @@ pub(crate) fn quality_failure_reason_text(
         parts.push(format!("{} unclassified", unclassified));
     }
 
-    if parts.is_empty() {
-        return None;
-    }
-
-    Some(format!(
-        "{} quality check{} failed ({})",
-        quality_failures.len(),
-        if quality_failures.len() == 1 { "" } else { "s" },
-        parts.join(", ")
-    ))
+    Some(ClassificationBreakdown { count, parts })
 }
 
 #[cfg(test)]
@@ -1045,6 +1142,7 @@ mod tests {
             &[QualityFailureDetail {
                 name: "clippy".to_string(),
                 classification: QualityFailureClass::Introduced,
+                origin: QualityFailureOrigin::Failure,
             }],
             &[],
             vec!["clippy returned warnings".to_string()],
@@ -1063,6 +1161,7 @@ mod tests {
             &[QualityFailureDetail {
                 name: "Semgrep scan".to_string(),
                 classification: QualityFailureClass::Preexisting,
+                origin: QualityFailureOrigin::Failure,
             }],
             &[],
             vec!["Pre-existing quality failures (not from this diff): Semgrep scan".to_string()],
@@ -1493,7 +1592,133 @@ mod tests {
         );
         assert!(summary.preexisting_quality_failures.is_empty());
         assert_eq!(summary.unclassified_quality_failures, vec!["Rustfmt"]);
+        // Deliberately updated with the origin split (re-adjudicates R2-13).
+        // What R5-21 protects is the CLASSIFICATION: a changed rustfmt config
+        // means the out-of-diff rows cannot be proven pre-existing, so they stay
+        // Unclassified and keep their review weight through the policy engine
+        // (Warnings → Advisory → ReviewRequired → CONDITIONAL). It never
+        // protected calling a formatter warning a *failed quality check* —
+        // Rustfmt reported `Warnings`, not `Failed`. The suppression is intact
+        // above; only the failure claim is gone.
+        assert!(
+            !summary.has_new_failures(),
+            "an unclassified WARNING is still not a failed quality check"
+        );
+
+        // The same shape from a check that genuinely failed still gates.
+        let failed_summary = build_quality_failure_summary(
+            &[failed_check("Rustfmt")],
+            &findings,
+            &CleanComparison::for_test_config_changed(&["rustfmt"]),
+        );
+        assert!(
+            failed_summary.has_new_failures(),
+            "a failed check with the same unclassified rows still fails the gate"
+        );
+    }
+
+    #[test]
+    fn unlocated_warning_is_not_a_failed_quality_check() {
+        // P0 "warning→failure": a baseline-signal check that reports `Warnings`
+        // without producing a single locatable finding (cargo audit raising an
+        // unmaintained-crate advisory) classifies as Unclassified — there is
+        // nothing to place inside or outside the diff. It must NOT make
+        // `quality_pass` false, and the gate text must not say "failed".
+        let summary = build_quality_failure_summary(
+            &[warning_check("Cargo audit")],
+            &[],
+            &CleanComparison::for_test(true, true),
+        );
+        assert_eq!(summary.unclassified_quality_failures, vec!["Cargo audit"]);
+        assert!(
+            !summary.has_new_failures(),
+            "a warning that produced no finding is not a new failure"
+        );
+
+        let reason = quality_failure_reason_text(&summary.quality_failures, &summary.details)
+            .expect("warning signals are still described");
+        assert!(
+            !reason.contains("failed"),
+            "warning-only reason must not use the word 'failed': {reason}"
+        );
+        assert_eq!(reason, "1 warning signal: 1 unclassified");
+    }
+
+    #[test]
+    fn unlocated_failure_still_fails_the_gate() {
+        // Fail-closed control for the test above: the SAME unlocated shape from
+        // a check that actually failed keeps gating.
+        let summary = build_quality_failure_summary(
+            &[failed_check("Cargo audit")],
+            &[],
+            &CleanComparison::for_test(true, true),
+        );
         assert!(summary.has_new_failures());
+        assert_eq!(
+            quality_failure_reason_text(&summary.quality_failures, &summary.details).as_deref(),
+            Some("1 quality check failed (1 unclassified)")
+        );
+    }
+
+    #[test]
+    fn in_diff_warning_is_introduced_but_still_not_a_failure() {
+        // An introduced warning keeps its classification (and its review weight
+        // through the policy engine) but is still not a failed quality check.
+        let findings = [in_diff_finding("rustfmt")];
+        let summary = build_quality_failure_summary(
+            &[warning_check("Rustfmt")],
+            &findings,
+            &CleanComparison::for_test(true, true),
+        );
+        assert_eq!(summary.introduced_quality_failures, vec!["Rustfmt"]);
+        assert!(!summary.has_new_failures());
+        assert_eq!(
+            quality_failure_reason_text(&summary.quality_failures, &summary.details).as_deref(),
+            Some("1 warning signal: 1 introduced")
+        );
+    }
+
+    #[test]
+    fn failure_and_warning_get_separate_sentences() {
+        let findings = [
+            in_diff_finding("cargo_test"),
+            out_of_diff_finding("rustfmt"),
+        ];
+        let summary = build_quality_failure_summary(
+            &[failed_check("cargo test"), warning_check("Rustfmt")],
+            &findings,
+            &CleanComparison::for_test(true, true),
+        );
+        assert!(summary.has_new_failures());
+        assert_eq!(
+            quality_failure_reason_text(&summary.quality_failures, &summary.details).as_deref(),
+            Some("1 quality check failed (1 introduced); 1 warning signal: 1 pre-existing")
+        );
+    }
+
+    #[test]
+    fn warning_only_summary_is_allow_with_review_not_hold() {
+        // Blast radius of the origin split on the hero label: with no real
+        // failure left, a warnings-only run is "mergeable with advisories".
+        let view = build_merge_decision_view(
+            true,  // policy_allow_merge
+            true,  // quality_pass (no longer broken by the warning)
+            false, // recommended_merge — policy still says review required
+            &["Cargo audit".to_string()],
+            &[QualityFailureDetail {
+                name: "Cargo audit".to_string(),
+                classification: QualityFailureClass::Unclassified,
+                origin: QualityFailureOrigin::Warning,
+            }],
+            &[],
+            vec!["Cargo audit note: 1 informational advisory".to_string()],
+        );
+        assert_eq!(view.state, MergeDecisionState::AllowWithReview);
+        assert!(
+            !view.reason.contains("failed"),
+            "decision reason must not claim a failure: {}",
+            view.reason
+        );
     }
 
     #[test]

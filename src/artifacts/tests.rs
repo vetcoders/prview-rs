@@ -1815,10 +1815,14 @@ fn merge_gate_surfaces_runtime_skipped_cargo_geiger() {
 
 #[test]
 fn merge_gate_surfaces_cargo_audit_informational_warnings_as_review_caveat() {
+    // The status here used to be `Passed`, which was a fiction: a cargo-audit run
+    // carrying an unmaintained-crate advisory reports `Warnings`. The injected
+    // `Passed` kept the check out of the quality summary entirely and therefore
+    // masked the warning→failure bug this test now also guards.
     let config = create_test_config(PolicyConfig::default());
     let checks = vec![CheckResult {
             name: "Cargo audit".to_string(),
-            status: CheckStatus::Passed,
+            status: CheckStatus::Warnings,
             duration: Duration::from_secs(1),
             output: r#"{"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{"unmaintained":[{"kind":"unmaintained","package":{"name":"paste","version":"1.0.15"},"advisory":{"id":"RUSTSEC-2024-0436"}}]}}"#.to_string(),
             cached: false,
@@ -1874,6 +1878,34 @@ fn merge_gate_surfaces_cargo_audit_informational_warnings_as_review_caveat() {
             .is_some_and(|items| items.iter().any(|item| item
                 .as_str()
                 .is_some_and(|text| text.contains("paste (unmaintained)"))))
+    );
+
+    // A warning-level check that produced no locatable finding classifies as
+    // `Unclassified`, but it is a WARNING — it must not be counted as a failed
+    // quality check. Before the origin split this exact shape flipped
+    // `quality_pass` to false and printed "1 quality check failed".
+    assert_eq!(
+        gate["decision"]["quality_pass"].as_bool(),
+        Some(true),
+        "an unlocated warning is not a quality failure: {}",
+        gate["decision"]
+    );
+    assert!(
+        !raw.contains("quality check failed") && !raw.contains("quality checks failed"),
+        "MERGE_GATE.json must not describe warnings as failed quality checks: {raw}"
+    );
+    // The verdict itself is unchanged: Warnings still reach the policy engine as
+    // an advisory signal, so the run stays CONDITIONAL — only the label is honest.
+    assert_eq!(
+        gate["decision"]["verdict"].as_str(),
+        Some("CONDITIONAL"),
+        "warning-level advisory keeps the CONDITIONAL verdict"
+    );
+    // …and the analysis is no longer degraded by a phantom quality failure.
+    assert_eq!(
+        gate["decision"]["analysis_status"].as_str(),
+        Some("complete"),
+        "no failed check means the analysis is complete, not degraded"
     );
 }
 
@@ -4060,6 +4092,7 @@ fn quality_failure_summary_has_new_failures_with_introduced() {
         &mut summary,
         "ESLint".to_string(),
         QualityFailureClass::Introduced,
+        QualityFailureOrigin::Failure,
     );
     assert!(summary.has_new_failures());
 }
@@ -4071,6 +4104,7 @@ fn quality_failure_summary_has_new_failures_with_mixed() {
         &mut summary,
         "ESLint".to_string(),
         QualityFailureClass::Mixed,
+        QualityFailureOrigin::Failure,
     );
     assert!(summary.has_new_failures());
 }
@@ -4082,6 +4116,7 @@ fn quality_failure_summary_has_new_failures_with_unclassified() {
         &mut summary,
         "cargo test".to_string(),
         QualityFailureClass::Unclassified,
+        QualityFailureOrigin::Failure,
     );
     assert!(summary.has_new_failures());
 }
@@ -4093,11 +4128,13 @@ fn quality_failure_summary_no_new_failures_when_only_preexisting() {
         &mut summary,
         "Cargo audit".to_string(),
         QualityFailureClass::Preexisting,
+        QualityFailureOrigin::Failure,
     );
     push_quality_failure(
         &mut summary,
         "ESLint".to_string(),
         QualityFailureClass::Preexisting,
+        QualityFailureOrigin::Failure,
     );
     assert!(!summary.has_new_failures());
     // quality_failures still lists them (backward compat)

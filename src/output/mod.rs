@@ -219,9 +219,11 @@ pub fn build_cli_json_summary(config: &Config, report: &Report) -> CliJsonSummar
 ///   variant A — advisory-fail does not force `exit != 0`).
 /// - CI (`--ci`) is the explicit strict exception: it additionally fails when
 ///   the analysis did not fully pass, matching the documented "strict exit
-///   codes" contract of `--ci`. This preserves the historical CI behavior
-///   (`block || !quality_pass → 1`) exactly.
-pub fn compute_exit_code(summary: &CliJsonSummary) -> i32 {
+///   codes" contract of `--ci` (`block || !quality_pass → 1`).
+/// - `--ci --fail-on-warnings` is the opt-in escape hatch: warning-level checks
+///   no longer break `quality_pass` (a warning is not a failure), so a team that
+///   wants a warnings-clean trunk asks for that exit explicitly.
+pub fn compute_exit_code(summary: &CliJsonSummary, fail_on_warnings: bool) -> i32 {
     use crate::policy::engine::MergeRecommendation;
 
     if summary.merge_recommendation == MergeRecommendation::Block {
@@ -229,6 +231,9 @@ pub fn compute_exit_code(summary: &CliJsonSummary) -> i32 {
     }
     let strict = summary.mode.execution_mode == "ci";
     if strict && !summary.quality_pass {
+        return 1;
+    }
+    if strict && fail_on_warnings && summary.checks_summary.warned > 0 {
         return 1;
     }
     0
@@ -1391,7 +1396,7 @@ mod tests {
 
         let summary = build_cli_json_summary(&config, &report);
         assert_eq!(summary.status, "ok");
-        assert_eq!(compute_exit_code(&summary), 0);
+        assert_eq!(compute_exit_code(&summary, false), 0);
     }
 
     #[test]
@@ -1424,7 +1429,7 @@ mod tests {
             summary.merge_recommendation,
             crate::policy::engine::MergeRecommendation::ReviewRequired
         );
-        assert_eq!(compute_exit_code(&summary), 0);
+        assert_eq!(compute_exit_code(&summary, false), 0);
     }
 
     #[test]
@@ -1453,7 +1458,76 @@ mod tests {
 
         let summary = build_cli_json_summary(&config, &report);
         assert_eq!(summary.mode.execution_mode, "ci");
-        assert_eq!(compute_exit_code(&summary), 1);
+        assert_eq!(compute_exit_code(&summary, false), 1);
+    }
+
+    #[test]
+    fn test_exit_code_ci_warnings_only_passes_unless_opted_in() {
+        // Warning→failure P0: a run whose only signal is a warning-level check
+        // has `quality_pass == true`, so --ci exits 0. `--fail-on-warnings` is
+        // the opt-in escape hatch that restores the old exit 1.
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Ci;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        std::fs::write(
+            temp.path().join("00_summary/MERGE_GATE.json"),
+            r#"{"decision":{"verdict":"CONDITIONAL","merge_recommendation":"review_required","allow_merge":false,"quality_pass":true}}"#,
+        )
+        .unwrap();
+
+        let report = Report {
+            target: "feature/warnings-only".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![CheckResult {
+                name: "Cargo audit".to_string(),
+                status: CheckStatus::Warnings,
+                duration: Duration::from_secs(1),
+                output: "1 unmaintained crate".to_string(),
+                cached: false,
+                provenance: None,
+            }],
+            heuristics: None,
+            artifacts_dir: temp.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: false,
+        };
+
+        let summary = build_cli_json_summary(&config, &report);
+        assert_eq!(summary.mode.execution_mode, "ci");
+        assert_eq!(summary.checks_summary.warned, 1);
+        assert!(summary.quality_pass);
+        assert_eq!(compute_exit_code(&summary, false), 0);
+        assert_eq!(compute_exit_code(&summary, true), 1);
+    }
+
+    #[test]
+    fn test_fail_on_warnings_is_scoped_to_ci() {
+        // Outside --ci the exit stays derived from the merge recommendation
+        // alone; the escape hatch never silently hardens a plain local run.
+        let config = test_config();
+        let report = Report {
+            target: "feature/warnings-only".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![CheckResult {
+                name: "Cargo audit".to_string(),
+                status: CheckStatus::Warnings,
+                duration: Duration::from_secs(1),
+                output: "1 unmaintained crate".to_string(),
+                cached: false,
+                provenance: None,
+            }],
+            heuristics: None,
+            artifacts_dir: PathBuf::from("."),
+            duration: Duration::from_secs(1),
+            unchanged: false,
+        };
+
+        let summary = build_cli_json_summary(&config, &report);
+        assert_ne!(summary.mode.execution_mode, "ci");
+        assert_eq!(compute_exit_code(&summary, true), 0);
     }
 
     #[test]
@@ -1484,7 +1558,7 @@ mod tests {
             summary.merge_recommendation,
             crate::policy::engine::MergeRecommendation::Block
         );
-        assert_eq!(compute_exit_code(&summary), 1);
+        assert_eq!(compute_exit_code(&summary, false), 1);
     }
 
     #[test]
