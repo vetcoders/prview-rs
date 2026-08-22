@@ -617,6 +617,17 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     // replaced one of them was left unpaired and its change went unreported.
     // Exact matches are claimed first (pass 1) so an unchanged re-add is never
     // spent on a removal that a different addition replaces.
+    //
+    // ACCEPTED LIMIT (deferred to 0.8, do not re-litigate). Pairing sees only
+    // the declaration LINES the diff emitted. An enum variant, a trait method or
+    // a struct field removed below an unchanged `pub enum` / `pub trait` /
+    // `pub struct` opener is a breaking change this scanner does not report:
+    // the opener was never emitted as -/+, so nothing enters `removed_syms` to
+    // pair at all. Closing it needs the item's body from BOTH commits, which a
+    // diff-only scanner does not have; the fix is the repo-backed breaking
+    // analysis planned for 0.8, not a deeper heuristic here. The limit was
+    // reviewed and accepted deliberately — widening it here would trade a known
+    // blind spot for guesses about text the scanner never saw.
     let mut added_used = vec![false; added_syms.len()];
     let mut unpaired_removed = Vec::new();
 

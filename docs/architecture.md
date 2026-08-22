@@ -725,6 +725,15 @@ silent re-addition. A re-add in a *different* file is a module move and becomes
 `RelocatedSymbol`, which is reported but deliberately excluded from breaking
 escalation.
 
+**Accepted limit (deferred to 0.8).** The scan sees only the declaration LINES a
+diff emitted. An enum variant, a trait method or a struct field removed below an
+unchanged `pub enum` / `pub trait` / `pub struct` opener is a breaking change
+prview does not report: the opener was never emitted as `-`/`+`, so nothing
+enters pairing to begin with. Reporting it needs the item's body from BOTH
+commits, which a diff-only scanner does not have — the fix is the repo-backed
+breaking analysis planned for 0.8, and this limit was reviewed and accepted
+deliberately rather than papered over with a deeper heuristic.
+
 Declarations are compared on their FULL text, continuation lines joined, up to
 `MAX_DECL_CONTINUATION_LINES` (32) — a runaway bound for static bodies and
 generated data tables, not a display width. The bound used to be eight lines,
