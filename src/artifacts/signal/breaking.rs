@@ -1024,7 +1024,13 @@ impl PendingDecl {
             return;
         }
         if !self.decl.identity.is_empty() {
-            self.decl.identity.push(' ');
+            // The lines are separated by the character that actually separated
+            // them. Joining with a space made a literal spanning two lines
+            // compare equal to the same literal rewritten with a space in it, so
+            // a changed public constant paired away as an unchanged re-add. The
+            // identity is only ever compared, never displayed, so the newline
+            // costs nothing and says what the source said.
+            self.decl.identity.push('\n');
         }
         self.decl.identity.push_str(line);
     }
@@ -2538,6 +2544,57 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "an unchanged re-emission is not breaking, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_newline_inside_a_literal_is_not_the_same_value_as_a_space() {
+        // The identity joined physical lines with a space, INCLUDING the ones a
+        // literal spans. A constant written across two lines therefore compared
+        // equal to the same constant rewritten with a space, and the exact-match
+        // pass consumed the addition: a changed public value left no finding.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const BANNER: &str = \"a",
+                "-b\";",
+                "+pub const BANNER: &str = \"a b\";",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "collapsing a literal's newline into a space changes the value, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_multiline_literal_reemitted_unchanged_is_still_a_no_op() {
+        // The tolerant direction: the same constant re-emitted across the same
+        // physical lines must stay a no-op.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const BANNER: &str = \"a",
+                "-b\";",
+                "+pub const BANNER: &str = \"a",
+                "+b\";",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "an unchanged multiline literal is not breaking, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

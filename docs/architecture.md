@@ -763,6 +763,13 @@ and char literals verbatim: a literal is code, so `pub const GREETING: &str =
 delimiter trackers, which want a brace inside a string silenced, and
 `code_with_literals` for callers comparing source.
 
+The identity separates its lines with the character that separated them: a
+newline, not a space. A literal spanning two physical lines otherwise compared
+equal to the same literal rewritten with a space in it, and a changed public
+constant paired away as an unchanged re-add. (Indentation INSIDE such a literal
+is already gone by then — lines reach the accumulator trimmed — so two multi-line
+literals differing only in leading whitespace still read as one.)
+
 A declaration ends at a `;` or a body `{` outside its brackets. Square brackets
 count for the same reason parentheses do: an array type states its length with a
 `;`, as in `pub const TABLE: [u8; 2] = [`, and reading that as the terminator

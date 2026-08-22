@@ -207,6 +207,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finalized at their identical opener, paired as an unchanged re-add, and the
   changed values below produced no finding at all. Square brackets are now
   counted like parentheses before a `;` ends a declaration.
+- **A literal spanning two lines is no longer the same value as one with a
+  space.** The comparison identity joined physical lines with a space, including
+  the lines a literal spans, so a rewritten public constant paired away as an
+  unchanged re-add. Lines are now separated by the boundary that separated them.
 - **Rewording a comment inside a declaration is no longer a signature change.**
   Declarations were compared on their verbatim text, comments and all, so a
   remove+re-add of a byte-identical public signature whose internal comment had
