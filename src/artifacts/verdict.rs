@@ -312,8 +312,10 @@ pub(crate) fn build_review_caveats(
         caveats.push(breaking_breakdown.summary_parts().join(" · "));
     }
 
-    if coverage.total_source > 0 && coverage.pct < 80 {
-        let mut coverage_caveat = format!("{}% coverage heuristic", coverage.pct);
+    if let Some(pct) = coverage.pct
+        && pct < 80
+    {
+        let mut coverage_caveat = format!("{}% coverage heuristic", pct);
         if coverage_has_rust_inline_test_blind_spot(coverage) {
             coverage_caveat.push_str(" (Rust inline #[cfg(test)] modules may be missed)");
         }

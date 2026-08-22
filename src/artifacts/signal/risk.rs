@@ -328,7 +328,7 @@ mod tests {
 
     fn empty_coverage() -> CoverageDelta {
         CoverageDelta {
-            pct: 100,
+            pct: None,
             total_source: 0,
             covered_count: 0,
             uncovered: vec![],

@@ -481,7 +481,12 @@ struct BreakingSection {
 
 #[derive(Serialize)]
 struct CoverageSection {
-    heuristic_ratio: f64,
+    /// `null` when there were no changed source files to evaluate. 0/0 is an
+    /// absence of measurement, not a perfect ratio.
+    heuristic_ratio: Option<f64>,
+    measured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_measured_reason: Option<&'static str>,
     matched: usize,
     total: usize,
     txt_path: &'static str,
@@ -891,11 +896,13 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             new_env_vars_count: new_env_vars,
         },
         coverage: CoverageSection {
-            heuristic_ratio: if ctx.coverage.total_source > 0 {
-                ctx.coverage.covered_count as f64 / ctx.coverage.total_source as f64
-            } else {
-                1.0
-            },
+            // 0/0 must serialize as null + measured:false, never as a 1.0 that
+            // downstream renders as "100% coverage".
+            heuristic_ratio: (ctx.coverage.total_source > 0)
+                .then(|| ctx.coverage.covered_count as f64 / ctx.coverage.total_source as f64),
+            measured: ctx.coverage.total_source > 0,
+            not_measured_reason: (ctx.coverage.total_source == 0)
+                .then_some("no changed source files to evaluate"),
             matched: ctx.coverage.covered_count,
             total: ctx.coverage.total_source,
             txt_path: "20_quality/coverage-delta.txt",
@@ -1248,7 +1255,7 @@ test result: FAILED. 0 passed; 1 failed
             coverage: CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,
@@ -1351,7 +1358,7 @@ test result: FAILED. 0 passed; 1 failed
             coverage: CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,
@@ -1480,7 +1487,7 @@ test result: FAILED. 0 passed; 1 failed
             coverage: CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,
@@ -1576,7 +1583,7 @@ test result: FAILED. 0 passed; 1 failed
             coverage: crate::artifacts::signal::CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,
@@ -1665,6 +1672,128 @@ test result: FAILED. 0 passed; 1 failed
         assert!(heuristics_json.get("dead_parrots").is_none());
     }
 
+    // ── SKIP-AS-ZERO regression guards (report.json) ─────────────────────
+
+    /// Minimal DashboardContext for report.json shape assertions.
+    fn skip_as_zero_ctx(
+        coverage: crate::artifacts::signal::CoverageDelta,
+    ) -> crate::artifacts::DashboardContext {
+        crate::artifacts::DashboardContext {
+            verdict: "PASS",
+            analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
+            allow_merge: true,
+            quality_pass: true,
+            policy_allow_merge: true,
+            recommended_merge: true,
+            review_caveats: vec![],
+            quality_failures: vec![],
+            introduced_quality_failures: vec![],
+            preexisting_quality_failures: vec![],
+            mixed_quality_failures: vec![],
+            unclassified_quality_failures: vec![],
+            quality_failure_details: vec![],
+            policy_mode: "warn",
+            blocking_issues: vec![],
+            check_gates: vec![],
+            breaking: vec![],
+            coverage,
+            findings: vec![],
+            per_file_diff_files: vec![],
+            skipped_checks: vec![],
+            previous_run: None,
+            run_history: vec![],
+            flaky_scores: vec![],
+            lint_metrics: vec![],
+            ownership_map: vec![],
+            risk_scores: vec![],
+            i18n_delta: None,
+        }
+    }
+
+    fn skip_as_zero_report(
+        ctx: &crate::artifacts::DashboardContext,
+        heuristics: Option<&crate::heuristics::HeuristicsResult>,
+    ) -> serde_json::Value {
+        use crate::cli::ExecutionMode;
+        use crate::config::test_config;
+        use crate::git::ResolvedRef;
+
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Standard;
+        let target = ResolvedRef {
+            name: "feature/skip-as-zero".to_string(),
+            commit_id: "deadbeef".to_string(),
+            is_remote: false,
+        };
+        let bases = vec![ResolvedRef {
+            name: "main".to_string(),
+            commit_id: "cafebabe".to_string(),
+            is_remote: false,
+        }];
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = ReportInput {
+            dir: tmp.path(),
+            config: &config,
+            diffs: &[],
+            checks: &[],
+            resolved_target: &target,
+            resolved_bases: &bases,
+            ctx,
+            run_started_at: "2026-03-12T00:00:00Z",
+            heuristics,
+            regression: None,
+        };
+        serde_json::to_value(build_report(&input)).expect("serialize report")
+    }
+
+    fn coverage_delta(
+        total_source: usize,
+        covered_count: usize,
+        pct: Option<u32>,
+    ) -> crate::artifacts::signal::CoverageDelta {
+        crate::artifacts::signal::CoverageDelta {
+            total_source,
+            covered_count,
+            pct,
+            uncovered: vec![],
+            covered: vec![],
+            non_code_count: 0,
+            ghost_tests: vec![],
+        }
+    }
+
+    #[test]
+    fn report_coverage_zero_of_zero_is_null_not_full_ratio() {
+        let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        let json = skip_as_zero_report(&ctx, None);
+        let cov = &json["quality"]["coverage"];
+
+        assert!(
+            cov["heuristic_ratio"].is_null(),
+            "0/0 must serialize as null, got {:?}",
+            cov["heuristic_ratio"]
+        );
+        assert_eq!(cov["measured"].as_bool(), Some(false));
+        assert!(cov["not_measured_reason"].as_str().is_some());
+        // Schema compatibility: the counters stay present for existing readers.
+        assert_eq!(cov["matched"].as_u64(), Some(0));
+        assert_eq!(cov["total"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn report_coverage_zero_of_n_stays_a_real_zero_ratio() {
+        // 0/3 IS a measurement — it must not be downgraded to "not measured".
+        let ctx = skip_as_zero_ctx(coverage_delta(3, 0, Some(0)));
+        let json = skip_as_zero_report(&ctx, None);
+        let cov = &json["quality"]["coverage"];
+
+        assert_eq!(cov["heuristic_ratio"].as_f64(), Some(0.0));
+        assert_eq!(cov["measured"].as_bool(), Some(true));
+        assert!(cov.get("not_measured_reason").is_none());
+        assert_eq!(cov["total"].as_u64(), Some(3));
+    }
+
     #[test]
     fn report_includes_cargo_audit_informational_caveat_when_context_has_none() {
         use crate::artifacts::{CheckGateEntry, DashboardContext};
@@ -1713,7 +1842,7 @@ test result: FAILED. 0 passed; 1 failed
             coverage: crate::artifacts::signal::CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,

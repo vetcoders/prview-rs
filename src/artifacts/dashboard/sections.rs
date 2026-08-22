@@ -1027,18 +1027,21 @@ pub(super) fn build_action_center(
     }
 
     let cov = &ctx.coverage;
-    if cov.total_source > 0 || cov.non_code_count > 0 {
-        if cov.pct < 80 {
+    // `pct == None` means no changed source files were evaluated. A diff of
+    // pure non-code changes used to fall through here and emit a "Coverage:
+    // 100%" chip out of a 0/0 ratio — emit nothing instead.
+    if let Some(cov_pct) = cov.pct {
+        if cov_pct < 80 {
             push_card(
                 &mut cards,
                 "#section-coverage",
-                if cov.pct < 50 {
+                if cov_pct < 50 {
                     "alert-error"
                 } else {
                     "alert-warning"
                 },
                 r#"<span data-i18n="section.coverage">Coverage</span>"#.to_string(),
-                escape_html(&format!("{}%", cov.pct)),
+                escape_html(&format!("{}%", cov_pct)),
                 i18n_template(
                     "message.changedCodeWithoutMatchingTests",
                     "Changed code without matching tests",
@@ -1055,7 +1058,7 @@ pub(super) fn build_action_center(
                     i18n_template(
                         "chip.coverageOk",
                         "Coverage: {pct}%",
-                        &[("pct", cov.pct.to_string())],
+                        &[("pct", cov_pct.to_string())],
                     )
                 ),
             );
@@ -1974,13 +1977,14 @@ pub(super) fn build_breaking_section(ctx: &DashboardContext) -> String {
 
 pub(super) fn build_coverage_section(ctx: &DashboardContext) -> String {
     let cov = &ctx.coverage;
-    if cov.total_source == 0 {
+    // No changed source files => nothing measured => no coverage section at all.
+    let Some(cov_pct) = cov.pct else {
         return String::new();
-    }
+    };
 
     // Coverage % is a metric, not a verdict: keep color only for the negative
     // signal (below threshold = "what is wrong?"), neutralize the rest.
-    let pct_color = if cov.pct < 50 {
+    let pct_color = if cov_pct < 50 {
         "var(--warn)"
     } else {
         "var(--fg)"
@@ -2049,7 +2053,7 @@ pub(super) fn build_coverage_section(ctx: &DashboardContext) -> String {
     </div>
 </div>"#,
         color = pct_color,
-        pct = cov.pct,
+        pct = cov_pct,
         coverage_detail = i18n_template(
             "message.coverageDetail",
             &format!(

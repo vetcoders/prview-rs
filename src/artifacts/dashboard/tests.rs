@@ -123,7 +123,7 @@ fn mock_ctx() -> DashboardContext {
         check_gates: vec![],
         breaking: vec![],
         coverage: super::super::CoverageDelta {
-            pct: 100,
+            pct: Some(100),
             total_source: 1,
             covered_count: 1,
             uncovered: vec![],
@@ -372,7 +372,7 @@ fn test_header_merge_chip_shows_review_caveat() {
         risk_level: BreakingRisk::High,
     }];
     ctx.coverage = super::super::CoverageDelta {
-        pct: 11,
+        pct: Some(11),
         total_source: 43,
         covered_count: 5,
         uncovered: vec![],
@@ -509,7 +509,7 @@ fn test_merge_decision_card_review_caveats() {
         risk_level: BreakingRisk::High,
     }];
     ctx.coverage = super::super::CoverageDelta {
-        pct: 11,
+        pct: Some(11),
         total_source: 43,
         covered_count: 5,
         uncovered: vec![],

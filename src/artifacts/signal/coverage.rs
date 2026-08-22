@@ -32,11 +32,27 @@ impl std::fmt::Display for CoverageMatchTier {
 
 // ── Coverage data structures ─────────────────────────────────────────
 
+/// Rendered when there was nothing to measure (no changed source files).
+/// A 0/0 ratio is an absence of data, never a perfect score.
+pub const COVERAGE_NOT_MEASURED: &str = "not measured";
+
+/// Format an optional coverage percentage for human-facing artifacts.
+///
+/// `None` means the heuristic had no changed source files to evaluate, which
+/// must never be presented as 100%.
+pub fn format_coverage_pct(pct: Option<u32>) -> String {
+    match pct {
+        Some(p) => format!("{}%", p),
+        None => COVERAGE_NOT_MEASURED.to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CoverageDelta {
     pub total_source: usize,
     pub covered_count: usize,
-    pub pct: u32,
+    /// `None` when `total_source == 0` — nothing was measured.
+    pub pct: Option<u32>,
     pub uncovered: Vec<CoverageFile>,
     pub covered: Vec<CoveragePair>,
     pub non_code_count: usize,
@@ -116,7 +132,9 @@ pub struct CoverageSignal {
     pub uncovered_files: Vec<String>,
     pub total_source_files: usize,
     pub covered_count: usize,
-    pub coverage_pct: u32,
+    /// `None` when `total_source_files == 0`: the heuristic had nothing to
+    /// evaluate. Consumers must render this as "not measured", not as 100%.
+    pub coverage_pct: Option<u32>,
     pub non_code_count: usize,
     pub has_rust_inline_tests: bool,
     pub rust_uncovered_count: usize,
@@ -275,10 +293,13 @@ pub fn compute_coverage_signal(
 
     let total = source_files.len();
     let covered_count = covered.len() + inline_tested_count;
+    // 0/0 is "nothing was measured", not "everything is covered". Reporting 100%
+    // for an empty scan is the SKIP-AS-ZERO inversion the gate already avoids
+    // (see build_heuristics_gate_check); coverage must speak the same language.
     let pct = if total > 0 {
-        (covered_count as f64 / total as f64 * 100.0) as u32
+        Some((covered_count as f64 / total as f64 * 100.0) as u32)
     } else {
-        100
+        None
     };
 
     let has_rust = source_files.iter().any(|f| f.path.ends_with(".rs"));
@@ -452,8 +473,10 @@ pub fn generate_coverage_delta(dir: &Path, signal: &CoverageSignal) -> Result<()
 
     let _ = writeln!(
         output,
-        "Summary: {}/{} changed code files have matching test changes ({}%)",
-        signal.covered_count, signal.total_source_files, pct
+        "Summary: {}/{} changed code files have matching test changes ({})",
+        signal.covered_count,
+        signal.total_source_files,
+        format_coverage_pct(pct)
     );
     if signal.inline_tested_count > 0 {
         let _ = writeln!(
@@ -820,7 +843,7 @@ mod tests {
 
         let signal = compute_coverage_signal(&[diff], None, Some(&repo));
         assert_eq!(signal.covered_count, 1);
-        assert_eq!(signal.coverage_pct, 100);
+        assert_eq!(signal.coverage_pct, Some(100));
         assert!(signal.uncovered_files.is_empty());
         assert_eq!(
             signal.covered_files[0],
@@ -850,7 +873,7 @@ mod tests {
 
         let signal = compute_coverage_signal(&[diff], None, Some(&repo));
         assert_eq!(signal.uncovered_files, vec!["src/lib.rs"]);
-        assert!(signal.coverage_pct < 100);
+        assert!(signal.coverage_pct.is_some_and(|p| p < 100));
     }
 
     #[test]
@@ -900,7 +923,7 @@ mod tests {
         assert_eq!(signal.total_source_files, 1);
         assert_eq!(signal.covered_count, 1);
         assert_eq!(signal.non_code_count, 4);
-        assert_eq!(signal.coverage_pct, 100);
+        assert_eq!(signal.coverage_pct, Some(100));
     }
 
     #[test]
@@ -994,7 +1017,7 @@ mod tests {
             signal.uncovered_files.is_empty(),
             "inline-tested file must not be counted as uncovered"
         );
-        assert_eq!(signal.coverage_pct, 100);
+        assert_eq!(signal.coverage_pct, Some(100));
         assert!(
             signal
                 .covered_files
@@ -1029,20 +1052,56 @@ mod tests {
             "a cfg(test) import without #[test] must not count as inline-tested"
         );
         assert_eq!(signal.uncovered_files, vec!["src/calc.rs"]);
-        assert!(signal.coverage_pct < 100);
+        assert!(signal.coverage_pct.is_some_and(|p| p < 100));
     }
 
     #[test]
-    fn coverage_delta_empty() {
+    fn coverage_delta_empty_reports_not_measured_not_100() {
         let tmp = TempDir::new().unwrap();
         let diff = mock_diff(vec![]);
 
         let signal = compute_coverage_signal(&[diff], None, None);
+        assert_eq!(
+            signal.coverage_pct, None,
+            "0/0 must be an absent measurement, not a percentage"
+        );
         generate_coverage_delta(tmp.path(), &signal).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("coverage-delta.txt")).unwrap();
         assert!(content.contains("0/0"));
-        assert!(content.contains("100%"));
+        assert!(
+            content.contains(COVERAGE_NOT_MEASURED),
+            "empty scan must be labelled '{COVERAGE_NOT_MEASURED}', got:\n{content}"
+        );
+        assert!(
+            !content.contains("100%"),
+            "empty scan must never claim 100% coverage, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn coverage_zero_of_n_is_a_real_zero_percent_measurement() {
+        // 0/N (N > 0) IS a measurement: source changed, no test changed.
+        // It must stay 0%, not degrade into "not measured".
+        let diff = mock_diff(vec![
+            mock_file_change("src/lib.rs", FileStatus::Modified, 10, 5),
+            mock_file_change("src/utils.rs", FileStatus::Added, 20, 0),
+        ]);
+
+        let signal = compute_coverage_signal(&[diff], None, None);
+        assert_eq!(signal.total_source_files, 2);
+        assert_eq!(signal.covered_count, 0);
+        assert_eq!(signal.coverage_pct, Some(0));
+
+        let tmp = TempDir::new().unwrap();
+        generate_coverage_delta(tmp.path(), &signal).unwrap();
+        let content = fs::read_to_string(tmp.path().join("coverage-delta.txt")).unwrap();
+        assert!(content.contains("0/2"));
+        assert!(
+            content.contains("(0%)"),
+            "0/N must render as a real 0%, got:\n{content}"
+        );
+        assert!(!content.contains(COVERAGE_NOT_MEASURED));
     }
 
     #[test]
@@ -1071,9 +1130,9 @@ mod tests {
             text
         );
         assert!(
-            text.contains(&format!("{}%", delta.pct)),
-            "Text artifact must show {}% but got:\n{}",
-            delta.pct,
+            text.contains(&format_coverage_pct(delta.pct)),
+            "Text artifact must show {} but got:\n{}",
+            format_coverage_pct(delta.pct),
             text
         );
         assert!(

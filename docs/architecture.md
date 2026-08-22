@@ -289,6 +289,15 @@ Cross-references changed source files with test files to estimate test coverage:
 - `CoveragePair` struct — a matched (source file, test file) pair with the match strategy used
 - `compute_coverage_signal(diffs, repo_root, repo)` — the canonical computation function
 - `generate_coverage_delta(dir, signal)` — renders `coverage-delta.txt` from a pre-computed signal
+- `format_coverage_pct(Option<u32>)` — the one renderer for the percentage; `None` becomes `not measured`
+
+**Unmeasured is not 100%.** `coverage_pct` / `CoverageDelta::pct` are
+`Option<u32>` and are `None` whenever no changed source file was evaluated
+(`total_source_files == 0`). Consumers must render that as "not measured" or
+omit the coverage surface entirely — never as a percentage. A real `0/N`
+(N > 0) stays a genuine `0%` measurement. In `report.json`,
+`quality.coverage.heuristic_ratio` is `null` in the unmeasured case and is
+paired with `measured: false` + `not_measured_reason`.
 
 Four-strategy filename heuristic matching:
 1. Exact stem match: `foo.rs` <-> `foo_test.rs` / `test_foo.rs` / `foo.test.ts`

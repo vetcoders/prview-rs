@@ -440,7 +440,7 @@ fn merge_gate_blocks_failed_cargo_audit_in_warn_mode_when_severity_is_block() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -520,7 +520,7 @@ fn merge_gate_executed_cargo_check_carries_real_evidence_and_log() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1081,7 +1081,7 @@ fn merge_gate_marks_heuristics_disabled_as_not_run() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1131,7 +1131,7 @@ fn merge_gate_files_field_omits_inline_findings_path_when_no_findings() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1188,7 +1188,7 @@ fn merge_gate_includes_inline_findings_path_when_sarif_exists() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1256,7 +1256,7 @@ fn merge_gate_surfaces_review_caveats_when_merge_needs_review() {
     let coverage = CoverageDelta {
         total_source: 4,
         covered_count: 1,
-        pct: 25,
+        pct: Some(25),
         uncovered: vec![crate::artifacts::signal::CoverageFile {
             status: 'M',
             path: "src/lib.rs".to_string(),
@@ -1316,7 +1316,7 @@ fn build_review_caveats_include_orphaned_test_candidates() {
     let coverage = CoverageDelta {
         total_source: 2,
         covered_count: 2,
-        pct: 100,
+        pct: Some(100),
         uncovered: vec![],
         covered: vec![],
         non_code_count: 0,
@@ -1371,7 +1371,7 @@ fn merge_gate_splits_introduced_and_preexisting_inline_findings() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1462,7 +1462,7 @@ fn merge_gate_splits_preexisting_quality_failures_from_inline_findings() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1565,7 +1565,7 @@ fn merge_gate_reason_mentions_preexisting_failures_under_merge_with_review() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1643,7 +1643,7 @@ fn merge_gate_marks_skipped_rust_quality_signals_as_review_caveats() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1710,7 +1710,7 @@ fn merge_gate_surfaces_skipped_cargo_geiger_when_security_was_requested() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1782,7 +1782,7 @@ fn merge_gate_surfaces_runtime_skipped_cargo_geiger() {
             &CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,
@@ -1847,7 +1847,7 @@ fn merge_gate_surfaces_cargo_audit_informational_warnings_as_review_caveat() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1907,7 +1907,7 @@ fn merge_gate_does_not_fail_fast_remote_only_for_expected_rust_gaps() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1990,7 +1990,7 @@ fn merge_gate_blocks_missing_rust_quality_signal_when_policy_sets_block() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -2055,7 +2055,7 @@ fn merge_gate_skipped_cargo_geiger_with_ignore_severity_produces_no_caveat() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -2540,7 +2540,7 @@ fn pr_review_summarizes_cargo_audit_without_dumping_json() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -2629,7 +2629,7 @@ fn pr_review_surfaces_cargo_audit_informational_warnings_when_check_passes() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -2778,6 +2778,70 @@ fn is_pathish_candidate_rejects_code_fragments() {
 }
 
 #[test]
+fn ai_index_coverage_signal_says_not_measured_for_zero_of_zero() {
+    use crate::artifacts::signal::COVERAGE_NOT_MEASURED;
+    use crate::git::DiffStats;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = tmp.path();
+    let config = create_test_config(PolicyConfig::default());
+    let diffs = vec![Diff {
+        base: "main".to_string(),
+        target: "feat/x".to_string(),
+        base_commit_id: "aaa".to_string(),
+        target_commit_id: "bbb".to_string(),
+        files: vec![],
+        stats: DiffStats {
+            files_changed: 0,
+            additions: 0,
+            deletions: 0,
+            copied: 0,
+        },
+        commits: vec![],
+    }];
+
+    let empty = CoverageDelta {
+        total_source: 0,
+        covered_count: 0,
+        pct: None,
+        uncovered: vec![],
+        covered: vec![],
+        non_code_count: 0,
+        ghost_tests: vec![],
+    };
+    generate_ai_index(out, &config, &diffs, &[], &empty).expect("ai index");
+    let index = std::fs::read_to_string(out.join("AI_INDEX.md")).expect("AI_INDEX.md");
+    assert!(
+        index.contains(&format!(
+            "Coverage signal: 0/0 changed code files ({COVERAGE_NOT_MEASURED})"
+        )),
+        "0/0 must be labelled not-measured, got:\n{index}"
+    );
+    assert!(
+        !index.contains("(100%)"),
+        "0/0 must never render as 100%, got:\n{index}"
+    );
+
+    // 0/N stays a real 0% measurement.
+    let measured = CoverageDelta {
+        total_source: 4,
+        covered_count: 0,
+        pct: Some(0),
+        uncovered: vec![],
+        covered: vec![],
+        non_code_count: 0,
+        ghost_tests: vec![],
+    };
+    generate_ai_index(out, &config, &diffs, &[], &measured).expect("ai index");
+    let index = std::fs::read_to_string(out.join("AI_INDEX.md")).expect("AI_INDEX.md");
+    assert!(
+        index.contains("Coverage signal: 0/4 changed code files (0%)"),
+        "0/N must render as 0%, got:\n{index}"
+    );
+    assert!(!index.contains(COVERAGE_NOT_MEASURED));
+}
+
+#[test]
 fn generate_ai_index_writes_reading_order_and_verdict() {
     use crate::git::DiffStats;
 
@@ -2811,7 +2875,7 @@ fn generate_ai_index_writes_reading_order_and_verdict() {
     let coverage = CoverageDelta {
         total_source: 0,
         covered_count: 0,
-        pct: 100,
+        pct: None,
         uncovered: vec![],
         covered: vec![],
         non_code_count: 0,
@@ -2992,7 +3056,7 @@ fn pr_review_counts_code_test_and_non_code_separately() {
         &CoverageDelta {
             total_source: 1,
             covered_count: 1,
-            pct: 100,
+            pct: Some(100),
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -3049,7 +3113,7 @@ fn pr_review_uses_coverage_delta_for_warning_summary() {
         &CoverageDelta {
             total_source: 4,
             covered_count: 1,
-            pct: 25,
+            pct: Some(25),
             uncovered: vec![crate::artifacts::signal::CoverageFile {
                 status: 'M',
                 path: "src/lib.rs".to_string(),
@@ -3113,7 +3177,7 @@ fn pr_review_surfaces_quick_wins_for_rust_signal_gaps_and_cargo_audit() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -4121,7 +4185,7 @@ fn preexisting_failures_do_not_block_gate() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -4228,7 +4292,7 @@ fn introduced_failures_still_block_gate() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -4348,7 +4412,7 @@ fn mixed_failures_include_both_preexisting_and_introduced_in_output() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
