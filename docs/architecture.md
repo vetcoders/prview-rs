@@ -216,6 +216,23 @@ Implementations:
 In standard execution mode, tests and lint are enabled by default, unless a
 preset (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*` disables them.
 
+#### Where checks run
+
+Checks must judge the *reviewed* commit, not whatever happens to be checked out
+locally. `plan_check_run()` resolves the working directory for every
+language check: when the resolved target equals `HEAD` (the ordinary local
+review) it returns `repo_root` unchanged; when they differ (`--pr`, `--remote`,
+or an explicit target) it materialises a detached `git worktree` at the target
+commit and returns that path. `node_modules` and `.venv` are symlinked into the
+snapshot, so tests and linters keep their installed environment without a
+reinstall.
+
+The Python and JS checks (`Ruff`, `Mypy`, `Pytest`, `TypeScript`, `ESLint`,
+`Vitest`, `Stylelint`) share **one** run-wide snapshot rather than each creating
+its own — see `uses_shared_scan_dir()`. Two families opt out deliberately:
+`SemgrepCheck` manages its own worktree because it also needs a baseline commit,
+and the cargo checks run at `cargo_cache_root` to reuse the Rust build cache.
+
 ### mcp/
 
 The MCP server (`prview mcp`) is a thin contract adapter over the prview core.
