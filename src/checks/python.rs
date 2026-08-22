@@ -2,17 +2,62 @@
 
 use super::{
     Check, CheckProvenance, CheckResult, CheckStatus, TEST_TIMEOUT_SECS, find_hard_fail_signatures,
-    plan_check_run, run_command, run_command_with_timeout, tool_spawn_failure_in_output,
+    plan_check_run, run_command_with_env, run_command_with_timeout_and_env,
+    tool_spawn_failure_in_output,
 };
 use crate::Config;
 use crate::cache;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Local;
+use std::path::PathBuf;
 
 pub struct RuffCheck;
 pub struct MypyCheck;
 pub struct PytestCheck;
+
+/// Where a python check must execute, plus the environment it needs there.
+struct PythonRun {
+    /// Directory to run the tool in — the reviewed snapshot in `--pr`/`--remote`
+    /// mode, the local checkout otherwise.
+    cwd: PathBuf,
+    /// Extra child environment (`UV_PROJECT_ENVIRONMENT`), empty for a local run.
+    env: Vec<(String, String)>,
+    /// Ephemeral snapshot, kept alive until the check finishes.
+    _snapshot: Option<crate::git::WorktreeSnapshot>,
+}
+
+/// Resolve where a python check runs, and isolate uv from the operator's
+/// environment when that place is a target snapshot.
+///
+/// `create_worktree_snapshot` symlinks the checkout's `.venv` into the snapshot
+/// so a review does not reinstall every dependency. `uv run` synchronises the
+/// project environment before executing, so a reviewed commit that adds, drops
+/// or pins dependencies differently would mutate the developer's ACTIVE
+/// environment through that symlink — a review is a read of someone's branch,
+/// never a write to their machine. `UV_PROJECT_ENVIRONMENT` moves the sync into
+/// a prview-owned per-repo directory ([`Config::uv_env_dir`]), so the reviewed
+/// dependency set is still installed and judged, just not on top of the
+/// operator's.
+///
+/// A local review (target == `HEAD`) sets no environment override and behaves
+/// exactly as before.
+fn plan_python_run(config: &Config) -> Result<PythonRun> {
+    let plan = plan_check_run(config)?;
+    let env = if plan.scan_dir == config.repo_root {
+        Vec::new()
+    } else {
+        vec![(
+            "UV_PROJECT_ENVIRONMENT".to_string(),
+            config.uv_env_dir().display().to_string(),
+        )]
+    };
+    Ok(PythonRun {
+        cwd: plan.scan_dir,
+        env,
+        _snapshot: plan._snapshot,
+    })
+}
 
 /// Classify a ruff run from its exit status and combined output.
 ///
@@ -66,14 +111,14 @@ impl Check for RuffCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let plan = plan_check_run(config)?;
-        let run_dir = &plan.scan_dir;
+        let plan = plan_python_run(config)?;
+        let run_dir = &plan.cwd;
 
         let use_uv = which::which("uv").is_ok();
         let output = if use_uv {
-            run_command("uv", &["run", "ruff", "check", "."], run_dir).await?
+            run_command_with_env("uv", &["run", "ruff", "check", "."], run_dir, &plan.env).await?
         } else {
-            run_command("ruff", &["check", "."], run_dir).await?
+            run_command_with_env("ruff", &["check", "."], run_dir, &plan.env).await?
         };
         let finished_at = Local::now().to_rfc3339();
 
@@ -168,14 +213,14 @@ impl Check for MypyCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let plan = plan_check_run(config)?;
-        let run_dir = &plan.scan_dir;
+        let plan = plan_python_run(config)?;
+        let run_dir = &plan.cwd;
 
         let use_uv = which::which("uv").is_ok();
         let output = if use_uv {
-            run_command("uv", &["run", "mypy", "."], run_dir).await?
+            run_command_with_env("uv", &["run", "mypy", "."], run_dir, &plan.env).await?
         } else {
-            run_command("mypy", &["."], run_dir).await?
+            run_command_with_env("mypy", &["."], run_dir, &plan.env).await?
         };
         let finished_at = Local::now().to_rfc3339();
 
@@ -249,15 +294,28 @@ impl Check for PytestCheck {
         // test runner Vitest all resolve their cwd through `plan_check_run`;
         // Pytest was the sole outlier. For a local review the plan resolves back
         // to `repo_root`, so that path is unchanged.
-        let plan = plan_check_run(config)?;
-        let run_dir = &plan.scan_dir;
+        let plan = plan_python_run(config)?;
+        let run_dir = &plan.cwd;
 
         let use_uv = which::which("uv").is_ok();
         let output = if use_uv {
-            run_command_with_timeout("uv", &["run", "pytest", "-v"], run_dir, TEST_TIMEOUT_SECS)
-                .await?
+            run_command_with_timeout_and_env(
+                "uv",
+                &["run", "pytest", "-v"],
+                run_dir,
+                TEST_TIMEOUT_SECS,
+                &plan.env,
+            )
+            .await?
         } else {
-            run_command_with_timeout("pytest", &["-v"], run_dir, TEST_TIMEOUT_SECS).await?
+            run_command_with_timeout_and_env(
+                "pytest",
+                &["-v"],
+                run_dir,
+                TEST_TIMEOUT_SECS,
+                &plan.env,
+            )
+            .await?
         };
         let finished_at = Local::now().to_rfc3339();
 
@@ -321,6 +379,58 @@ mod tests {
     fn test_ruff_check_name() {
         let check = RuffCheck;
         assert_eq!(check.name(), "Ruff");
+    }
+
+    /// A review must never write into the operator's environment. The snapshot
+    /// symlinks their `.venv`, and `uv run` syncs the project environment before
+    /// executing — so an off-HEAD python check has to be pointed at a
+    /// prview-owned environment instead of the symlinked one.
+    #[test]
+    fn python_run_off_head_isolates_uv_from_the_operator_environment() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let run = plan_python_run(&config).expect("plan");
+
+        assert_eq!(run.cwd, scan_dir.path());
+        assert_eq!(
+            run.env,
+            vec![(
+                "UV_PROJECT_ENVIRONMENT".to_string(),
+                config.uv_env_dir().display().to_string()
+            )],
+            "an off-HEAD python check must sync into a prview-owned environment",
+        );
+        let env_dir = config.uv_env_dir();
+        assert!(
+            !env_dir.starts_with(repo_root.path()),
+            "the reviewed sync must not reach the operator's checkout (its .venv is symlinked \
+             into the snapshot)",
+        );
+        assert!(
+            !env_dir.starts_with(scan_dir.path()),
+            "an environment inside the throwaway snapshot is reinstalled on every run",
+        );
+    }
+
+    /// A local review is unchanged: the operator's own environment, no override.
+    #[test]
+    fn python_run_local_target_is_unchanged() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+
+        let run = plan_python_run(&config).expect("plan");
+
+        assert_eq!(run.cwd, repo_root.path());
+        assert!(
+            run.env.is_empty(),
+            "a local review must keep using the checkout's own environment",
+        );
     }
 
     #[test]
