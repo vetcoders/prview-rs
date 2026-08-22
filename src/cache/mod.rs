@@ -8,14 +8,35 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Sidecar holding the check's captured output, next to its status entry.
+/// Legacy sidecar holding the check's captured output, next to its status entry.
+/// Only read now — see [`CacheEntry`].
 const LOG_SUFFIX: &str = ".log";
 
-/// Sidecar holding the check's serialized provenance, next to its status entry.
-/// Optional by construction: entries written before this sidecar existed simply
-/// have no such file, and a replay then reports an unknown provenance instead of
-/// failing.
+/// Legacy sidecar holding the check's serialized provenance. Only read now, so
+/// entries written by an older prview keep replaying instead of failing.
 const PROVENANCE_SUFFIX: &str = ".prov.json";
+
+/// Marker for a half-written entry. Named so [`Cache::cleanup`] can tell it from
+/// a real entry: counting one as live would evict a good entry in its place.
+const TMP_MARKER: &str = ".tmp-";
+
+/// One cache entry — verdict, output and provenance in a SINGLE file.
+///
+/// They used to be three files written one after another, so two prview
+/// processes populating the same key could interleave: one wrote its status
+/// while the other overwrote the provenance, leaving a hit that paired a verdict
+/// with another execution's command, timestamps and substrate. Provenance exists
+/// to prove what produced a result, so a mismatched pair is worse than none.
+/// Writing one file and publishing it with a single `rename` makes a torn entry
+/// unrepresentable: a reader sees the previous entry whole, or the new one whole.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CacheEntry {
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provenance: Option<String>,
+}
 
 /// Cache store
 pub struct Cache {
@@ -45,22 +66,26 @@ impl Cache {
         }
 
         let cache_dir = self.dir.join(check_name);
-        let cache_file = cache_dir.join(key);
-        if cache_file.exists() {
-            let status = fs::read_to_string(&cache_file).ok()?;
-            let output = fs::read_to_string(sidecar(&cache_dir, key, LOG_SUFFIX)).ok();
-            // Absent for entries written before the sidecar existed — an old
-            // entry replays with an unknown provenance, never a hard failure.
-            let provenance = fs::read_to_string(sidecar(&cache_dir, key, PROVENANCE_SUFFIX)).ok();
+        let raw = fs::read_to_string(cache_dir.join(key)).ok()?;
 
-            Some(CachedResult {
-                status: status.trim().to_string(),
-                output,
-                provenance,
-            })
-        } else {
-            None
+        // An entry written by this prview is one self-contained JSON document.
+        if let Ok(entry) = serde_json::from_str::<CacheEntry>(&raw) {
+            return Some(CachedResult {
+                status: entry.status.trim().to_string(),
+                output: entry.output,
+                provenance: entry.provenance,
+            });
         }
+
+        // Legacy layout: a bare status line with the output and provenance in
+        // sidecars. Kept readable so an upgrade does not throw away a warm
+        // cache; either sidecar may be missing, which replays as unknown rather
+        // than a hard failure.
+        Some(CachedResult {
+            status: raw.trim().to_string(),
+            output: fs::read_to_string(sidecar(&cache_dir, key, LOG_SUFFIX)).ok(),
+            provenance: fs::read_to_string(sidecar(&cache_dir, key, PROVENANCE_SUFFIX)).ok(),
+        })
     }
 
     /// Store result in cache.
@@ -68,6 +93,10 @@ impl Cache {
     /// `provenance` is an opaque serialized blob the caller round-trips: the
     /// cache stores bytes and never interprets them, so the provenance schema
     /// stays owned by `checks`.
+    ///
+    /// The verdict, output and provenance are published together by a single
+    /// `rename`, so a concurrent prview can never read a verdict paired with
+    /// another run's provenance (see [`CacheEntry`]).
     pub fn set(
         &self,
         check_name: &str,
@@ -86,24 +115,34 @@ impl Cache {
         // Clean old entries (keep last 5)
         self.cleanup(&cache_dir, 5)?;
 
-        // Write status
-        fs::write(cache_dir.join(key), status)?;
+        let entry = serde_json::to_string(&CacheEntry {
+            status: status.to_string(),
+            output: output.map(str::to_string),
+            provenance: provenance.map(str::to_string),
+        })?;
 
-        // Write log if present
-        if let Some(output) = output {
-            fs::write(sidecar(&cache_dir, key, LOG_SUFFIX), output)?;
+        // Stage the complete entry beside its destination — same directory, so
+        // the rename stays within one filesystem and is therefore atomic — then
+        // publish it in one step.
+        let staged = cache_dir.join(format!(
+            "{key}{TMP_MARKER}{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::write(&staged, entry)?;
+        if let Err(err) = fs::rename(&staged, cache_dir.join(key)) {
+            let _ = fs::remove_file(&staged);
+            return Err(err.into());
         }
 
-        // Write provenance if present, and drop a stale one otherwise so a
-        // re-run without provenance can never replay the previous run's.
-        match provenance {
-            Some(provenance) => {
-                fs::write(sidecar(&cache_dir, key, PROVENANCE_SUFFIX), provenance)?;
-            }
-            None => {
-                let _ = fs::remove_file(sidecar(&cache_dir, key, PROVENANCE_SUFFIX));
-            }
-        }
+        // Drop the legacy sidecars for this key: the published entry is now the
+        // whole truth, and leaving them behind would keep a previous run's
+        // output and provenance on disk under a live key.
+        let _ = fs::remove_file(sidecar(&cache_dir, key, LOG_SUFFIX));
+        let _ = fs::remove_file(sidecar(&cache_dir, key, PROVENANCE_SUFFIX));
 
         Ok(())
     }
@@ -113,7 +152,11 @@ impl Cache {
             .filter_map(|e| e.ok())
             .filter(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
-                !name.ends_with(LOG_SUFFIX) && !name.ends_with(PROVENANCE_SUFFIX)
+                // Legacy sidecars and a concurrent writer's staged entry are not
+                // entries: counting them would evict live results in their place.
+                !name.ends_with(LOG_SUFFIX)
+                    && !name.ends_with(PROVENANCE_SUFFIX)
+                    && !name.contains(TMP_MARKER)
             })
             .collect();
 
@@ -320,6 +363,115 @@ mod tests {
             .unwrap();
 
         assert!(cache.get("check", "key").unwrap().provenance.is_none());
+    }
+
+    /// The verdict, its output and its provenance must reach disk as ONE
+    /// published unit. While they were three independent writes, two prview
+    /// processes populating the same key could interleave and leave a hit
+    /// pairing one run's verdict with another run's provenance.
+    #[test]
+    fn cache_entry_is_published_as_one_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Cache {
+            dir: temp_dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        cache
+            .set(
+                "check",
+                "key",
+                "passed",
+                Some("out"),
+                Some(r#"{"cwd":"/repo"}"#),
+            )
+            .unwrap();
+
+        let dir = temp_dir.path().join("check");
+        assert!(
+            !dir.join("key.log").exists() && !dir.join("key.prov.json").exists(),
+            "the entry must not be spread across separately written sidecars",
+        );
+        let files: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["key".to_string()],
+            "one key must leave exactly one file — no staged remnants",
+        );
+
+        let entry = cache.get("check", "key").expect("entry");
+        assert_eq!(entry.status, "passed");
+        assert_eq!(entry.output.as_deref(), Some("out"));
+        assert_eq!(entry.provenance.as_deref(), Some(r#"{"cwd":"/repo"}"#));
+    }
+
+    /// A warm cache written by an older prview keeps replaying: the bare status
+    /// file with its sidecars is still understood.
+    #[test]
+    fn legacy_sidecar_entries_are_still_readable() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Cache {
+            dir: temp_dir.path().to_path_buf(),
+            enabled: true,
+        };
+        let dir = temp_dir.path().join("check");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("key"), "warnings\n").unwrap();
+        fs::write(dir.join("key.log"), "legacy out").unwrap();
+        fs::write(dir.join("key.prov.json"), r#"{"cwd":"/legacy"}"#).unwrap();
+
+        let entry = cache.get("check", "key").expect("legacy entry");
+        assert_eq!(entry.status, "warnings");
+        assert_eq!(entry.output.as_deref(), Some("legacy out"));
+        assert_eq!(entry.provenance.as_deref(), Some(r#"{"cwd":"/legacy"}"#));
+
+        // Overwriting a legacy entry must not leave its sidecars behind to be
+        // paired with the new verdict.
+        cache
+            .set("check", "key", "passed", Some("fresh"), None)
+            .unwrap();
+        let entry = cache.get("check", "key").expect("rewritten entry");
+        assert_eq!(entry.status, "passed");
+        assert_eq!(entry.output.as_deref(), Some("fresh"));
+        assert!(
+            entry.provenance.is_none(),
+            "a run without provenance must never replay the previous run's",
+        );
+    }
+
+    /// A staged entry from a crashed or concurrent writer is not an entry: it
+    /// must neither be served nor counted as one during eviction.
+    #[test]
+    fn staged_writes_are_not_mistaken_for_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Cache {
+            dir: temp_dir.path().to_path_buf(),
+            enabled: true,
+        };
+        let dir = temp_dir.path().join("check");
+
+        for i in 0..5 {
+            cache
+                .set("check", &format!("key{i}"), "passed", Some("out"), None)
+                .unwrap();
+        }
+        fs::write(dir.join(format!("key0{TMP_MARKER}999-1")), "half written").unwrap();
+
+        // One more entry triggers cleanup; a counted leftover would evict a live
+        // entry in its place.
+        cache
+            .set("check", "key5", "passed", Some("out"), None)
+            .unwrap();
+
+        for i in 1..=5 {
+            assert!(
+                cache.get("check", &format!("key{i}")).is_some(),
+                "key{i} must survive cleanup",
+            );
+        }
     }
 
     #[test]
