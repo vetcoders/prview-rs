@@ -76,16 +76,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the cargo child process only, so a fresh snapshot does not recompile the whole
   dependency graph and the operator's own `target/` is never written to. Local
   reviews, where the target resolves to `HEAD`, are unaffected: same cwd, no
-  environment override.
+  environment override. Whether cargo applies at all is decided by the reviewed
+  commit as well: a branch that dropped its last `Cargo.toml` is reviewed from a
+  Rust checkout, and the cargo gates used to report cargo's own "could not find
+  `Cargo.toml`" as that commit's verdict. The manifest is now looked up in the
+  target commit's tree — no worktree materialised to ask — and the checks skip
+  with a reason when the reviewed commit is not a cargo project.
 - Cargo check cache keys now name the substrate they judge. The cached-result
   lookup happens before the target snapshot is materialised, so a `--pr` run
   could hit an entry a previous local run had stored under the same working-tree
   hash and serve the local checkout's verdict as the PR's. Keys now use the
   resolved target commit whenever it differs from `HEAD`, together with the
-  repo-relative cargo root (`commit-<sha>-root:<path>`): the same commit checked
-  from the workspace root and from a configured member produces different
-  check/clippy/audit/rustfmt results, and keying on the commit alone let a later
-  run serve the other root's verdict.
+  repo-relative cargo root (`commit-<sha>-root-<hash>`, `-root-self` for the
+  repo root): the same commit checked from the workspace root and from a
+  configured member produces different check/clippy/audit/rustfmt results, and
+  keying on the commit alone let a later run serve the other root's verdict. The
+  root is hashed rather than spelled out because a cache key is a file name —
+  `crates/core` written verbatim named a file in a directory nothing creates, so
+  the store failed and the slowest gates in the tool recomputed on every review
+  of a workspace member. The local member key drops its `:` separator for the
+  same reason (illegal in Windows file names); existing entries miss once and
+  are repopulated.
 - A `cargo_root` configured outside the repository no longer makes an
   off-`HEAD` review scan an unrelated directory. A snapshot of the repo can
   never contain such a root, and the fallback ran cargo at the local path
@@ -103,9 +114,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `uv run` syncs the project environment before executing — so reviewing a
   branch with different dependencies installed into, and removed packages from,
   the developer's active environment. Off-`HEAD` runs now set
-  `UV_PROJECT_ENVIRONMENT` to a prview-owned per-repo directory
-  (`~/.prview/uv-env/<repo>`): the reviewed dependency set is still installed
-  and judged, just never on top of the operator's. Local reviews set no override.
+  `UV_PROJECT_ENVIRONMENT` to a prview-owned directory keyed by the reviewed
+  commit (`~/.prview/uv-env/<repo>/<target-sha>`): the reviewed dependency set
+  is still installed and judged, just never on top of the operator's. Per-commit
+  rather than per-repo, because `uv run` syncs before executing and releases its
+  lock while the child runs — two reviews of different commits sharing one
+  directory would resynchronise incompatible dependency sets under each other's
+  running pytest. Runs of the same commit still reuse a warm environment, and
+  the growth is bounded: the three most recently used environments survive, and
+  nothing used in the last 24 hours is ever removed. Local reviews set no
+  override.
 - Provenance no longer certifies a tree it could not verify. A working-tree
   status that fails to read (an index lock, a permissions error, a malformed
   repository) recorded `local-clean` — the claim that the scanned bytes exactly

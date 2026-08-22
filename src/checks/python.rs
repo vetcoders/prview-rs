@@ -2,7 +2,7 @@
 
 use super::{
     Check, CheckProvenance, CheckResult, CheckStatus, TEST_TIMEOUT_SECS, find_hard_fail_signatures,
-    plan_check_run, run_command_with_env, run_command_with_timeout_and_env,
+    off_head_target_commit, plan_check_run, run_command_with_env, run_command_with_timeout_and_env,
     tool_spawn_failure_in_output,
 };
 use crate::Config;
@@ -10,7 +10,8 @@ use crate::cache;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Local;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub struct RuffCheck;
 pub struct MypyCheck;
@@ -36,9 +37,18 @@ struct PythonRun {
 /// or pins dependencies differently would mutate the developer's ACTIVE
 /// environment through that symlink — a review is a read of someone's branch,
 /// never a write to their machine. `UV_PROJECT_ENVIRONMENT` moves the sync into
-/// a prview-owned per-repo directory ([`Config::uv_env_dir`]), so the reviewed
+/// a prview-owned directory ([`Config::uv_env_dir_for`]), so the reviewed
 /// dependency set is still installed and judged, just not on top of the
 /// operator's.
+///
+/// That environment is per REVIEWED COMMIT, not per repository. `uv run` syncs
+/// before executing and releases the environment lock while the child command
+/// runs, so two prview processes reviewing different commits of one repo would
+/// take turns installing incompatible dependency sets into the same directory —
+/// each one resynchronising (and removing packages) under the other's running
+/// pytest. A commit-scoped path makes those two reviews independent while
+/// keeping the environment warm across runs of the SAME commit, which is the
+/// case that pays for itself (re-review, `--watch`).
 ///
 /// A local review (target == `HEAD`) sets no environment override and behaves
 /// exactly as before.
@@ -47,9 +57,11 @@ fn plan_python_run(config: &Config) -> Result<PythonRun> {
     let env = if plan.scan_dir == config.repo_root {
         Vec::new()
     } else {
+        let env_dir = config.uv_env_dir_for(&reviewed_env_token(config, &plan.scan_dir));
+        mark_and_prune_uv_envs(&config.uv_env_root(), &env_dir);
         vec![(
             "UV_PROJECT_ENVIRONMENT".to_string(),
-            config.uv_env_dir().display().to_string(),
+            env_dir.display().to_string(),
         )]
     };
     Ok(PythonRun {
@@ -57,6 +69,85 @@ fn plan_python_run(config: &Config) -> Result<PythonRun> {
         env,
         _snapshot: plan._snapshot,
     })
+}
+
+/// Name of the environment for the substrate this run analyses.
+///
+/// The reviewed commit IS the dependency set, so it names the environment. When
+/// no off-`HEAD` commit resolves while the scan still happens elsewhere (an
+/// injected scan dir), the snapshot path stands in: unknown provenance must not
+/// collapse two different substrates onto one environment.
+fn reviewed_env_token(config: &Config, scan_dir: &Path) -> String {
+    off_head_target_commit(config)
+        .unwrap_or_else(|| format!("snapshot-{}", cache::key_token(&scan_dir.to_string_lossy())))
+}
+
+/// Environments kept regardless of age — the working set of a repo under review.
+const UV_ENVS_KEPT: usize = 3;
+
+/// How long an environment is untouchable after its last use. A review does not
+/// run for a day, so anything older cannot belong to a live run.
+const UV_ENV_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Marker refreshed on every use, so reuse (which only writes deep inside the
+/// environment) still counts as recent activity.
+const UV_ENV_USED_MARKER: &str = ".prview-used";
+
+/// Record this environment as used and drop the ones that are neither recent nor
+/// part of the working set.
+///
+/// Per-commit isolation trades one directory per repository for one per reviewed
+/// commit, so without a bound a busy repository would leave a virtualenv behind
+/// for every commit ever reviewed — hundreds of megabytes each. The bound is
+/// deliberately timid: the newest [`UV_ENVS_KEPT`] survive whatever their age,
+/// and nothing used within [`UV_ENV_MIN_AGE`] is touched, so a concurrent (or
+/// merely slow) review cannot have its environment deleted underneath it.
+///
+/// Nothing is created here: an absent root means no environment exists yet, and
+/// pre-creating the directory would leave uv an empty non-environment to reject.
+fn mark_and_prune_uv_envs(root: &Path, env_dir: &Path) {
+    if !root.is_dir() {
+        return;
+    }
+    if env_dir.is_dir() {
+        let _ = std::fs::write(env_dir.join(UV_ENV_USED_MARKER), b"");
+    }
+    prune_uv_envs(root, UV_ENVS_KEPT, UV_ENV_MIN_AGE);
+}
+
+/// Pure half of [`mark_and_prune_uv_envs`]: remove environments beyond the
+/// `keep` most recently used that have also been idle for at least `min_age`.
+fn prune_uv_envs(root: &Path, keep: usize, min_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut envs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .map(|p| (last_used(&p), p))
+        .collect();
+
+    // Newest first, so the tail is what the working set does not cover.
+    envs.sort_by_key(|(used, _)| std::cmp::Reverse(*used));
+    let now = std::time::SystemTime::now();
+    for (used, path) in envs.into_iter().skip(keep) {
+        let idle = now.duration_since(used).unwrap_or_default();
+        if idle >= min_age {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+/// When an environment was last used: the marker if this prview wrote one, the
+/// directory's own timestamp otherwise (an environment from an older prview, or
+/// one created but never reused).
+fn last_used(env_dir: &Path) -> std::time::SystemTime {
+    let marker = env_dir.join(UV_ENV_USED_MARKER);
+    std::fs::metadata(&marker)
+        .or_else(|_| std::fs::metadata(env_dir))
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
 }
 
 /// Classify a ruff run from its exit status and combined output.
@@ -401,11 +492,14 @@ mod tests {
             run.env,
             vec![(
                 "UV_PROJECT_ENVIRONMENT".to_string(),
-                config.uv_env_dir().display().to_string()
+                config
+                    .uv_env_dir_for(&reviewed_env_token(&config, scan_dir.path()))
+                    .display()
+                    .to_string()
             )],
             "an off-HEAD python check must sync into a prview-owned environment",
         );
-        let env_dir = config.uv_env_dir();
+        let env_dir = PathBuf::from(&run.env[0].1);
         assert!(
             !env_dir.starts_with(repo_root.path()),
             "the reviewed sync must not reach the operator's checkout (its .venv is symlinked \
@@ -415,6 +509,82 @@ mod tests {
             !env_dir.starts_with(scan_dir.path()),
             "an environment inside the throwaway snapshot is reinstalled on every run",
         );
+        assert!(
+            env_dir.starts_with(config.uv_env_root()),
+            "the environment stays inside the repo's prview-owned root",
+        );
+    }
+
+    /// One environment per repository was still shared state: two prview
+    /// processes reviewing different commits synced incompatible dependency sets
+    /// into the same directory, each resynchronising under the other's running
+    /// checks. Different substrates must get different environments.
+    #[test]
+    fn uv_environments_are_separated_per_reviewed_substrate() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let first_snapshot = tempfile::tempdir().expect("first snapshot");
+        let second_snapshot = tempfile::tempdir().expect("second snapshot");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+
+        config.scan_dir_override = Some(first_snapshot.path().to_path_buf());
+        let first = plan_python_run(&config).expect("plan");
+        config.scan_dir_override = Some(second_snapshot.path().to_path_buf());
+        let second = plan_python_run(&config).expect("plan");
+
+        assert_ne!(
+            first.env, second.env,
+            "two reviews of different substrates must not share one uv environment",
+        );
+        // Same substrate, same environment: reuse is what keeps this affordable.
+        config.scan_dir_override = Some(first_snapshot.path().to_path_buf());
+        assert_eq!(plan_python_run(&config).expect("plan").env, first.env);
+    }
+
+    /// Per-commit isolation trades one directory per repo for one per reviewed
+    /// commit, so the working set has to be bounded — a virtualenv per commit
+    /// ever reviewed is hundreds of megabytes each.
+    #[test]
+    fn stale_uv_environments_are_pruned_outside_the_working_set() {
+        let root = tempfile::tempdir().expect("uv-env root");
+        let mut envs = Vec::new();
+        for name in ["one", "two", "three", "four"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            // Distinct marker mtimes, newest last.
+            std::fs::write(dir.join(UV_ENV_USED_MARKER), b"").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            envs.push(dir);
+        }
+
+        // Nothing recent is ever removed, however many there are.
+        prune_uv_envs(root.path(), 1, Duration::from_secs(3600));
+        for dir in &envs {
+            assert!(dir.is_dir(), "a live environment must survive: {dir:?}");
+        }
+
+        // Past the age floor, only the working set stays.
+        prune_uv_envs(root.path(), 2, Duration::ZERO);
+        assert!(!envs[0].is_dir() && !envs[1].is_dir(), "stale envs stay");
+        assert!(
+            envs[2].is_dir() && envs[3].is_dir(),
+            "the newest environments are the working set",
+        );
+    }
+
+    /// Pruning must never be what creates the directory tree: uv rejects an
+    /// existing directory that is not a valid environment.
+    #[test]
+    fn marking_creates_nothing_when_no_environment_exists_yet() {
+        let home = tempfile::tempdir().expect("home");
+        let root = home.path().join("uv-env/repo");
+        let env_dir = root.join("commit");
+
+        mark_and_prune_uv_envs(&root, &env_dir);
+
+        assert!(!root.exists(), "an absent root must stay absent");
+        assert!(!env_dir.exists(), "uv creates the environment, not prview");
     }
 
     /// A local review is unchanged: the operator's own environment, no override.
