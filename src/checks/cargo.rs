@@ -555,13 +555,29 @@ fn cargo_substrate_hash(config: &Config) -> String {
 /// tomorrow's run resolves again. It is the shape `Cargo audit` already uses for
 /// advisories, which age the same way.
 ///
-/// Only a lockfile that is PROVEN absent stamps: when git cannot answer, the key
-/// stays as it was rather than churning on an unrelated failure.
+/// A lockfile that is PRESENT but does not cover the manifest pins nothing
+/// either: cargo updates it while it runs, from the same moving registry. Only a
+/// substrate PROVEN to resolve at run time stamps — when git or the parser cannot
+/// answer, the key stays as it was rather than churning on an unrelated failure.
 fn unlocked_substrate_stamp(config: &Config) -> Option<String> {
-    if substrate_has_lockfile(config) {
-        return None;
+    match substrate_lock_state(config) {
+        SubstrateLock::Pinned => None,
+        SubstrateLock::Absent | SubstrateLock::OutOfDate => {
+            Some(Local::now().format("%Y-%m-%d").to_string())
+        }
     }
-    Some(Local::now().format("%Y-%m-%d").to_string())
+}
+
+/// What the tree this run judges does about its dependency set.
+#[derive(Debug, PartialEq, Eq)]
+enum SubstrateLock {
+    /// No lockfile: cargo resolves the whole graph when it runs.
+    Absent,
+    /// A lockfile the manifest has outgrown — cargo must update it, which means
+    /// the registry again for at least part of the graph.
+    OutOfDate,
+    /// Pinned, or a question that could not be answered.
+    Pinned,
 }
 
 /// Whether the tree this run judges pins its dependency set.
@@ -570,28 +586,139 @@ fn unlocked_substrate_stamp(config: &Config) -> Option<String> {
 /// — and an off-`HEAD` run whose repository git cannot read — is answered from
 /// the working tree. Both look at the cargo root first and the repo root second,
 /// because a workspace member resolves from the workspace lockfile.
-fn substrate_has_lockfile(config: &Config) -> bool {
+///
+/// Existence used to be the whole test, and existence is not a pin: a target that
+/// adds a dependency without regenerating `Cargo.lock` still sends cargo to the
+/// registry — none of the commands pass `--locked`, which is what would assert
+/// otherwise — while the key promised the commit fully described the run. The
+/// manifest's declared dependencies are therefore checked against the lock's
+/// package list. It is a name-level test, so it under-reports (a workspace
+/// member's own manifest is not read, and a bumped requirement whose name is
+/// still locked is not caught); under-reporting is exactly today's behaviour,
+/// while over-reporting would only cost one extra cache miss a day.
+fn substrate_lock_state(config: &Config) -> SubstrateLock {
+    let Ok((manifest, lock)) = substrate_manifest_and_lock(config) else {
+        return SubstrateLock::Pinned;
+    };
+    let Some(lock) = lock else {
+        return SubstrateLock::Absent;
+    };
+    // No manifest to compare against is a question, not an answer.
+    let Some(manifest) = manifest else {
+        return SubstrateLock::Pinned;
+    };
+    if lock_covers_manifest(&manifest, &lock) {
+        SubstrateLock::Pinned
+    } else {
+        SubstrateLock::OutOfDate
+    }
+}
+
+/// The cargo root manifest of the judged tree and the lockfile governing it.
+///
+/// `Err` means the question could not be asked; `Ok(None)` that the file is
+/// genuinely absent. The lock is looked for at the cargo root first and the repo
+/// root second, because a workspace member resolves from the workspace lockfile.
+#[allow(clippy::result_unit_err)]
+fn substrate_manifest_and_lock(
+    config: &Config,
+) -> std::result::Result<(Option<String>, Option<String>), ()> {
+    let at = |dir: &str, name: &str| {
+        if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        }
+    };
+
     if let (Some(commit), ReviewedCargoRoot::Resolved(relative)) = (
         off_head_target_commit(config),
         resolve_reviewed_cargo_root(config),
     ) && let Ok(repo) = crate::git::Repository::open(&config.repo_root)
     {
-        return [relative.as_str(), ""].into_iter().any(|dir| {
-            let path = if dir.is_empty() {
-                "Cargo.lock".to_string()
-            } else {
-                format!("{dir}/Cargo.lock")
-            };
-            // An unanswerable lookup counts as locked: see the doc comment.
-            repo.regular_file_at_commit(commit.as_str(), &path)
-                .unwrap_or(true)
-        });
+        let read = |path: String| match repo.regular_file_at_commit(commit.as_str(), &path) {
+            Ok(true) => repo.file_at_commit(commit.as_str(), &path).map(Some),
+            Ok(false) => Ok(None),
+            Err(err) => Err(err),
+        };
+        let manifest = read(at(&relative, "Cargo.toml")).map_err(|_| ())?;
+        let lock = match read(at(&relative, "Cargo.lock")).map_err(|_| ())? {
+            Some(content) => Some(content),
+            None => read("Cargo.lock".to_string()).map_err(|_| ())?,
+        };
+        return Ok((manifest, lock));
     }
 
     // A relative cargo root is repo-root-relative by construction; `join` leaves
     // an absolute one alone, so this reads the same directory either way.
     let cargo_root = config.repo_root.join(cargo_cache_root(config));
-    cargo_root.join("Cargo.lock").exists() || config.repo_root.join("Cargo.lock").exists()
+    let lock = std::fs::read_to_string(cargo_root.join("Cargo.lock"))
+        .or_else(|_| std::fs::read_to_string(config.repo_root.join("Cargo.lock")))
+        .ok();
+    Ok((
+        std::fs::read_to_string(cargo_root.join("Cargo.toml")).ok(),
+        lock,
+    ))
+}
+
+/// Whether every dependency the manifest declares is already in the lock.
+///
+/// A dependency the lock has never heard of is one cargo has to resolve. Anything
+/// unparsable answers "covered": the stamp exists to bound a KNOWN gap, not to
+/// churn the cache on a file this code failed to read.
+fn lock_covers_manifest(manifest: &str, lock: &str) -> bool {
+    let (Ok(manifest), Ok(lock)) = (
+        toml::from_str::<toml::Table>(manifest),
+        toml::from_str::<toml::Table>(lock),
+    ) else {
+        return true;
+    };
+    let Some(packages) = lock.get("package").and_then(|packages| packages.as_array()) else {
+        return true;
+    };
+    let locked: std::collections::HashSet<&str> = packages
+        .iter()
+        .filter_map(|package| package.get("name").and_then(|name| name.as_str()))
+        .collect();
+
+    declared_dependencies(&manifest)
+        .iter()
+        .all(|name| locked.contains(name.as_str()))
+}
+
+/// Every crate name the manifest depends on, following `package = "..."` renames
+/// to the name the lockfile would record.
+fn declared_dependencies(manifest: &toml::Table) -> Vec<String> {
+    /// Normal, dev and build dependencies, wherever they are declared.
+    const SECTIONS: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
+
+    let mut tables: Vec<&toml::Table> = vec![manifest];
+    // `[workspace.dependencies]` and `[target.'cfg(...)'.dependencies]` hold the
+    // same sections one level down.
+    for nested in ["workspace", "target"] {
+        let Some(table) = manifest.get(nested).and_then(|value| value.as_table()) else {
+            continue;
+        };
+        tables.push(table);
+        tables.extend(table.values().filter_map(|value| value.as_table()));
+    }
+
+    let mut names = Vec::new();
+    for table in tables {
+        for section in SECTIONS {
+            let Some(deps) = table.get(*section).and_then(|deps| deps.as_table()) else {
+                continue;
+            };
+            for (key, spec) in deps {
+                let renamed = spec
+                    .as_table()
+                    .and_then(|spec| spec.get("package"))
+                    .and_then(|package| package.as_str());
+                names.push(renamed.unwrap_or(key).to_string());
+            }
+        }
+    }
+    names
 }
 
 /// Cache-key component naming the substrate a cargo check will actually analyse,
@@ -2173,6 +2300,22 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         repo_with_two_commits_containing(&[])
     }
 
+    fn head_sha(root: &Path) -> String {
+        use crate::git::cmd::git_cmd;
+
+        String::from_utf8(
+            git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string()
+    }
+
     /// Two commits in a fresh repo, both carrying `manifests` (repo-relative
     /// paths, written as minimal `Cargo.toml`s); returns the temp dir and the
     /// FIRST commit, so a config targeting it is off-HEAD.
@@ -2398,25 +2541,13 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
     /// evidence requirement would turn a legitimate layout into a permanent skip.
     #[test]
     fn a_moved_workspace_root_is_identified_by_its_members() {
-        use crate::git::cmd::git_cmd;
-
         let workspace = "[workspace]\nmembers=[\"core\"]\nresolver=\"2\"\n";
         let (repo, _first) = repo_with_two_commits();
         let root = repo.path();
         std::fs::create_dir_all(root.join("backend")).unwrap();
         std::fs::write(root.join("backend/Cargo.toml"), workspace).unwrap();
         commit_all(root, "workspace root moved into backend");
-        let target = String::from_utf8(
-            git_cmd()
-                .args(["rev-parse", "HEAD"])
-                .current_dir(root)
-                .output()
-                .expect("rev-parse")
-                .stdout,
-        )
-        .expect("utf8")
-        .trim()
-        .to_string();
+        let target = head_sha(root);
         // HEAD (the local checkout): the same workspace, back at the repo root.
         std::fs::remove_file(root.join("backend/Cargo.toml")).unwrap();
         std::fs::write(root.join("Cargo.toml"), workspace).unwrap();
@@ -2779,6 +2910,61 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             cargo_content_hash(&config),
             reviewed_substrate_key(&config).expect("reviewed key"),
             "a locked target must keep its permanent, content-addressed key",
+        );
+    }
+
+    /// A lockfile that is present but out of date pins nothing: cargo updates it
+    /// while it runs — none of the commands pass `--locked` — so the commit alone
+    /// does not describe the result, exactly as when no lock exists at all.
+    #[test]
+    fn a_lockfile_the_manifest_outgrew_is_not_a_pin() {
+        let (repo, _first) = repo_with_two_commits();
+        let root = repo.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        // The lock still describes the crate as it was before the dependency.
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(root, "add a dependency without regenerating the lock");
+        let stale = head_sha(root);
+
+        // A later commit regenerates the lock: the dependency set is pinned again.
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"x\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(root, "regenerate the lock");
+        let fresh = head_sha(root);
+        // Move HEAD past both so each review is off-`HEAD`.
+        std::fs::write(root.join("later.txt"), "after\n").unwrap();
+        commit_all(root, "after");
+
+        let config_for = |target: &str| {
+            test_config_builder()
+                .repo_root(root)
+                .profile(test_rust_profile(true))
+                .target(Some(target))
+                .build()
+        };
+
+        let key = cargo_content_hash(&config_for(&stale));
+        assert!(
+            key.contains("-unlocked-"),
+            "a lock cargo must update does not make the commit a complete key: {key}",
+        );
+        let config = config_for(&fresh);
+        assert_eq!(
+            cargo_content_hash(&config),
+            reviewed_substrate_key(&config).expect("reviewed key"),
+            "a lock that covers the manifest keeps the permanent, content-addressed key",
         );
     }
 

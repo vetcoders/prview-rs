@@ -383,6 +383,18 @@ the same way. Repeated runs within a session still hit; tomorrow's run resolves
 again. A lookup git cannot answer counts as locked, so an unrelated failure does
 not churn the key.
 
+Existence is not a pin, so the lockfile is also checked against the manifest:
+every dependency the cargo root's `Cargo.toml` declares must already appear in
+the lock's package list, renames (`package = "..."`) followed to the name the
+lock records. A target that adds a dependency without regenerating `Cargo.lock`
+sends cargo to the registry exactly as a missing lock does — no cargo command
+here passes `--locked`, which is what would assert otherwise — and now gets the
+same day stamp. The test is name-level and deliberately under-reports: it does
+not read a workspace member's own manifest, and a bumped requirement whose name
+is still locked reads as covered. Under-reporting is the behaviour that was there
+before; over-reporting would cost one extra cache miss a day, so anything that
+does not parse counts as covered.
+
 A cache key is a **file name**: `Cache::set` writes `<cache_dir>/<check>/<key>`
 and creates only the check-level directory. The root therefore travels hashed
 (`commit-<sha>-root-<hash>`, `-root-self` for the repo root) rather than
