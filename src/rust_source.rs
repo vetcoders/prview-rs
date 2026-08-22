@@ -86,7 +86,7 @@ enum OpenLiteral {
 /// delimiter from being read in the wrong language: `"http://x"` is a string,
 /// not a comment, and `format!("{}/*.{}", dir, ext)` is a glob pattern, not a
 /// block comment swallowing the rest of the file. Normal strings (with `\`
-/// escapes), raw strings (`r"…"`, `r#"…"#`, `br##"…"##`) and char literals
+/// escapes), raw strings (`r"…"`, `r#"…"#`, `br##"…"##`, `cr#"…"#`) and char literals
 /// (including `'\u{7b}'`) are recognised; a `'` that does not close as a char
 /// literal is a lifetime and is left alone. A char literal cannot span lines,
 /// so only strings are carried.
@@ -186,6 +186,11 @@ struct RawStringStart {
 }
 
 /// The raw string opening at `start`, or `None` if none opens there.
+///
+/// Every raw form is accepted: `r"…"`, `br"…"` and `cr"…"`, each with any hash
+/// count. A raw literal the scanner fails to recognize is worse than an unknown
+/// token, because its body is then read as code: the first interior `"` opens a
+/// phantom ordinary string, and the braces around it are counted as syntax.
 fn raw_string_start(code: &str, start: usize) -> Option<RawStringStart> {
     let bytes = code.as_bytes();
     // The prefix must be a token start, otherwise `bar"` would look like `b` + `"`.
@@ -194,7 +199,10 @@ fn raw_string_start(code: &str, start: usize) -> Option<RawStringStart> {
     }
 
     let mut i = start;
-    if bytes.get(i) == Some(&b'b') {
+    // `b` (byte string, 1.0) and `c` (C string, 1.77) both take the raw form.
+    // Only the RAW forms need recognizing here: `b"…"` and `c"…"` escape exactly
+    // like an ordinary string, so the `"` arm already blanks them correctly.
+    if matches!(bytes.get(i), Some(&b'b') | Some(&b'c')) {
         i += 1;
     }
     if bytes.get(i) != Some(&b'r') {
@@ -400,6 +408,48 @@ mod tests {
         assert_eq!(scanner.code_only("let s = \"one {"), "let s = ");
         assert_eq!(scanner.code_only("two \\\" still inside {"), "");
         assert_eq!(scanner.code_only("three\"; }"), "; }");
+    }
+
+    #[test]
+    fn a_raw_c_string_is_a_raw_string() {
+        // `cr"…"` / `cr#"…"#` (Rust 1.77) carry the same hash-counted delimiter
+        // as `r`/`br`. Reading only `r` and `br` left the `c` as code and the
+        // following `"` as an ORDINARY string opener, so an interior quote
+        // closed a literal that was still open and the braces after it were
+        // counted as syntax.
+        let mut scanner = SourceScanner::default();
+        assert_eq!(
+            scanner.code_only(r####"let s = cr#"a " {"#; }"####),
+            "let s = ; }"
+        );
+        // The same delimiter rule across lines: only `"#` with the opener's own
+        // hash count ends it.
+        let mut scanner = SourceScanner::default();
+        assert_eq!(scanner.code_only("let s = cr#\"{"), "let s = ");
+        assert_eq!(scanner.code_only("  \"still inside\","), "");
+        assert_eq!(scanner.code_only("}\"#; {"), "; {");
+    }
+
+    #[test]
+    fn a_c_string_is_still_an_ordinary_literal() {
+        // Guard the neighbour: `c"…"` is NOT raw, so it keeps normal escape
+        // handling — the escaped quote does not close it and the brace in its
+        // body never reaches the tracker.
+        //
+        // The `c` itself survives into the code text, exactly as `b"…"` has
+        // always left its `b`. That is left alone deliberately: a bare prefix
+        // letter is not a delimiter and cannot form a keyword, so no consumer
+        // reads it, and consuming it would change `b` handling for no measured
+        // defect.
+        let mut scanner = SourceScanner::default();
+        assert_eq!(
+            scanner.code_only(r#"let s = c"a \" { b"; }"#),
+            "let s = c; }"
+        );
+        assert_eq!(
+            scanner.code_only(r#"let s = b"a \" { b"; }"#),
+            "let s = b; }"
+        );
     }
 
     #[test]
