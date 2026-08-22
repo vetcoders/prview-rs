@@ -35,6 +35,56 @@ fn is_cli_entry_point(path: &str) -> bool {
     ) || norm.ends_with("/src/main.rs")
 }
 
+/// True if `s` consists entirely of identifier characters (ASCII letters,
+/// digits, underscore) — i.e. a plain word/identifier with no punctuation.
+///
+/// Only needles satisfying this get word-boundary matching via
+/// [`contains_word_bounded`]; needles carrying punctuation (e.g. `"todo!("`,
+/// `".unwrap()"`) are already naturally bounded and keep plain substring
+/// matching.
+fn is_plain_word(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// True if `byte` is a word-forming ASCII character (letter, digit, underscore).
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Match `needle` inside `haystack` respecting word boundaries.
+///
+/// The character immediately before a match must not be a word character
+/// (or the match must start at the beginning of the string). The character
+/// immediately after must also not be a word character, UNLESS `needle`
+/// itself already ends in a non-word character (e.g. `"todo!("` is already
+/// right-bounded by `(`) — in that case no trailing-boundary check is
+/// required.
+///
+/// Prevents substring false positives like `XXX` matching inside
+/// `mktemp fooXXXXXX`, or `TODO` matching inside `TODOS`/`todos_list`.
+fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let needs_right_boundary = needle.as_bytes().last().is_some_and(|&b| is_word_byte(b));
+
+    let hbytes = haystack.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = haystack[search_from..].find(needle) {
+        let start = search_from + rel;
+        let end = start + needle.len();
+
+        let left_ok = start == 0 || !is_word_byte(hbytes[start - 1]);
+        let right_ok = !needs_right_boundary || end == hbytes.len() || !is_word_byte(hbytes[end]);
+
+        if left_ok && right_ok {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
+}
+
 /// Patterns to scan for in added lines of patches.
 const SCAN_PATTERNS: &[(&str, &[&str])] = &[
     ("unwrap", &[".unwrap()"]),
@@ -226,7 +276,14 @@ pub fn generate_pattern_scan(dir: &Path, diffs: &[Diff], repo: &Repository) -> R
                 let is_test_code = file_is_test || test_lines.contains(&line_no);
 
                 for &(pattern_name, needles) in SCAN_PATTERNS {
-                    if needles.iter().any(|n| content.contains(n)) {
+                    let matched = needles.iter().any(|n| {
+                        if is_plain_word(n) {
+                            contains_word_bounded(content, n)
+                        } else {
+                            content.contains(n)
+                        }
+                    });
+                    if matched {
                         // `println`/`print` hits in a CLI entry point are
                         // intended output, not a debug leftover (P2-05).
                         let cli_intended =
@@ -832,5 +889,117 @@ mod tests {
         assert!(!set.contains(&2), "string with brace — still prod");
         assert!(!set.contains(&3), "closing brace of prod fn");
         assert!(set.contains(&7), "unwrap inside test module");
+    }
+
+    // ── word-boundary pattern matching (PRV-TODO-XXX / PRV-PATTERN-SUBSTRING) ──
+
+    fn scan_todo_pattern(new_content: &str) -> Option<serde_json::Value> {
+        let (_tmp, repo, base_id, target_id) =
+            make_test_repo(&[("src/lib.rs", "fn prod() {}\n", new_content)]);
+        let out = TempDir::new().unwrap();
+        let diff = make_diff_with_ids(
+            base_id,
+            target_id,
+            vec![mock_file_change("src/lib.rs", FileStatus::Modified, 1, 0)],
+        );
+
+        generate_pattern_scan(out.path(), &[diff], &repo).unwrap();
+
+        let path = out.path().join("PATTERN_SCAN.json");
+        if !path.exists() {
+            return None;
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        Some(parsed)
+    }
+
+    fn todo_pattern_present(scan: &Option<serde_json::Value>) -> bool {
+        scan.as_ref()
+            .and_then(|v| v["by_pattern"].as_array())
+            .map(|arr| arr.iter().any(|e| e["pattern"] == "todo"))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn pattern_scan_mktemp_template_is_not_todo() {
+        // XXX inside a mktemp-style template (fooXXXXXX) is a template
+        // placeholder, not a TODO marker — substring match falsely caught it.
+        let new = "fn run() {\n    let path = \"/tmp/fooXXXXXX\";\n}\n";
+        let scan = scan_todo_pattern(new);
+        assert!(
+            !todo_pattern_present(&scan),
+            "mktemp template XXXXXX must not be classified as todo pattern"
+        );
+    }
+
+    #[test]
+    fn pattern_scan_standalone_xxx_is_todo() {
+        // A standalone XXX (word-bounded on both sides) is a genuine TODO marker.
+        let new = "fn run() {\n    // XXX this needs a real fix\n}\n";
+        let scan = scan_todo_pattern(new);
+        assert!(
+            todo_pattern_present(&scan),
+            "standalone XXX marker must be classified as todo pattern"
+        );
+    }
+
+    #[test]
+    fn pattern_scan_todos_identifier_is_not_todo() {
+        // TODOS / todos_list are identifiers containing TODO as a substring,
+        // not the TODO marker itself.
+        let new = "fn run() {\n    let TODOS = 1;\n    let todos_list = vec![];\n}\n";
+        let scan = scan_todo_pattern(new);
+        assert!(
+            !todo_pattern_present(&scan),
+            "TODOS/todos_list identifiers must not be classified as todo pattern"
+        );
+    }
+
+    #[test]
+    fn pattern_scan_todo_colon_is_todo() {
+        // `TODO:` is the classic marker form and must still be caught.
+        let new = "fn run() {\n    // TODO: fix this\n}\n";
+        let scan = scan_todo_pattern(new);
+        assert!(
+            todo_pattern_present(&scan),
+            "TODO: marker must be classified as todo pattern"
+        );
+    }
+
+    #[test]
+    fn pattern_scan_todo_macro_is_todo() {
+        // `todo!(` is the Rust macro invocation and must still be caught.
+        let new = "fn run() {\n    todo!(\"not implemented\");\n}\n";
+        let scan = scan_todo_pattern(new);
+        assert!(
+            todo_pattern_present(&scan),
+            "todo!( macro must be classified as todo pattern"
+        );
+    }
+
+    #[test]
+    fn is_plain_word_distinguishes_words_from_punctuated_phrases() {
+        assert!(is_plain_word("TODO"));
+        assert!(is_plain_word("XXX"));
+        assert!(!is_plain_word("todo!("));
+        assert!(!is_plain_word(".unwrap()"));
+        assert!(!is_plain_word(""));
+    }
+
+    #[test]
+    fn contains_word_bounded_requires_boundaries_on_alnum_needle() {
+        assert!(!contains_word_bounded("fooXXXXXX", "XXX"));
+        assert!(contains_word_bounded("// XXX fixme", "XXX"));
+        assert!(!contains_word_bounded("TODOS", "TODO"));
+        assert!(contains_word_bounded("TODO: fix", "TODO"));
+    }
+
+    #[test]
+    fn contains_word_bounded_needle_ending_in_punctuation_skips_right_check() {
+        // "todo!(" already ends in punctuation, so no trailing-boundary
+        // check is required — only the left side must be word-bounded.
+        assert!(contains_word_bounded("todo!(\"x\")", "todo!("));
+        assert!(!contains_word_bounded("mytodo!(\"x\")", "todo!("));
     }
 }
