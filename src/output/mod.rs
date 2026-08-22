@@ -358,6 +358,13 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     // ALLOW/HOLD tokens from pre-2.1 runs are folded onto the unified set so the
     // CLI `--json` surface speaks the same language as MERGE_GATE.json.
     let raw_verdict = decision.get("verdict").and_then(Value::as_str);
+    // Whether the verdict below is what the pack said or what this reader had to
+    // substitute for it. A substituted verdict cannot leave the OTHER decision
+    // axes reading whatever the same unreliable decision block claimed: that
+    // published `verdict: "BLOCK"` beside `allow_merge: true` and an `approve`
+    // recommendation, breaking the `allow_merge == (verdict == "PASS")`
+    // invariant and letting `compute_exit_code` exit 0 on a BLOCK.
+    let mut normalized_to_block = false;
     let verdict = match raw_verdict {
         Some("PASS") | Some("ALLOW") => "PASS",
         Some("CONDITIONAL") | Some("HOLD") => "CONDITIONAL",
@@ -370,6 +377,7 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
                 "unknown_verdict: MERGE_GATE.json verdict `{other}` is not in the \
                  PASS/CONDITIONAL/BLOCK vocabulary; normalized to BLOCK"
             ));
+            normalized_to_block = true;
             "BLOCK"
         }
         None => {
@@ -378,6 +386,7 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
                  normalized to BLOCK"
                     .to_string(),
             );
+            normalized_to_block = true;
             "BLOCK"
         }
     };
@@ -388,10 +397,11 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         .and_then(Value::as_str)
         .map(|s| s.to_string());
 
-    let allow_merge = decision
-        .get("allow_merge")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let allow_merge = !normalized_to_block
+        && decision
+            .get("allow_merge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let quality_pass = decision
         .get("quality_pass")
         .and_then(Value::as_bool)
@@ -404,12 +414,21 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         _ if allow_merge && quality_pass => crate::policy::engine::AnalysisStatus::Complete,
         _ => crate::policy::engine::AnalysisStatus::Incomplete,
     };
-    let merge_recommendation = match decision.get("merge_recommendation").and_then(Value::as_str) {
-        Some("approve") => crate::policy::engine::MergeRecommendation::Approve,
-        Some("review_required") => crate::policy::engine::MergeRecommendation::ReviewRequired,
-        _ if allow_merge => crate::policy::engine::MergeRecommendation::Approve,
-        _ if verdict == "CONDITIONAL" => crate::policy::engine::MergeRecommendation::ReviewRequired,
-        _ => crate::policy::engine::MergeRecommendation::Block,
+    let merge_recommendation = if normalized_to_block {
+        // The recommendation is the axis automation keys off (`compute_exit_code`
+        // exits 1 only on Block), so it has to follow the verdict this reader
+        // substituted, not the recommendation printed beside the unreadable one.
+        crate::policy::engine::MergeRecommendation::Block
+    } else {
+        match decision.get("merge_recommendation").and_then(Value::as_str) {
+            Some("approve") => crate::policy::engine::MergeRecommendation::Approve,
+            Some("review_required") => crate::policy::engine::MergeRecommendation::ReviewRequired,
+            _ if allow_merge => crate::policy::engine::MergeRecommendation::Approve,
+            _ if verdict == "CONDITIONAL" => {
+                crate::policy::engine::MergeRecommendation::ReviewRequired
+            }
+            _ => crate::policy::engine::MergeRecommendation::Block,
+        }
     };
     Ok(MergeGateSummary {
         verdict: verdict.to_string(),
@@ -1940,6 +1959,75 @@ api-router/app/core/cache.py
                 "{err:#} for {bad}"
             );
         }
+    }
+
+    #[test]
+    fn verdict_normalized_to_block_forces_every_derived_axis_conservative() {
+        // A verdict collapsed to BLOCK while `allow_merge`/`merge_recommendation`
+        // stayed permissive published a decision that contradicted itself: the
+        // human surface said BLOCK, the machine surface said approve, and
+        // `compute_exit_code` keyed off the latter and let automation through.
+        // The documented invariant is `allow_merge == (verdict == "PASS")`.
+        let pack = pack_with_gate(
+            r#"{"verdict":"MAYBE","merge_recommendation":"approve",
+                "allow_merge":true,"quality_pass":true,
+                "analysis_status":"complete"}"#,
+        );
+
+        let summary = read_merge_gate_summary(pack.path()).expect("pack stays readable");
+        assert_eq!(summary.verdict, "BLOCK");
+        assert!(
+            !summary.allow_merge,
+            "a normalized BLOCK cannot keep allow_merge: {summary:?}"
+        );
+        assert_eq!(
+            summary.merge_recommendation,
+            crate::policy::engine::MergeRecommendation::Block,
+            "the recommendation must follow the verdict it was normalized to: {summary:?}"
+        );
+        assert!(
+            summary
+                .caveats
+                .iter()
+                .any(|c| c.starts_with("unknown_verdict:")),
+            "the normalization is still reported: {:?}",
+            summary.caveats
+        );
+
+        let config = test_config();
+        let report = Report {
+            target: "feature/unknown-verdict".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![],
+            heuristics: None,
+            artifacts_dir: pack.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: false,
+        };
+        let cli = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
+        assert_eq!(
+            compute_exit_code(&cli, false),
+            1,
+            "a BLOCK verdict must not exit 0"
+        );
+    }
+
+    #[test]
+    fn absent_verdict_normalized_to_block_is_equally_conservative() {
+        // Same collapse through the other arm: no `verdict` at all, with the
+        // remaining fields permissive.
+        let pack = pack_with_gate(
+            r#"{"merge_recommendation":"approve","allow_merge":true,"quality_pass":true}"#,
+        );
+
+        let summary = read_merge_gate_summary(pack.path()).expect("pack stays readable");
+        assert_eq!(summary.verdict, "BLOCK");
+        assert!(!summary.allow_merge);
+        assert_eq!(
+            summary.merge_recommendation,
+            crate::policy::engine::MergeRecommendation::Block
+        );
     }
 
     #[test]
