@@ -48,6 +48,14 @@ pub enum TreeState {
     /// generated `Cargo.lock`, a tool writing into the checkout) — the scanned
     /// bytes are NOT exactly `target_sha`.
     SnapshotDirty,
+    /// The reviewed commit's tree, unmodified, but with its DEPENDENCIES
+    /// borrowed: prview links the operator's `node_modules`/`.venv` into the
+    /// snapshot ([`SNAPSHOT_SCAFFOLDING`]) instead of installing what the
+    /// target's lockfile pins. The reviewed SOURCE is exactly `target_sha`; the
+    /// compiler, plugins, type definitions and runtime the tools loaded came
+    /// from the local checkout. A dependency-changing PR is precisely where the
+    /// two differ, so this must not be reported as an exact snapshot scan.
+    SnapshotBorrowedDeps,
     /// The repo's own working tree with no uncommitted changes — the scanned
     /// bytes are exactly `target_sha`.
     LocalClean,
@@ -66,6 +74,7 @@ impl TreeState {
         match self {
             Self::Snapshot => "snapshot",
             Self::SnapshotDirty => "snapshot-dirty",
+            Self::SnapshotBorrowedDeps => "snapshot-borrowed-deps",
             Self::LocalClean => "local-clean",
             Self::LocalDirty => "local-dirty",
             Self::Foreign => "foreign",
@@ -101,7 +110,9 @@ pub struct ScanSubstrate {
 /// Dirtiness is `git status --porcelain` (untracked files count, ignored ones do
 /// not). In a snapshot the dependency symlinks prview itself creates
 /// ([`SNAPSHOT_SCAFFOLDING`]) are excluded: they are the tool's own scaffolding,
-/// not a modification of the reviewed tree.
+/// not a modification of the reviewed tree. They are not free of consequence
+/// either — a snapshot that carries them is `snapshot-borrowed-deps`, because
+/// the tools read the operator's dependencies rather than the target's.
 ///
 /// Best effort: a `cwd` that is not in a git repository yields `None` for both
 /// fields rather than a guess, and a status that cannot be read yields a `None`
@@ -132,12 +143,10 @@ pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path) -> ScanSubstrate {
     } else if !belongs_to_repo(&repo, repo_root) {
         Some(TreeState::Foreign)
     } else {
-        working_tree_is_dirty(&repo, SNAPSHOT_SCAFFOLDING).map(|dirty| {
-            if dirty {
-                TreeState::SnapshotDirty
-            } else {
-                TreeState::Snapshot
-            }
+        working_tree_is_dirty(&repo, SNAPSHOT_SCAFFOLDING).map(|dirty| match dirty {
+            true => TreeState::SnapshotDirty,
+            false if borrows_local_dependencies(&repo) => TreeState::SnapshotBorrowedDeps,
+            false => TreeState::Snapshot,
         })
     };
 
@@ -152,6 +161,25 @@ pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path) -> ScanSubstrate {
 /// a review does not reinstall them. They are never part of the reviewed commit
 /// and must not make the snapshot look modified.
 const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
+
+/// Whether the snapshot actually CARRIES scaffolding links, i.e. whether the
+/// tools that ran there read the operator's dependencies rather than the ones
+/// the reviewed commit's lockfile pins.
+///
+/// Presence, not policy: an off-HEAD review of a repo with no local
+/// `node_modules` installs nothing and links nothing, and stays an exact
+/// snapshot scan. Only a link that exists could have been followed.
+///
+/// Checked at the WORKTREE ROOT, not at the check's `cwd` — a cargo member runs
+/// in a subdirectory while the scaffolding sits at the top of the snapshot.
+fn borrows_local_dependencies(repo: &git2::Repository) -> bool {
+    let Some(root) = repo.workdir() else {
+        return false;
+    };
+    SNAPSHOT_SCAFFOLDING
+        .iter()
+        .any(|name| root.join(name).is_symlink())
+}
 
 /// True when `repo` is the repository rooted at `repo_root` — its own working
 /// tree or one of its linked worktrees, which share a common git directory.
@@ -1364,10 +1392,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_substrate_of_a_snapshot_ignores_prview_scaffolding() {
+    fn scan_substrate_of_a_snapshot_records_borrowed_dependencies() {
         // prview symlinks node_modules/.venv into the snapshot itself. That is
         // the tool's own scaffolding, never part of the reviewed commit, so it
-        // must not flip every JS/Python review to a dirty snapshot.
+        // must not flip every JS/Python review to a dirty snapshot — the
+        // reviewed SOURCE really is the target's.
+        //
+        // It is not an exact snapshot scan either: the linked dependencies are
+        // the operator's, so tsc/ESLint/Vitest read a compiler, plugins and
+        // types the target's lockfile may not pin at all. Certifying that as
+        // `snapshot` is the overclaim this record exists to prevent.
         let (repo, first) = repo_with_one_commit();
         let root = repo.path();
         std::fs::create_dir(root.join("node_modules")).expect("node_modules");
@@ -1380,10 +1414,32 @@ mod tests {
             return;
         }
 
+        let tree_state = resolve_scan_substrate(&snapshot.worktree_path, root).tree_state;
+        assert_ne!(
+            tree_state,
+            Some(TreeState::SnapshotDirty),
+            "prview's own dependency symlinks are not a modification of the reviewed tree",
+        );
+        assert_eq!(
+            tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "a snapshot whose dependencies came from the local checkout is not an exact scan",
+        );
+    }
+
+    #[test]
+    fn a_snapshot_without_scaffolding_stays_an_exact_scan() {
+        // The borrowed-deps state is about links that EXIST. A review of a repo
+        // with no local dependency tree links nothing, so nothing was borrowed
+        // and the snapshot is exactly the reviewed commit.
+        let (repo, first) = repo_with_one_commit();
+        let root = repo.path();
+        let snapshot =
+            crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
+
         assert_eq!(
             resolve_scan_substrate(&snapshot.worktree_path, root).tree_state,
             Some(TreeState::Snapshot),
-            "prview's own dependency symlinks are not a modification of the reviewed tree",
         );
     }
 
