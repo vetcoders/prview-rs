@@ -232,18 +232,22 @@ impl Check for PytestCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
+        // Run from the reviewed substrate, not the local checkout: with a PR or
+        // remote target, `config.repo_root` still holds whatever branch happens
+        // to be checked out locally, so pytest would report a foreign branch's
+        // failures against the PR (PRV-PYTEST-HEAD). Ruff, Mypy and the sibling
+        // test runner Vitest all resolve their cwd through `plan_check_run`;
+        // Pytest was the sole outlier. For a local review the plan resolves back
+        // to `repo_root`, so that path is unchanged.
+        let plan = plan_check_run(config)?;
+        let run_dir = &plan.scan_dir;
+
         let use_uv = which::which("uv").is_ok();
         let output = if use_uv {
-            run_command_with_timeout(
-                "uv",
-                &["run", "pytest", "-v"],
-                &config.repo_root,
-                TEST_TIMEOUT_SECS,
-            )
-            .await?
-        } else {
-            run_command_with_timeout("pytest", &["-v"], &config.repo_root, TEST_TIMEOUT_SECS)
+            run_command_with_timeout("uv", &["run", "pytest", "-v"], run_dir, TEST_TIMEOUT_SECS)
                 .await?
+        } else {
+            run_command_with_timeout("pytest", &["-v"], run_dir, TEST_TIMEOUT_SECS).await?
         };
         let finished_at = Local::now().to_rfc3339();
 
@@ -271,7 +275,7 @@ impl Check for PytestCheck {
             provenance: Some(CheckProvenance {
                 command: cmd_str.to_string(),
                 tool_version: None,
-                cwd: config.repo_root.display().to_string(),
+                cwd: run_dir.display().to_string(),
                 exit_code: output.status.code(),
                 started_at,
                 finished_at,
@@ -613,6 +617,70 @@ mod tests {
             CheckStatus::Passed,
             "Ruff must pass because fetched target commit is clean. Output: {}",
             result_b.output
+        );
+    }
+
+    /// PRV-PYTEST-HEAD regression: Pytest must run in the reviewed substrate
+    /// (`plan.scan_dir`), never in `config.repo_root`.
+    ///
+    /// With a PR/remote target, `repo_root` still holds whatever branch happens
+    /// to be checked out locally, so the pre-fix code reported a foreign
+    /// branch's test failures against the PR. The fixture makes the two
+    /// directories disagree on purpose: `repo_root` holds a FAILING test and the
+    /// scan dir a PASSING one, so running in the wrong place is not merely
+    /// observable — it flips the verdict.
+    #[tokio::test]
+    async fn test_pytest_runs_in_scan_dir_not_repo_root() {
+        if which::which("pytest").is_err() && which::which("uv").is_err() {
+            return;
+        }
+
+        // repo_root == the stale local checkout: its test FAILS.
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        std::fs::write(
+            repo_root.path().join("test_stale_local.py"),
+            "def test_from_repo_root():\n    assert False, 'pytest ran in repo_root'\n",
+        )
+        .unwrap();
+
+        // scan_dir == the reviewed target snapshot: its test PASSES.
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        std::fs::write(
+            scan_dir.path().join("test_reviewed_head.py"),
+            "def test_from_scan_dir():\n    assert True\n",
+        )
+        .unwrap();
+
+        let mut config = test_config_builder()
+            .profile(test_python_profile(true))
+            .run_tests(true)
+            .repo_root(repo_root.path().to_path_buf())
+            .do_fetch(false)
+            .use_cache(false)
+            .build();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let result = PytestCheck.run(&config).await.expect("pytest run");
+
+        assert_eq!(
+            result.status,
+            CheckStatus::Passed,
+            "Pytest must run the reviewed snapshot's passing test, not repo_root's \
+             failing one. Output: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("pytest ran in repo_root"),
+            "Pytest executed in repo_root instead of the reviewed scan dir. Output: {}",
+            result.output
+        );
+
+        // Provenance must not claim a cwd the run never used.
+        let cwd = result.provenance.expect("provenance").cwd;
+        assert_eq!(
+            std::fs::canonicalize(&cwd).unwrap(),
+            std::fs::canonicalize(scan_dir.path()).unwrap(),
+            "provenance cwd must report the reviewed scan dir"
         );
     }
 }

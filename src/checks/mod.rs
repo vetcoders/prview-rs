@@ -659,7 +659,7 @@ fn is_cargo_target_check(name: &str) -> bool {
 fn uses_shared_scan_dir(name: &str) -> bool {
     matches!(
         name,
-        "Ruff" | "Mypy" | "TypeScript" | "ESLint" | "Vitest" | "Stylelint"
+        "Ruff" | "Mypy" | "Pytest" | "TypeScript" | "ESLint" | "Vitest" | "Stylelint"
     )
 }
 
@@ -978,6 +978,24 @@ mod tests {
                 "a shared override must be reused, never re-materialised as a new worktree",
             );
         }
+    }
+
+    #[test]
+    fn pytest_shares_the_run_wide_target_snapshot() {
+        // PRV-PYTEST-HEAD: Pytest resolves its cwd through plan_check_run like
+        // every other Python/JS check, so it must be listed here — otherwise a
+        // Python-only run would materialise a second worktree, and Pytest could
+        // drift back to running against the local checkout.
+        for name in ["Ruff", "Mypy", "Pytest", "Vitest"] {
+            assert!(
+                uses_shared_scan_dir(name),
+                "{name} resolves via plan_check_run and must share the run-wide snapshot",
+            );
+        }
+        assert!(
+            !uses_shared_scan_dir("Cargo test"),
+            "cargo checks run at cargo_cache_root and must stay out of the shared snapshot",
+        );
     }
 
     #[test]
