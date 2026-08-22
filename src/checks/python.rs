@@ -17,6 +17,46 @@ pub struct RuffCheck;
 pub struct MypyCheck;
 pub struct PytestCheck;
 
+/// Skip reason when the REVIEWED commit is not a Python project.
+///
+/// `config.profile` describes the local checkout. When a target removes the last
+/// Python project and source files, the checkout still says "Python" and the
+/// checks were still scheduled — into a snapshot that has no Python in it.
+/// Pytest is where that hurts: it exits 5 for "no tests collected", a blocking
+/// failure attributed to a target the check no longer applies to. Ruff and Mypy
+/// pass vacuously, which is a green signal for something never examined; both
+/// are answers about a question that should not have been asked.
+///
+/// The same shape as `missing_reviewed_cargo_manifest`, and answered from git —
+/// the snapshot carries exactly this tree, so no worktree is materialised to ask.
+///
+/// Fail open at every step: a question git cannot answer must not become a skip,
+/// so an unreadable repo or a failed walk leaves the check running.
+fn missing_reviewed_python_project(config: &Config) -> Option<String> {
+    let commit = off_head_target_commit(config)?;
+    let repo = crate::git::Repository::open(&config.repo_root).ok()?;
+
+    // A pyproject.toml is an explicit project declaration and settles it alone,
+    // exactly as `runs_python_checks` treats it locally.
+    if repo
+        .regular_file_at_commit(&commit, "pyproject.toml")
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    if repo
+        .any_file_at_commit(&commit, crate::config::is_runtime_python_path)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+
+    let short = &commit[..commit.len().min(8)];
+    Some(format!(
+        "commit {short} has no pyproject.toml and no Python source — not a Python project",
+    ))
+}
+
 /// Where a python check must execute, plus the environment it needs there.
 struct PythonRun {
     /// Directory to run the tool in — the reviewed snapshot in `--pr`/`--remote`
@@ -181,6 +221,9 @@ impl Check for RuffCheck {
                 config.profile.kind.as_str().to_lowercase()
             ));
         }
+        if let Some(reason) = missing_reviewed_python_project(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
         if !config.run_lint {
             return super::CheckEligibility::Skip("lint disabled".to_string());
         }
@@ -283,6 +326,9 @@ impl Check for MypyCheck {
                 config.profile.kind.as_str().to_lowercase()
             ));
         }
+        if let Some(reason) = missing_reviewed_python_project(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
         if !config.run_lint {
             return super::CheckEligibility::Skip("lint disabled".to_string());
         }
@@ -359,6 +405,9 @@ impl Check for PytestCheck {
                 "profile {}",
                 config.profile.kind.as_str().to_lowercase()
             ));
+        }
+        if let Some(reason) = missing_reviewed_python_project(config) {
+            return super::CheckEligibility::Skip(reason);
         }
         if config.is_fast_remote_only_standard() && !config.run_tests {
             return super::CheckEligibility::Skip("fast remote-only preset".to_string());
@@ -464,6 +513,104 @@ mod tests {
             .use_cache(false)
             .create_zip(false)
             .build()
+    }
+
+    /// Two commits: the reviewed one carries no Python at all, the checked-out
+    /// one does. Returns (repo, reviewed commit).
+    fn repo_whose_target_dropped_python() -> (tempfile::TempDir, String) {
+        use crate::git::cmd::git_cmd;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "prview@example.test"]);
+        run_git(&["config", "user.name", "prview test"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+
+        // Reviewed commit: a pure Rust tree, no Python whatsoever.
+        std::fs::write(root.join("README.md"), "rust only\n").expect("write");
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-q", "-m", "no python here"]);
+        let target = String::from_utf8(
+            git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string();
+
+        // Checked-out commit: the Python project the local profile detects.
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"x\"\n").expect("write");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(root.join("src/app.py"), "def main():\n    pass\n").expect("write");
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-q", "-m", "add python"]);
+
+        (tmp, target)
+    }
+
+    /// A target that is not a Python project must not be judged by Python
+    /// checks. Pytest is the sharp edge: it exits 5 for "no tests collected",
+    /// and that blocking failure was attributed to a target the check does not
+    /// apply to at all.
+    #[test]
+    fn python_checks_do_not_run_against_a_target_without_python() {
+        let (repo, target) = repo_whose_target_dropped_python();
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some(target);
+
+        let reason = missing_reviewed_python_project(&config)
+            .expect("a target with no Python is not a Python project");
+        assert!(
+            reason.contains("not a Python project"),
+            "the skip must say why: {reason}",
+        );
+
+        for eligibility in [
+            PytestCheck.check_eligibility(&config),
+            RuffCheck.check_eligibility(&config),
+            MypyCheck.check_eligibility(&config),
+        ] {
+            assert_eq!(
+                eligibility,
+                super::super::CheckEligibility::Skip(reason.clone()),
+                "every Python check must skip with the reviewed-tree reason",
+            );
+        }
+    }
+
+    /// The guard must not manufacture skips: a target that still carries Python
+    /// keeps running, and so does a local review, where the checkout IS the
+    /// target and git is never consulted.
+    #[test]
+    fn a_target_that_still_has_python_keeps_running() {
+        let (repo, _dropped) = repo_whose_target_dropped_python();
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+
+        // HEAD carries the Python project, so a review of it is not off-HEAD at
+        // all and the guard stays out of the way.
+        assert_eq!(missing_reviewed_python_project(&config), None);
+        assert_eq!(
+            PytestCheck.check_eligibility(&config),
+            super::super::CheckEligibility::Run,
+        );
+
+        config.target = Some("main".to_string());
+        assert_eq!(missing_reviewed_python_project(&config), None);
     }
 
     #[test]

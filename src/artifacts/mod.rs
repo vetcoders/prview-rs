@@ -130,8 +130,9 @@ pub struct GenerateInput<'a> {
     /// Working-tree cleanliness captured BEFORE checks ran and before any
     /// artifact was written (R4-19). Frozen here so an in-repo `--output-dir` or
     /// an untracked check cache cannot flip a clean source scan to "dirty" and
-    /// suppress the pre-existing downgrade.
-    pub worktree_clean: bool,
+    /// suppress the pre-existing downgrade. `None` when the status could not be
+    /// read — unknown, and never treated as clean.
+    pub worktree_clean: Option<bool>,
     /// Digest of the working-tree status captured in the SAME read as
     /// `worktree_clean`. Recorded in `00_summary/PROVENANCE.json`; `None` when
     /// the repository could not be inspected.
@@ -1108,7 +1109,7 @@ struct ProvenanceJsonInput<'a> {
     diffs: &'a [Diff],
     resolved_target: &'a ResolvedRef,
     resolved_bases: &'a [ResolvedRef],
-    worktree_clean: bool,
+    worktree_clean: Option<bool>,
     worktree_status_digest: Option<&'a str>,
 }
 

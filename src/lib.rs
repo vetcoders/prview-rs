@@ -41,8 +41,8 @@ pub struct App {
     /// checks, or artifact writes touch the tree (R4-19). Frozen so the
     /// pre-existing downgrade judges the scanned source state, not tool output
     /// (an in-repo `--output-dir` or an untracked check cache) that appears
-    /// later in the run.
-    pub(crate) worktree_clean_at_start: bool,
+    /// later in the run. `None` when the status could not be read at all.
+    pub(crate) worktree_clean_at_start: Option<bool>,
     /// Fingerprint of what was uncommitted at that same moment, from the same
     /// status read. Recorded in `00_summary/PROVENANCE.json` so a reviewer can
     /// tell two dirty runs apart instead of only knowing "dirty".
@@ -849,7 +849,11 @@ mod tests {
 
         // The App is built while the tree is clean — as a watcher's is.
         let app = crate::App::from_config(config).unwrap();
-        assert!(app.worktree_clean_at_start, "fixture starts clean");
+        assert_eq!(
+            app.worktree_clean_at_start,
+            Some(true),
+            "fixture starts clean"
+        );
 
         // A watched edit lands, then the iteration runs.
         std::fs::write(

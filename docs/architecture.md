@@ -312,6 +312,24 @@ with a reason when no candidate resolves. When git cannot answer at all
 (unreadable repo, unresolvable ref) nothing is skipped: an unverifiable claim
 may no more become a skip than a verdict.
 
+A manifest must also be a **regular file**. Git stores a symlink as a blob, so a
+`Cargo.toml` the reviewed commit replaced with a link to an external manifest
+satisfied a plain tree lookup, resolved as a cargo root, and let cargo build a
+foreign crate under the reviewed commit's cache key — the directory-symlink hole
+one path component deeper. `regular_file_at_commit()` answers `false` for a
+symlink, matching what manifest discovery already did, and the containment check
+resolves the manifest alongside the directory for the paths git cannot reach.
+
+Python eligibility follows the same rule for the same reason. `runs_python_checks()`
+reads the local profile, so a target that removed its last `pyproject.toml` and
+Python sources still scheduled the Python gates — and pytest exits 5 for "no
+tests collected", a blocking failure for a target the check no longer applies to.
+`missing_reviewed_python_project()` asks the reviewed tree: a `pyproject.toml`
+settles it alone, otherwise the tree is walked for runtime Python source. That
+walk is deliberately unbounded, unlike depth-limited cargo root discovery,
+because it concludes *absence* — a bounded search cannot prove absence, only
+manufacture confident false skips for deep layouts. Every step fails open.
+
 Cache keys follow the same substrate. Cached results are looked up **before**
 the shared snapshot exists, so cargo cache keys resolve the target commit
 directly (`off_head_target_commit()`) and key on the commit id whenever it
@@ -367,6 +385,16 @@ Every check records a `CheckProvenance` alongside its result: `command`,
     bytes are **not** exactly `target_sha`. The dependency symlinks prview
     itself creates (`node_modules`, `.venv`) are excluded — they are the tool's
     scaffolding, not a change to the reviewed tree;
+  - `snapshot-borrowed-deps` — the reviewed commit's tree, unmodified, but with
+    its dependencies borrowed. `create_worktree_snapshot()` links the operator's
+    `node_modules`/`.venv` into the snapshot instead of installing what the
+    target's lockfile pins, so the reviewed **source** is exactly `target_sha`
+    while the compiler, plugins, type definitions and runtime the tools loaded
+    came from the local checkout. A dependency-changing PR is where those
+    differ, so such a run is not reported as an exact snapshot scan. Reported
+    only when the links actually exist — a repo with no local dependency tree
+    links nothing and stays `snapshot`. Installing the target's own dependencies
+    instead is a network operation of unbounded cost and is not attempted;
   - `local-clean` — repo working tree, nothing uncommitted;
   - `local-dirty` — repo working tree with uncommitted changes — the scanned
     bytes are **not** exactly `target_sha`;
@@ -386,6 +414,17 @@ unknown instead of being recorded as clean. They surface in
 `20_quality/<gate>.result.json`, `20_quality/full-checks.log`,
 `00_summary/RUN.json` (`checks[]`), `00_summary/PROVENANCE.json` and
 `report.json` (`checks[]`).
+
+**A check that errors keeps its substrate.** A command that times out or crashes
+returns an error, and that row used to carry no provenance at all — null `cwd`,
+`target_sha` and `tree_state` for exactly the rows a reviewer most needs to
+place. The error path now reconstructs the directory the check was about to read
+without materialising anything: the run-wide shared snapshot is already on disk,
+and a review whose target is the checked-out `HEAD` reads the repo root. Two
+absences stay absences rather than being filled: `command` is an explicit
+`<no command recorded>`, and an off-`HEAD` check with no shared snapshot keeps a
+`None` provenance, because its own worktree is gone by then and naming the local
+checkout would name the one tree it was *not* reading.
 
 **Cache hits carry provenance too.** When a check result is cached, its status,
 output and provenance are stored as **one JSON entry** (`<key>` under the
@@ -420,7 +459,15 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
 - `head_sha` — commit checked out locally (equal to `target_sha` for an ordinary
   local review, different under `--pr`/`--remote`);
 - `worktree.clean` — whether the local tree had uncommitted changes, frozen
-  **before** any check ran or artifact was written (R4-19);
+  **before** any check ran or artifact was written (R4-19). `null` when the
+  status could not be read at all (an unreadable or malformed index): the two
+  failure modes are not the same, and only one of them is safe to answer
+  permissively. Without a git repository nothing can be uncommitted and such a
+  run has no diff baseline either, so it stays `true`; a repository whose status
+  simply could not be read establishes nothing, and reporting `true` there would
+  both publish a fact nobody checked and let the pre-existing downgrade silence
+  findings on a tree that was never inspected. The downgrade requires a proven
+  `true`, so unknown suppresses it;
 - `worktree.status_digest` — `sha256:<hex>` over a canonical rendering of the
   working-tree status, from the *same* read as `clean`. Each line is
   `XY <path>\0<content>`, where `<content>` fingerprints the file the entry
