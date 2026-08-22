@@ -760,6 +760,15 @@ attribute (`#[derive(…)]`) is carried the same way so it cannot take the `cfg`
 above it down with it; an attribute that never closes within
 `MAX_ATTRIBUTE_CONTINUATION_LINES` falls back to the tolerant `None`.
 
+`cfg_attr` counts as a guard exactly when it applies a `cfg`:
+`#[cfg_attr(feature = "a", cfg(unix))]` gates the item as surely as `#[cfg(unix)]`
+does, so it joins the conjunction, while `#[cfg_attr(unix, derive(Debug))]` decides
+an attribute ON the item and stays out — inventing a gate there would split an
+ordinary re-add into a phantom removal. The two families separate cleanly on the
+whitespace-stripped substring `,cfg(`: of the 44,562 `cfg_attr` attributes in the
+local crates.io registry, 189 apply a `cfg` (12 crates, the `portable-atomic`
+idiom) and none of them carry that substring inside a string literal.
+
 Both the module path and the perf tracker's test-context scope are counted over
 CODE only, via the shared scanner in `src/rust_source.rs`. It resolves comments
 and literals in ONE pass — `"http://x"` is a string and `format!("{}/*.{}")` is

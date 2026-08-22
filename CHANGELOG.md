@@ -201,6 +201,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `cfg_attr` that applies a `cfg` is part of the guard.** The guard filter
+  recognized only the literal `#[cfg(` spelling, so
+  `#[cfg_attr(feature = "a", cfg(unix))]` — which gates the item exactly as a
+  `cfg` does — was dropped from BOTH sides' identity: the declaration text then
+  paired, and a symbol that really left one configuration produced no finding at
+  all. `cfg_attr` now joins the conjunction when it applies a `cfg`, and only
+  then: `#[cfg_attr(unix, derive(Debug))]` decides an attribute on the item, not
+  the item, and a gate invented there would split an ordinary re-add into a
+  phantom removal.
 - **A trailing `//` no longer swallows the rest of a declaration.** Continuation
   lines are joined with a space, and the joined text was then scanned as one
   piece — so a comment on any continuation line commented out every line

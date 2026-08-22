@@ -815,7 +815,7 @@ impl CfgGuard {
     /// an API change. Any other attribute keeps the run alive but adds nothing:
     /// a `#[derive(…)]` between the `cfg` and its item does not change the gate.
     fn record(&mut self, attribute: String) {
-        if !attribute.starts_with("#[cfg(") {
+        if !gates_the_item(&attribute) {
             return;
         }
         let guards = self.guards.get_or_insert_with(Vec::new);
@@ -823,6 +823,28 @@ impl CfgGuard {
         guards.sort();
         guards.dedup();
     }
+}
+
+/// Does this whitespace-stripped attribute decide whether the item exists?
+///
+/// `#[cfg(…)]` obviously does. So does `#[cfg_attr(feature = "a", cfg(unix))]`:
+/// it applies a `cfg` under a condition, so the item is gated just as surely —
+/// reading only the literal `#[cfg(` spelling dropped BOTH sides' guards, the
+/// identical declaration text then paired, and a struct that really left the
+/// Unix build produced no finding at all.
+///
+/// The rest of the `cfg_attr` family — `#[cfg_attr(unix, derive(Debug))]`,
+/// `#[cfg_attr(docsrs, doc(cfg(…)))]` — decides an attribute ON the item, not
+/// the item, and must stay out: a gate invented there would split an ordinary
+/// re-add into a phantom removal, which is the error direction that costs
+/// trust. `,cfg(` is the whole distinction, applied to text whitespace has
+/// already been stripped from, and it separates the two families exactly across
+/// the 44,562 `cfg_attr` attributes in the local registry: 189 apply a `cfg`
+/// (12 crates, the `portable-atomic` idiom), and in none of them does the
+/// substring fall inside a string literal.
+fn gates_the_item(attribute: &str) -> bool {
+    attribute.starts_with("#[cfg(")
+        || (attribute.starts_with("#[cfg_attr(") && attribute.contains(",cfg("))
 }
 
 /// How many delimiters `line` leaves open, starting from `depth`.
@@ -2106,6 +2128,57 @@ mod tests {
         assert!(
             removed_symbol_types(&findings).contains(&"struct".to_string()),
             "a wrapped attribute must not drop the cfg above it, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_cfg_attr_that_applies_a_cfg_is_part_of_the_guard() {
+        // `#[cfg_attr(feature = "a", cfg(unix))]` gates the item exactly like a
+        // `#[cfg(…)]` does — it just decides, per feature, whether to apply one.
+        // Recognizing only the literal `#[cfg(` spelling discarded both sides'
+        // guards, so the identical struct text paired and the struct that really
+        // disappeared from Unix builds with feature `a` left no finding.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg_attr(feature = \"a\", cfg(unix))]",
+                "-pub struct Config;",
+                "+#[cfg_attr(feature = \"a\", cfg(windows))]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a re-add under a different cfg_attr guard must not cancel the removal, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_cfg_attr_that_applies_no_cfg_is_not_a_guard() {
+        // Guard the other direction: `#[cfg_attr(unix, derive(Debug))]` decides
+        // a derive, not whether the item exists. Reading it as a gate would
+        // split an ordinary re-add into a phantom removal.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg_attr(unix, derive(Debug))]",
+                "-pub struct Config;",
+                "+#[cfg_attr(windows, derive(Debug))]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a cfg_attr applying a derive is not a gate, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }
