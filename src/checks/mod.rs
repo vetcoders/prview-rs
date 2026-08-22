@@ -653,14 +653,46 @@ fn is_cargo_target_check(name: &str) -> bool {
 }
 
 /// Checks that resolve their scan directory through [`plan_check_run`] and so
-/// benefit from the run-wide shared target snapshot (thread 1). Cargo checks run
-/// at `cargo_cache_root` and semgrep manages its own worktree, so neither is
-/// listed here.
+/// benefit from the run-wide shared target snapshot (thread 1).
+///
+/// The cargo checks are listed too: they analyse the reviewed snapshot like
+/// every other language check and only redirect their *build cache* away from
+/// it (see `plan_cargo_run` in `checks::cargo`). Semgrep is the single opt-out —
+/// it manages its own worktree because it also needs a baseline commit.
 fn uses_shared_scan_dir(name: &str) -> bool {
     matches!(
         name,
-        "Ruff" | "Mypy" | "TypeScript" | "ESLint" | "Vitest" | "Stylelint"
+        "Ruff"
+            | "Mypy"
+            | "TypeScript"
+            | "ESLint"
+            | "Vitest"
+            | "Stylelint"
+            | "Cargo check"
+            | "Clippy"
+            | "Rustfmt"
+            | "Cargo test"
+            | "Cargo audit"
+            | "Cargo geiger"
     )
+}
+
+/// Commit id of the reviewed target when it differs from the checked-out `HEAD`.
+///
+/// `None` for an ordinary local review (target == `HEAD`) and whenever the repo
+/// or its refs cannot be resolved — both keep the plain working-tree behaviour.
+///
+/// Cache keys need this INDEPENDENTLY of `config.scan_dir_override`: the cached-
+/// result lookup runs in the dispatcher's first pass, BEFORE the shared snapshot
+/// is materialised. A key derived from the scan dir alone would therefore read a
+/// local-tree key and write a snapshot key — and, worse, a `--pr` run would hit
+/// the entry a previous local run stored under that same local-tree key, serving
+/// the local checkout's verdict as if it were the reviewed commit's.
+pub fn off_head_target_commit(config: &Config) -> Option<String> {
+    let repo = crate::git::Repository::open(&config.repo_root).ok()?;
+    let target = repo.resolve_target(config).ok()?;
+    let head = repo.head_commit_id().ok()?;
+    (target.commit_id != head).then_some(target.commit_id)
 }
 
 /// Materialise ONE target snapshot for the whole run and point `config` at it, so
@@ -811,8 +843,36 @@ pub async fn run_command_with_timeout(
     cwd: &Path,
     timeout_secs: u64,
 ) -> Result<Output> {
+    run_command_with_timeout_and_env(cmd, args, cwd, timeout_secs, &[]).await
+}
+
+/// Helper to run a command with extra environment variables.
+///
+/// `env` is applied to the child ONLY — the parent process environment is never
+/// mutated, so a per-check override (cargo's `CARGO_TARGET_DIR`) cannot leak
+/// into concurrently running checks.
+pub async fn run_command_with_env(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<Output> {
+    run_command_with_timeout_and_env(cmd, args, cwd, CHECK_TIMEOUT_SECS, env).await
+}
+
+/// Helper to run a command with custom timeout and extra environment variables.
+pub async fn run_command_with_timeout_and_env(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout_secs: u64,
+    env: &[(String, String)],
+) -> Result<Output> {
     let mut command = Command::new(cmd);
     command.args(args).current_dir(cwd);
+    for (key, value) in env {
+        command.env(key, value);
+    }
     // Shared rails (stdin-null, kill_on_drop, own process group) + concurrent
     // output drain + group-SIGKILL on timeout live in crate::proc.
     crate::proc::run_capture_with_timeout(command, Duration::from_secs(timeout_secs), cmd, || {
@@ -982,13 +1042,36 @@ mod tests {
 
     #[test]
     fn share_target_snapshot_is_a_noop_without_snapshot_backed_checks() {
-        // Cargo-only / no snapshot-backed checks: no shared worktree is created
-        // and the override stays unset so nothing changes for those checks.
+        // Semgrep owns its own worktree, so a semgrep-only run creates no shared
+        // worktree and the override stays unset.
         let mut config = rust_config(true, true, true);
-        let cargo_only: Vec<Box<dyn Check>> = vec![Box::new(crate::checks::cargo::CargoCheck)];
-        let snapshot = share_target_snapshot(&mut config, &cargo_only);
+        let semgrep_only: Vec<Box<dyn Check>> =
+            vec![Box::new(crate::checks::semgrep::SemgrepCheck)];
+        let snapshot = share_target_snapshot(&mut config, &semgrep_only);
         assert!(snapshot.is_none());
         assert!(config.scan_dir_override.is_none());
+    }
+
+    #[test]
+    fn cargo_checks_are_snapshot_backed() {
+        // Cargo checks judge the reviewed commit like every other language
+        // check, so they must take part in the run-wide shared snapshot; only
+        // their build cache is redirected away from it. Semgrep stays the one
+        // opt-out because it manages its own baseline worktree.
+        for name in [
+            "Cargo check",
+            "Clippy",
+            "Rustfmt",
+            "Cargo test",
+            "Cargo audit",
+            "Cargo geiger",
+        ] {
+            assert!(
+                uses_shared_scan_dir(name),
+                "{name} must resolve its scan dir through the shared snapshot",
+            );
+        }
+        assert!(!uses_shared_scan_dir("Semgrep scan"));
     }
 
     #[test]
