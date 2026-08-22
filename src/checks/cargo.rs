@@ -335,10 +335,13 @@ const CARGO_ROOT_DISCOVERY_DEPTH: usize = 2;
 /// 1. the mapped cargo root — the local root at the same relative path;
 /// 2. the repo root — a workspace root still checks its members;
 /// 3. exactly one directory within [`CARGO_ROOT_DISCOVERY_DEPTH`] carrying a
-///    manifest, for a crate the reviewed commit moved somewhere else.
+///    manifest that [`moved_manifest_is_configured_project`] shows to be the
+///    configured project, for a crate the reviewed commit moved somewhere else.
 ///
 /// Several candidates in step 3 resolve to nothing: which crate the review is
-/// about is not a thing to guess. Walking the tree also settles containment for
+/// about is not a thing to guess. Neither is a single unrelated one — being the
+/// last manifest standing is not evidence of being the project that moved.
+/// Walking the tree also settles containment for
 /// free — git trees are not traversed through symlinks, so a root the reviewed
 /// commit replaced with a symlink to an external directory has no entries here
 /// and simply does not resolve. The manifest itself is held to the same standard
@@ -384,7 +387,13 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
         mapped
     };
     match moved.as_slice() {
-        [only] => ReviewedCargoRoot::Resolved(only.clone()),
+        [only] => match moved_manifest_is_configured_project(config, &repo, &commit, only) {
+            Ok(()) => ReviewedCargoRoot::Resolved(only.clone()),
+            Err(why) => ReviewedCargoRoot::Unavailable(format!(
+                "commit {short} has no Cargo.toml at {aimed_at}; the only one elsewhere ({only}) \
+                 {why} — this review is not about it",
+            )),
+        },
         [] => ReviewedCargoRoot::Unavailable(format!(
             "commit {short} has no Cargo.toml at {aimed_at} or the repo root — not a cargo project",
         )),
@@ -394,6 +403,98 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
             many.join(", "),
         )),
     }
+}
+
+/// What a manifest says it IS, so a manifest found somewhere else in the
+/// reviewed tree can be told apart from the project this review is about.
+#[derive(Debug, PartialEq, Eq)]
+enum ManifestIdentity {
+    /// `[package] name` — the crate this manifest defines.
+    Package(String),
+    /// A virtual workspace root defines no crate of its own; the member list is
+    /// what identifies it.
+    Workspace(Vec<String>),
+}
+
+impl ManifestIdentity {
+    fn describe(&self) -> String {
+        match self {
+            Self::Package(name) => format!("crate `{name}`"),
+            Self::Workspace(members) => format!("a workspace over {}", members.join(", ")),
+        }
+    }
+}
+
+/// Read a manifest's identity, or `None` when it defines neither a package nor a
+/// workspace (or does not parse at all).
+fn manifest_identity(content: &str) -> Option<ManifestIdentity> {
+    let table: toml::Table = toml::from_str(content).ok()?;
+    if let Some(name) = table
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(|name| name.as_str())
+    {
+        return Some(ManifestIdentity::Package(name.to_string()));
+    }
+    let members = table.get("workspace")?.get("members")?.as_array()?;
+    let mut members: Vec<String> = members
+        .iter()
+        .filter_map(|member| member.as_str().map(str::to_string))
+        .collect();
+    members.sort();
+    Some(ManifestIdentity::Workspace(members))
+}
+
+/// Whether the lone manifest found elsewhere in the reviewed tree is the
+/// configured project, moved — the only reason to run cargo there.
+///
+/// "Exactly one manifest is left" is not that evidence. A commit that DELETES
+/// the Rust project while keeping an unrelated one within reach — an
+/// `examples/demo`, a test fixture crate — left this arm running every cargo
+/// gate against the demo and filing a green verdict for a project the reviewed
+/// commit no longer contains. Checked out normally that commit would not even be
+/// detected as a Rust project, because local profile detection never looks at
+/// `examples/`.
+///
+/// The identity being matched is the CONFIGURED project's, read from the local
+/// checkout — the same source the mapped candidate came from, and the only
+/// statement anywhere of which crate this review is about. Without it (no local
+/// manifest, one that does not parse, one that defines neither a package nor a
+/// workspace) there is nothing to compare, and an unproven guess is refused:
+/// the run is skipped with a reason instead of judging another project.
+///
+/// `Err` carries the fragment naming why, for the skip reason.
+fn moved_manifest_is_configured_project(
+    config: &Config,
+    repo: &crate::git::Repository,
+    commit: &str,
+    candidate: &str,
+) -> std::result::Result<(), String> {
+    let unproven = "cannot be shown to be the same project".to_string();
+    let local_manifest = config
+        .repo_root
+        .join(cargo_cache_root(config))
+        .join("Cargo.toml");
+    let configured = std::fs::read_to_string(&local_manifest)
+        .ok()
+        .as_deref()
+        .and_then(manifest_identity)
+        .ok_or_else(|| unproven.clone())?;
+    let found = repo
+        .file_at_commit(commit, &format!("{candidate}/Cargo.toml"))
+        .ok()
+        .as_deref()
+        .and_then(manifest_identity)
+        .ok_or(unproven)?;
+
+    if found == configured {
+        return Ok(());
+    }
+    Err(format!(
+        "is {}, not {}",
+        found.describe(),
+        configured.describe()
+    ))
 }
 
 /// Skip reason when the reviewed commit offers no cargo root to run in.
@@ -2258,6 +2359,79 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         assert_eq!(
             CargoCheck.check_eligibility(&config),
             super::super::CheckEligibility::Run
+        );
+    }
+
+    /// "Exactly one manifest is left" says nothing about whose it is. A commit
+    /// that DELETES the Rust project while keeping an example crate within reach
+    /// ran every cargo gate against the example and filed its green verdict for
+    /// a project the reviewed commit no longer contains — a commit that, checked
+    /// out normally, would not be detected as a Rust project at all.
+    #[test]
+    fn an_unrelated_lone_manifest_is_not_the_moved_crate() {
+        // Target commit: the configured crate is gone, a demo crate remains.
+        let (repo, target) = repo_with_two_commits_containing(&["examples/demo/Cargo.toml"]);
+        // HEAD (the local checkout): the project this review is configured for.
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname=\"app\"\nversion=\"0.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(repo.path(), "the project the review is about");
+
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        let reason = missing_reviewed_cargo_manifest(&config)
+            .expect("an unrelated crate must not stand in for a deleted project");
+        assert!(
+            reason.contains("examples/demo") && reason.contains("`x`") && reason.contains("`app`"),
+            "the skip reason must name the crate it found and the one it wanted: {reason}",
+        );
+    }
+
+    /// A virtual workspace root defines no crate, so package names cannot
+    /// identify it — its member list does. Moving one must keep working, or the
+    /// evidence requirement would turn a legitimate layout into a permanent skip.
+    #[test]
+    fn a_moved_workspace_root_is_identified_by_its_members() {
+        use crate::git::cmd::git_cmd;
+
+        let workspace = "[workspace]\nmembers=[\"core\"]\nresolver=\"2\"\n";
+        let (repo, _first) = repo_with_two_commits();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("backend")).unwrap();
+        std::fs::write(root.join("backend/Cargo.toml"), workspace).unwrap();
+        commit_all(root, "workspace root moved into backend");
+        let target = String::from_utf8(
+            git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string();
+        // HEAD (the local checkout): the same workspace, back at the repo root.
+        std::fs::remove_file(root.join("backend/Cargo.toml")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), workspace).unwrap();
+        commit_all(root, "workspace root back at the top");
+
+        let config = test_config_builder()
+            .repo_root(root)
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        assert_eq!(
+            resolve_reviewed_cargo_root(&config),
+            ReviewedCargoRoot::Resolved("backend".to_string()),
+            "the same workspace one level down is still the project under review",
         );
     }
 

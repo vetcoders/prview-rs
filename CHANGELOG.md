@@ -130,7 +130,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reviewed branch merely *moved* (a root workspace pushed into `backend/`) is
   found where it now lives, as long as exactly one directory within two levels
   carries a manifest; several candidates skip with a reason naming them rather
-  than guessing which crate the review is about.
+  than guessing which crate the review is about. That single candidate must also
+  prove it *is* the configured project — matching `[package] name`, or the member
+  list for a virtual workspace root that names no crate. Being the last manifest
+  standing is not evidence of having moved: a commit that deletes the Rust
+  project while keeping an `examples/demo` crate within reach had every cargo
+  gate run against the demo and file its green verdict for a project the commit
+  no longer contains, one that profile detection would not even call a Rust
+  project locally. Nothing to compare against skips with a reason too.
 - Cargo check cache keys now name the substrate they judge. The cached-result
   lookup happens before the target snapshot is materialised, so a `--pr` run
   could hit an entry a previous local run had stored under the same working-tree

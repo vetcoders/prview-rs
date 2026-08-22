@@ -306,6 +306,17 @@ crate a review is about is not something to guess. Without this, a moved crate
 left the run with nowhere to go and cargo's "could not find `Cargo.toml`" became
 the reviewed crate's verdict.
 
+The lone survivor of that third step must also **prove it is the configured
+project**: its `[package] name` — or, for a virtual workspace root that defines
+no crate, its member list — has to match the manifest at the local cargo root.
+Being the last manifest standing is not evidence of having moved. A commit that
+deletes the Rust project while keeping an `examples/demo` crate within two levels
+otherwise had every cargo gate run against the demo and file a green verdict for
+a project that commit no longer contains — a commit that, checked out normally,
+profile detection would not call a Rust project at all. No identity to compare
+against (no local manifest, one that does not parse, one that defines neither)
+is a skip with a reason, not a guess.
+
 A `cargo_root` configured **outside** the repository has no such mapping — a
 snapshot of this repo can never contain it. Off-`HEAD` runs then **skip** the
 cargo checks with a reason naming the unreachable root
