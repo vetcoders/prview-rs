@@ -197,7 +197,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under a `.prview-prune.lock` file at the environment root, so a second review
   cannot read a timestamp just before this one refreshes it and then delete the
   directory out from under a running `uv run`; a root already locked by a live
-  review is left alone entirely. Local reviews set no override.
+  review is left alone entirely. Local reviews set no override. Python runs also
+  refuse a `pyproject.toml` or `uv.lock` that resolves outside the tree being
+  judged — the counterpart of the Cargo manifest guards. A reviewed commit that
+  tracks either as a link to an external file had ruff, mypy and pytest configure
+  themselves, and uv resolve its dependency set, from another project entirely,
+  while provenance recorded an exact snapshot scan and the verdict was cached
+  under the reviewed commit. Metadata linked to a real file inside the tree
+  resolves back inside and still runs.
 - Provenance no longer certifies a tree it could not verify. A working-tree
   status that fails to read (an index lock, a permissions error, a malformed
   repository) recorded `local-clean` — the claim that the scanned bytes exactly

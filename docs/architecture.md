@@ -270,6 +270,16 @@ wins: each candidate is re-read immediately before it is removed.
 Nothing is pre-created — uv rejects an existing directory that is not a valid
 environment, so the directory tree only ever comes from uv itself.
 
+The tools read the project **files**, not the directory, so `plan_python_run()`
+also refuses a `pyproject.toml` or `uv.lock` that resolves outside the tree being
+judged — the Python counterpart of the Cargo manifest guards. A reviewed commit
+that tracks either as a link to an external file would have ruff, mypy and pytest
+configure themselves, and uv resolve dependencies, from another project, while
+provenance recorded an exact `snapshot` scan and the cache filed the verdict
+under the reviewed commit (`uv run` is given neither `--no-project` nor
+`--locked`, so nothing downstream re-asks). Metadata linked to a real file inside
+the tree resolves back inside and passes: escape is the target, not symlinks.
+
 The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,
 `Cargo audit`, `Cargo geiger`) run in the snapshot as well, but with one extra
 step. A snapshot is a throwaway temp dir, so its in-tree `target/` would force a
