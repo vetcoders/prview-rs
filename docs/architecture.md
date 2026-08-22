@@ -295,6 +295,16 @@ guards, while reordering the same two is not. An unseen scope or guard is
 `None`, which pairs with anything: the diff may simply not have re-emitted the
 context line on that side.
 
+An attribute is read to its balanced close, not to the end of its first line. A
+predicate wrapped as `#[cfg(any(` + feature lines + `))]` is one guard, equal to
+its single-line spelling — whitespace and line breaks are formatting, not a
+different gate. Reading only the opener left the continuation line looking like a
+new item, which cleared the guard and let a declaration that really disappeared
+for one configuration pair with its re-add under another. Any other wrapped
+attribute (`#[derive(…)]`) is carried the same way so it cannot take the `cfg`
+above it down with it; an attribute that never closes within
+`MAX_ATTRIBUTE_CONTINUATION_LINES` falls back to the tolerant `None`.
+
 Both the module path and the perf tracker's test-context scope are counted over
 CODE only, via the shared scanner in `src/rust_source.rs`. It resolves comments
 and literals in ONE pass — `"http://x"` is a string and `format!("{}/*.{}")` is

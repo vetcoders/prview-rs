@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `cfg` predicate wrapped across lines still guards its declaration.** The
+  breaking-change pairing recorded only the opener of `#[cfg(any(`, and the first
+  continuation line then looked like a new item and cleared the guard: both sides
+  of the diff came out unguarded, so a `pub` item that really disappeared for one
+  configuration paired with its re-add under a different one and left no finding
+  at all — the exact false negative the guard was added to prevent. Attributes
+  are now accumulated to their balanced close, which also makes a wrapped
+  predicate compare equal to its single-line spelling, and a wrapped
+  `#[derive(…)]` no longer takes the `cfg` above it down with it.
 - **One verdict vocabulary now answers for every reader surface.** The CLI
   matched a stored verdict case-sensitively while the MCP adapter ranked it
   through an uppercase fold, so a pack stating `verdict: "pass"` was a clean
