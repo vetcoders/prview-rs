@@ -1571,7 +1571,7 @@ mod tests {
             unchanged: false,
         };
 
-        let summary = build_cli_json_summary(&config, &report);
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_eq!(summary.mode.execution_mode, "ci");
         assert_eq!(summary.checks_summary.warned, 1);
         assert!(summary.quality_pass);
@@ -1584,6 +1584,13 @@ mod tests {
         // Outside --ci the exit stays derived from the merge recommendation
         // alone; the escape hatch never silently hardens a plain local run.
         let config = test_config();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        std::fs::write(
+            temp.path().join("00_summary/MERGE_GATE.json"),
+            r#"{"decision":{"verdict":"CONDITIONAL","merge_recommendation":"review_required","allow_merge":false,"quality_pass":true}}"#,
+        )
+        .unwrap();
         let report = Report {
             target: "feature/warnings-only".to_string(),
             bases: vec!["main".to_string()],
@@ -1597,12 +1604,12 @@ mod tests {
                 provenance: None,
             }],
             heuristics: None,
-            artifacts_dir: PathBuf::from("."),
+            artifacts_dir: temp.path().to_path_buf(),
             duration: Duration::from_secs(1),
             unchanged: false,
         };
 
-        let summary = build_cli_json_summary(&config, &report);
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_ne!(summary.mode.execution_mode, "ci");
         assert_eq!(compute_exit_code(&summary, true), 0);
     }
