@@ -255,8 +255,19 @@ virtualenv behind for every commit ever reviewed. Each run refreshes a
 inside, so directory mtime alone would understate activity), and
 `prune_uv_envs()` drops what is outside the working set: the three most recently
 used always survive, and nothing used within the last 24 hours is removed, so a
-concurrent or slow review cannot have its environment deleted mid-run. Nothing
-is pre-created — uv rejects an existing directory that is not a valid
+concurrent or slow review cannot have its environment deleted mid-run.
+
+Age alone would not be enough, because the reviews are concurrent: one process
+can read an environment's timestamp just before another refreshes it and then
+delete the directory once that other review's `uv run` has begun. Marking and
+pruning are therefore a single critical section, serialised across processes by
+a `.prview-prune.lock` file at the root (the same atomic
+create-new-plus-liveness lock the run index uses). The lock is opportunistic —
+pruning is housekeeping, so a root held by another live review is left to it,
+and this run only records its own use. A mark that lands outside the lock still
+wins: each candidate is re-read immediately before it is removed.
+
+Nothing is pre-created — uv rejects an existing directory that is not a valid
 environment, so the directory tree only ever comes from uv itself.
 
 The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,

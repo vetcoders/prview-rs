@@ -187,8 +187,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory would resynchronise incompatible dependency sets under each other's
   running pytest. Runs of the same commit still reuse a warm environment, and
   the growth is bounded: the three most recently used environments survive, and
-  nothing used in the last 24 hours is ever removed. Local reviews set no
-  override.
+  nothing used in the last 24 hours is ever removed. That age floor is enforced
+  under a `.prview-prune.lock` file at the environment root, so a second review
+  cannot read a timestamp just before this one refreshes it and then delete the
+  directory out from under a running `uv run`; a root already locked by a live
+  review is left alone entirely. Local reviews set no override.
 - Provenance no longer certifies a tree it could not verify. A working-tree
   status that fails to read (an index lock, a permissions error, a malformed
   repository) recorded `local-clean` — the claim that the scanned bytes exactly
