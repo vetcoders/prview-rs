@@ -69,8 +69,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unmatched `{` in a literal held it open and muted real production hits.
   Normal, raw (`r#"…"#`) and byte-string literals as well as char literals
   (`'}'`, `'\u{7b}'`) are recognised; lifetimes are not mistaken for char
-  literals. A literal spanning several diff lines is out of scope for this
-  per-line scanner.
+  literals. Block comments count too, and they are tracked ACROSS lines —
+  commenting a block of code out is exactly how an unbalanced brace ends up
+  inside a comment, and a `/* … } … */` spread over three lines closed the test
+  scope early (or, with a `{`, held it open and muted real production hits). A
+  `/*` inside a string literal stays data: `format!("{}/*.{}", dir, ext)` is a
+  glob pattern, and reading it as a comment opener would swallow the rest of the
+  hunk — a far more common line in real diffs than a block comment is. A *string*
+  literal spanning several diff lines is still out of scope for this per-line
+  scanner.
 - Breaking-change detection pairs duplicate declarations one-to-one. `cfg`-gated
   variants share (file, kind, name), and the pairing search never consumed its
   match, so every removal cancelled against the same unchanged re-add: the
