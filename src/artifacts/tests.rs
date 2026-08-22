@@ -5294,4 +5294,23 @@ fn worktree_digest_separates_nested_repositories_by_their_own_state() {
         moved.status_digest, dirty.status_digest,
         "edits inside a nested repository change what a scan would read",
     );
+
+    // Same HEAD, same dirty paths, different bytes: a clean/dirty flag says
+    // these are the same substrate, and cargo (or any other check that compiles
+    // the vendored tree) reads different code in each.
+    fs::write(nested.join("scratch.rs"), "pub fn something_else() {}\n").expect("nested rewrite");
+    let differently_dirty = capture_worktree_provenance(repo);
+    assert_ne!(
+        dirty.status_digest, differently_dirty.status_digest,
+        "a nested repository dirtied differently is a different substrate",
+    );
+
+    // And it is still a function of the tree: restoring the bytes restores the
+    // fingerprint.
+    fs::write(nested.join("scratch.rs"), "pub fn draft() {}\n").expect("nested restore");
+    assert_eq!(
+        capture_worktree_provenance(repo).status_digest,
+        dirty.status_digest,
+        "the same nested tree must fingerprint identically",
+    );
 }

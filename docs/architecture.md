@@ -494,9 +494,11 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   `XY <path>\0<content>`, where `<content>` fingerprints the file the entry
   points at: `blob:<len>:<sha256>` for a regular file (streamed, so a large file
   is not held in memory), `symlink:<sha256>` over the link target,
-  `gitlink:<head>:<clean|dirty>` for a nested repository (git never recurses
-  into one, so a submodule is a single status entry — its own `HEAD` and status
-  are what tell two of them apart), `dir` for an ordinary directory, `absent`
+  `gitlink:<head>:<clean|dirty:<sha256>|unknown>` for a nested repository (git
+  never recurses into one, so a submodule is a single status entry — its own
+  `HEAD` and, when it is dirty, a recursive digest of its own dirty subset are
+  what tell two of them apart; the recursion stops after three levels of
+  nesting and falls back to a bare `dirty`), `dir` for an ordinary directory, `absent`
   when the path is gone, `unreadable` on an IO error. Paths alone
   identify *which* files are modified, not *how*; two runs that touch the same
   files with different content are different substrates and must not share a

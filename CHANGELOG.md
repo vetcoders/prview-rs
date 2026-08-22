@@ -25,8 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dirty path, not just its status code and name, so two runs that modify the
   same files differently are distinguishable — including a nested repository,
   which git reports as a single entry and which therefore fingerprints by its
-  own `HEAD` and working state rather than by the bare fact that a directory is
-  there; each run freezes its own state, and under `--watch` every iteration
+  own `HEAD` and, when dirty, by a recursive digest of its own dirty subset
+  (three levels of nesting deep) rather than by the bare fact that a directory
+  is there; each run freezes its own state, and under `--watch` every iteration
   re-reads the tree it is about to analyse.
   The file is listed in `AI_INDEX.md`'s reading order, right after the gate
   verdict it explains — and in the documented contract for it
