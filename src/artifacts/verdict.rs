@@ -1926,9 +1926,7 @@ mod tests {
         let digest_for = |name: &[u8], body: &[u8]| -> Option<String> {
             let tmp = tempfile::tempdir().expect("tempdir");
             git2::Repository::init(tmp.path()).expect("init repo");
-            let path = tmp
-                .path()
-                .join(std::ffi::OsStr::from_bytes(name).to_os_string());
+            let path = tmp.path().join(std::ffi::OsStr::from_bytes(name));
             // The filesystem may reject the name (APFS enforces UTF-8); the
             // digest question only exists where it does not.
             std::fs::write(&path, body).ok()?;
