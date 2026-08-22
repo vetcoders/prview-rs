@@ -195,11 +195,16 @@ pub fn readable_signal<'v>(
 
 /// Select the object a gate pack's decision is read from.
 ///
-/// Two documented shapes, and the rule that separates them is the presence of
-/// `schema_version`, not the presence of `decision`:
+/// A stated `decision` object always wins, and only then does the presence of
+/// `schema_version` decide what an absent one means:
 ///
 /// * no `schema_version` — a pack predating the field. Its ROOT is the decision;
-///   this is the legacy read-back surface every reader keeps.
+///   this is the legacy read-back surface every reader keeps. The tolerance
+///   answers WHERE the decision sits when nothing else states it — it is not a
+///   rule that the root outranks a `decision` object the pack did write. A
+///   schema-less pack carrying one is read from it, because the alternative is
+///   to read a plainly stated decision as a decision with every signal missing,
+///   and every signal missing normalizes to BLOCK.
 /// * `schema_version` stated — the `decision` object that schema is built around
 ///   is mandatory. Falling back to the root there would publish a verdict
 ///   nothing in the pack stated, which is a re-derivation wearing a reader's
@@ -449,6 +454,38 @@ mod tests {
     fn gate_verdict_parse_fails_loud_for_unknown_values() {
         assert!(GateVerdict::try_from("HOLD").is_err());
         assert!(GateVerdict::try_from("ALLOW").is_err());
+    }
+
+    #[test]
+    fn a_decision_object_wins_over_the_root_even_without_a_schema() {
+        // The precedence is deliberate and load-bearing, so it is asserted
+        // rather than left implicit.
+        //
+        // The legacy tolerance answers WHERE a pack's decision sits when
+        // nothing else states it — not "the root always wins". Preferring the
+        // root whenever `schema_version` is absent would read this pack, whose
+        // decision is stated plainly in a `decision` object, as a decision with
+        // every signal missing, and every signal missing normalizes to BLOCK:
+        // a fabricated block for an artifact that stated an approval.
+        let nested_only = serde_json::json!({
+            "checks": [],
+            "decision": {"verdict": "PASS", "allow_merge": true},
+        });
+        let decision =
+            select_decision_object(&nested_only).expect("a stated decision object is readable");
+        assert_eq!(
+            decision.get("verdict").and_then(|v| v.as_str()),
+            Some("PASS")
+        );
+
+        // With no `decision` object the root IS the decision, which is the
+        // whole of the legacy read-back surface.
+        let root_only = serde_json::json!({"verdict": "ALLOW", "allow_merge": true});
+        let decision = select_decision_object(&root_only).expect("a legacy root is readable");
+        assert_eq!(
+            decision.get("verdict").and_then(|v| v.as_str()),
+            Some("ALLOW")
+        );
     }
 
     #[test]

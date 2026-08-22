@@ -189,6 +189,15 @@ to read at all: it is corrupt on both readers, not a decision with every signal
 missing. Reading one as a decision produced a "successful" summary carrying a
 normalized `BLOCK` for an artifact that never stated anything.
 
+For the same reason the tolerance is a fallback, not a precedence rule: a
+`decision` object, wherever it appears, is the decision. A schema-less pack that
+carries one is read from it rather than from its root, because reading a plainly
+stated decision as "every signal missing" would normalize to `BLOCK` and
+fabricate a block the artifact never stated. No writer has ever produced that
+shape — every generation back to the first public release emits `schema_version`
+and `decision` together — so a schema-less pack that ALSO carries root-level
+decision fields is undefined by this contract rather than resolved by it.
+
 A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
 never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with
 an `unknown_verdict:` caveat, and the MCP adapter ignores it for ranking, emits

@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Raw C string literals are read as raw strings.** The diff scanner accepted
+  the `r` and `br` raw prefixes but not `cr` (Rust 1.77), so `cr#"…"#` was not
+  recognized as an opener: the prefix leaked into the code text and the first
+  interior `"` opened a phantom ordinary string, leaving every brace in the
+  literal's body to be counted as syntax — the same failure as an untracked
+  multi-line literal, which pops a `mod` scope early and can cancel a real API
+  removal. Unlike the raw forms, `b"…"` and `c"…"` escape exactly like an
+  ordinary string and were already blanked correctly. The construct is real
+  outside this tree: 38 `cr#"…"#` sites across 11 crates in a 2025-crate
+  crates.io sample, including `syn` and `proc-macro2`.
 - **String literals are tracked across lines, like block comments already were.**
   The diff scanner blanked a literal only on the line that opened it, so the tail
   of a multi-line template or JSON fixture reached the delimiter trackers as
