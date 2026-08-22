@@ -219,6 +219,20 @@ forces every decision axis conservative (`verdict: "BLOCK"`,
 exit `1`), because a decision derived from a block this reader only partly read
 is not one it may publish as an approval.
 
+Correctly typed signals that CONTRADICT each other are reconciled the same way,
+by conservativeness rather than by field order. Each stated axis ranks
+`PASS`/`approve`/`allow_merge: true` as 1, `CONDITIONAL`/`review_required`/
+`allow_merge: false` as 2 and `BLOCK`/`block` as 3; the highest rank the pack
+states wins and every axis is published from it, with a `core_inconsistency:`
+caveat naming the originals. So `verdict: "BLOCK"` beside
+`merge_recommendation: "approve"` yields `block` on both surfaces — the CLI used
+to believe each field in turn and exit `0` on it — and `allow_merge: true`
+beside `review_required` never buys a `PASS`. Both readers rank through
+`gate::rank_from_verdict` / `gate::rank_from_merge_rec`. A recommendation
+outside the `approve` / `review_required` / `block` vocabulary cannot rank, so
+it is excluded from the reconciliation and named with an
+`unknown_merge_recommendation:` caveat rather than dropped in silence.
+
 ## Blocking rules
 
 Whether a check's `FAIL` blocks the merge depends on its policy severity:

@@ -419,7 +419,65 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         .and_then(Value::as_str)
         .map(|s| s.to_string());
 
-    let allow_merge = !normalized_to_block && raw_allow_merge.unwrap_or(false);
+    // An unrecognized recommendation is not an absent one either. It cannot rank,
+    // so it drops out of the reconciliation below — but it is named, exactly as
+    // the MCP adapter names it, instead of vanishing into a confident surface
+    // derived from the remaining signals.
+    let recommendation_rank = raw_recommendation.and_then(crate::gate::rank_from_merge_rec);
+    if let Some(raw) = raw_recommendation
+        && recommendation_rank.is_none()
+    {
+        caveats.push(format!(
+            "unknown_merge_recommendation: MERGE_GATE.json merge_recommendation `{raw}` is not in \
+             the approve/review_required/block vocabulary; it was ignored when deriving this \
+             decision"
+        ));
+    }
+
+    // Conservativeness reconciliation, shared with the MCP adapter through
+    // `gate::rank_from_*`: the most conservative axis the pack states wins, and
+    // every axis is then published from that one rank. Believing each field in
+    // turn let a pack that says `verdict: "BLOCK"` beside
+    // `merge_recommendation: "approve"` publish an approval — and, because
+    // `compute_exit_code` keys off the recommendation, exit 0 on a gate whose
+    // own canonical artifact said BLOCK.
+    let allow_rank = raw_allow_merge.map(|allow| if allow { 1 } else { 2 });
+    let stated_ranks: Vec<u8> = [
+        crate::gate::rank_from_verdict(verdict),
+        recommendation_rank,
+        allow_rank,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let final_rank = if normalized_to_block {
+        3
+    } else {
+        stated_ranks.iter().copied().max().unwrap_or(3)
+    };
+    // Only the PACK's own axes can be inconsistent with each other. A verdict
+    // this reader had to substitute is already named by its own caveat, and
+    // calling the substitution an inconsistency would blame the artifact for
+    // the reader's normalization.
+    if !normalized_to_block && stated_ranks.iter().any(|rank| *rank != final_rank) {
+        caveats.push(format!(
+            "core_inconsistency: MERGE_GATE.json states verdict={verdict}, \
+             merge_recommendation={}, allow_merge={}; the most conservative signal wins",
+            raw_recommendation.unwrap_or("null"),
+            raw_allow_merge
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+        ));
+    }
+
+    let verdict = crate::gate::verdict_from_rank(final_rank);
+    let allow_merge = final_rank == 1;
+    let merge_recommendation = match crate::gate::merge_rec_from_rank(final_rank) {
+        "approve" => crate::policy::engine::MergeRecommendation::Approve,
+        "review_required" => crate::policy::engine::MergeRecommendation::ReviewRequired,
+        _ => crate::policy::engine::MergeRecommendation::Block,
+    };
+
     let quality_pass = decision
         .get("quality_pass")
         .and_then(Value::as_bool)
@@ -431,22 +489,6 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         Some("incomplete") => crate::policy::engine::AnalysisStatus::Incomplete,
         _ if allow_merge && quality_pass => crate::policy::engine::AnalysisStatus::Complete,
         _ => crate::policy::engine::AnalysisStatus::Incomplete,
-    };
-    let merge_recommendation = if normalized_to_block {
-        // The recommendation is the axis automation keys off (`compute_exit_code`
-        // exits 1 only on Block), so it has to follow the verdict this reader
-        // substituted, not the recommendation printed beside the unreadable one.
-        crate::policy::engine::MergeRecommendation::Block
-    } else {
-        match raw_recommendation {
-            Some("approve") => crate::policy::engine::MergeRecommendation::Approve,
-            Some("review_required") => crate::policy::engine::MergeRecommendation::ReviewRequired,
-            _ if allow_merge => crate::policy::engine::MergeRecommendation::Approve,
-            _ if verdict == "CONDITIONAL" => {
-                crate::policy::engine::MergeRecommendation::ReviewRequired
-            }
-            _ => crate::policy::engine::MergeRecommendation::Block,
-        }
     };
     Ok(MergeGateSummary {
         verdict: verdict.to_string(),
@@ -1915,8 +1957,15 @@ api-router/app/core/cache.py
 
     #[test]
     fn legacy_verdict_synonyms_are_folded_without_a_caveat() {
-        for (legacy, unified) in [("ALLOW", "PASS"), ("HOLD", "CONDITIONAL")] {
-            let pack = pack_with_gate(&format!(r#"{{"verdict":"{legacy}","allow_merge":false}}"#));
+        // `allow_merge` matches each verdict here on purpose: `ALLOW` means a
+        // clean pass, so pairing it with `allow_merge: false` would be a
+        // contradictory pack, and a contradictory pack is supposed to earn a
+        // `core_inconsistency` caveat. What this test pins is the synonym
+        // folding, not the reconciliation.
+        for (legacy, unified, allow) in [("ALLOW", "PASS", true), ("HOLD", "CONDITIONAL", false)] {
+            let pack = pack_with_gate(&format!(
+                r#"{{"verdict":"{legacy}","allow_merge":{allow}}}"#
+            ));
             let gate = read_merge_gate_summary(pack.path()).expect("gate is readable");
             assert_eq!(gate.verdict, unified);
             assert!(
@@ -2051,6 +2100,100 @@ api-router/app/core/cache.py
                 "the error must name the real defect, got: {message}"
             );
         }
+    }
+
+    #[test]
+    fn an_explicit_block_verdict_overrides_an_approve_recommendation() {
+        // Every field here is present, correctly typed and in vocabulary, so
+        // none of the unreadable/unknown guards fire — and the reader simply
+        // believed each field in turn: it published the pack's `BLOCK` verdict
+        // beside an `Approve` recommendation, and `compute_exit_code` keys off
+        // the recommendation, so a gate whose own canonical artifact said BLOCK
+        // exited 0 outside CI. The MCP adapter has reconciled these axes by
+        // conservativeness since it was written.
+        let pack = pack_with_gate(
+            r#"{"verdict":"BLOCK","merge_recommendation":"approve",
+                "allow_merge":false,"quality_pass":true,
+                "analysis_status":"complete"}"#,
+        );
+
+        let summary = read_merge_gate_summary(pack.path()).expect("pack stays readable");
+        assert_eq!(summary.verdict, "BLOCK");
+        assert_eq!(
+            summary.merge_recommendation,
+            crate::policy::engine::MergeRecommendation::Block,
+            "an explicit BLOCK cannot leave an approve recommendation: {summary:?}"
+        );
+        assert!(!summary.allow_merge, "{summary:?}");
+        assert!(
+            summary
+                .caveats
+                .iter()
+                .any(|c| c.starts_with("core_inconsistency:")),
+            "the contradiction must be named, not silently resolved: {:?}",
+            summary.caveats
+        );
+
+        let config = test_config();
+        let report = Report {
+            target: "feature/contradictory-gate".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![],
+            heuristics: None,
+            artifacts_dir: pack.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: false,
+        };
+        let cli = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
+        assert_eq!(
+            compute_exit_code(&cli, false),
+            1,
+            "a BLOCK gate must fail the process even outside CI"
+        );
+    }
+
+    #[test]
+    fn a_permissive_flag_never_lowers_a_stated_verdict() {
+        // The mirror direction of the same rule: `allow_merge: true` beside a
+        // `review_required` recommendation must not buy a PASS.
+        let pack = pack_with_gate(
+            r#"{"verdict":"CONDITIONAL","merge_recommendation":"review_required",
+                "allow_merge":true,"quality_pass":true,
+                "analysis_status":"complete"}"#,
+        );
+
+        let summary = read_merge_gate_summary(pack.path()).expect("pack stays readable");
+        assert_eq!(summary.verdict, "CONDITIONAL");
+        assert!(
+            !summary.allow_merge,
+            "allow_merge == (verdict == PASS) is the documented invariant: {summary:?}"
+        );
+        assert_eq!(
+            summary.merge_recommendation,
+            crate::policy::engine::MergeRecommendation::ReviewRequired,
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn a_consistent_pack_earns_no_inconsistency_caveat() {
+        // Guard against over-reach: reconciliation must be silent when the
+        // axes already agree.
+        let pack = pack_with_gate(
+            r#"{"verdict":"PASS","merge_recommendation":"approve",
+                "allow_merge":true,"quality_pass":true,
+                "analysis_status":"complete"}"#,
+        );
+
+        let summary = read_merge_gate_summary(pack.path()).expect("pack stays readable");
+        assert_eq!(summary.verdict, "PASS");
+        assert!(summary.allow_merge, "{summary:?}");
+        assert!(
+            summary.caveats.is_empty(),
+            "a consistent pack reads clean: {:?}",
+            summary.caveats
+        );
     }
 
     #[test]

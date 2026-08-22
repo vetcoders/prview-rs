@@ -44,6 +44,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that disappeared for Unix builds was never reported. The guard is now the
   complete conjunction, sorted — reordering two attributes gates the item
   identically and is not an API change.
+- **Contradictory decision signals are reconciled by conservativeness, not by
+  field order.** A gate stating `verdict: "BLOCK"` beside
+  `merge_recommendation: "approve"` is correctly typed and in vocabulary, so
+  none of the unreadable/unknown guards fired and the CLI simply believed each
+  field in turn — publishing a `BLOCK` verdict next to an `Approve`
+  recommendation and, because `compute_exit_code` keys off the recommendation,
+  exiting `0` on a gate whose own canonical artifact said BLOCK. Both readers now
+  rank every stated axis through the shared `gate::rank_from_verdict` /
+  `gate::rank_from_merge_rec` (1 = pass, 2 = hold, 3 = block), publish all axes
+  from the highest rank, and name the contradiction with a `core_inconsistency:`
+  caveat. `allow_merge: true` beside `review_required` no longer buys a `PASS`
+  either, which is the `allow_merge == (verdict == "PASS")` invariant holding on
+  contradictory packs too. A recommendation outside the vocabulary cannot rank,
+  so it is excluded and named with `unknown_merge_recommendation:` — the caveat
+  the MCP surface already emitted and the CLI did not.
 - **A gate whose root is not a JSON object is corrupt on both readers.** The
   legacy tolerance says WHERE a schema-less pack's decision sits, not that
   anything parseable counts as one. A `MERGE_GATE.json` holding an array, a

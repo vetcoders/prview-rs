@@ -257,6 +257,56 @@ impl DecisionShapeError {
     }
 }
 
+/// Conservativeness rank of one decision axis: 1 = clean pass, 2 = hold /
+/// review required, 3 = block.
+///
+/// Both readers reconcile a decision by taking the MAX rank across the axes the
+/// pack states, then publishing every axis from that one number. A pack whose
+/// `verdict` says BLOCK beside a `merge_recommendation` of `approve` is
+/// contradictory, and a reader that simply believes each field in turn
+/// publishes an approval the artifact never gave. The rule lives here so the
+/// CLI and the MCP adapter cannot answer it differently.
+pub fn rank_from_merge_rec(s: &str) -> Option<u8> {
+    match s.to_ascii_lowercase().as_str() {
+        "block" => Some(3),
+        "review_required" | "hold" => Some(2),
+        "approve" => Some(1),
+        _ => None,
+    }
+}
+
+pub fn rank_from_verdict(s: &str) -> Option<u8> {
+    match s.to_ascii_uppercase().as_str() {
+        "BLOCK" => Some(3),
+        // `CONDITIONAL` is the unified core vocabulary (PV-03/04); `HOLD` is the
+        // retired legacy synonym, still recognized so the adapter stays a safe
+        // read-back net for pre-2.1 runs on disk.
+        "CONDITIONAL" | "HOLD" => Some(2),
+        // `ALLOW` is the retired pre-2.1 verdict synonym for a clean pass (folded
+        // to `PASS` on the CLI `--json` surface in `output::read_merge_gate_summary`).
+        // The adapter recognizes it for the same reason it recognizes `HOLD`:
+        // a legacy gate on disk must still normalize instead of failing loud.
+        "PASS" | "APPROVE" | "ALLOW" => Some(1),
+        _ => None,
+    }
+}
+
+pub fn merge_rec_from_rank(rank: u8) -> &'static str {
+    match rank {
+        3 => "block",
+        2 => "review_required",
+        _ => "approve",
+    }
+}
+
+pub fn verdict_from_rank(rank: u8) -> &'static str {
+    match rank {
+        3 => "BLOCK",
+        2 => "CONDITIONAL",
+        _ => "PASS",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GateVerdict {
     #[serde(rename = "PASS")]

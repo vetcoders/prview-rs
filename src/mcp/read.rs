@@ -4,7 +4,10 @@
 //! (`~/.prview/`) or a run's artifact pack. No review logic lives here — the
 //! MCP surface only reads truth the core already wrote.
 
-use crate::gate::{JsonKind, readable_signal};
+use crate::gate::{
+    JsonKind, merge_rec_from_rank, rank_from_merge_rec, rank_from_verdict, readable_signal,
+    verdict_from_rank,
+};
 use crate::mcp::types::{ToolError, error_class};
 use crate::storage::{RunEntry, RunIndex};
 use std::path::{Path, PathBuf};
@@ -622,48 +625,6 @@ pub struct NormalizedDecision {
     pub caveats: Vec<String>,
     pub base_used: Vec<String>,
     pub normalized: bool,
-}
-
-/// Conservativeness rank: BLOCK(3) > HOLD/review_required(2) > APPROVE/PASS(1).
-fn rank_from_merge_rec(s: &str) -> Option<u8> {
-    match s.to_ascii_lowercase().as_str() {
-        "block" => Some(3),
-        "review_required" | "hold" => Some(2),
-        "approve" => Some(1),
-        _ => None,
-    }
-}
-
-fn rank_from_verdict(s: &str) -> Option<u8> {
-    match s.to_ascii_uppercase().as_str() {
-        "BLOCK" => Some(3),
-        // `CONDITIONAL` is the unified core vocabulary (PV-03/04); `HOLD` is the
-        // retired legacy synonym, still recognized so the adapter stays a safe
-        // read-back net for pre-2.1 runs on disk.
-        "CONDITIONAL" | "HOLD" => Some(2),
-        // `ALLOW` is the retired pre-2.1 verdict synonym for a clean pass (folded
-        // to `PASS` on the CLI `--json` surface in `output::read_merge_gate_summary`).
-        // The adapter recognizes it for the same reason it recognizes `HOLD`:
-        // a legacy gate on disk must still normalize instead of failing loud.
-        "PASS" | "APPROVE" | "ALLOW" => Some(1),
-        _ => None,
-    }
-}
-
-fn merge_rec_from_rank(rank: u8) -> &'static str {
-    match rank {
-        3 => "block",
-        2 => "review_required",
-        _ => "approve",
-    }
-}
-
-fn verdict_from_rank(rank: u8) -> &'static str {
-    match rank {
-        3 => "BLOCK",
-        2 => "CONDITIONAL",
-        _ => "PASS",
-    }
 }
 
 fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {

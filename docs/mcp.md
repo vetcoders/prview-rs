@@ -201,8 +201,11 @@ The decision surface is normalized so callers read one vocabulary:
 
 If the stored gate emits contradictory signals (for example `allow_merge: true`
 alongside a block recommendation), the most conservative signal wins and a
-`core_inconsistency` note is appended to `caveats`. Legacy gate tokens (`ALLOW`,
-`HOLD`) written by older cores are still recognized on read and folded into the
+`core_inconsistency` note is appended to `caveats`. The CLI `--json` surface
+reconciles the same way through the same ranking
+(`gate::rank_from_verdict` / `gate::rank_from_merge_rec`), so the two surfaces
+cannot disagree about a contradictory pack. Legacy gate tokens (`ALLOW`, `HOLD`)
+written by older cores are still recognized on read and folded into the
 `PASS` / `CONDITIONAL` surface rather than failing loud.
 
 Anything the adapter could not read is named rather than dropped, and every such
