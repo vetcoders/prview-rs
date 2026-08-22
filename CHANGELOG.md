@@ -185,7 +185,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   foreign project while provenance recorded the local checkout. The manifest is
   now resolved against the cargo root before a local plan is returned; an
   externally configured `cargo_root` whose own manifest sits inside it is still
-  a legitimate local setup and is unaffected.
+  a legitimate local setup and is unaffected. A contained manifest can still
+  *declare* its way out: an absolute `path` dependency — or a relative one that
+  climbs out or passes through a symlink — had cargo compile source the reviewed
+  commit does not contain, under that commit's cache key and a `snapshot`
+  provenance row. Every local path an off-`HEAD` run's cargo root manifest names
+  (dependencies, dev, build, `[workspace.dependencies]`, `[target.*]`, `[patch]`,
+  `[replace]`) is now resolved against the snapshot, and one that leaves it is
+  refused with the dependency named. Local reviews are untouched: a path
+  dependency on a sibling checkout is an ordinary local setup, and a local run
+  claims nothing about a commit's contents.
 - A cargo root that the reviewed branch moved (a root crate pushed into
   `backend/`, a member renamed) is no longer projected into the snapshot
   verbatim. The locally detected path does not exist there, so cargo failed on a

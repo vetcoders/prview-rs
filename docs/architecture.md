@@ -334,6 +334,20 @@ scan dir, an unreadable repo), refusing rather than earning a verdict outside
 the reviewed tree. Canonicalisation is the test only; the path itself is passed
 through unchanged, so provenance keeps reporting the directory as the run saw it.
 
+What the contained manifest *declares* is the next step out.
+`dependency_paths_stay_in_snapshot()` reads the resolved cargo root's manifest
+and resolves every local `path` it names — dependencies, dev- and
+build-dependencies, `[workspace.dependencies]`, `[target.*]`, `[patch]` and
+`[replace]` — against the snapshot. An absolute path dependency, or a relative
+one that climbs out or passes through a symlink, has cargo compile source the
+reviewed commit does not contain while provenance reports `snapshot`, so the run
+is refused with the dependency named. Only off-`HEAD` runs are held to this: a
+local review is about the working tree as it stands, where a path dependency on
+a sibling checkout is an ordinary setup and no claim is made about a commit's
+contents. The check is static and reads only that one manifest — a member's own
+dependencies are not followed — because resolving the true graph means
+`cargo metadata`, a network-capable second resolve per check.
+
 Whether cargo applies at all is decided by the **reviewed** commit, not by the
 local profile. `config.profile.has_cargo` describes the checkout, so reviewing a
 branch that dropped its last `Cargo.toml` from a Rust checkout used to run every

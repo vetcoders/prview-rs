@@ -102,6 +102,7 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
         ReviewedCargoRoot::Unknown => reviewed_cargo_root(mapped, &plan.scan_dir),
     };
     let cwd = contained_in_snapshot(cwd, &plan.scan_dir)?;
+    dependency_paths_stay_in_snapshot(&cwd, &plan.scan_dir)?;
 
     Ok(CargoRun {
         cwd,
@@ -217,6 +218,88 @@ fn contained_in_snapshot(cwd: PathBuf, scan_dir: &Path) -> Result<PathBuf> {
         }
     }
     Ok(cwd)
+}
+
+/// Refuse a manifest that points cargo at source outside the reviewed snapshot.
+///
+/// The root and its manifest being contained says nothing about what that
+/// manifest declares. A reviewed `Cargo.toml` carrying an absolute `path`
+/// dependency — or a relative one that climbs out of the snapshot, or resolves
+/// through a symlink — has cargo compile a directory the reviewed commit does
+/// not contain, while provenance reports a `snapshot` scan and the verdict is
+/// cached under the reviewed commit. The same escape as a symlinked cargo root,
+/// one level further in.
+///
+/// Only OFF-`HEAD` runs are held to this. A local review is about the working
+/// tree as it stands, and a path dependency on a sibling checkout is an ordinary
+/// local setup; nothing there claims the verdict describes a commit's contents.
+///
+/// The check is static and reads only this manifest: a workspace member's own
+/// dependencies are not followed, and neither is anything a build script does.
+/// It refuses what it can prove escapes rather than pretending to be complete —
+/// running `cargo metadata` to resolve the true graph would need the network,
+/// the registry and a second full resolve per check.
+fn dependency_paths_stay_in_snapshot(cwd: &Path, scan_dir: &Path) -> Result<()> {
+    let (Ok(root), Ok(manifest)) = (
+        scan_dir.canonicalize(),
+        std::fs::read_to_string(cwd.join("Cargo.toml")),
+    ) else {
+        return Ok(());
+    };
+    let Ok(manifest) = toml::from_str::<toml::Table>(&manifest) else {
+        return Ok(());
+    };
+
+    for (name, declared) in manifest_dependency_paths(&manifest) {
+        // An absolute declared path replaces the root, which is the case at issue.
+        let Ok(resolved) = cwd.join(&declared).canonicalize() else {
+            continue;
+        };
+        if !resolved.starts_with(&root) {
+            anyhow::bail!(
+                "dependency `{name}` at {declared}, declared in {}, resolves outside the reviewed \
+                 snapshot ({}), so cargo would compile source the reviewed commit does not contain",
+                cwd.join("Cargo.toml").display(),
+                scan_dir.display(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Every local path a manifest points cargo at, dependencies and overrides alike,
+/// paired with the name it is declared under.
+fn manifest_dependency_paths(manifest: &toml::Table) -> Vec<(String, String)> {
+    fn spec_path((name, spec): (&str, &toml::Value)) -> Option<(String, String)> {
+        let path = spec.as_table()?.get("path")?.as_str()?;
+        Some((name.to_string(), path.to_string()))
+    }
+
+    let mut paths: Vec<(String, String)> = dependency_specs(manifest)
+        .into_iter()
+        .filter_map(spec_path)
+        .collect();
+    // `[patch.<source>.<name>]` nests one level deeper than `[replace.<name>]`.
+    if let Some(patch) = manifest.get("patch").and_then(|patch| patch.as_table()) {
+        for source in patch.values().filter_map(|source| source.as_table()) {
+            paths.extend(
+                source
+                    .iter()
+                    .filter_map(|(name, spec)| spec_path((name.as_str(), spec))),
+            );
+        }
+    }
+    if let Some(replace) = manifest
+        .get("replace")
+        .and_then(|replace| replace.as_table())
+    {
+        paths.extend(
+            replace
+                .iter()
+                .filter_map(|(name, spec)| spec_path((name.as_str(), spec))),
+        );
+    }
+    paths
 }
 
 /// Validate the mapped cargo root against the reviewed snapshot.
@@ -689,6 +772,21 @@ fn lock_covers_manifest(manifest: &str, lock: &str) -> bool {
 /// Every crate name the manifest depends on, following `package = "..."` renames
 /// to the name the lockfile would record.
 fn declared_dependencies(manifest: &toml::Table) -> Vec<String> {
+    dependency_specs(manifest)
+        .into_iter()
+        .map(|(key, spec)| {
+            spec.as_table()
+                .and_then(|spec| spec.get("package"))
+                .and_then(|package| package.as_str())
+                .unwrap_or(key)
+                .to_string()
+        })
+        .collect()
+}
+
+/// Every dependency a manifest declares, as `(key, spec)` — the key being what
+/// the manifest calls it, which a `package = "..."` rename may override.
+fn dependency_specs(manifest: &toml::Table) -> Vec<(&str, &toml::Value)> {
     /// Normal, dev and build dependencies, wherever they are declared.
     const SECTIONS: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
 
@@ -703,22 +801,16 @@ fn declared_dependencies(manifest: &toml::Table) -> Vec<String> {
         tables.extend(table.values().filter_map(|value| value.as_table()));
     }
 
-    let mut names = Vec::new();
+    let mut specs = Vec::new();
     for table in tables {
         for section in SECTIONS {
             let Some(deps) = table.get(*section).and_then(|deps| deps.as_table()) else {
                 continue;
             };
-            for (key, spec) in deps {
-                let renamed = spec
-                    .as_table()
-                    .and_then(|spec| spec.get("package"))
-                    .and_then(|package| package.as_str());
-                names.push(renamed.unwrap_or(key).to_string());
-            }
+            specs.extend(deps.iter().map(|(key, spec)| (key.as_str(), spec)));
         }
     }
-    names
+    specs
 }
 
 /// Cache-key component naming the substrate a cargo check will actually analyse,
@@ -2630,6 +2722,71 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             inside,
             "cargo must not follow a symlink out of the reviewed tree, got {}",
             cwd.display(),
+        );
+    }
+
+    /// The root and its manifest being contained says nothing about what that
+    /// manifest DECLARES. An absolute `path` dependency (or one that climbs out
+    /// of the snapshot) has cargo compile a directory the reviewed commit does
+    /// not contain, while provenance reports a `snapshot` scan and the verdict is
+    /// cached under the reviewed commit.
+    #[test]
+    fn a_path_dependency_outside_the_snapshot_is_refused() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(scan_dir.path(), true);
+        std::fs::write(
+            scan_dir.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+                 foreign = {{ path = \"{}\" }}\n",
+                outside.path().display(),
+            ),
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a dependency outside the reviewed tree must not be compiled as its own");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("outside the reviewed snapshot") && err.contains("foreign"),
+            "the refusal must name the escaping dependency: {err}",
+        );
+    }
+
+    /// The everyday case must survive: a workspace member depending on a sibling
+    /// by relative path stays inside the snapshot and still runs.
+    #[test]
+    fn a_path_dependency_inside_the_snapshot_still_runs() {
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(&scan_dir.path().join("sibling"), true);
+        write_crate(scan_dir.path(), true);
+        std::fs::write(
+            scan_dir.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+             sibling = { path = \"sibling\" }\n",
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        assert_eq!(
+            plan_cargo_run(&config)
+                .expect("an in-tree dependency is not an escape")
+                .cwd,
+            scan_dir.path(),
         );
     }
 
