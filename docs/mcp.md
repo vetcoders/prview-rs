@@ -205,6 +205,18 @@ alongside a block recommendation), the most conservative signal wins and a
 `HOLD`) written by older cores are still recognized on read and folded into the
 `PASS` / `CONDITIONAL` surface rather than failing loud.
 
+Anything the adapter could not read is named rather than dropped, and every such
+case sets `normalized: true`:
+
+- `unknown_verdict:` / `unknown_merge_recommendation:` — the field was present
+  but outside the known vocabulary, so it was ignored when deriving the decision.
+  A gate whose decision has NO recognizable signal at all is still a fail-loud
+  `storage_corrupt`.
+- `schema_forward_compat:` — the pack's `schema_version` is a newer MINOR of a
+  known MAJOR; it is read, and fields this build does not know are ignored. An
+  unknown MAJOR is `storage_corrupt`. A pack with no `schema_version` at all is
+  pre-2.1 and is accepted silently, like the `ALLOW`/`HOLD` tokens.
+
 Completed response:
 
 ```json
@@ -329,7 +341,7 @@ fields (e.g. `retry_after_ms`, `active_run_id`, `run_id`).
 | `artifact_missing` | The requested artifact does not exist within the run, is not UTF-8 text, or would escape the run directory. |
 | `tool_missing` | A required external tool is unavailable. |
 | `storage_locked` | Another review is already running for this repo branch. Carries `active_run_id` and `retry_after_ms`. |
-| `storage_corrupt` | `MERGE_GATE.json` is missing, invalid, has no recognizable decision, or an explicit `run_id` is ambiguous in storage. |
+| `storage_corrupt` | `MERGE_GATE.json` is missing, invalid, carries a `schema_version` with an unknown MAJOR, has no recognizable decision, or an explicit `run_id` is ambiguous in storage. |
 | `stale_run` | The run is still in progress or its process died before completing. Carries `retry_after_ms` while running. |
 
 ### Retrying

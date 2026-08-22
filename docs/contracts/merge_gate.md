@@ -147,6 +147,29 @@ by `derive_decision` (`src/artifacts/verdict.rs`), which calls
 them; the schema validator and the `prview mcp` adapter still tolerate them on
 read-back of older packs.
 
+## Reader contract
+
+`MERGE_GATE.json` is the ONLY derivation of the verdict. No reader re-derives one
+when the artifact cannot be read: `prview --json` / `--ci` exits `3` and the
+`prview mcp` adapter returns `storage_corrupt`. The removed CLI fallback
+(`fallback_merge_gate_summary`) re-derived `allow_merge = recommendation != block`
+and was the single place where `allow_merge: true` could coexist with a
+`CONDITIONAL` verdict, breaking the invariant above.
+
+Readers accept a pack by MAJOR version and say what they had to normalize:
+
+| `schema_version` on disk | Reader behavior |
+|---|---|
+| absent | Accepted silently — pre-2.1 packs predate the field |
+| known MAJOR (`1`, `2`), same-or-older MINOR | Accepted silently |
+| known MAJOR, newer MINOR | Accepted with a `schema_forward_compat:` caveat; unknown fields ignored |
+| unknown or unparsable MAJOR | Fail loud |
+
+A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
+never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with
+an `unknown_verdict:` caveat, and the MCP adapter ignores it for ranking, emits
+the same caveat, and sets `normalized: true`.
+
 ## Blocking rules
 
 Whether a check's `FAIL` blocks the merge depends on its policy severity:

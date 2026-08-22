@@ -245,7 +245,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         .count();
 
     let gate = json!({
-        "schema_version": "2.1",
+        "schema_version": crate::gate::MERGE_GATE_SCHEMA_VERSION,
         "generated_at": chrono::Local::now().to_rfc3339(),
         "bridge_stage": config.bridge_stage,
         "target": resolved_target.name,

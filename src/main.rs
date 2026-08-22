@@ -110,7 +110,16 @@ async fn run() -> Result<()> {
     // Normal run
     let report = app.run().await?;
 
-    let cli_summary = prview::output::build_cli_json_summary(&app.config, &report);
+    // The verdict comes from the pack's MERGE_GATE.json and nowhere else. If it
+    // cannot be read, prview cannot report a verdict — that is an execution
+    // error (exit 3, same contract as `prview gate`), never a guessed summary.
+    let cli_summary = match prview::output::build_cli_json_summary(&app.config, &report) {
+        Ok(summary) => summary,
+        Err(err) => {
+            display_error(&err);
+            std::process::exit(prview::gate::GATE_EXECUTION_ERROR_EXIT_CODE);
+        }
+    };
 
     // JSON output mode. Human summaries are emitted by App::run(); do not
     // print them a second time here.
@@ -152,7 +161,7 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     config.apply_gate_profile();
     let app = App::from_config(config)?;
     let report = app.run().await.context("gate review run failed")?;
-    let cli_summary = prview::output::build_cli_json_summary(&app.config, &report);
+    let cli_summary = prview::output::build_cli_json_summary(&app.config, &report)?;
     let merge_gate_path = report
         .artifacts_dir
         .join("00_summary")
