@@ -22,6 +22,7 @@
 use super::RegressionContext;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -388,6 +389,137 @@ fn strip_line_comment(line: &str) -> &str {
     line
 }
 
+/// Return `code` with the contents of string and char literals removed.
+///
+/// A brace typed inside a literal is data, not syntax: `const CLOSE: &str = "}"`
+/// in a test module used to close the test scope, so every later hit in that
+/// module was classified as production; an unmatched `{` in a literal held the
+/// scope open the other way and muted real production hits. Blanking literals
+/// also stops a marker quoted in a string from opening test context at all.
+///
+/// Normal strings (with `\` escapes), raw strings (`r"…"`, `r#"…"#`, `br##"…"##`)
+/// and char literals (including `'\u{7b}'`) are recognised. A `'` that does not
+/// close as a char literal is a lifetime and is left alone.
+///
+/// Best-effort, deliberately: this is a per-line scanner over diff text, so a
+/// literal spanning several lines (or cut in half by a hunk boundary) is not
+/// tracked across lines — its tail is read as code on the following line. That
+/// residue can only affect brace depth inside a literal body, which is rarer
+/// than the single-line case this fixes.
+fn blank_literals(code: &str) -> Cow<'_, str> {
+    let bytes = code.as_bytes();
+    if !bytes.iter().any(|b| matches!(b, b'"' | b'\'')) {
+        return Cow::Borrowed(code);
+    }
+
+    let mut out = String::with_capacity(code.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = raw_string_end(code, i) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'"' => i = normal_string_end(code, i),
+            b'\'' => match char_literal_end(code, i) {
+                Some(end) => i = end,
+                None => {
+                    out.push('\'');
+                    i += 1;
+                }
+            },
+            _ => {
+                let ch = code[i..]
+                    .chars()
+                    .next()
+                    .expect("index sits on a char boundary");
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// End index of a raw string starting at `start`, or `None` if none starts there.
+fn raw_string_end(code: &str, start: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    // The prefix must be a token start, otherwise `bar"` would look like `b` + `"`.
+    if start > 0 && bytes[start - 1].is_ascii_alphanumeric()
+        || start > 0 && bytes[start - 1] == b'_'
+    {
+        return None;
+    }
+
+    let mut i = start;
+    if bytes.get(i) == Some(&b'b') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'r') {
+        return None;
+    }
+    i += 1;
+
+    let hash_start = i;
+    while bytes.get(i) == Some(&b'#') {
+        i += 1;
+    }
+    let hashes = i - hash_start;
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    i += 1;
+
+    // Closing delimiter: a quote followed by exactly as many hashes.
+    while i < bytes.len() {
+        if bytes[i] == b'"' && bytes[i + 1..].iter().take(hashes).all(|b| *b == b'#') {
+            let close = i + 1 + hashes;
+            if close <= bytes.len() {
+                return Some(close);
+            }
+        }
+        i += 1;
+    }
+    // Unterminated on this line: the rest of the line is literal body.
+    Some(bytes.len())
+}
+
+/// End index of the normal string literal opening at `start`.
+fn normal_string_end(code: &str, start: usize) -> usize {
+    let bytes = code.as_bytes();
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// End index of the char literal opening at `start`, or `None` for a lifetime.
+fn char_literal_end(code: &str, start: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    if bytes.get(start + 1) == Some(&b'\\') {
+        // `'\''`, `'\\'`, `'\u{7b}'`: skip the escaped byte, then find the close.
+        // Bounded so a stray backslash cannot swallow the rest of the line.
+        let mut i = start + 3;
+        let limit = (start + 12).min(bytes.len());
+        while i < limit {
+            if bytes[i] == b'\'' {
+                return Some(i + 1);
+            }
+            i += 1;
+        }
+        return None;
+    }
+
+    let ch = code.get(start + 1..)?.chars().next()?;
+    let close = start + 1 + ch.len_utf8();
+    (bytes.get(close) == Some(&b'\'')).then_some(close + 1)
+}
+
 /// Map each added line of `hunk` to "is this line inside inline Rust test
 /// context?", in the same order as the added-line vector used for detection.
 ///
@@ -439,7 +571,7 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
         // Comments (whole-line, doc, or trailing) are not code: neither their
         // markers nor their braces may move the scope. A full-line comment
         // reduces to an empty slice here, which is inert on both counts.
-        let code = strip_line_comment(payload);
+        let code = blank_literals(strip_line_comment(payload));
         let trimmed = code.trim();
 
         // Only the outermost marker opens the context, so nested `#[test]`
@@ -1293,6 +1425,84 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         );
         assert_eq!(strip_line_comment("let x = 1;"), "let x = 1;");
         assert_eq!(strip_line_comment("// whole line"), "");
+    }
+
+    #[test]
+    fn test_braces_in_string_literals_do_not_move_test_scope() {
+        // A brace typed inside a literal is data, not syntax. Counting it closed
+        // the test scope early and reported the test-only query-in-loop below it
+        // as a production perf suspect.
+        let patch = r##"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[cfg(test)]
+ mod tests {
++    const CLOSE: &str = "}";
++    const RAW: &str = r#"}"#;
++    const CH: char = '}';
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"##;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a brace inside a literal must not leak a test hit into production"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_open_brace_in_string_literal_does_not_hold_test_scope_open() {
+        // The mirror failure: an unmatched `{` inside a literal kept the scope
+        // open past the end of the test module and muted the production hit
+        // that followed it.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[cfg(test)]
+ mod tests {
++    const OPEN: &str = "{";
++}
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a production query-in-loop after the test module must stay reported"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+    }
+
+    #[test]
+    fn test_blank_literals_removes_literal_contents_only() {
+        assert_eq!(blank_literals("let s = \"} {\";"), "let s = ;");
+        assert_eq!(blank_literals("let c = '}';"), "let c = ;");
+        assert_eq!(blank_literals("let e = '\\u{7b}';"), "let e = ;");
+        assert_eq!(blank_literals("let q = \"\\\"}\";"), "let q = ;");
+        assert_eq!(blank_literals("let r = r#\"}\"#;"), "let r = ;");
+        assert_eq!(blank_literals("let b = br##\"}\"##;"), "let b = ;");
+        // A lifetime is not a char literal and must survive untouched.
+        assert_eq!(
+            blank_literals("fn f<'a>(x: &'a str) {"),
+            "fn f<'a>(x: &'a str) {"
+        );
+        assert_eq!(blank_literals("if depth > 0 {"), "if depth > 0 {");
     }
 
     #[test]
