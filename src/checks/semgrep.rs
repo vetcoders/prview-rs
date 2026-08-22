@@ -88,7 +88,7 @@ impl Check for SemgrepCheck {
                     args: &args,
                     cwd,
                     repo_root: &config.repo_root,
-                    output: &output,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,

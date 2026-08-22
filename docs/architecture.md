@@ -519,6 +519,17 @@ absences stay absences rather than being filled: `command` is an explicit
 `None` provenance, because its own worktree is gone by then and naming the local
 checkout would name the one tree it was *not* reading.
 
+**A check that skips itself after reading keeps its substrate too.** The error
+fallback above covers the `Err` branch only, so a check that *handles* its own
+failure and returns `Skipped` bypasses it. Cargo geiger does exactly that twice:
+its ten-minute timeout is degraded to a skip rather than a gate error, and a
+virtual workspace manifest is detected up front by a `cargo metadata` probe. In
+both cases a cargo command has already read the reviewed tree, so the rows are
+built from the directory it ran in — only `exit_code` stays `null`, because that
+is the one thing genuinely unknown. A `null` substrate is reserved for the case
+where nothing was read at all (semgrep, when the snapshot could not be
+materialised).
+
 **Cache hits carry provenance too.** When a check result is cached, its status,
 output and provenance are stored as **one JSON entry** (`<key>` under the
 check's cache directory) and replayed together on the next hit. The replayed

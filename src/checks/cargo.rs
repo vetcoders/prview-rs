@@ -1055,7 +1055,7 @@ impl Check for CargoCheck {
                     args,
                     cwd,
                     repo_root: &config.repo_root,
-                    output: &output,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
@@ -1140,7 +1140,7 @@ impl Check for ClippyCheck {
                     args,
                     cwd,
                     repo_root: &config.repo_root,
-                    output: &output,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
@@ -1252,7 +1252,7 @@ impl Check for CargoTestCheck {
                     args,
                     cwd,
                     repo_root: &config.repo_root,
-                    output: &output,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
@@ -1338,7 +1338,7 @@ impl Check for RustfmtCheck {
                     args,
                     cwd,
                     repo_root: &config.repo_root,
-                    output: &output,
+                    exit_code: output.status.code(),
                     combined_output: &result_output,
                     started_at: &started_at,
                     finished_at: &finished_at,
@@ -1454,7 +1454,7 @@ impl Check for CargoAuditCheck {
                     args,
                     cwd,
                     repo_root: &config.repo_root,
-                    output: &output,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
@@ -1602,13 +1602,22 @@ impl Check for CargoGeigerCheck {
         let cwd = run.cwd.as_path();
 
         if cargo_metadata_is_virtual_manifest(cwd, &run.env).await {
+            let output = "Cargo geiger skipped: cargo metadata reports a virtual workspace manifest; cargo-geiger requires a concrete package. Configure package selection or run geiger per workspace member.".to_string();
             return Ok(CheckResult {
                 name: self.name().to_string(),
                 status: CheckStatus::Skipped,
                 duration: start.elapsed(),
-                output: "Cargo geiger skipped: cargo metadata reports a virtual workspace manifest; cargo-geiger requires a concrete package. Configure package selection or run geiger per workspace member.".to_string(),
+                // The snapshot was materialised and `cargo metadata` read it, so
+                // this skip HAS a substrate — see `skipped_after_reading`.
+                provenance: Some(self.skipped_after_reading(
+                    config,
+                    &["metadata", "--no-deps", "--format-version", "1"],
+                    cwd,
+                    &output,
+                    &started_at,
+                )),
+                output,
                 cached: false,
-                provenance: None,
             });
         }
 
@@ -1621,13 +1630,22 @@ impl Check for CargoGeigerCheck {
                 // and is a non-blocking advisory signal. A timeout is a tooling
                 // limitation, not a quality failure — degrade to Skipped instead
                 // of a hard Error so it does not pollute the merge gate.
+                let output = format!("cargo geiger skipped: {err}");
                 return Ok(CheckResult {
                     name: self.name().to_string(),
                     status: CheckStatus::Skipped,
                     duration: start.elapsed(),
-                    output: format!("cargo geiger skipped: {err}"),
+                    // Ten minutes of reading the reviewed tree happened before
+                    // this — the substrate is known, only the exit status is not.
+                    provenance: Some(self.skipped_after_reading(
+                        config,
+                        args,
+                        cwd,
+                        &output,
+                        &started_at,
+                    )),
+                    output,
                     cached: false,
-                    provenance: None,
                 });
             }
             Err(err) => return Err(err),
@@ -1653,7 +1671,7 @@ impl Check for CargoGeigerCheck {
                     args,
                     cwd,
                     repo_root: &config.repo_root,
-                    output: &output,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
@@ -1662,6 +1680,43 @@ impl Check for CargoGeigerCheck {
                 .build_repo_relative_cwd(),
             ),
         })
+    }
+}
+
+impl CargoGeigerCheck {
+    /// Provenance for a geiger run that READ the reviewed tree and then skipped.
+    ///
+    /// Both of this check's internal skips happen after the snapshot exists and
+    /// a cargo command has run in it: the virtual-manifest pre-flight (`cargo
+    /// metadata` answered from the reviewed tree) and the ten-minute timeout
+    /// (geiger spent that time reading it). Returning `Ok` with no provenance
+    /// meant `execute_live_check`'s error fallback never fired either — it only
+    /// covers `Err` — so the pack recorded null `cwd`, `target_sha` and
+    /// `tree_state` for a gate whose substrate was never in doubt.
+    ///
+    /// Only the exit status is genuinely unknown here, and `exit_code: None`
+    /// says exactly that.
+    fn skipped_after_reading(
+        &self,
+        config: &Config,
+        args: &[&str],
+        cwd: &Path,
+        output: &str,
+        started_at: &str,
+    ) -> super::CheckProvenance {
+        ProvenanceBuilder {
+            check: self.name(),
+            cmd: "cargo",
+            args,
+            cwd,
+            repo_root: &config.repo_root,
+            exit_code: None,
+            combined_output: output,
+            started_at,
+            finished_at: &Local::now().to_rfc3339(),
+            cache_key: self.cache_key(config),
+        }
+        .build_repo_relative_cwd()
     }
 }
 
@@ -1780,11 +1835,43 @@ async fn cargo_metadata_is_virtual_manifest(cwd: &Path, env: &[(String, String)]
         return false;
     };
 
-    metadata.get("root_package").is_some_and(|v| v.is_null())
-        && metadata
-            .get("workspace_members")
-            .and_then(|v| v.as_array())
-            .is_some_and(|members| !members.is_empty())
+    let workspace = metadata
+        .get("workspace_members")
+        .and_then(|v| v.as_array())
+        .is_some_and(|members| !members.is_empty());
+
+    workspace && !manifest_declares_a_package(&metadata, cwd)
+}
+
+/// Whether `cargo metadata` reports a package for the manifest in `cwd`.
+///
+/// `cargo metadata --format-version 1` emits no `root_package` key — the
+/// previous probe read one and so was always false, leaving every virtual
+/// workspace to pay a full geiger run before cargo refused it. With `--no-deps`
+/// the `packages` array is exactly the workspace members, so the manifest in
+/// `cwd` being absent from it is precisely "this directory is not a package".
+/// Asking about `cwd` rather than the workspace root keeps a member directory —
+/// a perfectly scannable package inside a virtual workspace — out of the skip.
+fn manifest_declares_a_package(metadata: &serde_json::Value, cwd: &Path) -> bool {
+    let manifest = resolve_symlinks(&cwd.join("Cargo.toml"));
+
+    metadata
+        .get("packages")
+        .and_then(|v| v.as_array())
+        .is_some_and(|packages| {
+            packages.iter().any(|package| {
+                package
+                    .get("manifest_path")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|path| resolve_symlinks(Path::new(path)) == manifest)
+            })
+        })
+}
+
+/// Canonicalise for comparison, keeping the original path when it cannot be
+/// resolved (a manifest that is not on this filesystem still compares by name).
+fn resolve_symlinks(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -2369,6 +2456,144 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             "fn main(){let x=1;println!(\"stale{}\",x);}\n"
         };
         std::fs::write(dir.join("src/main.rs"), main).unwrap();
+    }
+
+    /// Write a virtual workspace manifest (no root package) with one member.
+    fn write_virtual_workspace(dir: &Path) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"member\"]\n",
+        )
+        .unwrap();
+        let member = dir.join("member");
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"virtual-member\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(member.join("src/lib.rs"), "pub fn noop() {}\n").unwrap();
+    }
+
+    /// Turn `dir` into a git repository holding its current contents.
+    fn init_repo_with_commit(dir: &Path) {
+        use crate::git::cmd::git_cmd;
+
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "prview@example.test"],
+            vec!["config", "user.name", "prview test"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            let out = git_cmd()
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        commit_all(dir, "fixture");
+    }
+
+    /// Regression: the virtual-manifest pre-flight must actually fire.
+    ///
+    /// It read a `root_package` key that `cargo metadata --format-version 1`
+    /// does not emit, so it was always false: every virtual workspace paid a
+    /// full geiger run (minutes) only for cargo to refuse the manifest. The
+    /// member directory is the control — a real package inside that same
+    /// virtual workspace must still be scanned.
+    #[tokio::test]
+    async fn a_virtual_manifest_is_recognised_before_geiger_pays_for_it() {
+        if which::which("cargo").is_err() {
+            return;
+        }
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        write_virtual_workspace(workspace.path());
+        assert!(
+            cargo_metadata_is_virtual_manifest(workspace.path(), &[]).await,
+            "a [workspace] root with no [package] has nothing for geiger to scan",
+        );
+        assert!(
+            !cargo_metadata_is_virtual_manifest(&workspace.path().join("member"), &[]).await,
+            "a member of a virtual workspace is a concrete package and must be scanned",
+        );
+
+        let package = tempfile::tempdir().expect("package tempdir");
+        write_crate(package.path(), true);
+        assert!(
+            !cargo_metadata_is_virtual_manifest(package.path(), &[]).await,
+            "a plain package must never be skipped as a virtual manifest",
+        );
+    }
+
+    /// Regression: geiger's internal skips must still report their substrate.
+    ///
+    /// Both of them (the virtual-manifest pre-flight and the ten-minute
+    /// timeout) happen AFTER a cargo command has read the reviewed snapshot,
+    /// and both convert that into `Ok(Skipped)`. `execute_live_check`'s
+    /// error-provenance fallback only covers the `Err` branch, so before the
+    /// fix these rows reached PROVENANCE.json with null `cwd`, `target_sha`
+    /// and `tree_state` — claiming nothing was scanned when the reviewed tree
+    /// had just been read.
+    #[tokio::test]
+    async fn geiger_skipped_on_a_virtual_manifest_still_reports_its_substrate() {
+        if which::which("cargo").is_err() {
+            return;
+        }
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_virtual_workspace(scan_dir.path());
+        // A real snapshot is a git worktree, so the substrate is classifiable —
+        // the fixture has to be one too, or the assertion would only prove that
+        // an unverifiable directory stays unverifiable.
+        init_repo_with_commit(scan_dir.path());
+
+        let mut config = create_test_config(true, false, false);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let result = CargoGeigerCheck.run(&config).await.expect("geiger run");
+        if result.status != CheckStatus::Skipped {
+            // `cargo metadata` could not classify the fixture (offline cargo
+            // failure); nothing to assert about the skip's substrate.
+            return;
+        }
+
+        let provenance = result
+            .provenance
+            .expect("a skip decided after reading the snapshot must carry its substrate");
+        let scan_dir_name = scan_dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            provenance.cwd.contains(&scan_dir_name),
+            "provenance cwd must name the directory cargo metadata read, got {}",
+            provenance.cwd,
+        );
+        assert!(
+            provenance.tree_state.is_some(),
+            "the scanned substrate is knowable here, so it must be classified",
+        );
+        assert!(
+            provenance.target_sha.is_some(),
+            "the commit cargo metadata read is knowable here, so it must be recorded",
+        );
+        assert!(
+            provenance.exit_code.is_none(),
+            "geiger never ran, so no exit status may be claimed",
+        );
+        assert!(
+            provenance.command.contains("metadata"),
+            "the recorded command must be the one that read the tree, got {}",
+            provenance.command,
+        );
     }
 
     /// Regression: a cargo check must judge the REVIEWED snapshot, never the

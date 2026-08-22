@@ -103,6 +103,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than the scan root: a workspace member, or a crate the reviewed commit
   moved, runs one directory down, and that resolution is now shared with the
   planner instead of collapsed away.
+- Cargo geiger's *self-handled* skips now carry their substrate. The error
+  fallback above only covers checks that return an error, so geiger's two
+  internal skips — the ten-minute timeout degraded to `Skipped` rather than a
+  gate error, and the virtual-workspace pre-flight — slipped past it and wrote
+  null `cwd`, `target_sha` and `tree_state`. In both cases a cargo command had
+  already read the reviewed tree, so the rows are now built from the directory
+  it ran in, with `exit_code: null` naming the single thing that is genuinely
+  unknown. A null substrate now means what it says: nothing was read.
+- Cargo geiger's virtual-workspace pre-flight now fires. It tested a
+  `root_package` key that `cargo metadata --format-version 1` does not emit, so
+  it was always false and every virtual workspace paid a full geiger scan
+  (minutes) before cargo refused the manifest. The probe now asks whether the
+  manifest in the directory geiger would run in appears among the workspace's
+  packages, which leaves a member directory — a concrete package inside a
+  virtual workspace — scanned as before.
 - `Pytest` now runs in the reviewed target snapshot instead of `config.repo_root`.
   When reviewing a PR or a remote branch, `repo_root` still points at whatever is
   checked out locally, so pytest executed the *local* branch's tests and reported
