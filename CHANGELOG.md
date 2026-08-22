@@ -103,6 +103,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than the scan root: a workspace member, or a crate the reviewed commit
   moved, runs one directory down, and that resolution is now shared with the
   planner instead of collapsed away.
+- The status digest now fingerprints what a dirty **symlink reaches**, not only
+  the path it names. The link's own identity is still the target path — a link
+  retargeted at identical bytes is a different tree — but everything the checks
+  read through it lives at the far end, and hashing the pathname alone let all
+  of it change between two runs under one unchanged digest. The resolved file is
+  hashed, a directory is recorded without being descended into (an absolute link
+  can leave the repo), a dangling link reads `absent`, and a device or fifo is
+  never opened.
+- The status digest's reading is now **bounded**. It is taken before the first
+  check starts, and `recurse_untracked_dirs` means an untracked dataset, model
+  checkpoint or vendored bundle in the dirty subset was hashed whole — gigabytes
+  of reading in front of a review nobody had started yet. One capture may now
+  hash 256 MiB in total (measured at ~1 s in a release build), shared across
+  every entry and every nested repository it descends into; a file that does not
+  fit what is left is described as `stat:<len>:<mtime>` rather than read. That is
+  deliberately a different word from `blob:` and not a content hash: two runs
+  where an oversized file changed while keeping both its size and its mtime do
+  collide, a far narrower window than a constant "too big" marker, which would
+  have made every large file equal to every other. A refused read leaves the
+  allowance intact, so the entries after a huge one are still hashed, and entries
+  are ordered before any content is read, so the digest of an unchanged tree does
+  not depend on the order git reports them in. Ordinary review-sized dirt is
+  nowhere near the bound, so existing digests are unchanged. A fifo, socket or
+  device node in the dirty subset is also no longer opened at all — a reader with
+  no writer blocked the run forever.
+- Cargo geiger's *self-handled* skips now carry their substrate. The error
+  fallback above only covers checks that return an error, so geiger's two
+  internal skips — the ten-minute timeout degraded to `Skipped` rather than a
+  gate error, and the virtual-workspace pre-flight — slipped past it and wrote
+  null `cwd`, `target_sha` and `tree_state`. In both cases a cargo command had
+  already read the reviewed tree, so the rows are now built from the directory
+  it ran in, with `exit_code: null` naming the single thing that is genuinely
+  unknown. A null substrate now means what it says: nothing was read.
+- Cargo geiger's virtual-workspace pre-flight now fires. It tested a
+  `root_package` key that `cargo metadata --format-version 1` does not emit, so
+  it was always false and every virtual workspace paid a full geiger scan
+  (minutes) before cargo refused the manifest. The probe now asks whether the
+  manifest in the directory geiger would run in appears among the workspace's
+  packages, which leaves a member directory — a concrete package inside a
+  virtual workspace — scanned as before.
 - `Pytest` now runs in the reviewed target snapshot instead of `config.repo_root`.
   When reviewing a PR or a remote branch, `repo_root` still points at whatever is
   checked out locally, so pytest executed the *local* branch's tests and reported

@@ -519,6 +519,17 @@ absences stay absences rather than being filled: `command` is an explicit
 `None` provenance, because its own worktree is gone by then and naming the local
 checkout would name the one tree it was *not* reading.
 
+**A check that skips itself after reading keeps its substrate too.** The error
+fallback above covers the `Err` branch only, so a check that *handles* its own
+failure and returns `Skipped` bypasses it. Cargo geiger does exactly that twice:
+its ten-minute timeout is degraded to a skip rather than a gate error, and a
+virtual workspace manifest is detected up front by a `cargo metadata` probe. In
+both cases a cargo command has already read the reviewed tree, so the rows are
+built from the directory it ran in — only `exit_code` stays `null`, because that
+is the one thing genuinely unknown. A `null` substrate is reserved for the case
+where nothing was read at all (semgrep, when the snapshot could not be
+materialised).
+
 **Cache hits carry provenance too.** When a check result is cached, its status,
 output and provenance are stored as **one JSON entry** (`<key>` under the
 check's cache directory) and replayed together on the next hit. The replayed
@@ -569,7 +580,13 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   working-tree status, from the *same* read as `clean`. Each line is
   `XY <path>\0<content>`, where `<content>` fingerprints the file the entry
   points at: `blob:<len>:<sha256>` for a regular file (streamed, so a large file
-  is not held in memory), `symlink:<sha256>` over the link target,
+  is not held in memory), `symlink:<sha256 of the link target path>:<fingerprint
+  of what it reaches>` for a symlink — the link's own identity is the path it
+  names, which is what git stores, but everything the checks read through it
+  lives at the far end, so the resolved file is fingerprinted too (`dir` for a
+  directory, which is never descended into because an absolute link can leave
+  the repo, `absent` for a dangling link, `special` for a device or fifo, which
+  is never opened) —
   `gitlink:<head>:<clean|dirty:<sha256>|unknown>` for a nested repository (git
   never recurses into one, so a submodule is a single status entry — its own
   `HEAD` and, when it is dirty, a recursive digest of its own dirty subset are
@@ -582,8 +599,22 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   a name that is not valid UTF-8 is written as `<non-utf8:<sha256 of the
   bytes>>` and its content is still read through an OS-native path, because the
   single placeholder they shared before collapsed every such entry onto one line
-  with an `absent` body. Only the dirty subset is hashed. It is a stable fingerprint, not a
-  capture of a specific `git status --porcelain` stdout;
+  with an `absent` body. Only the dirty subset is hashed, and the reading is
+  **bounded**: one capture may hash 256 MiB in total (measured: ~1 s in a release
+  build), shared across every entry and every nested repository it descends
+  into. The digest is taken before the first check starts, so an untracked
+  dataset or vendored bundle in the dirty subset would otherwise put gigabytes of
+  reading in front of the run. A file that does not fit what is left is described
+  instead of read, as `stat:<len>:<mtime nanos>` — a deliberately different word
+  from `blob:`, because it is not a content hash; two runs where an oversized
+  file changed while keeping both its size and its mtime do collide, which is a
+  far narrower window than a constant "too big" marker that would have made every
+  large file equal to every other. A refused read leaves the allowance intact, so
+  the entries after a huge one are still hashed. Entries are ordered before their
+  content is read, so which of them the allowance covers — and therefore the
+  digest of an unchanged tree — does not depend on the order git reports them in.
+  It is a stable fingerprint, not a capture of a specific
+  `git status --porcelain` stdout;
 - `checks[]` — one row per configured check: `{id, cwd, target_sha, tree_state,
   started_at, cached, skipped}`, with `null` fields for a check that produced no
   provenance. `skipped` is `null` for a check that ran and carries the reason for

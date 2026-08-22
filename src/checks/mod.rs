@@ -1147,7 +1147,11 @@ pub struct ProvenanceBuilder<'a> {
     /// Repo root of the run. Classifies the substrate `cwd` sits on, and is the
     /// base for the repo-relative `cwd` rendering.
     pub repo_root: &'a Path,
-    pub output: &'a Output,
+    /// The command's exit status, or `None` when it never produced one — a
+    /// timeout, or a run abandoned after the tree had already been read. Absent
+    /// is not the same as absent provenance: the substrate was still scanned,
+    /// and a row of nulls would claim otherwise.
+    pub exit_code: Option<i32>,
     pub combined_output: &'a str,
     pub started_at: &'a str,
     pub finished_at: &'a str,
@@ -1174,7 +1178,7 @@ impl ProvenanceBuilder<'_> {
             command: format!("{} {}", self.cmd, self.args.join(" ")),
             tool_version: None,
             cwd: cwd_display,
-            exit_code: self.output.status.code(),
+            exit_code: self.exit_code,
             started_at: self.started_at.to_string(),
             finished_at: self.finished_at.to_string(),
             hard_fail_signatures: find_hard_fail_signatures(self.combined_output),
