@@ -204,9 +204,12 @@ alongside a block recommendation), the most conservative signal wins and a
 `core_inconsistency` note is appended to `caveats`. The CLI `--json` surface
 reconciles the same way through the same ranking
 (`gate::rank_from_verdict` / `gate::rank_from_merge_rec`), so the two surfaces
-cannot disagree about a contradictory pack. Legacy gate tokens (`ALLOW`, `HOLD`)
-written by older cores are still recognized on read and folded into the
-`PASS` / `CONDITIONAL` surface rather than failing loud.
+cannot disagree about a contradictory pack. Legacy gate tokens (`ALLOW`,
+`APPROVE`, `HOLD`) written by older cores are still recognized on read and folded
+into the `PASS` / `CONDITIONAL` surface rather than failing loud. That fold is
+`gate::canonical_verdict`, shared by this adapter, the CLI summary and
+`prview gate`, and it ignores case: a stored `"pass"` reads as `PASS` on every
+surface instead of approving on one and normalizing to `BLOCK` on another.
 
 Anything the adapter could not read is named rather than dropped, and every such
 case sets `normalized: true`:

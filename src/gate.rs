@@ -280,20 +280,37 @@ pub fn rank_from_merge_rec(s: &str) -> Option<u8> {
     }
 }
 
-pub fn rank_from_verdict(s: &str) -> Option<u8> {
-    match s.to_ascii_uppercase().as_str() {
-        "BLOCK" => Some(3),
-        // `CONDITIONAL` is the unified core vocabulary (PV-03/04); `HOLD` is the
-        // retired legacy synonym, still recognized so the adapter stays a safe
-        // read-back net for pre-2.1 runs on disk.
-        "CONDITIONAL" | "HOLD" => Some(2),
-        // `ALLOW` is the retired pre-2.1 verdict synonym for a clean pass (folded
-        // to `PASS` on the CLI `--json` surface in `output::read_merge_gate_summary`).
-        // The adapter recognizes it for the same reason it recognizes `HOLD`:
-        // a legacy gate on disk must still normalize instead of failing loud.
-        "PASS" | "APPROVE" | "ALLOW" => Some(1),
+/// The canonical verdict a stored spelling means, or `None` when it is outside
+/// the vocabulary entirely.
+///
+/// This is THE verdict vocabulary. Every reader folds through it — the CLI
+/// `--json` summary and the MCP adapter both — because two surfaces owning two
+/// copies of one vocabulary is how they came to disagree about the same file:
+/// the CLI matched the raw string case-sensitively while the adapter ranked it
+/// through an uppercase fold, so `verdict: "pass"` was a clean PASS to MCP
+/// automation and an unknown verdict normalized to BLOCK on the CLI.
+///
+/// Case is not meaning. Neither is a retired synonym: `ALLOW`/`APPROVE` are the
+/// pre-2.1 spellings of a clean pass and `HOLD` of `CONDITIONAL`, kept readable
+/// so a legacy pack on disk still normalizes instead of failing loud. What a
+/// pack states is what it stated — reading `"pass"` as a block would fabricate
+/// a verdict the artifact never gave, which is the same defect in the other
+/// direction.
+pub fn canonical_verdict(raw: &str) -> Option<&'static str> {
+    match raw.to_ascii_uppercase().as_str() {
+        "BLOCK" => Some("BLOCK"),
+        "CONDITIONAL" | "HOLD" => Some("CONDITIONAL"),
+        "PASS" | "APPROVE" | "ALLOW" => Some("PASS"),
         _ => None,
     }
+}
+
+pub fn rank_from_verdict(s: &str) -> Option<u8> {
+    canonical_verdict(s).map(|canonical| match canonical {
+        "BLOCK" => 3,
+        "CONDITIONAL" => 2,
+        _ => 1,
+    })
 }
 
 pub fn merge_rec_from_rank(rank: u8) -> &'static str {
@@ -399,7 +416,16 @@ pub fn build_gate_json_output(
     strict: bool,
 ) -> Result<GateJsonOutput> {
     let decision = read_merge_gate_decision(merge_gate_path)?;
-    if summary.verdict != decision.verdict {
+    // Fold the stored spelling before comparing. This check guards against the
+    // summary and the pack stating DIFFERENT decisions; a pack spelling its
+    // verdict `ALLOW`, `hold` or `pass` states the same decision the summary
+    // read, and firing here on that made `prview gate` reject an artifact both
+    // other readers accept.
+    let stated = match canonical_verdict(&decision.verdict) {
+        Some(canonical) => canonical,
+        None => bail!("unknown gate verdict `{}`", decision.verdict),
+    };
+    if summary.verdict != stated {
         bail!(
             "gate verdict mismatch: CLI summary has `{}`, MERGE_GATE.json has `{}`",
             summary.verdict,
@@ -407,7 +433,7 @@ pub fn build_gate_json_output(
         );
     }
 
-    let verdict = GateVerdict::try_from(decision.verdict.as_str())?;
+    let verdict = GateVerdict::try_from(stated)?;
     let exit_code = gate_exit_code(verdict, strict);
 
     Ok(GateJsonOutput {
@@ -452,8 +478,50 @@ mod tests {
 
     #[test]
     fn gate_verdict_parse_fails_loud_for_unknown_values() {
+        // `GateVerdict` is the TYPED parser for canonical values, so it stays
+        // strict. Legacy and non-canonical spellings are folded by
+        // `canonical_verdict` before they ever reach it.
         assert!(GateVerdict::try_from("HOLD").is_err());
         assert!(GateVerdict::try_from("ALLOW").is_err());
+        assert!(GateVerdict::try_from("pass").is_err());
+    }
+
+    #[test]
+    fn one_vocabulary_folds_every_spelling_the_readers_accept() {
+        for spelling in ["PASS", "pass", "Pass", "ALLOW", "allow", "APPROVE"] {
+            assert_eq!(canonical_verdict(spelling), Some("PASS"), "{spelling}");
+        }
+        for spelling in ["CONDITIONAL", "conditional", "HOLD", "hold"] {
+            assert_eq!(
+                canonical_verdict(spelling),
+                Some("CONDITIONAL"),
+                "{spelling}"
+            );
+        }
+        for spelling in ["BLOCK", "block", "Block"] {
+            assert_eq!(canonical_verdict(spelling), Some("BLOCK"), "{spelling}");
+        }
+        // Outside the vocabulary stays outside it: folding is about spelling,
+        // not about inventing a reading.
+        for spelling in ["", "MAYBE", "pas", "approved"] {
+            assert_eq!(canonical_verdict(spelling), None, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn the_rank_of_a_verdict_follows_its_canonical_form() {
+        // The ranking and the folding cannot drift apart, because the ranking
+        // is derived from the folding.
+        for spelling in ["PASS", "pass", "ALLOW", "APPROVE"] {
+            assert_eq!(rank_from_verdict(spelling), Some(1), "{spelling}");
+        }
+        for spelling in ["CONDITIONAL", "hold", "HOLD"] {
+            assert_eq!(rank_from_verdict(spelling), Some(2), "{spelling}");
+        }
+        for spelling in ["BLOCK", "block"] {
+            assert_eq!(rank_from_verdict(spelling), Some(3), "{spelling}");
+        }
+        assert_eq!(rank_from_verdict("MAYBE"), None);
     }
 
     #[test]

@@ -21,6 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One verdict vocabulary now answers for every reader surface.** The CLI
+  matched a stored verdict case-sensitively while the MCP adapter ranked it
+  through an uppercase fold, so a pack stating `verdict: "pass"` was a clean
+  `PASS` to MCP automation and an unknown verdict normalized to `BLOCK` on the
+  CLI — the same artifact approved by one reader and rejected by the other, which
+  is the divergence the shared reconciliation exists to prevent. `APPROVE`
+  diverged identically, case aside. A third surface was worse: `prview gate`
+  compared the folded summary verdict against the pack's RAW string, so any
+  legacy or non-canonical spelling (`ALLOW`, `HOLD`, `pass`) failed loud as a
+  "gate verdict mismatch" on a pack both other readers accept. The vocabulary
+  moved into `gate::canonical_verdict` and all three surfaces fold through it;
+  `rank_from_verdict` is now derived from it, so ranking and folding cannot drift
+  apart. `GateVerdict` stays a strict parser of canonical spellings and is fed
+  the folded value.
 - **Raw C string literals are read as raw strings.** The diff scanner accepted
   the `r` and `br` raw prefixes but not `cr` (Rust 1.77), so `cr#"…"#` was not
   recognized as an opener: the prefix leaked into the code text and the first
