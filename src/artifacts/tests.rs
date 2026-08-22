@@ -5096,3 +5096,40 @@ fn provenance_json_worktree_reflects_dirty_tree() {
         "the digest must fingerprint WHAT is dirty, not just that something is"
     );
 }
+
+#[test]
+fn worktree_digest_separates_runs_that_differ_only_in_content() {
+    // Two runs can dirty exactly the same paths with exactly the same status
+    // codes and still have judged different bytes. A status-set-only digest
+    // collides there, so the fingerprint promises more than it delivers.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let repo = repo_tmp.path();
+
+    // `own.rs` is the fixture's committed file — editing it yields an `M` entry.
+    let tracked = repo.join("own.rs");
+    fs::write(&tracked, "pub fn v1() {}\n").expect("write tracked");
+    let untracked = repo.join("scratch.rs");
+    fs::write(&untracked, "pub fn a() {}\n").expect("write untracked");
+    let first = capture_worktree_provenance(repo);
+
+    // Same paths, same `M`/`??` codes — different bytes.
+    fs::write(&tracked, "pub fn v2_completely_different() {}\n").expect("rewrite tracked");
+    fs::write(&untracked, "pub fn b() {}\n").expect("rewrite untracked");
+    let second = capture_worktree_provenance(repo);
+
+    assert_eq!(first.clean, second.clean, "both runs are dirty");
+    assert_ne!(
+        first.status_digest, second.status_digest,
+        "differently-dirty runs must be distinguishable, which is what the digest claims",
+    );
+
+    // Restoring the exact bytes restores the exact fingerprint: the digest is a
+    // function of the tree, not of time or run order.
+    fs::write(&tracked, "pub fn v1() {}\n").expect("restore tracked");
+    fs::write(&untracked, "pub fn a() {}\n").expect("restore untracked");
+    assert_eq!(
+        capture_worktree_provenance(repo).status_digest,
+        first.status_digest,
+        "the same tree state must fingerprint identically",
+    );
+}
