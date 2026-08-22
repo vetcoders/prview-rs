@@ -733,6 +733,15 @@ declarations agreeing on their opener and first eight lines finalized to the
 same truncated text and paired as an unchanged re-add, so a parameter, bound or
 return type changed below the cut produced no finding at all.
 
+Where a declaration ENDS is decided on a separate, comment-resolved view of the
+same lines, fed through the pending declaration's own `SourceScanner` one
+physical line at a time. The joined text has no line breaks, so scanning it as a
+whole let a `//` on any continuation line comment out every line appended after
+it: the closing `)` and the body `{` were never seen and the accumulator ran on
+into the body, so a body-only rewrite came out as a phantom `ChangedSignature`.
+Feeding line by line ends a `//` where it really ends while the scanner still
+carries an open literal or `/* … */` across the continuation lines.
+
 Pairing is scoped: two declarations pair only when their inline `mod` path and
 their `#[cfg(…)]` guard may be the same. The guard is the WHOLE conjunction of
 the attributes stacked above the declaration, sorted — `#[cfg(unix)]

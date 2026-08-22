@@ -429,8 +429,8 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     // with its bounds below it. Accumulate continuation lines on BOTH sides so
     // remove+re-add pairing compares full declarations: a change confined to a
     // continuation line used to hide behind an identical opening line.
-    let mut pending_removed: Option<SymbolDecl> = None;
-    let mut pending_added: Option<SymbolDecl> = None;
+    let mut pending_removed: Option<PendingDecl> = None;
+    let mut pending_added: Option<PendingDecl> = None;
 
     // Inline-module nesting, tracked per diff side (see `ModScope`).
     let mut before_scope = ModScope::default();
@@ -874,26 +874,47 @@ fn drop_removal_finding(findings: &mut Vec<BreakingFinding>, removed: &SymbolDec
     }
 }
 
+/// A declaration still absorbing continuation lines.
+///
+/// `decl.text` is the verbatim join used for identity and for the
+/// `BREAKING_CHANGES.md` row. Completeness is decided on `code` instead, which
+/// is the same lines read through a [`SourceScanner`] — one call per PHYSICAL
+/// line, which is what makes a `//` end where it really ends. Joining first and
+/// scanning the result once cannot: the join has no line breaks, so a comment on
+/// any continuation line commented out every line appended after it, the closing
+/// `)` and body `{` were never seen, and the accumulator ran on into the body
+/// until the cap — turning a body-only rewrite into a phantom signature change.
+///
+/// The scanner is what keeps the other direction right too: it carries an open
+/// literal or `/* … */` from one continuation line to the next, so a brace
+/// inside a multi-line string still does not end the declaration.
+struct PendingDecl {
+    decl: SymbolDecl,
+    code: String,
+    scanner: crate::rust_source::SourceScanner,
+}
+
 /// Start or continue accumulating a public declaration on one diff side.
 ///
 /// A declaration in progress absorbs `trimmed` as a continuation line; otherwise
 /// `trimmed` may open a new one. Either way the declaration is emitted as soon
 /// as it is complete (or once it has absorbed [`MAX_DECL_CONTINUATION_LINES`]).
 fn accumulate_decl(
-    pending: &mut Option<SymbolDecl>,
+    pending: &mut Option<PendingDecl>,
     collected: &mut Vec<SymbolDecl>,
     findings: &mut Vec<BreakingFinding>,
     trimmed: &str,
     site: &DeclSite<'_>,
 ) {
-    if let Some(decl) = pending.as_mut() {
-        if !decl.text.ends_with('(') && !trimmed.is_empty() {
-            decl.text.push(' ');
+    if let Some(open) = pending.as_mut() {
+        if !open.decl.text.ends_with('(') && !trimmed.is_empty() {
+            open.decl.text.push(' ');
         }
-        decl.text.push_str(trimmed);
-        decl.continuation_lines += 1;
-        if declaration_complete(&decl.text)
-            || decl.continuation_lines >= MAX_DECL_CONTINUATION_LINES
+        open.decl.text.push_str(trimmed);
+        open.push_code(trimmed);
+        open.decl.continuation_lines += 1;
+        if declaration_complete(&open.code)
+            || open.decl.continuation_lines >= MAX_DECL_CONTINUATION_LINES
         {
             finalize_decl(pending, collected, findings);
         }
@@ -913,21 +934,37 @@ fn accumulate_decl(
         side: site.side,
         continuation_lines: 0,
     };
-    if declaration_complete(trimmed) {
-        emit_decl(decl, collected, findings);
+    let mut open = PendingDecl {
+        decl,
+        code: String::new(),
+        scanner: crate::rust_source::SourceScanner::default(),
+    };
+    open.push_code(trimmed);
+    if declaration_complete(&open.code) {
+        emit_decl(open.decl, collected, findings);
     } else {
-        *pending = Some(decl);
+        *pending = Some(open);
+    }
+}
+
+impl PendingDecl {
+    /// Read one more physical line into the completeness view.
+    fn push_code(&mut self, trimmed: &str) {
+        self.code.push_str(&self.scanner.code_only(trimmed));
+        // The line ended: whatever the scanner still carries is a literal or a
+        // block comment, never a line comment.
+        self.code.push(' ');
     }
 }
 
 /// Emit a declaration that is no longer accumulating, if any.
 fn finalize_decl(
-    pending: &mut Option<SymbolDecl>,
+    pending: &mut Option<PendingDecl>,
     collected: &mut Vec<SymbolDecl>,
     findings: &mut Vec<BreakingFinding>,
 ) {
-    if let Some(decl) = pending.take() {
-        emit_decl(decl, collected, findings);
+    if let Some(open) = pending.take() {
+        emit_decl(open.decl, collected, findings);
     }
 }
 
@@ -962,15 +999,15 @@ fn should_scan_for_breaking_changes(path: &str) -> bool {
 /// decide whether to keep accumulating continuation lines so both "Before" and
 /// "After" are full declarations (BUG-4 / TOOLING-15).
 ///
-/// Only real delimiters count. `pub const TEMPLATE: &str = r#"{` opens a
-/// multi-line literal, and reading that `{` as the body opener finalized a
-/// TRUNCATED declaration — identical on both diff sides, so the removal was
-/// cancelled and the literal change that the patch actually made went
-/// unreported. The accumulated text is scanned as a whole, so a literal
-/// spanning continuation lines closes the declaration exactly where it really
-/// ends.
-fn declaration_complete(decl: &str) -> bool {
-    let code = crate::rust_source::code_only(decl);
+/// Only real delimiters count, and `code` has already had them resolved: it is
+/// the declaration's lines read through the pending declaration's own
+/// [`SourceScanner`], one call per physical line. `pub const TEMPLATE: &str =
+/// r#"{` opens a multi-line literal, and reading that `{` as the body opener
+/// finalized a TRUNCATED declaration — identical on both diff sides, so the
+/// removal was cancelled and the literal change the patch actually made went
+/// unreported. The scanner carries that literal across the continuation lines,
+/// and ends a `//` comment at the line that wrote it.
+fn declaration_complete(code: &str) -> bool {
     let mut depth: i32 = 0;
     for ch in code.chars() {
         match ch {
@@ -2221,6 +2258,70 @@ mod tests {
             removed_symbol_types(&findings).is_empty(),
             "the change must not also report a removal, got: {:?}",
             removed_symbol_types(&findings)
+        );
+    }
+
+    #[test]
+    fn a_trailing_comment_does_not_swallow_the_rest_of_a_declaration() {
+        // Continuation lines are joined with a space, so a `//` on one of them
+        // commented out everything appended after it: `declaration_complete`
+        // never saw the closing `)` or the body `{`, the accumulator ran on
+        // into the body, and a body-only rewrite came out as a phantom
+        // signature change.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn build(",
+                "-    a: u8, // how many",
+                "-    b: u8,",
+                "-) -> u8 {",
+                "-    old_body();",
+                "+pub fn build(",
+                "+    a: u8, // how many",
+                "+    b: u8,",
+                "+) -> u8 {",
+                "+    new_body();",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a body-only rewrite under a commented signature is not breaking, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_real_change_below_a_trailing_comment_still_surfaces() {
+        // The other direction: ending the comment at its own line must not cost
+        // the change that follows it.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn build(",
+                "-    a: u8, // how many",
+                "-    b: u8,",
+                "-) -> u8 {",
+                "+pub fn build(",
+                "+    a: u8, // how many",
+                "+    b: u16,",
+                "+) -> u8 {",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::ChangedSignature { before, after }
+                    if before.contains("b: u8") && after.contains("b: u16")
+            )),
+            "a parameter change below a trailing comment must surface, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }
 

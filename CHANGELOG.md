@@ -201,6 +201,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A trailing `//` no longer swallows the rest of a declaration.** Continuation
+  lines are joined with a space, and the joined text was then scanned as one
+  piece — so a comment on any continuation line commented out every line
+  appended after it. `declaration_complete` never saw the closing `)` or the
+  body `{`, the accumulator ran on into the body, and a body-only rewrite of a
+  commented multi-line signature was reported as a `ChangedSignature` that never
+  happened. Completeness is now decided on a separate view of the same lines,
+  read one physical line at a time, which ends a `//` where it really ends while
+  still carrying an open literal or `/* … */` across the lines.
 - **Every risky-pattern needle is word-bounded, not just the plain words.**
   Bounded matching was applied only to needles made entirely of identifier
   characters, so `todo!(`, `dbg!(`, `println!(`, `console.log(`, `unsafe {` and
