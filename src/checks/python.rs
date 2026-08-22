@@ -94,6 +94,7 @@ struct PythonRun {
 /// exactly as before.
 fn plan_python_run(config: &Config) -> Result<PythonRun> {
     let plan = plan_check_run(config)?;
+    metadata_stays_in_project(&plan.scan_dir)?;
     let env = if plan.scan_dir == config.repo_root {
         Vec::new()
     } else {
@@ -109,6 +110,51 @@ fn plan_python_run(config: &Config) -> Result<PythonRun> {
         env,
         _snapshot: plan._snapshot,
     })
+}
+
+/// The files that decide what a Python run actually reads.
+///
+/// `pyproject.toml` is the project itself — ruff, mypy and pytest take their
+/// configuration from it, and uv discovers the project through it. `uv.lock`
+/// pins the dependency set that gets installed and imported.
+const PYTHON_PROJECT_METADATA: &[&str] = &["pyproject.toml", "uv.lock"];
+
+/// Refuse project metadata that resolves outside the tree being judged.
+///
+/// The tools read the FILES, not the directory. A reviewed commit that replaces
+/// `pyproject.toml` with a link to an external manifest has uv discover another
+/// project — its configuration, its dependency set, its lockfile — while
+/// provenance records an exact `snapshot` scan and the cache stores the result
+/// under the reviewed commit. `uv run` is given neither `--no-project` nor
+/// `--locked`, so nothing downstream re-asks the question.
+///
+/// Applied to the local checkout as well, for the same reason the Cargo guards
+/// are ([`super::cargo`]): a working tree that tracks its metadata as a link to
+/// somewhere else earns another project's verdict just as effectively.
+///
+/// Symlinks are not the target — escape is. Metadata linked to a real file
+/// INSIDE the tree resolves back inside and passes. A path that cannot be
+/// canonicalised is simply not there: the tools reporting a missing project is a
+/// truthful failure of this tree, not a foreign one's verdict.
+fn metadata_stays_in_project(root: &Path) -> Result<()> {
+    let Ok(resolved_root) = root.canonicalize() else {
+        return Ok(());
+    };
+    for name in PYTHON_PROJECT_METADATA {
+        let path = root.join(name);
+        let Ok(resolved) = path.canonicalize() else {
+            continue;
+        };
+        if !resolved.starts_with(&resolved_root) {
+            anyhow::bail!(
+                "{} resolves outside the tree under review ({}), so a verdict earned there would \
+                 describe another project",
+                path.display(),
+                root.display(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Name of the environment for the substrate this run analyses.
@@ -689,6 +735,60 @@ mod tests {
             env_dir.starts_with(config.uv_env_root()),
             "the environment stays inside the repo's prview-owned root",
         );
+    }
+
+    /// uv reads the project metadata, not the directory. A reviewed commit that
+    /// replaces `pyproject.toml` or `uv.lock` with a link to an external file
+    /// makes ruff, mypy and pytest configure themselves — and uv resolve the
+    /// dependency set — from a project this review does not describe, while the
+    /// verdict is cached under the reviewed commit. Same refusal as the Cargo
+    /// manifest guard.
+    #[test]
+    #[cfg(unix)]
+    fn python_metadata_linked_out_of_the_snapshot_is_refused() {
+        for name in ["pyproject.toml", "uv.lock"] {
+            let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+            let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+            let outside = tempfile::tempdir().expect("outside tempdir");
+
+            let foreign = outside.path().join(name);
+            std::fs::write(&foreign, "[project]\nname = \"someone-else\"\n")
+                .expect("write foreign");
+            std::os::unix::fs::symlink(&foreign, scan_dir.path().join(name)).expect("symlink");
+
+            let mut config = create_test_config(true, true, true);
+            config.repo_root = repo_root.path().to_path_buf();
+            config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+            let Err(err) = plan_python_run(&config) else {
+                panic!("{name} resolving outside the snapshot must not earn a verdict");
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains(name),
+                "the refusal must name the file that escapes: {message}",
+            );
+        }
+    }
+
+    /// The guard is about escape, not about symlinks: metadata that resolves
+    /// back inside the reviewed tree is the tree's own.
+    #[test]
+    #[cfg(unix)]
+    fn python_metadata_inside_the_snapshot_is_accepted() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+
+        let real = scan_dir.path().join("packaging/pyproject.toml");
+        std::fs::create_dir_all(real.parent().expect("parent")).expect("packaging dir");
+        std::fs::write(&real, "[project]\nname = \"reviewed\"\n").expect("write metadata");
+        std::os::unix::fs::symlink(&real, scan_dir.path().join("pyproject.toml")).expect("symlink");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        assert_eq!(plan_python_run(&config).expect("plan").cwd, scan_dir.path(),);
     }
 
     /// One environment per repository was still shared state: two prview

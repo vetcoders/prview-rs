@@ -270,6 +270,16 @@ wins: each candidate is re-read immediately before it is removed.
 Nothing is pre-created — uv rejects an existing directory that is not a valid
 environment, so the directory tree only ever comes from uv itself.
 
+The tools read the project **files**, not the directory, so `plan_python_run()`
+also refuses a `pyproject.toml` or `uv.lock` that resolves outside the tree being
+judged — the Python counterpart of the Cargo manifest guards. A reviewed commit
+that tracks either as a link to an external file would have ruff, mypy and pytest
+configure themselves, and uv resolve dependencies, from another project, while
+provenance recorded an exact `snapshot` scan and the cache filed the verdict
+under the reviewed commit (`uv run` is given neither `--no-project` nor
+`--locked`, so nothing downstream re-asks). Metadata linked to a real file inside
+the tree resolves back inside and passes: escape is the target, not symlinks.
+
 The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,
 `Cargo audit`, `Cargo geiger`) run in the snapshot as well, but with one extra
 step. A snapshot is a throwaway temp dir, so its in-tree `target/` would force a
@@ -296,6 +306,17 @@ crate a review is about is not something to guess. Without this, a moved crate
 left the run with nowhere to go and cargo's "could not find `Cargo.toml`" became
 the reviewed crate's verdict.
 
+The lone survivor of that third step must also **prove it is the configured
+project**: its `[package] name` — or, for a virtual workspace root that defines
+no crate, its member list — has to match the manifest at the local cargo root.
+Being the last manifest standing is not evidence of having moved. A commit that
+deletes the Rust project while keeping an `examples/demo` crate within two levels
+otherwise had every cargo gate run against the demo and file a green verdict for
+a project that commit no longer contains — a commit that, checked out normally,
+profile detection would not call a Rust project at all. No identity to compare
+against (no local manifest, one that does not parse, one that defines neither)
+is a skip with a reason, not a guess.
+
 A `cargo_root` configured **outside** the repository has no such mapping — a
 snapshot of this repo can never contain it. Off-`HEAD` runs then **skip** the
 cargo checks with a reason naming the unreachable root
@@ -312,6 +333,20 @@ containment on the resolved paths for the cases git cannot answer (an injected
 scan dir, an unreadable repo), refusing rather than earning a verdict outside
 the reviewed tree. Canonicalisation is the test only; the path itself is passed
 through unchanged, so provenance keeps reporting the directory as the run saw it.
+
+What the contained manifest *declares* is the next step out.
+`dependency_paths_stay_in_snapshot()` reads the resolved cargo root's manifest
+and resolves every local `path` it names — dependencies, dev- and
+build-dependencies, `[workspace.dependencies]`, `[target.*]`, `[patch]` and
+`[replace]` — against the snapshot. An absolute path dependency, or a relative
+one that climbs out or passes through a symlink, has cargo compile source the
+reviewed commit does not contain while provenance reports `snapshot`, so the run
+is refused with the dependency named. Only off-`HEAD` runs are held to this: a
+local review is about the working tree as it stands, where a path dependency on
+a sibling checkout is an ordinary setup and no claim is made about a commit's
+contents. The check is static and reads only that one manifest — a member's own
+dependencies are not followed — because resolving the true graph means
+`cargo metadata`, a network-capable second resolve per check.
 
 Whether cargo applies at all is decided by the **reviewed** commit, not by the
 local profile. `config.profile.has_cargo` describes the checkout, so reviewing a
@@ -361,6 +396,18 @@ the filesystem) — the shape `Cargo audit` already uses for advisories, which a
 the same way. Repeated runs within a session still hit; tomorrow's run resolves
 again. A lookup git cannot answer counts as locked, so an unrelated failure does
 not churn the key.
+
+Existence is not a pin, so the lockfile is also checked against the manifest:
+every dependency the cargo root's `Cargo.toml` declares must already appear in
+the lock's package list, renames (`package = "..."`) followed to the name the
+lock records. A target that adds a dependency without regenerating `Cargo.lock`
+sends cargo to the registry exactly as a missing lock does — no cargo command
+here passes `--locked`, which is what would assert otherwise — and now gets the
+same day stamp. The test is name-level and deliberately under-reports: it does
+not read a workspace member's own manifest, and a bumped requirement whose name
+is still locked reads as covered. Under-reporting is the behaviour that was there
+before; over-reporting would cost one extra cache miss a day, so anything that
+does not parse counts as covered.
 
 A cache key is a **file name**: `Cache::set` writes `<cache_dir>/<check>/<key>`
 and creates only the check-level directory. The root therefore travels hashed
@@ -418,7 +465,10 @@ Every check records a `CheckProvenance` alongside its result: `command`,
   - `foreign` — a directory that is neither this repository's working tree nor
     one of its worktrees. Being outside `repo_root` is not proof of a snapshot,
     and labelling a different checkout `snapshot` would certify its verdict as
-    the reviewed commit's.
+    the reviewed commit's. Position does not settle it in the other direction
+    either: repository identity is checked **first**, so a vendored checkout, a
+    submodule or an in-repo symlink to another clone is `foreign` even though it
+    sits below `repo_root` — `target_sha` there is the other project's `HEAD`.
 
 Both are resolved from the directory the command actually ran in, by the single
 `resolve_scan_substrate(cwd, repo_root)` helper, so a change in where a check
@@ -504,8 +554,13 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   files with different content are different substrates and must not share a
   digest. Only the dirty subset is hashed. It is a stable fingerprint, not a
   capture of a specific `git status --porcelain` stdout;
-- `checks[]` — one row per check: `{id, cwd, target_sha, tree_state, started_at,
-  cached}`, with `null` fields for a check that produced no provenance. The
+- `checks[]` — one row per configured check: `{id, cwd, target_sha, tree_state,
+  started_at, cached, skipped}`, with `null` fields for a check that produced no
+  provenance. `skipped` is `null` for a check that ran and carries the reason for
+  one that did not: a gate ruled out during eligibility (tests disabled, a tool
+  absent) never reaches RUN.json's `checks[]`, and omitting it here too made a
+  deliberate skip indistinguishable from a gate that was never part of the run.
+  Those rows have every substrate field `null`, because nothing was read. The
   synthetic `heuristics_loctree` row is included: Loctree runs in-process rather
   than as a subprocess (`command` is `loctree (in-process)`), but it still reads
   a tree — the `git archive` extraction of the target commit in snapshot mode,

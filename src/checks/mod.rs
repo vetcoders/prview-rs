@@ -101,14 +101,20 @@ pub struct ScanSubstrate {
 /// `cwd` against `repo_root` along two axes — WHICH tree it is, and whether that
 /// tree still matches its commit:
 ///
-/// - inside `repo_root`: the live working tree, `local-clean` / `local-dirty`;
-/// - outside it, but a linked worktree of the SAME repository: a target
-///   snapshot, `snapshot` / `snapshot-dirty`. Being external is not by itself
-///   proof of a snapshot, and a snapshot is not immutable — a check can write
-///   into it (a generated `Cargo.lock`), after which its bytes are no longer
-///   exactly `target_sha`;
-/// - outside it and NOT a worktree of this repository: `foreign` — a different
-///   checkout whose bytes say nothing about the reviewed commit.
+/// Identity is settled BEFORE position, because position cannot answer it:
+///
+/// - not this repository at all: `foreign` — a different checkout whose bytes
+///   say nothing about the reviewed commit. Being lexically inside `repo_root`
+///   proves nothing, since a vendored checkout, a submodule or an in-repo
+///   symlink to another clone all live there and `discover` resolves to THEM;
+///   their `HEAD` belongs to another project, so calling that the reviewed
+///   repository's local tree misreports both fields at once;
+/// - this repository, inside `repo_root`: the live working tree, `local-clean` /
+///   `local-dirty`;
+/// - this repository, outside it — a linked worktree: a target snapshot,
+///   `snapshot` / `snapshot-dirty`. A snapshot is not immutable: a check can
+///   write into it (a generated `Cargo.lock`), after which its bytes are no
+///   longer exactly `target_sha`.
 ///
 /// Dirtiness is `git status --porcelain` (untracked files count, ignored ones do
 /// not). In a snapshot the dependency symlinks prview itself creates
@@ -136,7 +142,9 @@ pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path, consumable: &[&str])
     let is_external =
         crate::paths::normalize_to_repo_relative(&cwd.display().to_string(), repo_root).is_external;
 
-    let tree_state = if !is_external {
+    let tree_state = if !belongs_to_repo(&repo, repo_root) {
+        Some(TreeState::Foreign)
+    } else if !is_external {
         working_tree_is_dirty(&repo, &[]).map(|dirty| {
             if dirty {
                 TreeState::LocalDirty
@@ -144,8 +152,6 @@ pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path, consumable: &[&str])
                 TreeState::LocalClean
             }
         })
-    } else if !belongs_to_repo(&repo, repo_root) {
-        Some(TreeState::Foreign)
     } else {
         working_tree_is_dirty(&repo, SNAPSHOT_SCAFFOLDING).map(|dirty| match dirty {
             true => TreeState::SnapshotDirty,
@@ -1643,6 +1649,48 @@ mod tests {
             .tree_state,
             Some(TreeState::Snapshot),
         );
+    }
+
+    #[test]
+    fn a_nested_checkout_inside_the_repo_is_foreign_too() {
+        // Sitting lexically below repo_root does not make a directory this
+        // repository's working tree: a vendored checkout (or a submodule) is a
+        // repository of its own, and `discover` resolves to IT. Recording its
+        // HEAD as `local-clean` states that the reviewed repository's tree is at
+        // a commit that belongs to a different project entirely.
+        let (repo, _head) = repo_with_one_commit();
+        let root = repo.path();
+
+        let (nested_src, nested_head) = repo_with_one_commit();
+        let nested = root.join("vendor/other");
+        std::fs::create_dir_all(nested.parent().expect("parent")).expect("vendor dir");
+        copy_tree(nested_src.path(), &nested);
+
+        let substrate = resolve_scan_substrate(&nested, root, &[]);
+        assert_eq!(
+            substrate.target_sha.as_deref(),
+            Some(nested_head.as_str()),
+            "the sha read is the nested repository's, which is exactly the problem",
+        );
+        assert_eq!(
+            substrate.tree_state,
+            Some(TreeState::Foreign),
+            "another repository's tree says nothing about the reviewed commit, \
+             wherever it happens to sit",
+        );
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("create dir");
+        for entry in std::fs::read_dir(from).expect("read dir") {
+            let entry = entry.expect("entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy file");
+            }
+        }
     }
 
     #[test]

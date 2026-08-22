@@ -39,7 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run (`--base a --base b`) generates one patch per base, each with its own merge
   base, and a single scalar left every patch after the first unplaceable.
   `base_sha` remains, derived from that array's first entry, so existing
-  consumers keep working and the two cannot disagree. A reviewer holding
+  consumers keep working and the two cannot disagree. `checks[]` covers gates
+  that never ran: a check ruled out during eligibility (tests disabled, a tool
+  missing) was omitted entirely, which reads exactly like a gate that was never
+  part of the run. Such a check now gets a row with every substrate field null
+  and a `skipped` reason; rows for checks that ran carry `skipped: null`. A
+  reviewer holding
   only the artifacts no longer has to reconstruct the run's substrate from
   scattered gate files. Purely additive: no existing pack file changed shape,
   the manifest hashes it like any other artifact, and the sanity
@@ -125,7 +130,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reviewed branch merely *moved* (a root workspace pushed into `backend/`) is
   found where it now lives, as long as exactly one directory within two levels
   carries a manifest; several candidates skip with a reason naming them rather
-  than guessing which crate the review is about.
+  than guessing which crate the review is about. That single candidate must also
+  prove it *is* the configured project — matching `[package] name`, or the member
+  list for a virtual workspace root that names no crate. Being the last manifest
+  standing is not evidence of having moved: a commit that deletes the Rust
+  project while keeping an `examples/demo` crate within reach had every cargo
+  gate run against the demo and file its green verdict for a project the commit
+  no longer contains, one that profile detection would not even call a Rust
+  project locally. Nothing to compare against skips with a reason too.
 - Cargo check cache keys now name the substrate they judge. The cached-result
   lookup happens before the target snapshot is materialised, so a `--pr` run
   could hit an entry a previous local run had stored under the same working-tree
@@ -139,7 +151,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolves the dependency graph as it runs — so those keys (and the local
   working-tree keys, which have the same gap) carry the day: repeated runs in a
   session still hit, tomorrow's run resolves again, the way `Cargo audit`
-  already handles ageing advisories. The
+  already handles ageing advisories. A lockfile that is *present but out of
+  date* is not a pin either: a target that adds a dependency without
+  regenerating `Cargo.lock` still sends cargo to the registry, since no cargo
+  command here passes `--locked`. The manifest's declared dependencies are now
+  checked against the lock's package list (renames followed), and a lock the
+  manifest has outgrown carries the same day stamp. The
   root is hashed rather than spelled out because a cache key is a file name —
   `crates/core` written verbatim named a file in a directory nothing creates, so
   the store failed and the slowest gates in the tool recomputed on every review
@@ -168,7 +185,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   foreign project while provenance recorded the local checkout. The manifest is
   now resolved against the cargo root before a local plan is returned; an
   externally configured `cargo_root` whose own manifest sits inside it is still
-  a legitimate local setup and is unaffected.
+  a legitimate local setup and is unaffected. A contained manifest can still
+  *declare* its way out: an absolute `path` dependency — or a relative one that
+  climbs out or passes through a symlink — had cargo compile source the reviewed
+  commit does not contain, under that commit's cache key and a `snapshot`
+  provenance row. Every local path an off-`HEAD` run's cargo root manifest names
+  (dependencies, dev, build, `[workspace.dependencies]`, `[target.*]`, `[patch]`,
+  `[replace]`) is now resolved against the snapshot, and one that leaves it is
+  refused with the dependency named. Local reviews are untouched: a path
+  dependency on a sibling checkout is an ordinary local setup, and a local run
+  claims nothing about a commit's contents.
 - A cargo root that the reviewed branch moved (a root crate pushed into
   `backend/`, a member renamed) is no longer projected into the snapshot
   verbatim. The locally detected path does not exist there, so cargo failed on a
@@ -192,7 +218,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under a `.prview-prune.lock` file at the environment root, so a second review
   cannot read a timestamp just before this one refreshes it and then delete the
   directory out from under a running `uv run`; a root already locked by a live
-  review is left alone entirely. Local reviews set no override.
+  review is left alone entirely. Local reviews set no override. Python runs also
+  refuse a `pyproject.toml` or `uv.lock` that resolves outside the tree being
+  judged — the counterpart of the Cargo manifest guards. A reviewed commit that
+  tracks either as a link to an external file had ruff, mypy and pytest configure
+  themselves, and uv resolve its dependency set, from another project entirely,
+  while provenance recorded an exact snapshot scan and the verdict was cached
+  under the reviewed commit. Metadata linked to a real file inside the tree
+  resolves back inside and still runs.
 - Provenance no longer certifies a tree it could not verify. A working-tree
   status that fails to read (an index lock, a permissions error, a malformed
   repository) recorded `local-clean` — the claim that the scanned bytes exactly
@@ -226,7 +259,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `node_modules`; cargo and Semgrep read nothing through it, so a mixed
   repository no longer downgrades their provenance, and the Python checks run
   against the per-commit `UV_PROJECT_ENVIRONMENT` rather than the linked
-  `.venv`, so they stay `snapshot` too.
+  `.venv`, so they stay `snapshot` too. Repository identity is now settled
+  before position, in both directions: a check running in a vendored checkout, a
+  submodule or an in-repo symlink to another clone used to be recorded as this
+  repository's `local-clean`/`local-dirty` tree with the OTHER project's `HEAD`
+  as `target_sha`, because sitting below `repo_root` was taken as proof. Such a
+  directory is `foreign` wherever it sits.
 
 ### Changed
 

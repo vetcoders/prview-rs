@@ -590,13 +590,27 @@ fn generated_pack_carries_pack_level_provenance() {
             .starts_with("sha256:")
     );
 
-    // One row per check, matching RUN.json's checks[] exactly.
+    // One row per check. The rows that ran match RUN.json's checks[] exactly;
+    // the rest are checks ruled out before execution, which RUN.json does not
+    // carry and which a consumer must still be able to tell apart from a gate
+    // that was never scheduled.
     let rows = provenance["checks"].as_array().expect("checks array");
     let run_checks = run["checks"].as_array().expect("RUN.json checks");
-    assert_eq!(rows.len(), run_checks.len());
-    for (row, run_check) in rows.iter().zip(run_checks) {
+    let executed: Vec<_> = rows.iter().filter(|row| row["skipped"].is_null()).collect();
+    assert_eq!(executed.len(), run_checks.len());
+    for (row, run_check) in executed.iter().zip(run_checks) {
         assert_eq!(row["id"], run_check["gate"]);
         assert_eq!(row["cached"], run_check["cached"]);
+    }
+    for row in rows.iter().filter(|row| !row["skipped"].is_null()) {
+        assert!(
+            row["skipped"].as_str().is_some_and(|why| !why.is_empty()),
+            "a skipped gate is recorded with the reason it was ruled out"
+        );
+        assert!(
+            row["cwd"].is_null() && row["tree_state"].is_null(),
+            "a check that never ran read no tree"
+        );
     }
 
     // Additive, but not invisible: the manifest hashes it and sanity requires it.

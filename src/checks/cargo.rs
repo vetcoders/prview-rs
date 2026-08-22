@@ -102,6 +102,7 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
         ReviewedCargoRoot::Unknown => reviewed_cargo_root(mapped, &plan.scan_dir),
     };
     let cwd = contained_in_snapshot(cwd, &plan.scan_dir)?;
+    dependency_paths_stay_in_snapshot(&cwd, &plan.scan_dir)?;
 
     Ok(CargoRun {
         cwd,
@@ -217,6 +218,88 @@ fn contained_in_snapshot(cwd: PathBuf, scan_dir: &Path) -> Result<PathBuf> {
         }
     }
     Ok(cwd)
+}
+
+/// Refuse a manifest that points cargo at source outside the reviewed snapshot.
+///
+/// The root and its manifest being contained says nothing about what that
+/// manifest declares. A reviewed `Cargo.toml` carrying an absolute `path`
+/// dependency — or a relative one that climbs out of the snapshot, or resolves
+/// through a symlink — has cargo compile a directory the reviewed commit does
+/// not contain, while provenance reports a `snapshot` scan and the verdict is
+/// cached under the reviewed commit. The same escape as a symlinked cargo root,
+/// one level further in.
+///
+/// Only OFF-`HEAD` runs are held to this. A local review is about the working
+/// tree as it stands, and a path dependency on a sibling checkout is an ordinary
+/// local setup; nothing there claims the verdict describes a commit's contents.
+///
+/// The check is static and reads only this manifest: a workspace member's own
+/// dependencies are not followed, and neither is anything a build script does.
+/// It refuses what it can prove escapes rather than pretending to be complete —
+/// running `cargo metadata` to resolve the true graph would need the network,
+/// the registry and a second full resolve per check.
+fn dependency_paths_stay_in_snapshot(cwd: &Path, scan_dir: &Path) -> Result<()> {
+    let (Ok(root), Ok(manifest)) = (
+        scan_dir.canonicalize(),
+        std::fs::read_to_string(cwd.join("Cargo.toml")),
+    ) else {
+        return Ok(());
+    };
+    let Ok(manifest) = toml::from_str::<toml::Table>(&manifest) else {
+        return Ok(());
+    };
+
+    for (name, declared) in manifest_dependency_paths(&manifest) {
+        // An absolute declared path replaces the root, which is the case at issue.
+        let Ok(resolved) = cwd.join(&declared).canonicalize() else {
+            continue;
+        };
+        if !resolved.starts_with(&root) {
+            anyhow::bail!(
+                "dependency `{name}` at {declared}, declared in {}, resolves outside the reviewed \
+                 snapshot ({}), so cargo would compile source the reviewed commit does not contain",
+                cwd.join("Cargo.toml").display(),
+                scan_dir.display(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Every local path a manifest points cargo at, dependencies and overrides alike,
+/// paired with the name it is declared under.
+fn manifest_dependency_paths(manifest: &toml::Table) -> Vec<(String, String)> {
+    fn spec_path((name, spec): (&str, &toml::Value)) -> Option<(String, String)> {
+        let path = spec.as_table()?.get("path")?.as_str()?;
+        Some((name.to_string(), path.to_string()))
+    }
+
+    let mut paths: Vec<(String, String)> = dependency_specs(manifest)
+        .into_iter()
+        .filter_map(spec_path)
+        .collect();
+    // `[patch.<source>.<name>]` nests one level deeper than `[replace.<name>]`.
+    if let Some(patch) = manifest.get("patch").and_then(|patch| patch.as_table()) {
+        for source in patch.values().filter_map(|source| source.as_table()) {
+            paths.extend(
+                source
+                    .iter()
+                    .filter_map(|(name, spec)| spec_path((name.as_str(), spec))),
+            );
+        }
+    }
+    if let Some(replace) = manifest
+        .get("replace")
+        .and_then(|replace| replace.as_table())
+    {
+        paths.extend(
+            replace
+                .iter()
+                .filter_map(|(name, spec)| spec_path((name.as_str(), spec))),
+        );
+    }
+    paths
 }
 
 /// Validate the mapped cargo root against the reviewed snapshot.
@@ -335,10 +418,13 @@ const CARGO_ROOT_DISCOVERY_DEPTH: usize = 2;
 /// 1. the mapped cargo root — the local root at the same relative path;
 /// 2. the repo root — a workspace root still checks its members;
 /// 3. exactly one directory within [`CARGO_ROOT_DISCOVERY_DEPTH`] carrying a
-///    manifest, for a crate the reviewed commit moved somewhere else.
+///    manifest that [`moved_manifest_is_configured_project`] shows to be the
+///    configured project, for a crate the reviewed commit moved somewhere else.
 ///
 /// Several candidates in step 3 resolve to nothing: which crate the review is
-/// about is not a thing to guess. Walking the tree also settles containment for
+/// about is not a thing to guess. Neither is a single unrelated one — being the
+/// last manifest standing is not evidence of being the project that moved.
+/// Walking the tree also settles containment for
 /// free — git trees are not traversed through symlinks, so a root the reviewed
 /// commit replaced with a symlink to an external directory has no entries here
 /// and simply does not resolve. The manifest itself is held to the same standard
@@ -384,7 +470,13 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
         mapped
     };
     match moved.as_slice() {
-        [only] => ReviewedCargoRoot::Resolved(only.clone()),
+        [only] => match moved_manifest_is_configured_project(config, &repo, &commit, only) {
+            Ok(()) => ReviewedCargoRoot::Resolved(only.clone()),
+            Err(why) => ReviewedCargoRoot::Unavailable(format!(
+                "commit {short} has no Cargo.toml at {aimed_at}; the only one elsewhere ({only}) \
+                 {why} — this review is not about it",
+            )),
+        },
         [] => ReviewedCargoRoot::Unavailable(format!(
             "commit {short} has no Cargo.toml at {aimed_at} or the repo root — not a cargo project",
         )),
@@ -394,6 +486,98 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
             many.join(", "),
         )),
     }
+}
+
+/// What a manifest says it IS, so a manifest found somewhere else in the
+/// reviewed tree can be told apart from the project this review is about.
+#[derive(Debug, PartialEq, Eq)]
+enum ManifestIdentity {
+    /// `[package] name` — the crate this manifest defines.
+    Package(String),
+    /// A virtual workspace root defines no crate of its own; the member list is
+    /// what identifies it.
+    Workspace(Vec<String>),
+}
+
+impl ManifestIdentity {
+    fn describe(&self) -> String {
+        match self {
+            Self::Package(name) => format!("crate `{name}`"),
+            Self::Workspace(members) => format!("a workspace over {}", members.join(", ")),
+        }
+    }
+}
+
+/// Read a manifest's identity, or `None` when it defines neither a package nor a
+/// workspace (or does not parse at all).
+fn manifest_identity(content: &str) -> Option<ManifestIdentity> {
+    let table: toml::Table = toml::from_str(content).ok()?;
+    if let Some(name) = table
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(|name| name.as_str())
+    {
+        return Some(ManifestIdentity::Package(name.to_string()));
+    }
+    let members = table.get("workspace")?.get("members")?.as_array()?;
+    let mut members: Vec<String> = members
+        .iter()
+        .filter_map(|member| member.as_str().map(str::to_string))
+        .collect();
+    members.sort();
+    Some(ManifestIdentity::Workspace(members))
+}
+
+/// Whether the lone manifest found elsewhere in the reviewed tree is the
+/// configured project, moved — the only reason to run cargo there.
+///
+/// "Exactly one manifest is left" is not that evidence. A commit that DELETES
+/// the Rust project while keeping an unrelated one within reach — an
+/// `examples/demo`, a test fixture crate — left this arm running every cargo
+/// gate against the demo and filing a green verdict for a project the reviewed
+/// commit no longer contains. Checked out normally that commit would not even be
+/// detected as a Rust project, because local profile detection never looks at
+/// `examples/`.
+///
+/// The identity being matched is the CONFIGURED project's, read from the local
+/// checkout — the same source the mapped candidate came from, and the only
+/// statement anywhere of which crate this review is about. Without it (no local
+/// manifest, one that does not parse, one that defines neither a package nor a
+/// workspace) there is nothing to compare, and an unproven guess is refused:
+/// the run is skipped with a reason instead of judging another project.
+///
+/// `Err` carries the fragment naming why, for the skip reason.
+fn moved_manifest_is_configured_project(
+    config: &Config,
+    repo: &crate::git::Repository,
+    commit: &str,
+    candidate: &str,
+) -> std::result::Result<(), String> {
+    let unproven = "cannot be shown to be the same project".to_string();
+    let local_manifest = config
+        .repo_root
+        .join(cargo_cache_root(config))
+        .join("Cargo.toml");
+    let configured = std::fs::read_to_string(&local_manifest)
+        .ok()
+        .as_deref()
+        .and_then(manifest_identity)
+        .ok_or_else(|| unproven.clone())?;
+    let found = repo
+        .file_at_commit(commit, &format!("{candidate}/Cargo.toml"))
+        .ok()
+        .as_deref()
+        .and_then(manifest_identity)
+        .ok_or(unproven)?;
+
+    if found == configured {
+        return Ok(());
+    }
+    Err(format!(
+        "is {}, not {}",
+        found.describe(),
+        configured.describe()
+    ))
 }
 
 /// Skip reason when the reviewed commit offers no cargo root to run in.
@@ -454,13 +638,29 @@ fn cargo_substrate_hash(config: &Config) -> String {
 /// tomorrow's run resolves again. It is the shape `Cargo audit` already uses for
 /// advisories, which age the same way.
 ///
-/// Only a lockfile that is PROVEN absent stamps: when git cannot answer, the key
-/// stays as it was rather than churning on an unrelated failure.
+/// A lockfile that is PRESENT but does not cover the manifest pins nothing
+/// either: cargo updates it while it runs, from the same moving registry. Only a
+/// substrate PROVEN to resolve at run time stamps — when git or the parser cannot
+/// answer, the key stays as it was rather than churning on an unrelated failure.
 fn unlocked_substrate_stamp(config: &Config) -> Option<String> {
-    if substrate_has_lockfile(config) {
-        return None;
+    match substrate_lock_state(config) {
+        SubstrateLock::Pinned => None,
+        SubstrateLock::Absent | SubstrateLock::OutOfDate => {
+            Some(Local::now().format("%Y-%m-%d").to_string())
+        }
     }
-    Some(Local::now().format("%Y-%m-%d").to_string())
+}
+
+/// What the tree this run judges does about its dependency set.
+#[derive(Debug, PartialEq, Eq)]
+enum SubstrateLock {
+    /// No lockfile: cargo resolves the whole graph when it runs.
+    Absent,
+    /// A lockfile the manifest has outgrown — cargo must update it, which means
+    /// the registry again for at least part of the graph.
+    OutOfDate,
+    /// Pinned, or a question that could not be answered.
+    Pinned,
 }
 
 /// Whether the tree this run judges pins its dependency set.
@@ -469,28 +669,148 @@ fn unlocked_substrate_stamp(config: &Config) -> Option<String> {
 /// — and an off-`HEAD` run whose repository git cannot read — is answered from
 /// the working tree. Both look at the cargo root first and the repo root second,
 /// because a workspace member resolves from the workspace lockfile.
-fn substrate_has_lockfile(config: &Config) -> bool {
+///
+/// Existence used to be the whole test, and existence is not a pin: a target that
+/// adds a dependency without regenerating `Cargo.lock` still sends cargo to the
+/// registry — none of the commands pass `--locked`, which is what would assert
+/// otherwise — while the key promised the commit fully described the run. The
+/// manifest's declared dependencies are therefore checked against the lock's
+/// package list. It is a name-level test, so it under-reports (a workspace
+/// member's own manifest is not read, and a bumped requirement whose name is
+/// still locked is not caught); under-reporting is exactly today's behaviour,
+/// while over-reporting would only cost one extra cache miss a day.
+fn substrate_lock_state(config: &Config) -> SubstrateLock {
+    let Ok((manifest, lock)) = substrate_manifest_and_lock(config) else {
+        return SubstrateLock::Pinned;
+    };
+    let Some(lock) = lock else {
+        return SubstrateLock::Absent;
+    };
+    // No manifest to compare against is a question, not an answer.
+    let Some(manifest) = manifest else {
+        return SubstrateLock::Pinned;
+    };
+    if lock_covers_manifest(&manifest, &lock) {
+        SubstrateLock::Pinned
+    } else {
+        SubstrateLock::OutOfDate
+    }
+}
+
+/// The cargo root manifest of the judged tree and the lockfile governing it.
+///
+/// `Err` means the question could not be asked; `Ok(None)` that the file is
+/// genuinely absent. The lock is looked for at the cargo root first and the repo
+/// root second, because a workspace member resolves from the workspace lockfile.
+#[allow(clippy::result_unit_err)]
+fn substrate_manifest_and_lock(
+    config: &Config,
+) -> std::result::Result<(Option<String>, Option<String>), ()> {
+    let at = |dir: &str, name: &str| {
+        if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        }
+    };
+
     if let (Some(commit), ReviewedCargoRoot::Resolved(relative)) = (
         off_head_target_commit(config),
         resolve_reviewed_cargo_root(config),
     ) && let Ok(repo) = crate::git::Repository::open(&config.repo_root)
     {
-        return [relative.as_str(), ""].into_iter().any(|dir| {
-            let path = if dir.is_empty() {
-                "Cargo.lock".to_string()
-            } else {
-                format!("{dir}/Cargo.lock")
-            };
-            // An unanswerable lookup counts as locked: see the doc comment.
-            repo.regular_file_at_commit(commit.as_str(), &path)
-                .unwrap_or(true)
-        });
+        let read = |path: String| match repo.regular_file_at_commit(commit.as_str(), &path) {
+            Ok(true) => repo.file_at_commit(commit.as_str(), &path).map(Some),
+            Ok(false) => Ok(None),
+            Err(err) => Err(err),
+        };
+        let manifest = read(at(&relative, "Cargo.toml")).map_err(|_| ())?;
+        let lock = match read(at(&relative, "Cargo.lock")).map_err(|_| ())? {
+            Some(content) => Some(content),
+            None => read("Cargo.lock".to_string()).map_err(|_| ())?,
+        };
+        return Ok((manifest, lock));
     }
 
     // A relative cargo root is repo-root-relative by construction; `join` leaves
     // an absolute one alone, so this reads the same directory either way.
     let cargo_root = config.repo_root.join(cargo_cache_root(config));
-    cargo_root.join("Cargo.lock").exists() || config.repo_root.join("Cargo.lock").exists()
+    let lock = std::fs::read_to_string(cargo_root.join("Cargo.lock"))
+        .or_else(|_| std::fs::read_to_string(config.repo_root.join("Cargo.lock")))
+        .ok();
+    Ok((
+        std::fs::read_to_string(cargo_root.join("Cargo.toml")).ok(),
+        lock,
+    ))
+}
+
+/// Whether every dependency the manifest declares is already in the lock.
+///
+/// A dependency the lock has never heard of is one cargo has to resolve. Anything
+/// unparsable answers "covered": the stamp exists to bound a KNOWN gap, not to
+/// churn the cache on a file this code failed to read.
+fn lock_covers_manifest(manifest: &str, lock: &str) -> bool {
+    let (Ok(manifest), Ok(lock)) = (
+        toml::from_str::<toml::Table>(manifest),
+        toml::from_str::<toml::Table>(lock),
+    ) else {
+        return true;
+    };
+    let Some(packages) = lock.get("package").and_then(|packages| packages.as_array()) else {
+        return true;
+    };
+    let locked: std::collections::HashSet<&str> = packages
+        .iter()
+        .filter_map(|package| package.get("name").and_then(|name| name.as_str()))
+        .collect();
+
+    declared_dependencies(&manifest)
+        .iter()
+        .all(|name| locked.contains(name.as_str()))
+}
+
+/// Every crate name the manifest depends on, following `package = "..."` renames
+/// to the name the lockfile would record.
+fn declared_dependencies(manifest: &toml::Table) -> Vec<String> {
+    dependency_specs(manifest)
+        .into_iter()
+        .map(|(key, spec)| {
+            spec.as_table()
+                .and_then(|spec| spec.get("package"))
+                .and_then(|package| package.as_str())
+                .unwrap_or(key)
+                .to_string()
+        })
+        .collect()
+}
+
+/// Every dependency a manifest declares, as `(key, spec)` — the key being what
+/// the manifest calls it, which a `package = "..."` rename may override.
+fn dependency_specs(manifest: &toml::Table) -> Vec<(&str, &toml::Value)> {
+    /// Normal, dev and build dependencies, wherever they are declared.
+    const SECTIONS: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
+
+    let mut tables: Vec<&toml::Table> = vec![manifest];
+    // `[workspace.dependencies]` and `[target.'cfg(...)'.dependencies]` hold the
+    // same sections one level down.
+    for nested in ["workspace", "target"] {
+        let Some(table) = manifest.get(nested).and_then(|value| value.as_table()) else {
+            continue;
+        };
+        tables.push(table);
+        tables.extend(table.values().filter_map(|value| value.as_table()));
+    }
+
+    let mut specs = Vec::new();
+    for table in tables {
+        for section in SECTIONS {
+            let Some(deps) = table.get(*section).and_then(|deps| deps.as_table()) else {
+                continue;
+            };
+            specs.extend(deps.iter().map(|(key, spec)| (key.as_str(), spec)));
+        }
+    }
+    specs
 }
 
 /// Cache-key component naming the substrate a cargo check will actually analyse,
@@ -2072,6 +2392,22 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         repo_with_two_commits_containing(&[])
     }
 
+    fn head_sha(root: &Path) -> String {
+        use crate::git::cmd::git_cmd;
+
+        String::from_utf8(
+            git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string()
+    }
+
     /// Two commits in a fresh repo, both carrying `manifests` (repo-relative
     /// paths, written as minimal `Cargo.toml`s); returns the temp dir and the
     /// FIRST commit, so a config targeting it is off-HEAD.
@@ -2261,6 +2597,67 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         );
     }
 
+    /// "Exactly one manifest is left" says nothing about whose it is. A commit
+    /// that DELETES the Rust project while keeping an example crate within reach
+    /// ran every cargo gate against the example and filed its green verdict for
+    /// a project the reviewed commit no longer contains — a commit that, checked
+    /// out normally, would not be detected as a Rust project at all.
+    #[test]
+    fn an_unrelated_lone_manifest_is_not_the_moved_crate() {
+        // Target commit: the configured crate is gone, a demo crate remains.
+        let (repo, target) = repo_with_two_commits_containing(&["examples/demo/Cargo.toml"]);
+        // HEAD (the local checkout): the project this review is configured for.
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname=\"app\"\nversion=\"0.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(repo.path(), "the project the review is about");
+
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        let reason = missing_reviewed_cargo_manifest(&config)
+            .expect("an unrelated crate must not stand in for a deleted project");
+        assert!(
+            reason.contains("examples/demo") && reason.contains("`x`") && reason.contains("`app`"),
+            "the skip reason must name the crate it found and the one it wanted: {reason}",
+        );
+    }
+
+    /// A virtual workspace root defines no crate, so package names cannot
+    /// identify it — its member list does. Moving one must keep working, or the
+    /// evidence requirement would turn a legitimate layout into a permanent skip.
+    #[test]
+    fn a_moved_workspace_root_is_identified_by_its_members() {
+        let workspace = "[workspace]\nmembers=[\"core\"]\nresolver=\"2\"\n";
+        let (repo, _first) = repo_with_two_commits();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("backend")).unwrap();
+        std::fs::write(root.join("backend/Cargo.toml"), workspace).unwrap();
+        commit_all(root, "workspace root moved into backend");
+        let target = head_sha(root);
+        // HEAD (the local checkout): the same workspace, back at the repo root.
+        std::fs::remove_file(root.join("backend/Cargo.toml")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), workspace).unwrap();
+        commit_all(root, "workspace root back at the top");
+
+        let config = test_config_builder()
+            .repo_root(root)
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        assert_eq!(
+            resolve_reviewed_cargo_root(&config),
+            ReviewedCargoRoot::Resolved("backend".to_string()),
+            "the same workspace one level down is still the project under review",
+        );
+    }
+
     /// Discovery only helps when it has ONE answer. A tree with several
     /// candidate roots and no manifest where the run was aimed cannot be
     /// resolved by guessing which crate the review is about.
@@ -2325,6 +2722,71 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             inside,
             "cargo must not follow a symlink out of the reviewed tree, got {}",
             cwd.display(),
+        );
+    }
+
+    /// The root and its manifest being contained says nothing about what that
+    /// manifest DECLARES. An absolute `path` dependency (or one that climbs out
+    /// of the snapshot) has cargo compile a directory the reviewed commit does
+    /// not contain, while provenance reports a `snapshot` scan and the verdict is
+    /// cached under the reviewed commit.
+    #[test]
+    fn a_path_dependency_outside_the_snapshot_is_refused() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(scan_dir.path(), true);
+        std::fs::write(
+            scan_dir.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+                 foreign = {{ path = \"{}\" }}\n",
+                outside.path().display(),
+            ),
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a dependency outside the reviewed tree must not be compiled as its own");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("outside the reviewed snapshot") && err.contains("foreign"),
+            "the refusal must name the escaping dependency: {err}",
+        );
+    }
+
+    /// The everyday case must survive: a workspace member depending on a sibling
+    /// by relative path stays inside the snapshot and still runs.
+    #[test]
+    fn a_path_dependency_inside_the_snapshot_still_runs() {
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(&scan_dir.path().join("sibling"), true);
+        write_crate(scan_dir.path(), true);
+        std::fs::write(
+            scan_dir.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+             sibling = { path = \"sibling\" }\n",
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        assert_eq!(
+            plan_cargo_run(&config)
+                .expect("an in-tree dependency is not an escape")
+                .cwd,
+            scan_dir.path(),
         );
     }
 
@@ -2605,6 +3067,61 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             cargo_content_hash(&config),
             reviewed_substrate_key(&config).expect("reviewed key"),
             "a locked target must keep its permanent, content-addressed key",
+        );
+    }
+
+    /// A lockfile that is present but out of date pins nothing: cargo updates it
+    /// while it runs — none of the commands pass `--locked` — so the commit alone
+    /// does not describe the result, exactly as when no lock exists at all.
+    #[test]
+    fn a_lockfile_the_manifest_outgrew_is_not_a_pin() {
+        let (repo, _first) = repo_with_two_commits();
+        let root = repo.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        // The lock still describes the crate as it was before the dependency.
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(root, "add a dependency without regenerating the lock");
+        let stale = head_sha(root);
+
+        // A later commit regenerates the lock: the dependency set is pinned again.
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"x\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(root, "regenerate the lock");
+        let fresh = head_sha(root);
+        // Move HEAD past both so each review is off-`HEAD`.
+        std::fs::write(root.join("later.txt"), "after\n").unwrap();
+        commit_all(root, "after");
+
+        let config_for = |target: &str| {
+            test_config_builder()
+                .repo_root(root)
+                .profile(test_rust_profile(true))
+                .target(Some(target))
+                .build()
+        };
+
+        let key = cargo_content_hash(&config_for(&stale));
+        assert!(
+            key.contains("-unlocked-"),
+            "a lock cargo must update does not make the commit a complete key: {key}",
+        );
+        let config = config_for(&fresh);
+        assert_eq!(
+            cargo_content_hash(&config),
+            reviewed_substrate_key(&config).expect("reviewed key"),
+            "a lock that covers the manifest keeps the permanent, content-addressed key",
         );
     }
 

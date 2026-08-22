@@ -5028,6 +5028,16 @@ fn write_provenance_fixture_with_diffs(
     checks: &[CheckResult],
     diffs: &[Diff],
 ) -> serde_json::Value {
+    write_provenance_fixture_with_skips(repo_root, out, checks, &[], diffs)
+}
+
+fn write_provenance_fixture_with_skips(
+    repo_root: &Path,
+    out: &Path,
+    checks: &[CheckResult],
+    skipped_checks: &[crate::checks::SkippedCheck],
+    diffs: &[Diff],
+) -> serde_json::Value {
     let repo = Repository::open(repo_root).expect("open repo");
     let worktree = capture_worktree_provenance(repo_root);
     let resolved_target = ResolvedRef {
@@ -5045,6 +5055,7 @@ fn write_provenance_fixture_with_diffs(
         dir: out,
         repo: &repo,
         checks,
+        skipped_checks,
         diffs,
         resolved_target: &resolved_target,
         resolved_bases: &resolved_bases,
@@ -5145,6 +5156,46 @@ fn provenance_json_base_sha_is_the_commit_the_diff_used() {
         json["base_sha"], PROVENANCE_BASE_TIP,
         "the base tip is not what the diff compared against",
     );
+}
+
+#[test]
+fn provenance_json_records_checks_that_never_ran() {
+    // A gate ruled out before it ran — tests disabled, a tool absent — used to
+    // vanish from the manifest entirely, leaving a consumer unable to tell a
+    // deliberate skip from a check that was never part of this run. The row is
+    // all nulls because nothing was read; the reason is what it is there for.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let checks = [provenance_check(
+        "Cargo check",
+        false,
+        Some(snapshot_provenance("abc1234")),
+    )];
+    let skipped = [crate::checks::SkippedCheck {
+        id: "cargo_test".to_string(),
+        name: "Cargo test".to_string(),
+        reason: "tests disabled".to_string(),
+    }];
+
+    let json =
+        write_provenance_fixture_with_skips(repo_tmp.path(), out.path(), &checks, &skipped, &[]);
+
+    let rows = json["checks"].as_array().expect("checks array");
+    assert_eq!(rows.len(), 2, "a configured gate has a row either way");
+    assert!(
+        rows[0]["skipped"].is_null(),
+        "a check that ran is marked by the absence of a reason",
+    );
+
+    let row = &rows[1];
+    assert_eq!(row["id"], "cargo_test");
+    assert_eq!(row["skipped"], "tests disabled");
+    assert!(row["cwd"].is_null(), "a skip read no tree");
+    assert!(row["target_sha"].is_null());
+    assert!(row["tree_state"].is_null());
+    assert!(row["started_at"].is_null());
+    assert_eq!(row["cached"], false);
 }
 
 #[test]
