@@ -127,6 +127,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declarations also produce signature changes, a `pub struct Limit` and a
   `pub const Limit` in one file were rendered as one row plus a bogus
   "feature-gated variant" note. The grouping key now carries the symbol kind.
+- The pattern scan no longer reports an identifier as a TODO marker. Word
+  boundaries were read byte-wise over ASCII only, so `$` — an identifier
+  character in JavaScript/TypeScript and the macro metavariable sigil in Rust —
+  and every non-ASCII letter counted as a boundary: `const $TODO = false` and an
+  identifier abutting a Unicode letter were both reported, inflating `prod_hits`
+  and the risk score with exactly the false positives bounded matching exists to
+  exclude. Boundaries are now read per character over the union of identifier
+  characters the scanned languages accept.
 - A skipped `semgrep` run keeps its diagnostic. The tool/config-error skip reason
   was built from stderr alone, but under `--json` semgrep reports rule and config
   failures in the stdout payload's `errors[]` and can leave stderr empty — so the

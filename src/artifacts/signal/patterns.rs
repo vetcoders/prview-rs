@@ -46,9 +46,17 @@ fn is_plain_word(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// True if `byte` is a word-forming ASCII character (letter, digit, underscore).
-fn is_word_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
+/// True if `c` can be part of an identifier in one of the scanned languages.
+///
+/// Deliberately the UNION across languages rather than ASCII only: `$` forms
+/// identifiers in JavaScript/TypeScript (and is the metavariable sigil in Rust
+/// macros), and every scanned language admits non-ASCII letters and digits.
+/// Reading either as a word boundary reported `const $TODO = false` and an
+/// identifier abutting a Unicode letter as TODO markers — inflating `prod_hits`
+/// and the risk score with the very false positives bounded matching exists to
+/// exclude.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
 }
 
 /// Match `needle` inside `haystack` respecting word boundaries.
@@ -66,16 +74,22 @@ fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    let needs_right_boundary = needle.as_bytes().last().is_some_and(|&b| is_word_byte(b));
+    let needs_right_boundary = needle.chars().next_back().is_some_and(is_word_char);
 
-    let hbytes = haystack.as_bytes();
     let mut search_from = 0;
     while let Some(rel) = haystack[search_from..].find(needle) {
         let start = search_from + rel;
         let end = start + needle.len();
 
-        let left_ok = start == 0 || !is_word_byte(hbytes[start - 1]);
-        let right_ok = !needs_right_boundary || end == hbytes.len() || !is_word_byte(hbytes[end]);
+        // Boundaries are read per CHARACTER, not per byte: the byte before a
+        // non-ASCII letter is a UTF-8 continuation byte, which is not
+        // alphanumeric and used to read as a boundary.
+        let left_ok = !haystack[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_word_char);
+        let right_ok =
+            !needs_right_boundary || !haystack[end..].chars().next().is_some_and(is_word_char);
 
         if left_ok && right_ok {
             return true;
@@ -993,6 +1007,22 @@ mod tests {
         assert!(contains_word_bounded("// XXX fixme", "XXX"));
         assert!(!contains_word_bounded("TODOS", "TODO"));
         assert!(contains_word_bounded("TODO: fix", "TODO"));
+    }
+
+    #[test]
+    fn contains_word_bounded_respects_dollar_and_unicode_identifiers() {
+        // `$` is an identifier character in JavaScript/TypeScript and a macro
+        // metavariable sigil in Rust; a non-ASCII letter is an identifier
+        // character in every language scanned here. Treating either as a word
+        // boundary reported a plain identifier as a TODO marker and inflated
+        // `prod_hits` — the opposite of what bounded matching is for.
+        assert!(!contains_word_bounded("const $TODO = false", "TODO"));
+        assert!(!contains_word_bounded("const TODO$ = false", "TODO"));
+        assert!(!contains_word_bounded("let żTODO = 1;", "TODO"));
+        assert!(!contains_word_bounded("let TODOż = 1;", "TODO"));
+        // A real marker next to non-identifier punctuation still matches.
+        assert!(contains_word_bounded("// TODO: fix ż", "TODO"));
+        assert!(contains_word_bounded("${TODO}", "TODO"));
     }
 
     #[test]
