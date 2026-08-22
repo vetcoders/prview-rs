@@ -215,6 +215,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at the `#`, recording both `mod r#type` and `mod r#match` as `r`: two
   namespaces looked like one, and a removal from the first was cancelled by an
   unrelated addition in the second.
+- **A comparison inside a const argument no longer holds a test context open.**
+  The perf tracker counted the `<` of `Buffer<{ 1 < 2 }>` as a generic opener,
+  leaving the signature depth stuck above zero so the real body brace was read
+  as another type-level brace. The context never closed and every production
+  loop and query after the test was muted. A `<` now opens a generic only where
+  one can be — directly after what it parameterises.
 - **Rewording a comment inside a declaration is no longer a signature change.**
   Declarations were compared on their verbatim text, comments and all, so a
   remove+re-add of a byte-identical public signature whose internal comment had

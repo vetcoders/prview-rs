@@ -840,10 +840,16 @@ not by taking the first `{`. A brace in type or pattern position —
 body exists, so reading it as the opener made the very next line look like the
 item closing again: the context ended at the signature and the whole test body
 was classified as production. Inside a signature `<` is reliably a generic
-opener (signatures do not compare), with `->` excluded so a return arrow is not
-read as a closing angle bracket; the depth is clamped at zero so a hunk starting
-mid-signature errs toward closing the context rather than muting production
-code. Measured over the local crates.io registry: of 1,697,077 `fn` signatures,
+opener — but only where one can be: a `<` counts as opening a generic when it
+FOLLOWS what it parameterises (`Buffer<`, `Vec<`, `fn f<`, `::<`), and a `<`
+after whitespace is a comparison, which a const argument may hold
+(`Buffer<{ 1 < 2 }>`). Counting that comparison left the depth stuck above zero,
+the real body brace read as another type-level brace, and the context never
+closed — muting every production hit after the test. `->` is excluded so a return
+arrow is not read as a closing angle bracket; closers stay unconditional and the
+depth is clamped at zero, so a `<` this rule misjudges — like a hunk starting
+mid-signature — can only end the context early, never hold it open and mute
+production code. Measured over the local crates.io registry: of 1,697,077 `fn` signatures,
 1,191 carry a brace in that position and 715 place the body opener on a later
 line — the shape that actually breaks the tracker — 59 of them test-annotated.
 
