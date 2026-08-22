@@ -705,12 +705,10 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // Demanding a nested `decision` at every version made the one shape the
     // contract explicitly tolerates come back `storage_corrupt` from this
     // surface while the CLI read it fine.
-    let decision = crate::gate::select_decision_object(&value).map_err(|schema| {
+    let decision = crate::gate::select_decision_object(&value).map_err(|shape| {
         ToolError::new(
             error_class::STORAGE_CORRUPT,
-            format!(
-                "MERGE_GATE.json states schema_version {schema} but carries no `decision` object"
-            ),
+            format!("MERGE_GATE.json {}", shape.describe()),
         )
     })?;
 
@@ -1184,6 +1182,23 @@ mod tests {
         let d = read_decision(dir.path()).expect("a legacy root-shaped pack is readable");
         assert_eq!(d.verdict, "PASS");
         assert!(d.allow_merge, "{d:?}");
+    }
+
+    #[test]
+    fn a_non_object_gate_root_is_corrupt_on_both_readers() {
+        // The legacy root tolerance covers a pack whose decision fields sit at
+        // the root — not a pack that is an array, a scalar or `null`. Those
+        // carry no fields to read, and the two readers must agree they are
+        // corrupt rather than one of them inventing a normalized BLOCK.
+        for root in ["[1,2,3]", "\"BLOCK\"", "null", "7"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("00_summary")).unwrap();
+            std::fs::write(dir.path().join("00_summary/MERGE_GATE.json"), root).unwrap();
+
+            let err = read_decision(dir.path()).expect_err("a non-object gate root is corrupt");
+            assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+            assert!(err.message.contains("not a JSON object"), "{}", err.message);
+        }
     }
 
     #[test]

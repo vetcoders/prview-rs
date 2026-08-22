@@ -225,9 +225,11 @@ case sets `normalized: true`:
   is pre-2.1 and is accepted silently, like the `ALLOW`/`HOLD` tokens — including
   the pre-2.1 shape that carries its signals at the root instead of under
   `decision`. A pack that STATES a `schema_version` and still has no `decision`
-  object is `storage_corrupt`. Both readers apply that rule from one place
-  (`gate::select_decision_object`), so a pack the CLI reads is never one the MCP
-  adapter calls corrupt.
+  object is `storage_corrupt`, and so is a schema-less pack whose root is not an
+  object at all (an array, a scalar, `null`) — that root states no decision, it
+  is not a decision missing every field. Both readers apply those rules from one
+  place (`gate::select_decision_object`), so a pack the CLI reads is never one
+  the MCP adapter calls corrupt.
 
 Completed response:
 

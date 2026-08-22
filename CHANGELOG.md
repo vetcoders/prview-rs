@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that disappeared for Unix builds was never reported. The guard is now the
   complete conjunction, sorted — reordering two attributes gates the item
   identically and is not an API change.
+- **A gate whose root is not a JSON object is corrupt on both readers.** The
+  legacy tolerance says WHERE a schema-less pack's decision sits, not that
+  anything parseable counts as one. A `MERGE_GATE.json` holding an array, a
+  scalar or `null` was read by the CLI as a decision with every signal missing,
+  which normalized to `BLOCK` and returned a successful summary — for an artifact
+  the MCP reader rejected as `storage_corrupt`. Both now fail loud (`exit 3` /
+  `storage_corrupt`) with a message that names the actual defect.
 - A warning is no longer reported as a failed quality check. A baseline-signal
   check that reports `Warnings` (cargo-audit raising an unmaintained-crate
   advisory, `rustfmt`, `eslint`, `ruff`, `prettier`, `stylelint`, `semgrep`) is

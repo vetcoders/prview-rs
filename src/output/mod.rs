@@ -332,11 +332,11 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     // with the MCP adapter, because the two readers answering it differently is
     // exactly how the same pack became readable from one surface and corrupt
     // from the other.
-    let decision = crate::gate::select_decision_object(&value).map_err(|schema| {
+    let decision = crate::gate::select_decision_object(&value).map_err(|shape| {
         anyhow::anyhow!(
-            "merge gate artifact {} states schema_version {schema} but carries no `decision` \
-             object — the pack is corrupt and no verdict can be read from it",
+            "merge gate artifact {} {} — the pack is corrupt and no verdict can be read from it",
             gate_path.display(),
+            shape.describe(),
         )
     })?;
     // A decision signal present with the WRONG JSON type is not an absent one.
@@ -2029,6 +2029,28 @@ api-router/app/core/cache.py
             1,
             "a BLOCK verdict must not exit 0"
         );
+    }
+
+    #[test]
+    fn a_gate_whose_root_is_not_an_object_is_corrupt_not_a_block() {
+        // The legacy tolerance says WHERE the decision sits, not that anything
+        // parseable is a decision. A pack that parses to an array, a scalar or
+        // `null` has no fields at all: the CLI read one as a decision with no
+        // signals and answered a normalized BLOCK — a successful summary for an
+        // artifact the MCP reader rejects as corrupt.
+        for root in ["[1,2,3]", "\"BLOCK\"", "null", "7"] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+            std::fs::write(temp.path().join("00_summary/MERGE_GATE.json"), root).unwrap();
+
+            let err = read_merge_gate_summary(temp.path())
+                .expect_err("a non-object gate root carries no decision");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("not a JSON object"),
+                "the error must name the real defect, got: {message}"
+            );
+        }
     }
 
     #[test]

@@ -206,16 +206,54 @@ pub fn readable_signal<'v>(
 ///   clothes. `tools/validate_merge_gate.py` requires `decision` at every
 ///   version, so a reader that shrugs disagrees with the contract validator.
 ///
-/// `Err` carries the schema string for the caller to put in its own message.
-pub fn select_decision_object(value: &serde_json::Value) -> Result<&serde_json::Value, String> {
+/// The legacy tolerance is about WHERE the decision sits, not about whether the
+/// pack is a decision at all: a root that is an array, a scalar or `null` has no
+/// fields to read, and accepting it let the CLI answer a normalized BLOCK for an
+/// artifact the MCP reader called corrupt. Both now reject it.
+///
+/// `Err` describes which shape rule the pack broke; callers add their own
+/// framing.
+pub fn select_decision_object(
+    value: &serde_json::Value,
+) -> Result<&serde_json::Value, DecisionShapeError> {
     match value.get("decision") {
         Some(decision) if decision.is_object() => Ok(decision),
-        _ if value.get("schema_version").is_none() => Ok(value),
-        _ => Err(value
-            .get("schema_version")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?")
-            .to_string()),
+        _ if value.get("schema_version").is_some() => {
+            Err(DecisionShapeError::VersionedWithoutDecision(
+                value
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+            ))
+        }
+        _ if value.is_object() => Ok(value),
+        _ => Err(DecisionShapeError::NonObjectRoot(json_type_name(value))),
+    }
+}
+
+/// Why a gate pack carries no readable decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionShapeError {
+    /// The pack names its schema and then omits the object that schema is built
+    /// around.
+    VersionedWithoutDecision(String),
+    /// The pack states no schema, so its root WOULD be the decision — but the
+    /// root is not an object.
+    NonObjectRoot(&'static str),
+}
+
+impl DecisionShapeError {
+    /// The defect, as a clause a caller can put in its own sentence.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::VersionedWithoutDecision(schema) => {
+                format!("states schema_version {schema} but carries no `decision` object")
+            }
+            Self::NonObjectRoot(kind) => {
+                format!("is {kind}, not a JSON object, so it states no decision at all")
+            }
+        }
     }
 }
 

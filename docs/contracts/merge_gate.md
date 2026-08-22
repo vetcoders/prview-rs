@@ -183,6 +183,12 @@ by BOTH readers, not accepted by one and called corrupt by the other. The rule
 lives in one place (`gate::select_decision_object`) so the two surfaces cannot
 answer it differently again.
 
+That tolerance is about WHERE the decision sits, not about what counts as one. A
+schema-less pack whose root parses to an array, a scalar or `null` has no fields
+to read at all: it is corrupt on both readers, not a decision with every signal
+missing. Reading one as a decision produced a "successful" summary carrying a
+normalized `BLOCK` for an artifact that never stated anything.
+
 A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
 never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with
 an `unknown_verdict:` caveat, and the MCP adapter ignores it for ranking, emits
