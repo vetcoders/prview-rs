@@ -359,6 +359,35 @@ fn is_diff_metadata_line(line: &str) -> bool {
         || line.starts_with("deleted file mode ")
 }
 
+/// Return the code part of `line`, dropping a `//` comment wherever it starts.
+///
+/// Comments are not code: a marker mentioned in one must not open test context,
+/// and braces typed in one must not move the scope depth. Only FULL-LINE `//`
+/// used to be recognised, which left every trailing comment live.
+///
+/// String literals are respected so a `https://` URL is not mistaken for a
+/// comment — truncating there would drop whatever braces follow it and corrupt
+/// the depth in the other direction. Char literals are deliberately NOT tracked:
+/// a char literal cannot contain `//`, and tracking `'` would misread Rust
+/// lifetimes (`&'a str`). A stray `"` inside a char literal only suppresses
+/// stripping for that line, which is the pre-existing behavior.
+fn strip_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Skip the escaped character so `\"` does not close the string.
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
 /// Map each added line of `hunk` to "is this line inside inline Rust test
 /// context?", in the same order as the added-line vector used for detection.
 ///
@@ -406,16 +435,12 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
             .strip_prefix('+')
             .or_else(|| line.strip_prefix(' '))
             .unwrap_or(line);
-        let trimmed = payload.trim();
 
-        // Comments (including doc comments) never open test context — a doc
-        // comment mentioning `#[cfg(test)]` must not mute a production hit.
-        if trimmed.starts_with("//") {
-            if is_added {
-                flags.push(in_test);
-            }
-            continue;
-        }
+        // Comments (whole-line, doc, or trailing) are not code: neither their
+        // markers nor their braces may move the scope. A full-line comment
+        // reduces to an empty slice here, which is inert on both counts.
+        let code = strip_line_comment(payload);
+        let trimmed = code.trim();
 
         // Only the outermost marker opens the context, so nested `#[test]`
         // attributes do not reset the enclosing `mod tests` brace tracking.
@@ -430,7 +455,7 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
         }
 
         if in_test {
-            for ch in payload.chars() {
+            for ch in code.chars() {
                 match ch {
                     '{' => {
                         depth += 1;
@@ -1196,6 +1221,78 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
             result.suspected_files
         );
         assert_eq!(result.skipped_test_hits_count, 0);
+    }
+
+    // ---- trailing `//` comments are not code ----
+
+    #[test]
+    fn test_inline_trailing_comment_marker_does_not_open_test_context() {
+        // Only FULL-LINE `//` comments were treated as non-code, and the marker
+        // pattern is unanchored — so a marker mentioned at the end of a real
+        // statement opened test context and muted the production hit below it.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,8 @@
++let verify_all = true; // mirrored by #[cfg(test)] mod tests below
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT hash FROM users WHERE id = ?");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a marker inside a trailing comment is not test context"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_braces_in_trailing_comment_do_not_close_test_context() {
+        // The brace tracker counted braces inside a trailing comment, so a
+        // comment mentioning `}}` closed the test scope early and reported a
+        // genuine test-only hit as production.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ mod tests {
++    let n = 1; // not real braces: }}
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "braces inside a comment must not leak a test hit into production"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_double_slash_inside_string_literal_is_not_a_comment() {
+        // Stripping `//` blindly would truncate a URL and drop the brace that
+        // follows it, corrupting the scope depth in the other direction.
+        assert_eq!(
+            strip_line_comment("let url = \"https://example.com\"; // note"),
+            "let url = \"https://example.com\"; "
+        );
+        assert_eq!(strip_line_comment("let x = 1;"), "let x = 1;");
+        assert_eq!(strip_line_comment("// whole line"), "");
     }
 
     #[test]
