@@ -339,6 +339,15 @@ it carries the verdict, `output_dir`, a short `checks_summary`, `top_failures`,
 on disk, especially the canonical `RUN.json` and `MERGE_GATE.json` pair, plus
 `PR_REVIEW.md`.
 
+The verdict fields (`verdict`, `allow_merge`, `quality_pass`,
+`merge_recommendation`, `analysis_status`) are read from the run's
+`00_summary/MERGE_GATE.json` and from nowhere else. If that artifact is missing,
+unparsable, or stamped with a `schema_version` this build cannot read, prview
+reports an execution error and exits `3` instead of re-deriving a verdict —
+including on `--update` runs that re-read an earlier pack. A newer MINOR schema
+within a known MAJOR is accepted and reported through the optional `caveats`
+array, which also carries any verdict the reader had to normalize.
+
 ## Output
 
 Artifacts are written to `$PRVIEW_HOME/runs/<repo>/<branch>/<run_id>/`

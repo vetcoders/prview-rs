@@ -55,6 +55,11 @@ pub struct CliJsonSummary {
     pub artifacts: CliJsonArtifacts,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why_blocked: Option<String>,
+    /// Reader-side caveats raised while decoding `MERGE_GATE.json` — a verdict
+    /// this build had to normalize, or a pack schema newer than it understands.
+    /// Empty (and omitted from the wire) on a clean read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caveats: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +125,7 @@ struct MergeGateSummary {
     allow_merge: bool,
     quality_pass: bool,
     reason: Option<String>,
+    caveats: Vec<String>,
 }
 
 mod duration_serde {
@@ -169,12 +175,20 @@ fn failures_degraded_to_advisory(gate: &MergeGateSummary) -> bool {
         && gate.merge_recommendation == crate::policy::engine::MergeRecommendation::Approve
 }
 
-pub fn build_cli_json_summary(config: &Config, report: &Report) -> CliJsonSummary {
-    let gate = read_merge_gate_summary(&report.artifacts_dir)
-        .unwrap_or_else(|| fallback_merge_gate_summary(config, report));
+/// Build the `--json` / gate summary from the pack's `MERGE_GATE.json`.
+///
+/// The gate artifact is the ONLY derivation of the verdict. There is no
+/// re-derivation from the in-memory policy engine when the artifact is missing
+/// or unparsable: that fallback used to publish `allow_merge = rec != Block`,
+/// the single place in the codebase where `allow_merge: true` could coexist with
+/// a `CONDITIONAL` verdict, breaking the `allow_merge == (verdict == "PASS")`
+/// invariant of `docs/contracts/merge_gate.md`. An unreadable pack is now an
+/// execution error (exit 3), not a guess.
+pub fn build_cli_json_summary(config: &Config, report: &Report) -> anyhow::Result<CliJsonSummary> {
+    let gate = read_merge_gate_summary(&report.artifacts_dir)?;
     let checks_summary = CliJsonChecksSummary::from_checks(&report.checks);
 
-    CliJsonSummary {
+    Ok(CliJsonSummary {
         schema_version: "cli-json/v1",
         status: gate
             .merge_recommendation
@@ -207,7 +221,8 @@ pub fn build_cli_json_summary(config: &Config, report: &Report) -> CliJsonSummar
         } else {
             None
         },
-    }
+        caveats: gate.caveats,
+    })
 }
 
 /// Process exit code, derived from the merge *recommendation* rather than the
@@ -232,26 +247,6 @@ pub fn compute_exit_code(summary: &CliJsonSummary) -> i32 {
         return 1;
     }
     0
-}
-
-fn fallback_merge_gate_summary(config: &Config, report: &Report) -> MergeGateSummary {
-    let engine = crate::policy::engine::PolicyEngine::new(config);
-    let policy_summary = engine.evaluate_all(&report.checks, &[]);
-    let quality_pass = !report.has_failures();
-    let allow_merge =
-        policy_summary.merge_recommendation != crate::policy::engine::MergeRecommendation::Block;
-
-    MergeGateSummary {
-        verdict: policy_summary
-            .merge_recommendation
-            .legacy_verdict(policy_summary.analysis_status, quality_pass)
-            .to_string(),
-        analysis_status: policy_summary.analysis_status,
-        merge_recommendation: policy_summary.merge_recommendation,
-        allow_merge,
-        quality_pass,
-        reason: None,
-    }
 }
 
 impl CliJsonChecksSummary {
@@ -299,19 +294,63 @@ fn existing_relative_path(output_dir: &Path, relative: &str) -> Option<String> {
         .then(|| relative.to_string())
 }
 
-fn read_merge_gate_summary(output_dir: &Path) -> Option<MergeGateSummary> {
-    let raw =
-        std::fs::read_to_string(output_dir.join("00_summary").join("MERGE_GATE.json")).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
+/// Decode a pack's `MERGE_GATE.json` into the CLI summary surface.
+///
+/// Fail-loud: a missing, unreadable, or unparsable artifact is an error, and so
+/// is a pack whose `schema_version` this build does not know. Everything the
+/// reader had to normalize instead of read is reported back as a caveat.
+fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary> {
+    use anyhow::Context;
+
+    let gate_path = output_dir.join("00_summary").join("MERGE_GATE.json");
+    let raw = std::fs::read_to_string(&gate_path).with_context(|| {
+        format!(
+            "cannot read the merge gate artifact {} — the run produced no readable verdict",
+            gate_path.display()
+        )
+    })?;
+    let value: Value = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "failed to parse merge gate artifact {}",
+            gate_path.display()
+        )
+    })?;
+
+    let mut caveats = Vec::new();
+    if let Some(caveat) =
+        crate::gate::check_merge_gate_schema(value.get("schema_version").and_then(Value::as_str))
+            .with_context(|| format!("merge gate artifact {}", gate_path.display()))?
+    {
+        caveats.push(caveat);
+    }
+
     let decision = value.get("decision").unwrap_or(&value);
     // Canonical verdict vocabulary (PV-03/04): PASS / CONDITIONAL / BLOCK. Legacy
     // ALLOW/HOLD tokens from pre-2.1 runs are folded onto the unified set so the
     // CLI `--json` surface speaks the same language as MERGE_GATE.json.
-    let verdict = match decision.get("verdict").and_then(Value::as_str) {
+    let raw_verdict = decision.get("verdict").and_then(Value::as_str);
+    let verdict = match raw_verdict {
         Some("PASS") | Some("ALLOW") => "PASS",
         Some("CONDITIONAL") | Some("HOLD") => "CONDITIONAL",
         Some("BLOCK") => "BLOCK",
-        _ => "BLOCK",
+        // Collapsing an unreadable verdict to BLOCK is the safe default, but it
+        // is a normalization, not a reading — say so instead of letting the
+        // caller mistake it for what the pack claimed.
+        Some(other) => {
+            caveats.push(format!(
+                "unknown_verdict: MERGE_GATE.json verdict `{other}` is not in the \
+                 PASS/CONDITIONAL/BLOCK vocabulary; normalized to BLOCK"
+            ));
+            "BLOCK"
+        }
+        None => {
+            caveats.push(
+                "unknown_verdict: MERGE_GATE.json decision carries no `verdict`; \
+                 normalized to BLOCK"
+                    .to_string(),
+            );
+            "BLOCK"
+        }
     };
 
     let reason = decision
@@ -343,13 +382,14 @@ fn read_merge_gate_summary(output_dir: &Path) -> Option<MergeGateSummary> {
         _ if verdict == "CONDITIONAL" => crate::policy::engine::MergeRecommendation::ReviewRequired,
         _ => crate::policy::engine::MergeRecommendation::Block,
     };
-    Some(MergeGateSummary {
+    Ok(MergeGateSummary {
         verdict: verdict.to_string(),
         analysis_status,
         merge_recommendation,
         allow_merge,
         quality_pass,
         reason,
+        caveats,
     })
 }
 
@@ -858,7 +898,7 @@ pub fn print_summary(report: &Report) {
     }
 
     let gate = read_merge_gate_summary(&report.artifacts_dir);
-    if let Some(heading) = failure_summary_heading(report, gate.as_ref()) {
+    if let Some(heading) = failure_summary_heading(report, gate.as_ref().ok()) {
         println!();
         println!("{} {heading}", "⚠".yellow());
         for check in &report.checks {
@@ -875,24 +915,32 @@ pub fn print_summary(report: &Report) {
     // Final authoritative line: the merge-gate verdict, in the same vocabulary
     // as `--json` (PV-03). Never print a bare "all checks passed" that could
     // contradict a BLOCK/CONDITIONAL gate — the stdout summary must not lie.
-    if let Some(gate) = gate {
-        println!();
-        let (icon, label) = match gate.verdict.as_str() {
-            "PASS" => ("✓".green(), "PASS".green().bold()),
-            "BLOCK" => ("🛑".red(), "BLOCK".red().bold()),
-            _ => ("⚠".yellow(), "CONDITIONAL".yellow().bold()),
-        };
-        match gate.reason.as_deref() {
-            Some(reason) if !reason.trim().is_empty() => {
-                println!("{icon} Verdict: {label} — {reason}");
+    match gate {
+        Ok(gate) => {
+            println!();
+            let (icon, label) = match gate.verdict.as_str() {
+                "PASS" => ("✓".green(), "PASS".green().bold()),
+                "BLOCK" => ("🛑".red(), "BLOCK".red().bold()),
+                _ => ("⚠".yellow(), "CONDITIONAL".yellow().bold()),
+            };
+            match gate.reason.as_deref() {
+                Some(reason) if !reason.trim().is_empty() => {
+                    println!("{icon} Verdict: {label} — {reason}");
+                }
+                _ => println!("{icon} Verdict: {label}"),
             }
-            _ => println!("{icon} Verdict: {label}"),
+            for caveat in &gate.caveats {
+                println!("   {} {caveat}", "⚠".yellow());
+            }
         }
-    } else if !report.checks.is_empty() && !report.has_failures() {
-        // No gate artifact for this run (degenerate/minimal path) — fall back
-        // to the raw check tally rather than inventing a verdict.
-        println!();
-        println!("{} All checks passed!", "✓".green());
+        Err(err) => {
+            // No readable gate artifact. The raw check tally is NOT a verdict —
+            // announcing "all checks passed" here is exactly the guess this
+            // path used to make. Name the missing truth instead; the process
+            // exits 3 on the same condition.
+            println!();
+            println!("{} No merge-gate verdict for this run: {err}", "⚠".yellow());
+        }
     }
 
     println!();
@@ -918,6 +966,20 @@ mod tests {
     use crate::checks::{CheckResult, CheckStatus};
     use crate::cli::ExecutionMode;
     use crate::config::{test_config, test_rust_profile};
+
+    /// Minimal artifact pack carrying one `MERGE_GATE.json` decision. The gate
+    /// artifact is now the ONLY source of the verdict, so every summary test
+    /// has to plant one instead of leaning on a re-derivation fallback.
+    fn pack_with_gate(decision: &str) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        std::fs::write(
+            temp.path().join("00_summary/MERGE_GATE.json"),
+            format!(r#"{{"schema_version":"2.1","decision":{decision}}}"#),
+        )
+        .unwrap();
+        temp
+    }
 
     #[test]
     fn config_box_inner_width_fits_longest_line_and_title() {
@@ -1272,7 +1334,7 @@ mod tests {
             unchanged: false,
         };
 
-        let summary = build_cli_json_summary(&config, &report);
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         let value = serde_json::to_value(&summary).unwrap();
 
         assert_eq!(summary.schema_version, "cli-json/v1");
@@ -1330,6 +1392,11 @@ mod tests {
     #[test]
     fn test_cli_json_summary_marks_warning_runs_without_failures() {
         let config = test_config();
+        let pack = pack_with_gate(
+            r#"{"verdict":"CONDITIONAL","analysis_status":"degraded",
+                "merge_recommendation":"review_required","allow_merge":false,
+                "quality_pass":true}"#,
+        );
         let report = Report {
             target: "main".to_string(),
             bases: vec!["develop".to_string()],
@@ -1343,12 +1410,12 @@ mod tests {
                 provenance: None,
             }],
             heuristics: None,
-            artifacts_dir: PathBuf::from("."),
+            artifacts_dir: pack.path().to_path_buf(),
             duration: Duration::from_secs(1),
             unchanged: false,
         };
 
-        let summary = build_cli_json_summary(&config, &report);
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
 
         assert_eq!(summary.verdict, "CONDITIONAL");
         assert_eq!(summary.status, "fail");
@@ -1389,7 +1456,7 @@ mod tests {
             unchanged: false,
         };
 
-        let summary = build_cli_json_summary(&config, &report);
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_eq!(summary.status, "ok");
         assert_eq!(compute_exit_code(&summary), 0);
     }
@@ -1400,6 +1467,11 @@ mod tests {
         // failure is a review-required advisory — the status is still "fail",
         // but the process exits 0 because only a hard Block fails a non-CI run.
         let config = test_config();
+        let pack = pack_with_gate(
+            r#"{"verdict":"CONDITIONAL","analysis_status":"complete",
+                "merge_recommendation":"review_required","allow_merge":false,
+                "quality_pass":false}"#,
+        );
         let report = Report {
             target: "feature/broken".to_string(),
             bases: vec!["main".to_string()],
@@ -1413,12 +1485,12 @@ mod tests {
                 provenance: None,
             }],
             heuristics: None,
-            artifacts_dir: PathBuf::from("."),
+            artifacts_dir: pack.path().to_path_buf(),
             duration: Duration::from_secs(1),
             unchanged: false,
         };
 
-        let summary = build_cli_json_summary(&config, &report);
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_eq!(summary.status, "fail");
         assert_eq!(
             summary.merge_recommendation,
@@ -1433,6 +1505,11 @@ mod tests {
         // run tolerates fails the process under --ci.
         let mut config = test_config();
         config.execution_mode = ExecutionMode::Ci;
+        let pack = pack_with_gate(
+            r#"{"verdict":"CONDITIONAL","analysis_status":"complete",
+                "merge_recommendation":"review_required","allow_merge":false,
+                "quality_pass":false}"#,
+        );
         let report = Report {
             target: "feature/broken".to_string(),
             bases: vec!["main".to_string()],
@@ -1446,12 +1523,12 @@ mod tests {
                 provenance: None,
             }],
             heuristics: None,
-            artifacts_dir: PathBuf::from("."),
+            artifacts_dir: pack.path().to_path_buf(),
             duration: Duration::from_secs(1),
             unchanged: false,
         };
 
-        let summary = build_cli_json_summary(&config, &report);
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_eq!(summary.mode.execution_mode, "ci");
         assert_eq!(compute_exit_code(&summary), 1);
     }
@@ -1479,7 +1556,7 @@ mod tests {
             unchanged: false,
         };
 
-        let summary = build_cli_json_summary(&config, &report);
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_eq!(
             summary.merge_recommendation,
             crate::policy::engine::MergeRecommendation::Block
@@ -1490,6 +1567,10 @@ mod tests {
     #[test]
     fn test_cli_json_summary_canonicalizes_cargo_audit_failure_summary() {
         let config = test_config();
+        let pack = pack_with_gate(
+            r#"{"verdict":"BLOCK","analysis_status":"complete",
+                "merge_recommendation":"block","allow_merge":false,"quality_pass":false}"#,
+        );
         let report = Report {
             target: "feature/security".to_string(),
             bases: vec!["main".to_string()],
@@ -1537,12 +1618,12 @@ mod tests {
                 provenance: None,
             }],
             heuristics: None,
-            artifacts_dir: PathBuf::from("."),
+            artifacts_dir: pack.path().to_path_buf(),
             duration: Duration::from_secs(1),
             unchanged: false,
         };
 
-        let summary = build_cli_json_summary(&config, &report);
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         let failure = &summary.top_failures[0];
 
         assert_eq!(failure.id, "cargo_audit");
@@ -1556,6 +1637,10 @@ mod tests {
     #[test]
     fn test_cli_json_summary_canonicalizes_semgrep_failure_summary() {
         let config = test_config();
+        let pack = pack_with_gate(
+            r#"{"verdict":"BLOCK","analysis_status":"complete",
+                "merge_recommendation":"block","allow_merge":false,"quality_pass":false}"#,
+        );
         let report = Report {
             target: "feature/security".to_string(),
             bases: vec!["main".to_string()],
@@ -1576,12 +1661,12 @@ api-router/app/core/cache.py
                 provenance: None,
             }],
             heuristics: None,
-            artifacts_dir: PathBuf::from("."),
+            artifacts_dir: pack.path().to_path_buf(),
             duration: Duration::from_secs(1),
             unchanged: false,
         };
 
-        let summary = build_cli_json_summary(&config, &report);
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         let failure = &summary.top_failures[0];
 
         assert_eq!(failure.id, "semgrep_scan");
@@ -1612,6 +1697,119 @@ api-router/app/core/cache.py
         assert_eq!(
             gate.analysis_status,
             crate::policy::engine::AnalysisStatus::Incomplete
+        );
+    }
+
+    #[test]
+    fn missing_merge_gate_is_an_error_not_a_re_derived_verdict() {
+        // The removed `fallback_merge_gate_summary` published
+        // `allow_merge = rec != Block`, so a re-derived CONDITIONAL run came back
+        // with `allow_merge: true` — the one place the
+        // `allow_merge == (verdict == "PASS")` invariant could be violated. An
+        // unreadable pack must now fail loud instead.
+        let config = test_config();
+        let empty = tempfile::tempdir().unwrap();
+        let report = Report {
+            target: "feature/no-gate".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![CheckResult {
+                name: "cargo test".to_string(),
+                status: CheckStatus::Failed,
+                duration: Duration::from_secs(1),
+                output: "failed".to_string(),
+                cached: false,
+                provenance: None,
+            }],
+            heuristics: None,
+            artifacts_dir: empty.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: false,
+        };
+
+        let err = build_cli_json_summary(&config, &report)
+            .expect_err("a pack with no MERGE_GATE.json carries no verdict");
+        assert!(
+            format!("{err:#}").contains("MERGE_GATE.json"),
+            "error must name the missing artifact: {err:#}"
+        );
+    }
+
+    #[test]
+    fn unparsable_merge_gate_is_an_error() {
+        let config = test_config();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        std::fs::write(temp.path().join("00_summary/MERGE_GATE.json"), "{not json").unwrap();
+        let report = Report {
+            target: "feature/corrupt".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![],
+            heuristics: None,
+            artifacts_dir: temp.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: false,
+        };
+
+        assert!(build_cli_json_summary(&config, &report).is_err());
+    }
+
+    #[test]
+    fn unknown_verdict_collapses_to_block_with_an_explicit_caveat() {
+        // Collapsing to BLOCK is safe, but the reader must say it normalized
+        // rather than let the caller read it as the pack's own verdict.
+        let pack = pack_with_gate(r#"{"verdict":"PROBABLY","allow_merge":false}"#);
+        let gate = read_merge_gate_summary(pack.path()).expect("gate is readable");
+
+        assert_eq!(gate.verdict, "BLOCK");
+        let caveat = gate
+            .caveats
+            .iter()
+            .find(|c| c.starts_with("unknown_verdict:"))
+            .expect("unknown_verdict caveat present");
+        assert!(caveat.contains("PROBABLY"), "{caveat}");
+    }
+
+    #[test]
+    fn legacy_verdict_synonyms_are_folded_without_a_caveat() {
+        for (legacy, unified) in [("ALLOW", "PASS"), ("HOLD", "CONDITIONAL")] {
+            let pack = pack_with_gate(&format!(r#"{{"verdict":"{legacy}","allow_merge":false}}"#));
+            let gate = read_merge_gate_summary(pack.path()).expect("gate is readable");
+            assert_eq!(gate.verdict, unified);
+            assert!(
+                gate.caveats.is_empty(),
+                "legacy `{legacy}` is recognized vocabulary: {:?}",
+                gate.caveats
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_schema_major_fails_loud_and_newer_minor_only_caveats() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        std::fs::write(
+            temp.path().join("00_summary/MERGE_GATE.json"),
+            r#"{"schema_version":"9.0","decision":{"verdict":"PASS","allow_merge":true}}"#,
+        )
+        .unwrap();
+        let err = read_merge_gate_summary(temp.path()).expect_err("unknown major must fail loud");
+        assert!(format!("{err:#}").contains("9.0"), "{err:#}");
+
+        std::fs::write(
+            temp.path().join("00_summary/MERGE_GATE.json"),
+            r#"{"schema_version":"2.9","decision":{"verdict":"PASS","allow_merge":true,"quality_pass":true}}"#,
+        )
+        .unwrap();
+        let gate = read_merge_gate_summary(temp.path()).expect("newer minor is readable");
+        assert_eq!(gate.verdict, "PASS");
+        assert!(
+            gate.caveats
+                .iter()
+                .any(|c| c.starts_with("schema_forward_compat:")),
+            "caveats: {:?}",
+            gate.caveats
         );
     }
 
@@ -1651,6 +1849,7 @@ api-router/app/core/cache.py
             allow_merge: true,
             quality_pass: true,
             reason: Some("pre-existing findings outside the change".to_string()),
+            caveats: Vec::new(),
         };
 
         let heading = failure_summary_heading(&report, Some(&gate)).expect("heading");

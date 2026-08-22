@@ -36,6 +36,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (behavioral): an unreadable `MERGE_GATE.json` is now an execution
+  error, not a guessed verdict.** `prview --json` / `--ci` used to fall back to
+  re-deriving the decision from the in-memory policy engine when the gate
+  artifact was missing or unparsable, publishing `allow_merge = recommendation
+  != block` — the only path in the codebase where `allow_merge: true` could
+  coexist with a `CONDITIONAL` verdict, contradicting the documented
+  `allow_merge == (verdict == "PASS")` invariant. That fallback is removed:
+  a missing, unparsable, or unknown-schema gate artifact now prints an error and
+  exits `3`, the same execution-error code `prview gate` already used. This also
+  applies to `--update` runs that re-read an earlier pack, so a truncated
+  previous run reports the failure instead of resurrecting a plausible verdict.
+- **`MERGE_GATE.json` readers check `schema_version`.** A pack with an unknown or
+  unparsable MAJOR is rejected fail-loud (`exit 3` on the CLI, `storage_corrupt`
+  on the MCP surface). A newer MINOR of a known MAJOR is read and reported with a
+  `schema_forward_compat:` caveat. An absent `schema_version` stays accepted:
+  pre-2.1 packs predate the field, and the documented `ALLOW`/`HOLD` verdict
+  tolerance is unchanged.
+- **Unknown verdicts are reported instead of silently absorbed.** The CLI still
+  collapses an unrecognized verdict to `BLOCK`, but now says so through a new
+  optional `caveats` array on the `--json` summary (`unknown_verdict: …`) — the
+  reader no longer presents a normalization as something it read. The MCP
+  `verdict` surface likewise reports `unknown_verdict` /
+  `unknown_merge_recommendation` and sets `normalized: true` instead of dropping
+  the unparsable field on the floor. The `--json` summary keeps
+  `schema_version: "cli-json/v1"`: `caveats` is additive and omitted when empty.
+- Human stdout no longer prints "All checks passed!" when no gate artifact was
+  readable. The raw check tally is not a verdict; the summary now names the
+  missing truth.
+
 - **report.json schema (additive, one field now nullable).**
   `quality.coverage.heuristic_ratio` is `null` when nothing was measured
   (previously a misleading `1.0`) and is accompanied by new `measured: bool`

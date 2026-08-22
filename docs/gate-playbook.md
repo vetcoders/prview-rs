@@ -17,6 +17,12 @@ they must not parse stdout.
 Use `prview gate --json` when CI needs a machine-readable summary, artifact
 paths, or SARIF path discovery. Pass/fail still comes from the process exit code.
 
+Exit `3` covers every way the run can end without a trustworthy verdict — the
+review failing to execute, and the pack's `00_summary/MERGE_GATE.json` being
+missing, unparsable, or stamped with a `schema_version` this build cannot read.
+Plain `prview --ci` uses the same code for the same conditions: it never
+re-derives a verdict when the gate artifact cannot be read.
+
 ## Breaking-change escalation
 
 A genuine breaking API change in the diff — a removed public symbol, a changed

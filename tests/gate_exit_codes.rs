@@ -163,6 +163,77 @@ fn gate_exits_one_for_block_verdict() {
     prview_gate_command(repo).arg("gate").assert().code(1);
 }
 
+/// A pack whose `MERGE_GATE.json` is gone carries no verdict. `prview --ci` used
+/// to paper over that by re-deriving the decision from the in-memory policy
+/// engine — the one path where `allow_merge: true` could sit beside a
+/// `CONDITIONAL` verdict. The reader now fails loud with the same execution-error
+/// exit code the gate uses, and the contract has to hold at the process boundary.
+#[test]
+fn ci_run_exits_three_when_pack_has_no_merge_gate() {
+    let temp = create_gate_fixture();
+    let repo = temp.path();
+    let home = tempfile::tempdir().expect("prview home");
+    // Built once: the helper copies git into the fixture bin dir, which is not
+    // writable a second time.
+    let path = path_without_semgrep(repo);
+
+    // 1. A real run, so the pack on disk is a genuine one (metadata included).
+    let assert = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(repo)
+        .env("PATH", &path)
+        .env("PRVIEW_HOME", home.path())
+        .args(["--ci", "--quiet", "--no-zip", "--no-heuristics"])
+        .assert();
+    let first_code = assert.get_output().status.code();
+    assert!(
+        matches!(first_code, Some(0) | Some(1)),
+        "seeding run must produce a verdict, got exit {first_code:?}"
+    );
+
+    // 2. Amputate the verdict artifact, leaving an otherwise complete pack.
+    let mut removed = 0usize;
+    for gate in walk_merge_gate_json(home.path()) {
+        fs::remove_file(&gate).expect("remove MERGE_GATE.json");
+        removed += 1;
+    }
+    assert_eq!(
+        removed, 1,
+        "seeding run must write exactly one MERGE_GATE.json"
+    );
+
+    // 3. `--update` re-reads that pack (HEAD is unchanged). No verdict is
+    //    readable, so the process must report an execution error, not a guess.
+    Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(repo)
+        .env("PATH", &path)
+        .env("PRVIEW_HOME", home.path())
+        .args(["--ci", "--update", "--quiet", "--no-zip", "--no-heuristics"])
+        .assert()
+        .code(3);
+}
+
+/// Every `00_summary/MERGE_GATE.json` under a prview home.
+fn walk_merge_gate_json(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `latest` is a symlink to the newest run; following it would visit the
+        // same pack twice.
+        if path.is_symlink() {
+            continue;
+        }
+        if path.is_dir() {
+            found.extend(walk_merge_gate_json(&path));
+        } else if path.file_name().is_some_and(|n| n == "MERGE_GATE.json") {
+            found.push(path);
+        }
+    }
+    found
+}
+
 #[test]
 fn gate_exits_three_when_it_cannot_execute() {
     // Outside a git repository the review cannot run, so the gate reports an

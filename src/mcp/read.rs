@@ -692,6 +692,14 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
             format!("MERGE_GATE.json is not valid JSON: {e}"),
         )
     })?;
+    // A pack whose schema this build does not know cannot be normalized
+    // honestly: an unknown MAJOR is fail-loud, a newer MINOR is tolerated but
+    // carries a caveat. An absent `schema_version` is the documented pre-2.1
+    // read-back surface and is accepted silently.
+    let schema_caveat =
+        crate::gate::check_merge_gate_schema(value.get("schema_version").and_then(|v| v.as_str()))
+            .map_err(|e| ToolError::new(error_class::STORAGE_CORRUPT, e.to_string()))?;
+
     let decision = value.get("decision").ok_or_else(|| {
         ToolError::new(
             error_class::STORAGE_CORRUPT,
@@ -711,6 +719,31 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
 
     let merge_rank = raw_merge.as_deref().and_then(rank_from_merge_rec);
     let verdict_rank = raw_verdict.as_deref().and_then(rank_from_verdict);
+
+    // A present-but-unrecognized signal used to vanish into the `flatten()`
+    // below, so the caller saw a confident surface derived from the OTHER
+    // signal with no hint that a field had been dropped. Record it instead:
+    // the value is still not used to rank, but the reader stops pretending it
+    // read the pack cleanly. Legacy `ALLOW`/`HOLD` are recognized vocabulary,
+    // so they never land here.
+    let mut unknown_signal_caveats = Vec::new();
+    if let Some(raw) = raw_verdict.as_deref()
+        && verdict_rank.is_none()
+    {
+        unknown_signal_caveats.push(format!(
+            "unknown_verdict: MERGE_GATE.json verdict `{raw}` is not in the \
+             PASS/CONDITIONAL/BLOCK vocabulary; it was ignored when deriving this decision"
+        ));
+    }
+    if let Some(raw) = raw_merge.as_deref()
+        && merge_rank.is_none()
+    {
+        unknown_signal_caveats.push(format!(
+            "unknown_merge_recommendation: MERGE_GATE.json merge_recommendation `{raw}` is not in \
+             the approve/review_required/block vocabulary; it was ignored when deriving this \
+             decision"
+        ));
+    }
 
     // Need at least one decision signal to build a truthful surface.
     if merge_rank.is_none() && verdict_rank.is_none() {
@@ -737,10 +770,13 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     let signal_ranks: Vec<u8> = [merge_rank, verdict_rank].into_iter().flatten().collect();
     let signals_disagree = signal_ranks.iter().any(|&r| r != final_rank);
     let allow_contradicts = raw_allow.map(|a| a != allow_merge).unwrap_or(false);
-    let normalized = signals_disagree || allow_contradicts;
+    // An ignored signal is itself a normalization: the returned decision is not
+    // a faithful passthrough of what the pack says.
+    let normalized = signals_disagree || allow_contradicts || !unknown_signal_caveats.is_empty();
 
-    let mut caveats = Vec::new();
-    if normalized {
+    let mut caveats = schema_caveat.into_iter().collect::<Vec<_>>();
+    caveats.append(&mut unknown_signal_caveats);
+    if signals_disagree || allow_contradicts {
         caveats.push(format!(
             "core_inconsistency: original allow_merge={}, merge_recommendation={}, verdict={}",
             raw_allow
@@ -921,6 +957,121 @@ mod tests {
         assert!(
             !d.normalized,
             "ALLOW+allow_merge:true is self-consistent, no core_inconsistency"
+        );
+    }
+
+    #[test]
+    fn unknown_verdict_is_reported_as_normalized_with_caveat() {
+        // An unrecognized verdict used to vanish into the rank `flatten()`: the
+        // decision was derived from `merge_recommendation` alone and returned as
+        // a clean passthrough, with nothing telling the caller a field had been
+        // dropped. It must now surface as an explicit `unknown_verdict` caveat.
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "bases": ["main"],
+                "decision": {
+                    "merge_recommendation": "approve",
+                    "verdict": "MAYBE",
+                    "allow_merge": true
+                }
+            }),
+        );
+        let d = read_decision(dir.path()).unwrap();
+        assert_eq!(d.verdict, "PASS", "the recognizable signal still decides");
+        assert!(d.normalized, "an ignored signal is a normalization");
+        let caveat = d
+            .caveats
+            .iter()
+            .find(|c| c.starts_with("unknown_verdict:"))
+            .expect("unknown_verdict caveat present");
+        assert!(caveat.contains("MAYBE"), "{caveat}");
+    }
+
+    #[test]
+    fn unknown_merge_recommendation_is_reported_with_caveat() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "bases": ["main"],
+                "decision": {
+                    "merge_recommendation": "probably_fine",
+                    "verdict": "BLOCK",
+                    "allow_merge": false
+                }
+            }),
+        );
+        let d = read_decision(dir.path()).unwrap();
+        assert_eq!(d.verdict, "BLOCK");
+        assert!(d.normalized);
+        assert!(
+            d.caveats
+                .iter()
+                .any(|c| c.starts_with("unknown_merge_recommendation:")),
+            "caveats: {:?}",
+            d.caveats
+        );
+    }
+
+    #[test]
+    fn legacy_verdict_synonyms_raise_no_unknown_verdict_caveat() {
+        // The documented pre-2.1 tolerance is a safety net, not a hole: ALLOW and
+        // HOLD are recognized vocabulary and must never be reported as unknown.
+        for verdict in ["ALLOW", "HOLD"] {
+            let dir = tempfile::tempdir().unwrap();
+            write_gate(
+                dir.path(),
+                &serde_json::json!({
+                    "bases": ["main"],
+                    "decision": { "verdict": verdict, "allow_merge": verdict == "ALLOW" }
+                }),
+            );
+            let d = read_decision(dir.path()).unwrap();
+            assert!(
+                !d.caveats.iter().any(|c| c.starts_with("unknown_verdict:")),
+                "legacy `{verdict}` must stay tolerated: {:?}",
+                d.caveats
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_schema_major_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "schema_version": "9.0",
+                "bases": ["main"],
+                "decision": { "verdict": "PASS", "allow_merge": true }
+            }),
+        );
+        let err = read_decision(dir.path()).expect_err("unknown major must fail loud");
+        assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+        assert!(err.message.contains("9.0"), "{}", err.message);
+    }
+
+    #[test]
+    fn newer_schema_minor_is_tolerated_with_caveat() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "schema_version": "2.9",
+                "bases": ["main"],
+                "decision": { "verdict": "PASS", "merge_recommendation": "approve", "allow_merge": true }
+            }),
+        );
+        let d = read_decision(dir.path()).expect("newer minor is readable");
+        assert_eq!(d.verdict, "PASS");
+        assert!(
+            d.caveats
+                .iter()
+                .any(|c| c.starts_with("schema_forward_compat:")),
+            "caveats: {:?}",
+            d.caveats
         );
     }
 
