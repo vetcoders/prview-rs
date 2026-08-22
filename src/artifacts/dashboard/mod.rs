@@ -557,14 +557,15 @@ fn build_html(input: BuildHtmlInput<'_>) -> String {
         )
     };
 
-    let coverage_summary = if ctx.coverage.total_source > 0 {
-        i18n_template(
+    let coverage_summary = match ctx.coverage.pct {
+        Some(pct) => i18n_template(
             "summary.coveragePct",
-            &format!("{}% coverage", ctx.coverage.pct),
-            &[("pct", ctx.coverage.pct.to_string())],
-        )
-    } else {
-        escape_html("N/A")
+            &format!("{}% coverage", pct),
+            &[("pct", pct.to_string())],
+        ),
+        // Nothing was measured (no changed source files) — say so, do not
+        // borrow a number the heuristic never produced.
+        None => escape_html("N/A"),
     };
 
     let commit_count = diff.map(|d| d.commits.len()).unwrap_or(0);
@@ -927,12 +928,12 @@ fn build_html(input: BuildHtmlInput<'_>) -> String {
             );
         }
     }
-    if ctx.coverage.total_source > 0 {
-        if ctx.coverage.pct < 80 {
+    if let Some(pct) = ctx.coverage.pct {
+        if pct < 80 {
             let _ = write!(
                 nav,
                 "<a href=\"#section-coverage\"><span data-i18n=\"nav.coverage\">Coverage</span> <span class=\"nav-badge badge-warn\">{}</span></a>",
-                ctx.coverage.pct
+                pct
             );
         } else {
             let _ = write!(

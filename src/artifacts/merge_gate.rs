@@ -500,7 +500,7 @@ mod tests {
         CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: Vec::new(),
             covered: Vec::new(),
             non_code_count: 0,

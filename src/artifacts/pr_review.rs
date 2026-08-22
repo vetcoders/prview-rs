@@ -394,10 +394,12 @@ pub(crate) fn generate_pr_review(
             code_files, test_files
         ));
     }
-    if coverage.total_source > 0 && coverage.pct < 80 {
+    if let Some(pct) = coverage.pct
+        && pct < 80
+    {
         warnings.push(format!(
             "Coverage review signal: {}% heuristic coverage ({}/{})",
-            coverage.pct, coverage.covered_count, coverage.total_source
+            pct, coverage.covered_count, coverage.total_source
         ));
     } else if code_files > 0 && test_files == 0 {
         warnings.push(format!(

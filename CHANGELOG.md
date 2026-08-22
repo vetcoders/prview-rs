@@ -22,8 +22,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opened after it balance out, commented-out markers no longer open it, and any
   ambiguity resolves toward production — a false positive costs a reviewer a
   glance, a false negative hides a real regression.
+- Coverage no longer reports an unmeasured scan as perfect. A diff with zero
+  changed source files produced `0/0 (100%)` in `AI_INDEX.md`,
+  `coverage-delta.txt`, and the dashboard; it now reads `not measured`, and the
+  coverage card/chip/section is omitted instead of showing a fabricated 100%.
+  A real `0/N` (N > 0) is still a genuine `0%` measurement.
+- `report.json` no longer zero-fills skipped analysis. `quality.heuristics` now
+  carries `status` (`"measured"` / `"skipped"`), an optional `skip_reason`, and
+  `total_files`; a loctree run that scanned no files (or never ran) omits
+  `dead_exports`, `cycles`, `twins`, and `unused_symbols` instead of emitting
+  zeros indistinguishable from a clean scan. This matches the SKIP semantics
+  `MERGE_GATE.json` and `heuristics_loctree.result.json` already used.
 
 ### Changed
+
+- **report.json schema (additive, one field now nullable).**
+  `quality.coverage.heuristic_ratio` is `null` when nothing was measured
+  (previously a misleading `1.0`) and is accompanied by new `measured: bool`
+  and optional `not_measured_reason` fields. No field was removed or renamed.
+  Consumers reading `heuristic_ratio` must handle `null` — the bundled
+  dashboard PR-comment generator renders it as `not measured`, and
+  `history.rs` already treats a missing value as "no baseline".
 
 - Bumped the bundled `loctree` structural-analysis crate from `0.8` to `0.13.0`.
   The public API prview consumes (`analyzer::{cycles, dead_parrots, twins}`,
