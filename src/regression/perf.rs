@@ -445,9 +445,7 @@ fn blank_literals(code: &str) -> Cow<'_, str> {
 fn raw_string_end(code: &str, start: usize) -> Option<usize> {
     let bytes = code.as_bytes();
     // The prefix must be a token start, otherwise `bar"` would look like `b` + `"`.
-    if start > 0 && bytes[start - 1].is_ascii_alphanumeric()
-        || start > 0 && bytes[start - 1] == b'_'
-    {
+    if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
         return None;
     }
 
