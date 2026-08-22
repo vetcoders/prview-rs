@@ -97,7 +97,7 @@ src/
 ├── artifacts/
 │   ├── mod.rs         # Core layout, patches, merge gate, ZIP
 │   ├── signal/        # High-signal generators (one module per domain)
-│   └── dashboard.rs   # HTML dashboard
+│   └── dashboard/     # HTML dashboard generation (mod.rs, sections.rs, assets.rs, tests)
 ├── mcp/               # MCP server (stdio) for agent integrations
 ├── scope/             # Scoped review packs (filter by files/commits)
 ├── policy/            # Policy parser + blocking semantics

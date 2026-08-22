@@ -146,7 +146,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: vetcoders/prview-rs@main # pin to a released tag once one ships `prview gate`
+      - uses: vetcoders/prview-rs@v0.6.0 # pin to a released tag
         id: prview
         with:
           strict: "true"
@@ -161,9 +161,8 @@ The Action maps pass/fail only from the `prview gate` exit-code contract. JSON
 stdout is used for step-summary details and artifact paths, not for deciding
 whether the check passed. `cargo-binstall` is used when available, with
 `cargo install prview` as the fallback. Set `version` to a published release
-that contains `prview gate`, or `latest` for the newest release. The gate
-command is not in the `0.5.0` crate; until a release that includes it is
-published, install the action from `main`.
+that contains `prview gate` (`0.6.0` or newer), or `latest` for the newest
+release.
 
 GitHub code scanning accepts SARIF uploads through
 `github/codeql-action/upload-sarif`. Keep SARIF under GitHub's ingestion limits:
