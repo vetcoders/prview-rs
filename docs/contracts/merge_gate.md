@@ -183,6 +183,12 @@ by BOTH readers, not accepted by one and called corrupt by the other. The rule
 lives in one place (`gate::select_decision_object`) so the two surfaces cannot
 answer it differently again.
 
+That tolerance is about WHERE the decision sits, not about what counts as one. A
+schema-less pack whose root parses to an array, a scalar or `null` has no fields
+to read at all: it is corrupt on both readers, not a decision with every signal
+missing. Reading one as a decision produced a "successful" summary carrying a
+normalized `BLOCK` for an artifact that never stated anything.
+
 A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
 never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with
 an `unknown_verdict:` caveat, and the MCP adapter ignores it for ranking, emits
@@ -212,6 +218,20 @@ forces every decision axis conservative (`verdict: "BLOCK"`,
 `allow_merge: false`, `merge_recommendation: block`, and therefore `--ci`
 exit `1`), because a decision derived from a block this reader only partly read
 is not one it may publish as an approval.
+
+Correctly typed signals that CONTRADICT each other are reconciled the same way,
+by conservativeness rather than by field order. Each stated axis ranks
+`PASS`/`approve`/`allow_merge: true` as 1, `CONDITIONAL`/`review_required`/
+`allow_merge: false` as 2 and `BLOCK`/`block` as 3; the highest rank the pack
+states wins and every axis is published from it, with a `core_inconsistency:`
+caveat naming the originals. So `verdict: "BLOCK"` beside
+`merge_recommendation: "approve"` yields `block` on both surfaces — the CLI used
+to believe each field in turn and exit `0` on it — and `allow_merge: true`
+beside `review_required` never buys a `PASS`. Both readers rank through
+`gate::rank_from_verdict` / `gate::rank_from_merge_rec`. A recommendation
+outside the `approve` / `review_required` / `block` vocabulary cannot rank, so
+it is excluded from the reconciliation and named with an
+`unknown_merge_recommendation:` caveat rather than dropped in silence.
 
 ## Blocking rules
 

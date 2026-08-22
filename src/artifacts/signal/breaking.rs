@@ -122,9 +122,9 @@ enum DiffSide {
 struct DeclSite<'a> {
     file: &'a str,
     scope: &'a ModScope,
-    /// The `#[cfg(…)]` currently standing above the next declaration on this
-    /// side, `None` when the diff has not shown one.
-    cfg_guard: Option<&'a str>,
+    /// The `#[cfg(…)]` conjunction currently standing above the next
+    /// declaration on this side, `None` when the diff has not shown one.
+    cfg_guard: Option<&'a [String]>,
     side: DiffSide,
 }
 
@@ -138,10 +138,10 @@ struct SymbolDecl {
     text: String,
     /// Hunk-local inline-module path (`""` when the diff never showed one).
     scope: String,
-    /// The `#[cfg(…)]` predicate guarding this declaration, whitespace removed.
-    /// `None` means the diff never showed one for this side — unknown, not
-    /// "unguarded".
-    cfg_guard: Option<String>,
+    /// Every `#[cfg(…)]` predicate guarding this declaration, whitespace
+    /// removed and sorted. `None` means the diff never showed one for this
+    /// side — unknown, not "unguarded".
+    cfg_guard: Option<Vec<String>>,
     side: DiffSide,
     /// Continuation lines absorbed so far, capped by
     /// [`MAX_DECL_CONTINUATION_LINES`].
@@ -165,7 +165,8 @@ struct ModScope {
     /// `(module name, brace depth the module was opened at)`.
     stack: Vec<(String, i32)>,
     depth: i32,
-    /// Carries a `/* … */` left open by an earlier line of this side.
+    /// Carries a `/* … */` or a string literal left open by an earlier line of
+    /// this side.
     scanner: crate::rust_source::SourceScanner,
 }
 
@@ -182,9 +183,11 @@ impl ModScope {
     /// data: `const CLOSE: &str = "}";` inside `mod a` used to pop the module,
     /// leaving a later removal of `a::Config` with an unknown scope — which
     /// pairs with anything, so an unrelated `b::Config` addition cancelled a
-    /// real API removal. Block comments are tracked across lines, because
-    /// commenting a block of code out is exactly how an unbalanced brace ends
-    /// up inside one.
+    /// real API removal. Block comments AND string literals are tracked across
+    /// lines: commenting a block of code out is exactly how an unbalanced brace
+    /// ends up inside a comment, and a multi-line template or JSON fixture is
+    /// exactly how one ends up inside a literal. State is per side and per
+    /// hunk — see [`ModScope::reset`].
     fn feed(&mut self, payload: &str) {
         let code = self.scanner.code_only(payload);
         let opened = mod_opening_name(code.trim());
@@ -412,8 +415,8 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     // The `#[cfg(…)]` currently standing above the next declaration, per side.
     // Context lines feed both, so an unchanged guard above a re-emitted
     // declaration is KNOWN on both sides and the pair is not split by it.
-    let mut before_cfg: Option<String> = None;
-    let mut after_cfg: Option<String> = None;
+    let mut before_cfg: Option<Vec<String>> = None;
+    let mut after_cfg: Option<Vec<String>> = None;
 
     for line in patch.lines() {
         // Track current file from diff headers
@@ -661,11 +664,17 @@ fn find_pairable_addition(
 /// did disappear for anyone building with feature `a`, which is precisely the
 /// breaking change the report exists to name.
 ///
+/// A guard is the WHOLE conjunction of the attributes above the declaration.
+/// Keeping only the last one made `#[cfg(unix)] #[cfg(feature = "x")]` and
+/// `#[cfg(windows)] #[cfg(feature = "x")]` compare equal on the shared feature
+/// alone, so a removal that really happened on Unix paired with a Windows-only
+/// re-add and vanished.
+///
 /// An unknown guard (`None`) pairs with anything, the same tolerance
 /// [`scopes_may_pair`] gives an unseen module opener: the attribute may simply
 /// sit on a context line this hunk did not re-emit on that side, and treating
 /// "not shown" as "no cfg" would turn ordinary re-adds into phantom removals.
-fn cfgs_may_pair(removed: &Option<String>, added: &Option<String>) -> bool {
+fn cfgs_may_pair(removed: &Option<Vec<String>>, added: &Option<Vec<String>>) -> bool {
     match (removed, added) {
         (Some(removed), Some(added)) => removed == added,
         _ => true,
@@ -696,9 +705,17 @@ fn breaks_attribute_run(trimmed: &str) -> bool {
 ///
 /// Call it AFTER the line has been offered to the declaration accumulator: a
 /// declaration is guarded by the attribute above it, not by one on its own line.
-fn update_cfg_guard(pending: &mut Option<String>, trimmed: &str) {
+///
+/// Consecutive `#[cfg(…)]` attributes ACCUMULATE — stacking them is Rust's `AND`
+/// — and the accumulated set is sorted, because `#[cfg(a)] #[cfg(b)]` and
+/// `#[cfg(b)] #[cfg(a)]` gate the item identically and a reorder is not an API
+/// change.
+fn update_cfg_guard(pending: &mut Option<Vec<String>>, trimmed: &str) {
     if let Some(cfg) = cfg_attribute(trimmed) {
-        *pending = Some(cfg);
+        let guards = pending.get_or_insert_with(Vec::new);
+        guards.push(cfg);
+        guards.sort();
+        guards.dedup();
     } else if breaks_attribute_run(trimmed) {
         *pending = None;
     }
@@ -758,7 +775,7 @@ fn accumulate_decl(
         name,
         text: trimmed.to_string(),
         scope: site.scope.path(),
-        cfg_guard: site.cfg_guard.map(str::to_string),
+        cfg_guard: site.cfg_guard.map(<[String]>::to_vec),
         side: site.side,
         continuation_lines: 0,
     };
@@ -1606,6 +1623,41 @@ mod tests {
     }
 
     #[test]
+    fn a_literal_spanning_lines_does_not_pop_the_module_scope() {
+        // Same defect, one line further on: the literal OPENS on one line and
+        // closes on the next, so the tail of its body reached the tracker as
+        // code and its `}` popped `mod a`. The removal of `a::Config` then
+        // carried an unknown scope, paired with the unrelated `b::Config`
+        // addition, and the real API removal vanished from the report. Multi-
+        // line literals are not exotic here: 241 of them live in this tree and
+        // 168 carry a brace in their body.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " pub mod a {",
+                " const TEMPLATE: &str = \"opens {",
+                " closes } here\";",
+                "-    pub struct Config {",
+                "-        pub x: u32,",
+                "-    }",
+                " }",
+                " pub mod b {",
+                "+    pub struct Config {",
+                "+        pub x: u32,",
+                "+    }",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a brace inside a multi-line literal must not merge two module scopes, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn literal_brace_does_not_invent_a_module_scope() {
         // The mirror direction: an unmatched `{` in a literal used to deepen the
         // tracked scope, so a later removal and addition in the SAME module
@@ -1740,6 +1792,59 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "an identical re-add under the same cfg is not breaking, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_stack_of_cfg_attributes_is_one_guard() {
+        // Stacked attributes are Rust's AND. Keeping only the last one made
+        // these two sides compare equal on the shared `feature = "x"` alone, so
+        // a struct that really disappeared for Unix builds paired with its
+        // Windows-only re-add and left no finding.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(unix)]",
+                "-#[cfg(feature = \"x\")]",
+                "-pub struct Config;",
+                "+#[cfg(windows)]",
+                "+#[cfg(feature = \"x\")]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a re-add under a different cfg stack must not cancel the removal, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_reordered_cfg_stack_is_the_same_guard() {
+        // Guard the other direction: the conjunction is commutative, so moving
+        // one attribute above another is formatting, not an API change.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(unix)]",
+                "-#[cfg(feature = \"x\")]",
+                "-pub struct Config;",
+                "+#[cfg(feature = \"x\")]",
+                "+#[cfg(unix)]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "reordering a cfg stack is not breaking, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

@@ -304,6 +304,14 @@ do not fail the process. Add `--fail-on-warnings` to opt into exit `1` for them;
 the flag requires `--ci` and does not affect `prview gate`, whose exit codes come
 from the gate contract (see `docs/gate-playbook.md`).
 
+`--fail-on-warnings` counts the artifact pack's check list, not the CLI's own.
+The artifact run generates further checks — `public_api_diff`, `unsafe_audit`,
+`ghost_refs` and the synthetic `heuristics_loctree` — which reach
+`MERGE_GATE.json` and the dashboard but never the in-memory report the plain
+tally is built from. The `--json` summary states both numbers:
+`checks_summary.warned` is what the CLI ran, `checks_summary.warned_in_pack` is
+the complete count the flag keys off, and it is always the larger of the two.
+
 ## Examples
 
 ### Rust project

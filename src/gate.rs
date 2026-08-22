@@ -206,16 +206,104 @@ pub fn readable_signal<'v>(
 ///   clothes. `tools/validate_merge_gate.py` requires `decision` at every
 ///   version, so a reader that shrugs disagrees with the contract validator.
 ///
-/// `Err` carries the schema string for the caller to put in its own message.
-pub fn select_decision_object(value: &serde_json::Value) -> Result<&serde_json::Value, String> {
+/// The legacy tolerance is about WHERE the decision sits, not about whether the
+/// pack is a decision at all: a root that is an array, a scalar or `null` has no
+/// fields to read, and accepting it let the CLI answer a normalized BLOCK for an
+/// artifact the MCP reader called corrupt. Both now reject it.
+///
+/// `Err` describes which shape rule the pack broke; callers add their own
+/// framing.
+pub fn select_decision_object(
+    value: &serde_json::Value,
+) -> Result<&serde_json::Value, DecisionShapeError> {
     match value.get("decision") {
         Some(decision) if decision.is_object() => Ok(decision),
-        _ if value.get("schema_version").is_none() => Ok(value),
-        _ => Err(value
-            .get("schema_version")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?")
-            .to_string()),
+        _ if value.get("schema_version").is_some() => {
+            Err(DecisionShapeError::VersionedWithoutDecision(
+                value
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+            ))
+        }
+        _ if value.is_object() => Ok(value),
+        _ => Err(DecisionShapeError::NonObjectRoot(json_type_name(value))),
+    }
+}
+
+/// Why a gate pack carries no readable decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionShapeError {
+    /// The pack names its schema and then omits the object that schema is built
+    /// around.
+    VersionedWithoutDecision(String),
+    /// The pack states no schema, so its root WOULD be the decision — but the
+    /// root is not an object.
+    NonObjectRoot(&'static str),
+}
+
+impl DecisionShapeError {
+    /// The defect, as a clause a caller can put in its own sentence.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::VersionedWithoutDecision(schema) => {
+                format!("states schema_version {schema} but carries no `decision` object")
+            }
+            Self::NonObjectRoot(kind) => {
+                format!("is {kind}, not a JSON object, so it states no decision at all")
+            }
+        }
+    }
+}
+
+/// Conservativeness rank of one decision axis: 1 = clean pass, 2 = hold /
+/// review required, 3 = block.
+///
+/// Both readers reconcile a decision by taking the MAX rank across the axes the
+/// pack states, then publishing every axis from that one number. A pack whose
+/// `verdict` says BLOCK beside a `merge_recommendation` of `approve` is
+/// contradictory, and a reader that simply believes each field in turn
+/// publishes an approval the artifact never gave. The rule lives here so the
+/// CLI and the MCP adapter cannot answer it differently.
+pub fn rank_from_merge_rec(s: &str) -> Option<u8> {
+    match s.to_ascii_lowercase().as_str() {
+        "block" => Some(3),
+        "review_required" | "hold" => Some(2),
+        "approve" => Some(1),
+        _ => None,
+    }
+}
+
+pub fn rank_from_verdict(s: &str) -> Option<u8> {
+    match s.to_ascii_uppercase().as_str() {
+        "BLOCK" => Some(3),
+        // `CONDITIONAL` is the unified core vocabulary (PV-03/04); `HOLD` is the
+        // retired legacy synonym, still recognized so the adapter stays a safe
+        // read-back net for pre-2.1 runs on disk.
+        "CONDITIONAL" | "HOLD" => Some(2),
+        // `ALLOW` is the retired pre-2.1 verdict synonym for a clean pass (folded
+        // to `PASS` on the CLI `--json` surface in `output::read_merge_gate_summary`).
+        // The adapter recognizes it for the same reason it recognizes `HOLD`:
+        // a legacy gate on disk must still normalize instead of failing loud.
+        "PASS" | "APPROVE" | "ALLOW" => Some(1),
+        _ => None,
+    }
+}
+
+pub fn merge_rec_from_rank(rank: u8) -> &'static str {
+    match rank {
+        3 => "block",
+        2 => "review_required",
+        _ => "approve",
+    }
+}
+
+pub fn verdict_from_rank(rank: u8) -> &'static str {
+    match rank {
+        3 => "BLOCK",
+        2 => "CONDITIONAL",
+        _ => "PASS",
     }
 }
 

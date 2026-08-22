@@ -21,6 +21,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **String literals are tracked across lines, like block comments already were.**
+  The diff scanner blanked a literal only on the line that opened it, so the tail
+  of a multi-line template or JSON fixture reached the delimiter trackers as
+  code: its closing `"` read as an OPENER and the `}` in front of it as syntax.
+  That popped `mod a` one level early, left a removed `a::Config` with an unknown
+  scope, and an unknown scope pairs with anything — so an unrelated `b::Config`
+  addition cancelled a real API removal. The construct is not exotic here: 241
+  multi-line literals live in this tree and 168 carry a brace in their body, and
+  replaying the last 201 commits shows 29 hunk sides whose brace counting this
+  corrects (21 of them in the scope-popped-early direction, the one that HIDES a
+  breaking change). The scanner now carries an open normal or raw literal, with
+  the raw delimiter's own hash count, and forgets it at the same hunk boundary
+  where it forgets an open comment. The residual cost of carrying is a hunk that
+  STARTS mid-literal, measured at 1 in 872 over the same history, and it cannot
+  outlive the hunk.
+- **The `cfg` guard of a declaration is the whole stack of attributes above it.**
+  Stacked `#[cfg(…)]` attributes are Rust's `AND`, but only the last one was
+  recorded, so `#[cfg(unix)] #[cfg(feature = "x")] pub struct Config;` replaced
+  by the same struct under `#[cfg(windows)] #[cfg(feature = "x")]` compared equal
+  on the shared feature alone: the removal paired with the re-add and the API
+  that disappeared for Unix builds was never reported. The guard is now the
+  complete conjunction, sorted — reordering two attributes gates the item
+  identically and is not an API change.
+- **Contradictory decision signals are reconciled by conservativeness, not by
+  field order.** A gate stating `verdict: "BLOCK"` beside
+  `merge_recommendation: "approve"` is correctly typed and in vocabulary, so
+  none of the unreadable/unknown guards fired and the CLI simply believed each
+  field in turn — publishing a `BLOCK` verdict next to an `Approve`
+  recommendation and, because `compute_exit_code` keys off the recommendation,
+  exiting `0` on a gate whose own canonical artifact said BLOCK. Both readers now
+  rank every stated axis through the shared `gate::rank_from_verdict` /
+  `gate::rank_from_merge_rec` (1 = pass, 2 = hold, 3 = block), publish all axes
+  from the highest rank, and name the contradiction with a `core_inconsistency:`
+  caveat. `allow_merge: true` beside `review_required` no longer buys a `PASS`
+  either, which is the `allow_merge == (verdict == "PASS")` invariant holding on
+  contradictory packs too. A recommendation outside the vocabulary cannot rank,
+  so it is excluded and named with `unknown_merge_recommendation:` — the caveat
+  the MCP surface already emitted and the CLI did not.
+- **A gate whose root is not a JSON object is corrupt on both readers.** The
+  legacy tolerance says WHERE a schema-less pack's decision sits, not that
+  anything parseable counts as one. A `MERGE_GATE.json` holding an array, a
+  scalar or `null` was read by the CLI as a decision with every signal missing,
+  which normalized to `BLOCK` and returned a successful summary — for an artifact
+  the MCP reader rejected as `storage_corrupt`. Both now fail loud (`exit 3` /
+  `storage_corrupt`) with a message that names the actual defect.
+- **`--ci --fail-on-warnings` counts the warnings it promised to count.** The
+  flag read `Report.checks` — the list the CLI itself executed — while the
+  artifact run appends `public_api_diff`, `unsafe_audit`, `ghost_refs` and the
+  synthetic `heuristics_loctree` to the list `MERGE_GATE.json` is built from, and
+  none of those ever returns to the CLI. A run whose only warning came from one
+  of them exited `0` under a flag that promises to fail when any check warns. The
+  exit now keys off the pack's canonical `checks[]`, and the `--json` summary
+  states both numbers: `checks_summary.warned` (what the CLI ran) and the new
+  additive `checks_summary.warned_in_pack` (the complete count), which is never
+  smaller. A pack with no readable `checks` array falls back to the CLI tally and
+  says so with an `unreadable_checks:` caveat.
 - A warning is no longer reported as a failed quality check. A baseline-signal
   check that reports `Warnings` (cargo-audit raising an unmaintained-crate
   advisory, `rustfmt`, `eslint`, `ruff`, `prettier`, `stylelint`, `semgrep`) is

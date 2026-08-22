@@ -4,7 +4,10 @@
 //! (`~/.prview/`) or a run's artifact pack. No review logic lives here — the
 //! MCP surface only reads truth the core already wrote.
 
-use crate::gate::{JsonKind, readable_signal};
+use crate::gate::{
+    JsonKind, merge_rec_from_rank, rank_from_merge_rec, rank_from_verdict, readable_signal,
+    verdict_from_rank,
+};
 use crate::mcp::types::{ToolError, error_class};
 use crate::storage::{RunEntry, RunIndex};
 use std::path::{Path, PathBuf};
@@ -624,48 +627,6 @@ pub struct NormalizedDecision {
     pub normalized: bool,
 }
 
-/// Conservativeness rank: BLOCK(3) > HOLD/review_required(2) > APPROVE/PASS(1).
-fn rank_from_merge_rec(s: &str) -> Option<u8> {
-    match s.to_ascii_lowercase().as_str() {
-        "block" => Some(3),
-        "review_required" | "hold" => Some(2),
-        "approve" => Some(1),
-        _ => None,
-    }
-}
-
-fn rank_from_verdict(s: &str) -> Option<u8> {
-    match s.to_ascii_uppercase().as_str() {
-        "BLOCK" => Some(3),
-        // `CONDITIONAL` is the unified core vocabulary (PV-03/04); `HOLD` is the
-        // retired legacy synonym, still recognized so the adapter stays a safe
-        // read-back net for pre-2.1 runs on disk.
-        "CONDITIONAL" | "HOLD" => Some(2),
-        // `ALLOW` is the retired pre-2.1 verdict synonym for a clean pass (folded
-        // to `PASS` on the CLI `--json` surface in `output::read_merge_gate_summary`).
-        // The adapter recognizes it for the same reason it recognizes `HOLD`:
-        // a legacy gate on disk must still normalize instead of failing loud.
-        "PASS" | "APPROVE" | "ALLOW" => Some(1),
-        _ => None,
-    }
-}
-
-fn merge_rec_from_rank(rank: u8) -> &'static str {
-    match rank {
-        3 => "block",
-        2 => "review_required",
-        _ => "approve",
-    }
-}
-
-fn verdict_from_rank(rank: u8) -> &'static str {
-    match rank {
-        3 => "BLOCK",
-        2 => "CONDITIONAL",
-        _ => "PASS",
-    }
-}
-
 fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {
     value
         .and_then(|v| v.as_array())
@@ -705,12 +666,10 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // Demanding a nested `decision` at every version made the one shape the
     // contract explicitly tolerates come back `storage_corrupt` from this
     // surface while the CLI read it fine.
-    let decision = crate::gate::select_decision_object(&value).map_err(|schema| {
+    let decision = crate::gate::select_decision_object(&value).map_err(|shape| {
         ToolError::new(
             error_class::STORAGE_CORRUPT,
-            format!(
-                "MERGE_GATE.json states schema_version {schema} but carries no `decision` object"
-            ),
+            format!("MERGE_GATE.json {}", shape.describe()),
         )
     })?;
 
@@ -1184,6 +1143,23 @@ mod tests {
         let d = read_decision(dir.path()).expect("a legacy root-shaped pack is readable");
         assert_eq!(d.verdict, "PASS");
         assert!(d.allow_merge, "{d:?}");
+    }
+
+    #[test]
+    fn a_non_object_gate_root_is_corrupt_on_both_readers() {
+        // The legacy root tolerance covers a pack whose decision fields sit at
+        // the root — not a pack that is an array, a scalar or `null`. Those
+        // carry no fields to read, and the two readers must agree they are
+        // corrupt rather than one of them inventing a normalized BLOCK.
+        for root in ["[1,2,3]", "\"BLOCK\"", "null", "7"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("00_summary")).unwrap();
+            std::fs::write(dir.path().join("00_summary/MERGE_GATE.json"), root).unwrap();
+
+            let err = read_decision(dir.path()).expect_err("a non-object gate root is corrupt");
+            assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+            assert!(err.message.contains("not a JSON object"), "{}", err.message);
+        }
     }
 
     #[test]
