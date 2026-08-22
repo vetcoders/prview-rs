@@ -204,7 +204,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scan — for a dependency-changing PR, the case where the two differ most. A
   snapshot that carries those links is now `snapshot-borrowed-deps`: the
   reviewed source is exactly the target, the dependencies are borrowed. A repo
-  with no local dependency tree links nothing and stays `snapshot`.
+  with no local dependency tree links nothing and stays `snapshot`, and the
+  label is applied per check rather than per directory — a link only counts
+  against a command that can read it. The JS checks resolve their toolchain
+  through `node_modules`; cargo and Semgrep read nothing through it, so a mixed
+  repository no longer downgrades their provenance, and the Python checks run
+  against the per-commit `UV_PROJECT_ENVIRONMENT` rather than the linked
+  `.venv`, so they stay `snapshot` too.
 
 ### Changed
 

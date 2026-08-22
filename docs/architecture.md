@@ -392,9 +392,14 @@ Every check records a `CheckProvenance` alongside its result: `command`,
     while the compiler, plugins, type definitions and runtime the tools loaded
     came from the local checkout. A dependency-changing PR is where those
     differ, so such a run is not reported as an exact snapshot scan. Reported
-    only when the links actually exist — a repo with no local dependency tree
-    links nothing and stays `snapshot`. Installing the target's own dependencies
-    instead is a network operation of unbounded cost and is not attempted;
+    only when the links actually exist **and the check reads them** — a repo with
+    no local dependency tree links nothing and stays `snapshot`, and so does a
+    cargo or Semgrep run in a mixed repository that merely happens to have
+    `node_modules` linked. The JS checks (TypeScript, ESLint, Vitest, Stylelint)
+    resolve their toolchain through `node_modules`; the Python checks resolve
+    theirs through the per-commit `UV_PROJECT_ENVIRONMENT` prview points uv at,
+    never the linked `.venv`. Installing the target's own dependencies instead is
+    a network operation of unbounded cost and is not attempted;
   - `local-clean` — repo working tree, nothing uncommitted;
   - `local-dirty` — repo working tree with uncommitted changes — the scanned
     bytes are **not** exactly `target_sha`;

@@ -615,6 +615,7 @@ impl Check for CargoCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,
@@ -699,6 +700,7 @@ impl Check for ClippyCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,
@@ -810,6 +812,7 @@ impl Check for CargoTestCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,
@@ -895,6 +898,7 @@ impl Check for RustfmtCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,
@@ -1010,6 +1014,7 @@ impl Check for CargoAuditCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,
@@ -1208,6 +1213,7 @@ impl Check for CargoGeigerCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,

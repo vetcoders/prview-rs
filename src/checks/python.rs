@@ -286,7 +286,7 @@ impl Check for RuffCheck {
                     target_sha: None,
                     tree_state: None,
                 }
-                .with_scan_substrate(run_dir, &config.repo_root),
+                .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
         })
     }
@@ -387,7 +387,7 @@ impl Check for MypyCheck {
                     target_sha: None,
                     tree_state: None,
                 }
-                .with_scan_substrate(run_dir, &config.repo_root),
+                .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
         })
     }
@@ -493,7 +493,7 @@ impl Check for PytestCheck {
                     target_sha: None,
                     tree_state: None,
                 }
-                .with_scan_substrate(run_dir, &config.repo_root),
+                .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
         })
     }
