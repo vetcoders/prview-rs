@@ -43,7 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that never ran: a check ruled out during eligibility (tests disabled, a tool
   missing) was omitted entirely, which reads exactly like a gate that was never
   part of the run. Such a check now gets a row with every substrate field null
-  and a `skipped` reason; rows for checks that ran carry `skipped: null`. A
+  and a `skipped` reason; rows for checks that ran carry `skipped: null`. Those
+  rows identify the gate through the canonical name→id mapper, like every other
+  id in the pack: a skipped check was labelled with a naive slug of its display
+  name, so the same configured gate appeared as `typescript` when skipped and
+  `tsc` when it ran (likewise `cargo_check`/`cargo`, `vitest`/`tests`) and could
+  not be correlated. `REPORT.json.checks_skipped[]` is corrected with it. A
   reviewer holding
   only the artifacts no longer has to reconstruct the run's substrate from
   scattered gate files. Purely additive: no existing pack file changed shape,

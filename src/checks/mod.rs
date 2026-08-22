@@ -714,9 +714,19 @@ where
     Ok((results, skipped))
 }
 
+/// A skipped check identifies itself the way every other check does.
+///
+/// The id used to be a naive slug — a fourth copy of the normalisation
+/// `crate::check_id` exists to be the canon of. It agrees with the alias table
+/// for most names and silently disagrees for the aliased ones, so the same
+/// configured gate appeared as `typescript` where it ran and as `tsc` where it
+/// was skipped (likewise `cargo_check`/`cargo`, `vitest`/`tests`). Both ids
+/// reach the artifacts — `REPORT.json.checks_skipped[]` and the skipped rows in
+/// `PROVENANCE.json.checks[]` — so a consumer could not correlate a skip with
+/// the gate it belongs to.
 fn build_skipped_check(check: &dyn Check, reason: String) -> SkippedCheck {
     let name = check.name().to_string();
-    let id = name.to_lowercase().replace([' ', '-', '/'], "_");
+    let id = crate::check_id::check_id_from_name(&name);
 
     SkippedCheck { id, name, reason }
 }
@@ -1379,6 +1389,32 @@ mod tests {
         config.use_cache = false;
         config.create_zip = false;
         config
+    }
+
+    /// A gate must carry the same id whether it ran or was ruled out. The naive
+    /// slug agreed with the alias table for most names and disagreed exactly
+    /// where an alias exists, so the same configured check appeared under two
+    /// ids in the same pack and no consumer could pair them.
+    #[test]
+    fn a_skipped_check_keeps_the_canonical_gate_id() {
+        for (check, id) in [
+            (&cargo::CargoCheck as &dyn Check, "cargo"),
+            (&typescript::TypeScriptCheck, "tsc"),
+            (&typescript::VitestCheck, "tests"),
+        ] {
+            let skipped = build_skipped_check(check, "tool missing".to_string());
+            assert_eq!(
+                skipped.id,
+                id,
+                "{} must be identified as the gate it is, not as a slug of its display name",
+                check.name(),
+            );
+            assert_eq!(
+                skipped.id,
+                crate::check_id::check_id_from_name(check.name()),
+                "the skipped id must come from the canonical mapper",
+            );
+        }
     }
 
     /// Minimal git fixture: an initialised repo with one commit, returning the

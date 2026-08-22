@@ -560,7 +560,11 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   one that did not: a gate ruled out during eligibility (tests disabled, a tool
   absent) never reaches RUN.json's `checks[]`, and omitting it here too made a
   deliberate skip indistinguishable from a gate that was never part of the run.
-  Those rows have every substrate field `null`, because nothing was read. The
+  Those rows have every substrate field `null`, because nothing was read. Their
+  `id` comes from the same canonical mapper as every executed row
+  (`check_id_from_name`): a skipped gate is `tsc`, `cargo` or `tests`, never the
+  slug of its display name, so a consumer can pair the skip with the gate it
+  belongs to. `REPORT.json.checks_skipped[]` carries the same id. The
   synthetic `heuristics_loctree` row is included: Loctree runs in-process rather
   than as a subprocess (`command` is `loctree (in-process)`), but it still reads
   a tree — the `git archive` extraction of the target commit in snapshot mode,
