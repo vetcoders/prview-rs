@@ -748,8 +748,9 @@ pub struct WorktreeProvenance {
     /// No staged, unstaged, or untracked changes at capture time.
     pub clean: bool,
     /// `sha256:<hex>` over the canonical `XY <path>` rendering of the status
-    /// (see [`render_status_porcelain`]). `None` when the repository could not
-    /// be inspected — an unknown fingerprint stays visibly unknown.
+    /// PLUS the current bytes of every dirty path (see
+    /// [`render_status_fingerprint`]). `None` when the repository could not be
+    /// inspected — an unknown fingerprint stays visibly unknown.
     pub status_digest: Option<String>,
 }
 
@@ -782,9 +783,10 @@ pub(crate) fn capture_worktree_provenance(repo_root: &std::path::Path) -> Worktr
         };
     };
 
-    let porcelain = render_status_porcelain(&statuses);
+    let workdir = repo.workdir().map(|dir| dir.to_path_buf());
+    let fingerprint = render_status_fingerprint(&statuses, workdir.as_deref());
     let mut hasher = Sha256::new();
-    hasher.update(porcelain.as_bytes());
+    hasher.update(fingerprint.as_bytes());
 
     WorktreeProvenance {
         clean: statuses.is_empty(),
@@ -792,55 +794,118 @@ pub(crate) fn capture_worktree_provenance(repo_root: &std::path::Path) -> Worktr
     }
 }
 
-/// Render the status entries in the shape of `git status --porcelain`: one
-/// sorted `XY <path>` line per entry, index status first, worktree status
-/// second, untracked entries as `??`.
+/// The status rendering plus the current CONTENT of every dirty path.
 ///
-/// This is a canonical *rendering*, not a capture of the CLI's stdout — it is a
-/// fingerprint of what was dirty, so it must be stable across git versions and
-/// locales rather than byte-identical to any one `git status` invocation.
-fn render_status_porcelain(statuses: &git2::Statuses<'_>) -> String {
-    use git2::Status;
-
+/// The status set alone cannot tell two runs apart: editing the same tracked
+/// file to different text leaves the same `M <path>` line, so a status-only
+/// digest claimed two materially different substrates were the same one. Each
+/// entry therefore carries a fingerprint of the bytes on disk right now:
+/// `blob:<len>:<sha256>` for a regular file, the hashed target for a symlink,
+/// `dir` for a directory (a submodule gitlink), `absent` for a deleted path and
+/// `unreadable` when the bytes cannot be read.
+///
+/// Only the dirty subset is read — a clean tree hashes nothing, and every scan
+/// prview runs afterwards (semgrep, loctree, the language checks) reads far more
+/// of the tree than this does.
+fn render_status_fingerprint(statuses: &git2::Statuses<'_>, workdir: Option<&Path>) -> String {
     let mut lines: Vec<String> = statuses
         .iter()
         .map(|entry| {
-            let status = entry.status();
             let path = entry.path().unwrap_or("<non-utf8>").to_string();
-            if status.contains(Status::WT_NEW) && !status.intersects(Status::INDEX_NEW) {
-                return format!("?? {path}");
-            }
-            let index = if status.contains(Status::INDEX_NEW) {
-                'A'
-            } else if status.contains(Status::INDEX_MODIFIED) {
-                'M'
-            } else if status.contains(Status::INDEX_DELETED) {
-                'D'
-            } else if status.contains(Status::INDEX_RENAMED) {
-                'R'
-            } else if status.contains(Status::INDEX_TYPECHANGE) {
-                'T'
-            } else {
-                ' '
-            };
-            let worktree = if status.contains(Status::WT_NEW) {
-                'A'
-            } else if status.contains(Status::WT_MODIFIED) {
-                'M'
-            } else if status.contains(Status::WT_DELETED) {
-                'D'
-            } else if status.contains(Status::WT_RENAMED) {
-                'R'
-            } else if status.contains(Status::WT_TYPECHANGE) {
-                'T'
-            } else {
-                ' '
-            };
-            format!("{index}{worktree} {path}")
+            let content = workdir.map_or_else(
+                || "unknown".to_string(),
+                |dir| content_fingerprint(&dir.join(&path)),
+            );
+            format!("{} {path}\0{content}", status_codes(entry.status()))
         })
         .collect();
     lines.sort();
     lines.join("\n")
+}
+
+/// Fingerprint the bytes currently at `path`, without loading the file whole.
+fn content_fingerprint(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        // The path is gone (a deletion) — that IS its state.
+        return "absent".to_string();
+    };
+
+    if meta.is_symlink() {
+        return match std::fs::read_link(path) {
+            Ok(target) => {
+                let mut hasher = Sha256::new();
+                hasher.update(target.as_os_str().as_encoded_bytes());
+                format!("symlink:{:x}", hasher.finalize())
+            }
+            Err(_) => "unreadable".to_string(),
+        };
+    }
+    if meta.is_dir() {
+        // A gitlink (submodule) entry: its contents belong to another
+        // repository, so the superproject records only that it is a directory.
+        return "dir".to_string();
+    }
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return "unreadable".to_string();
+    };
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut len: u64 = 0;
+    loop {
+        match std::io::Read::read(&mut file, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                len += n as u64;
+                hasher.update(&buf[..n]);
+            }
+            Err(_) => return "unreadable".to_string(),
+        }
+    }
+    format!("blob:{len}:{:x}", hasher.finalize())
+}
+
+/// The `XY` status pair in the shape of `git status --porcelain`: index status
+/// first, worktree status second, an untracked entry as `??`.
+///
+/// This is a canonical *rendering*, not a capture of the CLI's stdout — it is
+/// part of a fingerprint, so it must be stable across git versions and locales
+/// rather than byte-identical to any one `git status` invocation.
+fn status_codes(status: git2::Status) -> String {
+    use git2::Status;
+
+    if status.contains(Status::WT_NEW) && !status.intersects(Status::INDEX_NEW) {
+        return "??".to_string();
+    }
+    let index = if status.contains(Status::INDEX_NEW) {
+        'A'
+    } else if status.contains(Status::INDEX_MODIFIED) {
+        'M'
+    } else if status.contains(Status::INDEX_DELETED) {
+        'D'
+    } else if status.contains(Status::INDEX_RENAMED) {
+        'R'
+    } else if status.contains(Status::INDEX_TYPECHANGE) {
+        'T'
+    } else {
+        ' '
+    };
+    let worktree = if status.contains(Status::WT_NEW) {
+        'A'
+    } else if status.contains(Status::WT_MODIFIED) {
+        'M'
+    } else if status.contains(Status::WT_DELETED) {
+        'D'
+    } else if status.contains(Status::WT_RENAMED) {
+        'R'
+    } else if status.contains(Status::WT_TYPECHANGE) {
+        'T'
+    } else {
+        ' '
+    };
+    format!("{index}{worktree}")
 }
 
 pub(crate) fn classify_quality_failure(

@@ -410,8 +410,9 @@ When a generator produces no file, the CLI prints an `i` note explaining why.
 
 - `00_summary/MERGE_GATE.json` is the canonical source of check statuses.
 - `00_summary/PROVENANCE.json` answers *what was judged*: the target/base/head commits, whether the local
-  working tree was clean when the run started (plus a digest fingerprinting what was dirty), and, per check,
-  the directory and commit it actually read. A `cached: true` row replays the provenance of the earlier run
+  working tree was clean when the run started (plus a digest fingerprinting what was dirty, content included),
+  and, per check, the directory and commit it actually read. `base_sha` is the merge base the diff was really
+  computed from, not the tip of the base branch. A `cached: true` row replays the provenance of the earlier run
   that filled the cache entry.
 - `PR_REVIEW.md` is a concise review narrative, not a raw log dump.
 - `00_summary/FAILURES_SUMMARY.md` summarizes blocking failures and advisories without copying whole JSON files.

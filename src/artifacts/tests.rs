@@ -4944,6 +4944,19 @@ fn write_provenance_fixture(
     out: &Path,
     checks: &[CheckResult],
 ) -> serde_json::Value {
+    write_provenance_fixture_with_diffs(repo_root, out, checks, &[])
+}
+
+/// Base tip the operator names, distinct from the merge base a diverged branch
+/// is actually diffed against.
+const PROVENANCE_BASE_TIP: &str = "def5678def5678def5678def5678def5678de";
+
+fn write_provenance_fixture_with_diffs(
+    repo_root: &Path,
+    out: &Path,
+    checks: &[CheckResult],
+    diffs: &[Diff],
+) -> serde_json::Value {
     let repo = Repository::open(repo_root).expect("open repo");
     let worktree = capture_worktree_provenance(repo_root);
     let resolved_target = ResolvedRef {
@@ -4953,7 +4966,7 @@ fn write_provenance_fixture(
     };
     let resolved_bases = vec![ResolvedRef {
         name: "origin/main".to_string(),
-        commit_id: "def5678def5678def5678def5678def5678de".to_string(),
+        commit_id: PROVENANCE_BASE_TIP.to_string(),
         is_remote: true,
     }];
 
@@ -4961,6 +4974,7 @@ fn write_provenance_fixture(
         dir: out,
         repo: &repo,
         checks,
+        diffs,
         resolved_target: &resolved_target,
         resolved_bases: &resolved_bases,
         worktree_clean: worktree.clean,
@@ -5028,6 +5042,41 @@ fn provenance_json_records_pack_level_substrate() {
 }
 
 #[test]
+fn provenance_json_base_sha_is_the_commit_the_diff_used() {
+    // Diverged branches: the patch is generated from the merge base, while
+    // `resolved_bases` still holds the base TIP the operator named. Recording
+    // the tip would name a commit no diff in the pack was computed against.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+    let merge_base = "1111111111111111111111111111111111111111";
+
+    let diffs = vec![Diff {
+        target: "feature/provenance".to_string(),
+        base: "origin/main".to_string(),
+        target_commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        base_commit_id: merge_base.to_string(),
+        files: vec![],
+        stats: DiffStats {
+            files_changed: 0,
+            additions: 0,
+            deletions: 0,
+            copied: 0,
+        },
+        commits: vec![],
+    }];
+
+    let json = write_provenance_fixture_with_diffs(repo_tmp.path(), out.path(), &[], &diffs);
+    assert_eq!(
+        json["base_sha"], merge_base,
+        "base_sha must name the baseline the patch was produced from",
+    );
+    assert_ne!(
+        json["base_sha"], PROVENANCE_BASE_TIP,
+        "the base tip is not what the diff compared against",
+    );
+}
+
+#[test]
 fn provenance_json_worktree_reflects_dirty_tree() {
     let (repo_tmp, _head) = provenance_fixture_repo();
     let out = tempfile::tempdir().expect("out tempdir");
@@ -5045,5 +5094,42 @@ fn provenance_json_worktree_reflects_dirty_tree() {
     assert_ne!(
         dirty["worktree"]["status_digest"], clean["worktree"]["status_digest"],
         "the digest must fingerprint WHAT is dirty, not just that something is"
+    );
+}
+
+#[test]
+fn worktree_digest_separates_runs_that_differ_only_in_content() {
+    // Two runs can dirty exactly the same paths with exactly the same status
+    // codes and still have judged different bytes. A status-set-only digest
+    // collides there, so the fingerprint promises more than it delivers.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let repo = repo_tmp.path();
+
+    // `own.rs` is the fixture's committed file — editing it yields an `M` entry.
+    let tracked = repo.join("own.rs");
+    fs::write(&tracked, "pub fn v1() {}\n").expect("write tracked");
+    let untracked = repo.join("scratch.rs");
+    fs::write(&untracked, "pub fn a() {}\n").expect("write untracked");
+    let first = capture_worktree_provenance(repo);
+
+    // Same paths, same `M`/`??` codes — different bytes.
+    fs::write(&tracked, "pub fn v2_completely_different() {}\n").expect("rewrite tracked");
+    fs::write(&untracked, "pub fn b() {}\n").expect("rewrite untracked");
+    let second = capture_worktree_provenance(repo);
+
+    assert_eq!(first.clean, second.clean, "both runs are dirty");
+    assert_ne!(
+        first.status_digest, second.status_digest,
+        "differently-dirty runs must be distinguishable, which is what the digest claims",
+    );
+
+    // Restoring the exact bytes restores the exact fingerprint: the digest is a
+    // function of the tree, not of time or run order.
+    fs::write(&tracked, "pub fn v1() {}\n").expect("restore tracked");
+    fs::write(&untracked, "pub fn a() {}\n").expect("restore untracked");
+    assert_eq!(
+        capture_worktree_provenance(repo).status_digest,
+        first.status_digest,
+        "the same tree state must fingerprint identically",
     );
 }

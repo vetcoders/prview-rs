@@ -327,15 +327,22 @@ unknown instead of being recorded as clean. They surface in
 `00_summary/RUN.json` (`checks[]`), `00_summary/PROVENANCE.json` and
 `report.json` (`checks[]`).
 
-**Cache hits carry provenance too.** When a check result is cached, its
-provenance is serialized next to the entry (`<key>.prov.json` under the check's
-cache directory) and replayed on the next hit. The replayed record describes the
-run that *populated* the entry — its `cwd`, `started_at`, `target_sha` and
-`tree_state` — and `cached: true` on the result is what marks it as a replay
-rather than a fresh execution. Without this the fastest runs (all-cache-hit)
-were the only ones with no audit trail at all. Entries written before the
-sidecar existed, or whose blob no longer parses, replay with no provenance
-instead of failing the run.
+**Cache hits carry provenance too.** When a check result is cached, its status,
+output and provenance are stored as **one JSON entry** (`<key>` under the
+check's cache directory) and replayed together on the next hit. The replayed
+record describes the run that *populated* the entry — its `cwd`, `started_at`,
+`target_sha` and `tree_state` — and `cached: true` on the result is what marks
+it as a replay rather than a fresh execution. Without this the fastest runs
+(all-cache-hit) were the only ones with no audit trail at all.
+
+The entry is written to a `<key>.tmp-<pid>-<nanos>` staging file and published
+with a single `fs::rename`, so a concurrent reader sees either the old entry or
+the new one — never a result paired with another run's provenance. Staging files
+are excluded from lookups and from `cleanup()`. Older packs wrote the status,
+the `.log` output and the `.prov.json` provenance as three separate files; those
+legacy triples are still read (so a warm cache survives the upgrade) and are
+removed the first time the key is rewritten. An entry whose blob no longer
+parses replays with no provenance instead of failing the run.
 
 #### Pack-level provenance — `00_summary/PROVENANCE.json`
 
@@ -343,17 +350,36 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
 "what did *this pack* judge", once, for a reviewer holding only the artifacts:
 
 - `target_sha` — commit whose tree the pack judges;
-- `base_sha` — first resolved diff baseline;
+- `base_sha` — the baseline the diff was actually generated from, i.e. the
+  **merge base** taken from the first diff (`Diff.base_commit_id`), not the tip
+  of the base branch. The two differ whenever the base moved ahead of the branch
+  point, and the patch, the changed-file list and every diff-scoped gate are all
+  computed against the merge base — so recording the tip would describe a
+  comparison the pack never made. It falls back to the first resolved base ref
+  only when there is no diff at all;
 - `head_sha` — commit checked out locally (equal to `target_sha` for an ordinary
   local review, different under `--pr`/`--remote`);
 - `worktree.clean` — whether the local tree had uncommitted changes, frozen
   **before** any check ran or artifact was written (R4-19);
-- `worktree.status_digest` — `sha256:<hex>` over a canonical `XY <path>`
-  rendering of the working-tree status, from the *same* read as `clean`, so two
-  differently-dirty runs are distinguishable. It is a stable fingerprint, not a
+- `worktree.status_digest` — `sha256:<hex>` over a canonical rendering of the
+  working-tree status, from the *same* read as `clean`. Each line is
+  `XY <path>\0<content>`, where `<content>` fingerprints the file the entry
+  points at: `blob:<len>:<sha256>` for a regular file (streamed, so a large file
+  is not held in memory), `symlink:<sha256>` over the link target, `dir`,
+  `absent` when the path is gone, `unreadable` on an IO error. Paths alone
+  identify *which* files are modified, not *how*; two runs that touch the same
+  files with different content are different substrates and must not share a
+  digest. Only the dirty subset is hashed. It is a stable fingerprint, not a
   capture of a specific `git status --porcelain` stdout;
 - `checks[]` — one row per check: `{id, cwd, target_sha, tree_state, started_at,
   cached}`, with `null` fields for a check that produced no provenance.
+
+The worktree state is frozen **per run**, and a `--watch` iteration is a run:
+each iteration re-reads the working tree before its checks, so the pack it emits
+describes the tree that iteration analysed rather than the tree as it looked
+when the watcher started. (With an in-repo `--output-dir` this means later
+iterations legitimately report *dirty* — they can see the previous iteration's
+artifacts. The default output root is `~/.prview/runs`, outside the repo.)
 
 The file is purely additive: no other pack file changed shape for it. It is
 hashed by `MANIFEST.json` like any other artifact and listed in the sanity

@@ -448,6 +448,12 @@ impl App {
     /// Quick run for watch mode (skip heavy checks)
     async fn run_quick(&self) -> Result<output::Report> {
         let run_started_at = Instant::now();
+        // `--watch` builds ONE App and then produces a pack per detected edit,
+        // so the state frozen at construction describes the tree as it was when
+        // the watcher started — by definition not the tree that just changed.
+        // Each iteration is its own run and freezes its own worktree state, at
+        // the start of that run and before this pack is written.
+        let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
         let target = self.repo.resolve_target(&self.config)?;
         let bases = if self.config.current_only {
             Vec::new()
@@ -471,8 +477,8 @@ impl App {
             resolved_bases: &bases,
             run_start: run_started_at,
             skipped_checks: vec![],
-            worktree_clean: self.worktree_clean_at_start,
-            worktree_status_digest: self.worktree_status_digest_at_start.clone(),
+            worktree_clean: worktree.clean,
+            worktree_status_digest: worktree.status_digest.clone(),
         })?;
 
         Ok(output::Report {
@@ -809,6 +815,66 @@ mod tests {
             commit_id: sha.to_string(),
             is_remote: false,
         }
+    }
+
+    /// `--watch` reuses ONE `App` for every pack it emits, so worktree state
+    /// frozen at construction describes the tree as it was when the watcher
+    /// started — never the edit that triggered this iteration. Each quick run
+    /// must freeze its own.
+    #[tokio::test]
+    async fn watch_iterations_record_their_own_worktree_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git_run(repo, &["init", "-q", "-b", "main"]);
+        git_run(repo, &["config", "user.email", "t@t.t"]);
+        git_run(repo, &["config", "user.name", "T"]);
+        git_run(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn keep() {}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "base"]);
+        git_run(repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("src/lib.rs"), "pub fn keep() {}\n// edit\n").unwrap();
+        git_run(repo, &["commit", "-qam", "feature"]);
+
+        let out = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.repo_root = repo.to_path_buf();
+        config.target = Some("feature".to_string());
+        config.bases = vec!["main".to_string()];
+        config.output_dir = Some(out.path().to_path_buf());
+        config.run_heuristics = false;
+        config.quiet = true;
+        config.create_zip = false;
+
+        // The App is built while the tree is clean — as a watcher's is.
+        let app = crate::App::from_config(config).unwrap();
+        assert!(app.worktree_clean_at_start, "fixture starts clean");
+
+        // A watched edit lands, then the iteration runs.
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn keep() {}\n// watched edit\n",
+        )
+        .unwrap();
+        let report = app.run_quick().await.unwrap();
+
+        let provenance: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(report.artifacts_dir.join("00_summary/PROVENANCE.json"))
+                .expect("PROVENANCE.json"),
+        )
+        .expect("parse PROVENANCE.json");
+
+        assert_eq!(
+            provenance["worktree"]["clean"], false,
+            "the pack must describe the tree this iteration ran on, not the one \
+             the watcher started with",
+        );
+        assert_ne!(
+            provenance["worktree"]["status_digest"].as_str(),
+            app.worktree_status_digest_at_start.as_deref(),
+            "a re-frozen digest must differ from the watcher's start-of-process one",
+        );
     }
 
     /// The snapshot-regression base must be exactly the base ref handed to
