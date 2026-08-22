@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A test marker on a body-less item no longer mutes the rest of its hunk.**
+  The performance-regression tracker closed a test context only when its opening
+  brace balanced again, but `#[cfg(test)] mod tests;` and `#[cfg(test)] use
+  crate::helper;` never open one. The context stayed active for the remainder of
+  the hunk, so production loops and queries added below such a declaration were
+  recorded as test-only and disappeared from the signal. A context opened over an
+  item that ends at its `;` now closes there.
 - **A long signature change is no longer swallowed by the accumulation cap.**
   Declaration text stopped accumulating after eight continuation lines, which
   cuts inside the real distribution of `pub` signatures: two long declarations

@@ -324,6 +324,13 @@ worse than an unknown token: its body is then read as code, and the first
 interior `"` opens a phantom literal. That state is per side and per hunk: a
 hunk boundary is where contiguity ends, and every consumer resets there.
 
+The perf tracker's test context closes two ways, because not every test item has
+a body. One that opens a brace closes when that brace balances again; one that
+does not — `#[cfg(test)] mod tests;`, `#[cfg(test)] use crate::helper;` — closes
+at the `;` ending the item the marker annotates. Waiting for a brace that never
+comes left the context open for the rest of the hunk, and every production loop
+and query below it was recorded as test-only and dropped from the signal.
+
 #### signal/coverage.rs — coverage delta computation
 
 Cross-references changed source files with test files to estimate test coverage:
