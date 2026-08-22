@@ -182,7 +182,12 @@ legacy tolerance of reading its root as the decision.
 A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
 never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with
 an `unknown_verdict:` caveat, and the MCP adapter ignores it for ranking, emits
-the same caveat, and sets `normalized: true`.
+the same caveat, and sets `normalized: true`. A verdict the CLI substituted this
+way also governs everything derived beside it: `allow_merge` is forced `false`
+and `merge_recommendation` to `block`, whatever the same decision block claimed.
+A pack whose verdict could not be read is not a pack whose approval can be
+trusted, and the exit code follows the recommendation — so the invariant
+`allow_merge == (verdict == "PASS")` holds on the substituted verdict too.
 
 The accepted version set is exactly the one `tools/validate_merge_gate.py`
 accepts, compared as written — a spelling that merely parses to a known tuple
