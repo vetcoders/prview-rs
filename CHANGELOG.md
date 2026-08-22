@@ -81,7 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Rust checkout, and the cargo gates used to report cargo's own "could not find
   `Cargo.toml`" as that commit's verdict. The manifest is now looked up in the
   target commit's tree — no worktree materialised to ask — and the checks skip
-  with a reason when the reviewed commit is not a cargo project.
+  with a reason when the reviewed commit is not a cargo project. A crate the
+  reviewed branch merely *moved* (a root workspace pushed into `backend/`) is
+  found where it now lives, as long as exactly one directory within two levels
+  carries a manifest; several candidates skip with a reason naming them rather
+  than guessing which crate the review is about.
 - Cargo check cache keys now name the substrate they judge. The cached-result
   lookup happens before the target snapshot is materialised, so a `--pr` run
   could hit an entry a previous local run had stored under the same working-tree
@@ -103,6 +107,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anyway — the reviewed commit's name on a foreign tree's verdict, the same
   false-verdict class the snapshot move fixed. Those runs now **skip** the cargo
   checks with a reason naming the unreachable root; local reviews are unchanged.
+  The same refusal now survives a target-controlled `backend/` **symlink** into
+  an external directory, which carries no `..` and passed the lexical check:
+  resolving the root from the git tree cannot follow a symlink out of the
+  reviewed commit, and a resolved path that still leaves the snapshot is refused
+  instead of producing a foreign tree's verdict cached under that commit.
 - A cargo root that the reviewed branch moved (a root crate pushed into
   `backend/`, a member renamed) is no longer projected into the snapshot
   verbatim. The locally detected path does not exist there, so cargo failed on a
