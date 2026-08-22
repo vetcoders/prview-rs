@@ -334,6 +334,15 @@ fn missing_reviewed_cargo_manifest(config: &Config) -> Option<String> {
 /// repo-root lockfile in whenever the cargo root differs from the repo root so
 /// such a bump invalidates the member key.
 fn cargo_content_hash(config: &Config) -> String {
+    let base = cargo_substrate_hash(config);
+    match unlocked_substrate_stamp(config) {
+        Some(day) => format!("{base}-unlocked-{day}"),
+        None => base,
+    }
+}
+
+/// The substrate half of [`cargo_content_hash`], without the freshness stamp.
+fn cargo_substrate_hash(config: &Config) -> String {
     if let Some(commit) = reviewed_substrate_key(config) {
         return commit;
     }
@@ -348,6 +357,60 @@ fn cargo_content_hash(config: &Config) -> String {
             cache::cargo_lock_hash(&config.repo_root)
         )
     }
+}
+
+/// Freshness stamp for a substrate whose dependencies are not pinned.
+///
+/// A commit is a permanent content key only for what the commit CONTAINS.
+/// Without a committed `Cargo.lock`, cargo resolves the dependency graph when it
+/// runs — in a throwaway snapshot, from a registry that keeps moving — so a
+/// semver-compatible release published after the first review can change what
+/// builds while the entry keyed on the commit alone replays the old verdict
+/// until eviction. The local path has the same gap: `rust_hash` folds in a
+/// `Cargo.lock` that is not there.
+///
+/// Appending the day bounds that staleness without throwing the cache away:
+/// repeated runs within a session (the case the cache exists for) still hit, and
+/// tomorrow's run resolves again. It is the shape `Cargo audit` already uses for
+/// advisories, which age the same way.
+///
+/// Only a lockfile that is PROVEN absent stamps: when git cannot answer, the key
+/// stays as it was rather than churning on an unrelated failure.
+fn unlocked_substrate_stamp(config: &Config) -> Option<String> {
+    if substrate_has_lockfile(config) {
+        return None;
+    }
+    Some(Local::now().format("%Y-%m-%d").to_string())
+}
+
+/// Whether the tree this run judges pins its dependency set.
+///
+/// The reviewed commit is asked through git (no snapshot needed); a local review
+/// — and an off-`HEAD` run whose repository git cannot read — is answered from
+/// the working tree. Both look at the cargo root first and the repo root second,
+/// because a workspace member resolves from the workspace lockfile.
+fn substrate_has_lockfile(config: &Config) -> bool {
+    if let (Some(commit), ReviewedCargoRoot::Resolved(relative)) = (
+        off_head_target_commit(config),
+        resolve_reviewed_cargo_root(config),
+    ) && let Ok(repo) = crate::git::Repository::open(&config.repo_root)
+    {
+        return [relative.as_str(), ""].into_iter().any(|dir| {
+            let path = if dir.is_empty() {
+                "Cargo.lock".to_string()
+            } else {
+                format!("{dir}/Cargo.lock")
+            };
+            // An unanswerable lookup counts as locked: see the doc comment.
+            repo.path_exists_at_commit(commit.as_str(), &path)
+                .unwrap_or(true)
+        });
+    }
+
+    // A relative cargo root is repo-root-relative by construction; `join` leaves
+    // an absolute one alone, so this reads the same directory either way.
+    let cargo_root = config.repo_root.join(cargo_cache_root(config));
+    cargo_root.join("Cargo.lock").exists() || config.repo_root.join("Cargo.lock").exists()
 }
 
 /// Cache-key component naming the substrate a cargo check will actually analyse,
@@ -2285,6 +2348,66 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         assert!(
             !key.contains('/') && !key.contains('\\') && !key.contains(':'),
             "a cache key must be a single path component, got: {key}",
+        );
+    }
+
+    /// A commit only pins its dependencies if it carries a `Cargo.lock`.
+    /// Without one, cargo resolves afresh in the throwaway snapshot, so a
+    /// semver-compatible release published after the first review changes what
+    /// builds — while the cached verdict, keyed on the commit alone, is replayed
+    /// until eviction.
+    #[test]
+    fn an_unlocked_reviewed_target_is_not_cached_indefinitely() {
+        let (unlocked, unlocked_target) = repo_with_two_commits_containing(&["Cargo.toml"]);
+        let config = test_config_builder()
+            .repo_root(unlocked.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&unlocked_target))
+            .build();
+        let key = cargo_content_hash(&config);
+        assert!(
+            key.contains("-unlocked-"),
+            "an unresolved dependency set must not be keyed on the commit alone: {key}",
+        );
+        assert!(
+            key.starts_with(&reviewed_substrate_key(&config).expect("reviewed key")),
+            "the substrate must still identify the entry: {key}",
+        );
+
+        // A committed lock pins the dependency set: the commit IS the substrate,
+        // and the key stays permanent.
+        let (locked, locked_target) =
+            repo_with_two_commits_containing(&["Cargo.toml", "Cargo.lock"]);
+        let config = test_config_builder()
+            .repo_root(locked.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&locked_target))
+            .build();
+        assert_eq!(
+            cargo_content_hash(&config),
+            reviewed_substrate_key(&config).expect("reviewed key"),
+            "a locked target must keep its permanent, content-addressed key",
+        );
+    }
+
+    /// The same reasoning applies to a local review: an unlocked working tree's
+    /// source hash does not describe the dependency set cargo will resolve.
+    #[test]
+    fn an_unlocked_local_tree_is_not_cached_indefinitely() {
+        let repo_root = tempfile::tempdir().expect("repo tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+
+        assert!(
+            cargo_content_hash(&config).contains("-unlocked-"),
+            "a working tree with no Cargo.lock resolves dependencies at run time",
+        );
+
+        std::fs::write(repo_root.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        assert!(
+            !cargo_content_hash(&config).contains("-unlocked-"),
+            "a locked working tree is fully described by its files",
         );
     }
 

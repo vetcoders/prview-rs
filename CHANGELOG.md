@@ -23,8 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fingerprinting what was dirty, and one row per check — `{id, cwd, target_sha,
   tree_state, started_at, cached}`. The digest covers the *content* of every
   dirty path, not just its status code and name, so two runs that modify the
-  same files differently are distinguishable; each run freezes its own state,
-  and under `--watch` every iteration re-reads the tree it is about to analyse.
+  same files differently are distinguishable — including a nested repository,
+  which git reports as a single entry and which therefore fingerprints by its
+  own `HEAD` and working state rather than by the bare fact that a directory is
+  there; each run freezes its own state, and under `--watch` every iteration
+  re-reads the tree it is about to analyse.
   The file is listed in `AI_INDEX.md`'s reading order, right after the gate
   verdict it explains. A reviewer holding only the artifacts no longer has to
   reconstruct the run's substrate from scattered gate files. Purely additive: no
@@ -94,7 +97,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repo-relative cargo root (`commit-<sha>-root-<hash>`, `-root-self` for the
   repo root): the same commit checked from the workspace root and from a
   configured member produces different check/clippy/audit/rustfmt results, and
-  keying on the commit alone let a later run serve the other root's verdict. The
+  keying on the commit alone let a later run serve the other root's verdict. A
+  target that commits no `Cargo.lock` is not pinned by its commit at all — cargo
+  resolves the dependency graph as it runs — so those keys (and the local
+  working-tree keys, which have the same gap) carry the day: repeated runs in a
+  session still hit, tomorrow's run resolves again, the way `Cargo audit`
+  already handles ageing advisories. The
   root is hashed rather than spelled out because a cache key is a file name —
   `crates/core` written verbatim named a file in a directory nothing creates, so
   the store failed and the slowest gates in the tool recomputed on every review

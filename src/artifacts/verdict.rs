@@ -843,9 +843,7 @@ fn content_fingerprint(path: &Path) -> String {
         };
     }
     if meta.is_dir() {
-        // A gitlink (submodule) entry: its contents belong to another
-        // repository, so the superproject records only that it is a directory.
-        return "dir".to_string();
+        return nested_repo_fingerprint(path);
     }
 
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -865,6 +863,48 @@ fn content_fingerprint(path: &Path) -> String {
         }
     }
     format!("blob:{len}:{:x}", hasher.finalize())
+}
+
+/// Fingerprint a directory that the status walk did not descend into.
+///
+/// Git never recurses into another repository: a submodule (or an embedded
+/// checkout) is ONE status entry, so the digest used to record nothing but "a
+/// directory is there". A submodule sitting on a different commit, or carrying
+/// uncommitted work, is a materially different tree for every scan that follows
+/// — and it fingerprinted identically, the collision this digest exists to
+/// prevent.
+///
+/// Its own repository answers both questions cheaply: `HEAD` names the commit,
+/// and one status walk says whether anything is uncommitted. That walk is only
+/// ever run for a directory the superproject ALREADY reported as dirty, so it
+/// costs nothing on a clean tree. Anything unreadable degrades to a coarser
+/// marker rather than a false match.
+fn nested_repo_fingerprint(path: &Path) -> String {
+    // `open`, not `discover`: a plain directory must not resolve to the
+    // superproject and report ITS head as the directory's content.
+    let Ok(repo) = git2::Repository::open(path) else {
+        // Not a repository — an ordinary directory carries no content of its
+        // own, and the status walk lists whatever is inside it separately.
+        return "dir".to_string();
+    };
+
+    let head = repo
+        .head()
+        .ok()
+        .and_then(|head| head.target())
+        .map_or_else(|| "unborn".to_string(), |oid| oid.to_string());
+
+    let mut opts = git2::StatusOptions::new();
+    // Untracked directories are not expanded here: whether ANY entry exists is
+    // the whole question, so there is no reason to walk a vendored tree deeply.
+    opts.include_untracked(true).recurse_untracked_dirs(false);
+    let state = match repo.statuses(Some(&mut opts)) {
+        Ok(statuses) if statuses.is_empty() => "clean",
+        Ok(_) => "dirty",
+        Err(_) => "unknown",
+    };
+
+    format!("gitlink:{head}:{state}")
 }
 
 /// The `XY` status pair in the shape of `git status --porcelain`: index status
