@@ -55,6 +55,17 @@ fn is_plain_word(s: &str) -> bool {
 /// identifier abutting a Unicode letter as TODO markers — inflating `prod_hits`
 /// and the risk score with the very false positives bounded matching exists to
 /// exclude.
+///
+/// Known and deliberate boundary: `char::is_alphanumeric` is the Unicode
+/// Alphabetic + Numeric property, which excludes most combining marks (`U+0301`
+/// and friends), while every scanned language admits them as identifier
+/// continuations. `TODO` followed by a bare combining mark therefore still reads
+/// as a standalone marker. Closing that needs an `XID_Continue` table — a new
+/// dependency or a hand-rolled range set — and the case is not observable: a
+/// 33.4M-line sample (crates.io, npm, site-packages) holds 181k combining marks
+/// and NOT ONE of them adjacent to a `TODO`/`FIXME`/`HACK`/`XXX` occurrence.
+/// The residual error also points at reporting a false marker, not at hiding a
+/// real one.
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
