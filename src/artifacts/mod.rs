@@ -625,6 +625,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         dir: &summary_dir,
         repo: &repo,
         checks: &all_checks,
+        diffs,
         resolved_target,
         resolved_bases,
         worktree_clean,
@@ -1102,10 +1103,35 @@ struct ProvenanceJsonInput<'a> {
     dir: &'a Path,
     repo: &'a Repository,
     checks: &'a [CheckResult],
+    /// The diffs the pack was built from — the authority on which commit the
+    /// patch was actually computed against.
+    diffs: &'a [Diff],
     resolved_target: &'a ResolvedRef,
     resolved_bases: &'a [ResolvedRef],
     worktree_clean: bool,
     worktree_status_digest: Option<&'a str>,
+}
+
+/// The baseline the pack's diff was actually produced from.
+///
+/// `resolved_bases` holds the base *tips* the operator named. When the branches
+/// have diverged the patch is generated from the merge base instead
+/// (`Repository::resolve_diff_bases`), so recording a tip here would name a
+/// commit no diff in the pack was computed against — the contradiction of a file
+/// whose whole job is to state what was compared. Reading the value off the diff
+/// itself makes that impossible by construction.
+///
+/// Falls back to the first resolved base when there is no diff at all: an empty
+/// diff set means either `--current-only` (no base, `None`) or a base pointing
+/// at the target commit, where the tip IS the baseline.
+fn provenance_base_sha<'a>(
+    diffs: &'a [Diff],
+    resolved_bases: &'a [ResolvedRef],
+) -> Option<&'a str> {
+    diffs
+        .first()
+        .map(|diff| diff.base_commit_id.as_str())
+        .or_else(|| resolved_bases.first().map(|base| base.commit_id.as_str()))
 }
 
 /// PROVENANCE.json — pack-level record of WHAT was analysed.
@@ -1123,6 +1149,7 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
         dir,
         repo,
         checks,
+        diffs,
         resolved_target,
         resolved_bases,
         worktree_clean,
@@ -1151,7 +1178,9 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
         "generated_at": chrono::Local::now().to_rfc3339(),
         // Commit whose tree the pack judges.
         "target_sha": resolved_target.commit_id,
-        "base_sha": resolved_bases.first().map(|b| b.commit_id.as_str()),
+        // The commit the patch was really computed against — the merge base when
+        // the branches diverged, not the base tip the operator named.
+        "base_sha": provenance_base_sha(diffs, resolved_bases),
         // Commit checked out locally. Equal to target_sha for an ordinary local
         // review; different when a fetched ref is analysed (`--pr`/`--remote`).
         "head_sha": repo.head_commit_id().ok(),

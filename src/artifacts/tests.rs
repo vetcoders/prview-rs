@@ -4944,6 +4944,19 @@ fn write_provenance_fixture(
     out: &Path,
     checks: &[CheckResult],
 ) -> serde_json::Value {
+    write_provenance_fixture_with_diffs(repo_root, out, checks, &[])
+}
+
+/// Base tip the operator names, distinct from the merge base a diverged branch
+/// is actually diffed against.
+const PROVENANCE_BASE_TIP: &str = "def5678def5678def5678def5678def5678de";
+
+fn write_provenance_fixture_with_diffs(
+    repo_root: &Path,
+    out: &Path,
+    checks: &[CheckResult],
+    diffs: &[Diff],
+) -> serde_json::Value {
     let repo = Repository::open(repo_root).expect("open repo");
     let worktree = capture_worktree_provenance(repo_root);
     let resolved_target = ResolvedRef {
@@ -4953,7 +4966,7 @@ fn write_provenance_fixture(
     };
     let resolved_bases = vec![ResolvedRef {
         name: "origin/main".to_string(),
-        commit_id: "def5678def5678def5678def5678def5678de".to_string(),
+        commit_id: PROVENANCE_BASE_TIP.to_string(),
         is_remote: true,
     }];
 
@@ -4961,6 +4974,7 @@ fn write_provenance_fixture(
         dir: out,
         repo: &repo,
         checks,
+        diffs,
         resolved_target: &resolved_target,
         resolved_bases: &resolved_bases,
         worktree_clean: worktree.clean,
@@ -5025,6 +5039,41 @@ fn provenance_json_records_pack_level_substrate() {
     let heuristics = &rows[2];
     assert!(heuristics["cwd"].is_null());
     assert!(heuristics["tree_state"].is_null());
+}
+
+#[test]
+fn provenance_json_base_sha_is_the_commit_the_diff_used() {
+    // Diverged branches: the patch is generated from the merge base, while
+    // `resolved_bases` still holds the base TIP the operator named. Recording
+    // the tip would name a commit no diff in the pack was computed against.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+    let merge_base = "1111111111111111111111111111111111111111";
+
+    let diffs = vec![Diff {
+        target: "feature/provenance".to_string(),
+        base: "origin/main".to_string(),
+        target_commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        base_commit_id: merge_base.to_string(),
+        files: vec![],
+        stats: DiffStats {
+            files_changed: 0,
+            additions: 0,
+            deletions: 0,
+            copied: 0,
+        },
+        commits: vec![],
+    }];
+
+    let json = write_provenance_fixture_with_diffs(repo_tmp.path(), out.path(), &[], &diffs);
+    assert_eq!(
+        json["base_sha"], merge_base,
+        "base_sha must name the baseline the patch was produced from",
+    );
+    assert_ne!(
+        json["base_sha"], PROVENANCE_BASE_TIP,
+        "the base tip is not what the diff compared against",
+    );
 }
 
 #[test]
