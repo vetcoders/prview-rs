@@ -287,6 +287,14 @@ silent re-addition. A re-add in a *different* file is a module move and becomes
 `RelocatedSymbol`, which is reported but deliberately excluded from breaking
 escalation.
 
+Declarations are compared on their FULL text, continuation lines joined, up to
+`MAX_DECL_CONTINUATION_LINES` (32) — a runaway bound for static bodies and
+generated data tables, not a display width. The bound used to be eight lines,
+which cut inside the real distribution of `pub` signatures: two long
+declarations agreeing on their opener and first eight lines finalized to the
+same truncated text and paired as an unchanged re-add, so a parameter, bound or
+return type changed below the cut produced no finding at all.
+
 Pairing is scoped: two declarations pair only when their inline `mod` path and
 their `#[cfg(…)]` guard may be the same. The guard is the WHOLE conjunction of
 the attributes stacked above the declaration, sorted — `#[cfg(unix)]
@@ -294,6 +302,16 @@ the attributes stacked above the declaration, sorted — `#[cfg(unix)]
 guards, while reordering the same two is not. An unseen scope or guard is
 `None`, which pairs with anything: the diff may simply not have re-emitted the
 context line on that side.
+
+An attribute is read to its balanced close, not to the end of its first line. A
+predicate wrapped as `#[cfg(any(` + feature lines + `))]` is one guard, equal to
+its single-line spelling — whitespace and line breaks are formatting, not a
+different gate. Reading only the opener left the continuation line looking like a
+new item, which cleared the guard and let a declaration that really disappeared
+for one configuration pair with its re-add under another. Any other wrapped
+attribute (`#[derive(…)]`) is carried the same way so it cannot take the `cfg`
+above it down with it; an attribute that never closes within
+`MAX_ATTRIBUTE_CONTINUATION_LINES` falls back to the tolerant `None`.
 
 Both the module path and the perf tracker's test-context scope are counted over
 CODE only, via the shared scanner in `src/rust_source.rs`. It resolves comments
@@ -305,6 +323,13 @@ never reaches a delimiter tracker as syntax. Every raw form is recognized —
 worse than an unknown token: its body is then read as code, and the first
 interior `"` opens a phantom literal. That state is per side and per hunk: a
 hunk boundary is where contiguity ends, and every consumer resets there.
+
+The perf tracker's test context closes two ways, because not every test item has
+a body. One that opens a brace closes when that brace balances again; one that
+does not — `#[cfg(test)] mod tests;`, `#[cfg(test)] use crate::helper;` — closes
+at the `;` ending the item the marker annotates. Waiting for a brace that never
+comes left the context open for the rest of the hunk, and every production loop
+and query below it was recorded as test-only and dropped from the signal.
 
 #### signal/coverage.rs — coverage delta computation
 

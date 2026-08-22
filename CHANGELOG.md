@@ -21,6 +21,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A test marker on a body-less item no longer mutes the rest of its hunk.**
+  The performance-regression tracker closed a test context only when its opening
+  brace balanced again, but `#[cfg(test)] mod tests;` and `#[cfg(test)] use
+  crate::helper;` never open one. The context stayed active for the remainder of
+  the hunk, so production loops and queries added below such a declaration were
+  recorded as test-only and disappeared from the signal. A context opened over an
+  item that ends at its `;` now closes there.
+- **A long signature change is no longer swallowed by the accumulation cap.**
+  Declaration text stopped accumulating after eight continuation lines, which
+  cuts inside the real distribution of `pub` signatures: two long declarations
+  that agree on their opener and those eight lines finalized to the SAME
+  truncated text, so the exact-match pass paired them as an unchanged re-add and
+  a parameter, bound or return type changed on the ninth line or later produced
+  no finding at all. The bound is now 32 lines and is documented as what it is —
+  a runaway valve for static bodies and generated data tables, not a display
+  width.
+- **A `cfg` predicate wrapped across lines still guards its declaration.** The
+  breaking-change pairing recorded only the opener of `#[cfg(any(`, and the first
+  continuation line then looked like a new item and cleared the guard: both sides
+  of the diff came out unguarded, so a `pub` item that really disappeared for one
+  configuration paired with its re-add under a different one and left no finding
+  at all — the exact false negative the guard was added to prevent. Attributes
+  are now accumulated to their balanced close, which also makes a wrapped
+  predicate compare equal to its single-line spelling, and a wrapped
+  `#[derive(…)]` no longer takes the `cfg` above it down with it.
+- **One verdict vocabulary now answers for every reader surface.** The CLI
+  matched a stored verdict case-sensitively while the MCP adapter ranked it
+  through an uppercase fold, so a pack stating `verdict: "pass"` was a clean
+  `PASS` to MCP automation and an unknown verdict normalized to `BLOCK` on the
+  CLI — the same artifact approved by one reader and rejected by the other, which
+  is the divergence the shared reconciliation exists to prevent. `APPROVE`
+  diverged identically, case aside. A third surface was worse: `prview gate`
+  compared the folded summary verdict against the pack's RAW string, so any
+  legacy or non-canonical spelling (`ALLOW`, `HOLD`, `pass`) failed loud as a
+  "gate verdict mismatch" on a pack both other readers accept. The vocabulary
+  moved into `gate::canonical_verdict` and all three surfaces fold through it;
+  `rank_from_verdict` is now derived from it, so ranking and folding cannot drift
+  apart. `GateVerdict` stays a strict parser of canonical spellings and is fed
+  the folded value.
 - **Raw C string literals are read as raw strings.** The diff scanner accepted
   the `r` and `br` raw prefixes but not `cr` (Rust 1.77), so `cr#"…"#` was not
   recognized as an opener: the prefix leaked into the code text and the first

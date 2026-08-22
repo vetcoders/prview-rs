@@ -198,6 +198,18 @@ shape — every generation back to the first public release emits `schema_versio
 and `decision` together — so a schema-less pack that ALSO carries root-level
 decision fields is undefined by this contract rather than resolved by it.
 
+One vocabulary answers "what verdict is this?" for every surface. The CLI
+`--json` summary, the MCP adapter and `prview gate` all fold a stored spelling
+through `gate::canonical_verdict`, which is case-insensitive and accepts the
+retired synonyms (`ALLOW`/`APPROVE` → `PASS`, `HOLD` → `CONDITIONAL`). Case is
+not meaning: a pack stating `verdict: "pass"` stated a pass, and reading it as a
+block would fabricate a verdict the artifact never gave. Each surface owning its
+own copy of this vocabulary is precisely how they came to read one file three
+ways — MCP ranking `"pass"` as a clean `PASS`, the CLI calling it an unknown
+verdict and normalizing to `BLOCK`, and `prview gate` refusing the pack as a
+verdict mismatch. `GateVerdict` stays a strict parser of the canonical spellings;
+it is fed the folded value, never the raw one.
+
 A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
 never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with
 an `unknown_verdict:` caveat, and the MCP adapter ignores it for ranking, emits

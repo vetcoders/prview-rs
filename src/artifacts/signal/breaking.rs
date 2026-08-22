@@ -149,9 +149,23 @@ struct SymbolDecl {
 }
 
 /// Continuation lines a single declaration may absorb before it is finalized
-/// as-is. Bounds both runaway accumulation (a `Lazy::new(|| { .. })` static
-/// body) and the width of a `BREAKING_CHANGES.md` table cell.
-const MAX_DECL_CONTINUATION_LINES: usize = 8;
+/// as-is. Bounds runaway accumulation — a `Lazy::new(|| { .. })` static body or
+/// a hundred-line `pub const WORDS: &[&str] = &[` table, where "the rest of the
+/// declaration" is data, not signature.
+///
+/// The bound is a safety valve, NOT a display width: what gets truncated here is
+/// the text the pairing COMPARES. At eight lines it cut inside the real
+/// distribution, so two long declarations agreeing on their opener and first
+/// eight lines finalized to the same truncated text, paired as an unchanged
+/// re-add and swallowed a parameter, bound or return type changed below the cut.
+/// Measured over 2,970,120 `pub` declarations in the local crates.io registry:
+/// 94.76% wrap over no continuation line at all, 4.96% over one to eight, and
+/// 0.27% over more — of which this bound now covers everything up to 32 lines
+/// (87% of that remainder). What is left beyond it is dominated by generated
+/// data tables. A declaration longer than the bound is still compared on its
+/// first 32 lines, so a change below the cut can still hide; widening it further
+/// trades that for smearing whole static bodies into one "declaration".
+const MAX_DECL_CONTINUATION_LINES: usize = 32;
 
 /// Inline-module nesting for ONE side of a unified diff.
 ///
@@ -425,8 +439,8 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     // The `#[cfg(…)]` currently standing above the next declaration, per side.
     // Context lines feed both, so an unchanged guard above a re-emitted
     // declaration is KNOWN on both sides and the pair is not split by it.
-    let mut before_cfg: Option<Vec<String>> = None;
-    let mut after_cfg: Option<Vec<String>> = None;
+    let mut before_cfg = CfgGuard::default();
+    let mut after_cfg = CfgGuard::default();
 
     for line in patch.lines() {
         // Track current file from diff headers
@@ -435,8 +449,8 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
             before_scope.reset();
             after_scope.reset();
-            before_cfg = None;
-            after_cfg = None;
+            before_cfg.reset();
+            after_cfg.reset();
             if let Some(space_idx) = rest.find(" b/") {
                 current_file = rest[space_idx + 3..].to_string();
                 should_scan_current_file = should_scan_for_breaking_changes(&current_file);
@@ -455,8 +469,8 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
             before_scope.reset();
             after_scope.reset();
-            before_cfg = None;
-            after_cfg = None;
+            before_cfg.reset();
+            after_cfg.reset();
             continue;
         }
 
@@ -487,11 +501,11 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                 &DeclSite {
                     file: &current_file,
                     scope: &before_scope,
-                    cfg_guard: before_cfg.as_deref(),
+                    cfg_guard: before_cfg.guard(),
                     side: DiffSide::Removed,
                 },
             );
-            update_cfg_guard(&mut before_cfg, trimmed);
+            before_cfg.feed(trimmed);
 
             // JS/TS exports
             if trimmed.starts_with("export ") || trimmed.starts_with("export default") {
@@ -524,11 +538,11 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                 &DeclSite {
                     file: &current_file,
                     scope: &after_scope,
-                    cfg_guard: after_cfg.as_deref(),
+                    cfg_guard: after_cfg.guard(),
                     side: DiffSide::Added,
                 },
             );
-            update_cfg_guard(&mut after_cfg, trimmed);
+            after_cfg.feed(trimmed);
 
             after_scope.feed(content);
 
@@ -575,8 +589,8 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
         finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
         let content = line.strip_prefix(' ').unwrap_or(line);
         let trimmed = content.trim();
-        update_cfg_guard(&mut before_cfg, trimmed);
-        update_cfg_guard(&mut after_cfg, trimmed);
+        before_cfg.feed(trimmed);
+        after_cfg.feed(trimmed);
         before_scope.feed(content);
         after_scope.feed(content);
     }
@@ -691,18 +705,6 @@ fn cfgs_may_pair(removed: &Option<Vec<String>>, added: &Option<Vec<String>>) -> 
     }
 }
 
-/// The `cfg` predicate this line states, whitespace removed, if it states one.
-///
-/// Whitespace is dropped so `#[cfg(feature="a")]` and `#[cfg(feature = "a")]`
-/// are one predicate: a reformatted attribute is not a different gate, and
-/// reading it as one would report a removal that never happened.
-fn cfg_attribute(trimmed: &str) -> Option<String> {
-    if !trimmed.starts_with("#[cfg(") {
-        return None;
-    }
-    Some(trimmed.chars().filter(|c| !c.is_whitespace()).collect())
-}
-
 /// Does this line end the run of attributes standing above a declaration?
 ///
 /// Attributes, doc comments and blank lines sit between a `cfg` and the item it
@@ -711,24 +713,146 @@ fn breaks_attribute_run(trimmed: &str) -> bool {
     !trimmed.is_empty() && !trimmed.starts_with("#[") && !trimmed.starts_with("//")
 }
 
-/// Advance one side's pending `cfg` guard past `trimmed`.
+/// An attribute may wrap over this many lines before the tracker gives up on it.
 ///
-/// Call it AFTER the line has been offered to the declaration accumulator: a
-/// declaration is guarded by the attribute above it, not by one on its own line.
+/// A diff shows attributes the same way it shows everything else — partially. An
+/// opener whose close never arrives would otherwise swallow the rest of the hunk
+/// as continuation lines and keep a stale guard standing over declarations it
+/// does not gate.
+const MAX_ATTRIBUTE_CONTINUATION_LINES: usize = 32;
+
+/// An attribute whose delimiters have not closed yet.
+struct OpenAttribute {
+    /// Everything read so far, whitespace removed.
+    text: String,
+    /// How many delimiters are still open.
+    depth: usize,
+    /// How many lines it has absorbed.
+    lines: usize,
+}
+
+/// One diff side's `#[cfg(…)]` conjunction standing above the next declaration.
 ///
-/// Consecutive `#[cfg(…)]` attributes ACCUMULATE — stacking them is Rust's `AND`
-/// — and the accumulated set is sorted, because `#[cfg(a)] #[cfg(b)]` and
-/// `#[cfg(b)] #[cfg(a)]` gate the item identically and a reorder is not an API
-/// change.
-fn update_cfg_guard(pending: &mut Option<Vec<String>>, trimmed: &str) {
-    if let Some(cfg) = cfg_attribute(trimmed) {
-        let guards = pending.get_or_insert_with(Vec::new);
-        guards.push(cfg);
+/// Attributes wrap. `#[cfg(any(` on its own line used to be recorded as the
+/// whole predicate, and the very next line — `feature = "a",` — was then read as
+/// a new item and cleared the guard: the declaration below it came out
+/// unguarded, so a struct that really disappeared for one configuration paired
+/// with its re-add under a different one and left no finding. An attribute is
+/// therefore accumulated until its delimiters balance, and only the finished
+/// text becomes a guard.
+///
+/// Whitespace is dropped so `#[cfg(feature="a")]`, `#[cfg(feature = "a")]` and
+/// the same predicate wrapped across four lines are ONE predicate: reformatting
+/// an attribute is not a different gate, and reading it as one would report a
+/// removal that never happened.
+#[derive(Default)]
+struct CfgGuard {
+    /// The accumulated conjunction, or `None` for "not known on this side".
+    guards: Option<Vec<String>>,
+    open: Option<OpenAttribute>,
+}
+
+impl CfgGuard {
+    /// The conjunction currently standing above the next declaration.
+    fn guard(&self) -> Option<&[String]> {
+        self.guards.as_deref()
+    }
+
+    /// Forget everything: the diff has jumped somewhere else.
+    fn reset(&mut self) {
+        self.guards = None;
+        self.open = None;
+    }
+
+    /// Advance this side past `trimmed`.
+    ///
+    /// Call it AFTER the line has been offered to the declaration accumulator: a
+    /// declaration is guarded by the attribute above it, not by one on its own
+    /// line.
+    fn feed(&mut self, trimmed: &str) {
+        if let Some(open) = self.open.as_mut() {
+            open.text
+                .extend(trimmed.chars().filter(|c| !c.is_whitespace()));
+            open.depth = delimiter_depth(trimmed, open.depth);
+            open.lines += 1;
+            if open.depth == 0 {
+                let finished = self.open.take().expect("open attribute").text;
+                self.record(finished);
+            } else if open.lines >= MAX_ATTRIBUTE_CONTINUATION_LINES {
+                // Unknown pairs with anything, which is the tolerant direction:
+                // a guard invented from an unfinished attribute would fabricate
+                // removals out of ordinary re-adds.
+                self.reset();
+            }
+            return;
+        }
+
+        if trimmed.starts_with("#[") {
+            let text: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+            let depth = delimiter_depth(trimmed, 0);
+            if depth == 0 {
+                self.record(text);
+            } else {
+                self.open = Some(OpenAttribute {
+                    text,
+                    depth,
+                    lines: 1,
+                });
+            }
+            return;
+        }
+
+        if breaks_attribute_run(trimmed) {
+            self.guards = None;
+        }
+    }
+
+    /// Add one finished attribute to the conjunction.
+    ///
+    /// Consecutive `#[cfg(…)]` attributes ACCUMULATE — stacking them is Rust's
+    /// `AND` — and the accumulated set is sorted, because `#[cfg(a)] #[cfg(b)]`
+    /// and `#[cfg(b)] #[cfg(a)]` gate the item identically and a reorder is not
+    /// an API change. Any other attribute keeps the run alive but adds nothing:
+    /// a `#[derive(…)]` between the `cfg` and its item does not change the gate.
+    fn record(&mut self, attribute: String) {
+        if !attribute.starts_with("#[cfg(") {
+            return;
+        }
+        let guards = self.guards.get_or_insert_with(Vec::new);
+        guards.push(attribute);
         guards.sort();
         guards.dedup();
-    } else if breaks_attribute_run(trimmed) {
-        *pending = None;
     }
+}
+
+/// How many delimiters `line` leaves open, starting from `depth`.
+///
+/// Delimiters inside a string literal are text, not structure: `#[doc = "a ("]`
+/// closes on its own line. Escapes are honoured so a `\"` does not end the
+/// string early.
+fn delimiter_depth(line: &str, depth: usize) -> usize {
+    let mut depth = depth;
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in line.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
 }
 
 /// Drop ONE removed-symbol finding matching `removed`.
@@ -1860,6 +1984,96 @@ mod tests {
     }
 
     #[test]
+    fn a_multiline_cfg_predicate_still_guards_its_declaration() {
+        // A predicate wrapped across lines used to record only its opener, and
+        // the first continuation line then cleared the guard entirely. Both
+        // sides read as unguarded, the identical struct text paired, and a
+        // struct that really disappeared for `feature = "b"` builds left no
+        // finding at all.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(any(",
+                "-    feature = \"a\",",
+                "-    feature = \"b\"",
+                "-))]",
+                "-pub struct Config;",
+                "+#[cfg(any(",
+                "+    feature = \"a\",",
+                "+    feature = \"c\"",
+                "+))]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a re-add under a different multiline cfg must not cancel the removal, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_rewrapped_cfg_predicate_is_the_same_guard() {
+        // Guard the other direction: wrapping one predicate across lines is
+        // formatting, exactly like the spacing inside it. The accumulated
+        // attribute must compare equal to its single-line spelling, or every
+        // `rustfmt` rewrap would report a removal that never happened.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(any(feature = \"a\", feature = \"b\"))]",
+                "-pub struct Config;",
+                "+#[cfg(any(",
+                "+    feature = \"a\",",
+                "+    feature = \"b\"",
+                "+))]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "rewrapping a cfg predicate is not breaking, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_multiline_attribute_does_not_drop_the_cfg_above_it() {
+        // The same wrapping applies to any attribute standing between the
+        // `cfg` and its item: a wrapped `#[derive(…)]` used to break the
+        // attribute run on its continuation line and take the guard with it.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(unix)]",
+                "-#[derive(",
+                "-    Debug,",
+                "-)]",
+                "-pub struct Config;",
+                "+#[cfg(windows)]",
+                "+#[derive(",
+                "+    Debug,",
+                "+)]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a wrapped attribute must not drop the cfg above it, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn an_unseen_cfg_guard_pairs_as_before() {
         // The attribute may sit on a context line the hunk never re-emitted on
         // one side. Unknown must pair with anything, exactly as an unseen
@@ -1971,6 +2185,67 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "identical multi-line remove+re-add must produce no finding, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_long_signature_change_below_the_old_cap_is_not_swallowed() {
+        // Accumulation used to stop after eight continuation lines. Two long
+        // declarations that agree on the opener and those eight lines then
+        // finalized to the SAME truncated text, so the exact-match pass paired
+        // them, consumed the addition and dropped the removal — the changed
+        // return type on the tenth line produced no finding at all.
+        let mut body = Vec::new();
+        for (side, ret) in [("-", "u8"), ("+", "u16")] {
+            body.push(format!("{side}pub fn build("));
+            for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+                body.push(format!("{side}    {name}: u8,"));
+            }
+            body.push(format!("{side}) -> {ret} {{"));
+        }
+        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+        let patch = one_file_patch("src/model.rs", &refs);
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::ChangedSignature { before, after }
+                    if before.contains("-> u8") && after.contains("-> u16")
+            )),
+            "a return type changed past the eighth continuation line must surface, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            removed_symbol_types(&findings).is_empty(),
+            "the change must not also report a removal, got: {:?}",
+            removed_symbol_types(&findings)
+        );
+    }
+
+    #[test]
+    fn a_long_declaration_reemitted_unchanged_is_still_a_no_op() {
+        // The tolerant direction of the same accumulation: a long signature the
+        // diff re-emits verbatim must stay a no-op, not become a removal.
+        let mut body = Vec::new();
+        for side in ["-", "+"] {
+            body.push(format!("{side}pub fn build("));
+            for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] {
+                body.push(format!("{side}    {name}: u8,"));
+            }
+            body.push(format!("{side}) -> u8 {{"));
+        }
+        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+        let patch = one_file_patch("src/model.rs", &refs);
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "an unchanged long declaration must produce no finding, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

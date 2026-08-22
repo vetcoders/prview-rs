@@ -447,11 +447,60 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
                 in_test = false;
                 depth = 0;
                 seen_open = false;
+            } else if !seen_open && ends_the_annotated_item(trimmed) {
+                // Not every test item has a body. `#[cfg(test)] mod tests;` and
+                // `#[cfg(test)] use crate::helper;` never open a brace, so the
+                // "balanced again" close above could not fire and the context
+                // stayed open over the rest of the hunk — every production loop
+                // and query below it was recorded as test-only and vanished from
+                // the signal. Such an item ends at its `;`, and so does the
+                // context it opened.
+                in_test = false;
+                depth = 0;
             }
         }
     }
 
     flags
+}
+
+/// Does this line finish a body-less item that a test marker annotated?
+///
+/// Only meaningful while the marker's item has not opened a brace: attributes
+/// stack above their item, so a line that is nothing but attributes is not it
+/// yet, and a line that opens a body is handled by the brace tracker instead.
+fn ends_the_annotated_item(trimmed: &str) -> bool {
+    let item = item_after_attributes(trimmed);
+    !item.is_empty() && item.ends_with(';')
+}
+
+/// The line with any leading `#[…]` attributes removed.
+///
+/// `#[cfg(test)] mod tests;` states the marker and the item it annotates on one
+/// line, so the item cannot be found by looking at how the line starts.
+fn item_after_attributes(trimmed: &str) -> &str {
+    let mut rest = trimmed;
+    while rest.starts_with("#[") {
+        let mut depth = 0usize;
+        let mut end = None;
+        for (index, ch) in rest.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index + ch.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // An attribute whose `]` is on a later line annotates nothing here.
+        let Some(end) = end else { return "" };
+        rest = rest[end..].trim_start();
+    }
+    rest
 }
 
 /// Split patch text into hunks (each starting with @@ or diff --git).
@@ -1258,6 +1307,93 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         );
         assert_eq!(result.query_in_loop_count, 0);
         assert_eq!(result.suspected_files.len(), 1);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_cfg_gated_external_module_closes_its_test_context() {
+        // `#[cfg(test)] mod tests;` annotates an item with no body, so no brace
+        // ever opened and the "balanced again" close could not fire. The test
+        // context stayed open for the rest of the hunk and recorded the
+        // production query-in-loop below it as test-only, dropping it from the
+        // performance signal entirely.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ mod tests;
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a body-less test item must not mute the production code below it"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_cfg_gated_import_closes_its_test_context() {
+        // The same shape with a `use`: the annotated item ends at its `;`, so
+        // the context it opened ends there too.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ use crate::helper;
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a cfg-gated import must not mute the production code below it"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_cfg_gated_module_with_a_body_still_holds_its_context() {
+        // The other direction: an item that DOES open a body keeps the context
+        // until its brace balances, exactly as before. Closing at the first
+        // `;` inside it would report genuine test-only work as production.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ mod tests {
++    let n = 1;
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a statement inside a test module must not close its context"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
         assert!(result.suspected_files[0].test_context_only);
     }
 

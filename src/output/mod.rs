@@ -402,14 +402,15 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     let mut normalized_to_block = !unreadable.is_empty();
     let verdict_is_mistyped = decision.get("verdict").is_some() && raw_verdict.is_none();
     caveats.append(&mut unreadable);
-    let verdict = match raw_verdict {
-        Some("PASS") | Some("ALLOW") => "PASS",
-        Some("CONDITIONAL") | Some("HOLD") => "CONDITIONAL",
-        Some("BLOCK") => "BLOCK",
+    // The vocabulary itself lives in `gate::canonical_verdict`, shared with the
+    // MCP adapter. This reader owning a second copy of it is exactly how the
+    // two surfaces came to read one pack two ways.
+    let verdict = match raw_verdict.map(|raw| (raw, crate::gate::canonical_verdict(raw))) {
+        Some((_, Some(canonical))) => canonical,
         // Collapsing an unreadable verdict to BLOCK is the safe default, but it
         // is a normalization, not a reading — say so instead of letting the
         // caller mistake it for what the pack claimed.
-        Some(other) => {
+        Some((other, None)) => {
             caveats.push(format!(
                 "unknown_verdict: MERGE_GATE.json verdict `{other}` is not in the \
                  PASS/CONDITIONAL/BLOCK vocabulary; normalized to BLOCK"
@@ -2023,6 +2024,68 @@ api-router/app/core/cache.py
                 gate.caveats.is_empty(),
                 "legacy `{legacy}` is recognized vocabulary: {:?}",
                 gate.caveats
+            );
+        }
+    }
+
+    #[test]
+    fn both_readers_agree_on_every_verdict_spelling() {
+        // The two surfaces used to carry two vocabularies for one field: the CLI
+        // matched the raw string case-sensitively while the MCP adapter ranked
+        // it through an ASCII-uppercase fold. A pack saying `verdict: "pass"`
+        // was therefore a clean PASS to MCP automation and an unknown verdict
+        // normalized to BLOCK on the CLI — the same artifact, approved by one
+        // reader and rejected by the other. `APPROVE` diverged the same way,
+        // case aside: it ranked as a pass but was not in the CLI's fold.
+        for (spelling, expected) in [
+            ("PASS", "PASS"),
+            ("pass", "PASS"),
+            ("Pass", "PASS"),
+            ("ALLOW", "PASS"),
+            ("allow", "PASS"),
+            ("APPROVE", "PASS"),
+            ("CONDITIONAL", "CONDITIONAL"),
+            ("conditional", "CONDITIONAL"),
+            ("HOLD", "CONDITIONAL"),
+            ("hold", "CONDITIONAL"),
+            ("BLOCK", "BLOCK"),
+            ("block", "BLOCK"),
+        ] {
+            let pack = pack_with_gate(&format!(
+                r#"{{"verdict":"{spelling}","merge_recommendation":"{rec}",
+                     "allow_merge":{allow},"quality_pass":true,
+                     "analysis_status":"complete"}}"#,
+                rec = match expected {
+                    "PASS" => "approve",
+                    "CONDITIONAL" => "review_required",
+                    _ => "block",
+                },
+                allow = expected == "PASS",
+            ));
+
+            let cli = read_merge_gate_summary(pack.path()).expect("gate is readable");
+            let mcp = crate::mcp::read::read_decision(pack.path()).expect("gate is readable");
+
+            assert_eq!(
+                cli.verdict, expected,
+                "CLI read `{spelling}` as {}: {:?}",
+                cli.verdict, cli.caveats
+            );
+            assert_eq!(
+                mcp.verdict, expected,
+                "MCP read `{spelling}` as {}",
+                mcp.verdict
+            );
+            assert_eq!(
+                cli.verdict, mcp.verdict,
+                "the two readers must not disagree about `{spelling}`"
+            );
+            assert!(
+                !cli.caveats
+                    .iter()
+                    .any(|c| c.starts_with("unknown_verdict:")),
+                "`{spelling}` is recognized vocabulary, not an unknown verdict: {:?}",
+                cli.caveats
             );
         }
     }
