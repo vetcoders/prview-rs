@@ -2,14 +2,14 @@
 
 use super::{
     Check, CheckResult, CheckStatus, ProvenanceBuilder, TEST_TIMEOUT_SECS, has_tool_crash,
-    run_command, run_command_with_timeout,
+    off_head_target_commit, plan_check_run, run_command_with_env, run_command_with_timeout_and_env,
 };
 use crate::Config;
 use crate::cache;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Local;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct CargoCheck;
 pub struct ClippyCheck;
@@ -18,12 +18,107 @@ pub struct RustfmtCheck;
 pub struct CargoAuditCheck;
 pub struct CargoGeigerCheck;
 
+/// The cargo package/workspace root inside the LOCAL checkout.
 fn cargo_cache_root(config: &Config) -> &Path {
     config
         .profile
         .cargo_root
         .as_deref()
         .unwrap_or(config.repo_root.as_path())
+}
+
+/// Where a cargo check must execute, plus the environment it needs there.
+struct CargoRun {
+    /// Directory to run `cargo` in — the reviewed snapshot's cargo root in
+    /// `--pr`/`--remote` mode, the local cargo root otherwise.
+    cwd: PathBuf,
+    /// Extra child environment (`CARGO_TARGET_DIR`), empty for a local run.
+    env: Vec<(String, String)>,
+    /// Ephemeral snapshot, kept alive until the check finishes.
+    _snapshot: Option<crate::git::WorktreeSnapshot>,
+}
+
+/// Resolve where the cargo commands for this run must execute.
+///
+/// Cargo checks must judge the REVIEWED commit like every other language check.
+/// Running them at the local cargo root meant that a `--pr`/`--remote` pack
+/// combined the target's diff with build/clippy/test/fmt results from whatever
+/// branch happened to be checked out locally — a foreign tree's verdict printed
+/// under the reviewed PR's name (the 2026-07-24 remote-only regression).
+///
+/// Two cases:
+/// - local review (target == `HEAD`, or the repo/refs cannot be resolved):
+///   unchanged — the local cargo root, no environment override, so the
+///   operator's own warm `target/` is used and left exactly as it was;
+/// - reviewed review (target != `HEAD`): the matching cargo root INSIDE the
+///   snapshot, with `CARGO_TARGET_DIR` pointed at the per-repo shared build
+///   cache. Without that redirect every run would compile the entire dependency
+///   graph from zero, because the snapshot is a fresh temp dir thrown away at
+///   the end of the run — which is the reason the checks were pinned to the
+///   local root in the first place.
+fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
+    let local_root = cargo_cache_root(config).to_path_buf();
+    let plan = plan_check_run(config)?;
+
+    if plan.scan_dir == config.repo_root {
+        return Ok(CargoRun {
+            cwd: local_root,
+            env: Vec::new(),
+            _snapshot: plan._snapshot,
+        });
+    }
+
+    let Some(cwd) = snapshot_cargo_root(&local_root, &config.repo_root, &plan.scan_dir) else {
+        // A cargo root configured outside the repo cannot exist inside a
+        // snapshot of that repo, so there is nothing to redirect to: keep the
+        // previous local-tree behaviour rather than invent a path.
+        return Ok(CargoRun {
+            cwd: local_root,
+            env: Vec::new(),
+            _snapshot: plan._snapshot,
+        });
+    };
+
+    // Cargo creates the target directory itself, so nothing is materialised
+    // here — resolving the path stays free of filesystem side effects.
+    let target_dir = config.cargo_build_cache_dir();
+
+    Ok(CargoRun {
+        cwd,
+        env: vec![(
+            "CARGO_TARGET_DIR".to_string(),
+            target_dir.display().to_string(),
+        )],
+        _snapshot: plan._snapshot,
+    })
+}
+
+/// Map the local cargo root onto the same relative location inside `scan_dir`.
+///
+/// Returns `None` when the cargo root is not inside the repo, which a snapshot
+/// of that repo can never contain.
+fn snapshot_cargo_root(local_root: &Path, repo_root: &Path, scan_dir: &Path) -> Option<PathBuf> {
+    // A relative cargo root (`.`) is repo-root-relative by construction.
+    let relative = if local_root.is_relative() {
+        local_root
+    } else {
+        local_root.strip_prefix(repo_root).ok()?
+    };
+
+    if relative.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::CurDir | std::path::Component::Normal(_)
+        )
+    }) {
+        let joined = relative
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .fold(scan_dir.to_path_buf(), |acc, c| acc.join(c));
+        Some(joined)
+    } else {
+        None
+    }
 }
 
 /// Content hash for dependency-sensitive cargo checks (check/clippy/geiger).
@@ -36,6 +131,9 @@ fn cargo_cache_root(config: &Config) -> &Path {
 /// repo-root lockfile in whenever the cargo root differs from the repo root so
 /// such a bump invalidates the member key.
 fn cargo_content_hash(config: &Config) -> String {
+    if let Some(commit) = reviewed_substrate_key(config) {
+        return commit;
+    }
     let cargo_root = cargo_cache_root(config);
     let base = cache::rust_hash(cargo_root);
     if cargo_root == config.repo_root.as_path() {
@@ -47,6 +145,23 @@ fn cargo_content_hash(config: &Config) -> String {
             cache::cargo_lock_hash(&config.repo_root)
         )
     }
+}
+
+/// Cache-key component naming the substrate a cargo check will actually analyse,
+/// when that substrate is NOT the local working tree.
+///
+/// The reviewed tree is fully determined by the target commit, so the commit id
+/// IS the content key — no file hashing needed, and no chance of colliding with
+/// a local-tree key written by an earlier local run (which would serve the local
+/// checkout's verdict for a PR).
+fn reviewed_substrate_key(config: &Config) -> Option<String> {
+    off_head_target_commit(config).map(|commit| format!("commit-{commit}"))
+}
+
+/// Source hash for source-only cargo checks (rustfmt): the reviewed commit when
+/// one is being analysed, the local tree hash otherwise.
+fn cargo_source_hash(config: &Config) -> String {
+    reviewed_substrate_key(config).unwrap_or_else(|| cache::rust_hash(cargo_cache_root(config)))
 }
 
 #[async_trait]
@@ -73,10 +188,11 @@ impl Check for CargoCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
         let args = &["check", "--message-format=short"];
-        let output = run_command("cargo", args, cwd).await?;
+        let output = run_command_with_env("cargo", args, cwd, &run.env).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -145,10 +261,11 @@ impl Check for ClippyCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
         let args = &["clippy", "--message-format=short", "--", "-D", "warnings"];
-        let output = run_command("cargo", args, cwd).await?;
+        let output = run_command_with_env("cargo", args, cwd, &run.env).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -250,10 +367,13 @@ impl Check for CargoTestCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
         let args = &["test", "--all-targets", "--no-fail-fast"];
-        let output = run_command_with_timeout("cargo", args, cwd, TEST_TIMEOUT_SECS).await?;
+        let output =
+            run_command_with_timeout_and_env("cargo", args, cwd, TEST_TIMEOUT_SECS, &run.env)
+                .await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -315,20 +435,18 @@ impl Check for RustfmtCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!(
-            "rustfmt-{}",
-            cache::rust_hash(cargo_cache_root(config))
-        ))
+        Some(format!("rustfmt-{}", cargo_source_hash(config)))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
         let args = &["fmt", "--check"];
-        let output = run_command("cargo", args, cwd).await?;
+        let output = run_command_with_env("cargo", args, cwd, &run.env).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -430,23 +548,23 @@ impl Check for CargoAuditCheck {
         // which may be a workspace member with its own Cargo.lock — not the repo
         // root. Keying on the root lock while executing in a member meant a
         // member Cargo.lock change never invalidated the cache and a stale audit
-        // was served (PR #12 review #22).
-        let cargo_root = cargo_cache_root(config);
-        Some(format!(
-            "audit-{}-{}",
-            cache::cargo_lock_hash(cargo_root),
-            day
-        ))
+        // was served (PR #12 review #22). When a reviewed commit is analysed the
+        // lock that matters lives in the snapshot, and the commit id names it
+        // exactly.
+        let lock = reviewed_substrate_key(config)
+            .unwrap_or_else(|| cache::cargo_lock_hash(cargo_cache_root(config)));
+        Some(format!("audit-{lock}-{day}"))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
         let args = &["audit", "--json"];
-        let output = run_command("cargo", args, cwd).await?;
+        let output = run_command_with_env("cargo", args, cwd, &run.env).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -603,9 +721,10 @@ impl Check for CargoGeigerCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
-        if cargo_metadata_is_virtual_manifest(cwd).await {
+        if cargo_metadata_is_virtual_manifest(cwd, &run.env).await {
             return Ok(CheckResult {
                 name: self.name().to_string(),
                 status: CheckStatus::Skipped,
@@ -617,7 +736,8 @@ impl Check for CargoGeigerCheck {
         }
 
         let args = &["geiger", "--output-format", "Ratio"];
-        let output = match run_command_with_timeout("cargo", args, cwd, 600).await {
+        let output = match run_command_with_timeout_and_env("cargo", args, cwd, 600, &run.env).await
+        {
             Ok(output) => output,
             Err(err) if super::is_timeout_error(&err) => {
                 // `cargo geiger` can take many minutes on large dependency trees
@@ -756,16 +876,17 @@ fn is_virtual_manifest_error(output: &str) -> bool {
         && output.contains("requires running against an actual package")
 }
 
-async fn cargo_metadata_is_virtual_manifest(cwd: &Path) -> bool {
+async fn cargo_metadata_is_virtual_manifest(cwd: &Path, env: &[(String, String)]) -> bool {
     // Async with a hard timeout: a synchronous `cargo metadata` here blocked
     // the whole FuturesUnordered check pool whenever cargo sat on a file lock
     // (e.g. a parallel build in the same repo) — the in-process cousin of the
     // npx hang class.
-    let Ok(output) = crate::checks::run_command_with_timeout(
+    let Ok(output) = crate::checks::run_command_with_timeout_and_env(
         "cargo",
         &["metadata", "--no-deps", "--format-version", "1"],
         cwd,
         60,
+        env,
     )
     .await
     else {
@@ -1351,5 +1472,162 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         ));
         assert!(!is_virtual_manifest_error("error: Found 3 warnings"));
         assert!(!is_virtual_manifest_error("a virtual manifest"));
+    }
+
+    /// Write a minimal, dependency-free binary crate whose `main.rs` is either
+    /// rustfmt-clean or deliberately mangled.
+    fn write_crate(dir: &Path, formatted: bool) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"substrate-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"substrate-fixture\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let main = if formatted {
+            "fn main() {\n    println!(\"reviewed\");\n}\n"
+        } else {
+            "fn main(){let x=1;println!(\"stale{}\",x);}\n"
+        };
+        std::fs::write(dir.join("src/main.rs"), main).unwrap();
+    }
+
+    /// Regression: a cargo check must judge the REVIEWED snapshot, never the
+    /// local checkout.
+    ///
+    /// With a `--pr`/`--remote` target, `repo_root` still holds whatever branch
+    /// is checked out locally, so the pre-fix code ran build/clippy/test/fmt
+    /// against a foreign tree and printed the result under the reviewed PR's
+    /// name. The fixture makes the two directories disagree on purpose:
+    /// `repo_root` is badly formatted and the scan dir is clean, so running in
+    /// the wrong place does not merely show up in provenance — it flips the
+    /// verdict.
+    #[tokio::test]
+    async fn test_cargo_check_runs_in_scan_dir_not_repo_root() {
+        if which::which("cargo").is_err() {
+            return;
+        }
+
+        // repo_root == the stale local checkout: `cargo fmt --check` complains.
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), false);
+
+        // scan_dir == the reviewed target snapshot: formatting is clean.
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(scan_dir.path(), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let result = RustfmtCheck.run(&config).await.expect("rustfmt run");
+        if result.status == CheckStatus::Skipped {
+            // rustfmt component missing — nothing to assert about the substrate.
+            return;
+        }
+
+        assert_eq!(
+            result.status,
+            CheckStatus::Passed,
+            "the cargo check must judge the reviewed snapshot's clean tree, not \
+             repo_root's mangled one. Output: {}",
+            result.output
+        );
+
+        // Provenance must name the directory the run actually used.
+        let cwd = result.provenance.expect("provenance").cwd;
+        let scan_dir_name = scan_dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            cwd.contains(&scan_dir_name),
+            "provenance cwd must report the reviewed scan dir, got {cwd}",
+        );
+    }
+
+    /// The reviewed snapshot is a throwaway temp dir, so its in-tree `target/`
+    /// would force a full dependency rebuild on every run. `CARGO_TARGET_DIR`
+    /// must therefore point at the per-repo shared build cache — outside both
+    /// the snapshot and the operator's own tree.
+    #[tokio::test]
+    async fn test_cargo_run_uses_shared_build_cache_off_head() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let run = plan_cargo_run(&config).expect("plan");
+
+        assert_eq!(run.cwd, scan_dir.path());
+        assert_eq!(
+            run.env,
+            vec![(
+                "CARGO_TARGET_DIR".to_string(),
+                config.cargo_build_cache_dir().display().to_string()
+            )],
+            "cargo must build into the shared per-repo cache, not the snapshot",
+        );
+        let target_dir = config.cargo_build_cache_dir();
+        assert!(
+            !target_dir.starts_with(scan_dir.path()),
+            "a build cache inside the throwaway snapshot caches nothing",
+        );
+        assert!(
+            !target_dir.starts_with(repo_root.path()),
+            "prview must not write into the operator's own tree",
+        );
+    }
+
+    /// A local review (target == HEAD) is unchanged: the local cargo root, and
+    /// no `CARGO_TARGET_DIR` redirect, so the operator's warm `target/` is used
+    /// exactly as before.
+    #[tokio::test]
+    async fn test_cargo_run_local_target_is_unchanged() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        // No scan_dir_override, and a non-git repo_root: plan_check_run resolves
+        // back to the working tree — the ordinary local path.
+
+        let run = plan_cargo_run(&config).expect("plan");
+
+        assert_eq!(run.cwd, repo_root.path());
+        assert!(
+            run.env.is_empty(),
+            "a local run must not redirect the build directory",
+        );
+    }
+
+    #[test]
+    fn test_snapshot_cargo_root_maps_workspace_member() {
+        let repo_root = Path::new("/repo");
+        let scan_dir = Path::new("/tmp/snap");
+
+        assert_eq!(
+            snapshot_cargo_root(Path::new("/repo/crates/core"), repo_root, scan_dir),
+            Some(PathBuf::from("/tmp/snap/crates/core")),
+        );
+        assert_eq!(
+            snapshot_cargo_root(repo_root, repo_root, scan_dir),
+            Some(PathBuf::from("/tmp/snap")),
+        );
+        // A relative cargo root is repo-root-relative by construction.
+        assert_eq!(
+            snapshot_cargo_root(Path::new("."), repo_root, scan_dir),
+            Some(PathBuf::from("/tmp/snap")),
+        );
+        // Outside the repo: a snapshot of that repo can never contain it.
+        assert_eq!(
+            snapshot_cargo_root(Path::new("/elsewhere/crate"), repo_root, scan_dir),
+            None,
+        );
     }
 }

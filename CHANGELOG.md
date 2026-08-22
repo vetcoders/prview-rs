@@ -22,6 +22,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered as a shared-snapshot check alongside them. Local reviews, where the
   target resolves to `HEAD`, are unaffected. Its recorded `provenance.cwd` now
   reports the directory the run actually used.
+- The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,
+  `Cargo audit`, `Cargo geiger`) now run against the reviewed target snapshot
+  instead of the local checkout. When reviewing a PR or a remote branch, they
+  executed at `cargo_cache_root` — the working tree of whatever branch happened
+  to be checked out — so a remote-only pack combined the target's diff with
+  build, clippy, test and fmt verdicts from unrelated local code. The build
+  cache that motivated that shortcut is preserved by pointing `CARGO_TARGET_DIR`
+  at a per-repo shared directory (`~/.prview/cargo-target/<repo>`), passed to
+  the cargo child process only, so a fresh snapshot does not recompile the whole
+  dependency graph and the operator's own `target/` is never written to. Local
+  reviews, where the target resolves to `HEAD`, are unaffected: same cwd, no
+  environment override.
+- Cargo check cache keys now name the substrate they judge. The cached-result
+  lookup happens before the target snapshot is materialised, so a `--pr` run
+  could hit an entry a previous local run had stored under the same working-tree
+  hash and serve the local checkout's verdict as the PR's. Keys now use the
+  resolved target commit whenever it differs from `HEAD`.
 
 ### Changed
 

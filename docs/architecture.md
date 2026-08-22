@@ -219,19 +219,38 @@ preset (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*` disables t
 #### Where checks run
 
 Checks must judge the *reviewed* commit, not whatever happens to be checked out
-locally. `plan_check_run()` resolves the working directory for every
-language check: when the resolved target equals `HEAD` (the ordinary local
-review) it returns `repo_root` unchanged; when they differ (`--pr`, `--remote`,
-or an explicit target) it materialises a detached `git worktree` at the target
-commit and returns that path. `node_modules` and `.venv` are symlinked into the
+locally. `plan_check_run()` resolves the working directory for every language
+check: when the resolved target equals `HEAD` (the ordinary local review) it
+returns `repo_root` unchanged; when they differ (`--pr`, `--remote`, or an
+explicit target) it materialises a detached `git worktree` at the target commit
+and returns that path. `node_modules` and `.venv` are symlinked into the
 snapshot, so tests and linters keep their installed environment without a
 reinstall.
 
 The Python and JS checks (`Ruff`, `Mypy`, `Pytest`, `TypeScript`, `ESLint`,
 `Vitest`, `Stylelint`) share **one** run-wide snapshot rather than each creating
-its own — see `uses_shared_scan_dir()`. Two families opt out deliberately:
-`SemgrepCheck` manages its own worktree because it also needs a baseline commit,
-and the cargo checks run at `cargo_cache_root` to reuse the Rust build cache.
+its own — see `uses_shared_scan_dir()`. `SemgrepCheck` is the single deliberate
+opt-out: it manages its own worktree because it also needs a baseline commit.
+
+The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,
+`Cargo audit`, `Cargo geiger`) run in the snapshot as well, but with one extra
+step. A snapshot is a throwaway temp dir, so its in-tree `target/` would force a
+full dependency rebuild on every run — the reason these checks were originally
+pinned to the local checkout. `plan_cargo_run()` instead points
+`CARGO_TARGET_DIR` at `Config::cargo_build_cache_dir()`
+(`~/.prview/cargo-target/<repo>`), a per-repo build cache shared across runs and
+kept out of the operator's own `target/`. The variable is passed to the cargo
+child process only; a local review sets no override at all and uses the working
+tree's `target/` exactly as before. Cargo checks are already serialized on a
+single-permit semaphore (`is_cargo_target_check()`), so they never contend for
+that cache within a run; two concurrent prview runs on different commits rely on
+cargo's own build-directory locking.
+
+Cache keys follow the same substrate. Cached results are looked up **before**
+the shared snapshot exists, so cargo cache keys resolve the target commit
+directly (`off_head_target_commit()`) and key on the commit id whenever it
+differs from `HEAD` — otherwise a `--pr` run would hit an entry a previous local
+run stored under a working-tree hash and serve the local checkout's verdict.
 
 ### mcp/
 

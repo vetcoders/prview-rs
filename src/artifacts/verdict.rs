@@ -727,10 +727,13 @@ fn has_resolvable_base_diff(
 /// Since A2, the other file-scoped linters (`ruff`, `eslint`, `stylelint`) run
 /// through `plan_check_run`, which materialises a worktree snapshot of the target
 /// and scans there in `--pr`/`--remote` mode — so their out-of-diff findings also
-/// genuinely predate the target diff and may be downgraded. `rustfmt` and
-/// `cargo_audit` are deliberately excluded: they run at `cargo_cache_root` (the
-/// local checkout), a *different* tree than the target, so their out-of-diff rows
-/// prove nothing about the target diff and must NOT be downgraded (R3-16).
+/// genuinely predate the target diff and may be downgraded.
+///
+/// `rustfmt` and `cargo_audit` were originally excluded because they ran at the
+/// local checkout (R3-16). They now scan the snapshot too, but stay off this
+/// list: widening the pre-existing downgrade is a gate-semantics decision, not a
+/// side effect of moving a check onto the reviewed substrate. Keeping them out
+/// is the conservative side — findings surface instead of being suppressed.
 fn check_scans_target_snapshot(check_id: &str) -> bool {
     matches!(check_id, "semgrep_scan" | "ruff" | "eslint" | "stylelint")
 }

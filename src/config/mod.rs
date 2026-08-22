@@ -987,6 +987,22 @@ impl Config {
             .join("cache")
             .join(cache_namespace_from_root(&self.repo_root))
     }
+
+    /// Shared cargo build directory used when checks run off an ephemeral
+    /// target snapshot.
+    ///
+    /// A `--pr`/`--remote` review compiles a freshly materialised worktree, and
+    /// its in-tree `target/` is thrown away with the snapshot — so every run
+    /// would rebuild the whole dependency graph from zero. Pointing
+    /// `CARGO_TARGET_DIR` at one per-repo directory (same namespace as
+    /// [`Config::cache_dir`]) keeps that cache warm across runs while leaving
+    /// the operator's own `target/` untouched: prview must never overwrite the
+    /// binary a developer just built.
+    pub fn cargo_build_cache_dir(&self) -> PathBuf {
+        prview_home()
+            .join("cargo-target")
+            .join(cache_namespace_from_root(&self.repo_root))
+    }
 }
 
 /// Find git repository root from current directory
