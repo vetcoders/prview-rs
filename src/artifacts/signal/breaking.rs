@@ -89,6 +89,19 @@ fn symbol_name(line: &str) -> Option<String> {
     None
 }
 
+/// Classify an added NON-function public declaration as `(symbol_type, name)`.
+///
+/// `pub fn` is excluded on purpose: added functions go through the multi-line
+/// signature accumulator instead, which reconstructs the full signature before
+/// recording it.
+fn classify_added_pub_symbol(line: &str) -> Option<(&'static str, String)> {
+    PUB_SYMBOL_TYPES
+        .iter()
+        .filter(|(prefix, _)| *prefix != "pub fn ")
+        .find(|(prefix, _)| line.starts_with(prefix))
+        .and_then(|(_, symbol_type)| symbol_name(line).map(|name| (*symbol_type, name)))
+}
+
 /// Collect added public symbols across a patch as `(file, type, name)`.
 fn collect_added_public_symbols(patch: &str) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
@@ -207,9 +220,11 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     let mut current_file = String::new();
     let mut should_scan_current_file = false;
 
-    // Track removed/added public function lines for signature change detection
-    let mut removed_fns: Vec<(String, String, String)> = Vec::new(); // (file, name, full_line)
-    let mut added_fns: Vec<(String, String, String)> = Vec::new();
+    // Track removed/added public symbol declarations (ALL kinds in
+    // `PUB_SYMBOL_TYPES`, not just `pub fn`) for remove+re-add pairing and
+    // signature change detection: (file, symbol_type, name, full_line).
+    let mut removed_syms: Vec<(String, String, String, String)> = Vec::new();
+    let mut added_syms: Vec<(String, String, String, String)> = Vec::new();
 
     // When an added `pub fn` signature spans multiple diff lines, accumulate the
     // continuation lines so the "After" is the FULL signature, not just the
@@ -234,29 +249,25 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
         // A pending multi-line signature is finalized by any non-added line.
         let is_added_line = line.starts_with('+') && !line.starts_with("+++");
         if !is_added_line && let Some((f, n, sig)) = pending_added_fn.take() {
-            added_fns.push((f, n, sig));
+            added_syms.push((f, "function".to_string(), n, sig));
         }
 
         // Removed lines
         if let Some(content) = line.strip_prefix('-') {
             let trimmed = content.trim();
 
-            let pub_types = [
-                ("pub fn ", "function"),
-                ("pub struct ", "struct"),
-                ("pub enum ", "enum"),
-                ("pub trait ", "trait"),
-                ("pub type ", "type alias"),
-                ("pub const ", "constant"),
-                ("pub static ", "static"),
-            ];
-
-            for (pattern, symbol_type) in &pub_types {
+            for (pattern, symbol_type) in PUB_SYMBOL_TYPES {
                 if trimmed.starts_with(pattern) {
-                    if *pattern == "pub fn "
-                        && let Some(name) = extract_fn_name(trimmed)
-                    {
-                        removed_fns.push((current_file.clone(), name, trimmed.to_string()));
+                    // Record EVERY public symbol kind for remove+re-add pairing,
+                    // not only `pub fn` — a non-fn declaration re-emitted
+                    // unchanged by the diff used to leak a phantom removal.
+                    if let Some(name) = symbol_name(trimmed) {
+                        removed_syms.push((
+                            current_file.clone(),
+                            (*symbol_type).to_string(),
+                            name,
+                            trimmed.to_string(),
+                        ));
                     }
                     findings.push(BreakingFinding {
                         file: current_file.clone(),
@@ -296,19 +307,33 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                 }
                 sig.push_str(trimmed);
                 if signature_complete(sig)
-                    && let Some(done) = pending_added_fn.take()
+                    && let Some((f, n, s)) = pending_added_fn.take()
                 {
-                    added_fns.push(done);
+                    added_syms.push((f, "function".to_string(), n, s));
                 }
             } else if trimmed.starts_with("pub fn ")
                 && let Some(name) = extract_fn_name(trimmed)
             {
                 if signature_complete(trimmed) {
-                    added_fns.push((current_file.clone(), name, trimmed.to_string()));
+                    added_syms.push((
+                        current_file.clone(),
+                        "function".to_string(),
+                        name,
+                        trimmed.to_string(),
+                    ));
                 } else {
                     // Signature spans multiple lines — start accumulating.
                     pending_added_fn = Some((current_file.clone(), name, trimmed.to_string()));
                 }
+            } else if let Some((symbol_type, name)) = classify_added_pub_symbol(trimmed) {
+                // Non-fn public declarations are single-line: record them
+                // directly so the pairing below can cancel a matching removal.
+                added_syms.push((
+                    current_file.clone(),
+                    symbol_type.to_string(),
+                    name,
+                    trimmed.to_string(),
+                ));
             }
 
             // New env requirements
@@ -350,20 +375,21 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     }
 
     // Finalize a signature still being accumulated at end of patch.
-    if let Some(done) = pending_added_fn.take() {
-        added_fns.push(done);
+    if let Some((f, n, s)) = pending_added_fn.take() {
+        added_syms.push((f, "function".to_string(), n, s));
     }
 
-    // Pair removed + added public functions in the same file:
-    //   - identical signature line -> no-op remove+readd, drop the removal (P1-10:
-    //     e.g. a body rewritten to delegate, with the `pub fn` line unchanged but
-    //     emitted as -/+ by the diff)
-    //   - different signature line  -> a signature change, not a removal
-    for (r_file, r_name, r_line) in &removed_fns {
-        let Some((_, _, a_line)) = added_fns
-            .iter()
-            .find(|(a_file, a_name, _)| a_file == r_file && a_name == r_name)
-        else {
+    // Pair removed + added public symbols of the SAME kind and name in the same
+    // file — every kind in `PUB_SYMBOL_TYPES`, not just `pub fn` (P1-09/10):
+    //   - identical declaration line -> no-op remove+readd, drop the removal
+    //     (e.g. a fn body rewritten to delegate, or a struct whose fields
+    //     changed below an unchanged `pub struct` line, emitted as -/+ by the
+    //     diff)
+    //   - different declaration line -> a signature change, not a removal
+    for (r_file, r_type, r_name, r_line) in &removed_syms {
+        let Some((_, _, _, a_line)) = added_syms.iter().find(|(a_file, a_type, a_name, _)| {
+            a_file == r_file && a_type == r_type && a_name == r_name
+        }) else {
             continue;
         };
 
@@ -372,7 +398,7 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             !(f.file == *r_file
                 && matches!(
                     &f.kind,
-                    BreakingKind::RemovedSymbol { symbol_type } if symbol_type == "function"
+                    BreakingKind::RemovedSymbol { symbol_type } if symbol_type == r_type
                 )
                 && f.line == *r_line)
         });
@@ -502,6 +528,7 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
             if let BreakingKind::ChangedSignature { before, after } = &f.kind {
                 let name = extract_fn_name(before)
                     .or_else(|| extract_fn_name(after))
+                    .or_else(|| symbol_name(before))
                     .unwrap_or_else(|| before.clone());
                 let key = (f.file.clone(), name);
                 if !groups.contains_key(&key) {
@@ -774,6 +801,168 @@ mod tests {
             "identical remove+readd must produce no breaking finding, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
+    }
+
+    /// Build a single-file patch from raw diff body lines (each already carrying
+    /// its `-`/`+`/` ` prefix).
+    fn one_file_patch(file: &str, body: &[&str]) -> String {
+        let mut patch =
+            format!("diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -1,2 +1,2 @@\n");
+        for line in body {
+            patch.push_str(line);
+            patch.push('\n');
+        }
+        patch
+    }
+
+    fn removed_symbol_types(findings: &[BreakingFinding]) -> Vec<String> {
+        findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::RemovedSymbol { symbol_type } => Some(symbol_type.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn identical_remove_readd_non_fn_symbols_are_not_breaking() {
+        // P1-09/10 residual: the same-file remove+re-add pairing used to cover
+        // `pub fn` ONLY, so a struct/enum/trait/type/const/static whose
+        // declaration line was re-emitted unchanged by the diff (e.g. a body or
+        // field reordering below it) produced a phantom RemovedSymbol.
+        let cases: [(&str, &str, &str); 6] = [
+            ("struct", "src/model.rs", "pub struct Config {"),
+            ("enum", "src/model.rs", "pub enum Mode {"),
+            ("trait", "src/model.rs", "pub trait Check {"),
+            ("type alias", "src/model.rs", "pub type Alias = u32;"),
+            ("constant", "src/model.rs", "pub const LIMIT: usize = 8;"),
+            ("static", "src/model.rs", "pub static NAME: &str = \"a\";"),
+        ];
+
+        for (label, file, decl) in cases {
+            let findings = analyze_all_breaking_changes(&[one_file_patch(
+                file,
+                &[
+                    &format!("-{decl}"),
+                    "-    old_detail: u8,",
+                    &format!("+{decl}"),
+                    "+    new_detail: u8,",
+                ],
+            )]);
+            assert!(
+                !findings.iter().any(|f| matches!(
+                    &f.kind,
+                    BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+                )),
+                "identical remove+readd of {label} must produce no breaking finding, got: {:?}",
+                findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn changed_non_fn_declaration_is_signature_change_not_removal() {
+        // A genuinely modified public declaration must surface as a signature
+        // change (one finding), never as removal + silent re-addition.
+        let cases: [(&str, &str, &str); 3] = [
+            (
+                "struct",
+                "pub struct Config<T> {",
+                "pub struct Config<T, U> {",
+            ),
+            (
+                "type alias",
+                "pub type Alias = u32;",
+                "pub type Alias = u64;",
+            ),
+            (
+                "constant",
+                "pub const LIMIT: usize = 8;",
+                "pub const LIMIT: u32 = 8;",
+            ),
+        ];
+
+        for (label, before, after) in cases {
+            let findings = analyze_all_breaking_changes(&[one_file_patch(
+                "src/model.rs",
+                &[&format!("-{before}"), &format!("+{after}")],
+            )]);
+            assert!(
+                findings.iter().any(|f| matches!(
+                    &f.kind,
+                    BreakingKind::ChangedSignature { before: b, after: a }
+                        if b == before && a == after
+                )),
+                "{label} change must be a ChangedSignature, got: {:?}",
+                findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+            );
+            assert!(
+                removed_symbol_types(&findings).is_empty(),
+                "{label} change must not also report a removal, got: {:?}",
+                removed_symbol_types(&findings)
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_non_fn_removal_stays_removed() {
+        // Guard against the pairing over-reaching: with no re-add, real removals
+        // of every public symbol kind must still be breaking.
+        let cases: [(&str, &str); 6] = [
+            ("struct", "pub struct Config {"),
+            ("enum", "pub enum Mode {"),
+            ("trait", "pub trait Check {"),
+            ("type alias", "pub type Alias = u32;"),
+            ("constant", "pub const LIMIT: usize = 8;"),
+            ("static", "pub static NAME: &str = \"a\";"),
+        ];
+
+        for (expected_type, decl) in cases {
+            let findings = analyze_all_breaking_changes(&[one_file_patch(
+                "src/model.rs",
+                &[&format!("-{decl}"), "-    detail: u8,"],
+            )]);
+            assert!(
+                removed_symbol_types(&findings).contains(&expected_type.to_string()),
+                "real removal of {expected_type} must stay a RemovedSymbol, got: {:?}",
+                findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn pub_use_reexport_is_not_a_tracked_public_symbol() {
+        // `pub use` is deliberately outside PUB_SYMBOL_TYPES: re-export lines
+        // churn constantly and were never emitted as RemovedSymbol, so neither
+        // an identical nor a changed remove+re-add may invent a breaking
+        // finding. Pins that contract so a future symbol-kind addition cannot
+        // reintroduce the phantom asymmetry unpaired.
+        let identical = analyze_all_breaking_changes(&[one_file_patch(
+            "src/lib.rs",
+            &[
+                "-pub use crate::model::Config;",
+                "+pub use crate::model::Config;",
+            ],
+        )]);
+        let changed = analyze_all_breaking_changes(&[one_file_patch(
+            "src/lib.rs",
+            &[
+                "-pub use crate::model::Config;",
+                "+pub use crate::model::Settings;",
+            ],
+        )]);
+
+        for (label, findings) in [("identical", identical), ("changed", changed)] {
+            assert!(
+                !findings.iter().any(|f| matches!(
+                    &f.kind,
+                    BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+                )),
+                "{label} pub use re-export must produce no breaking finding, got: {:?}",
+                findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

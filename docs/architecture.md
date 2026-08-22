@@ -271,13 +271,21 @@ Types and functions used across multiple signal modules:
 Heuristic scan of diffs for API-breaking changes:
 
 - `BreakingRisk` enum (`High`, `Medium`, `Low`) — publicness heuristic based on file path depth and barrel/re-export file detection
-- `BreakingFinding` struct with `BreakingKind` (`RemovedSymbol`, `ChangedSignature`, `NewEnvRequirement`)
+- `BreakingFinding` struct with `BreakingKind` (`RemovedSymbol`, `RelocatedSymbol`, `ChangedSignature`, `NewEnvRequirement`)
 - `analyze_all_breaking_changes(patches)` — returns all findings from multiple patch texts
 - `write_breaking_changes(dir, findings)` — writes `BREAKING_CHANGES.md` if findings are non-empty
 
 Scans for removed `pub` symbols (fn, struct, enum, trait, type, const, static),
-JS/TS `export` removals, signature changes (same function name with different params),
-and new environment variable requirements. Only scans code files (not tests, config, docs).
+JS/TS `export` removals, signature changes, and new environment variable
+requirements. Only scans code files (not tests, config, docs).
+
+Remove + re-add pairing (applies to every `pub` symbol kind above, not just
+functions): when a declaration is removed and re-added for the same name and
+kind, an identical declaration line is a diff artifact and yields no finding,
+while a changed one yields a single `ChangedSignature` — never a removal plus a
+silent re-addition. A re-add in a *different* file is a module move and becomes
+`RelocatedSymbol`, which is reported but deliberately excluded from breaking
+escalation.
 
 #### signal/coverage.rs — coverage delta computation
 
