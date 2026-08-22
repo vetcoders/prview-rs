@@ -507,8 +507,13 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   files with different content are different substrates and must not share a
   digest. Only the dirty subset is hashed. It is a stable fingerprint, not a
   capture of a specific `git status --porcelain` stdout;
-- `checks[]` — one row per check: `{id, cwd, target_sha, tree_state, started_at,
-  cached}`, with `null` fields for a check that produced no provenance. The
+- `checks[]` — one row per configured check: `{id, cwd, target_sha, tree_state,
+  started_at, cached, skipped}`, with `null` fields for a check that produced no
+  provenance. `skipped` is `null` for a check that ran and carries the reason for
+  one that did not: a gate ruled out during eligibility (tests disabled, a tool
+  absent) never reaches RUN.json's `checks[]`, and omitting it here too made a
+  deliberate skip indistinguishable from a gate that was never part of the run.
+  Those rows have every substrate field `null`, because nothing was read. The
   synthetic `heuristics_loctree` row is included: Loctree runs in-process rather
   than as a subprocess (`command` is `loctree (in-process)`), but it still reads
   a tree — the `git archive` extraction of the target commit in snapshot mode,

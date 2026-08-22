@@ -609,7 +609,9 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         breaking: breaking_findings,
         coverage: coverage_delta.clone(),
         diff_dir: &diff_dir,
-        skipped_checks,
+        // Cloned: PROVENANCE.json records the same skips further down, and the
+        // two surfaces must describe one list.
+        skipped_checks: skipped_checks.clone(),
         out_dir: &out_dir,
         diffs,
         ownership_map,
@@ -683,6 +685,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         dir: &summary_dir,
         repo: &repo,
         checks: &all_checks,
+        skipped_checks: &skipped_checks,
         diffs,
         resolved_target,
         resolved_bases,
@@ -1161,6 +1164,10 @@ struct ProvenanceJsonInput<'a> {
     dir: &'a Path,
     repo: &'a Repository,
     checks: &'a [CheckResult],
+    /// Checks that were configured but never executed. They are gates too: a
+    /// consumer must be able to tell "deliberately not run, for this reason"
+    /// from "not part of this run at all", and an absent row says the latter.
+    skipped_checks: &'a [crate::checks::SkippedCheck],
     /// The diffs the pack was built from — the authority on which commit the
     /// patch was actually computed against.
     diffs: &'a [Diff],
@@ -1217,6 +1224,7 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
         dir,
         repo,
         checks,
+        skipped_checks,
         diffs,
         resolved_target,
         resolved_bases,
@@ -1224,22 +1232,38 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
         worktree_status_digest,
     } = input;
 
-    let check_rows: Vec<serde_json::Value> = checks
-        .iter()
-        .map(|c| {
-            let prov = c.provenance.as_ref();
-            json!({
-                "id": check_id_from_name(&c.name),
-                "cwd": prov.map(|p| p.cwd.as_str()),
-                "target_sha": prov.and_then(|p| p.target_sha.as_deref()),
-                "tree_state": prov.and_then(|p| p.tree_state).map(|s| s.as_str()),
-                "started_at": prov.map(|p| p.started_at.as_str()),
-                // A replayed cache hit carries the ORIGINAL execution's
-                // provenance; this flag is what separates it from a fresh run.
-                "cached": c.cached,
-            })
+    let executed = checks.iter().map(|c| {
+        let prov = c.provenance.as_ref();
+        json!({
+            "id": check_id_from_name(&c.name),
+            "cwd": prov.map(|p| p.cwd.as_str()),
+            "target_sha": prov.and_then(|p| p.target_sha.as_deref()),
+            "tree_state": prov.and_then(|p| p.tree_state).map(|s| s.as_str()),
+            "started_at": prov.map(|p| p.started_at.as_str()),
+            // A replayed cache hit carries the ORIGINAL execution's
+            // provenance; this flag is what separates it from a fresh run.
+            "cached": c.cached,
+            // Present on every row so the two kinds are told apart by VALUE
+            // rather than by a missing key: null means the check ran.
+            "skipped": serde_json::Value::Null,
         })
-        .collect();
+    });
+    // A check ruled out before it ran read no tree, so every substrate field is
+    // null — but it was configured, and silence about it is indistinguishable
+    // from never having been scheduled. The reason is what makes the row worth
+    // reading.
+    let skipped = skipped_checks.iter().map(|s| {
+        json!({
+            "id": s.id,
+            "cwd": serde_json::Value::Null,
+            "target_sha": serde_json::Value::Null,
+            "tree_state": serde_json::Value::Null,
+            "started_at": serde_json::Value::Null,
+            "cached": false,
+            "skipped": s.reason,
+        })
+    });
+    let check_rows: Vec<serde_json::Value> = executed.chain(skipped).collect();
 
     let bases = provenance_bases(diffs, resolved_bases);
     let base_rows: Vec<serde_json::Value> = bases

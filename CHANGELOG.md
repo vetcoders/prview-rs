@@ -39,7 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run (`--base a --base b`) generates one patch per base, each with its own merge
   base, and a single scalar left every patch after the first unplaceable.
   `base_sha` remains, derived from that array's first entry, so existing
-  consumers keep working and the two cannot disagree. A reviewer holding
+  consumers keep working and the two cannot disagree. `checks[]` covers gates
+  that never ran: a check ruled out during eligibility (tests disabled, a tool
+  missing) was omitted entirely, which reads exactly like a gate that was never
+  part of the run. Such a check now gets a row with every substrate field null
+  and a `skipped` reason; rows for checks that ran carry `skipped: null`. A
+  reviewer holding
   only the artifacts no longer has to reconstruct the run's substrate from
   scattered gate files. Purely additive: no existing pack file changed shape,
   the manifest hashes it like any other artifact, and the sanity
