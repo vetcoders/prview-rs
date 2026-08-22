@@ -35,17 +35,6 @@ fn is_cli_entry_point(path: &str) -> bool {
     ) || norm.ends_with("/src/main.rs")
 }
 
-/// True if `s` consists entirely of identifier characters (ASCII letters,
-/// digits, underscore) — i.e. a plain word/identifier with no punctuation.
-///
-/// Only needles satisfying this get word-boundary matching via
-/// [`contains_word_bounded`]; needles carrying punctuation (e.g. `"todo!("`,
-/// `".unwrap()"`) are already naturally bounded and keep plain substring
-/// matching.
-fn is_plain_word(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 /// True if `c` can be part of an identifier in one of the scanned languages.
 ///
 /// Deliberately the UNION across languages rather than ASCII only: `$` forms
@@ -72,12 +61,20 @@ fn is_word_char(c: char) -> bool {
 
 /// Match `needle` inside `haystack` respecting word boundaries.
 ///
-/// The character immediately before a match must not be a word character
-/// (or the match must start at the beginning of the string). The character
-/// immediately after must also not be a word character, UNLESS `needle`
-/// itself already ends in a non-word character (e.g. `"todo!("` is already
-/// right-bounded by `(`) — in that case no trailing-boundary check is
-/// required.
+/// EACH side is checked only where the needle itself has an identifier edge,
+/// because that is the only side on which a longer identifier can swallow it:
+///
+/// - `"todo!("` ends in `(`, so it is already right-bounded and no trailing
+///   check applies — but it STARTS with `t`, so `mytodo!(…)` must not match.
+/// - `".unwrap()"` starts with `.`, so no leading check applies — requiring one
+///   would reject `value.unwrap()`, which is every real occurrence.
+/// - `"TODO"` has identifier edges on both sides, so both are checked.
+///
+/// Deriving the rule from the needle rather than from a "is it a plain word"
+/// test is what lets a punctuated needle be bounded on its one identifier side:
+/// gating the whole helper on plain words left `todo!(`, `dbg!(` and
+/// `println!(` on raw substring matching, so `mytodo!(…)` was reported as a
+/// TODO marker.
 ///
 /// Prevents substring false positives like `XXX` matching inside
 /// `mktemp fooXXXXXX`, or `TODO` matching inside `TODOS`/`todos_list`.
@@ -85,6 +82,7 @@ fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
+    let needs_left_boundary = needle.chars().next().is_some_and(is_word_char);
     let needs_right_boundary = needle.chars().next_back().is_some_and(is_word_char);
 
     let mut search_from = 0;
@@ -95,10 +93,11 @@ fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
         // Boundaries are read per CHARACTER, not per byte: the byte before a
         // non-ASCII letter is a UTF-8 continuation byte, which is not
         // alphanumeric and used to read as a boundary.
-        let left_ok = !haystack[..start]
-            .chars()
-            .next_back()
-            .is_some_and(is_word_char);
+        let left_ok = !needs_left_boundary
+            || !haystack[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_word_char);
         let right_ok =
             !needs_right_boundary || !haystack[end..].chars().next().is_some_and(is_word_char);
 
@@ -111,9 +110,19 @@ fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
 }
 
 /// Patterns to scan for in added lines of patches.
+///
+/// Every needle is matched with [`contains_word_bounded`], which bounds each
+/// side only where the needle has an identifier edge. The `eprint` family is
+/// listed explicitly because it used to be caught by accident: `eprintln!(`
+/// CONTAINS `println!(`, so raw substring matching reported it while also
+/// reporting `myprintln!(`. Bounding the needle ends both, and the family it
+/// was catching for real is named here instead.
 const SCAN_PATTERNS: &[(&str, &[&str])] = &[
     ("unwrap", &[".unwrap()"]),
-    ("println", &["println!(", "print!("]),
+    (
+        "println",
+        &["println!(", "print!(", "eprintln!(", "eprint!("],
+    ),
     ("dbg", &["dbg!("]),
     ("todo", &["todo!(", "TODO", "FIXME", "HACK", "XXX"]),
     (
@@ -301,13 +310,7 @@ pub fn generate_pattern_scan(dir: &Path, diffs: &[Diff], repo: &Repository) -> R
                 let is_test_code = file_is_test || test_lines.contains(&line_no);
 
                 for &(pattern_name, needles) in SCAN_PATTERNS {
-                    let matched = needles.iter().any(|n| {
-                        if is_plain_word(n) {
-                            contains_word_bounded(content, n)
-                        } else {
-                            content.contains(n)
-                        }
-                    });
+                    let matched = needles.iter().any(|n| contains_word_bounded(content, n));
                     if matched {
                         // `println`/`print` hits in a CLI entry point are
                         // intended output, not a debug leftover (P2-05).
@@ -939,11 +942,15 @@ mod tests {
         Some(parsed)
     }
 
-    fn todo_pattern_present(scan: &Option<serde_json::Value>) -> bool {
+    fn pattern_present(scan: &Option<serde_json::Value>, pattern: &str) -> bool {
         scan.as_ref()
             .and_then(|v| v["by_pattern"].as_array())
-            .map(|arr| arr.iter().any(|e| e["pattern"] == "todo"))
+            .map(|arr| arr.iter().any(|e| e["pattern"] == pattern))
             .unwrap_or(false)
+    }
+
+    fn todo_pattern_present(scan: &Option<serde_json::Value>) -> bool {
+        pattern_present(scan, "todo")
     }
 
     #[test]
@@ -1004,12 +1011,121 @@ mod tests {
     }
 
     #[test]
-    fn is_plain_word_distinguishes_words_from_punctuated_phrases() {
-        assert!(is_plain_word("TODO"));
-        assert!(is_plain_word("XXX"));
-        assert!(!is_plain_word("todo!("));
-        assert!(!is_plain_word(".unwrap()"));
-        assert!(!is_plain_word(""));
+    fn pattern_scan_prefixed_todo_macro_is_not_todo() {
+        // The scanner reached `contains_word_bounded` only for needles made
+        // entirely of identifier characters, so `todo!(` kept plain substring
+        // matching and `mytodo!(…)` was reported as a TODO marker — the very
+        // substring false positive bounded matching exists to exclude.
+        let new = "fn run() {\n    mytodo!(\"custom macro\");\n}\n";
+        let scan = scan_todo_pattern(new);
+        assert!(
+            !todo_pattern_present(&scan),
+            "a macro whose name merely ends in todo! must not be a TODO marker"
+        );
+    }
+
+    #[test]
+    fn pattern_scan_prefixed_debug_macros_are_not_hits() {
+        // Same class, same needles list: `dbg!(` and `println!(` start with an
+        // identifier character, so a longer macro name ending in one of them
+        // used to be reported as a debug leftover.
+        let new = "fn run() {\n    mydbg!(1);\n    myprintln!(\"x\");\n}\n";
+        let scan = scan_todo_pattern(new);
+        assert!(
+            !pattern_present(&scan, "dbg"),
+            "mydbg! must not be reported as a dbg leftover"
+        );
+        assert!(
+            !pattern_present(&scan, "println"),
+            "myprintln! must not be reported as a println leftover"
+        );
+    }
+
+    #[test]
+    fn pattern_scan_still_flags_the_eprint_family() {
+        // Guard the coverage that used to ride on substring matching:
+        // `eprintln!(` contains `println!(`, so it was reported only by
+        // accident. Word-bounding the needle ends that accident, and the
+        // family is listed explicitly instead.
+        let new = "fn run() {\n    eprintln!(\"x\");\n}\n";
+        assert!(
+            pattern_present(&scan_todo_pattern(new), "println"),
+            "eprintln! must still be reported as debug output"
+        );
+
+        let new = "fn run() {\n    eprint!(\"x\");\n}\n";
+        assert!(
+            pattern_present(&scan_todo_pattern(new), "println"),
+            "eprint! must still be reported as debug output"
+        );
+    }
+
+    #[test]
+    fn word_boundaries_are_derived_from_each_needle_edge() {
+        // A needle is bounded on the side where it has an identifier edge, and
+        // only there — that is the only side a longer identifier can swallow it
+        // from. Asking for a boundary on the other side rejects every real
+        // occurrence instead.
+        assert!(contains_word_bounded("value.unwrap()", ".unwrap()"));
+        assert!(contains_word_bounded("a.b().unwrap();", ".unwrap()"));
+        assert!(!contains_word_bounded("mytodo!(\"x\")", "todo!("));
+        assert!(contains_word_bounded("crate::todo!(\"x\")", "todo!("));
+        assert!(!contains_word_bounded("", "TODO"));
+        assert!(!contains_word_bounded("TODO", ""));
+    }
+
+    #[test]
+    fn every_scan_needle_keeps_its_real_occurrences() {
+        // The whole needle table, not just the reported three: bounding must
+        // not cost a single genuine hit. `eslint-disable-next-line` is the
+        // interesting one — `-` is not an identifier character, so the longer
+        // directive still matches the shorter needle.
+        for (haystack, needle) in [
+            ("value.unwrap()", ".unwrap()"),
+            ("    println!(\"x\");", "println!("),
+            ("    eprintln!(\"x\");", "eprintln!("),
+            ("    dbg!(x);", "dbg!("),
+            ("    todo!(\"x\");", "todo!("),
+            ("// TODO: fix", "TODO"),
+            ("// @ts-ignore", "@ts-ignore"),
+            ("// eslint-disable-next-line no-console", "eslint-disable"),
+            ("window.console.log(x)", "console.log("),
+            ("} catch {", "catch {"),
+            ("promise.catch(() => {})", ".catch(() =>"),
+            ("pub unsafe fn raw() {}", "unsafe fn"),
+            ("    unsafe { ptr.read() }", "unsafe {"),
+            ("#[allow(dead_code)]", "#[allow("),
+            ("#![allow(dead_code)]", "#![allow("),
+            ("const x = y as unknown as Z;", "as unknown as"),
+            ("const x = y as any;", "as any"),
+        ] {
+            assert!(
+                contains_word_bounded(haystack, needle),
+                "needle {needle:?} must still match {haystack:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_identifier_edged_needle_rejects_a_longer_identifier() {
+        // The other direction, for every needle that starts or ends inside an
+        // identifier: a longer name containing it is not a hit.
+        for (haystack, needle) in [
+            ("myprintln!(\"x\")", "println!("),
+            ("myprint!(\"x\")", "print!("),
+            ("mydbg!(1)", "dbg!("),
+            ("mytodo!(\"x\")", "todo!("),
+            ("let TODOS = 1;", "TODO"),
+            ("let myconsole.log(x)", "console.log("),
+            ("fn trycatch {", "catch {"),
+            ("myunsafe { }", "unsafe {"),
+            ("const x = y as anything;", "as any"),
+        ] {
+            assert!(
+                !contains_word_bounded(haystack, needle),
+                "needle {needle:?} must not match {haystack:?}"
+            );
+        }
     }
 
     #[test]

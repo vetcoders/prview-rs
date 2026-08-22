@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every risky-pattern needle is word-bounded, not just the plain words.**
+  Bounded matching was applied only to needles made entirely of identifier
+  characters, so `todo!(`, `dbg!(`, `println!(`, `console.log(`, `unsafe {` and
+  `as any` kept raw substring matching: `mytodo!(…)` was reported as a TODO
+  marker and every `has any` in a doc comment as a type cast — the exact
+  substring false positives bounded matching exists to exclude. Each side of a
+  needle is now bounded where the needle itself has an identifier edge, which
+  leaves `.unwrap()` matching `value.unwrap()` and `eslint-disable` matching
+  `eslint-disable-next-line`. `eprintln!`/`eprint!` are now listed explicitly:
+  they used to be caught only because `eprintln!(` contains `println!(`.
 - **A test marker on a body-less item no longer mutes the rest of its hunk.**
   The performance-regression tracker closed a test context only when its opening
   brace balanced again, but `#[cfg(test)] mod tests;` and `#[cfg(test)] use
