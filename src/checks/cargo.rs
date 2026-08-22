@@ -238,37 +238,103 @@ fn contained_in_snapshot(cwd: PathBuf, scan_dir: &Path) -> Result<PathBuf> {
 /// tree as it stands, and a path dependency on a sibling checkout is an ordinary
 /// local setup; nothing there claims the verdict describes a commit's contents.
 ///
-/// The check is static and reads only this manifest: a workspace member's own
-/// dependencies are not followed, and neither is anything a build script does.
-/// It refuses what it can prove escapes rather than pretending to be complete —
-/// running `cargo metadata` to resolve the true graph would need the network,
-/// the registry and a second full resolve per check.
+/// The root manifest is not the only one cargo reads. `cargo check` at a
+/// workspace root builds its members, and a member declares its own
+/// dependencies, so every manifest within [`MEMBER_MANIFEST_DEPTH`] of the cargo
+/// root is held to the same rule. That walk is the whole cost: no subprocess, no
+/// registry, no resolve. What it still does not cover is a member outside that
+/// subtree, a `[patch]` in `.cargo/config.toml`, and anything a build script
+/// does — it refuses what it can prove escapes rather than pretending to be
+/// complete, because resolving the true graph means `cargo metadata`, a
+/// network-capable second resolve for each of six gates.
 fn dependency_paths_stay_in_snapshot(cwd: &Path, scan_dir: &Path) -> Result<()> {
-    let (Ok(root), Ok(manifest)) = (
-        scan_dir.canonicalize(),
-        std::fs::read_to_string(cwd.join("Cargo.toml")),
-    ) else {
-        return Ok(());
-    };
-    let Ok(manifest) = toml::from_str::<toml::Table>(&manifest) else {
+    let Ok(root) = scan_dir.canonicalize() else {
         return Ok(());
     };
 
-    for (name, declared) in manifest_dependency_paths(&manifest) {
-        // An absolute declared path replaces the root, which is the case at issue.
-        let Ok(resolved) = cwd.join(&declared).canonicalize() else {
-            continue;
-        };
-        if !resolved.starts_with(&root) {
+    for manifest_dir in manifest_dirs_below(cwd, MEMBER_MANIFEST_DEPTH) {
+        let manifest_path = manifest_dir.join("Cargo.toml");
+        // A member manifest that is itself a link out of the snapshot is the
+        // same escape as an escaping dependency, one file earlier.
+        if let Ok(resolved) = manifest_path.canonicalize()
+            && !resolved.starts_with(&root)
+        {
             anyhow::bail!(
-                "dependency `{name}` at {declared}, declared in {}, resolves outside the reviewed \
-                 snapshot ({}), so cargo would compile source the reviewed commit does not contain",
-                cwd.join("Cargo.toml").display(),
+                "the manifest at {} resolves outside the reviewed snapshot ({}), so cargo would \
+                 read a project the reviewed commit does not contain",
+                manifest_path.display(),
                 scan_dir.display(),
             );
         }
+        let Ok(manifest) = std::fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(manifest) = toml::from_str::<toml::Table>(&manifest) else {
+            continue;
+        };
+
+        for (name, declared) in manifest_dependency_paths(&manifest) {
+            // An absolute declared path replaces the root, which is the case at
+            // issue; a relative one is resolved against ITS own manifest.
+            let Ok(resolved) = manifest_dir.join(&declared).canonicalize() else {
+                continue;
+            };
+            if !resolved.starts_with(&root) {
+                anyhow::bail!(
+                    "dependency `{name}` at {declared}, declared in {}, resolves outside the \
+                     reviewed snapshot ({}), so cargo would compile source the reviewed commit \
+                     does not contain",
+                    manifest_path.display(),
+                    scan_dir.display(),
+                );
+            }
+        }
     }
     Ok(())
+}
+
+/// How far below the cargo root a workspace member's manifest is looked for.
+///
+/// Members live a level or two down (`crates/core`, `services/api/worker`);
+/// past that the walk costs more than it proves.
+const MEMBER_MANIFEST_DEPTH: usize = 3;
+
+/// Directories at or below `root` that carry a `Cargo.toml`.
+///
+/// Symlinked directories are never entered: the snapshot links dependency
+/// scaffolding (`node_modules`) in, and a link is not part of the reviewed tree.
+/// `target/` and `.git/` hold no manifest cargo would read as a member.
+fn manifest_dirs_below(root: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    collect_manifest_dirs(root, depth, &mut found);
+    found
+}
+
+fn collect_manifest_dirs(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if dir.join("Cargo.toml").is_file() {
+        found.push(dir.to_path_buf());
+    }
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `symlink_metadata` does not follow, so a linked directory is not a
+        // directory here and is skipped.
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        if matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("target" | ".git")
+        ) {
+            continue;
+        }
+        collect_manifest_dirs(&path, depth - 1, found);
+    }
 }
 
 /// Every local path a manifest points cargo at, dependencies and overrides alike,
@@ -2841,6 +2907,47 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         assert!(
             err.contains("outside the reviewed snapshot") && err.contains("foreign"),
             "the refusal must name the escaping dependency: {err}",
+        );
+    }
+
+    /// `cargo check` at a workspace root builds its MEMBERS, and a member
+    /// declares its own dependencies. Reading only the root manifest left a
+    /// member free to point cargo at an absolute path outside the snapshot,
+    /// under an exact `snapshot` provenance row.
+    #[test]
+    fn a_member_path_dependency_outside_the_snapshot_is_refused() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        std::fs::create_dir_all(scan_dir.path().join("crates/member")).unwrap();
+        std::fs::write(
+            scan_dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/member\"]\nresolver=\"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            scan_dir.path().join("crates/member/Cargo.toml"),
+            format!(
+                "[package]\nname=\"member\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+                 foreign = {{ path = \"{}\" }}\n",
+                outside.path().display(),
+            ),
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a member may not point the workspace build at a foreign directory");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("crates/member") && err.contains("outside the reviewed snapshot"),
+            "the refusal must name the member manifest that declares it: {err}",
         );
     }
 

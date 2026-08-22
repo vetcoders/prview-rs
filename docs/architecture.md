@@ -348,9 +348,18 @@ reviewed commit does not contain while provenance reports `snapshot`, so the run
 is refused with the dependency named. Only off-`HEAD` runs are held to this: a
 local review is about the working tree as it stands, where a path dependency on
 a sibling checkout is an ordinary setup and no claim is made about a commit's
-contents. The check is static and reads only that one manifest — a member's own
-dependencies are not followed — because resolving the true graph means
-`cargo metadata`, a network-capable second resolve per check.
+contents.
+
+`cargo check` at a workspace root builds its members, and a member declares its
+own dependencies, so every manifest within three levels of the cargo root is
+read the same way — a bounded directory walk that never enters a symlinked
+directory (the snapshot links `node_modules` in) and skips `target/` and
+`.git/`. A member manifest that is itself a link out of the snapshot is refused
+with them. What the walk still does not cover is a member outside that subtree,
+a `[patch]` in `.cargo/config.toml`, and anything a build script does: it
+refuses what it can prove escapes rather than pretending to be complete, because
+resolving the true graph means `cargo metadata`, a network-capable second
+resolve for each of six gates.
 
 Whether cargo applies at all is decided by the **reviewed** commit, not by the
 local profile. `config.profile.has_cargo` describes the checkout, so reviewing a

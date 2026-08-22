@@ -207,9 +207,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provenance row. Every local path an off-`HEAD` run's cargo root manifest names
   (dependencies, dev, build, `[workspace.dependencies]`, `[target.*]`, `[patch]`,
   `[replace]`) is now resolved against the snapshot, and one that leaves it is
-  refused with the dependency named. Local reviews are untouched: a path
-  dependency on a sibling checkout is an ordinary local setup, and a local run
-  claims nothing about a commit's contents.
+  refused with the dependency named — and not only the root manifest's, since
+  `cargo check` at a workspace root builds its members: every manifest within
+  three levels of the cargo root is read the same way, through a bounded walk
+  that never enters a symlinked directory and skips `target/` and `.git/`. A
+  member manifest that is itself a link out of the snapshot is refused with
+  them. Local reviews are untouched: a path dependency on a sibling checkout is
+  an ordinary local setup, and a local run claims nothing about a commit's
+  contents.
 - A cargo root that the reviewed branch moved (a root crate pushed into
   `backend/`, a member renamed) is no longer projected into the snapshot
   verbatim. The locally detected path does not exist there, so cargo failed on a
