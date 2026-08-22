@@ -84,6 +84,7 @@ Every run writes an artifact pack:
 - `report.json` — machine-readable output
 - `dashboard.html` — interactive exploration
 - `00_summary/MERGE_GATE.json` — gate automation
+- `00_summary/PROVENANCE.json` — what the pack judged, and which tree each check read
 
 ## Usage
 
@@ -146,7 +147,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: vetcoders/prview-rs@main # pin to a released tag once one ships `prview gate`
+      - uses: vetcoders/prview-rs@v0.6.0 # pin to a released tag
         id: prview
         with:
           strict: "true"
@@ -161,9 +162,8 @@ The Action maps pass/fail only from the `prview gate` exit-code contract. JSON
 stdout is used for step-summary details and artifact paths, not for deciding
 whether the check passed. `cargo-binstall` is used when available, with
 `cargo install prview` as the fallback. Set `version` to a published release
-that contains `prview gate`, or `latest` for the newest release. The gate
-command is not in the `0.5.0` crate; until a release that includes it is
-published, install the action from `main`.
+that contains `prview gate` (`0.6.0` or newer), or `latest` for the newest
+release.
 
 GitHub code scanning accepts SARIF uploads through
 `github/codeql-action/upload-sarif`. Keep SARIF under GitHub's ingestion limits:
@@ -179,6 +179,7 @@ step.
 | `report.json` | Machine-readable findings |
 | `dashboard.html` | Visual summary of the analysis |
 | `00_summary/MERGE_GATE.json` | Pass/fail gate for automation |
+| `00_summary/PROVENANCE.json` | Commits, working-tree state, and the tree each check scanned |
 | `INLINE_FINDINGS.sarif` | Per-finding annotations (optional) |
 
 The merge decision is a single enum — `PASS`, `CONDITIONAL`, or `BLOCK` — so both humans and automation read one truth. See [`docs/contracts/merge_gate.md`](docs/contracts/merge_gate.md).

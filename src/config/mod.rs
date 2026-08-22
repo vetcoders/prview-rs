@@ -987,6 +987,49 @@ impl Config {
             .join("cache")
             .join(cache_namespace_from_root(&self.repo_root))
     }
+
+    /// Shared cargo build directory used when checks run off an ephemeral
+    /// target snapshot.
+    ///
+    /// A `--pr`/`--remote` review compiles a freshly materialised worktree, and
+    /// its in-tree `target/` is thrown away with the snapshot — so every run
+    /// would rebuild the whole dependency graph from zero. Pointing
+    /// `CARGO_TARGET_DIR` at one per-repo directory (same namespace as
+    /// [`Config::cache_dir`]) keeps that cache warm across runs while leaving
+    /// the operator's own `target/` untouched: prview must never overwrite the
+    /// binary a developer just built.
+    pub fn cargo_build_cache_dir(&self) -> PathBuf {
+        prview_home()
+            .join("cargo-target")
+            .join(cache_namespace_from_root(&self.repo_root))
+    }
+
+    /// Where this repository's reviewed-commit python environments live.
+    ///
+    /// The snapshot symlinks the operator's `.venv` so a review does not
+    /// reinstall the world — but `uv run` synchronises the project environment
+    /// before executing, so a target whose dependencies differ from the local
+    /// branch would install into (and remove packages from) the developer's
+    /// active environment. Pointing `UV_PROJECT_ENVIRONMENT` under this
+    /// prview-owned root (same namespace as [`Config::cache_dir`]) keeps the
+    /// operator's `.venv` read-only. A local review sets no override at all.
+    pub fn uv_env_root(&self) -> PathBuf {
+        prview_home()
+            .join("uv-env")
+            .join(cache_namespace_from_root(&self.repo_root))
+    }
+
+    /// The environment for ONE reviewed substrate.
+    ///
+    /// One environment per repository was still shared state: two prview
+    /// processes reviewing different commits synchronised incompatible
+    /// dependency sets into the same directory, each under the other's running
+    /// checks. Keying the directory by the substrate makes those reviews
+    /// independent, while runs of the same commit keep reusing a warm
+    /// environment.
+    pub fn uv_env_dir_for(&self, substrate: &str) -> PathBuf {
+        self.uv_env_root().join(substrate)
+    }
 }
 
 /// Find git repository root from current directory
@@ -1202,11 +1245,21 @@ fn detect_python_source(repo_root: &Path) -> bool {
 }
 
 fn is_runtime_python_file(repo_root: &Path, path: &Path) -> bool {
-    if path.extension().is_none_or(|ext| ext != "py") {
+    is_runtime_python_path(path.strip_prefix(repo_root).unwrap_or(path))
+}
+
+/// Whether a REPO-RELATIVE path is Python the project actually runs, as opposed
+/// to tooling, fixtures or vendored code.
+///
+/// Split out from [`is_runtime_python_file`] because the same question has to be
+/// asked of a git TREE, where no filesystem path exists: deciding whether the
+/// reviewed commit is still a Python project must not consult the operator's
+/// checkout (see `missing_reviewed_python_project` in `checks::python`).
+pub(crate) fn is_runtime_python_path(rel: &Path) -> bool {
+    if rel.extension().is_none_or(|ext| ext != "py") {
         return false;
     }
 
-    let rel = path.strip_prefix(repo_root).unwrap_or(path);
     let parts: Vec<String> = rel
         .components()
         .map(|component| component.as_os_str().to_string_lossy().to_string())

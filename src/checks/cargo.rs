@@ -2,14 +2,14 @@
 
 use super::{
     Check, CheckResult, CheckStatus, ProvenanceBuilder, TEST_TIMEOUT_SECS, has_tool_crash,
-    run_command, run_command_with_timeout,
+    off_head_target_commit, plan_check_run, run_command_with_env, run_command_with_timeout_and_env,
 };
 use crate::Config;
 use crate::cache;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Local;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct CargoCheck;
 pub struct ClippyCheck;
@@ -18,12 +18,644 @@ pub struct RustfmtCheck;
 pub struct CargoAuditCheck;
 pub struct CargoGeigerCheck;
 
+/// The cargo package/workspace root inside the LOCAL checkout.
 fn cargo_cache_root(config: &Config) -> &Path {
     config
         .profile
         .cargo_root
         .as_deref()
         .unwrap_or(config.repo_root.as_path())
+}
+
+/// Where a cargo check must execute, plus the environment it needs there.
+struct CargoRun {
+    /// Directory to run `cargo` in — the reviewed snapshot's cargo root in
+    /// `--pr`/`--remote` mode, the local cargo root otherwise.
+    cwd: PathBuf,
+    /// Extra child environment (`CARGO_TARGET_DIR`), empty for a local run.
+    env: Vec<(String, String)>,
+    /// Ephemeral snapshot, kept alive until the check finishes.
+    _snapshot: Option<crate::git::WorktreeSnapshot>,
+}
+
+/// Resolve where the cargo commands for this run must execute.
+///
+/// Cargo checks must judge the REVIEWED commit like every other language check.
+/// Running them at the local cargo root meant that a `--pr`/`--remote` pack
+/// combined the target's diff with build/clippy/test/fmt results from whatever
+/// branch happened to be checked out locally — a foreign tree's verdict printed
+/// under the reviewed PR's name (the 2026-07-24 remote-only regression).
+///
+/// Two cases:
+/// - local review (target == `HEAD`, or the repo/refs cannot be resolved):
+///   unchanged — the local cargo root, no environment override, so the
+///   operator's own warm `target/` is used and left exactly as it was;
+/// - reviewed review (target != `HEAD`): the matching cargo root INSIDE the
+///   snapshot, with `CARGO_TARGET_DIR` pointed at the per-repo shared build
+///   cache. Without that redirect every run would compile the entire dependency
+///   graph from zero, because the snapshot is a fresh temp dir thrown away at
+///   the end of the run — which is the reason the checks were pinned to the
+///   local root in the first place.
+///
+/// A cargo root configured OUTSIDE the repo has no third case: a snapshot of
+/// this repo can never contain it, so the reviewed tree cannot be analysed at
+/// all. That combination is refused by [`CargoCheck::check_eligibility`] and
+/// friends before a command is built; reaching it here is a bug, and the error
+/// is loud rather than a silent fallback onto the operator's local tree.
+fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
+    let local_root = cargo_cache_root(config).to_path_buf();
+    let plan = plan_check_run(config)?;
+
+    if plan.scan_dir == config.repo_root {
+        return Ok(CargoRun {
+            cwd: manifest_stays_in_root(local_root)?,
+            env: Vec::new(),
+            _snapshot: plan._snapshot,
+        });
+    }
+
+    let Some(mapped) = snapshot_cargo_root(&local_root, &config.repo_root, &plan.scan_dir) else {
+        anyhow::bail!(
+            "cargo root {} lies outside the repository, so the reviewed commit's tree cannot be \
+             analysed; configure a cargo_root inside the repo or review the local checkout",
+            local_root.display()
+        );
+    };
+
+    // Cargo creates the target directory itself, so nothing is materialised
+    // here — resolving the path stays free of filesystem side effects.
+    let target_dir = config.cargo_build_cache_dir();
+
+    let cwd = match resolve_reviewed_cargo_root(config) {
+        // The reviewed commit's own tree said where its manifest is.
+        ReviewedCargoRoot::Resolved(relative) => relative
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .fold(plan.scan_dir.clone(), |acc, part| acc.join(part)),
+        // Eligibility skips this case, so reaching it means a check ran anyway.
+        ReviewedCargoRoot::Unavailable(reason) => anyhow::bail!(
+            "the reviewed commit has no cargo root to run in ({reason}), so no cargo verdict can \
+             be earned for it"
+        ),
+        // Git could not answer (an injected scan dir, an unreadable repo): fall
+        // back to inspecting the materialised snapshot.
+        ReviewedCargoRoot::Unknown => reviewed_cargo_root(mapped, &plan.scan_dir),
+    };
+    let cwd = contained_in_snapshot(cwd, &plan.scan_dir)?;
+    dependency_paths_stay_in_snapshot(&cwd, &plan.scan_dir)?;
+
+    Ok(CargoRun {
+        cwd,
+        env: vec![(
+            "CARGO_TARGET_DIR".to_string(),
+            target_dir.display().to_string(),
+        )],
+        _snapshot: plan._snapshot,
+    })
+}
+
+/// The directory a cargo check would have run in, given a scan dir that already
+/// exists.
+///
+/// Shares its resolution with [`plan_cargo_run`] rather than repeating it, and
+/// materialises nothing: the caller is the error path in the dispatcher, which
+/// has the run-wide snapshot (or the local root) in hand and only needs to know
+/// where within it the command was headed. Collapsing every cargo run to the
+/// snapshot root there would report a directory the command did not run in —
+/// wrong in exactly the workspace-member case the cache key already learned to
+/// distinguish.
+///
+/// Best effort by construction: a root the reviewed tree cannot offer falls back
+/// to the scan dir, which is the closest true statement available.
+pub(super) fn planned_cargo_cwd(config: &Config, scan_dir: &Path) -> PathBuf {
+    if scan_dir == config.repo_root {
+        return cargo_cache_root(config).to_path_buf();
+    }
+    match resolve_reviewed_cargo_root(config) {
+        ReviewedCargoRoot::Resolved(relative) => relative
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .fold(scan_dir.to_path_buf(), |acc, part| acc.join(part)),
+        ReviewedCargoRoot::Unavailable(_) => scan_dir.to_path_buf(),
+        ReviewedCargoRoot::Unknown => {
+            match snapshot_cargo_root(cargo_cache_root(config), &config.repo_root, scan_dir) {
+                Some(mapped) => reviewed_cargo_root(mapped, scan_dir),
+                None => scan_dir.to_path_buf(),
+            }
+        }
+    }
+}
+
+/// Refuse a manifest that is a link out of the directory cargo will run in.
+///
+/// [`contained_in_snapshot`] documents that it also covers a local review, but
+/// it never sees one: the local plan returns before reaching it. A checkout that
+/// tracks `Cargo.toml` as a link to an external manifest therefore had cargo
+/// build a foreign project while provenance recorded `local-clean` — the same
+/// escape the reviewed-tree guard closes for off-`HEAD` runs.
+///
+/// Containment is judged against the cargo root itself, not the repository. An
+/// externally configured `cargo_root` is a legitimate local setup (recorded as a
+/// `foreign` substrate, and refused only for off-`HEAD` reviews); what must not
+/// happen is cargo being walked out of the project it was pointed at.
+fn manifest_stays_in_root(cwd: PathBuf) -> Result<PathBuf> {
+    let manifest = cwd.join("Cargo.toml");
+    let (Ok(resolved), Ok(root)) = (manifest.canonicalize(), cwd.canonicalize()) else {
+        // Nothing there yet: cargo reporting a missing manifest is a truthful
+        // local failure, not a foreign project's verdict.
+        return Ok(cwd);
+    };
+    if !resolved.starts_with(&root) {
+        anyhow::bail!(
+            "the manifest at {} resolves outside the cargo root ({}), so a verdict earned there \
+             would describe another project",
+            manifest.display(),
+            cwd.display(),
+        );
+    }
+    Ok(cwd)
+}
+
+/// Refuse a cargo root that leaves the reviewed snapshot.
+///
+/// The lexical check in [`repo_relative_cargo_root`] only sees the path the
+/// OPERATOR configured. The reviewed commit controls the tree, and a directory
+/// it replaced with a symlink to somewhere else resolves to a path with no `..`
+/// in it — so cargo would run on a foreign tree and the verdict would be cached
+/// under the reviewed commit, exactly the hole the external-root refusal closed.
+/// Containment is therefore settled on the real, resolved paths, after the
+/// snapshot exists.
+///
+/// The directory is not the whole answer: a root that stays inside the snapshot
+/// can still hold a `Cargo.toml` that is itself a link to an external manifest,
+/// and cargo reads the manifest, not the directory. The same is true of
+/// `Cargo.lock` — cargo follows a symlinked lockfile even under `--locked`, so a
+/// reviewed commit tracking its lock as a link to an external file had the whole
+/// dependency graph resolved from another project's pins while provenance
+/// recorded an exact `snapshot` scan. All three are therefore resolved.
+/// The tree-level guard in [`resolve_reviewed_cargo_root`] already rejects such a
+/// manifest for an off-HEAD review; this is the same refusal on the materialised
+/// bytes, for the paths that guard cannot reach (a repo whose tree git could not
+/// be asked about). A LOCAL review never reaches this function — it returns from
+/// `plan_cargo_run` earlier — and is covered by [`manifest_stays_in_root`].
+///
+/// A path that cannot be canonicalised (nothing there yet) is left alone: cargo
+/// reporting a missing directory is a truthful local failure, not a foreign
+/// tree's verdict. The path itself is returned unchanged — canonicalisation is
+/// the test, not the answer, and resolving it would rewrite the directory
+/// provenance reports (`/var` → `/private/var` on macOS).
+fn contained_in_snapshot(cwd: PathBuf, scan_dir: &Path) -> Result<PathBuf> {
+    let Ok(root) = scan_dir.canonicalize() else {
+        return Ok(cwd);
+    };
+    for target in [cwd.clone(), cwd.join("Cargo.toml"), cwd.join("Cargo.lock")] {
+        let Ok(resolved) = target.canonicalize() else {
+            continue;
+        };
+        if !resolved.starts_with(&root) {
+            anyhow::bail!(
+                "{} resolves outside the reviewed snapshot ({}), so a verdict earned \
+                 there would describe another tree",
+                target.display(),
+                scan_dir.display(),
+            );
+        }
+    }
+    Ok(cwd)
+}
+
+/// Refuse a manifest that points cargo at source outside the reviewed snapshot.
+///
+/// The root and its manifest being contained says nothing about what that
+/// manifest declares. A reviewed `Cargo.toml` carrying an absolute `path`
+/// dependency — or a relative one that climbs out of the snapshot, or resolves
+/// through a symlink — has cargo compile a directory the reviewed commit does
+/// not contain, while provenance reports a `snapshot` scan and the verdict is
+/// cached under the reviewed commit. The same escape as a symlinked cargo root,
+/// one level further in.
+///
+/// Only OFF-`HEAD` runs are held to this. A local review is about the working
+/// tree as it stands, and a path dependency on a sibling checkout is an ordinary
+/// local setup; nothing there claims the verdict describes a commit's contents.
+///
+/// The root manifest is not the only one cargo reads. `cargo check` at a
+/// workspace root builds its members, and a member declares its own
+/// dependencies, so every manifest within [`MEMBER_MANIFEST_DEPTH`] of the cargo
+/// root is held to the same rule. That walk is the whole cost: no subprocess, no
+/// registry, no resolve. What it still does not cover is a member outside that
+/// subtree, a `[patch]` in `.cargo/config.toml`, and anything a build script
+/// does — it refuses what it can prove escapes rather than pretending to be
+/// complete, because resolving the true graph means `cargo metadata`, a
+/// network-capable second resolve for each of six gates.
+fn dependency_paths_stay_in_snapshot(cwd: &Path, scan_dir: &Path) -> Result<()> {
+    let Ok(root) = scan_dir.canonicalize() else {
+        return Ok(());
+    };
+
+    for manifest_dir in manifest_dirs_below(cwd, MEMBER_MANIFEST_DEPTH) {
+        let manifest_path = manifest_dir.join("Cargo.toml");
+        // A member manifest that is itself a link out of the snapshot is the
+        // same escape as an escaping dependency, one file earlier.
+        if let Ok(resolved) = manifest_path.canonicalize()
+            && !resolved.starts_with(&root)
+        {
+            anyhow::bail!(
+                "the manifest at {} resolves outside the reviewed snapshot ({}), so cargo would \
+                 read a project the reviewed commit does not contain",
+                manifest_path.display(),
+                scan_dir.display(),
+            );
+        }
+        let Ok(manifest) = std::fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(manifest) = toml::from_str::<toml::Table>(&manifest) else {
+            continue;
+        };
+
+        for (name, declared) in manifest_dependency_paths(&manifest) {
+            // An absolute declared path replaces the root, which is the case at
+            // issue; a relative one is resolved against ITS own manifest.
+            let Ok(resolved) = manifest_dir.join(&declared).canonicalize() else {
+                continue;
+            };
+            if !resolved.starts_with(&root) {
+                anyhow::bail!(
+                    "dependency `{name}` at {declared}, declared in {}, resolves outside the \
+                     reviewed snapshot ({}), so cargo would compile source the reviewed commit \
+                     does not contain",
+                    manifest_path.display(),
+                    scan_dir.display(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How far below the cargo root a workspace member's manifest is looked for.
+///
+/// Members live a level or two down (`crates/core`, `services/api/worker`);
+/// past that the walk costs more than it proves.
+const MEMBER_MANIFEST_DEPTH: usize = 3;
+
+/// Directories at or below `root` that carry a `Cargo.toml`.
+///
+/// Symlinked directories are never entered: the snapshot links dependency
+/// scaffolding (`node_modules`) in, and a link is not part of the reviewed tree.
+/// `target/` and `.git/` hold no manifest cargo would read as a member.
+fn manifest_dirs_below(root: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    collect_manifest_dirs(root, depth, &mut found);
+    found
+}
+
+fn collect_manifest_dirs(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if dir.join("Cargo.toml").is_file() {
+        found.push(dir.to_path_buf());
+    }
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `symlink_metadata` does not follow, so a linked directory is not a
+        // directory here and is skipped.
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        if matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("target" | ".git")
+        ) {
+            continue;
+        }
+        collect_manifest_dirs(&path, depth - 1, found);
+    }
+}
+
+/// Every local path a manifest points cargo at, dependencies and overrides alike,
+/// paired with the name it is declared under.
+fn manifest_dependency_paths(manifest: &toml::Table) -> Vec<(String, String)> {
+    fn spec_path((name, spec): (&str, &toml::Value)) -> Option<(String, String)> {
+        let path = spec.as_table()?.get("path")?.as_str()?;
+        Some((name.to_string(), path.to_string()))
+    }
+
+    let mut paths: Vec<(String, String)> = dependency_specs(manifest)
+        .into_iter()
+        .filter_map(spec_path)
+        .collect();
+    // `[patch.<source>.<name>]` nests one level deeper than `[replace.<name>]`.
+    if let Some(patch) = manifest.get("patch").and_then(|patch| patch.as_table()) {
+        for source in patch.values().filter_map(|source| source.as_table()) {
+            paths.extend(
+                source
+                    .iter()
+                    .filter_map(|(name, spec)| spec_path((name.as_str(), spec))),
+            );
+        }
+    }
+    if let Some(replace) = manifest
+        .get("replace")
+        .and_then(|replace| replace.as_table())
+    {
+        paths.extend(
+            replace
+                .iter()
+                .filter_map(|(name, spec)| spec_path((name.as_str(), spec))),
+        );
+    }
+    paths
+}
+
+/// Validate the mapped cargo root against the reviewed snapshot.
+///
+/// `config.profile.cargo_root` describes the LOCAL checkout. When the reviewed
+/// branch moved the crate (a root crate pushed into `backend/`, a member renamed)
+/// that path does not exist in the snapshot, and projecting it blindly makes
+/// cargo fail on a missing manifest — an execution error reported as the reviewed
+/// crate's verdict. Fall back to the snapshot root when it carries a manifest of
+/// its own: a workspace root still checks its members, and provenance records the
+/// directory actually used. With no manifest anywhere, keep the mapped path so
+/// cargo's own error names the real problem instead of prview inventing one.
+fn reviewed_cargo_root(mapped: PathBuf, scan_dir: &Path) -> PathBuf {
+    if mapped.join("Cargo.toml").exists() || !scan_dir.join("Cargo.toml").exists() {
+        return mapped;
+    }
+    scan_dir.to_path_buf()
+}
+
+/// Map the local cargo root onto the same relative location inside `scan_dir`.
+///
+/// Returns `None` when the cargo root is not inside the repo, which a snapshot
+/// of that repo can never contain.
+fn snapshot_cargo_root(local_root: &Path, repo_root: &Path, scan_dir: &Path) -> Option<PathBuf> {
+    let relative = repo_relative_cargo_root(local_root, repo_root)?;
+    Some(
+        relative
+            .components()
+            .fold(scan_dir.to_path_buf(), |acc, c| acc.join(c)),
+    )
+}
+
+/// The cargo root as a path relative to the repo root — the discriminator that
+/// says WHICH tree inside the reviewed commit cargo will read.
+///
+/// `None` when the configured root is not inside the repo (an absolute path
+/// elsewhere, or one escaping through `..`).
+fn repo_relative_cargo_root(local_root: &Path, repo_root: &Path) -> Option<PathBuf> {
+    // A relative cargo root (`.`) is repo-root-relative by construction.
+    let relative = if local_root.is_relative() {
+        local_root
+    } else {
+        local_root.strip_prefix(repo_root).ok()?
+    };
+
+    if !relative.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::CurDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return None;
+    }
+
+    Some(
+        relative
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect(),
+    )
+}
+
+/// Skip reason when the reviewed commit's cargo tree cannot be reached at all.
+///
+/// A `cargo_root` outside the repository cannot be materialised from a snapshot
+/// of that repository. The pre-fix code quietly ran cargo at the local path
+/// instead — scanning a tree the review does not describe and filing the verdict
+/// under the reviewed commit. The honest answer is no verdict: skip with a reason
+/// the pack records, rather than a green light earned by a different tree.
+fn unreachable_reviewed_cargo_root(config: &Config) -> Option<String> {
+    let commit = off_head_target_commit(config)?;
+    let local_root = cargo_cache_root(config);
+    if repo_relative_cargo_root(local_root, &config.repo_root).is_some() {
+        return None;
+    }
+    Some(format!(
+        "cargo root {} is outside the repo — commit {} cannot be checked there",
+        local_root.display(),
+        &commit[..commit.len().min(8)]
+    ))
+}
+
+/// Where the reviewed commit keeps the cargo project this run must judge.
+#[derive(Debug, PartialEq, Eq)]
+enum ReviewedCargoRoot {
+    /// Repo-relative directory inside the reviewed tree (empty = repo root).
+    Resolved(String),
+    /// The reviewed commit offers no single cargo root to run in; the string is
+    /// the skip reason recorded in the pack.
+    Unavailable(String),
+    /// The question does not apply or could not be asked: a local review, or a
+    /// repository git cannot read.
+    Unknown,
+}
+
+/// How far below the repo root a moved manifest is looked for.
+///
+/// A crate that moved is moved a level or two (`backend/`, `crates/core`), and
+/// every extra level widens the chance of matching an unrelated fixture crate
+/// deep in the tree. Two levels covers the realistic moves; anything further is
+/// treated as "not found" rather than guessed at.
+const CARGO_ROOT_DISCOVERY_DEPTH: usize = 2;
+
+/// Resolve the cargo root from the REVIEWED commit's tree.
+///
+/// Eligibility used to read `config.profile`, which describes the LOCAL
+/// checkout: a branch that dropped or moved its last `Cargo.toml` was still
+/// reviewed from a Rust checkout, so the cargo gates ran and filed cargo's own
+/// "could not find `Cargo.toml`" as the reviewed commit's verdict — a failure
+/// invented by the tool.
+///
+/// The reviewed tree IS the target commit's tree, so the question is answered
+/// from git and no snapshot is materialised to ask it. Three candidates, in the
+/// order [`reviewed_cargo_root`] would try them:
+///
+/// 1. the mapped cargo root — the local root at the same relative path;
+/// 2. the repo root — a workspace root still checks its members;
+/// 3. exactly one directory within [`CARGO_ROOT_DISCOVERY_DEPTH`] carrying a
+///    manifest that [`moved_manifest_is_configured_project`] shows to be the
+///    configured project, for a crate the reviewed commit moved somewhere else.
+///
+/// Several candidates in step 3 resolve to nothing: which crate the review is
+/// about is not a thing to guess. Neither is a single unrelated one — being the
+/// last manifest standing is not evidence of being the project that moved.
+/// Walking the tree also settles containment for
+/// free — git trees are not traversed through symlinks, so a root the reviewed
+/// commit replaced with a symlink to an external directory has no entries here
+/// and simply does not resolve. The manifest itself is held to the same standard
+/// by [`crate::git::Repository::regular_file_at_commit`]: a `Cargo.toml` replaced
+/// with a link to an external file is not a manifest this review can trust, and
+/// resolving it would let cargo read foreign code under the reviewed commit's
+/// cache key.
+fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
+    let (Some(commit), Some(relative)) = (
+        off_head_target_commit(config),
+        repo_relative_cargo_root(cargo_cache_root(config), &config.repo_root),
+    ) else {
+        return ReviewedCargoRoot::Unknown;
+    };
+    let Ok(repo) = crate::git::Repository::open(&config.repo_root) else {
+        return ReviewedCargoRoot::Unknown;
+    };
+
+    let mapped = cargo_root_path(&relative);
+    for candidate in [mapped.as_str(), ""] {
+        let path = if candidate.is_empty() {
+            "Cargo.toml".to_string()
+        } else {
+            format!("{candidate}/Cargo.toml")
+        };
+        match repo.regular_file_at_commit(&commit, &path) {
+            Ok(true) => return ReviewedCargoRoot::Resolved(candidate.to_string()),
+            Ok(false) => {}
+            // The question could not be asked — do not answer it.
+            Err(_) => return ReviewedCargoRoot::Unknown,
+        }
+    }
+
+    let Ok(moved) =
+        repo.dirs_containing_at_commit(&commit, "Cargo.toml", CARGO_ROOT_DISCOVERY_DEPTH)
+    else {
+        return ReviewedCargoRoot::Unknown;
+    };
+    let short = &commit[..commit.len().min(8)];
+    let aimed_at = if mapped.is_empty() {
+        "the repo root".to_string()
+    } else {
+        mapped
+    };
+    match moved.as_slice() {
+        [only] => match moved_manifest_is_configured_project(config, &repo, &commit, only) {
+            Ok(()) => ReviewedCargoRoot::Resolved(only.clone()),
+            Err(why) => ReviewedCargoRoot::Unavailable(format!(
+                "commit {short} has no Cargo.toml at {aimed_at}; the only one elsewhere ({only}) \
+                 {why} — this review is not about it",
+            )),
+        },
+        [] => ReviewedCargoRoot::Unavailable(format!(
+            "commit {short} has no Cargo.toml at {aimed_at} or the repo root — not a cargo project",
+        )),
+        many => ReviewedCargoRoot::Unavailable(format!(
+            "commit {short} has no Cargo.toml at {aimed_at}, and several elsewhere ({}) — \
+             cannot tell which crate this review is about",
+            many.join(", "),
+        )),
+    }
+}
+
+/// What a manifest says it IS, so a manifest found somewhere else in the
+/// reviewed tree can be told apart from the project this review is about.
+#[derive(Debug, PartialEq, Eq)]
+enum ManifestIdentity {
+    /// `[package] name` — the crate this manifest defines.
+    Package(String),
+    /// A virtual workspace root defines no crate of its own; the member list is
+    /// what identifies it.
+    Workspace(Vec<String>),
+}
+
+impl ManifestIdentity {
+    fn describe(&self) -> String {
+        match self {
+            Self::Package(name) => format!("crate `{name}`"),
+            Self::Workspace(members) => format!("a workspace over {}", members.join(", ")),
+        }
+    }
+}
+
+/// Read a manifest's identity, or `None` when it defines neither a package nor a
+/// workspace (or does not parse at all).
+fn manifest_identity(content: &str) -> Option<ManifestIdentity> {
+    let table: toml::Table = toml::from_str(content).ok()?;
+    if let Some(name) = table
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(|name| name.as_str())
+    {
+        return Some(ManifestIdentity::Package(name.to_string()));
+    }
+    let members = table.get("workspace")?.get("members")?.as_array()?;
+    let mut members: Vec<String> = members
+        .iter()
+        .filter_map(|member| member.as_str().map(str::to_string))
+        .collect();
+    members.sort();
+    Some(ManifestIdentity::Workspace(members))
+}
+
+/// Whether the lone manifest found elsewhere in the reviewed tree is the
+/// configured project, moved — the only reason to run cargo there.
+///
+/// "Exactly one manifest is left" is not that evidence. A commit that DELETES
+/// the Rust project while keeping an unrelated one within reach — an
+/// `examples/demo`, a test fixture crate — left this arm running every cargo
+/// gate against the demo and filing a green verdict for a project the reviewed
+/// commit no longer contains. Checked out normally that commit would not even be
+/// detected as a Rust project, because local profile detection never looks at
+/// `examples/`.
+///
+/// The identity being matched is the CONFIGURED project's, read from the local
+/// checkout — the same source the mapped candidate came from, and the only
+/// statement anywhere of which crate this review is about. Without it (no local
+/// manifest, one that does not parse, one that defines neither a package nor a
+/// workspace) there is nothing to compare, and an unproven guess is refused:
+/// the run is skipped with a reason instead of judging another project.
+///
+/// `Err` carries the fragment naming why, for the skip reason.
+fn moved_manifest_is_configured_project(
+    config: &Config,
+    repo: &crate::git::Repository,
+    commit: &str,
+    candidate: &str,
+) -> std::result::Result<(), String> {
+    let unproven = "cannot be shown to be the same project".to_string();
+    let local_manifest = config
+        .repo_root
+        .join(cargo_cache_root(config))
+        .join("Cargo.toml");
+    let configured = std::fs::read_to_string(&local_manifest)
+        .ok()
+        .as_deref()
+        .and_then(manifest_identity)
+        .ok_or_else(|| unproven.clone())?;
+    let found = repo
+        .file_at_commit(commit, &format!("{candidate}/Cargo.toml"))
+        .ok()
+        .as_deref()
+        .and_then(manifest_identity)
+        .ok_or(unproven)?;
+
+    if found == configured {
+        return Ok(());
+    }
+    Err(format!(
+        "is {}, not {}",
+        found.describe(),
+        configured.describe()
+    ))
+}
+
+/// Skip reason when the reviewed commit offers no cargo root to run in.
+fn missing_reviewed_cargo_manifest(config: &Config) -> Option<String> {
+    match resolve_reviewed_cargo_root(config) {
+        ReviewedCargoRoot::Unavailable(reason) => Some(reason),
+        ReviewedCargoRoot::Resolved(_) | ReviewedCargoRoot::Unknown => None,
+    }
 }
 
 /// Content hash for dependency-sensitive cargo checks (check/clippy/geiger).
@@ -36,17 +668,331 @@ fn cargo_cache_root(config: &Config) -> &Path {
 /// repo-root lockfile in whenever the cargo root differs from the repo root so
 /// such a bump invalidates the member key.
 fn cargo_content_hash(config: &Config) -> String {
+    let base = cargo_substrate_hash(config);
+    match unlocked_substrate_stamp(config) {
+        Some(day) => format!("{base}-unlocked-{day}"),
+        None => base,
+    }
+}
+
+/// The substrate half of [`cargo_content_hash`], without the freshness stamp.
+fn cargo_substrate_hash(config: &Config) -> String {
+    if let Some(commit) = reviewed_substrate_key(config) {
+        return commit;
+    }
     let cargo_root = cargo_cache_root(config);
     let base = cache::rust_hash(cargo_root);
     if cargo_root == config.repo_root.as_path() {
         base
     } else {
         format!(
-            "{}-root:{}",
+            "{}-root-{}",
             base,
             cache::cargo_lock_hash(&config.repo_root)
         )
     }
+}
+
+/// Freshness stamp for a substrate whose dependencies are not pinned.
+///
+/// A commit is a permanent content key only for what the commit CONTAINS.
+/// Without a committed `Cargo.lock`, cargo resolves the dependency graph when it
+/// runs — in a throwaway snapshot, from a registry that keeps moving — so a
+/// semver-compatible release published after the first review can change what
+/// builds while the entry keyed on the commit alone replays the old verdict
+/// until eviction. The local path has the same gap: `rust_hash` folds in a
+/// `Cargo.lock` that is not there.
+///
+/// Appending the day bounds that staleness without throwing the cache away:
+/// repeated runs within a session (the case the cache exists for) still hit, and
+/// tomorrow's run resolves again. It is the shape `Cargo audit` already uses for
+/// advisories, which age the same way.
+///
+/// A lockfile that is PRESENT but does not cover the manifest pins nothing
+/// either: cargo updates it while it runs, from the same moving registry. Only a
+/// substrate PROVEN to resolve at run time stamps — when git or the parser cannot
+/// answer, the key stays as it was rather than churning on an unrelated failure.
+fn unlocked_substrate_stamp(config: &Config) -> Option<String> {
+    match substrate_lock_state(config) {
+        SubstrateLock::Pinned => None,
+        SubstrateLock::Absent | SubstrateLock::OutOfDate => {
+            Some(Local::now().format("%Y-%m-%d").to_string())
+        }
+    }
+}
+
+/// What the tree this run judges does about its dependency set.
+#[derive(Debug, PartialEq, Eq)]
+enum SubstrateLock {
+    /// No lockfile: cargo resolves the whole graph when it runs.
+    Absent,
+    /// A lockfile the manifest has outgrown — cargo must update it, which means
+    /// the registry again for at least part of the graph.
+    OutOfDate,
+    /// Pinned, or a question that could not be answered.
+    Pinned,
+}
+
+/// Whether the tree this run judges pins its dependency set.
+///
+/// The reviewed commit is asked through git (no snapshot needed); a local review
+/// — and an off-`HEAD` run whose repository git cannot read — is answered from
+/// the working tree. Both look at the cargo root first and the repo root second,
+/// because a workspace member resolves from the workspace lockfile.
+///
+/// Existence used to be the whole test, and existence is not a pin: a target that
+/// adds a dependency without regenerating `Cargo.lock` still sends cargo to the
+/// registry — none of the commands pass `--locked`, which is what would assert
+/// otherwise — while the key promised the commit fully described the run. The
+/// manifest's declared dependencies are therefore checked against the lock's
+/// package list. It is a name-level test, so it under-reports (a workspace
+/// member's own manifest is not read, and a bumped requirement whose name is
+/// still locked is not caught); under-reporting is exactly today's behaviour,
+/// while over-reporting would only cost one extra cache miss a day.
+fn substrate_lock_state(config: &Config) -> SubstrateLock {
+    let Ok((manifest, lock)) = substrate_manifest_and_lock(config) else {
+        return SubstrateLock::Pinned;
+    };
+    let Some(lock) = lock else {
+        return SubstrateLock::Absent;
+    };
+    // No manifest to compare against is a question, not an answer.
+    let Some(manifest) = manifest else {
+        return SubstrateLock::Pinned;
+    };
+    if lock_covers_manifest(&manifest, &lock) {
+        SubstrateLock::Pinned
+    } else {
+        SubstrateLock::OutOfDate
+    }
+}
+
+/// The cargo root manifest of the judged tree and the lockfile governing it.
+///
+/// `Err` means the question could not be asked; `Ok(None)` that the file is
+/// genuinely absent. The lock is looked for at the cargo root first and the repo
+/// root second, because a workspace member resolves from the workspace lockfile.
+#[allow(clippy::result_unit_err)]
+fn substrate_manifest_and_lock(
+    config: &Config,
+) -> std::result::Result<(Option<String>, Option<String>), ()> {
+    let at = |dir: &str, name: &str| {
+        if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        }
+    };
+
+    if let (Some(commit), ReviewedCargoRoot::Resolved(relative)) = (
+        off_head_target_commit(config),
+        resolve_reviewed_cargo_root(config),
+    ) && let Ok(repo) = crate::git::Repository::open(&config.repo_root)
+    {
+        let read = |path: String| match repo.regular_file_at_commit(commit.as_str(), &path) {
+            Ok(true) => repo.file_at_commit(commit.as_str(), &path).map(Some),
+            Ok(false) => Ok(None),
+            Err(err) => Err(err),
+        };
+        let manifest = read(at(&relative, "Cargo.toml")).map_err(|_| ())?;
+        let lock = match read(at(&relative, "Cargo.lock")).map_err(|_| ())? {
+            Some(content) => Some(content),
+            None => read("Cargo.lock".to_string()).map_err(|_| ())?,
+        };
+        return Ok((manifest, lock));
+    }
+
+    // A relative cargo root is repo-root-relative by construction; `join` leaves
+    // an absolute one alone, so this reads the same directory either way.
+    let cargo_root = config.repo_root.join(cargo_cache_root(config));
+    let lock = std::fs::read_to_string(cargo_root.join("Cargo.lock"))
+        .or_else(|_| std::fs::read_to_string(config.repo_root.join("Cargo.lock")))
+        .ok();
+    Ok((
+        std::fs::read_to_string(cargo_root.join("Cargo.toml")).ok(),
+        lock,
+    ))
+}
+
+/// Whether the lock already answers every dependency the manifest declares.
+///
+/// Two ways it does not: a dependency the lock has never heard of, and one whose
+/// locked version no longer satisfies the requirement the manifest asks for
+/// (`serde = "1"` bumped to `"2"` over a lock still pinning 1.x). Both send cargo
+/// back to the registry when it runs, since nothing here passes `--locked`.
+///
+/// Anything unparsable answers "covered": the stamp exists to bound a KNOWN gap,
+/// not to churn the cache on a file this code failed to read. A `[patch]` or
+/// `[replace]` that redirects a dependency to a version outside its requirement
+/// reads as uncovered — the cost of that is one extra cache miss a day.
+fn lock_covers_manifest(manifest: &str, lock: &str) -> bool {
+    let (Ok(manifest), Ok(lock)) = (
+        toml::from_str::<toml::Table>(manifest),
+        toml::from_str::<toml::Table>(lock),
+    ) else {
+        return true;
+    };
+    let Some(packages) = lock.get("package").and_then(|packages| packages.as_array()) else {
+        return true;
+    };
+    let mut locked: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for package in packages {
+        let Some(name) = package.get("name").and_then(|name| name.as_str()) else {
+            continue;
+        };
+        let versions = locked.entry(name).or_default();
+        if let Some(version) = package.get("version").and_then(|version| version.as_str()) {
+            versions.push(version);
+        }
+    }
+
+    for (name, requirement) in declared_dependencies(&manifest) {
+        let Some(versions) = locked.get(name.as_str()) else {
+            return false;
+        };
+        // No requirement to check: a path or git dependency, or one inherited
+        // from the workspace, which the root manifest states instead.
+        let Some(requirement) = requirement else {
+            continue;
+        };
+        let Ok(requirement) = semver::VersionReq::parse(&requirement) else {
+            continue;
+        };
+        let satisfied = versions
+            .iter()
+            .any(|version| match semver::Version::parse(version) {
+                Ok(version) => requirement.matches(&version),
+                // A version this parser cannot read answers nothing, so it
+                // counts as satisfying rather than as proof of staleness.
+                Err(_) => true,
+            });
+        if !satisfied {
+            return false;
+        }
+    }
+    true
+}
+
+/// Every crate the manifest depends on — the name the lockfile would record
+/// (following a `package = "..."` rename) and the version requirement asked of
+/// it, when one is stated at all.
+fn declared_dependencies(manifest: &toml::Table) -> Vec<(String, Option<String>)> {
+    dependency_specs(manifest)
+        .into_iter()
+        .map(|(key, spec)| {
+            let (name, requirement) = match spec {
+                // `dep = "1.2"` is the requirement, spelled short.
+                toml::Value::String(requirement) => (key, Some(requirement.clone())),
+                _ => (
+                    spec.as_table()
+                        .and_then(|spec| spec.get("package"))
+                        .and_then(|package| package.as_str())
+                        .unwrap_or(key),
+                    spec.as_table()
+                        .and_then(|spec| spec.get("version"))
+                        .and_then(|version| version.as_str())
+                        .map(str::to_string),
+                ),
+            };
+            (name.to_string(), requirement)
+        })
+        .collect()
+}
+
+/// Every dependency a manifest declares, as `(key, spec)` — the key being what
+/// the manifest calls it, which a `package = "..."` rename may override.
+fn dependency_specs(manifest: &toml::Table) -> Vec<(&str, &toml::Value)> {
+    /// Normal, dev and build dependencies, wherever they are declared.
+    const SECTIONS: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
+
+    let mut tables: Vec<&toml::Table> = vec![manifest];
+    // `[workspace.dependencies]` and `[target.'cfg(...)'.dependencies]` hold the
+    // same sections one level down.
+    for nested in ["workspace", "target"] {
+        let Some(table) = manifest.get(nested).and_then(|value| value.as_table()) else {
+            continue;
+        };
+        tables.push(table);
+        tables.extend(table.values().filter_map(|value| value.as_table()));
+    }
+
+    let mut specs = Vec::new();
+    for table in tables {
+        for section in SECTIONS {
+            let Some(deps) = table.get(*section).and_then(|deps| deps.as_table()) else {
+                continue;
+            };
+            specs.extend(deps.iter().map(|(key, spec)| (key.as_str(), spec)));
+        }
+    }
+    specs
+}
+
+/// Cache-key component naming the substrate a cargo check will actually analyse,
+/// when that substrate is NOT the local working tree.
+///
+/// The reviewed tree is fully determined by the target commit, so the commit id
+/// IS the content key — no file hashing needed, and no chance of colliding with
+/// a local-tree key written by an earlier local run (which would serve the local
+/// checkout's verdict for a PR).
+///
+/// The commit alone is not the whole substrate though: the same commit checked
+/// from the workspace root and from a configured member yields different
+/// check/clippy/audit/rustfmt results, so the cargo root travels in the key too
+/// — the same discriminator the local hash path already carries.
+///
+/// `None` when the configured cargo root lies outside the repo: then no reviewed
+/// tree is analysed at all (the check is skipped, see
+/// [`unreachable_reviewed_cargo_root`]) and a commit-shaped key would promise a
+/// result about a commit nothing scanned.
+fn reviewed_substrate_key(config: &Config) -> Option<String> {
+    let commit = off_head_target_commit(config)?;
+    reviewed_substrate_key_for(&commit, cargo_cache_root(config), &config.repo_root)
+}
+
+/// Pure half of [`reviewed_substrate_key`].
+fn reviewed_substrate_key_for(commit: &str, local_root: &Path, repo_root: &Path) -> Option<String> {
+    let relative = repo_relative_cargo_root(local_root, repo_root)?;
+    Some(format!(
+        "commit-{commit}-root-{}",
+        cargo_root_token(&relative)
+    ))
+}
+
+/// The repo-relative cargo root as a git-style path (`crates/core`, empty string
+/// for the repo root itself) — the form git trees and cache keys both need.
+fn cargo_root_path(relative: &Path) -> String {
+    relative
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The cargo root as ONE file-name-safe cache-key component.
+///
+/// A cache key is a file name (`<cache_dir>/<check>/<key>`), and `Cache::set`
+/// creates only the check-level directory. A nested root written verbatim put a
+/// separator inside the key, so the write targeted a directory that never
+/// existed: every store failed and check/clippy/audit/geiger — the slowest gates
+/// in the tool — recomputed on every review of a workspace member. Hashing the
+/// path keeps the discriminator exact while staying one component; `self` marks
+/// the repo root, and cannot be confused with a hash (hex has no `s`).
+fn cargo_root_token(relative: &Path) -> String {
+    let path = cargo_root_path(relative);
+    if path.is_empty() {
+        return "self".to_string();
+    }
+    cache::key_token(&path)
+}
+
+/// Source hash for source-only cargo checks (rustfmt): the reviewed commit when
+/// one is being analysed, the local tree hash otherwise.
+fn cargo_source_hash(config: &Config) -> String {
+    reviewed_substrate_key(config).unwrap_or_else(|| cache::rust_hash(cargo_cache_root(config)))
 }
 
 #[async_trait]
@@ -62,6 +1008,12 @@ impl Check for CargoCheck {
                 config.profile.kind.as_str().to_lowercase()
             ));
         }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
         super::CheckEligibility::Run
     }
 
@@ -73,10 +1025,11 @@ impl Check for CargoCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
         let args = &["check", "--message-format=short"];
-        let output = run_command("cargo", args, cwd).await?;
+        let output = run_command_with_env("cargo", args, cwd, &run.env).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -97,16 +1050,18 @@ impl Check for CargoCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,
-                    output: &output,
+                    repo_root: &config.repo_root,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
     }
@@ -134,6 +1089,12 @@ impl Check for ClippyCheck {
         if !config.should_run_heavy_rust_lint() {
             return super::CheckEligibility::Skip("lint disabled".to_string());
         }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
         super::CheckEligibility::Run
     }
 
@@ -145,10 +1106,11 @@ impl Check for ClippyCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
         let args = &["clippy", "--message-format=short", "--", "-D", "warnings"];
-        let output = run_command("cargo", args, cwd).await?;
+        let output = run_command_with_env("cargo", args, cwd, &run.env).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -173,16 +1135,18 @@ impl Check for ClippyCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,
-                    output: &output,
+                    repo_root: &config.repo_root,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
     }
@@ -238,6 +1202,12 @@ impl Check for CargoTestCheck {
         if !config.run_tests {
             return super::CheckEligibility::Skip("tests disabled".to_string());
         }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
         super::CheckEligibility::Run
     }
 
@@ -250,10 +1220,13 @@ impl Check for CargoTestCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
         let args = &["test", "--all-targets", "--no-fail-fast"];
-        let output = run_command_with_timeout("cargo", args, cwd, TEST_TIMEOUT_SECS).await?;
+        let output =
+            run_command_with_timeout_and_env("cargo", args, cwd, TEST_TIMEOUT_SECS, &run.env)
+                .await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -274,16 +1247,18 @@ impl Check for CargoTestCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,
-                    output: &output,
+                    repo_root: &config.repo_root,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
     }
@@ -311,24 +1286,28 @@ impl Check for RustfmtCheck {
         if !config.should_run_heavy_rust_lint() {
             return super::CheckEligibility::Skip("lint disabled".to_string());
         }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
         super::CheckEligibility::Run
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!(
-            "rustfmt-{}",
-            cache::rust_hash(cargo_cache_root(config))
-        ))
+        Some(format!("rustfmt-{}", cargo_source_hash(config)))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
         let args = &["fmt", "--check"];
-        let output = run_command("cargo", args, cwd).await?;
+        let output = run_command_with_env("cargo", args, cwd, &run.env).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -354,16 +1333,18 @@ impl Check for RustfmtCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,
-                    output: &output,
+                    repo_root: &config.repo_root,
+                    exit_code: output.status.code(),
                     combined_output: &result_output,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
     }
@@ -415,6 +1396,12 @@ impl Check for CargoAuditCheck {
                 "tool not installed (cargo-audit is missing)".to_string(),
             );
         }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
         super::CheckEligibility::Run
     }
 
@@ -430,23 +1417,23 @@ impl Check for CargoAuditCheck {
         // which may be a workspace member with its own Cargo.lock — not the repo
         // root. Keying on the root lock while executing in a member meant a
         // member Cargo.lock change never invalidated the cache and a stale audit
-        // was served (PR #12 review #22).
-        let cargo_root = cargo_cache_root(config);
-        Some(format!(
-            "audit-{}-{}",
-            cache::cargo_lock_hash(cargo_root),
-            day
-        ))
+        // was served (PR #12 review #22). When a reviewed commit is analysed the
+        // lock that matters lives in the snapshot, and the commit id names it
+        // exactly.
+        let lock = reviewed_substrate_key(config)
+            .unwrap_or_else(|| cache::cargo_lock_hash(cargo_cache_root(config)));
+        Some(format!("audit-{lock}-{day}"))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
         let args = &["audit", "--json"];
-        let output = run_command("cargo", args, cwd).await?;
+        let output = run_command_with_env("cargo", args, cwd, &run.env).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -462,16 +1449,18 @@ impl Check for CargoAuditCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,
-                    output: &output,
+                    repo_root: &config.repo_root,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
     }
@@ -592,6 +1581,12 @@ impl Check for CargoGeigerCheck {
                 "tool not installed (cargo-geiger is missing)".to_string(),
             );
         }
+        if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
         super::CheckEligibility::Run
     }
 
@@ -603,34 +1598,54 @@ impl Check for CargoGeigerCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let cwd = cargo_cache_root(config);
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
 
-        if cargo_metadata_is_virtual_manifest(cwd).await {
+        if cargo_metadata_is_virtual_manifest(cwd, &run.env).await {
+            let output = "Cargo geiger skipped: cargo metadata reports a virtual workspace manifest; cargo-geiger requires a concrete package. Configure package selection or run geiger per workspace member.".to_string();
             return Ok(CheckResult {
                 name: self.name().to_string(),
                 status: CheckStatus::Skipped,
                 duration: start.elapsed(),
-                output: "Cargo geiger skipped: cargo metadata reports a virtual workspace manifest; cargo-geiger requires a concrete package. Configure package selection or run geiger per workspace member.".to_string(),
+                // The snapshot was materialised and `cargo metadata` read it, so
+                // this skip HAS a substrate — see `skipped_after_reading`.
+                provenance: Some(self.skipped_after_reading(
+                    config,
+                    &["metadata", "--no-deps", "--format-version", "1"],
+                    cwd,
+                    &output,
+                    &started_at,
+                )),
+                output,
                 cached: false,
-                provenance: None,
             });
         }
 
         let args = &["geiger", "--output-format", "Ratio"];
-        let output = match run_command_with_timeout("cargo", args, cwd, 600).await {
+        let output = match run_command_with_timeout_and_env("cargo", args, cwd, 600, &run.env).await
+        {
             Ok(output) => output,
             Err(err) if super::is_timeout_error(&err) => {
                 // `cargo geiger` can take many minutes on large dependency trees
                 // and is a non-blocking advisory signal. A timeout is a tooling
                 // limitation, not a quality failure — degrade to Skipped instead
                 // of a hard Error so it does not pollute the merge gate.
+                let output = format!("cargo geiger skipped: {err}");
                 return Ok(CheckResult {
                     name: self.name().to_string(),
                     status: CheckStatus::Skipped,
                     duration: start.elapsed(),
-                    output: format!("cargo geiger skipped: {err}"),
+                    // Ten minutes of reading the reviewed tree happened before
+                    // this — the substrate is known, only the exit status is not.
+                    provenance: Some(self.skipped_after_reading(
+                        config,
+                        args,
+                        cwd,
+                        &output,
+                        &started_at,
+                    )),
+                    output,
                     cached: false,
-                    provenance: None,
                 });
             }
             Err(err) => return Err(err),
@@ -651,18 +1666,57 @@ impl Check for CargoGeigerCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "cargo",
                     args,
                     cwd,
-                    output: &output,
+                    repo_root: &config.repo_root,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
+    }
+}
+
+impl CargoGeigerCheck {
+    /// Provenance for a geiger run that READ the reviewed tree and then skipped.
+    ///
+    /// Both of this check's internal skips happen after the snapshot exists and
+    /// a cargo command has run in it: the virtual-manifest pre-flight (`cargo
+    /// metadata` answered from the reviewed tree) and the ten-minute timeout
+    /// (geiger spent that time reading it). Returning `Ok` with no provenance
+    /// meant `execute_live_check`'s error fallback never fired either — it only
+    /// covers `Err` — so the pack recorded null `cwd`, `target_sha` and
+    /// `tree_state` for a gate whose substrate was never in doubt.
+    ///
+    /// Only the exit status is genuinely unknown here, and `exit_code: None`
+    /// says exactly that.
+    fn skipped_after_reading(
+        &self,
+        config: &Config,
+        args: &[&str],
+        cwd: &Path,
+        output: &str,
+        started_at: &str,
+    ) -> super::CheckProvenance {
+        ProvenanceBuilder {
+            check: self.name(),
+            cmd: "cargo",
+            args,
+            cwd,
+            repo_root: &config.repo_root,
+            exit_code: None,
+            combined_output: output,
+            started_at,
+            finished_at: &Local::now().to_rfc3339(),
+            cache_key: self.cache_key(config),
+        }
+        .build_repo_relative_cwd()
     }
 }
 
@@ -756,16 +1810,17 @@ fn is_virtual_manifest_error(output: &str) -> bool {
         && output.contains("requires running against an actual package")
 }
 
-async fn cargo_metadata_is_virtual_manifest(cwd: &Path) -> bool {
+async fn cargo_metadata_is_virtual_manifest(cwd: &Path, env: &[(String, String)]) -> bool {
     // Async with a hard timeout: a synchronous `cargo metadata` here blocked
     // the whole FuturesUnordered check pool whenever cargo sat on a file lock
     // (e.g. a parallel build in the same repo) — the in-process cousin of the
     // npx hang class.
-    let Ok(output) = crate::checks::run_command_with_timeout(
+    let Ok(output) = crate::checks::run_command_with_timeout_and_env(
         "cargo",
         &["metadata", "--no-deps", "--format-version", "1"],
         cwd,
         60,
+        env,
     )
     .await
     else {
@@ -780,11 +1835,43 @@ async fn cargo_metadata_is_virtual_manifest(cwd: &Path) -> bool {
         return false;
     };
 
-    metadata.get("root_package").is_some_and(|v| v.is_null())
-        && metadata
-            .get("workspace_members")
-            .and_then(|v| v.as_array())
-            .is_some_and(|members| !members.is_empty())
+    let workspace = metadata
+        .get("workspace_members")
+        .and_then(|v| v.as_array())
+        .is_some_and(|members| !members.is_empty());
+
+    workspace && !manifest_declares_a_package(&metadata, cwd)
+}
+
+/// Whether `cargo metadata` reports a package for the manifest in `cwd`.
+///
+/// `cargo metadata --format-version 1` emits no `root_package` key — the
+/// previous probe read one and so was always false, leaving every virtual
+/// workspace to pay a full geiger run before cargo refused it. With `--no-deps`
+/// the `packages` array is exactly the workspace members, so the manifest in
+/// `cwd` being absent from it is precisely "this directory is not a package".
+/// Asking about `cwd` rather than the workspace root keeps a member directory —
+/// a perfectly scannable package inside a virtual workspace — out of the skip.
+fn manifest_declares_a_package(metadata: &serde_json::Value, cwd: &Path) -> bool {
+    let manifest = resolve_symlinks(&cwd.join("Cargo.toml"));
+
+    metadata
+        .get("packages")
+        .and_then(|v| v.as_array())
+        .is_some_and(|packages| {
+            packages.iter().any(|package| {
+                package
+                    .get("manifest_path")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|path| resolve_symlinks(Path::new(path)) == manifest)
+            })
+        })
+}
+
+/// Canonicalise for comparison, keeping the original path when it cannot be
+/// resolved (a manifest that is not on this filesystem still compares by name).
+fn resolve_symlinks(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -1351,5 +2438,1248 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         ));
         assert!(!is_virtual_manifest_error("error: Found 3 warnings"));
         assert!(!is_virtual_manifest_error("a virtual manifest"));
+    }
+
+    /// Write a minimal, dependency-free binary crate whose `main.rs` is either
+    /// rustfmt-clean or deliberately mangled.
+    fn write_crate(dir: &Path, formatted: bool) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"substrate-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"substrate-fixture\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let main = if formatted {
+            "fn main() {\n    println!(\"reviewed\");\n}\n"
+        } else {
+            "fn main(){let x=1;println!(\"stale{}\",x);}\n"
+        };
+        std::fs::write(dir.join("src/main.rs"), main).unwrap();
+    }
+
+    /// Write a virtual workspace manifest (no root package) with one member.
+    fn write_virtual_workspace(dir: &Path) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"member\"]\n",
+        )
+        .unwrap();
+        let member = dir.join("member");
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"virtual-member\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(member.join("src/lib.rs"), "pub fn noop() {}\n").unwrap();
+    }
+
+    /// Turn `dir` into a git repository holding its current contents.
+    fn init_repo_with_commit(dir: &Path) {
+        use crate::git::cmd::git_cmd;
+
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "prview@example.test"],
+            vec!["config", "user.name", "prview test"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            let out = git_cmd()
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        commit_all(dir, "fixture");
+    }
+
+    /// Regression: the virtual-manifest pre-flight must actually fire.
+    ///
+    /// It read a `root_package` key that `cargo metadata --format-version 1`
+    /// does not emit, so it was always false: every virtual workspace paid a
+    /// full geiger run (minutes) only for cargo to refuse the manifest. The
+    /// member directory is the control — a real package inside that same
+    /// virtual workspace must still be scanned.
+    #[tokio::test]
+    async fn a_virtual_manifest_is_recognised_before_geiger_pays_for_it() {
+        if which::which("cargo").is_err() {
+            return;
+        }
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        write_virtual_workspace(workspace.path());
+        assert!(
+            cargo_metadata_is_virtual_manifest(workspace.path(), &[]).await,
+            "a [workspace] root with no [package] has nothing for geiger to scan",
+        );
+        assert!(
+            !cargo_metadata_is_virtual_manifest(&workspace.path().join("member"), &[]).await,
+            "a member of a virtual workspace is a concrete package and must be scanned",
+        );
+
+        let package = tempfile::tempdir().expect("package tempdir");
+        write_crate(package.path(), true);
+        assert!(
+            !cargo_metadata_is_virtual_manifest(package.path(), &[]).await,
+            "a plain package must never be skipped as a virtual manifest",
+        );
+    }
+
+    /// Regression: geiger's internal skips must still report their substrate.
+    ///
+    /// Both of them (the virtual-manifest pre-flight and the ten-minute
+    /// timeout) happen AFTER a cargo command has read the reviewed snapshot,
+    /// and both convert that into `Ok(Skipped)`. `execute_live_check`'s
+    /// error-provenance fallback only covers the `Err` branch, so before the
+    /// fix these rows reached PROVENANCE.json with null `cwd`, `target_sha`
+    /// and `tree_state` — claiming nothing was scanned when the reviewed tree
+    /// had just been read.
+    #[tokio::test]
+    async fn geiger_skipped_on_a_virtual_manifest_still_reports_its_substrate() {
+        if which::which("cargo").is_err() {
+            return;
+        }
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_virtual_workspace(scan_dir.path());
+        // A real snapshot is a git worktree, so the substrate is classifiable —
+        // the fixture has to be one too, or the assertion would only prove that
+        // an unverifiable directory stays unverifiable.
+        init_repo_with_commit(scan_dir.path());
+
+        let mut config = create_test_config(true, false, false);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let result = CargoGeigerCheck.run(&config).await.expect("geiger run");
+        if result.status != CheckStatus::Skipped {
+            // `cargo metadata` could not classify the fixture (offline cargo
+            // failure); nothing to assert about the skip's substrate.
+            return;
+        }
+
+        let provenance = result
+            .provenance
+            .expect("a skip decided after reading the snapshot must carry its substrate");
+        let scan_dir_name = scan_dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            provenance.cwd.contains(&scan_dir_name),
+            "provenance cwd must name the directory cargo metadata read, got {}",
+            provenance.cwd,
+        );
+        assert!(
+            provenance.tree_state.is_some(),
+            "the scanned substrate is knowable here, so it must be classified",
+        );
+        assert!(
+            provenance.target_sha.is_some(),
+            "the commit cargo metadata read is knowable here, so it must be recorded",
+        );
+        assert!(
+            provenance.exit_code.is_none(),
+            "geiger never ran, so no exit status may be claimed",
+        );
+        assert!(
+            provenance.command.contains("metadata"),
+            "the recorded command must be the one that read the tree, got {}",
+            provenance.command,
+        );
+    }
+
+    /// Regression: a cargo check must judge the REVIEWED snapshot, never the
+    /// local checkout.
+    ///
+    /// With a `--pr`/`--remote` target, `repo_root` still holds whatever branch
+    /// is checked out locally, so the pre-fix code ran build/clippy/test/fmt
+    /// against a foreign tree and printed the result under the reviewed PR's
+    /// name. The fixture makes the two directories disagree on purpose:
+    /// `repo_root` is badly formatted and the scan dir is clean, so running in
+    /// the wrong place does not merely show up in provenance — it flips the
+    /// verdict.
+    #[tokio::test]
+    async fn test_cargo_check_runs_in_scan_dir_not_repo_root() {
+        if which::which("cargo").is_err() {
+            return;
+        }
+
+        // repo_root == the stale local checkout: `cargo fmt --check` complains.
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), false);
+
+        // scan_dir == the reviewed target snapshot: formatting is clean.
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(scan_dir.path(), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let result = RustfmtCheck.run(&config).await.expect("rustfmt run");
+        if result.status == CheckStatus::Skipped {
+            // rustfmt component missing — nothing to assert about the substrate.
+            return;
+        }
+
+        assert_eq!(
+            result.status,
+            CheckStatus::Passed,
+            "the cargo check must judge the reviewed snapshot's clean tree, not \
+             repo_root's mangled one. Output: {}",
+            result.output
+        );
+
+        // Provenance must name the directory the run actually used.
+        let cwd = result.provenance.expect("provenance").cwd;
+        let scan_dir_name = scan_dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            cwd.contains(&scan_dir_name),
+            "provenance cwd must report the reviewed scan dir, got {cwd}",
+        );
+    }
+
+    /// The reviewed snapshot is a throwaway temp dir, so its in-tree `target/`
+    /// would force a full dependency rebuild on every run. `CARGO_TARGET_DIR`
+    /// must therefore point at the per-repo shared build cache — outside both
+    /// the snapshot and the operator's own tree.
+    #[tokio::test]
+    async fn test_cargo_run_uses_shared_build_cache_off_head() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let run = plan_cargo_run(&config).expect("plan");
+
+        assert_eq!(run.cwd, scan_dir.path());
+        assert_eq!(
+            run.env,
+            vec![(
+                "CARGO_TARGET_DIR".to_string(),
+                config.cargo_build_cache_dir().display().to_string()
+            )],
+            "cargo must build into the shared per-repo cache, not the snapshot",
+        );
+        let target_dir = config.cargo_build_cache_dir();
+        assert!(
+            !target_dir.starts_with(scan_dir.path()),
+            "a build cache inside the throwaway snapshot caches nothing",
+        );
+        assert!(
+            !target_dir.starts_with(repo_root.path()),
+            "prview must not write into the operator's own tree",
+        );
+    }
+
+    /// A local review (target == HEAD) is unchanged: the local cargo root, and
+    /// no `CARGO_TARGET_DIR` redirect, so the operator's warm `target/` is used
+    /// exactly as before.
+    #[tokio::test]
+    async fn test_cargo_run_local_target_is_unchanged() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        // No scan_dir_override, and a non-git repo_root: plan_check_run resolves
+        // back to the working tree — the ordinary local path.
+
+        let run = plan_cargo_run(&config).expect("plan");
+
+        assert_eq!(run.cwd, repo_root.path());
+        assert!(
+            run.env.is_empty(),
+            "a local run must not redirect the build directory",
+        );
+    }
+
+    /// Commit everything in `root` under a fresh test identity.
+    fn commit_all(root: &Path, message: &str) {
+        use crate::git::cmd::git_cmd;
+
+        for args in [
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", message, "--no-verify"],
+        ] {
+            let out = git_cmd()
+                .args(&args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+    }
+
+    fn repo_with_two_commits() -> (tempfile::TempDir, String) {
+        repo_with_two_commits_containing(&[])
+    }
+
+    fn head_sha(root: &Path) -> String {
+        use crate::git::cmd::git_cmd;
+
+        String::from_utf8(
+            git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string()
+    }
+
+    /// Two commits in a fresh repo, both carrying `manifests` (repo-relative
+    /// paths, written as minimal `Cargo.toml`s); returns the temp dir and the
+    /// FIRST commit, so a config targeting it is off-HEAD.
+    fn repo_with_two_commits_containing(manifests: &[&str]) -> (tempfile::TempDir, String) {
+        use crate::git::cmd::git_cmd;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "prview@example.test"]);
+        run_git(&["config", "user.name", "prview test"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+        for manifest in manifests {
+            let path = root.join(manifest);
+            std::fs::create_dir_all(path.parent().expect("manifest parent")).unwrap();
+            std::fs::write(path, "[package]\nname=\"x\"\nversion=\"0.0.0\"\n").unwrap();
+        }
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-q", "-m", "one"]);
+        let first = String::from_utf8(
+            git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        run_git(&["commit", "-qam", "two"]);
+        (tmp, first)
+    }
+
+    /// A cargo root OUTSIDE the repository cannot be materialised from a
+    /// snapshot of that repository. The pre-fix code silently ran cargo there
+    /// anyway — scanning the operator's unrelated checkout and filing the result
+    /// under the reviewed commit. No verdict beats a foreign tree's verdict.
+    #[test]
+    fn cargo_checks_skip_when_cargo_root_is_outside_the_repo() {
+        let (repo, first) = repo_with_two_commits();
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+
+        let mut profile = test_rust_profile(true);
+        profile.cargo_root = Some(outside.path().to_path_buf());
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(profile)
+            .target(Some(&first))
+            .run_lint(true)
+            .run_tests(true)
+            .build();
+
+        assert!(
+            unreachable_reviewed_cargo_root(&config).is_some(),
+            "an external cargo root cannot host the reviewed commit",
+        );
+        for check in [
+            &CargoCheck as &dyn Check,
+            &ClippyCheck,
+            &RustfmtCheck,
+            &CargoTestCheck,
+        ] {
+            match check.check_eligibility(&config) {
+                super::super::CheckEligibility::Skip(reason) => assert!(
+                    reason.contains("outside the repo"),
+                    "{} skip reason must name the unreachable root, got: {reason}",
+                    check.name()
+                ),
+                super::super::CheckEligibility::Run => panic!(
+                    "{} must not run against a tree the review does not describe",
+                    check.name()
+                ),
+            }
+        }
+    }
+
+    /// An in-repo cargo root keeps running off-HEAD — the skip above must be
+    /// narrow, not a blanket disable of cargo checks in `--pr` mode.
+    #[test]
+    fn cargo_checks_still_run_off_head_for_an_in_repo_cargo_root() {
+        let (repo, first) = repo_with_two_commits_containing(&["crates/core/Cargo.toml"]);
+        let mut profile = test_rust_profile(true);
+        profile.cargo_root = Some(repo.path().join("crates/core"));
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(profile)
+            .target(Some(&first))
+            .build();
+
+        assert!(unreachable_reviewed_cargo_root(&config).is_none());
+        assert!(missing_reviewed_cargo_manifest(&config).is_none());
+        assert_eq!(
+            CargoCheck.check_eligibility(&config),
+            super::super::CheckEligibility::Run
+        );
+    }
+
+    /// The local checkout is Rust, the reviewed commit is not: the branch under
+    /// review dropped its last `Cargo.toml`. Eligibility read the LOCAL profile,
+    /// so every cargo gate ran anyway and reported cargo's "could not find
+    /// Cargo.toml" as the reviewed commit's verdict — a manufactured failure
+    /// against a target that is simply not a cargo project.
+    #[test]
+    fn cargo_checks_skip_when_the_reviewed_commit_has_no_manifest() {
+        // First commit: no manifest anywhere. Second (HEAD): the local Rust tree.
+        let (repo, first) = repo_with_two_commits_containing(&[]);
+        std::fs::create_dir_all(repo.path().join("crates/core")).unwrap();
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        commit_all(repo.path(), "add cargo");
+
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&first))
+            .run_lint(true)
+            .run_tests(true)
+            .build();
+
+        for check in [
+            &CargoCheck as &dyn Check,
+            &ClippyCheck,
+            &RustfmtCheck,
+            &CargoTestCheck,
+        ] {
+            match check.check_eligibility(&config) {
+                super::super::CheckEligibility::Skip(reason) => assert!(
+                    reason.contains("no Cargo.toml"),
+                    "{} skip reason must name the missing manifest, got: {reason}",
+                    check.name()
+                ),
+                super::super::CheckEligibility::Run => panic!(
+                    "{} must not report a missing manifest as the reviewed commit's verdict",
+                    check.name()
+                ),
+            }
+        }
+    }
+
+    /// The reviewed commit may have moved the crate somewhere else entirely
+    /// (root workspace pushed into `backend/`). Neither the mapped path nor the
+    /// snapshot root has a manifest then, so the run had nowhere to go: the
+    /// commit IS a cargo project, and reporting "not a cargo project" is as
+    /// false as the missing-manifest failure that reporting replaced.
+    #[test]
+    fn a_cargo_root_moved_to_another_directory_is_rediscovered() {
+        // Target commit: the only manifest lives in `backend/`.
+        let (repo, target) = repo_with_two_commits_containing(&["backend/Cargo.toml"]);
+        // HEAD (the local checkout): the crate is back at the repo root.
+        std::fs::remove_file(repo.path().join("backend/Cargo.toml")).unwrap();
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(repo.path(), "move the crate back to the root");
+
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        assert!(
+            missing_reviewed_cargo_manifest(&config).is_none(),
+            "the reviewed commit is a cargo project — just not where it used to be",
+        );
+        assert_eq!(
+            resolve_reviewed_cargo_root(&config),
+            ReviewedCargoRoot::Resolved("backend".to_string()),
+            "the run must go where the reviewed manifest actually is",
+        );
+        assert_eq!(
+            CargoCheck.check_eligibility(&config),
+            super::super::CheckEligibility::Run
+        );
+    }
+
+    /// "Exactly one manifest is left" says nothing about whose it is. A commit
+    /// that DELETES the Rust project while keeping an example crate within reach
+    /// ran every cargo gate against the example and filed its green verdict for
+    /// a project the reviewed commit no longer contains — a commit that, checked
+    /// out normally, would not be detected as a Rust project at all.
+    #[test]
+    fn an_unrelated_lone_manifest_is_not_the_moved_crate() {
+        // Target commit: the configured crate is gone, a demo crate remains.
+        let (repo, target) = repo_with_two_commits_containing(&["examples/demo/Cargo.toml"]);
+        // HEAD (the local checkout): the project this review is configured for.
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname=\"app\"\nversion=\"0.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(repo.path(), "the project the review is about");
+
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        let reason = missing_reviewed_cargo_manifest(&config)
+            .expect("an unrelated crate must not stand in for a deleted project");
+        assert!(
+            reason.contains("examples/demo") && reason.contains("`x`") && reason.contains("`app`"),
+            "the skip reason must name the crate it found and the one it wanted: {reason}",
+        );
+    }
+
+    /// A virtual workspace root defines no crate, so package names cannot
+    /// identify it — its member list does. Moving one must keep working, or the
+    /// evidence requirement would turn a legitimate layout into a permanent skip.
+    #[test]
+    fn a_moved_workspace_root_is_identified_by_its_members() {
+        let workspace = "[workspace]\nmembers=[\"core\"]\nresolver=\"2\"\n";
+        let (repo, _first) = repo_with_two_commits();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("backend")).unwrap();
+        std::fs::write(root.join("backend/Cargo.toml"), workspace).unwrap();
+        commit_all(root, "workspace root moved into backend");
+        let target = head_sha(root);
+        // HEAD (the local checkout): the same workspace, back at the repo root.
+        std::fs::remove_file(root.join("backend/Cargo.toml")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), workspace).unwrap();
+        commit_all(root, "workspace root back at the top");
+
+        let config = test_config_builder()
+            .repo_root(root)
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        assert_eq!(
+            resolve_reviewed_cargo_root(&config),
+            ReviewedCargoRoot::Resolved("backend".to_string()),
+            "the same workspace one level down is still the project under review",
+        );
+    }
+
+    /// Discovery only helps when it has ONE answer. A tree with several
+    /// candidate roots and no manifest where the run was aimed cannot be
+    /// resolved by guessing which crate the review is about.
+    #[test]
+    fn an_ambiguous_moved_cargo_root_is_not_guessed() {
+        let (repo, target) =
+            repo_with_two_commits_containing(&["backend/Cargo.toml", "frontend/Cargo.toml"]);
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        let reason = missing_reviewed_cargo_manifest(&config).expect("ambiguity must not run");
+        assert!(
+            reason.contains("backend") && reason.contains("frontend"),
+            "the skip reason must name what it could not choose between: {reason}",
+        );
+    }
+
+    /// The reviewed commit can turn an in-repo cargo root into a symlink
+    /// pointing outside the repository. The lexical component check accepts it
+    /// (no `..` in the path), and following it runs cargo on the operator's
+    /// unrelated tree while the verdict is cached under the reviewed commit —
+    /// the external-root hole, reopened by a target-controlled symlink.
+    #[tokio::test]
+    async fn a_symlinked_cargo_root_never_escapes_the_snapshot() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(scan_dir.path(), true);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), scan_dir.path().join("backend")).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(&repo_root.path().join("backend"), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().join("backend"));
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let cwd = match plan_cargo_run(&config) {
+            Ok(run) => run.cwd,
+            // Refusing outright is equally honest — what must never happen is a
+            // verdict earned outside the reviewed tree.
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("outside"),
+                    "unexpected error: {err}"
+                );
+                return;
+            }
+        };
+        let inside = cwd
+            .canonicalize()
+            .expect("cwd")
+            .starts_with(scan_dir.path().canonicalize().expect("scan_dir"));
+        assert!(
+            inside,
+            "cargo must not follow a symlink out of the reviewed tree, got {}",
+            cwd.display(),
+        );
+    }
+
+    /// Cargo follows a symlinked `Cargo.lock` even under `--locked`, so a
+    /// reviewed commit tracking its lock as a link to an external file had the
+    /// whole dependency graph resolved from another project's pins — under this
+    /// commit's cache key and a `snapshot` provenance row.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_lockfile_never_escapes_the_snapshot() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(scan_dir.path(), true);
+        std::os::unix::fs::symlink(
+            outside.path().join("Cargo.lock"),
+            scan_dir.path().join("Cargo.lock"),
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a lockfile pointing out of the reviewed tree must not pin this run");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("Cargo.lock") && err.contains("outside the reviewed snapshot"),
+            "the refusal must name the escaping lockfile: {err}",
+        );
+    }
+
+    /// The root and its manifest being contained says nothing about what that
+    /// manifest DECLARES. An absolute `path` dependency (or one that climbs out
+    /// of the snapshot) has cargo compile a directory the reviewed commit does
+    /// not contain, while provenance reports a `snapshot` scan and the verdict is
+    /// cached under the reviewed commit.
+    #[test]
+    fn a_path_dependency_outside_the_snapshot_is_refused() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(scan_dir.path(), true);
+        std::fs::write(
+            scan_dir.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+                 foreign = {{ path = \"{}\" }}\n",
+                outside.path().display(),
+            ),
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a dependency outside the reviewed tree must not be compiled as its own");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("outside the reviewed snapshot") && err.contains("foreign"),
+            "the refusal must name the escaping dependency: {err}",
+        );
+    }
+
+    /// `cargo check` at a workspace root builds its MEMBERS, and a member
+    /// declares its own dependencies. Reading only the root manifest left a
+    /// member free to point cargo at an absolute path outside the snapshot,
+    /// under an exact `snapshot` provenance row.
+    #[test]
+    fn a_member_path_dependency_outside_the_snapshot_is_refused() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        std::fs::create_dir_all(scan_dir.path().join("crates/member")).unwrap();
+        std::fs::write(
+            scan_dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/member\"]\nresolver=\"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            scan_dir.path().join("crates/member/Cargo.toml"),
+            format!(
+                "[package]\nname=\"member\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+                 foreign = {{ path = \"{}\" }}\n",
+                outside.path().display(),
+            ),
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a member may not point the workspace build at a foreign directory");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("crates/member") && err.contains("outside the reviewed snapshot"),
+            "the refusal must name the member manifest that declares it: {err}",
+        );
+    }
+
+    /// The everyday case must survive: a workspace member depending on a sibling
+    /// by relative path stays inside the snapshot and still runs.
+    #[test]
+    fn a_path_dependency_inside_the_snapshot_still_runs() {
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(&scan_dir.path().join("sibling"), true);
+        write_crate(scan_dir.path(), true);
+        std::fs::write(
+            scan_dir.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+             sibling = { path = \"sibling\" }\n",
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        assert_eq!(
+            plan_cargo_run(&config)
+                .expect("an in-tree dependency is not an escape")
+                .cwd,
+            scan_dir.path(),
+        );
+    }
+
+    /// A directory symlink is not the only escape the reviewed commit controls.
+    /// It can keep the expected cargo root and replace `Cargo.toml` ITSELF with a
+    /// link to an external manifest: the tree lookup finds an entry (git stores a
+    /// symlink as a blob), and cargo then builds whatever that manifest points
+    /// at, under the reviewed commit's cache key.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_reviewed_manifest_is_not_a_cargo_project() {
+        use crate::git::cmd::git_cmd;
+
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+
+        let (repo, _first) = repo_with_two_commits();
+        let root = repo.path();
+        std::os::unix::fs::symlink(outside.path().join("Cargo.toml"), root.join("Cargo.toml"))
+            .expect("symlink");
+        commit_all(root, "manifest replaced by a link");
+        let target = String::from_utf8(
+            git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string();
+        // Move HEAD past the reviewed commit so the review is off-HEAD.
+        std::fs::write(root.join("later.txt"), "after\n").expect("write");
+        commit_all(root, "after");
+
+        let config = test_config_builder()
+            .repo_root(root)
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        let reason = missing_reviewed_cargo_manifest(&config)
+            .expect("a manifest that is a link out of the tree must not resolve to a project");
+        assert!(
+            reason.contains("not a cargo project"),
+            "the skip must say the reviewed commit carries no manifest: {reason}",
+        );
+    }
+
+    /// The same refusal on materialised bytes, for the paths the tree guard does
+    /// not cover: the cargo root itself stays inside the snapshot, so only
+    /// resolving the manifest catches the escape.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_symlinked_manifest_inside_the_snapshot_is_still_refused() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        std::fs::create_dir_all(scan_dir.path().join("src")).expect("src");
+        std::fs::write(scan_dir.path().join("src/main.rs"), "fn main() {}\n").expect("main");
+        std::os::unix::fs::symlink(
+            outside.path().join("Cargo.toml"),
+            scan_dir.path().join("Cargo.toml"),
+        )
+        .expect("symlink");
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a manifest resolving outside the snapshot must not be built");
+        };
+        assert!(
+            err.to_string().contains("outside the reviewed snapshot"),
+            "unexpected error: {err}",
+        );
+    }
+
+    /// A LOCAL review reaches none of the reviewed-tree guards: `plan_cargo_run`
+    /// returns before them. A checkout tracking `Cargo.toml` as a link to an
+    /// external manifest therefore had cargo build a foreign project while
+    /// provenance recorded the cwd as the local checkout.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_local_manifest_link_out_of_the_root_is_refused() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        std::fs::create_dir_all(repo_root.path().join("src")).expect("src");
+        std::fs::write(repo_root.path().join("src/main.rs"), "fn main() {}\n").expect("main");
+        std::os::unix::fs::symlink(
+            outside.path().join("Cargo.toml"),
+            repo_root.path().join("Cargo.toml"),
+        )
+        .expect("symlink");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a local manifest resolving outside its root must not be built");
+        };
+        assert!(
+            err.to_string().contains("outside the cargo root"),
+            "unexpected error: {err}",
+        );
+    }
+
+    /// The guard must not refuse an ordinary local project, nor an externally
+    /// configured `cargo_root` whose own manifest sits inside it — that is a
+    /// legitimate local setup, recorded as a `foreign` substrate.
+    #[tokio::test]
+    async fn a_local_manifest_inside_its_root_is_accepted() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        assert_eq!(plan_cargo_run(&config).expect("plan").cwd, repo_root.path());
+
+        let external = tempfile::tempdir().expect("external tempdir");
+        write_crate(external.path(), true);
+        config.profile.cargo_root = Some(external.path().to_path_buf());
+        assert_eq!(plan_cargo_run(&config).expect("plan").cwd, external.path());
+    }
+
+    /// A member root that the reviewed commit does not have still counts as a
+    /// cargo project when the commit carries a workspace manifest at its root:
+    /// that is exactly the fallback `reviewed_cargo_root` performs.
+    #[test]
+    fn a_moved_cargo_root_is_still_a_cargo_project() {
+        let (repo, first) = repo_with_two_commits_containing(&["Cargo.toml"]);
+        let mut profile = test_rust_profile(true);
+        profile.cargo_root = Some(repo.path().join("backend"));
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(profile)
+            .target(Some(&first))
+            .build();
+
+        assert!(
+            missing_reviewed_cargo_manifest(&config).is_none(),
+            "the snapshot root carries a manifest, so the run has somewhere to go",
+        );
+    }
+
+    /// The same commit checked from the workspace root and from a configured
+    /// member produces different results, so the cargo root must travel in the
+    /// cache key beside the commit. Keying on the commit alone let a later run
+    /// serve the other root's verdict.
+    #[test]
+    fn reviewed_substrate_key_discriminates_the_cargo_root() {
+        let repo_root = Path::new("/repo");
+        let commit = "abc123";
+
+        let root_key = reviewed_substrate_key_for(commit, repo_root, repo_root).expect("root key");
+        let member_key =
+            reviewed_substrate_key_for(commit, Path::new("/repo/crates/core"), repo_root)
+                .expect("member key");
+
+        assert_ne!(
+            root_key, member_key,
+            "workspace root and member must not share one reviewed-substrate key",
+        );
+        assert!(root_key.contains(commit) && member_key.contains(commit));
+        assert_eq!(
+            member_key,
+            format!("commit-{commit}-root-{}", cache::key_token("crates/core")),
+            "the member key must name exactly its own root",
+        );
+        assert!(
+            root_key.ends_with("-root-self"),
+            "the repo root must be named, not hashed away: {root_key}",
+        );
+        // Two different roots must never collide onto one key.
+        assert_ne!(
+            reviewed_substrate_key_for(commit, Path::new("/repo/crates/core"), repo_root),
+            reviewed_substrate_key_for(commit, Path::new("/repo/crates/cli"), repo_root),
+        );
+        // A relative `.` root is the repo root itself — same substrate, same key.
+        assert_eq!(
+            reviewed_substrate_key_for(commit, Path::new("."), repo_root),
+            Some(root_key),
+        );
+    }
+
+    /// A cache key is a FILE NAME. `crates/core` used to travel into it
+    /// verbatim, so the key named a file inside a directory `Cache::set` never
+    /// creates: every write failed silently and the most expensive checks in the
+    /// tool recomputed on every single review of a workspace member.
+    #[test]
+    fn reviewed_substrate_key_is_usable_as_a_file_name() {
+        let key = reviewed_substrate_key_for(
+            "abc123",
+            Path::new("/repo/crates/core"),
+            Path::new("/repo"),
+        )
+        .expect("member key");
+        assert!(
+            !key.contains('/') && !key.contains('\\') && !key.contains(':'),
+            "a cache key must be a single path component, got: {key}",
+        );
+
+        // End to end: the key a nested root produces must survive a real cache
+        // round-trip, which is what the embedded separator broke.
+        let dir = tempfile::tempdir().expect("cache tempdir");
+        let cache = crate::cache::Cache::with_dir(dir.path().to_path_buf(), true);
+        cache
+            .set("Clippy", &key, "passed", Some("out"), None)
+            .expect("a nested-root key must be storable");
+        assert_eq!(
+            cache.get("Clippy", &key).expect("cache hit").status,
+            "passed",
+        );
+    }
+
+    /// The local (non-reviewed) member key carried the same colon, which is an
+    /// illegal file-name character on Windows. Both key paths are file names and
+    /// both must stay portable.
+    #[test]
+    fn local_member_cache_key_is_usable_as_a_file_name() {
+        let repo_root = tempfile::tempdir().expect("repo tempdir");
+        write_crate(&repo_root.path().join("crates/core"), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().join("crates/core"));
+
+        let key = cargo_content_hash(&config);
+        assert!(
+            !key.contains('/') && !key.contains('\\') && !key.contains(':'),
+            "a cache key must be a single path component, got: {key}",
+        );
+    }
+
+    /// A commit only pins its dependencies if it carries a `Cargo.lock`.
+    /// Without one, cargo resolves afresh in the throwaway snapshot, so a
+    /// semver-compatible release published after the first review changes what
+    /// builds — while the cached verdict, keyed on the commit alone, is replayed
+    /// until eviction.
+    #[test]
+    fn an_unlocked_reviewed_target_is_not_cached_indefinitely() {
+        let (unlocked, unlocked_target) = repo_with_two_commits_containing(&["Cargo.toml"]);
+        let config = test_config_builder()
+            .repo_root(unlocked.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&unlocked_target))
+            .build();
+        let key = cargo_content_hash(&config);
+        assert!(
+            key.contains("-unlocked-"),
+            "an unresolved dependency set must not be keyed on the commit alone: {key}",
+        );
+        assert!(
+            key.starts_with(&reviewed_substrate_key(&config).expect("reviewed key")),
+            "the substrate must still identify the entry: {key}",
+        );
+
+        // A committed lock pins the dependency set: the commit IS the substrate,
+        // and the key stays permanent.
+        let (locked, locked_target) =
+            repo_with_two_commits_containing(&["Cargo.toml", "Cargo.lock"]);
+        let config = test_config_builder()
+            .repo_root(locked.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&locked_target))
+            .build();
+        assert_eq!(
+            cargo_content_hash(&config),
+            reviewed_substrate_key(&config).expect("reviewed key"),
+            "a locked target must keep its permanent, content-addressed key",
+        );
+    }
+
+    /// A lockfile that is present but out of date pins nothing: cargo updates it
+    /// while it runs — none of the commands pass `--locked` — so the commit alone
+    /// does not describe the result, exactly as when no lock exists at all.
+    #[test]
+    fn a_lockfile_the_manifest_outgrew_is_not_a_pin() {
+        let (repo, _first) = repo_with_two_commits();
+        let root = repo.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        // The lock still describes the crate as it was before the dependency.
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(root, "add a dependency without regenerating the lock");
+        let stale = head_sha(root);
+
+        // A later commit regenerates the lock: the dependency set is pinned again.
+        std::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"x\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        commit_all(root, "regenerate the lock");
+        let fresh = head_sha(root);
+        // Move HEAD past both so each review is off-`HEAD`.
+        std::fs::write(root.join("later.txt"), "after\n").unwrap();
+        commit_all(root, "after");
+
+        let config_for = |target: &str| {
+            test_config_builder()
+                .repo_root(root)
+                .profile(test_rust_profile(true))
+                .target(Some(target))
+                .build()
+        };
+
+        let key = cargo_content_hash(&config_for(&stale));
+        assert!(
+            key.contains("-unlocked-"),
+            "a lock cargo must update does not make the commit a complete key: {key}",
+        );
+        let config = config_for(&fresh);
+        assert_eq!(
+            cargo_content_hash(&config),
+            reviewed_substrate_key(&config).expect("reviewed key"),
+            "a lock that covers the manifest keeps the permanent, content-addressed key",
+        );
+    }
+
+    /// The name being locked is not the same as the requirement being met. A
+    /// commit that bumps `serde = "1"` to `"2"` over a lock still pinning 1.x
+    /// leaves cargo to resolve that dependency from the registry, exactly as a
+    /// dependency the lock had never heard of.
+    #[test]
+    fn a_locked_version_the_manifest_no_longer_accepts_is_not_a_pin() {
+        let lock = "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+                    [[package]]\nname = \"x\"\nversion = \"0.0.0\"\n";
+        let manifest = |requirement: &str| {
+            format!(
+                "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+                 serde = {{ version = \"{requirement}\", features = [\"derive\"] }}\n"
+            )
+        };
+
+        assert!(
+            !lock_covers_manifest(&manifest("2"), lock),
+            "a requirement the locked version cannot satisfy sends cargo to the registry",
+        );
+        assert!(
+            lock_covers_manifest(&manifest("1"), lock),
+            "a requirement the lock already satisfies keeps the commit a complete key",
+        );
+        assert!(
+            lock_covers_manifest(&manifest("not a requirement"), lock),
+            "an unreadable requirement answers nothing and must not churn the key",
+        );
+    }
+
+    /// The same reasoning applies to a local review: an unlocked working tree's
+    /// source hash does not describe the dependency set cargo will resolve.
+    #[test]
+    fn an_unlocked_local_tree_is_not_cached_indefinitely() {
+        let repo_root = tempfile::tempdir().expect("repo tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+
+        assert!(
+            cargo_content_hash(&config).contains("-unlocked-"),
+            "a working tree with no Cargo.lock resolves dependencies at run time",
+        );
+
+        std::fs::write(repo_root.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        assert!(
+            !cargo_content_hash(&config).contains("-unlocked-"),
+            "a locked working tree is fully described by its files",
+        );
+    }
+
+    /// An external cargo root scans no reviewed tree at all, so it must not
+    /// produce a commit-shaped key promising a result about that commit.
+    #[test]
+    fn reviewed_substrate_key_is_absent_for_an_external_cargo_root() {
+        assert_eq!(
+            reviewed_substrate_key_for("abc123", Path::new("/elsewhere/crate"), Path::new("/repo")),
+            None,
+        );
+    }
+
+    /// The reviewed branch may have moved the crate (root crate pushed into
+    /// `backend/`, member renamed). The locally detected root does not exist in
+    /// the snapshot then, and running cargo in a missing directory reports an
+    /// execution error as the reviewed crate's verdict.
+    #[tokio::test]
+    async fn cargo_run_falls_back_to_the_snapshot_root_when_the_manifest_moved() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        // Local layout: the crate lives in crates/core.
+        write_crate(&repo_root.path().join("crates/core"), true);
+        // Reviewed layout: the crate moved back to the repo root.
+        write_crate(scan_dir.path(), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().join("crates/core"));
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let run = plan_cargo_run(&config).expect("plan");
+        assert_eq!(
+            run.cwd,
+            scan_dir.path(),
+            "a stale member path must not be projected into the snapshot verbatim",
+        );
+
+        // When the mapped root DOES exist in the snapshot, it still wins.
+        write_crate(&scan_dir.path().join("crates/core"), true);
+        let run = plan_cargo_run(&config).expect("plan");
+        assert_eq!(run.cwd, scan_dir.path().join("crates/core"));
+    }
+
+    /// Defence in depth for the eligibility skip: if a cargo check is ever run
+    /// directly with an external root off-HEAD, it must fail loudly instead of
+    /// quietly analysing the operator's own tree.
+    #[tokio::test]
+    async fn cargo_run_refuses_an_external_cargo_root_off_head() {
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(outside.path(), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(outside.path().to_path_buf());
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let err = match plan_cargo_run(&config) {
+            Ok(run) => panic!(
+                "external root off-HEAD must not resolve, got cwd {}",
+                run.cwd.display()
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("outside the repository"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn test_snapshot_cargo_root_maps_workspace_member() {
+        let repo_root = Path::new("/repo");
+        let scan_dir = Path::new("/tmp/snap");
+
+        assert_eq!(
+            snapshot_cargo_root(Path::new("/repo/crates/core"), repo_root, scan_dir),
+            Some(PathBuf::from("/tmp/snap/crates/core")),
+        );
+        assert_eq!(
+            snapshot_cargo_root(repo_root, repo_root, scan_dir),
+            Some(PathBuf::from("/tmp/snap")),
+        );
+        // A relative cargo root is repo-root-relative by construction.
+        assert_eq!(
+            snapshot_cargo_root(Path::new("."), repo_root, scan_dir),
+            Some(PathBuf::from("/tmp/snap")),
+        );
+        // Outside the repo: a snapshot of that repo can never contain it.
+        assert_eq!(
+            snapshot_cargo_root(Path::new("/elsewhere/crate"), repo_root, scan_dir),
+            None,
+        );
     }
 }

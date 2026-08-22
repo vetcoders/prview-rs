@@ -267,7 +267,7 @@ prview gate --strict
 Use the composite Action for the final required stage:
 
 ```yaml
-- uses: vetcoders/prview-rs@main # pin to a released tag once one ships `prview gate`
+- uses: vetcoders/prview-rs@v0.6.0 # pin to a released tag
   id: prview
   with:
     strict: "true"

@@ -130,8 +130,13 @@ pub struct GenerateInput<'a> {
     /// Working-tree cleanliness captured BEFORE checks ran and before any
     /// artifact was written (R4-19). Frozen here so an in-repo `--output-dir` or
     /// an untracked check cache cannot flip a clean source scan to "dirty" and
-    /// suppress the pre-existing downgrade.
-    pub worktree_clean: bool,
+    /// suppress the pre-existing downgrade. `None` when the status could not be
+    /// read — unknown, and never treated as clean.
+    pub worktree_clean: Option<bool>,
+    /// Digest of the working-tree status captured in the SAME read as
+    /// `worktree_clean`. Recorded in `00_summary/PROVENANCE.json`; `None` when
+    /// the repository could not be inspected.
+    pub worktree_status_digest: Option<String>,
 }
 
 struct RunJsonInput<'a> {
@@ -185,9 +190,66 @@ pub(crate) struct DashboardContextInput<'a> {
     clean_comparison: CleanComparison,
 }
 
+/// Provenance for the synthetic `heuristics_loctree` result.
+///
+/// The gate is synthetic, the substrate is not: heuristics scan either an
+/// extracted target tree or the local working tree, and PROVENANCE.json's whole
+/// job is to name the tree behind every gating signal. Leaving these rows null
+/// made one of the pack's gates the only unauditable one.
+///
+/// Three cases, and none of them guesses:
+/// - an analysis root WITH the commit it was extracted from — `git archive`
+///   writes the commit's tree and nothing else, so the bytes are exactly that
+///   commit (`snapshot`);
+/// - an analysis root with no recorded commit (a result deserialized from a
+///   pack written before `analysis_sha` existed) — the directory is reported,
+///   the substrate stays unknown;
+/// - no analysis root — the scan ran in `repo_root`, classified like any other
+///   in-place scan.
+fn heuristics_provenance(
+    heuristics: &HeuristicsResult,
+    config: &Config,
+) -> Option<crate::checks::CheckProvenance> {
+    use crate::checks::{ScanSubstrate, TreeState, resolve_scan_substrate};
+
+    let (cwd, substrate) = match heuristics.analysis_root.as_deref() {
+        Some(root) => (
+            root.to_string(),
+            match heuristics.analysis_sha.as_deref() {
+                Some(sha) => ScanSubstrate {
+                    target_sha: Some(sha.to_string()),
+                    tree_state: Some(TreeState::Snapshot),
+                },
+                None => ScanSubstrate::default(),
+            },
+        ),
+        None => (
+            config.repo_root.display().to_string(),
+            // Loctree consumes no dependency tree of its own — it reads source.
+            resolve_scan_substrate(&config.repo_root, &config.repo_root, &[]),
+        ),
+    };
+
+    Some(crate::checks::CheckProvenance {
+        // Loctree runs in-process as a library, so there is no argv to record.
+        command: "loctree (in-process)".to_string(),
+        tool_version: None,
+        cwd,
+        target_sha: substrate.target_sha,
+        tree_state: substrate.tree_state,
+        exit_code: None,
+        // Absent only in results built before the scan recorded its own timing
+        // (older packs, hand-built fixtures).
+        started_at: heuristics.started_at.clone().unwrap_or_default(),
+        finished_at: heuristics.finished_at.clone().unwrap_or_default(),
+        hard_fail_signatures: Vec::new(),
+        cache_key: None,
+    })
+}
+
 /// Build a synthetic CheckResult for heuristics_loctree so it appears in
 /// report.json checks[] and dashboard checks table alongside real checks.
-fn build_heuristics_check(heuristics: Option<&HeuristicsResult>) -> CheckResult {
+fn build_heuristics_check(heuristics: Option<&HeuristicsResult>, config: &Config) -> CheckResult {
     use crate::checks::CheckStatus;
     match heuristics {
         Some(heuristics)
@@ -218,7 +280,7 @@ fn build_heuristics_check(heuristics: Option<&HeuristicsResult>) -> CheckResult 
                 duration: std::time::Duration::ZERO,
                 output,
                 cached: false,
-                provenance: None,
+                provenance: heuristics_provenance(heuristics, config),
             }
         }
         _ => CheckResult {
@@ -244,6 +306,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         run_start,
         skipped_checks,
         worktree_clean,
+        worktree_status_digest,
     } = input;
     let t_total = Instant::now();
     let mut stage_timings = Vec::new();
@@ -253,7 +316,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     .to_rfc3339();
 
     // Build extended checks list including synthetic heuristics check
-    let heuristics_check = build_heuristics_check(heuristics);
+    let heuristics_check = build_heuristics_check(heuristics, config);
     let mut all_checks: Vec<CheckResult> = checks.to_vec();
     all_checks.push(heuristics_check);
     let context_artifacts = plan_context_artifacts(config, diffs, &all_checks);
@@ -546,7 +609,9 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         breaking: breaking_findings,
         coverage: coverage_delta.clone(),
         diff_dir: &diff_dir,
-        skipped_checks,
+        // Cloned: PROVENANCE.json records the same skips further down, and the
+        // two surfaces must describe one list.
+        skipped_checks: skipped_checks.clone(),
         out_dir: &out_dir,
         diffs,
         ownership_map,
@@ -612,6 +677,22 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         "REVIEW_SUMMARY + review.html + AI_INDEX",
         t,
     ));
+
+    // 00_summary/PROVENANCE.json — pack-level substrate record. Written before
+    // RUN.json/MANIFEST so the manifest hashes it like any other pack file.
+    let t = Instant::now();
+    generate_provenance_json(ProvenanceJsonInput {
+        dir: &summary_dir,
+        repo: &repo,
+        checks: &all_checks,
+        skipped_checks: &skipped_checks,
+        diffs,
+        resolved_target,
+        resolved_bases,
+        worktree_clean,
+        worktree_status_digest: worktree_status_digest.as_deref(),
+    })?;
+    stage_timings.push(finish_timing(emit_human_stdout, "PROVENANCE.json", t));
 
     // 00_summary/RUN.json — after all generators complete for accurate timing
     let t = Instant::now();
@@ -869,6 +950,12 @@ fn generate_checks_log(dir: &Path, checks: &[CheckResult]) -> Result<()> {
             content.push_str(&format!("Command: {}\n", prov.command));
             content.push_str(&format!("Exit code: {:?}\n", prov.exit_code));
             content.push_str(&format!("CWD: {}\n", prov.cwd));
+            if let Some(ref sha) = prov.target_sha {
+                content.push_str(&format!("Target SHA: {}\n", sha));
+            }
+            if let Some(state) = prov.tree_state {
+                content.push_str(&format!("Tree state: {}\n", state.as_str()));
+            }
             if !prov.hard_fail_signatures.is_empty() {
                 content.push_str(&format!(
                     "Hard fail signatures: {}\n",
@@ -958,6 +1045,12 @@ fn generate_gate_results(dir: &Path, checks: &[CheckResult]) -> Result<()> {
             result["started_at"] = json!(prov.started_at);
             result["finished_at"] = json!(prov.finished_at);
             result["hard_fail_signatures"] = json!(prov.hard_fail_signatures);
+            if let Some(ref sha) = prov.target_sha {
+                result["target_sha"] = json!(sha);
+            }
+            if let Some(state) = prov.tree_state {
+                result["tree_state"] = json!(state.as_str());
+            }
             if let Some(ref ver) = prov.tool_version {
                 result["tool_version"] = json!(ver);
             }
@@ -1067,6 +1160,149 @@ fn generate_heuristics_gate_result(
     Ok(())
 }
 
+struct ProvenanceJsonInput<'a> {
+    dir: &'a Path,
+    repo: &'a Repository,
+    checks: &'a [CheckResult],
+    /// Checks that were configured but never executed. They are gates too: a
+    /// consumer must be able to tell "deliberately not run, for this reason"
+    /// from "not part of this run at all", and an absent row says the latter.
+    skipped_checks: &'a [crate::checks::SkippedCheck],
+    /// The diffs the pack was built from — the authority on which commit the
+    /// patch was actually computed against.
+    diffs: &'a [Diff],
+    resolved_target: &'a ResolvedRef,
+    resolved_bases: &'a [ResolvedRef],
+    worktree_clean: Option<bool>,
+    worktree_status_digest: Option<&'a str>,
+}
+
+/// Every baseline the pack's diffs were actually produced from, named.
+///
+/// `resolved_bases` holds the base *tips* the operator named. When the branches
+/// have diverged the patch is generated from the merge base instead
+/// (`Repository::resolve_diff_bases`), so recording a tip here would name a
+/// commit no diff in the pack was computed against — the contradiction of a file
+/// whose whole job is to state what was compared. Reading the values off the
+/// diffs themselves makes that impossible by construction.
+///
+/// One entry per diff: `--base a --base b` produces a patch per base, each with
+/// its own merge base, and collapsing them to one row left a reviewer unable to
+/// say which commit the second patch came from.
+///
+/// Falls back to the resolved bases when there is no diff at all: an empty diff
+/// set means either `--current-only` (no base, so no rows) or a base pointing at
+/// the target commit, where the tip IS the baseline.
+fn provenance_bases<'a>(
+    diffs: &'a [Diff],
+    resolved_bases: &'a [ResolvedRef],
+) -> Vec<(&'a str, &'a str)> {
+    if diffs.is_empty() {
+        return resolved_bases
+            .iter()
+            .map(|base| (base.name.as_str(), base.commit_id.as_str()))
+            .collect();
+    }
+    diffs
+        .iter()
+        .map(|diff| (diff.base.as_str(), diff.base_commit_id.as_str()))
+        .collect()
+}
+
+/// PROVENANCE.json — pack-level record of WHAT was analysed.
+///
+/// Per-check provenance already lives in `20_quality/<gate>.result.json` and
+/// `RUN.json`, but a reviewer holding only the pack still had to reconstruct the
+/// run's substrate from those rows. This file states it once: the commits
+/// involved, the state of the local working tree at the moment the run started,
+/// and one row per check naming the tree that check actually read.
+///
+/// Purely additive: no existing pack file changes shape because of it.
+fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
+    use serde_json::json;
+    let ProvenanceJsonInput {
+        dir,
+        repo,
+        checks,
+        skipped_checks,
+        diffs,
+        resolved_target,
+        resolved_bases,
+        worktree_clean,
+        worktree_status_digest,
+    } = input;
+
+    let executed = checks.iter().map(|c| {
+        let prov = c.provenance.as_ref();
+        json!({
+            "id": check_id_from_name(&c.name),
+            "cwd": prov.map(|p| p.cwd.as_str()),
+            "target_sha": prov.and_then(|p| p.target_sha.as_deref()),
+            "tree_state": prov.and_then(|p| p.tree_state).map(|s| s.as_str()),
+            "started_at": prov.map(|p| p.started_at.as_str()),
+            // A replayed cache hit carries the ORIGINAL execution's
+            // provenance; this flag is what separates it from a fresh run.
+            "cached": c.cached,
+            // Present on every row so the two kinds are told apart by VALUE
+            // rather than by a missing key: null means the check ran.
+            "skipped": serde_json::Value::Null,
+        })
+    });
+    // A check ruled out before it ran read no tree, so every substrate field is
+    // null — but it was configured, and silence about it is indistinguishable
+    // from never having been scheduled. The reason is what makes the row worth
+    // reading.
+    let skipped = skipped_checks.iter().map(|s| {
+        json!({
+            "id": s.id,
+            "cwd": serde_json::Value::Null,
+            "target_sha": serde_json::Value::Null,
+            "tree_state": serde_json::Value::Null,
+            "started_at": serde_json::Value::Null,
+            "cached": false,
+            "skipped": s.reason,
+        })
+    });
+    let check_rows: Vec<serde_json::Value> = executed.chain(skipped).collect();
+
+    let bases = provenance_bases(diffs, resolved_bases);
+    let base_rows: Vec<serde_json::Value> = bases
+        .iter()
+        .map(|(name, sha)| json!({ "name": name, "sha": sha }))
+        .collect();
+
+    let provenance = json!({
+        "schema_version": "1.0",
+        "generated_at": chrono::Local::now().to_rfc3339(),
+        // Commit whose tree the pack judges.
+        "target_sha": resolved_target.commit_id,
+        // The commit the FIRST patch was really computed against — the merge
+        // base when the branches diverged, not the base tip the operator named.
+        // Kept for consumers that predate `bases[]`; it is that array's first
+        // `sha` by construction, so the two cannot disagree.
+        "base_sha": bases.first().map(|(_, sha)| *sha),
+        // Every baseline, named: a multi-base run produces one patch per base,
+        // and a reviewer holding the pack must be able to place each of them.
+        "bases": base_rows,
+        // Commit checked out locally. Equal to target_sha for an ordinary local
+        // review; different when a fetched ref is analysed (`--pr`/`--remote`).
+        "head_sha": repo.head_commit_id().ok(),
+        "worktree": {
+            // Frozen before checks ran and before any artifact was written
+            // (R4-19), so tool output cannot flip a clean scan to "dirty".
+            "clean": worktree_clean,
+            "status_digest": worktree_status_digest,
+        },
+        "checks": check_rows,
+    });
+
+    fs::write(
+        dir.join("PROVENANCE.json"),
+        serde_json::to_string_pretty(&provenance)?,
+    )?;
+    Ok(())
+}
+
 /// RUN.json — single source of truth (Artifact Pack v1)
 fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
     use serde_json::json;
@@ -1102,6 +1338,15 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             if let Some(ref prov) = c.provenance {
                 entry["exit_code"] = json!(prov.exit_code);
                 entry["hard_fail_signatures"] = json!(prov.hard_fail_signatures);
+                // Which tree this gate actually read: without it the run record
+                // cannot prove the gate saw the reviewed commit rather than an
+                // uncommitted local tree.
+                if let Some(ref sha) = prov.target_sha {
+                    entry["target_sha"] = json!(sha);
+                }
+                if let Some(state) = prov.tree_state {
+                    entry["tree_state"] = json!(state.as_str());
+                }
             }
             entry
         })

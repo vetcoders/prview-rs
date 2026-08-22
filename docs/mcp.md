@@ -59,7 +59,7 @@ Response:
 
 ```json
 {
-  "version": "0.3.1",
+  "version": "0.6.0",
   "protocol": "prview.mcp.v1",
   "deps_global": { "git": true },
   "deps_repo": {

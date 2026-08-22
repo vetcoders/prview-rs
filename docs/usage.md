@@ -137,7 +137,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: vetcoders/prview-rs@main # pin to a released tag once one ships `prview gate`
+      - uses: vetcoders/prview-rs@v0.6.0 # pin to a released tag
         id: prview
         with:
           strict: "true"
@@ -154,9 +154,8 @@ separated `args`.
 
 The Action prefers `cargo-binstall` when that binary is already available on the
 runner and falls back to `cargo install prview --locked --force`. Set `version`
-to a published release that contains `prview gate`, or `latest` for the newest
-release. The gate command is not in the `0.5.0` crate; until a release that
-includes it is published, install the action from `main`.
+to a published release that contains `prview gate` (`0.6.0` or newer), or
+`latest` for the newest release.
 
 SARIF upload requires `permissions: security-events: write`. prview writes
 `30_context/INLINE_FINDINGS.sarif` only when there are inline findings or
@@ -384,6 +383,7 @@ $HOME/.prview/runs/my-repo/feature-x/20260225-185357/
 
 ├── 00_summary/
 │   ├── RUN.json             # Run metadata, execution mode, check inventory
+│   ├── PROVENANCE.json      # What was analysed: base/head/target SHAs, worktree state, per-check substrate
 │   ├── FAILURES_SUMMARY.md  # Compact blocking failures without raw dumps
 │   ├── MANIFEST.json        # SHA256 hashes for generated files
 │   ├── SANITY.json          # Integrity validation results
@@ -437,6 +437,13 @@ When a generator produces no file, the CLI prints an `i` note explaining why.
 #### How to read an artifact pack
 
 - `00_summary/MERGE_GATE.json` is the canonical source of check statuses.
+- `00_summary/PROVENANCE.json` answers *what was judged*: the target/base/head commits, whether the local
+  working tree was clean when the run started (plus a digest fingerprinting what was dirty, content included),
+  and, per check, the directory and commit it actually read. `bases[]` names every baseline the pack's patches
+  were computed from — the merge base of each diff, not the tip of the base branch — and `base_sha` is its first
+  entry, kept for older consumers. A `cached: true` row replays the provenance of the earlier run
+  that filled the cache entry, and a row with a non-null `skipped` is a gate that was ruled out
+  before it ran, with the reason.
 - `PR_REVIEW.md` is a concise review narrative, not a raw log dump.
 - `00_summary/FAILURES_SUMMARY.md` summarizes blocking failures and advisories without copying whole JSON files.
 - When `30_context/INLINE_FINDINGS.sarif` exists, it emits findings per location/advisory and is suitable for annotation integrations.

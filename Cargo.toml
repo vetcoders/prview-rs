@@ -41,6 +41,10 @@ serde_json = "1"
 serde_yaml = "0.9"
 toml = "1"
 
+# Cargo.lock freshness: does a locked version still satisfy the manifest?
+# Cargo's own version parser, already in the dependency graph.
+semver = "1"
+
 # Terminal UI
 colored = "3"
 

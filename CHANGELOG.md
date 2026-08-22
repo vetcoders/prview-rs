@@ -18,6 +18,186 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejects it otherwise) and it restores the pre-change CI behaviour for teams
   that want a warnings-clean trunk. `prview gate` is untouched — its exit codes
   come from the verdict contract, not from this flag.
+- `00_summary/PROVENANCE.json` — a pack-level record of *what was analysed*,
+  next to the per-check rows that record *where each gate ran*. It carries the
+  `target_sha` the pack judges, the `base_sha` it diffed against — the merge
+  base the patch was actually generated from, not the tip of the base branch,
+  which differ as soon as the base moves ahead of the branch point — the
+  `head_sha` checked out locally, whether the working tree was clean when the
+  run started (frozen before any check ran) with a `sha256` digest
+  fingerprinting what was dirty, and one row per check — `{id, cwd, target_sha,
+  tree_state, started_at, cached}`. The digest covers the *content* of every
+  dirty path, not just its status code and name, so two runs that modify the
+  same files differently are distinguishable — including a nested repository,
+  which git reports as a single entry and which therefore fingerprints by its
+  own `HEAD` and, when dirty, by a recursive digest of its own dirty subset
+  (three levels of nesting deep) rather than by the bare fact that a directory
+  is there; each run freezes its own state, and under `--watch` every iteration
+  re-reads the tree it is about to analyse. Paths are taken from git's raw
+  bytes: a filename that is not valid UTF-8 is fingerprinted by those bytes and
+  its content read through an OS-native path, where a single `<non-utf8>`
+  placeholder previously merged every such entry into one line whose content
+  lookup found nothing.
+  The file is listed in `AI_INDEX.md`'s reading order, right after the gate
+  verdict it explains — and in the documented contract for it
+  (`docs/contracts/ai_index.md`) and the artifact-pack inventory in `README.md`,
+  so a consumer implementing the contract can discover that the file is required
+  and where it belongs. `worktree.clean` is nullable: a status that could not be
+  read is reported as unknown rather than as a clean tree. `bases[]` names every
+  baseline the pack's patches were produced from as `{name, sha}`: a multi-base
+  run (`--base a --base b`) generates one patch per base, each with its own merge
+  base, and a single scalar left every patch after the first unplaceable.
+  `base_sha` remains, derived from that array's first entry, so existing
+  consumers keep working and the two cannot disagree. `checks[]` covers gates
+  that never ran: a check ruled out during eligibility (tests disabled, a tool
+  missing) was omitted entirely, which reads exactly like a gate that was never
+  part of the run. Such a check now gets a row with every substrate field null
+  and a `skipped` reason; rows for checks that ran carry `skipped: null`. Those
+  rows identify the gate through the canonical name→id mapper, like every other
+  id in the pack: a skipped check was labelled with a naive slug of its display
+  name, so the same configured gate appeared as `typescript` when skipped and
+  `tsc` when it ran (likewise `cargo_check`/`cargo`, `vitest`/`tests`) and could
+  not be correlated. `REPORT.json.checks_skipped[]` is corrected with it. A
+  reviewer holding
+  only the artifacts no longer has to reconstruct the run's substrate from
+  scattered gate files. Purely additive: no existing pack file changed shape,
+  the manifest hashes it like any other artifact, and the sanity
+  `required_files` check now requires it.
+- Check provenance now records the tree each gate actually scanned: `target_sha`
+  (the commit whose tree the check read) and `tree_state` (`snapshot`,
+  `snapshot-dirty`, `snapshot-borrowed-deps`, `local-clean`, `local-dirty` or
+  `foreign`). Previously `cwd`
+  was the only substrate
+  signal, so an artifact pack could not prove whether a gate saw the reviewed
+  commit or an operator's uncommitted working tree. Both fields are resolved
+  from the directory the command ran in and surface in
+  `20_quality/<gate>.result.json`, `20_quality/full-checks.log`,
+  `00_summary/RUN.json` and `report.json`. They are additive and optional:
+  consumers of older packs (and of checks that ran outside a git repository)
+  keep parsing unchanged, so no artifact `schema_version` bump is required.
+  The synthetic `heuristics_loctree` gate is covered too: it runs in-process
+  rather than as a subprocess, but it still scans a tree — the `git archive`
+  extraction of the target commit, or `repo_root` when no snapshot could be
+  made — and its `PROVENANCE.json` row used to be entirely null, leaving one of
+  the pack's gating signals unauditable. `HeuristicsResult` now carries the
+  commit its analysis root was extracted from along with the scan's start and
+  end times (all additive and optional).
+
+### Changed
+
+- **`--ci` exit code for a warnings-only run: `1` → `0`.** Warning-level checks
+  no longer break `quality_pass`, and `--ci` still exits `1` only on `BLOCK` or a
+  broken quality gate — so a run whose worst signal is a warning now exits `0`.
+  Pass `--ci --fail-on-warnings` to keep the old exit. Runs with a real failure,
+  and every `prview gate` exit code, are unchanged.
+- **BREAKING (behavioral): an unreadable `MERGE_GATE.json` is now an execution
+  error, not a guessed verdict.** `prview --json` / `--ci` used to fall back to
+  re-deriving the decision from the in-memory policy engine when the gate
+  artifact was missing or unparsable, publishing `allow_merge = recommendation
+  != block` — the only path in the codebase where `allow_merge: true` could
+  coexist with a `CONDITIONAL` verdict, contradicting the documented
+  `allow_merge == (verdict == "PASS")` invariant. That fallback is removed:
+  a missing, unparsable, or unknown-schema gate artifact now prints an error and
+  exits `3`, the same execution-error code `prview gate` already used. This also
+  applies to `--update` runs that re-read an earlier pack, so a truncated
+  previous run reports the failure instead of resurrecting a plausible verdict.
+- **`MERGE_GATE.json` readers check `schema_version`.** A pack with an unknown or
+  unparsable MAJOR is rejected fail-loud (`exit 3` on the CLI, `storage_corrupt`
+  on the MCP surface), and so is a `schema_version` that is present but is not a
+  `MAJOR.MINOR` string — a number, an object, or an explicit `null` used to be
+  read as "field absent", i.e. as a legacy pack, which is the opposite of what it
+  means. A version with extra components (`2.1.3`) is rejected rather than
+  truncated to `2.1`, so "readable by prview" cannot drift away from the exact
+  set `tools/validate_merge_gate.py` accepts. A newer MINOR of a known MAJOR is
+  read and reported with a `schema_forward_compat:` caveat — on every known
+  MAJOR, so a `1.9` pack is now caveated instead of accepted in silence — and the
+  MCP surface marks that read `normalized: true`, as the documented contract
+  already promised. Version components must also be spelled canonically:
+  `u32::from_str` accepts leading zeros and a leading `+`, so `02.2`, `2.02` and
+  `+2.2` all parsed to the known `(2, 2)` and were read as the current schema
+  while the validator rejects those exact strings. An absent `schema_version` stays accepted: pre-2.1 packs
+  predate the field, and the documented `ALLOW`/`HOLD` verdict tolerance is
+  unchanged.
+- **A versioned pack without a `decision` object is a corrupt artifact.** The CLI
+  reader fell back to treating the gate's ROOT as the decision, so a pack that
+  states `schema_version: "2.2"` and then carries no `decision` (or a non-object
+  one) normalized quietly to `BLOCK` / `allow_merge: false` with an
+  `unknown_verdict:` caveat — a verdict nothing in the pack ever stated. It now
+  exits `3`, matching `tools/validate_merge_gate.py` (which requires `decision`
+  at every version) and the `prview mcp` adapter (which already returned
+  `storage_corrupt`). A pack with NO `schema_version` predates the field and
+  keeps the legacy tolerance: its root is still read as the decision.
+- **The legacy tolerance is now whole on both readers.** The `prview mcp` adapter
+  required a `decision` object unconditionally, so a genuine pre-2.1 pack — no
+  `schema_version`, signals at the root — was answered `storage_corrupt` by the
+  MCP surface while the CLI read the very same file and printed a verdict. One
+  artifact cannot be simultaneously readable and corrupt depending on which
+  surface asks. Both readers now select the decision object through a single
+  `gate::select_decision_object`: `decision` when it is an object, the root when
+  the pack states no `schema_version`, and fail-loud otherwise. The corruption
+  rule for versioned packs is unchanged; only the disagreement is gone.
+- **A wrongly typed decision signal is a normalization, not an absent field.**
+  `verdict: "PASS"` beside `merge_recommendation: 7` used to collapse through
+  `as_str()` into "no recommendation", so the `prview mcp` adapter returned a
+  decision derived from the surviving signal with `normalized: false` and no
+  caveat — a field ignored in silence, which the MCP contract forbids. Each
+  decision signal now distinguishes absent from present-but-untypable and emits
+  an `unreadable_verdict:` / `unreadable_merge_recommendation:` /
+  `unreadable_allow_merge:` caveat with `normalized: true`. A pack with no
+  usable signal at all is still `storage_corrupt`.
+- **The CLI reader names wrongly typed signals too, and refuses to approve on
+  them.** The `unreadable_*` discipline above shipped on the MCP surface only;
+  the CLI still went through `as_str()` / `as_bool()`, so `verdict: 7` was
+  reported as `unknown_verdict: … carries no verdict` (a claim about a field that
+  was in fact present), `merge_recommendation: 7` fell through to
+  `review_required`, and `allow_merge: "true"` silently became `false`. Worse,
+  a pack with a valid `verdict: "PASS"` beside a mistyped `merge_recommendation`
+  published a `PASS` derived from a decision block the reader had only partly
+  read. Both readers now share `gate::readable_signal`: a present-but-untypable
+  field emits the same `unreadable_<field>:` caveat on `--json`, and — matching
+  the unknown-verdict rule already in place — forces every derived axis
+  conservative (`verdict: "BLOCK"`, `allow_merge: false`,
+  `merge_recommendation: block`, `--ci` exit `1`). A well-typed pack gains no
+  caveat and is unaffected.
+- **Unknown verdicts are reported instead of silently absorbed.** The CLI still
+  collapses an unrecognized verdict to `BLOCK`, but now says so through a new
+  optional `caveats` array on the `--json` summary (`unknown_verdict: …`) — the
+  reader no longer presents a normalization as something it read. The MCP
+  `verdict` surface likewise reports `unknown_verdict` /
+  `unknown_merge_recommendation` and sets `normalized: true` instead of dropping
+  the unparsable field on the floor. The `--json` summary keeps
+  `schema_version: "cli-json/v1"`: `caveats` is additive and omitted when empty.
+  A verdict the CLI collapsed to `BLOCK` now also forces the axes derived beside
+  it: `allow_merge` is `false` and `merge_recommendation` is `Block` regardless
+  of what the same unreliable decision block claimed. A pack with an unreadable
+  verdict but `allow_merge: true` and `merge_recommendation: "approve"` used to
+  publish `verdict: "BLOCK"` next to an approval — breaking the
+  `allow_merge == (verdict == "PASS")` invariant — and, because
+  `compute_exit_code` keys off the recommendation, `--ci` exited `0` on it.
+- Human stdout no longer prints "All checks passed!" when no gate artifact was
+  readable. The raw check tally is not a verdict; the summary now names the
+  missing truth.
+- **`report.json` schema_version: `1.0` → `2.0`.**
+  `quality.coverage.heuristic_ratio` is `null` when nothing was measured
+  (previously a misleading `1.0`) and is accompanied by new `measured: bool`
+  and optional `not_measured_reason` fields; `quality.heuristics` omits its
+  counters on a skipped scan. No field was removed or renamed, but a field that
+  was always a number can now be `null` and counters can now be absent, so a
+  decoder written against `1.0` does not parse every pack — that is a MAJOR, not
+  an additive MINOR. Consumers reading `heuristic_ratio` must handle `null` —
+  the bundled dashboard PR-comment generator renders it as `not measured`, and
+  `history.rs` already treats a missing value as "no baseline".
+- Bumped the bundled `loctree` structural-analysis crate from `0.8` to `0.13.0`.
+  The public API prview consumes (`analyzer::{cycles, dead_parrots, twins}`,
+  `snapshot::{Snapshot, project_cache_dir, run_init, SNAPSHOT_SCHEMA_VERSION}`,
+  `args::ParsedArgs`) is source-compatible — no call sites changed. The snapshot
+  schema version is now decoupled from the crate version (pinned at `0.11.0`
+  instead of tracking `CARGO_PKG_VERSION`); prview's `major.minor` schema gate
+  handles the transition, so stale `0.8`-era caches are re-scanned automatically.
+  loctree 0.13 also widens file-type coverage in the scan (markdown, shell,
+  config, and other non-source files now count toward the snapshot), so the
+  `LOCTREE` heuristics stats (`total_files`, `total_loc`, `by_language`) report
+  higher, broader numbers than under 0.8 for the same tree.
 
 ### Fixed
 
@@ -159,7 +339,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anything other than `failure` / `warning` now fails the contract validator,
   because a consumer told to filter on `origin == "failure"` cannot do that on a
   pack where the field is optional.
-
 - Perf regression detection now resolves inline Rust test context (`#[cfg(test)]`,
   `mod tests`, `#[test]`) **per hit line** instead of per hunk. A production hot
   path that merely shared a hunk with a test module was classified as
@@ -278,124 +457,255 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dead_exports`, `cycles`, `twins`, and `unused_symbols` instead of emitting
   zeros indistinguishable from a clean scan. This matches the SKIP semantics
   `MERGE_GATE.json` and `heuristics_loctree.result.json` already used.
+- Cached check results now carry provenance. A cache hit used to return
+  `provenance: None`, so the fastest runs — the ones where every gate is served
+  from cache — were the only ones with no audit trail at all: no command, no
+  `cwd`, no `target_sha`, no `tree_state`. Status, output and provenance are now
+  stored as a single JSON cache entry and replayed together on a hit, describing
+  the run that populated it; `cached: true` on the result is what marks the row
+  as a replay rather than a fresh execution. The entry is published with an
+  atomic rename from a staging file, so parallel prview processes on the same
+  cache can never pair one run's result with another run's provenance. Entries
+  written by an older prview are still read in their previous multi-file form
+  (no cache invalidation, no cold rebuild) and are collapsed into the new shape
+  the first time the key is rewritten. A check that *errors* keeps its substrate
+  too: a command that times out or crashes used to produce a row with a null
+  `cwd`, `target_sha` and `tree_state`, which are precisely the rows where
+  "which tree produced this error" is the first question asked. The error path
+  now reconstructs the directory the check was about to read without
+  materialising anything, while stating what it does not know — `command` reads
+  `<no command recorded>`, and an off-`HEAD` check whose own worktree is already
+  gone keeps no provenance rather than naming the local checkout it was not
+  reading. Cargo checks report the directory they were actually headed for
+  rather than the scan root: a workspace member, or a crate the reviewed commit
+  moved, runs one directory down, and that resolution is now shared with the
+  planner instead of collapsed away.
+- The status digest now fingerprints what a dirty **symlink reaches**, not only
+  the path it names. The link's own identity is still the target path — a link
+  retargeted at identical bytes is a different tree — but everything the checks
+  read through it lives at the far end, and hashing the pathname alone let all
+  of it change between two runs under one unchanged digest. The resolved file is
+  hashed, a directory is recorded without being descended into (an absolute link
+  can leave the repo), a dangling link reads `absent`, and a device or fifo is
+  never opened.
+- The status digest's reading is now **bounded**. It is taken before the first
+  check starts, and `recurse_untracked_dirs` means an untracked dataset, model
+  checkpoint or vendored bundle in the dirty subset was hashed whole — gigabytes
+  of reading in front of a review nobody had started yet. One capture may now
+  hash 256 MiB in total (measured at ~1 s in a release build), shared across
+  every entry and every nested repository it descends into; a file that does not
+  fit what is left is described as `stat:<len>:<mtime>` rather than read. That is
+  deliberately a different word from `blob:` and not a content hash: two runs
+  where an oversized file changed while keeping both its size and its mtime do
+  collide, a far narrower window than a constant "too big" marker, which would
+  have made every large file equal to every other. A refused read leaves the
+  allowance intact, so the entries after a huge one are still hashed, and entries
+  are ordered before any content is read, so the digest of an unchanged tree does
+  not depend on the order git reports them in. Ordinary review-sized dirt is
+  nowhere near the bound, so existing digests are unchanged. A fifo, socket or
+  device node in the dirty subset is also no longer opened at all — a reader with
+  no writer blocked the run forever.
+- Cargo geiger's *self-handled* skips now carry their substrate. The error
+  fallback above only covers checks that return an error, so geiger's two
+  internal skips — the ten-minute timeout degraded to `Skipped` rather than a
+  gate error, and the virtual-workspace pre-flight — slipped past it and wrote
+  null `cwd`, `target_sha` and `tree_state`. In both cases a cargo command had
+  already read the reviewed tree, so the rows are now built from the directory
+  it ran in, with `exit_code: null` naming the single thing that is genuinely
+  unknown. A null substrate now means what it says: nothing was read.
+- Cargo geiger's virtual-workspace pre-flight now fires. It tested a
+  `root_package` key that `cargo metadata --format-version 1` does not emit, so
+  it was always false and every virtual workspace paid a full geiger scan
+  (minutes) before cargo refused the manifest. The probe now asks whether the
+  manifest in the directory geiger would run in appears among the workspace's
+  packages, which leaves a member directory — a concrete package inside a
+  virtual workspace — scanned as before.
+- `Pytest` now runs in the reviewed target snapshot instead of `config.repo_root`.
+  When reviewing a PR or a remote branch, `repo_root` still points at whatever is
+  checked out locally, so pytest executed the *local* branch's tests and reported
+  their failures against the PR — a false failure from unrelated code, even when
+  the PR's own tests were green. Ruff, Mypy and the JS checks were moved onto the
+  target snapshot earlier; `Pytest` was the one check left behind, and is now
+  registered as a shared-snapshot check alongside them. Local reviews, where the
+  target resolves to `HEAD`, are unaffected. Its recorded `provenance.cwd` now
+  reports the directory the run actually used. Whether the Python checks apply
+  at all is decided by the reviewed commit as well: a target that removed its
+  last `pyproject.toml` and Python sources is still reviewed from a Python
+  checkout, and pytest exited 5 for "no tests collected" — a blocking failure
+  for a target the check no longer applies to, with Ruff and Mypy passing
+  vacuously beside it. All three now skip with a reason when the reviewed tree
+  carries no Python, resolved from git without materialising a worktree, and
+  fail open whenever git cannot answer.
+- The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,
+  `Cargo audit`, `Cargo geiger`) now run against the reviewed target snapshot
+  instead of the local checkout. When reviewing a PR or a remote branch, they
+  executed at `cargo_cache_root` — the working tree of whatever branch happened
+  to be checked out — so a remote-only pack combined the target's diff with
+  build, clippy, test and fmt verdicts from unrelated local code. The build
+  cache that motivated that shortcut is preserved by pointing `CARGO_TARGET_DIR`
+  at a per-repo shared directory (`~/.prview/cargo-target/<repo>`), passed to
+  the cargo child process only, so a fresh snapshot does not recompile the whole
+  dependency graph and the operator's own `target/` is never written to. Local
+  reviews, where the target resolves to `HEAD`, are unaffected: same cwd, no
+  environment override. Whether cargo applies at all is decided by the reviewed
+  commit as well: a branch that dropped its last `Cargo.toml` is reviewed from a
+  Rust checkout, and the cargo gates used to report cargo's own "could not find
+  `Cargo.toml`" as that commit's verdict. The manifest is now looked up in the
+  target commit's tree — no worktree materialised to ask — and the checks skip
+  with a reason when the reviewed commit is not a cargo project. A crate the
+  reviewed branch merely *moved* (a root workspace pushed into `backend/`) is
+  found where it now lives, as long as exactly one directory within two levels
+  carries a manifest; several candidates skip with a reason naming them rather
+  than guessing which crate the review is about. That single candidate must also
+  prove it *is* the configured project — matching `[package] name`, or the member
+  list for a virtual workspace root that names no crate. Being the last manifest
+  standing is not evidence of having moved: a commit that deletes the Rust
+  project while keeping an `examples/demo` crate within reach had every cargo
+  gate run against the demo and file its green verdict for a project the commit
+  no longer contains, one that profile detection would not even call a Rust
+  project locally. Nothing to compare against skips with a reason too.
+- Cargo check cache keys now name the substrate they judge. The cached-result
+  lookup happens before the target snapshot is materialised, so a `--pr` run
+  could hit an entry a previous local run had stored under the same working-tree
+  hash and serve the local checkout's verdict as the PR's. Keys now use the
+  resolved target commit whenever it differs from `HEAD`, together with the
+  repo-relative cargo root (`commit-<sha>-root-<hash>`, `-root-self` for the
+  repo root): the same commit checked from the workspace root and from a
+  configured member produces different check/clippy/audit/rustfmt results, and
+  keying on the commit alone let a later run serve the other root's verdict. A
+  target that commits no `Cargo.lock` is not pinned by its commit at all — cargo
+  resolves the dependency graph as it runs — so those keys (and the local
+  working-tree keys, which have the same gap) carry the day: repeated runs in a
+  session still hit, tomorrow's run resolves again, the way `Cargo audit`
+  already handles ageing advisories. A lockfile that is *present but out of
+  date* is not a pin either: a target that adds a dependency without
+  regenerating `Cargo.lock` still sends cargo to the registry, since no cargo
+  command here passes `--locked`. The manifest's declared dependencies are now
+  checked against the lock's package list (renames followed) *and* against the
+  versions it pins — a `serde = "1"` bumped to `"2"` over a lock still holding
+  1.x is as unresolved as a dependency the lock never heard of — so a lock the
+  manifest has outgrown carries the same day stamp. The
+  root is hashed rather than spelled out because a cache key is a file name —
+  `crates/core` written verbatim named a file in a directory nothing creates, so
+  the store failed and the slowest gates in the tool recomputed on every review
+  of a workspace member. The local member key drops its `:` separator for the
+  same reason (illegal in Windows file names); existing entries miss once and
+  are repopulated.
+- A `cargo_root` configured outside the repository no longer makes an
+  off-`HEAD` review scan an unrelated directory. A snapshot of the repo can
+  never contain such a root, and the fallback ran cargo at the local path
+  anyway — the reviewed commit's name on a foreign tree's verdict, the same
+  false-verdict class the snapshot move fixed. Those runs now **skip** the cargo
+  checks with a reason naming the unreachable root; local reviews are unchanged.
+  The same refusal now survives a target-controlled `backend/` **symlink** into
+  an external directory, which carries no `..` and passed the lexical check:
+  resolving the root from the git tree cannot follow a symlink out of the
+  reviewed commit, and a resolved path that still leaves the snapshot is refused
+  instead of producing a foreign tree's verdict cached under that commit. The
+  same holds one path component deeper, for a reviewed commit that keeps the
+  cargo root and replaces `Cargo.toml` *itself* with a link to an external
+  manifest: git stores a symlink as a blob, so a plain tree lookup accepted it.
+  A manifest must now be a regular file, and the containment check resolves the
+  manifest alongside the directory for the cases the tree lookup cannot cover —
+  and `Cargo.lock` with them, because cargo follows a symlinked lockfile even
+  under `--locked`, so a reviewed commit tracking its lock as a link to an
+  external file had its entire dependency graph resolved from another project's
+  pins.
+  A **local** review is one of those cases and was reached by neither guard —
+  the local plan returns before the containment check runs — so a checkout
+  tracking `Cargo.toml` as a link to an external manifest had cargo build a
+  foreign project while provenance recorded the local checkout. The manifest is
+  now resolved against the cargo root before a local plan is returned; an
+  externally configured `cargo_root` whose own manifest sits inside it is still
+  a legitimate local setup and is unaffected. A contained manifest can still
+  *declare* its way out: an absolute `path` dependency — or a relative one that
+  climbs out or passes through a symlink — had cargo compile source the reviewed
+  commit does not contain, under that commit's cache key and a `snapshot`
+  provenance row. Every local path an off-`HEAD` run's cargo root manifest names
+  (dependencies, dev, build, `[workspace.dependencies]`, `[target.*]`, `[patch]`,
+  `[replace]`) is now resolved against the snapshot, and one that leaves it is
+  refused with the dependency named — and not only the root manifest's, since
+  `cargo check` at a workspace root builds its members: every manifest within
+  three levels of the cargo root is read the same way, through a bounded walk
+  that never enters a symlinked directory and skips `target/` and `.git/`. A
+  member manifest that is itself a link out of the snapshot is refused with
+  them. Local reviews are untouched: a path dependency on a sibling checkout is
+  an ordinary local setup, and a local run claims nothing about a commit's
+  contents.
+- A cargo root that the reviewed branch moved (a root crate pushed into
+  `backend/`, a member renamed) is no longer projected into the snapshot
+  verbatim. The locally detected path does not exist there, so cargo failed on a
+  missing manifest and the execution error was reported as the reviewed crate's
+  verdict; the run now falls back to the snapshot root when it carries a
+  manifest of its own.
+- Python checks no longer synchronise the operator's virtual environment when
+  reviewing another commit. The target snapshot symlinks the checkout's `.venv`,
+  and `uv run` syncs the project environment before executing — so reviewing a
+  branch with different dependencies installed into, and removed packages from,
+  the developer's active environment. Off-`HEAD` runs now set
+  `UV_PROJECT_ENVIRONMENT` to a prview-owned directory keyed by the reviewed
+  commit (`~/.prview/uv-env/<repo>/<target-sha>`): the reviewed dependency set
+  is still installed and judged, just never on top of the operator's. Per-commit
+  rather than per-repo, because `uv run` syncs before executing and releases its
+  lock while the child runs — two reviews of different commits sharing one
+  directory would resynchronise incompatible dependency sets under each other's
+  running pytest. Runs of the same commit still reuse a warm environment, and
+  the growth is bounded: the three most recently used environments survive, and
+  nothing used in the last 24 hours is ever removed. That age floor is enforced
+  under a `.prview-prune.lock` file at the environment root, so a second review
+  cannot read a timestamp just before this one refreshes it and then delete the
+  directory out from under a running `uv run`; a root already locked by a live
+  review is left alone entirely. Local reviews set no override. Python runs also
+  refuse a `pyproject.toml` or `uv.lock` that resolves outside the tree being
+  judged — the counterpart of the Cargo manifest guards. A reviewed commit that
+  tracks either as a link to an external file had ruff, mypy and pytest configure
+  themselves, and uv resolve its dependency set, from another project entirely,
+  while provenance recorded an exact snapshot scan and the verdict was cached
+  under the reviewed commit. Metadata linked to a real file inside the tree
+  resolves back inside and still runs.
+- Provenance no longer certifies a tree it could not verify. A working-tree
+  status that fails to read (an index lock, a permissions error, a malformed
+  repository) recorded `local-clean` — the claim that the scanned bytes exactly
+  match the commit, made precisely when nothing could be checked. It now records
+  no `tree_state` at all, the same "visibly unknown" the non-git case uses. The
+  pack-level `worktree.clean` had the same gap and is now `null` in that case
+  instead of `true`: the value is published as a fact in `PROVENANCE.json` and
+  decides whether out-of-diff failures are downgraded to pre-existing, so
+  certifying an uninspected tree could silence real findings. A run with no git
+  repository at all still reports `true` — nothing can be uncommitted without
+  one, and such a run has no diff baseline to downgrade against anyway.
+- A snapshot that a check wrote into is no longer recorded as an exact commit
+  scan. `tree_state: snapshot` was assigned to any directory outside the repo
+  root, so a generated `Cargo.lock` (or any tool writing into the checkout) left
+  the artifact claiming bytes that had already changed, and an external
+  `cargo_root` — a different checkout entirely — was labelled a snapshot of the
+  reviewed commit. Snapshots are now verified against their own status
+  (`snapshot` / `snapshot-dirty`, ignoring the `node_modules` and `.venv`
+  symlinks prview itself creates), and a directory that is not a worktree of
+  this repository is recorded as `foreign`. Those ignored symlinks are not free
+  of consequence either: prview links the *operator's* dependencies into the
+  snapshot rather than installing what the target's lockfile pins, so `tsc`,
+  ESLint, Stylelint and Vitest read a compiler, plugins, type definitions and a
+  runtime from the local checkout while the pack certified an exact target-tree
+  scan — for a dependency-changing PR, the case where the two differ most. A
+  snapshot that carries those links is now `snapshot-borrowed-deps`: the
+  reviewed source is exactly the target, the dependencies are borrowed. A repo
+  with no local dependency tree links nothing and stays `snapshot`, and the
+  label is applied per check rather than per directory — a link only counts
+  against a command that can read it. The JS checks resolve their toolchain
+  through `node_modules`; cargo and Semgrep read nothing through it, so a mixed
+  repository no longer downgrades their provenance, and the Python checks run
+  against the per-commit `UV_PROJECT_ENVIRONMENT` rather than the linked
+  `.venv`, so they stay `snapshot` too. Repository identity is now settled
+  before position, in both directions: a check running in a vendored checkout, a
+  submodule or an in-repo symlink to another clone used to be recorded as this
+  repository's `local-clean`/`local-dirty` tree with the OTHER project's `HEAD`
+  as `target_sha`, because sitting below `repo_root` was taken as proof. Such a
+  directory is `foreign` wherever it sits.
 
-### Changed
+### Security
 
-- **`--ci` exit code for a warnings-only run: `1` → `0`.** Warning-level checks
-  no longer break `quality_pass`, and `--ci` still exits `1` only on `BLOCK` or a
-  broken quality gate — so a run whose worst signal is a warning now exits `0`.
-  Pass `--ci --fail-on-warnings` to keep the old exit. Runs with a real failure,
-  and every `prview gate` exit code, are unchanged.
-- **BREAKING (behavioral): an unreadable `MERGE_GATE.json` is now an execution
-  error, not a guessed verdict.** `prview --json` / `--ci` used to fall back to
-  re-deriving the decision from the in-memory policy engine when the gate
-  artifact was missing or unparsable, publishing `allow_merge = recommendation
-  != block` — the only path in the codebase where `allow_merge: true` could
-  coexist with a `CONDITIONAL` verdict, contradicting the documented
-  `allow_merge == (verdict == "PASS")` invariant. That fallback is removed:
-  a missing, unparsable, or unknown-schema gate artifact now prints an error and
-  exits `3`, the same execution-error code `prview gate` already used. This also
-  applies to `--update` runs that re-read an earlier pack, so a truncated
-  previous run reports the failure instead of resurrecting a plausible verdict.
-- **`MERGE_GATE.json` readers check `schema_version`.** A pack with an unknown or
-  unparsable MAJOR is rejected fail-loud (`exit 3` on the CLI, `storage_corrupt`
-  on the MCP surface), and so is a `schema_version` that is present but is not a
-  `MAJOR.MINOR` string — a number, an object, or an explicit `null` used to be
-  read as "field absent", i.e. as a legacy pack, which is the opposite of what it
-  means. A version with extra components (`2.1.3`) is rejected rather than
-  truncated to `2.1`, so "readable by prview" cannot drift away from the exact
-  set `tools/validate_merge_gate.py` accepts. A newer MINOR of a known MAJOR is
-  read and reported with a `schema_forward_compat:` caveat — on every known
-  MAJOR, so a `1.9` pack is now caveated instead of accepted in silence — and the
-  MCP surface marks that read `normalized: true`, as the documented contract
-  already promised. Version components must also be spelled canonically:
-  `u32::from_str` accepts leading zeros and a leading `+`, so `02.2`, `2.02` and
-  `+2.2` all parsed to the known `(2, 2)` and were read as the current schema
-  while the validator rejects those exact strings. An absent `schema_version` stays accepted: pre-2.1 packs
-  predate the field, and the documented `ALLOW`/`HOLD` verdict tolerance is
-  unchanged.
-- **A versioned pack without a `decision` object is a corrupt artifact.** The CLI
-  reader fell back to treating the gate's ROOT as the decision, so a pack that
-  states `schema_version: "2.2"` and then carries no `decision` (or a non-object
-  one) normalized quietly to `BLOCK` / `allow_merge: false` with an
-  `unknown_verdict:` caveat — a verdict nothing in the pack ever stated. It now
-  exits `3`, matching `tools/validate_merge_gate.py` (which requires `decision`
-  at every version) and the `prview mcp` adapter (which already returned
-  `storage_corrupt`). A pack with NO `schema_version` predates the field and
-  keeps the legacy tolerance: its root is still read as the decision.
-- **The legacy tolerance is now whole on both readers.** The `prview mcp` adapter
-  required a `decision` object unconditionally, so a genuine pre-2.1 pack — no
-  `schema_version`, signals at the root — was answered `storage_corrupt` by the
-  MCP surface while the CLI read the very same file and printed a verdict. One
-  artifact cannot be simultaneously readable and corrupt depending on which
-  surface asks. Both readers now select the decision object through a single
-  `gate::select_decision_object`: `decision` when it is an object, the root when
-  the pack states no `schema_version`, and fail-loud otherwise. The corruption
-  rule for versioned packs is unchanged; only the disagreement is gone.
-- **A wrongly typed decision signal is a normalization, not an absent field.**
-  `verdict: "PASS"` beside `merge_recommendation: 7` used to collapse through
-  `as_str()` into "no recommendation", so the `prview mcp` adapter returned a
-  decision derived from the surviving signal with `normalized: false` and no
-  caveat — a field ignored in silence, which the MCP contract forbids. Each
-  decision signal now distinguishes absent from present-but-untypable and emits
-  an `unreadable_verdict:` / `unreadable_merge_recommendation:` /
-  `unreadable_allow_merge:` caveat with `normalized: true`. A pack with no
-  usable signal at all is still `storage_corrupt`.
-- **The CLI reader names wrongly typed signals too, and refuses to approve on
-  them.** The `unreadable_*` discipline above shipped on the MCP surface only;
-  the CLI still went through `as_str()` / `as_bool()`, so `verdict: 7` was
-  reported as `unknown_verdict: … carries no verdict` (a claim about a field that
-  was in fact present), `merge_recommendation: 7` fell through to
-  `review_required`, and `allow_merge: "true"` silently became `false`. Worse,
-  a pack with a valid `verdict: "PASS"` beside a mistyped `merge_recommendation`
-  published a `PASS` derived from a decision block the reader had only partly
-  read. Both readers now share `gate::readable_signal`: a present-but-untypable
-  field emits the same `unreadable_<field>:` caveat on `--json`, and — matching
-  the unknown-verdict rule already in place — forces every derived axis
-  conservative (`verdict: "BLOCK"`, `allow_merge: false`,
-  `merge_recommendation: block`, `--ci` exit `1`). A well-typed pack gains no
-  caveat and is unaffected.
-- **Unknown verdicts are reported instead of silently absorbed.** The CLI still
-  collapses an unrecognized verdict to `BLOCK`, but now says so through a new
-  optional `caveats` array on the `--json` summary (`unknown_verdict: …`) — the
-  reader no longer presents a normalization as something it read. The MCP
-  `verdict` surface likewise reports `unknown_verdict` /
-  `unknown_merge_recommendation` and sets `normalized: true` instead of dropping
-  the unparsable field on the floor. The `--json` summary keeps
-  `schema_version: "cli-json/v1"`: `caveats` is additive and omitted when empty.
-  A verdict the CLI collapsed to `BLOCK` now also forces the axes derived beside
-  it: `allow_merge` is `false` and `merge_recommendation` is `Block` regardless
-  of what the same unreliable decision block claimed. A pack with an unreadable
-  verdict but `allow_merge: true` and `merge_recommendation: "approve"` used to
-  publish `verdict: "BLOCK"` next to an approval — breaking the
-  `allow_merge == (verdict == "PASS")` invariant — and, because
-  `compute_exit_code` keys off the recommendation, `--ci` exited `0` on it.
-- Human stdout no longer prints "All checks passed!" when no gate artifact was
-  readable. The raw check tally is not a verdict; the summary now names the
-  missing truth.
-
-- **`report.json` schema_version: `1.0` → `2.0`.**
-  `quality.coverage.heuristic_ratio` is `null` when nothing was measured
-  (previously a misleading `1.0`) and is accompanied by new `measured: bool`
-  and optional `not_measured_reason` fields; `quality.heuristics` omits its
-  counters on a skipped scan. No field was removed or renamed, but a field that
-  was always a number can now be `null` and counters can now be absent, so a
-  decoder written against `1.0` does not parse every pack — that is a MAJOR, not
-  an additive MINOR. Consumers reading `heuristic_ratio` must handle `null` —
-  the bundled dashboard PR-comment generator renders it as `not measured`, and
-  `history.rs` already treats a missing value as "no baseline".
-
-- Bumped the bundled `loctree` structural-analysis crate from `0.8` to `0.13.0`.
-  The public API prview consumes (`analyzer::{cycles, dead_parrots, twins}`,
-  `snapshot::{Snapshot, project_cache_dir, run_init, SNAPSHOT_SCHEMA_VERSION}`,
-  `args::ParsedArgs`) is source-compatible — no call sites changed. The snapshot
-  schema version is now decoupled from the crate version (pinned at `0.11.0`
-  instead of tracking `CARGO_PKG_VERSION`); prview's `major.minor` schema gate
-  handles the transition, so stale `0.8`-era caches are re-scanned automatically.
-  loctree 0.13 also widens file-type coverage in the scan (markdown, shell,
-  config, and other non-source files now count toward the snapshot), so the
-  `LOCTREE` heuristics stats (`total_files`, `total_loc`, `by_language`) report
-  higher, broader numbers than under 0.8 for the same tree.
+- bump ammonia 4.1.3 → 4.1.4 (RUSTSEC-2026-0213: XSS via SVG `animate`/`set` attributes)
 
 ## [0.6.0] - 2026-07-07
 
@@ -417,7 +727,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - refactor(githooks): collapse pre-push gate invocation to one line
 - docs(gate): add rollout playbook and hook recipes
 - docs(changelog): record loctree 0.13 adaptation
-- build(deps): bump loctree 0.8 → 0.13.0
+- build(deps): bump loctree 0.8 → 0.13.0 — source-compatible; stale 0.8-era caches are rescanned automatically via the schema gate, and the wider file-type scan coverage broadens the `LOCTREE` heuristics totals (`total_files`, `total_loc`, `by_language`) for the same tree
 
 ### Fixed
 - fail fast without gate subcommand

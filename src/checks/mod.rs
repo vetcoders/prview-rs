@@ -33,17 +33,267 @@ pub use semgrep::SemgrepCheck;
 pub(crate) use semgrep::output_reports_scan_errors as semgrep_output_reports_scan_errors;
 pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 
+/// Which tree a check's command actually read.
+///
+/// Provenance without this is not auditable: `cwd` alone cannot tell a reviewer
+/// whether the bytes a gate scanned were the reviewed commit or whatever the
+/// operator happened to have uncommitted on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TreeState {
+    /// A tree materialised from THIS repository's objects at the reviewed
+    /// target commit, unmodified — the scanned bytes are exactly `target_sha`.
+    /// Either the ephemeral `git worktree` the language checks share, or the
+    /// `git archive` extraction the Loctree heuristics scan; both carry the
+    /// commit's tree and nothing from the working directory.
+    Snapshot,
+    /// Same worktree, but it carries changes the run itself produced (a
+    /// generated `Cargo.lock`, a tool writing into the checkout) — the scanned
+    /// bytes are NOT exactly `target_sha`.
+    SnapshotDirty,
+    /// The reviewed commit's tree, unmodified, but with its DEPENDENCIES
+    /// borrowed: prview links the operator's `node_modules`/`.venv` into the
+    /// snapshot ([`SNAPSHOT_SCAFFOLDING`]) instead of installing what the
+    /// target's lockfile pins. The reviewed SOURCE is exactly `target_sha`; the
+    /// compiler, plugins, type definitions and runtime the tools loaded came
+    /// from the local checkout. A dependency-changing PR is precisely where the
+    /// two differ, so this must not be reported as an exact snapshot scan.
+    SnapshotBorrowedDeps,
+    /// The repo's own working tree with no uncommitted changes — the scanned
+    /// bytes are exactly `target_sha`.
+    LocalClean,
+    /// The repo's own working tree carrying uncommitted changes — the scanned
+    /// bytes are NOT exactly `target_sha`.
+    LocalDirty,
+    /// A directory that is neither this repository's working tree nor one of its
+    /// worktrees (e.g. a `cargo_root` configured outside the repo). Whatever
+    /// `target_sha` names, it belongs to a DIFFERENT checkout: the scanned bytes
+    /// say nothing about the reviewed commit.
+    Foreign,
+}
+
+impl TreeState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::SnapshotDirty => "snapshot-dirty",
+            Self::SnapshotBorrowedDeps => "snapshot-borrowed-deps",
+            Self::LocalClean => "local-clean",
+            Self::LocalDirty => "local-dirty",
+            Self::Foreign => "foreign",
+        }
+    }
+}
+
+/// The substrate a check ran against: the commit whose tree was scanned, and
+/// whether that tree was a snapshot or the live local working tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanSubstrate {
+    pub target_sha: Option<String>,
+    pub tree_state: Option<TreeState>,
+}
+
+/// Resolve the substrate `cwd` sits on — the single source of truth every check
+/// records through its provenance.
+///
+/// `target_sha` is the commit checked out in `cwd` (the snapshot's detached
+/// commit, or the repo's `HEAD` for an in-place scan). `tree_state` classifies
+/// `cwd` against `repo_root` along two axes — WHICH tree it is, and whether that
+/// tree still matches its commit:
+///
+/// Identity is settled BEFORE position, because position cannot answer it:
+///
+/// - not this repository at all: `foreign` — a different checkout whose bytes
+///   say nothing about the reviewed commit. Being lexically inside `repo_root`
+///   proves nothing, since a vendored checkout, a submodule or an in-repo
+///   symlink to another clone all live there and `discover` resolves to THEM;
+///   their `HEAD` belongs to another project, so calling that the reviewed
+///   repository's local tree misreports both fields at once;
+/// - this repository, inside `repo_root`: the live working tree, `local-clean` /
+///   `local-dirty`;
+/// - this repository, outside it — a linked worktree: a target snapshot,
+///   `snapshot` / `snapshot-dirty`. A snapshot is not immutable: a check can
+///   write into it (a generated `Cargo.lock`), after which its bytes are no
+///   longer exactly `target_sha`.
+///
+/// Dirtiness is `git status --porcelain` (untracked files count, ignored ones do
+/// not). In a snapshot the dependency symlinks prview itself creates
+/// ([`SNAPSHOT_SCAFFOLDING`]) are excluded: they are the tool's own scaffolding,
+/// not a modification of the reviewed tree. They are not free of consequence
+/// either — a snapshot is `snapshot-borrowed-deps` when it carries a link THIS
+/// command could actually consume, named by `consumable` (see
+/// [`consumable_scaffolding`]).
+///
+/// Best effort: a `cwd` that is not in a git repository yields `None` for both
+/// fields rather than a guess, and a status that cannot be read yields a `None`
+/// `tree_state` — an unknown substrate stays visibly unknown instead of being
+/// certified clean.
+pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path, consumable: &[&str]) -> ScanSubstrate {
+    let Ok(repo) = git2::Repository::discover(cwd) else {
+        return ScanSubstrate::default();
+    };
+
+    let target_sha = repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map(|commit| commit.id().to_string())
+        .ok();
+
+    let is_external =
+        crate::paths::normalize_to_repo_relative(&cwd.display().to_string(), repo_root).is_external;
+
+    let tree_state = if !belongs_to_repo(&repo, repo_root) {
+        Some(TreeState::Foreign)
+    } else if !is_external {
+        working_tree_is_dirty(&repo, &[]).map(|dirty| {
+            if dirty {
+                TreeState::LocalDirty
+            } else {
+                TreeState::LocalClean
+            }
+        })
+    } else {
+        working_tree_is_dirty(&repo, SNAPSHOT_SCAFFOLDING).map(|dirty| match dirty {
+            true => TreeState::SnapshotDirty,
+            false if borrows_local_dependencies(&repo, consumable) => {
+                TreeState::SnapshotBorrowedDeps
+            }
+            false => TreeState::Snapshot,
+        })
+    };
+
+    ScanSubstrate {
+        target_sha,
+        tree_state,
+    }
+}
+
+/// Paths prview itself materialises inside a target snapshot (see
+/// `create_worktree_snapshot`): symlinks to the operator's dependency caches, so
+/// a review does not reinstall them. They are never part of the reviewed commit
+/// and must not make the snapshot look modified.
+const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
+
+/// Which scaffolding links a given check could actually READ.
+///
+/// Presence of a link is not consumption of it, and the two must not be
+/// confused: a mixed repository has `node_modules` linked into every snapshot,
+/// but a cargo or semgrep run resolves nothing through it. Labelling those runs
+/// `snapshot-borrowed-deps` states a mixed substrate that never existed — the
+/// same class of false claim, pointing the other way, as certifying an exact
+/// scan.
+///
+/// The JS checks resolve their compiler, plugins, type definitions and runtime
+/// through `node_modules` (`local_js_bin` looks in `node_modules/.bin` first),
+/// so for them a linked tree is genuinely the operator's.
+///
+/// The Python checks return NOTHING, deliberately. The snapshot still links
+/// `.venv` — `create_worktree_snapshot` does not know who will run there — but
+/// `plan_python_run` points `UV_PROJECT_ENVIRONMENT` at a prview-owned
+/// per-commit directory, so an off-HEAD Python command installs and reads the
+/// reviewed dependency set, never the link. Without uv the commands come off
+/// `PATH` and use the ambient interpreter, which is not the link either. Should
+/// that redirect ever be removed, `.venv` belongs back in this list.
+fn consumable_scaffolding(check: &str) -> &'static [&'static str] {
+    match check {
+        "TypeScript" | "ESLint" | "Vitest" | "Stylelint" => &["node_modules"],
+        _ => &[],
+    }
+}
+
+/// Whether the snapshot actually CARRIES a link this command could consume.
+///
+/// Presence, not policy: an off-HEAD review of a repo with no local
+/// `node_modules` installs nothing and links nothing, and stays an exact
+/// snapshot scan. Only a link that exists AND is consumable could have been
+/// followed.
+///
+/// Checked at the WORKTREE ROOT, not at the check's `cwd` — a cargo member runs
+/// in a subdirectory while the scaffolding sits at the top of the snapshot.
+fn borrows_local_dependencies(repo: &git2::Repository, consumable: &[&str]) -> bool {
+    let Some(root) = repo.workdir() else {
+        return false;
+    };
+    consumable.iter().any(|name| root.join(name).is_symlink())
+}
+
+/// True when `repo` is the repository rooted at `repo_root` — its own working
+/// tree or one of its linked worktrees, which share a common git directory.
+///
+/// A directory merely being outside `repo_root` proves nothing: an external
+/// `cargo_root` discovers a DIFFERENT repository, and labelling that a snapshot
+/// of the reviewed commit is exactly the false-provenance this record exists to
+/// prevent.
+fn belongs_to_repo(repo: &git2::Repository, repo_root: &Path) -> bool {
+    let Ok(main) = git2::Repository::discover(repo_root) else {
+        return false;
+    };
+    canonical(repo.commondir()) == canonical(main.commondir())
+}
+
+fn canonical(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `git status --porcelain` is non-empty, ignoring `exempt` top-level paths
+/// (untracked files count, ignored ones do not).
+///
+/// `None` when the status cannot be read — an index lock, a permissions error or
+/// a malformed repository. That is an UNKNOWN tree state, not a clean one:
+/// reporting "clean" there would let provenance certify that the scanned bytes
+/// match the commit precisely when nothing could be verified.
+fn working_tree_is_dirty(repo: &git2::Repository, exempt: &[&str]) -> Option<bool> {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .include_ignored(false)
+        .include_unmodified(false);
+    let statuses = repo.statuses(Some(&mut opts)).ok()?;
+    Some(statuses.iter().any(|entry| {
+        let path = entry.path().unwrap_or_default();
+        !exempt
+            .iter()
+            .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    }))
+}
+
 /// Provenance data for a check execution (Artifact Pack v1)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckProvenance {
     pub command: String,
     pub tool_version: Option<String>,
     pub cwd: String,
+    /// Commit whose tree the check scanned. Additive and optional: absent from
+    /// artifacts written before this field existed, and when the substrate is
+    /// not a git repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_sha: Option<String>,
+    /// Whether `cwd` was a target snapshot or the live local tree. Additive and
+    /// optional — see `target_sha`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_state: Option<TreeState>,
     pub exit_code: Option<i32>,
     pub started_at: String,
     pub finished_at: String,
     pub hard_fail_signatures: Vec<String>,
     pub cache_key: Option<String>,
+}
+
+impl CheckProvenance {
+    /// Record the substrate the check ran on, resolved from the directory the
+    /// command actually ran in. Checks that build their provenance literally
+    /// (rather than through [`ProvenanceBuilder`]) chain this so the resolution
+    /// logic stays in one place.
+    ///
+    /// `check` is the check's own [`Check::name`]: which dependency links the
+    /// classification may hold against this run is a property of the command,
+    /// not of the directory (see [`consumable_scaffolding`]).
+    #[must_use]
+    pub fn with_scan_substrate(mut self, check: &str, cwd: &Path, repo_root: &Path) -> Self {
+        let substrate = resolve_scan_substrate(cwd, repo_root, consumable_scaffolding(check));
+        self.target_sha = substrate.target_sha;
+        self.tree_state = substrate.tree_state;
+        self
+    }
 }
 
 /// A check that was configured but could not run
@@ -464,9 +714,19 @@ where
     Ok((results, skipped))
 }
 
+/// A skipped check identifies itself the way every other check does.
+///
+/// The id used to be a naive slug — a fourth copy of the normalisation
+/// `crate::check_id` exists to be the canon of. It agrees with the alias table
+/// for most names and silently disagrees for the aliased ones, so the same
+/// configured gate appeared as `typescript` where it ran and as `tsc` where it
+/// was skipped (likewise `cargo_check`/`cargo`, `vitest`/`tests`). Both ids
+/// reach the artifacts — `REPORT.json.checks_skipped[]` and the skipped rows in
+/// `PROVENANCE.json.checks[]` — so a consumer could not correlate a skip with
+/// the gate it belongs to.
 fn build_skipped_check(check: &dyn Check, reason: String) -> SkippedCheck {
     let name = check.name().to_string();
-    let id = name.to_lowercase().replace([' ', '-', '/'], "_");
+    let id = crate::check_id::check_id_from_name(&name);
 
     SkippedCheck { id, name, reason }
 }
@@ -487,12 +747,91 @@ fn load_cached_result(check: &dyn Check, config: &Config, cache: &Cache) -> Opti
         duration: Duration::from_secs(0),
         output,
         cached: true,
-        provenance: None,
+        provenance: replayed_provenance(cached.provenance.as_deref()),
     })
+}
+
+/// Rebuild the provenance a cache hit is replaying.
+///
+/// The fastest runs are the cache hits, and they used to be the only ones with
+/// no provenance at all — the audit trail went blank exactly where it was
+/// cheapest to keep. The stored blob describes the ORIGINAL execution
+/// (`started_at`/`finished_at`, `cwd`, `target_sha`, `tree_state` of the run
+/// that populated the entry); `CheckResult::cached` is what marks the row as a
+/// replay rather than a fresh execution.
+///
+/// Unreadable or absent blobs resolve to `None`: an entry written by an older
+/// prview (no sidecar) or one whose schema has since changed replays with an
+/// unknown provenance instead of panicking or failing the run.
+fn replayed_provenance(stored: Option<&str>) -> Option<CheckProvenance> {
+    serde_json::from_str(stored?).ok()
+}
+
+/// `CheckProvenance.command` for an execution that failed before any command
+/// reported one (a timeout, a spawn failure). Explicit, so a consumer reading
+/// the field sees an absence rather than a plausible-looking command line.
+const NO_COMMAND_RECORDED: &str = "<no command recorded>";
+
+/// The directory a check WOULD have read, for an execution that ended in `Err`.
+///
+/// Resolved WITHOUT materialising anything: the shared snapshot is already on
+/// disk, and a review whose target is the checked-out `HEAD` reads the repo root.
+/// An off-HEAD run with no shared snapshot returns `None` — that check built its
+/// own worktree, which is gone by the time the error surfaces, and inventing a
+/// path for it would put a fabricated substrate in the manifest.
+///
+/// A cargo check does not run at the scan root: a workspace member, or a crate
+/// the reviewed commit moved, sits in a subdirectory of it. That resolution is
+/// shared with `plan_cargo_run` rather than approximated here, so the manifest
+/// names the directory the command was actually headed for.
+fn errored_check_scan_dir(name: &str, config: &Config) -> Option<std::path::PathBuf> {
+    let scan_dir = if let Some(scan_dir) = &config.scan_dir_override {
+        uses_shared_scan_dir(name).then(|| scan_dir.clone())?
+    } else {
+        off_head_target_commit(config)
+            .is_none()
+            .then(|| config.repo_root.clone())?
+    };
+    Some(match is_cargo_target_check(name) {
+        true => cargo::planned_cargo_cwd(config, &scan_dir),
+        false => scan_dir,
+    })
+}
+
+/// Provenance for a check that errored: no command, but the substrate it was
+/// about to read.
+///
+/// A timeout or a crash produces exactly the rows a reviewer most needs to place
+/// — "which tree produced this error" — and those were the rows the manifest
+/// left entirely null.
+fn errored_check_provenance(
+    name: &str,
+    config: &Config,
+    cache_key: Option<String>,
+    output: &str,
+    started_at: String,
+) -> Option<CheckProvenance> {
+    let scan_dir = errored_check_scan_dir(name, config)?;
+    Some(
+        CheckProvenance {
+            command: NO_COMMAND_RECORDED.to_string(),
+            tool_version: None,
+            cwd: scan_dir.display().to_string(),
+            exit_code: None,
+            started_at,
+            finished_at: chrono::Local::now().to_rfc3339(),
+            hard_fail_signatures: find_hard_fail_signatures(output),
+            cache_key,
+            target_sha: None,
+            tree_state: None,
+        }
+        .with_scan_substrate(name, &scan_dir, &config.repo_root),
+    )
 }
 
 async fn execute_live_check(check: Box<dyn Check>, config: &Config, cache: &Cache) -> CheckResult {
     let start = std::time::Instant::now();
+    let started_at = chrono::Local::now().to_rfc3339();
     let name = check.name().to_string();
     let cache_key = check.cache_key(config);
 
@@ -512,10 +851,24 @@ async fn execute_live_check(check: Box<dyn Check>, config: &Config, cache: &Cach
             // transient miss for the whole hash lifetime, so a later run with
             // the tool present still reports Skipped (PR #12 review #14).
             if result.status != CheckStatus::Skipped
-                && let Some(key) = cache_key
-                && let Err(e) = cache.set(&name, &key, result.status.as_str(), Some(&result.output))
+                && let Some(key) = cache_key.clone()
             {
-                eprintln!("  warning: cache write failed for {name}: {e}");
+                // Store the provenance next to the result so a later cache hit
+                // can replay it. Serialization is best effort: a provenance that
+                // cannot be encoded must never cost us the cached result itself.
+                let provenance = result
+                    .provenance
+                    .as_ref()
+                    .and_then(|prov| serde_json::to_string(prov).ok());
+                if let Err(e) = cache.set(
+                    &name,
+                    &key,
+                    result.status.as_str(),
+                    Some(&result.output),
+                    provenance.as_deref(),
+                ) {
+                    eprintln!("  warning: cache write failed for {name}: {e}");
+                }
             }
 
             result
@@ -532,13 +885,14 @@ async fn execute_live_check(check: Box<dyn Check>, config: &Config, cache: &Cach
             } else {
                 CheckStatus::Error
             };
+            let provenance = errored_check_provenance(&name, config, cache_key, &msg, started_at);
             CheckResult {
                 name,
                 status,
                 duration: start.elapsed(),
                 output: msg,
                 cached: false,
-                provenance: None,
+                provenance,
             }
         }
     }
@@ -653,14 +1007,47 @@ fn is_cargo_target_check(name: &str) -> bool {
 }
 
 /// Checks that resolve their scan directory through [`plan_check_run`] and so
-/// benefit from the run-wide shared target snapshot (thread 1). Cargo checks run
-/// at `cargo_cache_root` and semgrep manages its own worktree, so neither is
-/// listed here.
+/// benefit from the run-wide shared target snapshot (thread 1).
+///
+/// The cargo checks are listed too: they analyse the reviewed snapshot like
+/// every other language check and only redirect their *build cache* away from
+/// it (see `plan_cargo_run` in `checks::cargo`). Semgrep is the single opt-out —
+/// it manages its own worktree because it also needs a baseline commit.
 fn uses_shared_scan_dir(name: &str) -> bool {
     matches!(
         name,
-        "Ruff" | "Mypy" | "TypeScript" | "ESLint" | "Vitest" | "Stylelint"
+        "Ruff"
+            | "Mypy"
+            | "Pytest"
+            | "TypeScript"
+            | "ESLint"
+            | "Vitest"
+            | "Stylelint"
+            | "Cargo check"
+            | "Clippy"
+            | "Rustfmt"
+            | "Cargo test"
+            | "Cargo audit"
+            | "Cargo geiger"
     )
+}
+
+/// Commit id of the reviewed target when it differs from the checked-out `HEAD`.
+///
+/// `None` for an ordinary local review (target == `HEAD`) and whenever the repo
+/// or its refs cannot be resolved — both keep the plain working-tree behaviour.
+///
+/// Cache keys need this INDEPENDENTLY of `config.scan_dir_override`: the cached-
+/// result lookup runs in the dispatcher's first pass, BEFORE the shared snapshot
+/// is materialised. A key derived from the scan dir alone would therefore read a
+/// local-tree key and write a snapshot key — and, worse, a `--pr` run would hit
+/// the entry a previous local run stored under that same local-tree key, serving
+/// the local checkout's verdict as if it were the reviewed commit's.
+pub fn off_head_target_commit(config: &Config) -> Option<String> {
+    let repo = crate::git::Repository::open(&config.repo_root).ok()?;
+    let target = repo.resolve_target(config).ok()?;
+    let head = repo.head_commit_id().ok()?;
+    (target.commit_id != head).then_some(target.commit_id)
 }
 
 /// Materialise ONE target snapshot for the whole run and point `config` at it, so
@@ -750,37 +1137,56 @@ pub fn tool_spawn_failure_in_output(output: &str) -> bool {
 
 /// Build provenance from a command execution
 pub struct ProvenanceBuilder<'a> {
+    /// The check's own [`Check::name`] — decides which dependency links the
+    /// substrate classification may hold against this run (see
+    /// [`consumable_scaffolding`]).
+    pub check: &'a str,
     pub cmd: &'a str,
     pub args: &'a [&'a str],
     pub cwd: &'a Path,
-    pub output: &'a Output,
+    /// Repo root of the run. Classifies the substrate `cwd` sits on, and is the
+    /// base for the repo-relative `cwd` rendering.
+    pub repo_root: &'a Path,
+    /// The command's exit status, or `None` when it never produced one — a
+    /// timeout, or a run abandoned after the tree had already been read. Absent
+    /// is not the same as absent provenance: the substrate was still scanned,
+    /// and a row of nulls would claim otherwise.
+    pub exit_code: Option<i32>,
     pub combined_output: &'a str,
     pub started_at: &'a str,
     pub finished_at: &'a str,
     pub cache_key: Option<String>,
 }
 
-impl<'a> ProvenanceBuilder<'a> {
+impl ProvenanceBuilder<'_> {
+    /// Record `cwd` verbatim (absolute path as the command saw it).
     pub fn build(self) -> CheckProvenance {
-        self.build_with_repo_root(None)
+        let cwd = self.cwd.display().to_string();
+        self.build_with_cwd_display(cwd)
     }
 
-    pub fn build_with_repo_root(self, repo_root: Option<&Path>) -> CheckProvenance {
-        let cwd_str = self.cwd.display().to_string();
-        let cwd_display = match repo_root {
-            Some(root) => crate::paths::normalize_path_display(&cwd_str, root),
-            None => cwd_str,
-        };
+    /// Record `cwd` relative to the repo root (`[external]/…` when the command
+    /// ran outside it, e.g. in a target snapshot).
+    pub fn build_repo_relative_cwd(self) -> CheckProvenance {
+        let cwd =
+            crate::paths::normalize_path_display(&self.cwd.display().to_string(), self.repo_root);
+        self.build_with_cwd_display(cwd)
+    }
+
+    fn build_with_cwd_display(self, cwd_display: String) -> CheckProvenance {
         CheckProvenance {
             command: format!("{} {}", self.cmd, self.args.join(" ")),
             tool_version: None,
             cwd: cwd_display,
-            exit_code: self.output.status.code(),
+            exit_code: self.exit_code,
             started_at: self.started_at.to_string(),
             finished_at: self.finished_at.to_string(),
             hard_fail_signatures: find_hard_fail_signatures(self.combined_output),
             cache_key: self.cache_key,
+            target_sha: None,
+            tree_state: None,
         }
+        .with_scan_substrate(self.check, self.cwd, self.repo_root)
     }
 }
 
@@ -811,8 +1217,36 @@ pub async fn run_command_with_timeout(
     cwd: &Path,
     timeout_secs: u64,
 ) -> Result<Output> {
+    run_command_with_timeout_and_env(cmd, args, cwd, timeout_secs, &[]).await
+}
+
+/// Helper to run a command with extra environment variables.
+///
+/// `env` is applied to the child ONLY — the parent process environment is never
+/// mutated, so a per-check override (cargo's `CARGO_TARGET_DIR`) cannot leak
+/// into concurrently running checks.
+pub async fn run_command_with_env(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<Output> {
+    run_command_with_timeout_and_env(cmd, args, cwd, CHECK_TIMEOUT_SECS, env).await
+}
+
+/// Helper to run a command with custom timeout and extra environment variables.
+pub async fn run_command_with_timeout_and_env(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout_secs: u64,
+    env: &[(String, String)],
+) -> Result<Output> {
     let mut command = Command::new(cmd);
     command.args(args).current_dir(cwd);
+    for (key, value) in env {
+        command.env(key, value);
+    }
     // Shared rails (stdin-null, kill_on_drop, own process group) + concurrent
     // output drain + group-SIGKILL on timeout live in crate::proc.
     crate::proc::run_capture_with_timeout(command, Duration::from_secs(timeout_secs), cmd, || {
@@ -961,6 +1395,398 @@ mod tests {
         config
     }
 
+    /// A gate must carry the same id whether it ran or was ruled out. The naive
+    /// slug agreed with the alias table for most names and disagreed exactly
+    /// where an alias exists, so the same configured check appeared under two
+    /// ids in the same pack and no consumer could pair them.
+    #[test]
+    fn a_skipped_check_keeps_the_canonical_gate_id() {
+        for (check, id) in [
+            (&cargo::CargoCheck as &dyn Check, "cargo"),
+            (&typescript::TypeScriptCheck, "tsc"),
+            (&typescript::VitestCheck, "tests"),
+        ] {
+            let skipped = build_skipped_check(check, "tool missing".to_string());
+            assert_eq!(
+                skipped.id,
+                id,
+                "{} must be identified as the gate it is, not as a slug of its display name",
+                check.name(),
+            );
+            assert_eq!(
+                skipped.id,
+                crate::check_id::check_id_from_name(check.name()),
+                "the skipped id must come from the canonical mapper",
+            );
+        }
+    }
+
+    /// Minimal git fixture: an initialised repo with one commit, returning the
+    /// temp dir and the commit id.
+    fn repo_with_one_commit() -> (tempfile::TempDir, String) {
+        use crate::git::cmd::git_cmd;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {:?} failed", args);
+        };
+
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "prview@example.test"]);
+        run_git(&["config", "user.name", "prview test"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("tracked.txt"), "one\n").expect("write fixture");
+        run_git(&["add", "tracked.txt"]);
+        run_git(&["commit", "-q", "-m", "one"]);
+
+        let out = git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .expect("rev-parse");
+        assert!(out.status.success());
+        let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        (tmp, sha)
+    }
+
+    #[test]
+    fn scan_substrate_of_a_target_snapshot_names_the_snapshot_commit() {
+        // A snapshot-backed check scans an ephemeral worktree of the reviewed
+        // commit. Provenance must name THAT commit and mark the tree as a
+        // snapshot — otherwise an artifact cannot prove which tree was scanned.
+        let (repo, first) = repo_with_one_commit();
+        let root = repo.path();
+
+        let snapshot =
+            crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
+        let substrate = resolve_scan_substrate(
+            &snapshot.worktree_path,
+            root,
+            consumable_scaffolding("TypeScript"),
+        );
+
+        assert_eq!(substrate.target_sha.as_deref(), Some(first.as_str()));
+        assert_eq!(substrate.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[test]
+    fn scan_substrate_of_a_clean_local_tree_is_head() {
+        // Target == HEAD: the check reads the local tree in place. With nothing
+        // uncommitted, the scanned bytes really are HEAD.
+        let (repo, head) = repo_with_one_commit();
+        let root = repo.path();
+
+        let substrate = resolve_scan_substrate(root, root, consumable_scaffolding("TypeScript"));
+
+        assert_eq!(substrate.target_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(substrate.tree_state, Some(TreeState::LocalClean));
+    }
+
+    #[test]
+    fn scan_substrate_of_a_dirty_local_tree_is_flagged() {
+        // The audit-critical case: the check ran on HEAD's working tree, but the
+        // tree carried uncommitted edits, so the scanned bytes are NOT HEAD. The
+        // provenance must say so rather than claim a clean HEAD scan.
+        let (repo, head) = repo_with_one_commit();
+        let root = repo.path();
+
+        std::fs::write(root.join("tracked.txt"), "edited\n").expect("dirty the tree");
+        let substrate = resolve_scan_substrate(root, root, consumable_scaffolding("TypeScript"));
+        assert_eq!(substrate.target_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(substrate.tree_state, Some(TreeState::LocalDirty));
+
+        // An untracked file is dirt too — `git status --porcelain` lists it.
+        std::fs::write(root.join("tracked.txt"), "one\n").expect("restore");
+        assert_eq!(
+            resolve_scan_substrate(root, root, consumable_scaffolding("TypeScript")).tree_state,
+            Some(TreeState::LocalClean),
+            "restoring the tracked file must return the tree to clean",
+        );
+        std::fs::write(root.join("untracked.txt"), "new\n").expect("write untracked");
+        assert_eq!(
+            resolve_scan_substrate(root, root, consumable_scaffolding("TypeScript")).tree_state,
+            Some(TreeState::LocalDirty),
+        );
+    }
+
+    #[test]
+    fn scan_substrate_of_a_mutated_snapshot_is_not_certified_clean() {
+        // A snapshot is not immutable: a check can write into it (cargo
+        // generating a `Cargo.lock` the repo does not track). `snapshot` means
+        // "bytes exactly equal target_sha", so a worktree carrying generated
+        // files must not keep that label just because it sits outside repo_root.
+        let (repo, first) = repo_with_one_commit();
+        let root = repo.path();
+
+        let snapshot =
+            crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
+        assert_eq!(
+            resolve_scan_substrate(
+                &snapshot.worktree_path,
+                root,
+                consumable_scaffolding("TypeScript")
+            )
+            .tree_state,
+            Some(TreeState::Snapshot),
+            "a freshly materialised snapshot is exactly the commit",
+        );
+
+        std::fs::write(snapshot.worktree_path.join("Cargo.lock"), "# generated\n")
+            .expect("write generated file");
+        let substrate = resolve_scan_substrate(
+            &snapshot.worktree_path,
+            root,
+            consumable_scaffolding("TypeScript"),
+        );
+        assert_eq!(substrate.target_sha.as_deref(), Some(first.as_str()));
+        assert_eq!(
+            substrate.tree_state,
+            Some(TreeState::SnapshotDirty),
+            "a command that wrote into the snapshot must not be recorded as a clean commit scan",
+        );
+    }
+
+    #[test]
+    fn scan_substrate_of_a_snapshot_records_borrowed_dependencies() {
+        // prview symlinks node_modules/.venv into the snapshot itself. That is
+        // the tool's own scaffolding, never part of the reviewed commit, so it
+        // must not flip every JS/Python review to a dirty snapshot — the
+        // reviewed SOURCE really is the target's.
+        //
+        // It is not an exact snapshot scan either: the linked dependencies are
+        // the operator's, so tsc/ESLint/Vitest read a compiler, plugins and
+        // types the target's lockfile may not pin at all. Certifying that as
+        // `snapshot` is the overclaim this record exists to prevent.
+        let (repo, first) = repo_with_one_commit();
+        let root = repo.path();
+        std::fs::create_dir(root.join("node_modules")).expect("node_modules");
+        std::fs::write(root.join("node_modules/marker"), "dep\n").expect("dep file");
+
+        let snapshot =
+            crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
+        if !snapshot.worktree_path.join("node_modules").exists() {
+            // Symlinking is unix-only; nothing to assert elsewhere.
+            return;
+        }
+
+        let tree_state = resolve_scan_substrate(
+            &snapshot.worktree_path,
+            root,
+            consumable_scaffolding("TypeScript"),
+        )
+        .tree_state;
+        assert_ne!(
+            tree_state,
+            Some(TreeState::SnapshotDirty),
+            "prview's own dependency symlinks are not a modification of the reviewed tree",
+        );
+        assert_eq!(
+            tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "a snapshot whose dependencies came from the local checkout is not an exact scan",
+        );
+    }
+
+    #[test]
+    fn a_snapshot_is_only_borrowed_for_the_checks_that_read_the_link() {
+        // The mirror of the overclaim above: a mixed repository links
+        // `node_modules` into EVERY snapshot, but a cargo or Python command
+        // resolves nothing through it. Labelling those runs
+        // `snapshot-borrowed-deps` reports a mixed substrate that never
+        // existed — a false claim in the other direction.
+        let (repo, first) = repo_with_one_commit();
+        let root = repo.path();
+        std::fs::create_dir(root.join("node_modules")).expect("node_modules");
+        std::fs::write(root.join("node_modules/marker"), "dep\n").expect("dep file");
+
+        let snapshot =
+            crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
+        if !snapshot.worktree_path.join("node_modules").exists() {
+            // Symlinking is unix-only; nothing to assert elsewhere.
+            return;
+        }
+
+        let state = |check: &str| {
+            resolve_scan_substrate(&snapshot.worktree_path, root, consumable_scaffolding(check))
+                .tree_state
+        };
+
+        assert_eq!(
+            state("TypeScript"),
+            Some(TreeState::SnapshotBorrowedDeps),
+            "tsc resolves its compiler and types through the linked tree",
+        );
+        for check in ["Cargo check", "Clippy", "Cargo test", "Semgrep"] {
+            assert_eq!(
+                state(check),
+                Some(TreeState::Snapshot),
+                "{check} reads nothing through node_modules, so its scan is exactly the commit",
+            );
+        }
+        for check in ["Ruff", "Mypy", "Pytest"] {
+            assert_eq!(
+                state(check),
+                Some(TreeState::Snapshot),
+                "{check} runs against the per-commit UV_PROJECT_ENVIRONMENT, not a linked tree",
+            );
+        }
+    }
+
+    #[test]
+    fn checks_that_install_nothing_locally_consume_no_scaffolding() {
+        // Guards the classification table itself: the cargo, semgrep and Python
+        // commands must stay out of the consumable list. The Python entry is the
+        // load-bearing one — it is empty only because `plan_python_run`
+        // redirects uv away from the linked `.venv`.
+        for check in [
+            "Cargo check",
+            "Clippy",
+            "Rustfmt",
+            "Cargo test",
+            "Cargo audit",
+            "Cargo geiger",
+            "Semgrep",
+            "Ruff",
+            "Mypy",
+            "Pytest",
+        ] {
+            assert!(
+                consumable_scaffolding(check).is_empty(),
+                "{check} does not read prview's dependency links",
+            );
+        }
+        for check in ["TypeScript", "ESLint", "Vitest", "Stylelint"] {
+            assert_eq!(
+                consumable_scaffolding(check),
+                &["node_modules"],
+                "{check} resolves its toolchain through node_modules",
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapshot_without_scaffolding_stays_an_exact_scan() {
+        // The borrowed-deps state is about links that EXIST. A review of a repo
+        // with no local dependency tree links nothing, so nothing was borrowed
+        // and the snapshot is exactly the reviewed commit.
+        let (repo, first) = repo_with_one_commit();
+        let root = repo.path();
+        let snapshot =
+            crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
+
+        assert_eq!(
+            resolve_scan_substrate(
+                &snapshot.worktree_path,
+                root,
+                consumable_scaffolding("TypeScript")
+            )
+            .tree_state,
+            Some(TreeState::Snapshot),
+        );
+    }
+
+    #[test]
+    fn a_nested_checkout_inside_the_repo_is_foreign_too() {
+        // Sitting lexically below repo_root does not make a directory this
+        // repository's working tree: a vendored checkout (or a submodule) is a
+        // repository of its own, and `discover` resolves to IT. Recording its
+        // HEAD as `local-clean` states that the reviewed repository's tree is at
+        // a commit that belongs to a different project entirely.
+        let (repo, _head) = repo_with_one_commit();
+        let root = repo.path();
+
+        let (nested_src, nested_head) = repo_with_one_commit();
+        let nested = root.join("vendor/other");
+        std::fs::create_dir_all(nested.parent().expect("parent")).expect("vendor dir");
+        copy_tree(nested_src.path(), &nested);
+
+        let substrate = resolve_scan_substrate(&nested, root, &[]);
+        assert_eq!(
+            substrate.target_sha.as_deref(),
+            Some(nested_head.as_str()),
+            "the sha read is the nested repository's, which is exactly the problem",
+        );
+        assert_eq!(
+            substrate.tree_state,
+            Some(TreeState::Foreign),
+            "another repository's tree says nothing about the reviewed commit, \
+             wherever it happens to sit",
+        );
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("create dir");
+        for entry in std::fs::read_dir(from).expect("read dir") {
+            let entry = entry.expect("entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy file");
+            }
+        }
+    }
+
+    #[test]
+    fn scan_substrate_of_a_foreign_checkout_is_not_a_snapshot() {
+        // Being outside repo_root does NOT make a directory a snapshot of the
+        // reviewed commit: an external cargo_root is a different repository
+        // entirely. Labelling it `snapshot` would certify a foreign tree's
+        // verdict as the reviewed commit's.
+        let (repo, _) = repo_with_one_commit();
+        let (other, other_head) = repo_with_one_commit();
+
+        let substrate = resolve_scan_substrate(
+            other.path(),
+            repo.path(),
+            consumable_scaffolding("TypeScript"),
+        );
+        assert_eq!(substrate.target_sha.as_deref(), Some(other_head.as_str()));
+        assert_eq!(substrate.tree_state, Some(TreeState::Foreign));
+    }
+
+    #[test]
+    fn unreadable_status_is_unknown_not_clean() {
+        // An index lock, a permissions error or a malformed repository must not
+        // be reported as "no uncommitted changes" — that would certify bytes
+        // nobody could verify.
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        std::fs::write(root.join(".git/index"), b"not an index at all").expect("corrupt the index");
+
+        let opened = git2::Repository::discover(root).expect("repo still opens");
+        assert_eq!(
+            working_tree_is_dirty(&opened, &[]),
+            None,
+            "a status that cannot be read is unknown, not clean",
+        );
+        assert_eq!(
+            resolve_scan_substrate(root, root, consumable_scaffolding("TypeScript")).tree_state,
+            None,
+            "an unknown substrate must stay visibly unknown in provenance",
+        );
+    }
+
+    #[test]
+    fn scan_substrate_outside_a_repository_stays_unknown() {
+        // No git repo: report nothing rather than guessing a substrate.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        if git2::Repository::discover(tmp.path()).is_ok() {
+            // TMPDIR itself lives inside a repository on this machine — the
+            // no-repo case cannot be staged here.
+            return;
+        }
+        let substrate =
+            resolve_scan_substrate(tmp.path(), tmp.path(), consumable_scaffolding("TypeScript"));
+        assert_eq!(substrate, ScanSubstrate::default());
+    }
+
     #[test]
     fn plan_check_run_reuses_shared_scan_dir_without_new_worktree() {
         // Once the dispatcher has set a run-wide shared snapshot, every check's
@@ -981,14 +1807,55 @@ mod tests {
     }
 
     #[test]
+    fn pytest_shares_the_run_wide_target_snapshot() {
+        // PRV-PYTEST-HEAD: Pytest resolves its cwd through plan_check_run like
+        // every other Python/JS check, so it must be listed here — otherwise a
+        // Python-only run would materialise a second worktree, and Pytest could
+        // drift back to running against the local checkout.
+        for name in ["Ruff", "Mypy", "Pytest", "Vitest", "Cargo test"] {
+            assert!(
+                uses_shared_scan_dir(name),
+                "{name} resolves via plan_check_run and must share the run-wide snapshot",
+            );
+        }
+        assert!(
+            !uses_shared_scan_dir("Semgrep"),
+            "semgrep manages its own worktree (needs a baseline commit) and must stay out",
+        );
+    }
+
+    #[test]
     fn share_target_snapshot_is_a_noop_without_snapshot_backed_checks() {
-        // Cargo-only / no snapshot-backed checks: no shared worktree is created
-        // and the override stays unset so nothing changes for those checks.
+        // Semgrep owns its own worktree, so a semgrep-only run creates no shared
+        // worktree and the override stays unset.
         let mut config = rust_config(true, true, true);
-        let cargo_only: Vec<Box<dyn Check>> = vec![Box::new(crate::checks::cargo::CargoCheck)];
-        let snapshot = share_target_snapshot(&mut config, &cargo_only);
+        let semgrep_only: Vec<Box<dyn Check>> =
+            vec![Box::new(crate::checks::semgrep::SemgrepCheck)];
+        let snapshot = share_target_snapshot(&mut config, &semgrep_only);
         assert!(snapshot.is_none());
         assert!(config.scan_dir_override.is_none());
+    }
+
+    #[test]
+    fn cargo_checks_are_snapshot_backed() {
+        // Cargo checks judge the reviewed commit like every other language
+        // check, so they must take part in the run-wide shared snapshot; only
+        // their build cache is redirected away from it. Semgrep stays the one
+        // opt-out because it manages its own baseline worktree.
+        for name in [
+            "Cargo check",
+            "Clippy",
+            "Rustfmt",
+            "Cargo test",
+            "Cargo audit",
+            "Cargo geiger",
+        ] {
+            assert!(
+                uses_shared_scan_dir(name),
+                "{name} must resolve its scan dir through the shared snapshot",
+            );
+        }
+        assert!(!uses_shared_scan_dir("Semgrep scan"));
     }
 
     #[test]
@@ -1708,5 +2575,249 @@ test result: ok. 2 passed; 0 failed
             cache2.get("Mock", "mock-key").is_some(),
             "a Passed result must still be cached"
         );
+    }
+
+    #[tokio::test]
+    async fn a_check_that_errors_still_records_the_tree_it_was_reading() {
+        // A command that times out (or crashes) returns `Err`, and the error
+        // arm built a result with `provenance: None` — so the manifest emitted a
+        // row whose cwd, target_sha and tree_state were all null. Those are the
+        // rows that most need placing: "which tree produced this error" is the
+        // first question asked about a timeout.
+        use async_trait::async_trait;
+
+        struct TimingOutCheck;
+
+        #[async_trait]
+        impl Check for TimingOutCheck {
+            fn name(&self) -> &str {
+                "Ruff"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                anyhow::bail!("ruff {TIMEOUT_MARKER} 300s")
+            }
+            fn cache_key(&self, _config: &Config) -> Option<String> {
+                Some("ruff-key".to_string())
+            }
+        }
+
+        let (repo, head) = repo_with_one_commit();
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(tmp.path().to_path_buf(), true);
+
+        let result = execute_live_check(Box::new(TimingOutCheck), &config, &cache).await;
+        assert_eq!(result.status, CheckStatus::Error);
+
+        let prov = result
+            .provenance
+            .expect("an errored check must still say which tree it was reading");
+        assert_eq!(prov.cwd, repo.path().display().to_string());
+        assert_eq!(prov.target_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(prov.tree_state, Some(TreeState::LocalClean));
+        assert_eq!(
+            prov.exit_code, None,
+            "no command completed, so there is no exit code to report",
+        );
+        assert_eq!(
+            prov.command, NO_COMMAND_RECORDED,
+            "the absence of a command must be stated, not invented",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_errored_cargo_check_reports_the_member_it_was_headed_for() {
+        // Reconstructing the substrate from the shared scan dir is right for a
+        // check that runs at the snapshot root, but a cargo workspace member
+        // runs one directory down. Collapsing every cargo run to the root
+        // reported a directory the command never entered.
+        use async_trait::async_trait;
+
+        struct TimingOutCargo;
+
+        #[async_trait]
+        impl Check for TimingOutCargo {
+            fn name(&self) -> &str {
+                "Cargo check"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                anyhow::bail!("cargo {TIMEOUT_MARKER} 600s")
+            }
+            fn cache_key(&self, _config: &Config) -> Option<String> {
+                None
+            }
+        }
+
+        let write_member = |root: &std::path::Path| {
+            let member = root.join("crates/core");
+            std::fs::create_dir_all(member.join("src")).expect("member");
+            std::fs::write(
+                member.join("Cargo.toml"),
+                "[package]\nname = \"m\"\nversion = \"0.0.0\"\n",
+            )
+            .expect("manifest");
+        };
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_member(repo_root.path());
+        write_member(scan_dir.path());
+
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().join("crates/core"));
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(tmp.path().to_path_buf(), true);
+        let result = execute_live_check(Box::new(TimingOutCargo), &config, &cache).await;
+
+        let prov = result
+            .provenance
+            .expect("an errored cargo check keeps its substrate");
+        assert_eq!(
+            prov.cwd,
+            scan_dir.path().join("crates/core").display().to_string(),
+            "the member the command was headed for, not the snapshot root",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_off_head_check_that_errors_does_not_invent_a_snapshot_path() {
+        // The honest limit of the above: off-HEAD with no shared snapshot, the
+        // check built its own worktree and it is gone by the time the error
+        // surfaces. An unknown substrate stays unknown rather than being
+        // guessed as the local checkout — which is the one tree it was NOT
+        // reading.
+        use async_trait::async_trait;
+
+        struct TimingOutCheck;
+
+        #[async_trait]
+        impl Check for TimingOutCheck {
+            fn name(&self) -> &str {
+                "Ruff"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                anyhow::bail!("ruff {TIMEOUT_MARKER} 300s")
+            }
+            fn cache_key(&self, _config: &Config) -> Option<String> {
+                None
+            }
+        }
+
+        let (repo, head) = repo_with_one_commit();
+        std::fs::write(repo.path().join("tracked.txt"), "two\n").expect("write");
+        let run_git = |args: &[&str]| {
+            let out = crate::git::cmd::git_cmd()
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run_git(&["commit", "-qam", "two", "--no-verify"]);
+
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some(head);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(tmp.path().to_path_buf(), true);
+
+        let result = execute_live_check(Box::new(TimingOutCheck), &config, &cache).await;
+        assert!(
+            result.provenance.is_none(),
+            "a vanished per-check worktree must not be reported as the local tree",
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hit_replays_the_provenance_of_the_run_that_filled_it() {
+        // Two passes over the dispatcher's own path: pass 1 executes the check
+        // and writes the cache entry, pass 2 is served from cache. The cached
+        // pass used to return `provenance: None`, so the FASTEST runs were the
+        // ones with no audit trail at all.
+        use async_trait::async_trait;
+
+        struct MockCheck;
+
+        #[async_trait]
+        impl Check for MockCheck {
+            fn name(&self) -> &str {
+                "Mock"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                Ok(CheckResult {
+                    name: "Mock".to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_secs(0),
+                    output: "ok".to_string(),
+                    cached: false,
+                    provenance: Some(CheckProvenance {
+                        command: "mock --run".to_string(),
+                        tool_version: Some("1.2.3".to_string()),
+                        cwd: "[external]/snapshot".to_string(),
+                        target_sha: Some("cafebabe".to_string()),
+                        tree_state: Some(TreeState::Snapshot),
+                        exit_code: Some(0),
+                        started_at: "2026-08-22T10:00:00+02:00".to_string(),
+                        finished_at: "2026-08-22T10:00:01+02:00".to_string(),
+                        hard_fail_signatures: vec![],
+                        cache_key: Some("mock-key".to_string()),
+                    }),
+                })
+            }
+            fn cache_key(&self, _config: &Config) -> Option<String> {
+                Some("mock-key".to_string())
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = rust_config(true, true, true);
+        let cache = Cache::with_dir(tmp.path().to_path_buf(), true);
+
+        // Pass 1 — live execution, fills the cache.
+        let live = execute_live_check(Box::new(MockCheck), &config, &cache).await;
+        assert!(!live.cached);
+        let live_prov = live.provenance.expect("live run must carry provenance");
+
+        // Pass 2 — served from cache.
+        let hit = load_cached_result(&MockCheck, &config, &cache)
+            .expect("second pass must hit the cache");
+        assert!(hit.cached, "a replay must announce itself as cached");
+        let hit_prov = hit
+            .provenance
+            .expect("a cache hit must carry the provenance of the run that filled it");
+
+        assert_eq!(hit_prov.command, live_prov.command);
+        assert_eq!(hit_prov.cwd, live_prov.cwd);
+        assert_eq!(hit_prov.target_sha, live_prov.target_sha);
+        assert_eq!(hit_prov.tree_state, live_prov.tree_state);
+        assert_eq!(hit_prov.started_at, live_prov.started_at);
+        assert_eq!(hit_prov.exit_code, live_prov.exit_code);
+        assert_eq!(hit_prov.cache_key, live_prov.cache_key);
+    }
+
+    #[test]
+    fn legacy_cache_entry_without_provenance_replays_without_panicking() {
+        // Entries written by an older prview have no provenance sidecar, and a
+        // schema drift can leave one unparseable. Both must degrade to "unknown
+        // provenance", never to a failed run.
+        assert!(replayed_provenance(None).is_none());
+        assert!(replayed_provenance(Some("{ not json")).is_none());
+        assert!(replayed_provenance(Some(r#"{"unrelated":true}"#)).is_none());
     }
 }

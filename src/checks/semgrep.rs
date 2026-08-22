@@ -94,10 +94,12 @@ impl Check for SemgrepCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "semgrep",
                     args: &args,
                     cwd,
-                    output: &output,
+                    repo_root: &config.repo_root,
+                    exit_code: output.status.code(),
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,

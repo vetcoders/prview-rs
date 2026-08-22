@@ -196,6 +196,13 @@ struct CheckEntry {
     command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
+    /// Commit whose tree this check read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_sha: Option<String>,
+    /// `snapshot` | `local-clean` | `local-dirty` — whether the scanned tree is
+    /// exactly `target_sha`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tree_state: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_excerpt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -732,19 +739,22 @@ fn build_report(input: &ReportInput<'_>) -> Report {
                 None
             };
 
-            let (command, cwd, signatures) = if let Some(ref prov) = c.provenance {
-                (
-                    Some(prov.command.clone()),
-                    Some(prov.cwd.clone()),
-                    if prov.hard_fail_signatures.is_empty() {
-                        None
-                    } else {
-                        Some(prov.hard_fail_signatures.clone())
-                    },
-                )
-            } else {
-                (None, None, None)
-            };
+            let (command, cwd, target_sha, tree_state, signatures) =
+                if let Some(ref prov) = c.provenance {
+                    (
+                        Some(prov.command.clone()),
+                        Some(prov.cwd.clone()),
+                        prov.target_sha.clone(),
+                        prov.tree_state.map(|state| state.as_str()),
+                        if prov.hard_fail_signatures.is_empty() {
+                            None
+                        } else {
+                            Some(prov.hard_fail_signatures.clone())
+                        },
+                    )
+                } else {
+                    (None, None, None, None, None)
+                };
 
             let failed_tests = if id == "cargo_test"
                 && matches!(c.status, CheckStatus::Failed | CheckStatus::Error)
@@ -763,6 +773,8 @@ fn build_report(input: &ReportInput<'_>) -> Report {
                 duration_ms: c.duration.as_millis() as u64,
                 command,
                 cwd,
+                target_sha,
+                tree_state,
                 error_excerpt,
                 signatures,
                 finding_stats: if id == "semgrep_scan" {

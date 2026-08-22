@@ -3235,6 +3235,7 @@ dependencies = [
  "regex",
  "rmcp 2.0.0",
  "schemars",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

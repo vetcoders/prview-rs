@@ -32,7 +32,8 @@ Generates Artifact Pack v1 with structured, verifiable PR review artifacts:\n\n\
     review.html   Standard portable human review export\n\
     dashboard.html  Interactive HTML report (optional via --no-dashboard)\n\n\
   Trustworthiness:\n\
-    - CheckProvenance: command, exit_code, cwd, timestamps per gate\n\
+    - CheckProvenance: command, exit_code, cwd, scanned tree\n\
+      (target_sha + tree_state), timestamps per gate\n\
     - Hard fail signatures: Rust panics, Node rejections, Python tracebacks,\n\
       segfaults, sanitizers (live + cached results validated)\n\
     - MANIFEST.json: SHA256 hashes of all generated files\n\

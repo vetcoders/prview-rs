@@ -117,6 +117,17 @@ pub(crate) fn generate_ai_index(
         step
     )?;
     step += 1;
+    // Written after this index (so an `exists()` guard would always be false),
+    // but mandatory for every pack — the sanity check requires it. An agent
+    // reading the verdict needs the substrate it was computed on right next to
+    // it: which commits, which working tree, which tree each gate actually read.
+    writeln!(
+        md,
+        "{}. `00_summary/PROVENANCE.json` — what this pack judged: target/base \
+         commits, working-tree state, per-check substrate.",
+        step
+    )?;
+    step += 1;
     if dir.join("00_summary/FAILURES_SUMMARY.md").exists() {
         writeln!(
             md,
@@ -143,7 +154,7 @@ pub(crate) fn generate_ai_index(
     writeln!(md, "## Layout\n")?;
     writeln!(
         md,
-        "- `00_summary/` — run, gate, metadata, sanity, manifest."
+        "- `00_summary/` — run, gate, provenance, metadata, sanity, manifest."
     )?;
     writeln!(
         md,
