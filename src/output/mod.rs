@@ -322,49 +322,65 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     })?;
 
     let mut caveats = Vec::new();
-    // A readable `schema_version` also settles the pack's SHAPE below: from 2.1
-    // the contract has a `decision` object, and a pack that states its version
-    // is claiming that contract.
-    let schema_stated = value.get("schema_version").is_some();
     if let Some(caveat) = crate::gate::check_merge_gate_schema_field(value.get("schema_version"))
         .with_context(|| format!("merge gate artifact {}", gate_path.display()))?
     {
         caveats.push(caveat);
     }
 
-    let decision = match value.get("decision") {
-        Some(decision) if decision.is_object() => decision,
-        // Packs with no `schema_version` predate the field, and reading their
-        // root as the decision is the documented legacy read-back surface.
-        _ if !schema_stated => &value,
-        // A pack that names its schema and then omits (or mistypes) the object
-        // that schema is built around is structurally broken. Reading the root
-        // instead produced a verdict nothing in the pack stated — a
-        // re-derivation wearing a reader's clothes, which is exactly what the
-        // fail-loud contract removed. `tools/validate_merge_gate.py` rejects
-        // such a pack and the MCP adapter calls it `storage_corrupt`; the CLI
-        // must not be the one surface that shrugs.
-        _ => anyhow::bail!(
-            "merge gate artifact {} states schema_version {} but carries no `decision` object — \
-             the pack is corrupt and no verdict can be read from it",
+    // Legacy root-as-decision vs. mandatory `decision` object: one rule, shared
+    // with the MCP adapter, because the two readers answering it differently is
+    // exactly how the same pack became readable from one surface and corrupt
+    // from the other.
+    let decision = crate::gate::select_decision_object(&value).map_err(|schema| {
+        anyhow::anyhow!(
+            "merge gate artifact {} states schema_version {schema} but carries no `decision` \
+             object — the pack is corrupt and no verdict can be read from it",
             gate_path.display(),
-            value
-                .get("schema_version")
-                .and_then(Value::as_str)
-                .unwrap_or("?"),
-        ),
-    };
-    // Canonical verdict vocabulary (PV-03/04): PASS / CONDITIONAL / BLOCK. Legacy
-    // ALLOW/HOLD tokens from pre-2.1 runs are folded onto the unified set so the
-    // CLI `--json` surface speaks the same language as MERGE_GATE.json.
-    let raw_verdict = decision.get("verdict").and_then(Value::as_str);
+        )
+    })?;
+    // A decision signal present with the WRONG JSON type is not an absent one.
+    // Reading each through `as_str()` / `as_bool()` collapsed the two, and
+    // "absent" is the state this reader forgives: `merge_recommendation: 7`
+    // became "no recommendation", the fallback below then reconstructed
+    // `Approve` from `allow_merge`, and `--ci` exited 0 on a pack whose
+    // decision this reader had silently failed to read. The MCP adapter has
+    // named such a field since the unreadable-signal contract landed; the CLI
+    // half of that contract was documented but never implemented.
+    let mut unreadable = Vec::new();
+    let raw_verdict = crate::gate::readable_signal(
+        "verdict",
+        decision.get("verdict"),
+        crate::gate::JsonKind::String,
+        &mut unreadable,
+    )
+    .and_then(Value::as_str);
+    let raw_allow_merge = crate::gate::readable_signal(
+        "allow_merge",
+        decision.get("allow_merge"),
+        crate::gate::JsonKind::Boolean,
+        &mut unreadable,
+    )
+    .and_then(Value::as_bool);
+    let raw_recommendation = crate::gate::readable_signal(
+        "merge_recommendation",
+        decision.get("merge_recommendation"),
+        crate::gate::JsonKind::String,
+        &mut unreadable,
+    )
+    .and_then(Value::as_str);
     // Whether the verdict below is what the pack said or what this reader had to
     // substitute for it. A substituted verdict cannot leave the OTHER decision
     // axes reading whatever the same unreliable decision block claimed: that
     // published `verdict: "BLOCK"` beside `allow_merge: true` and an `approve`
     // recommendation, breaking the `allow_merge == (verdict == "PASS")`
-    // invariant and letting `compute_exit_code` exit 0 on a BLOCK.
-    let mut normalized_to_block = false;
+    // invariant and letting `compute_exit_code` exit 0 on a BLOCK. An ignored
+    // signal anywhere in the block earns the same treatment: a decision derived
+    // from a partly unread block is not a decision this reader may publish as
+    // permissive.
+    let mut normalized_to_block = !unreadable.is_empty();
+    let verdict_is_mistyped = decision.get("verdict").is_some() && raw_verdict.is_none();
+    caveats.append(&mut unreadable);
     let verdict = match raw_verdict {
         Some("PASS") | Some("ALLOW") => "PASS",
         Some("CONDITIONAL") | Some("HOLD") => "CONDITIONAL",
@@ -381,11 +397,17 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
             "BLOCK"
         }
         None => {
-            caveats.push(
-                "unknown_verdict: MERGE_GATE.json decision carries no `verdict`; \
-                 normalized to BLOCK"
-                    .to_string(),
-            );
+            // A verdict that IS there but could not be typed has already been
+            // named by its `unreadable_verdict:` caveat; saying the decision
+            // "carries no verdict" on top of that would be a second, false
+            // claim about the same field.
+            if !verdict_is_mistyped {
+                caveats.push(
+                    "unknown_verdict: MERGE_GATE.json decision carries no `verdict`; \
+                     normalized to BLOCK"
+                        .to_string(),
+                );
+            }
             normalized_to_block = true;
             "BLOCK"
         }
@@ -397,11 +419,7 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         .and_then(Value::as_str)
         .map(|s| s.to_string());
 
-    let allow_merge = !normalized_to_block
-        && decision
-            .get("allow_merge")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+    let allow_merge = !normalized_to_block && raw_allow_merge.unwrap_or(false);
     let quality_pass = decision
         .get("quality_pass")
         .and_then(Value::as_bool)
@@ -420,7 +438,7 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         // substituted, not the recommendation printed beside the unreadable one.
         crate::policy::engine::MergeRecommendation::Block
     } else {
-        match decision.get("merge_recommendation").and_then(Value::as_str) {
+        match raw_recommendation {
             Some("approve") => crate::policy::engine::MergeRecommendation::Approve,
             Some("review_required") => crate::policy::engine::MergeRecommendation::ReviewRequired,
             _ if allow_merge => crate::policy::engine::MergeRecommendation::Approve,
@@ -2010,6 +2028,140 @@ api-router/app/core/cache.py
             compute_exit_code(&cli, false),
             1,
             "a BLOCK verdict must not exit 0"
+        );
+    }
+
+    #[test]
+    fn a_mistyped_recommendation_is_not_read_as_an_absent_one() {
+        // `merge_recommendation: 7` collapsed through `as_str()` into "no
+        // recommendation", and the fallback then RECONSTRUCTED `Approve` from
+        // `allow_merge` — so a pack carrying a signal this reader could not
+        // read reported success, silently, and `--ci` exited 0. The documented
+        // contract says a mistyped signal normalizes conservatively and is
+        // reported; only the MCP surface actually did that.
+        let pack = pack_with_gate(
+            r#"{"verdict":"PASS","merge_recommendation":7,
+                "allow_merge":true,"quality_pass":true,
+                "analysis_status":"complete"}"#,
+        );
+
+        let summary = read_merge_gate_summary(pack.path()).expect("pack stays readable");
+        assert!(
+            summary
+                .caveats
+                .iter()
+                .any(|c| c.starts_with("unreadable_merge_recommendation:")),
+            "an ignored signal must be named: {:?}",
+            summary.caveats
+        );
+        assert_eq!(
+            summary.merge_recommendation,
+            crate::policy::engine::MergeRecommendation::Block,
+            "an unreadable signal cannot leave a permissive recommendation: {summary:?}"
+        );
+        assert!(
+            !summary.allow_merge,
+            "an unreadable signal cannot leave allow_merge: {summary:?}"
+        );
+
+        let config = test_config();
+        let report = Report {
+            target: "feature/mistyped-recommendation".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![],
+            heuristics: None,
+            artifacts_dir: pack.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: false,
+        };
+        let cli = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
+        assert_eq!(
+            compute_exit_code(&cli, false),
+            1,
+            "a pack with an unreadable decision signal must not exit 0"
+        );
+    }
+
+    #[test]
+    fn a_mistyped_allow_merge_is_named_not_silently_defaulted() {
+        // `allow_merge: "false"` already defaulted to `false`, which is the safe
+        // direction — but silently. The reader ignored a field and reported a
+        // clean read, which is the same contract breach in a quieter costume.
+        let pack = pack_with_gate(
+            r#"{"verdict":"PASS","merge_recommendation":"approve",
+                "allow_merge":"true","quality_pass":true,
+                "analysis_status":"complete"}"#,
+        );
+
+        let summary = read_merge_gate_summary(pack.path()).expect("pack stays readable");
+        assert!(
+            summary
+                .caveats
+                .iter()
+                .any(|c| c.starts_with("unreadable_allow_merge:")),
+            "an ignored signal must be named: {:?}",
+            summary.caveats
+        );
+        assert!(!summary.allow_merge, "{summary:?}");
+        assert_eq!(
+            summary.merge_recommendation,
+            crate::policy::engine::MergeRecommendation::Block,
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn a_mistyped_verdict_says_so_instead_of_claiming_none_was_present() {
+        // The `None` arm's message ("carries no `verdict`") is a lie for a
+        // verdict that IS present and merely untypable.
+        let pack = pack_with_gate(
+            r#"{"verdict":7,"merge_recommendation":"approve",
+                "allow_merge":true,"quality_pass":true}"#,
+        );
+
+        let summary = read_merge_gate_summary(pack.path()).expect("pack stays readable");
+        assert_eq!(summary.verdict, "BLOCK");
+        assert!(
+            summary
+                .caveats
+                .iter()
+                .any(|c| c.starts_with("unreadable_verdict:")),
+            "the mistyped verdict must be named: {:?}",
+            summary.caveats
+        );
+        assert!(
+            !summary
+                .caveats
+                .iter()
+                .any(|c| c.contains("carries no `verdict`")),
+            "a present-but-untypable verdict is not an absent one: {:?}",
+            summary.caveats
+        );
+    }
+
+    #[test]
+    fn a_well_typed_pack_gains_no_unreadable_caveats() {
+        // Guard against over-reach: the conservative path must fire on
+        // mistyped signals only, never on an ordinary pack.
+        let pack = pack_with_gate(
+            r#"{"verdict":"PASS","merge_recommendation":"approve",
+                "allow_merge":true,"quality_pass":true,
+                "analysis_status":"complete"}"#,
+        );
+
+        let summary = read_merge_gate_summary(pack.path()).expect("pack stays readable");
+        assert_eq!(summary.verdict, "PASS");
+        assert!(summary.allow_merge, "{summary:?}");
+        assert_eq!(
+            summary.merge_recommendation,
+            crate::policy::engine::MergeRecommendation::Approve,
+            "{summary:?}"
+        );
+        assert!(
+            !summary.caveats.iter().any(|c| c.starts_with("unreadable_")),
+            "a well-typed pack carries no unreadable caveats: {:?}",
+            summary.caveats
         );
     }
 

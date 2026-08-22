@@ -127,6 +127,98 @@ pub fn check_merge_gate_schema_field(field: Option<&serde_json::Value>) -> Resul
     }
 }
 
+/// JSON type a decision signal is expected to carry.
+#[derive(Clone, Copy)]
+pub enum JsonKind {
+    String,
+    Boolean,
+}
+
+impl JsonKind {
+    fn matches(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Boolean => value.is_boolean(),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::String => "a string",
+            Self::Boolean => "a boolean",
+        }
+    }
+}
+
+/// Human-readable JSON type name, for saying what was found instead.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// A decision signal, or `None` plus a caveat when it is present with the wrong
+/// JSON type.
+///
+/// Absence is the one state a reader accepts in silence — it is the documented
+/// shape of an older pack. A field that IS there but cannot be typed is a
+/// different thing entirely, and collapsing the two through `as_str()` lets a
+/// reader ignore a signal while reporting a clean passthrough.
+///
+/// Shared by both readers on purpose: the CLI and the MCP adapter answer the
+/// same contract question about the same artifact, and the one that had this
+/// rule while the other did not is how `merge_recommendation: 7` came back as
+/// `storage_corrupt` from one surface and as `approve` from the other.
+pub fn readable_signal<'v>(
+    field: &str,
+    value: Option<&'v serde_json::Value>,
+    want: JsonKind,
+    caveats: &mut Vec<String>,
+) -> Option<&'v serde_json::Value> {
+    let present = value?;
+    if want.matches(present) {
+        return Some(present);
+    }
+    caveats.push(format!(
+        "unreadable_{field}: MERGE_GATE.json {field} is {}, not {}; it was ignored when deriving \
+         this decision",
+        json_type_name(present),
+        want.label()
+    ));
+    None
+}
+
+/// Select the object a gate pack's decision is read from.
+///
+/// Two documented shapes, and the rule that separates them is the presence of
+/// `schema_version`, not the presence of `decision`:
+///
+/// * no `schema_version` — a pack predating the field. Its ROOT is the decision;
+///   this is the legacy read-back surface every reader keeps.
+/// * `schema_version` stated — the `decision` object that schema is built around
+///   is mandatory. Falling back to the root there would publish a verdict
+///   nothing in the pack stated, which is a re-derivation wearing a reader's
+///   clothes. `tools/validate_merge_gate.py` requires `decision` at every
+///   version, so a reader that shrugs disagrees with the contract validator.
+///
+/// `Err` carries the schema string for the caller to put in its own message.
+pub fn select_decision_object(value: &serde_json::Value) -> Result<&serde_json::Value, String> {
+    match value.get("decision") {
+        Some(decision) if decision.is_object() => Ok(decision),
+        _ if value.get("schema_version").is_none() => Ok(value),
+        _ => Err(value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .to_string()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GateVerdict {
     #[serde(rename = "PASS")]

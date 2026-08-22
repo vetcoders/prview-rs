@@ -177,7 +177,11 @@ schema is built around. A missing or non-object `decision` there is a corrupt
 artifact, not a normalization: the CLI exits `3` and the MCP adapter returns
 `storage_corrupt`, matching `tools/validate_merge_gate.py`, which requires
 `decision` at every version. Only a pack with NO `schema_version` keeps the
-legacy tolerance of reading its root as the decision.
+legacy tolerance of reading its root as the decision — and that tolerance is
+whole: a legacy pack shaped `{"verdict": "ALLOW", "allow_merge": true}` is read
+by BOTH readers, not accepted by one and called corrupt by the other. The rule
+lives in one place (`gate::select_decision_object`) so the two surfaces cannot
+answer it differently again.
 
 A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
 never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with
@@ -198,10 +202,16 @@ requires every `quality_failure_details` entry to carry an `origin` of exactly
 if a pack may omit or mistype it.
 
 A decision signal present with the wrong JSON type (`merge_recommendation: 7`,
-`allow_merge: "false"`) is not the same as an absent one. The MCP adapter names
-it with an `unreadable_<field>:` caveat and sets `normalized: true`; the CLI
-falls back to its conservative default (`BLOCK` / no merge) and reports the
-normalization.
+`allow_merge: "false"`) is not the same as an absent one. Absence is the state a
+reader forgives, because it is the shape of an older pack; a field that is there
+and cannot be typed is a field the reader FAILED to read, and saying nothing
+about it publishes a confidence the read does not have. Both readers name it
+with an `unreadable_<field>:` caveat — `verdict`, `merge_recommendation` and
+`allow_merge`. The MCP adapter additionally sets `normalized: true`; the CLI
+forces every decision axis conservative (`verdict: "BLOCK"`,
+`allow_merge: false`, `merge_recommendation: block`, and therefore `--ci`
+exit `1`), because a decision derived from a block this reader only partly read
+is not one it may publish as an approval.
 
 ## Blocking rules
 

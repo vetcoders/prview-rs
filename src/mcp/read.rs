@@ -4,6 +4,7 @@
 //! (`~/.prview/`) or a run's artifact pack. No review logic lives here — the
 //! MCP surface only reads truth the core already wrote.
 
+use crate::gate::{JsonKind, readable_signal};
 use crate::mcp::types::{ToolError, error_class};
 use crate::storage::{RunEntry, RunIndex};
 use std::path::{Path, PathBuf};
@@ -676,67 +677,6 @@ fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// JSON type a decision signal is expected to carry.
-#[derive(Clone, Copy)]
-enum JsonKind {
-    String,
-    Boolean,
-}
-
-impl JsonKind {
-    fn matches(self, value: &serde_json::Value) -> bool {
-        match self {
-            Self::String => value.is_string(),
-            Self::Boolean => value.is_boolean(),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::String => "a string",
-            Self::Boolean => "a boolean",
-        }
-    }
-}
-
-/// Human-readable JSON type name, for saying what was found instead.
-fn json_type_name(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
-    }
-}
-
-/// A decision signal, or `None` plus a caveat when it is present with the wrong
-/// JSON type.
-///
-/// Absence is the one state the adapter accepts in silence — it is the
-/// documented shape of an older pack. A field that IS there but cannot be typed
-/// is a different thing entirely, and collapsing the two through `as_str()` let
-/// the reader ignore a signal while reporting a clean passthrough.
-fn readable_signal<'v>(
-    field: &str,
-    value: Option<&'v serde_json::Value>,
-    want: JsonKind,
-    caveats: &mut Vec<String>,
-) -> Option<&'v serde_json::Value> {
-    let present = value?;
-    if want.matches(present) {
-        return Some(present);
-    }
-    caveats.push(format!(
-        "unreadable_{field}: MERGE_GATE.json {field} is {}, not {}; it was ignored when deriving \
-         this decision",
-        json_type_name(present),
-        want.label()
-    ));
-    None
-}
-
 /// Read and normalize a run's merge decision (R1). Missing/invalid
 /// `MERGE_GATE.json` is a fail-loud `storage_corrupt`, never a silent default.
 pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
@@ -760,10 +700,17 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     let schema_caveat = crate::gate::check_merge_gate_schema_field(value.get("schema_version"))
         .map_err(|e| ToolError::new(error_class::STORAGE_CORRUPT, e.to_string()))?;
 
-    let decision = value.get("decision").ok_or_else(|| {
+    // A pack with no `schema_version` predates the field and its ROOT is the
+    // decision — the same legacy tolerance the CLI reader and the contract keep.
+    // Demanding a nested `decision` at every version made the one shape the
+    // contract explicitly tolerates come back `storage_corrupt` from this
+    // surface while the CLI read it fine.
+    let decision = crate::gate::select_decision_object(&value).map_err(|schema| {
         ToolError::new(
             error_class::STORAGE_CORRUPT,
-            "MERGE_GATE.json missing `decision` object",
+            format!(
+                "MERGE_GATE.json states schema_version {schema} but carries no `decision` object"
+            ),
         )
     })?;
 
@@ -1217,6 +1164,49 @@ mod tests {
                 "{} for {bad}",
                 err.message
             );
+        }
+    }
+
+    #[test]
+    fn a_legacy_root_shaped_pack_is_read_not_called_corrupt() {
+        // A pack with no `schema_version` predates the field, and reading its
+        // ROOT as the decision is the documented legacy read-back surface — the
+        // CLI reader and `docs/contracts/merge_gate.md` both keep it. This
+        // adapter demanded a nested `decision` object at every version, so the
+        // one pack shape the contract explicitly tolerates came back
+        // `storage_corrupt`.
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({ "verdict": "ALLOW", "allow_merge": true }),
+        );
+
+        let d = read_decision(dir.path()).expect("a legacy root-shaped pack is readable");
+        assert_eq!(d.verdict, "PASS");
+        assert!(d.allow_merge, "{d:?}");
+    }
+
+    #[test]
+    fn a_versioned_pack_without_a_decision_object_stays_corrupt() {
+        // The other half of the same rule: once a pack names its schema, the
+        // object that schema is built around is mandatory. Reading the root
+        // there would publish a verdict nothing in the pack stated.
+        for decision in [None, Some(serde_json::json!("PASS"))] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gate = serde_json::json!({
+                "schema_version": "2.2",
+                "verdict": "ALLOW",
+                "allow_merge": true
+            });
+            if let Some(decision) = decision.clone() {
+                gate["decision"] = decision;
+            }
+            write_gate(dir.path(), &gate);
+
+            let err = read_decision(dir.path())
+                .expect_err("a versioned pack with no decision object is corrupt");
+            assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+            assert!(err.message.contains("decision"), "{}", err.message);
         }
     }
 

@@ -240,6 +240,19 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_string_holding_a_quote_and_a_slash_slash_stays_one_literal() {
+        // The reason comments and literals are resolved in ONE pass: a
+        // comment-stripping pass that only knows `"…"` sees the interior quote
+        // of `r#"a " b // c"#` as closing the string, then reads the `//` as a
+        // real comment and truncates the line — dropping the `{` after it and
+        // corrupting the depth for both the perf and module-scope trackers.
+        assert_eq!(code_only("let s = r#\"a \" b // c\"#; {"), "let s = ; {");
+        assert_eq!(code_only("let b = br##\"x \" // y\"##; }"), "let b = ; }");
+        // A `//` genuinely after the literal still ends the code.
+        assert_eq!(code_only("let s = r#\"a\"#; // trailing {"), "let s = ; ");
+    }
+
+    #[test]
     fn block_comments_are_not_code() {
         assert_eq!(code_only("let a = 5 /* } */ ;"), "let a = 5  ;");
         // Rust block comments nest.

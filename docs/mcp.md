@@ -222,7 +222,12 @@ case sets `normalized: true`:
   known MAJOR; it is read, and fields this build does not know are ignored. An
   unknown MAJOR is `storage_corrupt`, and so is a `schema_version` that is
   present but not a `MAJOR.MINOR` string. A pack with no `schema_version` at all
-  is pre-2.1 and is accepted silently, like the `ALLOW`/`HOLD` tokens.
+  is pre-2.1 and is accepted silently, like the `ALLOW`/`HOLD` tokens — including
+  the pre-2.1 shape that carries its signals at the root instead of under
+  `decision`. A pack that STATES a `schema_version` and still has no `decision`
+  object is `storage_corrupt`. Both readers apply that rule from one place
+  (`gate::select_decision_object`), so a pack the CLI reads is never one the MCP
+  adapter calls corrupt.
 
 Completed response:
 
