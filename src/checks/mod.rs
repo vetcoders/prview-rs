@@ -599,8 +599,24 @@ fn load_cached_result(check: &dyn Check, config: &Config, cache: &Cache) -> Opti
         duration: Duration::from_secs(0),
         output,
         cached: true,
-        provenance: None,
+        provenance: replayed_provenance(cached.provenance.as_deref()),
     })
+}
+
+/// Rebuild the provenance a cache hit is replaying.
+///
+/// The fastest runs are the cache hits, and they used to be the only ones with
+/// no provenance at all — the audit trail went blank exactly where it was
+/// cheapest to keep. The stored blob describes the ORIGINAL execution
+/// (`started_at`/`finished_at`, `cwd`, `target_sha`, `tree_state` of the run
+/// that populated the entry); `CheckResult::cached` is what marks the row as a
+/// replay rather than a fresh execution.
+///
+/// Unreadable or absent blobs resolve to `None`: an entry written by an older
+/// prview (no sidecar) or one whose schema has since changed replays with an
+/// unknown provenance instead of panicking or failing the run.
+fn replayed_provenance(stored: Option<&str>) -> Option<CheckProvenance> {
+    serde_json::from_str(stored?).ok()
 }
 
 async fn execute_live_check(check: Box<dyn Check>, config: &Config, cache: &Cache) -> CheckResult {
@@ -625,9 +641,23 @@ async fn execute_live_check(check: Box<dyn Check>, config: &Config, cache: &Cach
             // the tool present still reports Skipped (PR #12 review #14).
             if result.status != CheckStatus::Skipped
                 && let Some(key) = cache_key
-                && let Err(e) = cache.set(&name, &key, result.status.as_str(), Some(&result.output))
             {
-                eprintln!("  warning: cache write failed for {name}: {e}");
+                // Store the provenance next to the result so a later cache hit
+                // can replay it. Serialization is best effort: a provenance that
+                // cannot be encoded must never cost us the cached result itself.
+                let provenance = result
+                    .provenance
+                    .as_ref()
+                    .and_then(|prov| serde_json::to_string(prov).ok());
+                if let Err(e) = cache.set(
+                    &name,
+                    &key,
+                    result.status.as_str(),
+                    Some(&result.output),
+                    provenance.as_deref(),
+                ) {
+                    eprintln!("  warning: cache write failed for {name}: {e}");
+                }
             }
 
             result
@@ -2036,5 +2066,85 @@ test result: ok. 2 passed; 0 failed
             cache2.get("Mock", "mock-key").is_some(),
             "a Passed result must still be cached"
         );
+    }
+
+    #[tokio::test]
+    async fn cache_hit_replays_the_provenance_of_the_run_that_filled_it() {
+        // Two passes over the dispatcher's own path: pass 1 executes the check
+        // and writes the cache entry, pass 2 is served from cache. The cached
+        // pass used to return `provenance: None`, so the FASTEST runs were the
+        // ones with no audit trail at all.
+        use async_trait::async_trait;
+
+        struct MockCheck;
+
+        #[async_trait]
+        impl Check for MockCheck {
+            fn name(&self) -> &str {
+                "Mock"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                Ok(CheckResult {
+                    name: "Mock".to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_secs(0),
+                    output: "ok".to_string(),
+                    cached: false,
+                    provenance: Some(CheckProvenance {
+                        command: "mock --run".to_string(),
+                        tool_version: Some("1.2.3".to_string()),
+                        cwd: "[external]/snapshot".to_string(),
+                        target_sha: Some("cafebabe".to_string()),
+                        tree_state: Some(TreeState::Snapshot),
+                        exit_code: Some(0),
+                        started_at: "2026-08-22T10:00:00+02:00".to_string(),
+                        finished_at: "2026-08-22T10:00:01+02:00".to_string(),
+                        hard_fail_signatures: vec![],
+                        cache_key: Some("mock-key".to_string()),
+                    }),
+                })
+            }
+            fn cache_key(&self, _config: &Config) -> Option<String> {
+                Some("mock-key".to_string())
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = rust_config(true, true, true);
+        let cache = Cache::with_dir(tmp.path().to_path_buf(), true);
+
+        // Pass 1 — live execution, fills the cache.
+        let live = execute_live_check(Box::new(MockCheck), &config, &cache).await;
+        assert!(!live.cached);
+        let live_prov = live.provenance.expect("live run must carry provenance");
+
+        // Pass 2 — served from cache.
+        let hit = load_cached_result(&MockCheck, &config, &cache)
+            .expect("second pass must hit the cache");
+        assert!(hit.cached, "a replay must announce itself as cached");
+        let hit_prov = hit
+            .provenance
+            .expect("a cache hit must carry the provenance of the run that filled it");
+
+        assert_eq!(hit_prov.command, live_prov.command);
+        assert_eq!(hit_prov.cwd, live_prov.cwd);
+        assert_eq!(hit_prov.target_sha, live_prov.target_sha);
+        assert_eq!(hit_prov.tree_state, live_prov.tree_state);
+        assert_eq!(hit_prov.started_at, live_prov.started_at);
+        assert_eq!(hit_prov.exit_code, live_prov.exit_code);
+        assert_eq!(hit_prov.cache_key, live_prov.cache_key);
+    }
+
+    #[test]
+    fn legacy_cache_entry_without_provenance_replays_without_panicking() {
+        // Entries written by an older prview have no provenance sidecar, and a
+        // schema drift can leave one unparseable. Both must degrade to "unknown
+        // provenance", never to a failed run.
+        assert!(replayed_provenance(None).is_none());
+        assert!(replayed_provenance(Some("{ not json")).is_none());
+        assert!(replayed_provenance(Some(r#"{"unrelated":true}"#)).is_none());
     }
 }

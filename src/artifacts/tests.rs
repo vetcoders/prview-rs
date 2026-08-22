@@ -4903,3 +4903,147 @@ Trailing <script>alert('xss')</script> injection.
     );
     assert!(!html.contains("alert('xss')"), "script body leaked");
 }
+
+// ── 00_summary/PROVENANCE.json ─────────────────────────────────────────────
+
+fn provenance_fixture_repo() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_git_fixture(tmp.path(), &["init", "-q", "-b", "main"]);
+    let head = write_commit_fixture(tmp.path(), "own.rs", "pub fn own() -> u8 { 1 }\n");
+    (tmp, head)
+}
+
+fn provenance_check(name: &str, cached: bool, provenance: Option<CheckProvenance>) -> CheckResult {
+    CheckResult {
+        name: name.to_string(),
+        status: CheckStatus::Passed,
+        duration: Duration::from_secs(1),
+        output: String::new(),
+        cached,
+        provenance,
+    }
+}
+
+fn snapshot_provenance(target_sha: &str) -> CheckProvenance {
+    CheckProvenance {
+        command: "cargo check".to_string(),
+        tool_version: None,
+        cwd: "[external]/snapshot".to_string(),
+        target_sha: Some(target_sha.to_string()),
+        tree_state: Some(crate::checks::TreeState::Snapshot),
+        exit_code: Some(0),
+        started_at: "2026-08-22T10:00:00+02:00".to_string(),
+        finished_at: "2026-08-22T10:00:01+02:00".to_string(),
+        hard_fail_signatures: vec![],
+        cache_key: Some("commit-deadbeef".to_string()),
+    }
+}
+
+fn write_provenance_fixture(
+    repo_root: &Path,
+    out: &Path,
+    checks: &[CheckResult],
+) -> serde_json::Value {
+    let repo = Repository::open(repo_root).expect("open repo");
+    let worktree = capture_worktree_provenance(repo_root);
+    let resolved_target = ResolvedRef {
+        name: "feature/provenance".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let resolved_bases = vec![ResolvedRef {
+        name: "origin/main".to_string(),
+        commit_id: "def5678def5678def5678def5678def5678de".to_string(),
+        is_remote: true,
+    }];
+
+    generate_provenance_json(ProvenanceJsonInput {
+        dir: out,
+        repo: &repo,
+        checks,
+        resolved_target: &resolved_target,
+        resolved_bases: &resolved_bases,
+        worktree_clean: worktree.clean,
+        worktree_status_digest: worktree.status_digest.as_deref(),
+    })
+    .expect("generate_provenance_json");
+
+    serde_json::from_str(
+        &fs::read_to_string(out.join("PROVENANCE.json")).expect("read PROVENANCE.json"),
+    )
+    .expect("parse PROVENANCE.json")
+}
+
+#[test]
+fn provenance_json_records_pack_level_substrate() {
+    let (repo_tmp, head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let checks = [
+        provenance_check("Cargo check", false, Some(snapshot_provenance("abc1234"))),
+        // A cache hit replays the ORIGINAL execution's provenance; only the
+        // cached flag separates it from a fresh run.
+        provenance_check("Clippy", true, Some(snapshot_provenance("abc1234"))),
+        // A check with no provenance at all must still appear, with nulls —
+        // silence about a gate is exactly what this file exists to prevent.
+        provenance_check("heuristics_loctree", false, None),
+    ];
+
+    let json = write_provenance_fixture(repo_tmp.path(), out.path(), &checks);
+
+    assert_eq!(json["schema_version"], "1.0");
+    assert_eq!(json["target_sha"], "abc1234abc1234abc1234abc1234abc1234ab");
+    assert_eq!(json["base_sha"], "def5678def5678def5678def5678def5678de");
+    assert_eq!(json["head_sha"], head);
+    assert_eq!(json["worktree"]["clean"], true);
+    assert!(
+        json["worktree"]["status_digest"]
+            .as_str()
+            .expect("digest")
+            .starts_with("sha256:"),
+        "clean tree must still carry a digest of its (empty) status"
+    );
+
+    let rows = json["checks"].as_array().expect("checks array");
+    assert_eq!(rows.len(), 3, "every check gets a row");
+
+    let cargo = &rows[0];
+    assert_eq!(cargo["id"], check_id_from_name("Cargo check"));
+    assert_eq!(cargo["cwd"], "[external]/snapshot");
+    assert_eq!(cargo["target_sha"], "abc1234");
+    assert_eq!(cargo["tree_state"], "snapshot");
+    assert_eq!(cargo["started_at"], "2026-08-22T10:00:00+02:00");
+    assert_eq!(cargo["cached"], false);
+
+    let clippy = &rows[1];
+    assert_eq!(clippy["cached"], true);
+    assert_eq!(
+        clippy["tree_state"], "snapshot",
+        "a cache hit must carry the substrate it was produced on"
+    );
+
+    let heuristics = &rows[2];
+    assert!(heuristics["cwd"].is_null());
+    assert!(heuristics["tree_state"].is_null());
+}
+
+#[test]
+fn provenance_json_worktree_reflects_dirty_tree() {
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let clean = write_provenance_fixture(repo_tmp.path(), out.path(), &[]);
+    assert_eq!(clean["worktree"]["clean"], true);
+
+    fs::write(repo_tmp.path().join("uncommitted.rs"), "pub fn oops() {}\n").expect("dirty file");
+
+    let dirty = write_provenance_fixture(repo_tmp.path(), out.path(), &[]);
+    assert_eq!(
+        dirty["worktree"]["clean"], false,
+        "an untracked file makes the tree dirty"
+    );
+    assert_ne!(
+        dirty["worktree"]["status_digest"], clean["worktree"]["status_digest"],
+        "the digest must fingerprint WHAT is dirty, not just that something is"
+    );
+}

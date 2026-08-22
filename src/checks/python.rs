@@ -569,6 +569,81 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    /// Cache keys must follow the SUBSTRATE, not the local working tree.
+    ///
+    /// The cached-result lookup runs before the shared target snapshot exists,
+    /// so a key derived from the local tree would let a `--pr` run hit the entry
+    /// a previous local run stored — serving the local checkout's verdict as the
+    /// reviewed commit's. The snapshot-backed language checks key on the target
+    /// commit id whenever it differs from `HEAD`; this locks that in.
+    #[test]
+    fn language_cache_keys_do_not_share_entries_across_substrates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_path = tmp.path();
+        run_git(repo_path, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repo_path.join("pyproject.toml"),
+            "[project]\nname = \"test\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        run_git(repo_path, &["add", "pyproject.toml"]);
+        let first = write_commit(repo_path, "main.py", "def hello():\n    pass\n");
+        let second = write_commit(
+            repo_path,
+            "main.py",
+            "import os\n\ndef hello():\n    pass\n",
+        );
+
+        let config_for = |target: Option<&str>| {
+            let mut builder = test_config_builder()
+                .profile(test_python_profile(true))
+                .run_lint(true)
+                .run_tests(true)
+                .do_fetch(false)
+                .repo_root(repo_path.to_path_buf());
+            if let Some(target) = target {
+                builder = builder.target(Some(target));
+            }
+            builder.build()
+        };
+
+        // HEAD sits on `second`; a local review keys on the local tree hash.
+        let local_key = RuffCheck
+            .cache_key(&config_for(None))
+            .expect("local cache key");
+
+        // Same checkout, but the reviewed target is an older commit: the check
+        // will scan a snapshot of `first`, so its key must name `first`.
+        let off_head_key = RuffCheck
+            .cache_key(&config_for(Some(first.as_str())))
+            .expect("off-HEAD cache key");
+
+        assert!(
+            off_head_key.contains(&first),
+            "an off-HEAD key must name the analysed commit, got {off_head_key}"
+        );
+        assert_ne!(
+            local_key, off_head_key,
+            "a local run and a run on a fetched target must never share a cache entry"
+        );
+        assert!(
+            !local_key.contains(&second),
+            "a local review keys on the working tree, which HEAD alone does not describe"
+        );
+
+        // Two different targets must not collide with each other either.
+        let other_target_key = RuffCheck
+            .cache_key(&config_for(Some(second.as_str())))
+            .expect("second-target cache key");
+        assert_ne!(off_head_key, other_target_key);
+
+        // Mypy shares the shape; guard it too so the pair cannot drift apart.
+        assert_ne!(
+            MypyCheck.cache_key(&config_for(None)),
+            MypyCheck.cache_key(&config_for(Some(first.as_str()))),
+        );
+    }
+
     #[tokio::test]
     async fn test_ruff_runs_on_fetched_target_in_remote_mode() {
         if which::which("ruff").is_err() && which::which("uv").is_err() {

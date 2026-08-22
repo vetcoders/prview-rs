@@ -355,6 +355,7 @@ $HOME/.prview/runs/my-repo/feature-x/20260225-185357/
 
 ├── 00_summary/
 │   ├── RUN.json             # Run metadata, execution mode, check inventory
+│   ├── PROVENANCE.json      # What was analysed: base/head/target SHAs, worktree state, per-check substrate
 │   ├── FAILURES_SUMMARY.md  # Compact blocking failures without raw dumps
 │   ├── MANIFEST.json        # SHA256 hashes for generated files
 │   ├── SANITY.json          # Integrity validation results
@@ -408,6 +409,10 @@ When a generator produces no file, the CLI prints an `i` note explaining why.
 #### How to read an artifact pack
 
 - `00_summary/MERGE_GATE.json` is the canonical source of check statuses.
+- `00_summary/PROVENANCE.json` answers *what was judged*: the target/base/head commits, whether the local
+  working tree was clean when the run started (plus a digest fingerprinting what was dirty), and, per check,
+  the directory and commit it actually read. A `cached: true` row replays the provenance of the earlier run
+  that filled the cache entry.
 - `PR_REVIEW.md` is a concise review narrative, not a raw log dump.
 - `00_summary/FAILURES_SUMMARY.md` summarizes blocking failures and advisories without copying whole JSON files.
 - When `30_context/INLINE_FINDINGS.sarif` exists, it emits findings per location/advisory and is suitable for annotation integrations.

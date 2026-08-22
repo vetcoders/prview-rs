@@ -254,8 +254,8 @@ run stored under a working-tree hash and serve the local checkout's verdict.
 
 #### Check provenance
 
-Every non-cached check records a `CheckProvenance` alongside its result:
-`command`, `tool_version`, `cwd`, `exit_code`, `started_at`/`finished_at`,
+Every check records a `CheckProvenance` alongside its result: `command`,
+`tool_version`, `cwd`, `exit_code`, `started_at`/`finished_at`,
 `hard_fail_signatures`, `cache_key`, plus the substrate it read:
 
 - `target_sha` — commit whose tree the check scanned (the snapshot's detached
@@ -271,7 +271,51 @@ runs is reflected in its provenance without per-check bookkeeping. Both are
 optional and additive: they are absent from packs generated before they existed,
 and when the scan directory is not inside a git repository. They surface in
 `20_quality/<gate>.result.json`, `20_quality/full-checks.log`,
-`00_summary/RUN.json` (`checks[]`) and `report.json` (`checks[]`).
+`00_summary/RUN.json` (`checks[]`), `00_summary/PROVENANCE.json` and
+`report.json` (`checks[]`).
+
+**Cache hits carry provenance too.** When a check result is cached, its
+provenance is serialized next to the entry (`<key>.prov.json` under the check's
+cache directory) and replayed on the next hit. The replayed record describes the
+run that *populated* the entry — its `cwd`, `started_at`, `target_sha` and
+`tree_state` — and `cached: true` on the result is what marks it as a replay
+rather than a fresh execution. Without this the fastest runs (all-cache-hit)
+were the only ones with no audit trail at all. Entries written before the
+sidecar existed, or whose blob no longer parses, replay with no provenance
+instead of failing the run.
+
+#### Pack-level provenance — `00_summary/PROVENANCE.json`
+
+The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
+"what did *this pack* judge", once, for a reviewer holding only the artifacts:
+
+- `target_sha` — commit whose tree the pack judges;
+- `base_sha` — first resolved diff baseline;
+- `head_sha` — commit checked out locally (equal to `target_sha` for an ordinary
+  local review, different under `--pr`/`--remote`);
+- `worktree.clean` — whether the local tree had uncommitted changes, frozen
+  **before** any check ran or artifact was written (R4-19);
+- `worktree.status_digest` — `sha256:<hex>` over a canonical `XY <path>`
+  rendering of the working-tree status, from the *same* read as `clean`, so two
+  differently-dirty runs are distinguishable. It is a stable fingerprint, not a
+  capture of a specific `git status --porcelain` stdout;
+- `checks[]` — one row per check: `{id, cwd, target_sha, tree_state, started_at,
+  cached}`, with `null` fields for a check that produced no provenance.
+
+The file is purely additive: no other pack file changed shape for it. It is
+hashed by `MANIFEST.json` like any other artifact and listed in the sanity
+`required_files` check.
+
+#### Known limitation (deferred to 0.8)
+
+Provenance is an **observation a check writes**, not a constraint the type
+system enforces. The `Check` trait still hands each implementation a `&Config`
+and trusts it to resolve its own directory and record what it read; nothing
+prevents a new check from running somewhere and reporting something else, or
+from returning no provenance at all. Making the substrate a *parameter* — a
+`CheckContext` carrying the resolved scan dir and substrate, with `run()` unable
+to look elsewhere — is the 0.8 cut. Until then the guarantee is "every check
+reports where it ran", not "no check can run anywhere else".
 
 ### mcp/
 
@@ -287,7 +331,7 @@ The core artifact generator. Builds the numbered directory layout
 (`00_summary/`, `10_diff/`, `20_quality/`, `30_context/`):
 
 - Root: `PR_REVIEW.md`, `dashboard.html`, `artifacts.zip`
-- `00_summary/`: `RUN.json`, `FAILURES_SUMMARY.md`, `MANIFEST.json`, `SANITY.json`, `MERGE_GATE.json/md`, metadata
+- `00_summary/`: `RUN.json`, `PROVENANCE.json`, `FAILURES_SUMMARY.md`, `MANIFEST.json`, `SANITY.json`, `MERGE_GATE.json/md`, metadata
 - `10_diff/`: `full.patch`, `per-commit-diffs/` (batching + thematic labels), `per-file-diffs/` (hotspots)
 - `20_quality/`: per-check `*.result.json` + `*.log`, `full-checks.log`, `checks-errors.log`, `coverage-delta.txt`, `BREAKING_CHANGES.md`
 - `30_context/`: optional `INLINE_FINDINGS.sarif`, `changed-tests.txt`, profile-specific (`cargo-tree`, `tsc-trace`, `eslint`, `vitest`)

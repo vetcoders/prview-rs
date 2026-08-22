@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `00_summary/PROVENANCE.json` — a pack-level record of *what was analysed*,
+  next to the per-check rows that record *where each gate ran*. It carries the
+  `target_sha` the pack judges, the `base_sha` it diffed against, the `head_sha`
+  checked out locally, whether the working tree was clean when the run started
+  (frozen before any check ran) with a `sha256` digest fingerprinting what was
+  dirty, and one row per check — `{id, cwd, target_sha, tree_state, started_at,
+  cached}`. A reviewer holding only the artifacts no longer has to reconstruct
+  the run's substrate from scattered gate files. Purely additive: no existing
+  pack file changed shape, the manifest hashes it like any other artifact, and
+  the sanity `required_files` check now requires it.
 - Check provenance now records the tree each gate actually scanned: `target_sha`
   (the commit whose tree the check read) and `tree_state` (`snapshot`,
   `local-clean` or `local-dirty`). Previously `cwd` was the only substrate
@@ -26,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cached check results now carry provenance. A cache hit used to return
+  `provenance: None`, so the fastest runs — the ones where every gate is served
+  from cache — were the only ones with no audit trail at all: no command, no
+  `cwd`, no `target_sha`, no `tree_state`. The provenance is now stored beside
+  the cache entry and replayed on a hit, describing the run that populated it;
+  `cached: true` on the result is what marks the row as a replay rather than a
+  fresh execution. Entries written by an older prview simply have no stored
+  provenance and replay without it, so no cache invalidation is needed.
 - `Pytest` now runs in the reviewed target snapshot instead of `config.repo_root`.
   When reviewing a PR or a remote branch, `repo_root` still points at whatever is
   checked out locally, so pytest executed the *local* branch's tests and reported
