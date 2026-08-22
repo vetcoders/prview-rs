@@ -232,6 +232,16 @@ The Python and JS checks (`Ruff`, `Mypy`, `Pytest`, `TypeScript`, `ESLint`,
 its own — see `uses_shared_scan_dir()`. `SemgrepCheck` is the single deliberate
 opt-out: it manages its own worktree because it also needs a baseline commit.
 
+The Python checks add one step on top of that symlink. `uv run` synchronises the
+project environment before executing, so a reviewed commit whose dependencies
+differ from the local branch would install into — and remove packages from — the
+operator's active `.venv` through the snapshot symlink. `plan_python_run()`
+therefore sets `UV_PROJECT_ENVIRONMENT` to `Config::uv_env_dir()`
+(`~/.prview/uv-env/<repo>`) for off-`HEAD` runs: the reviewed dependency set is
+still installed and judged, in a prview-owned per-repo environment kept warm
+across runs. A local review sets no override and uses the checkout's own
+environment exactly as before.
+
 The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,
 `Cargo audit`, `Cargo geiger`) run in the snapshot as well, but with one extra
 step. A snapshot is a throwaway temp dir, so its in-tree `target/` would force a
@@ -246,11 +256,40 @@ single-permit semaphore (`is_cargo_target_check()`), so they never contend for
 that cache within a run; two concurrent prview runs on different commits rely on
 cargo's own build-directory locking.
 
+Which directory inside the snapshot is resolved in two steps.
+`config.profile.cargo_root` describes the LOCAL checkout, so it is mapped onto
+the same relative path inside the snapshot and then validated: if the reviewed
+branch moved the crate (a root crate pushed into `backend/`, a member renamed)
+that path does not exist there, and `reviewed_cargo_root()` falls back to the
+snapshot root when it carries a manifest of its own, rather than letting cargo
+fail on a missing directory and reporting it as the crate's verdict.
+
+A `cargo_root` configured **outside** the repository has no such mapping — a
+snapshot of this repo can never contain it. Off-`HEAD` runs then **skip** the
+cargo checks with a reason naming the unreachable root
+(`unreachable_reviewed_cargo_root()`), instead of quietly analysing the
+operator's unrelated checkout and filing the result under the reviewed commit.
+No verdict is the honest answer where a foreign tree's verdict was the bug.
+
 Cache keys follow the same substrate. Cached results are looked up **before**
 the shared snapshot exists, so cargo cache keys resolve the target commit
 directly (`off_head_target_commit()`) and key on the commit id whenever it
 differs from `HEAD` — otherwise a `--pr` run would hit an entry a previous local
-run stored under a working-tree hash and serve the local checkout's verdict.
+run stored under a working-tree hash and serve the local checkout's verdict. The
+commit is not the whole substrate, though: the same commit checked from the
+workspace root and from a configured member yields different results, so the
+repo-relative cargo root travels in the key beside it
+(`commit-<sha>-root:<path>`) — the discriminator the local hash path already
+carried.
+
+**Known limitation — submodules.** `create_worktree_snapshot()` runs
+`git worktree add` only, so gitlink directories stay empty. A Cargo workspace
+whose member or path dependency lives in a submodule therefore reports a missing
+manifest in an off-`HEAD` review, even though the reviewed commit builds in a
+checkout with its submodules initialised. Materialising them in the snapshot
+means a `git submodule update --init` per run — network-capable, unbounded, and
+writing into the superproject's module store while the operator works in it —
+so it is deliberately deferred rather than smuggled into a review path.
 
 #### Check provenance
 
@@ -260,16 +299,30 @@ Every check records a `CheckProvenance` alongside its result: `command`,
 
 - `target_sha` — commit whose tree the check scanned (the snapshot's detached
   commit, or the repo `HEAD` for an in-place scan).
-- `tree_state` — `snapshot` (ephemeral worktree of the reviewed commit),
-  `local-clean` (repo working tree, nothing uncommitted) or `local-dirty` (repo
-  working tree with uncommitted changes — the scanned bytes are **not** exactly
-  `target_sha`).
+- `tree_state` — which tree, and whether it still matches its commit:
+  - `snapshot` — ephemeral worktree **of this repository** at the reviewed
+    commit, unmodified;
+  - `snapshot-dirty` — the same worktree after the run wrote into it (a
+    generated `Cargo.lock`, a tool writing into the checkout), so the scanned
+    bytes are **not** exactly `target_sha`. The dependency symlinks prview
+    itself creates (`node_modules`, `.venv`) are excluded — they are the tool's
+    scaffolding, not a change to the reviewed tree;
+  - `local-clean` — repo working tree, nothing uncommitted;
+  - `local-dirty` — repo working tree with uncommitted changes — the scanned
+    bytes are **not** exactly `target_sha`;
+  - `foreign` — a directory that is neither this repository's working tree nor
+    one of its worktrees. Being outside `repo_root` is not proof of a snapshot,
+    and labelling a different checkout `snapshot` would certify its verdict as
+    the reviewed commit's.
 
 Both are resolved from the directory the command actually ran in, by the single
 `resolve_scan_substrate(cwd, repo_root)` helper, so a change in where a check
 runs is reflected in its provenance without per-check bookkeeping. Both are
 optional and additive: they are absent from packs generated before they existed,
-and when the scan directory is not inside a git repository. They surface in
+and when the scan directory is not inside a git repository. `tree_state` is also
+absent when the working-tree status cannot be read at all (an index lock, a
+permissions error, a malformed repository) — an unverifiable tree stays visibly
+unknown instead of being recorded as clean. They surface in
 `20_quality/<gate>.result.json`, `20_quality/full-checks.log`,
 `00_summary/RUN.json` (`checks[]`), `00_summary/PROVENANCE.json` and
 `report.json` (`checks[]`).

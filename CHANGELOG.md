@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the sanity `required_files` check now requires it.
 - Check provenance now records the tree each gate actually scanned: `target_sha`
   (the commit whose tree the check read) and `tree_state` (`snapshot`,
-  `local-clean` or `local-dirty`). Previously `cwd` was the only substrate
+  `snapshot-dirty`, `local-clean`, `local-dirty` or `foreign`). Previously `cwd`
+  was the only substrate
   signal, so an artifact pack could not prove whether a gate saw the reviewed
   commit or an operator's uncommitted working tree. Both fields are resolved
   from the directory the command ran in and surface in
@@ -69,7 +70,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lookup happens before the target snapshot is materialised, so a `--pr` run
   could hit an entry a previous local run had stored under the same working-tree
   hash and serve the local checkout's verdict as the PR's. Keys now use the
-  resolved target commit whenever it differs from `HEAD`.
+  resolved target commit whenever it differs from `HEAD`, together with the
+  repo-relative cargo root (`commit-<sha>-root:<path>`): the same commit checked
+  from the workspace root and from a configured member produces different
+  check/clippy/audit/rustfmt results, and keying on the commit alone let a later
+  run serve the other root's verdict.
+- A `cargo_root` configured outside the repository no longer makes an
+  off-`HEAD` review scan an unrelated directory. A snapshot of the repo can
+  never contain such a root, and the fallback ran cargo at the local path
+  anyway — the reviewed commit's name on a foreign tree's verdict, the same
+  false-verdict class the snapshot move fixed. Those runs now **skip** the cargo
+  checks with a reason naming the unreachable root; local reviews are unchanged.
+- A cargo root that the reviewed branch moved (a root crate pushed into
+  `backend/`, a member renamed) is no longer projected into the snapshot
+  verbatim. The locally detected path does not exist there, so cargo failed on a
+  missing manifest and the execution error was reported as the reviewed crate's
+  verdict; the run now falls back to the snapshot root when it carries a
+  manifest of its own.
+- Python checks no longer synchronise the operator's virtual environment when
+  reviewing another commit. The target snapshot symlinks the checkout's `.venv`,
+  and `uv run` syncs the project environment before executing — so reviewing a
+  branch with different dependencies installed into, and removed packages from,
+  the developer's active environment. Off-`HEAD` runs now set
+  `UV_PROJECT_ENVIRONMENT` to a prview-owned per-repo directory
+  (`~/.prview/uv-env/<repo>`): the reviewed dependency set is still installed
+  and judged, just never on top of the operator's. Local reviews set no override.
+- Provenance no longer certifies a tree it could not verify. A working-tree
+  status that fails to read (an index lock, a permissions error, a malformed
+  repository) recorded `local-clean` — the claim that the scanned bytes exactly
+  match the commit, made precisely when nothing could be checked. It now records
+  no `tree_state` at all, the same "visibly unknown" the non-git case uses.
+- A snapshot that a check wrote into is no longer recorded as an exact commit
+  scan. `tree_state: snapshot` was assigned to any directory outside the repo
+  root, so a generated `Cargo.lock` (or any tool writing into the checkout) left
+  the artifact claiming bytes that had already changed, and an external
+  `cargo_root` — a different checkout entirely — was labelled a snapshot of the
+  reviewed commit. Snapshots are now verified against their own status
+  (`snapshot` / `snapshot-dirty`, ignoring the `node_modules` and `.venv`
+  symlinks prview itself creates), and a directory that is not a worktree of
+  this repository is recorded as `foreign`.
 
 ### Changed
 

@@ -1003,6 +1003,22 @@ impl Config {
             .join("cargo-target")
             .join(cache_namespace_from_root(&self.repo_root))
     }
+
+    /// Python environment used when checks run off an ephemeral target snapshot.
+    ///
+    /// The snapshot symlinks the operator's `.venv` so a review does not
+    /// reinstall the world — but `uv run` synchronises the project environment
+    /// before executing, so a target whose dependencies differ from the local
+    /// branch would install into (and remove packages from) the developer's
+    /// active environment. Pointing `UV_PROJECT_ENVIRONMENT` at one per-repo
+    /// directory (same namespace as [`Config::cache_dir`]) gives the reviewed
+    /// commit its own environment, kept warm across runs, while the operator's
+    /// `.venv` is never written to. A local review sets no override at all.
+    pub fn uv_env_dir(&self) -> PathBuf {
+        prview_home()
+            .join("uv-env")
+            .join(cache_namespace_from_root(&self.repo_root))
+    }
 }
 
 /// Find git repository root from current directory
