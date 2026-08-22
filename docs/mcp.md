@@ -214,8 +214,9 @@ case sets `normalized: true`:
   `storage_corrupt`.
 - `schema_forward_compat:` — the pack's `schema_version` is a newer MINOR of a
   known MAJOR; it is read, and fields this build does not know are ignored. An
-  unknown MAJOR is `storage_corrupt`. A pack with no `schema_version` at all is
-  pre-2.1 and is accepted silently, like the `ALLOW`/`HOLD` tokens.
+  unknown MAJOR is `storage_corrupt`, and so is a `schema_version` that is
+  present but not a `MAJOR.MINOR` string. A pack with no `schema_version` at all
+  is pre-2.1 and is accepted silently, like the `ALLOW`/`HOLD` tokens.
 
 Completed response:
 

@@ -57,6 +57,22 @@ pub(crate) enum QualityFailureOrigin {
     Warning,
 }
 
+impl QualityFailureOrigin {
+    /// Wire name used in `MERGE_GATE.json`.
+    ///
+    /// The origin is not an internal detail: without it a consumer reading
+    /// `introduced_quality_failures: ["Rustfmt"]` next to `quality_pass: true`
+    /// sees a self-contradicting pack, because the array says "failure" and the
+    /// flag says the entry never gated. Naming the origin is what makes the two
+    /// readable together.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Failure => "failure",
+            Self::Warning => "warning",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct QualityFailureDetail {
     pub name: String,

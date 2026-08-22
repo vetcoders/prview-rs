@@ -322,9 +322,8 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     })?;
 
     let mut caveats = Vec::new();
-    if let Some(caveat) =
-        crate::gate::check_merge_gate_schema(value.get("schema_version").and_then(Value::as_str))
-            .with_context(|| format!("merge gate artifact {}", gate_path.display()))?
+    if let Some(caveat) = crate::gate::check_merge_gate_schema_field(value.get("schema_version"))
+        .with_context(|| format!("merge gate artifact {}", gate_path.display()))?
     {
         caveats.push(caveat);
     }
@@ -1892,6 +1891,30 @@ api-router/app/core/cache.py
             "caveats: {:?}",
             gate.caveats
         );
+    }
+
+    #[test]
+    fn non_string_schema_version_fails_loud_instead_of_reading_as_legacy() {
+        // `and_then(Value::as_str)` collapsed a present-but-wrongly-typed field
+        // to `None`, which the schema checker reads as "pre-2.1 pack, accept
+        // silently". A pack that states a version this reader cannot even type
+        // is exactly the case fail-loud exists for.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        for bad in [
+            r#"{"schema_version":2.1,"decision":{"verdict":"PASS","allow_merge":true}}"#,
+            r#"{"schema_version":null,"decision":{"verdict":"PASS","allow_merge":true}}"#,
+            r#"{"schema_version":{"major":2},"decision":{"verdict":"PASS","allow_merge":true}}"#,
+            r#"{"schema_version":["2.1"],"decision":{"verdict":"PASS","allow_merge":true}}"#,
+        ] {
+            std::fs::write(temp.path().join("00_summary/MERGE_GATE.json"), bad).unwrap();
+            let err = read_merge_gate_summary(temp.path())
+                .expect_err("a non-string schema_version must fail loud");
+            assert!(
+                format!("{err:#}").contains("schema_version"),
+                "{err:#} for {bad}"
+            );
+        }
     }
 
     #[test]

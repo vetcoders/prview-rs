@@ -1910,6 +1910,106 @@ fn merge_gate_surfaces_cargo_audit_informational_warnings_as_review_caveat() {
 }
 
 #[test]
+fn merge_gate_names_the_origin_of_every_quality_failure_entry() {
+    // The origin split lives in memory only until the pack states it. Read from
+    // disk, `introduced_quality_failures: ["Rustfmt"]` next to `quality_pass:
+    // true` is a pack contradicting itself: the array claims a failure, the flag
+    // claims nothing failed, and nothing in the JSON explains which is right.
+    let config = create_test_config(PolicyConfig::default());
+    let checks = vec![
+        CheckResult {
+            name: "Rustfmt".to_string(),
+            status: CheckStatus::Warnings,
+            duration: Duration::from_secs(1),
+            output: "Diff in src/new.rs at line 1".to_string(),
+            cached: false,
+            provenance: None,
+        },
+        CheckResult {
+            name: "Clippy".to_string(),
+            status: CheckStatus::Failed,
+            duration: Duration::from_secs(1),
+            output: "src/new.rs:1: error".to_string(),
+            cached: false,
+            provenance: None,
+        },
+    ];
+    let inline = InlineFindingsSummary {
+        status: "passed".to_string(),
+        findings_count: 0,
+        dashboard_findings: vec![],
+    };
+    let resolved_target = ResolvedRef {
+        name: "main".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    generate_merge_gate_test!(
+        tmp.path(),
+        &config,
+        &checks,
+        None,
+        &inline,
+        &[],
+        &CoverageDelta {
+            total_source: 0,
+            covered_count: 0,
+            pct: None,
+            uncovered: vec![],
+            covered: vec![],
+            non_code_count: 0,
+            ghost_tests: vec![],
+        },
+        &[],
+        &resolved_target,
+        &[],
+    )
+    .expect("merge gate");
+
+    let raw = std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate");
+    let gate: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+
+    let details = gate["decision"]["quality_failure_details"]
+        .as_array()
+        .expect("details array");
+    let origin_of = |name: &str| {
+        details
+            .iter()
+            .find(|detail| detail["name"] == name)
+            .unwrap_or_else(|| panic!("`{name}` missing from quality_failure_details: {details:?}"))
+            ["origin"]
+            .as_str()
+            .map(str::to_string)
+    };
+    assert_eq!(
+        origin_of("Rustfmt"),
+        Some("warning".to_string()),
+        "a warning-level entry must say so on the wire: {gate}"
+    );
+    assert_eq!(
+        origin_of("Clippy"),
+        Some("failure".to_string()),
+        "a hard failure must stay distinguishable from a warning: {gate}"
+    );
+
+    // A new readable field is a MINOR schema change; a pack that carries it and
+    // still claims 2.1 lies to `tools/validate_merge_gate.py` and to any reader
+    // deciding whether `origin` can be trusted to be present.
+    assert_eq!(
+        gate["schema_version"].as_str(),
+        Some(crate::gate::MERGE_GATE_SCHEMA_VERSION),
+        "the pack stamps the schema this build writes"
+    );
+    assert_eq!(
+        crate::gate::MERGE_GATE_SCHEMA_VERSION,
+        "2.2",
+        "adding `origin` to quality_failure_details bumps the MINOR"
+    );
+}
+
+#[test]
 fn merge_gate_does_not_fail_fast_remote_only_for_expected_rust_gaps() {
     let mut config = create_test_config(PolicyConfig::default());
     config.run_tests = false;

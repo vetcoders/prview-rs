@@ -696,9 +696,8 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // honestly: an unknown MAJOR is fail-loud, a newer MINOR is tolerated but
     // carries a caveat. An absent `schema_version` is the documented pre-2.1
     // read-back surface and is accepted silently.
-    let schema_caveat =
-        crate::gate::check_merge_gate_schema(value.get("schema_version").and_then(|v| v.as_str()))
-            .map_err(|e| ToolError::new(error_class::STORAGE_CORRUPT, e.to_string()))?;
+    let schema_caveat = crate::gate::check_merge_gate_schema_field(value.get("schema_version"))
+        .map_err(|e| ToolError::new(error_class::STORAGE_CORRUPT, e.to_string()))?;
 
     let decision = value.get("decision").ok_or_else(|| {
         ToolError::new(
@@ -771,8 +770,14 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     let signals_disagree = signal_ranks.iter().any(|&r| r != final_rank);
     let allow_contradicts = raw_allow.map(|a| a != allow_merge).unwrap_or(false);
     // An ignored signal is itself a normalization: the returned decision is not
-    // a faithful passthrough of what the pack says.
-    let normalized = signals_disagree || allow_contradicts || !unknown_signal_caveats.is_empty();
+    // a faithful passthrough of what the pack says. A forward schema is the same
+    // situation one level up — the pack was written by a build this one does not
+    // fully know, so the read is best-effort and the caveat must be backed by the
+    // flag consumers actually branch on.
+    let normalized = signals_disagree
+        || allow_contradicts
+        || !unknown_signal_caveats.is_empty()
+        || schema_caveat.is_some();
 
     let mut caveats = schema_caveat.into_iter().collect::<Vec<_>>();
     caveats.append(&mut unknown_signal_caveats);
@@ -1073,6 +1078,65 @@ mod tests {
             "caveats: {:?}",
             d.caveats
         );
+    }
+
+    #[test]
+    fn forward_schema_read_is_marked_normalized() {
+        // docs/mcp.md: "Anything the adapter could not read is named rather than
+        // dropped, and every such case sets `normalized: true`" — and it lists
+        // `schema_forward_compat:` among them. A caveat next to
+        // `normalized: false` tells the client the decision was passed through
+        // unchanged while simultaneously admitting fields were ignored.
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "schema_version": "2.9",
+                "bases": ["main"],
+                "decision": { "verdict": "PASS", "merge_recommendation": "approve", "allow_merge": true }
+            }),
+        );
+        let d = read_decision(dir.path()).expect("newer minor is readable");
+        assert!(
+            d.caveats
+                .iter()
+                .any(|c| c.starts_with("schema_forward_compat:")),
+            "caveats: {:?}",
+            d.caveats
+        );
+        assert!(
+            d.normalized,
+            "a forward-schema read ignored unknown fields; that is a normalization"
+        );
+    }
+
+    #[test]
+    fn non_string_schema_version_is_storage_corrupt() {
+        // Same defect as the CLI reader: `as_str()` turned a present-but-
+        // wrongly-typed field into "absent", which is the silently-accepted
+        // legacy path.
+        for bad in [
+            serde_json::json!(2.1),
+            serde_json::json!(null),
+            serde_json::json!({ "major": 2 }),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_gate(
+                dir.path(),
+                &serde_json::json!({
+                    "schema_version": bad,
+                    "bases": ["main"],
+                    "decision": { "verdict": "PASS", "allow_merge": true }
+                }),
+            );
+            let err = read_decision(dir.path()).expect_err("non-string schema must fail loud");
+            assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+            assert!(
+                err.message.contains("schema_version"),
+                "{} for {bad}",
+                err.message
+            );
+        }
     }
 
     #[test]

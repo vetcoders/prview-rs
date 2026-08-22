@@ -9,17 +9,36 @@ use std::path::Path;
 pub const GATE_EXECUTION_ERROR_EXIT_CODE: i32 = 3;
 
 /// `schema_version` this build stamps into `MERGE_GATE.json`.
-pub const MERGE_GATE_SCHEMA_VERSION: &str = "2.1";
+pub const MERGE_GATE_SCHEMA_VERSION: &str = "2.2";
 
-/// MAJOR versions of `MERGE_GATE.json` this build knows how to read. Matches the
-/// set accepted by `tools/validate_merge_gate.py` (1.0 / 2.0 / 2.1).
-const MERGE_GATE_KNOWN_MAJORS: &[u32] = &[1, 2];
+/// `MERGE_GATE.json` schemas this build has actually seen, as `(MAJOR, MINOR)`.
+///
+/// This is the SAME set `tools/validate_merge_gate.py` accepts verbatim
+/// (`1.0` / `2.0` / `2.1` / `2.2`), so "readable by the CLI/MCP" and "valid per the
+/// contract validator" cannot drift apart for a version in the set. The reader
+/// is deliberately broader in exactly two documented directions — an absent
+/// field and a newer MINOR of a known MAJOR — and both are announced rather
+/// than silent.
+const MERGE_GATE_KNOWN_SCHEMAS: &[(u32, u32)] = &[(1, 0), (2, 0), (2, 1), (2, 2)];
 
+/// Parse a strict `MAJOR.MINOR` version. Anything else — a bare `2`, a trailing
+/// dot, or a third component like `2.1.3` — is NOT this contract's version
+/// shape and must not be silently truncated into one.
 fn parse_major_minor(version: &str) -> Option<(u32, u32)> {
-    let mut parts = version.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor))
+    let (major, minor) = version.split_once('.')?;
+    if minor.contains('.') {
+        return None;
+    }
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Newest MINOR this build knows for `major`, if the MAJOR is known at all.
+fn newest_known_minor(major: u32) -> Option<u32> {
+    MERGE_GATE_KNOWN_SCHEMAS
+        .iter()
+        .filter(|(known_major, _)| *known_major == major)
+        .map(|(_, minor)| *minor)
+        .max()
 }
 
 /// Check a pack's `MERGE_GATE.json` `schema_version` against what this build can
@@ -28,11 +47,14 @@ fn parse_major_minor(version: &str) -> Option<(u32, u32)> {
 /// * absent — accepted silently; packs predating the field are the documented
 ///   legacy read-back surface (same safety net as the retired `ALLOW`/`HOLD`
 ///   verdict synonyms).
-/// * known MAJOR, same-or-older MINOR — accepted silently.
+/// * known MAJOR, MINOR this build has seen — accepted silently.
 /// * known MAJOR, newer MINOR — accepted with a caveat: the pack may carry
-///   fields this build ignores, and the reader must say so.
-/// * unknown or unparsable MAJOR — fail loud; a reader that cannot name the
-///   schema cannot honestly name the verdict.
+///   fields this build ignores, and the reader must say so. This holds on EVERY
+///   known MAJOR, not just the current one: a `1.9` pack is as unseen as a
+///   `2.9` one, and silence about it was a reader claiming a fidelity it does
+///   not have.
+/// * unknown MAJOR, or a version that is not `MAJOR.MINOR` at all — fail loud;
+///   a reader that cannot name the schema cannot honestly name the verdict.
 pub fn check_merge_gate_schema(raw: Option<&str>) -> Result<Option<String>> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -40,21 +62,50 @@ pub fn check_merge_gate_schema(raw: Option<&str>) -> Result<Option<String>> {
     let Some((major, minor)) = parse_major_minor(raw) else {
         bail!("unreadable MERGE_GATE.json schema_version `{raw}` (expected MAJOR.MINOR)");
     };
-    if !MERGE_GATE_KNOWN_MAJORS.contains(&major) {
+    let Some(newest_minor) = newest_known_minor(major) else {
+        let known: Vec<String> = MERGE_GATE_KNOWN_SCHEMAS
+            .iter()
+            .map(|(major, minor)| format!("{major}.{minor}"))
+            .collect();
         bail!(
             "unsupported MERGE_GATE.json schema_version `{raw}`: major {major} is not readable by \
-             this build (known majors: 1, 2; current schema {MERGE_GATE_SCHEMA_VERSION})"
+             this build (known schemas: {}; current schema {MERGE_GATE_SCHEMA_VERSION})",
+            known.join(", ")
         );
-    }
-    let (current_major, current_minor) = parse_major_minor(MERGE_GATE_SCHEMA_VERSION)
-        .expect("MERGE_GATE_SCHEMA_VERSION is a MAJOR.MINOR literal");
-    if major == current_major && minor > current_minor {
+    };
+    if minor > newest_minor {
         return Ok(Some(format!(
-            "schema_forward_compat: MERGE_GATE.json schema_version `{raw}` is newer than this \
-             build's `{MERGE_GATE_SCHEMA_VERSION}`; unknown fields were ignored"
+            "schema_forward_compat: MERGE_GATE.json schema_version `{raw}` is newer than the \
+             newest `{major}.{newest_minor}` this build knows; unknown fields were ignored"
         )));
     }
     Ok(None)
+}
+
+/// [`check_merge_gate_schema`] for a raw JSON field, distinguishing "absent"
+/// from "present but not a string".
+///
+/// Every reader used to reach the checker through `.and_then(Value::as_str)`,
+/// which maps a number, an object, or an explicit `null` onto `None` — the one
+/// input the checker accepts in silence, because an absent field means a
+/// pre-2.1 pack. A pack that states a `schema_version` this build cannot even
+/// type is the opposite of a legacy pack and must fail loud.
+pub fn check_merge_gate_schema_field(field: Option<&serde_json::Value>) -> Result<Option<String>> {
+    match field {
+        None => check_merge_gate_schema(None),
+        Some(serde_json::Value::String(raw)) => check_merge_gate_schema(Some(raw)),
+        Some(other) => bail!(
+            "unreadable MERGE_GATE.json schema_version: expected a MAJOR.MINOR string, found {}",
+            match other {
+                serde_json::Value::Null => "null".to_string(),
+                serde_json::Value::Bool(_) => "a boolean".to_string(),
+                serde_json::Value::Number(n) => format!("the number {n}"),
+                serde_json::Value::Array(_) => "an array".to_string(),
+                serde_json::Value::Object(_) => "an object".to_string(),
+                serde_json::Value::String(_) => unreachable!("handled above"),
+            }
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +255,7 @@ mod tests {
     #[test]
     fn schema_check_accepts_absent_and_known_versions_silently() {
         assert_eq!(check_merge_gate_schema(None).unwrap(), None);
+        assert_eq!(check_merge_gate_schema(Some("2.2")).unwrap(), None);
         assert_eq!(check_merge_gate_schema(Some("2.1")).unwrap(), None);
         assert_eq!(check_merge_gate_schema(Some("2.0")).unwrap(), None);
         assert_eq!(check_merge_gate_schema(Some("1.0")).unwrap(), None);
@@ -216,6 +268,31 @@ mod tests {
             .expect("newer minor emits a caveat");
         assert!(caveat.starts_with("schema_forward_compat:"), "{caveat}");
         assert!(caveat.contains("2.7"), "{caveat}");
+    }
+
+    #[test]
+    fn schema_check_rejects_versions_that_are_not_major_minor() {
+        // `tools/validate_merge_gate.py` accepts an exact string set, so a
+        // reader that silently truncates `2.1.3` to `2.1` calls a pack readable
+        // that the contract validator rejects.
+        for raw in ["2.1.3", "2", "2.", "2.1.", ".1", "2.1.0.0"] {
+            assert!(
+                check_merge_gate_schema(Some(raw)).is_err(),
+                "`{raw}` is not MAJOR.MINOR and must fail loud"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_check_caveats_newer_minor_of_a_legacy_major() {
+        // A `1.x` pack newer than the only released `1.0` was accepted in total
+        // silence, while the same situation on the current major produced a
+        // caveat. Unknown minors carry unknown fields on every known major.
+        let caveat = check_merge_gate_schema(Some("1.9"))
+            .expect("a known major stays readable")
+            .expect("a minor this build never saw must be named");
+        assert!(caveat.starts_with("schema_forward_compat:"), "{caveat}");
+        assert!(caveat.contains("1.9"), "{caveat}");
     }
 
     #[test]
