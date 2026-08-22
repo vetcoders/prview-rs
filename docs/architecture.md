@@ -468,6 +468,19 @@ status `skipped`/`SKIP`, and `report.json`'s `quality.heuristics` emits
 `status: "skipped"` with a `skip_reason` and omits `dead_exports`, `cycles`,
 `twins`, and `unused_symbols` rather than writing zeros that read as results.
 
+**A disabled scan is not a broken scanner.** `--quick` and `--no-heuristics`
+short-circuit `heuristics::run_all` to a default result, which the caller still
+passes on, so `report.json` used to describe an intentional skip as
+`skip_reason: "loctree analysis unavailable"` — a tool failure that never
+happened — and hand the reader a `log_path` pointing at a zero-filled stub. The
+three skips are now distinguishable in `quality.heuristics`:
+
+| `skip_reason` | meaning | `total_files` | `log_path` |
+|---|---|---|---|
+| `heuristics not run` | not asked for (`--quick`, `--no-heuristics`) | absent | absent |
+| `loctree analysis unavailable` | asked for, scanner failed | present | present |
+| `loctree scanned no files` | ran, measured nothing | `0` | present |
+
 ### cache/mod.rs
 
 Hash-based caching:

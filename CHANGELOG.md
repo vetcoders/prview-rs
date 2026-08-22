@@ -143,6 +143,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from stderr, else the payload's `errors[]` (reading `message` / `long_msg` /
   `short_msg` / `type`, whichever the semgrep version emits), else raw stdout, so
   a crash traceback printed on stdout also survives.
+- `report.json` distinguishes a disabled heuristics run from a broken scanner.
+  `--quick` and `--no-heuristics` short-circuit the scan to a default result
+  that the caller still passes on, so the report described the intentional skip
+  as `skip_reason: "loctree analysis unavailable"` — a tool failure that never
+  happened — and pointed `log_path` at a zero-filled stub, while the
+  `"heuristics not run"` reason was unreachable from the production path. A run
+  that never asked for heuristics now reads `heuristics not run` and omits both
+  `total_files` and `log_path`. No field changed shape, so `report.json` stays
+  `schema_version: "2.0"`.
 - Coverage no longer reports an unmeasured scan as perfect. A diff with zero
   changed source files produced `0/0 (100%)` in `AI_INDEX.md`,
   `coverage-delta.txt`, and the dashboard; it now reads `not measured`, and the

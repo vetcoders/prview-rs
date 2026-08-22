@@ -866,7 +866,17 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         .filter(|b| matches!(b.kind, BreakingKind::ChangedSignature { .. }))
         .count();
 
-    let heuristics_section = match input.heuristics {
+    // A disabled run is not a broken scanner. `heuristics::run_all`
+    // short-circuits to a DEFAULT result when `run_heuristics` is off, and the
+    // caller still passes it, so `Some(..)` alone cannot tell "loctree failed"
+    // from "loctree was never asked to run". Only the config knows.
+    let heuristics_input = input
+        .config
+        .run_heuristics
+        .then_some(input.heuristics)
+        .flatten();
+
+    let heuristics_section = match heuristics_input {
         Some(h) => {
             let loctree = h.loctree.as_ref();
             let available = loctree.map(|l| l.available).unwrap_or(false);
@@ -1588,6 +1598,9 @@ test result: FAILED. 0 passed; 1 failed
 
         let mut config = test_config();
         config.execution_mode = ExecutionMode::Standard;
+        // The fixture below is a loctree run that measured 10 files, so the
+        // config must be one that actually asked for heuristics.
+        config.run_heuristics = true;
 
         let ctx = DashboardContext {
             verdict: "PASS",
@@ -1748,9 +1761,13 @@ test result: FAILED. 0 passed; 1 failed
         }
     }
 
+    /// `run_heuristics` is the config flag, not a property of `heuristics`:
+    /// a disabled run still hands the report a default result, and telling the
+    /// two apart is the whole point of the heuristics section's skip reason.
     fn skip_as_zero_report(
         ctx: &crate::artifacts::DashboardContext,
         heuristics: Option<&crate::heuristics::HeuristicsResult>,
+        run_heuristics: bool,
     ) -> serde_json::Value {
         use crate::cli::ExecutionMode;
         use crate::config::test_config;
@@ -1758,6 +1775,7 @@ test result: FAILED. 0 passed; 1 failed
 
         let mut config = test_config();
         config.execution_mode = ExecutionMode::Standard;
+        config.run_heuristics = run_heuristics;
         let target = ResolvedRef {
             name: "feature/skip-as-zero".to_string(),
             commit_id: "deadbeef".to_string(),
@@ -1803,7 +1821,7 @@ test result: FAILED. 0 passed; 1 failed
     #[test]
     fn report_coverage_zero_of_zero_is_null_not_full_ratio() {
         let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
-        let json = skip_as_zero_report(&ctx, None);
+        let json = skip_as_zero_report(&ctx, None, false);
         let cov = &json["quality"]["coverage"];
 
         assert!(
@@ -1827,7 +1845,7 @@ test result: FAILED. 0 passed; 1 failed
         // cut was fixing one level down. MINOR would promise old decoders keep
         // working, which is exactly what stopped being true, so this is a MAJOR.
         let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
-        let json = skip_as_zero_report(&ctx, None);
+        let json = skip_as_zero_report(&ctx, None, false);
 
         assert!(
             json["quality"]["coverage"]["heuristic_ratio"].is_null(),
@@ -1844,7 +1862,7 @@ test result: FAILED. 0 passed; 1 failed
     fn report_coverage_zero_of_n_stays_a_real_zero_ratio() {
         // 0/3 IS a measurement — it must not be downgraded to "not measured".
         let ctx = skip_as_zero_ctx(coverage_delta(3, 0, Some(0)));
-        let json = skip_as_zero_report(&ctx, None);
+        let json = skip_as_zero_report(&ctx, None, false);
         let cov = &json["quality"]["coverage"];
 
         assert_eq!(cov["heuristic_ratio"].as_f64(), Some(0.0));
@@ -1871,7 +1889,7 @@ test result: FAILED. 0 passed; 1 failed
             ..Default::default()
         };
         let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
-        let json = skip_as_zero_report(&ctx, Some(&heuristics));
+        let json = skip_as_zero_report(&ctx, Some(&heuristics), true);
         let h = &json["quality"]["heuristics"];
 
         assert_eq!(h["status"].as_str(), Some("skipped"));
@@ -1887,9 +1905,39 @@ test result: FAILED. 0 passed; 1 failed
     }
 
     #[test]
+    fn report_heuristics_disabled_is_not_reported_as_an_unavailable_scanner() {
+        use crate::heuristics::HeuristicsResult;
+
+        // What a `--quick` / `--no-heuristics` run actually produces:
+        // `heuristics::run_all` short-circuits to a default result and `App::run`
+        // still passes it, so the report saw `Some(..)` with no loctree and
+        // called the scanner unavailable — a tool failure that never happened.
+        // A consumer cannot tell an intentional skip from a broken scanner, and
+        // the log path it was handed points at a zero-filled stub.
+        let heuristics = HeuristicsResult::default();
+        let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        let json = skip_as_zero_report(&ctx, Some(&heuristics), false);
+        let h = &json["quality"]["heuristics"];
+
+        assert_eq!(h["available"].as_bool(), Some(false));
+        assert_eq!(h["status"].as_str(), Some("skipped"));
+        assert_eq!(h["skip_reason"].as_str(), Some("heuristics not run"));
+        assert!(
+            h.get("log_path").is_none(),
+            "a run that never invoked loctree has no loctree log, got {:?}",
+            h.get("log_path")
+        );
+        assert!(
+            h.get("total_files").is_none(),
+            "a disabled scan measured nothing, got {:?}",
+            h.get("total_files")
+        );
+    }
+
+    #[test]
     fn report_heuristics_not_run_is_marked_skipped() {
         let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
-        let json = skip_as_zero_report(&ctx, None);
+        let json = skip_as_zero_report(&ctx, None, false);
         let h = &json["quality"]["heuristics"];
 
         assert_eq!(h["available"].as_bool(), Some(false));
