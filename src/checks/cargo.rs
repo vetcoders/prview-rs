@@ -176,6 +176,51 @@ fn unreachable_reviewed_cargo_root(config: &Config) -> Option<String> {
     ))
 }
 
+/// Skip reason when the REVIEWED commit is not a cargo project at all.
+///
+/// Eligibility reads `config.profile`, which describes the LOCAL checkout. A
+/// branch that drops its last `Cargo.toml` is still reviewed from a Rust
+/// checkout, so every cargo gate ran, found no manifest in the snapshot and
+/// filed cargo's own "could not find `Cargo.toml`" as the reviewed commit's
+/// verdict — a failure invented by the tool for a target that is simply not a
+/// cargo project.
+///
+/// The reviewed tree is the target commit's tree, so the manifest question is
+/// answered from git directly: no snapshot is materialised to find out. Both
+/// places [`reviewed_cargo_root`] would run count — the mapped cargo root and
+/// the snapshot root it falls back to. When git cannot answer (unreadable repo,
+/// unresolvable ref) nothing is skipped: an unverifiable claim must not become a
+/// skip any more than it may become a verdict.
+fn missing_reviewed_cargo_manifest(config: &Config) -> Option<String> {
+    let commit = off_head_target_commit(config)?;
+    let relative = repo_relative_cargo_root(cargo_cache_root(config), &config.repo_root)?;
+    let repo = crate::git::Repository::open(&config.repo_root).ok()?;
+
+    let root_path = cargo_root_path(&relative);
+    let mut candidates = vec!["Cargo.toml".to_string()];
+    if !root_path.is_empty() {
+        candidates.push(format!("{root_path}/Cargo.toml"));
+    }
+    for candidate in &candidates {
+        match repo.path_exists_at_commit(&commit, candidate) {
+            Ok(true) => return None,
+            Ok(false) => {}
+            // The question could not be asked — do not answer it.
+            Err(_) => return None,
+        }
+    }
+
+    Some(format!(
+        "commit {} has no Cargo.toml at {} or the repo root — not a cargo project",
+        &commit[..commit.len().min(8)],
+        if root_path.is_empty() {
+            "the repo root".to_string()
+        } else {
+            root_path
+        },
+    ))
+}
+
 /// Content hash for dependency-sensitive cargo checks (check/clippy/geiger).
 ///
 /// `rust_hash` keys on files under `cargo_cache_root`. When that root is a
@@ -285,6 +330,9 @@ impl Check for CargoCheck {
         if let Some(reason) = unreachable_reviewed_cargo_root(config) {
             return super::CheckEligibility::Skip(reason);
         }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
         super::CheckEligibility::Run
     }
 
@@ -360,6 +408,9 @@ impl Check for ClippyCheck {
             return super::CheckEligibility::Skip("lint disabled".to_string());
         }
         if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
             return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
@@ -471,6 +522,9 @@ impl Check for CargoTestCheck {
         if let Some(reason) = unreachable_reviewed_cargo_root(config) {
             return super::CheckEligibility::Skip(reason);
         }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
         super::CheckEligibility::Run
     }
 
@@ -549,6 +603,9 @@ impl Check for RustfmtCheck {
             return super::CheckEligibility::Skip("lint disabled".to_string());
         }
         if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
             return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
@@ -655,6 +712,9 @@ impl Check for CargoAuditCheck {
             );
         }
         if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
             return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
@@ -836,6 +896,9 @@ impl Check for CargoGeigerCheck {
             );
         }
         if let Some(reason) = unreachable_reviewed_cargo_root(config) {
+            return super::CheckEligibility::Skip(reason);
+        }
+        if let Some(reason) = missing_reviewed_cargo_manifest(config) {
             return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
@@ -1736,9 +1799,31 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         );
     }
 
-    /// Two commits in a fresh repo; returns the temp dir and the FIRST commit,
-    /// so a config targeting it is off-HEAD.
+    /// Commit everything in `root` under a fresh test identity.
+    fn commit_all(root: &Path, message: &str) {
+        use crate::git::cmd::git_cmd;
+
+        for args in [
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", message, "--no-verify"],
+        ] {
+            let out = git_cmd()
+                .args(&args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+    }
+
     fn repo_with_two_commits() -> (tempfile::TempDir, String) {
+        repo_with_two_commits_containing(&[])
+    }
+
+    /// Two commits in a fresh repo, both carrying `manifests` (repo-relative
+    /// paths, written as minimal `Cargo.toml`s); returns the temp dir and the
+    /// FIRST commit, so a config targeting it is off-HEAD.
+    fn repo_with_two_commits_containing(manifests: &[&str]) -> (tempfile::TempDir, String) {
         use crate::git::cmd::git_cmd;
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1755,8 +1840,13 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         run_git(&["config", "user.email", "prview@example.test"]);
         run_git(&["config", "user.name", "prview test"]);
         run_git(&["config", "commit.gpgsign", "false"]);
+        for manifest in manifests {
+            let path = root.join(manifest);
+            std::fs::create_dir_all(path.parent().expect("manifest parent")).unwrap();
+            std::fs::write(path, "[package]\nname=\"x\"\nversion=\"0.0.0\"\n").unwrap();
+        }
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
-        run_git(&["add", "a.txt"]);
+        run_git(&["add", "-A"]);
         run_git(&["commit", "-q", "-m", "one"]);
         let first = String::from_utf8(
             git_cmd()
@@ -1822,7 +1912,7 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
     /// narrow, not a blanket disable of cargo checks in `--pr` mode.
     #[test]
     fn cargo_checks_still_run_off_head_for_an_in_repo_cargo_root() {
-        let (repo, first) = repo_with_two_commits();
+        let (repo, first) = repo_with_two_commits_containing(&["crates/core/Cargo.toml"]);
         let mut profile = test_rust_profile(true);
         profile.cargo_root = Some(repo.path().join("crates/core"));
         let config = test_config_builder()
@@ -1832,9 +1922,71 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             .build();
 
         assert!(unreachable_reviewed_cargo_root(&config).is_none());
+        assert!(missing_reviewed_cargo_manifest(&config).is_none());
         assert_eq!(
             CargoCheck.check_eligibility(&config),
             super::super::CheckEligibility::Run
+        );
+    }
+
+    /// The local checkout is Rust, the reviewed commit is not: the branch under
+    /// review dropped its last `Cargo.toml`. Eligibility read the LOCAL profile,
+    /// so every cargo gate ran anyway and reported cargo's "could not find
+    /// Cargo.toml" as the reviewed commit's verdict — a manufactured failure
+    /// against a target that is simply not a cargo project.
+    #[test]
+    fn cargo_checks_skip_when_the_reviewed_commit_has_no_manifest() {
+        // First commit: no manifest anywhere. Second (HEAD): the local Rust tree.
+        let (repo, first) = repo_with_two_commits_containing(&[]);
+        std::fs::create_dir_all(repo.path().join("crates/core")).unwrap();
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        commit_all(repo.path(), "add cargo");
+
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(test_rust_profile(true))
+            .target(Some(&first))
+            .run_lint(true)
+            .run_tests(true)
+            .build();
+
+        for check in [
+            &CargoCheck as &dyn Check,
+            &ClippyCheck,
+            &RustfmtCheck,
+            &CargoTestCheck,
+        ] {
+            match check.check_eligibility(&config) {
+                super::super::CheckEligibility::Skip(reason) => assert!(
+                    reason.contains("no Cargo.toml"),
+                    "{} skip reason must name the missing manifest, got: {reason}",
+                    check.name()
+                ),
+                super::super::CheckEligibility::Run => panic!(
+                    "{} must not report a missing manifest as the reviewed commit's verdict",
+                    check.name()
+                ),
+            }
+        }
+    }
+
+    /// A member root that the reviewed commit does not have still counts as a
+    /// cargo project when the commit carries a workspace manifest at its root:
+    /// that is exactly the fallback `reviewed_cargo_root` performs.
+    #[test]
+    fn a_moved_cargo_root_is_still_a_cargo_project() {
+        let (repo, first) = repo_with_two_commits_containing(&["Cargo.toml"]);
+        let mut profile = test_rust_profile(true);
+        profile.cargo_root = Some(repo.path().join("backend"));
+        let config = test_config_builder()
+            .repo_root(repo.path())
+            .profile(profile)
+            .target(Some(&first))
+            .build();
+
+        assert!(
+            missing_reviewed_cargo_manifest(&config).is_none(),
+            "the snapshot root carries a manifest, so the run has somewhere to go",
         );
     }
 

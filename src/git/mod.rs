@@ -701,6 +701,19 @@ impl Repository {
         &self.path
     }
 
+    /// Whether `file_path` exists in the tree of `commit_ref`.
+    ///
+    /// Answers "does the REVIEWED commit contain this file" without materialising
+    /// a worktree — the snapshot carries exactly this tree, so the tree lookup is
+    /// the same answer for a fraction of the cost. An `Err` means the question
+    /// could not be asked (unreadable repo, unknown ref), which callers must not
+    /// confuse with a confirmed absence.
+    pub fn path_exists_at_commit(&self, commit_ref: &str, file_path: &str) -> Result<bool> {
+        let safe_path = crate::paths::validate_repo_relative_str(file_path)?;
+        let tree = self.inner.revparse_single(commit_ref)?.peel_to_tree()?;
+        Ok(tree.get_path(safe_path).is_ok())
+    }
+
     /// Read file content at a specific commit/ref
     pub fn file_at_commit(&self, commit_ref: &str, file_path: &str) -> Result<String> {
         let obj = self.inner.revparse_single(commit_ref)?;
