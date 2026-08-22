@@ -763,6 +763,14 @@ and char literals verbatim: a literal is code, so `pub const GREETING: &str =
 delimiter trackers, which want a brace inside a string silenced, and
 `code_with_literals` for callers comparing source.
 
+A declaration ends at a `;` or a body `{` outside its brackets. Square brackets
+count for the same reason parentheses do: an array type states its length with a
+`;`, as in `pub const TABLE: [u8; 2] = [`, and reading that as the terminator
+finalized both diff sides at their identical opener — the changed values below
+produced no finding at all. Measured over the local crates.io registry, 719
+public `const`/`static` declarations in 126 crates open a multi-line initializer
+on a line whose type carries such a `;`.
+
 Pairing is scoped: two declarations pair only when their inline `mod` path and
 their `#[cfg(…)]` guard may be the same. The guard is the WHOLE conjunction of
 the attributes stacked above the declaration, sorted — `#[cfg(unix)]

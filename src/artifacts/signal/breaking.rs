@@ -1084,8 +1084,14 @@ fn declaration_complete(code: &str) -> bool {
     let mut depth: i32 = 0;
     for ch in code.chars() {
         match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
+            // Square brackets are counted for the same reason parentheses are:
+            // an array type states its length with a `;` — `pub const TABLE:
+            // [u8; 2] = [` — and reading that as the terminator finalized the
+            // declaration at its opener. Both sides of a diff then held the same
+            // opener text, paired as an unchanged re-add, and a changed
+            // initializer below produced no finding at all.
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
             '{' if depth <= 0 => return true,
             ';' if depth <= 0 => return true,
             _ => {}
@@ -2475,6 +2481,63 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "rewording a comment is not an API change, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_changed_multiline_array_constant_surfaces() {
+        // `[u8; 2]` states a length with a `;`, inside the TYPE. Accepting that
+        // `;` as the declaration's terminator finalized both sides at their
+        // identical opener, the exact-match pass paired them, and the changed
+        // values below vanished.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const TABLE: [u8; 2] = [",
+                "-    1, 2,",
+                "-];",
+                "+pub const TABLE: [u8; 2] = [",
+                "+    3, 4,",
+                "+];",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::ChangedSignature { before, after }
+                    if before.contains("1, 2") && after.contains("3, 4")
+            )),
+            "a changed multiline array constant must surface, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_reemitted_multiline_array_constant_is_still_a_no_op() {
+        // The tolerant direction: reading the whole initializer must not turn a
+        // verbatim re-emission into a removal.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const TABLE: [u8; 2] = [",
+                "-    1, 2,",
+                "-];",
+                "+pub const TABLE: [u8; 2] = [",
+                "+    1, 2,",
+                "+];",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "an unchanged re-emission is not breaking, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }
