@@ -277,12 +277,21 @@ fn mod_opening_name(trimmed: &str) -> Option<String> {
     if !rest.starts_with(char::is_whitespace) {
         return None;
     }
+    let rest = rest.trim_start();
+    // A module may be named with a keyword through a raw identifier. Stopping at
+    // the `#` recorded `r#type` and `r#match` both as `r`, so two different
+    // namespaces looked like one and a removal from the first paired away
+    // against an unrelated addition in the second. The prefix is kept in the
+    // name because it is part of how the path is written.
+    let (prefix, rest) = match rest.strip_prefix("r#") {
+        Some(after) => ("r#", after),
+        None => ("", rest),
+    };
     let name: String = rest
-        .trim_start()
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect();
-    (!name.is_empty()).then_some(name)
+    (!name.is_empty()).then(|| format!("{prefix}{name}"))
 }
 
 /// May a removal in `removed_scope` and an addition in `added_scope` describe
@@ -1842,6 +1851,37 @@ mod tests {
         assert!(
             removed_symbol_types(&findings).contains(&"struct".to_string()),
             "removal from mod a must survive an unrelated add in mod b, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn raw_identifier_modules_are_different_scopes() {
+        // A module may be named with a keyword through a raw identifier. The
+        // scope parser stopped at the `#`, so `r#type` and `r#match` were both
+        // recorded as `r`: two different namespaces looked like one, and the
+        // removal of `r#type::Config` was cancelled by the unrelated addition of
+        // `r#match::Config`.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " pub mod r#type {",
+                "-    pub struct Config {",
+                "-        pub x: u32,",
+                "-    }",
+                " }",
+                " pub mod r#match {",
+                "+    pub struct Config {",
+                "+        pub x: u32,",
+                "+    }",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "removal from mod r#type must survive an add in mod r#match, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

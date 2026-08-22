@@ -778,6 +778,10 @@ produced no finding at all. Measured over the local crates.io registry, 719
 public `const`/`static` declarations in 126 crates open a multi-line initializer
 on a line whose type carries such a `;`.
 
+Inline module names keep their raw-identifier prefix. `mod r#type` and
+`mod r#match` were both recorded as `r`, so two namespaces looked like one and a
+removal from the first was cancelled by an unrelated addition in the second.
+
 Pairing is scoped: two declarations pair only when their inline `mod` path and
 their `#[cfg(…)]` guard may be the same. The guard is the WHOLE conjunction of
 the attributes stacked above the declaration, sorted — `#[cfg(unix)]

@@ -211,6 +211,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   space.** The comparison identity joined physical lines with a space, including
   the lines a literal spans, so a rewritten public constant paired away as an
   unchanged re-add. Lines are now separated by the boundary that separated them.
+- **A raw-identifier module is its own scope.** The inline-module parser stopped
+  at the `#`, recording both `mod r#type` and `mod r#match` as `r`: two
+  namespaces looked like one, and a removal from the first was cancelled by an
+  unrelated addition in the second.
 - **Rewording a comment inside a declaration is no longer a signature change.**
   Declarations were compared on their verbatim text, comments and all, so a
   remove+re-add of a byte-identical public signature whose internal comment had
