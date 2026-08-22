@@ -8,6 +8,15 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Sidecar holding the check's captured output, next to its status entry.
+const LOG_SUFFIX: &str = ".log";
+
+/// Sidecar holding the check's serialized provenance, next to its status entry.
+/// Optional by construction: entries written before this sidecar existed simply
+/// have no such file, and a replay then reports an unknown provenance instead of
+/// failing.
+const PROVENANCE_SUFFIX: &str = ".prov.json";
+
 /// Cache store
 pub struct Cache {
     dir: PathBuf,
@@ -35,28 +44,37 @@ impl Cache {
             return None;
         }
 
-        let cache_file = self.dir.join(check_name).join(key);
+        let cache_dir = self.dir.join(check_name);
+        let cache_file = cache_dir.join(key);
         if cache_file.exists() {
             let status = fs::read_to_string(&cache_file).ok()?;
-            let log_file = self.dir.join(check_name).join(format!("{}.log", key));
-            let output = fs::read_to_string(&log_file).ok();
+            let output = fs::read_to_string(sidecar(&cache_dir, key, LOG_SUFFIX)).ok();
+            // Absent for entries written before the sidecar existed — an old
+            // entry replays with an unknown provenance, never a hard failure.
+            let provenance = fs::read_to_string(sidecar(&cache_dir, key, PROVENANCE_SUFFIX)).ok();
 
             Some(CachedResult {
                 status: status.trim().to_string(),
                 output,
+                provenance,
             })
         } else {
             None
         }
     }
 
-    /// Store result in cache
+    /// Store result in cache.
+    ///
+    /// `provenance` is an opaque serialized blob the caller round-trips: the
+    /// cache stores bytes and never interprets them, so the provenance schema
+    /// stays owned by `checks`.
     pub fn set(
         &self,
         check_name: &str,
         key: &str,
         status: &str,
         output: Option<&str>,
+        provenance: Option<&str>,
     ) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -73,7 +91,18 @@ impl Cache {
 
         // Write log if present
         if let Some(output) = output {
-            fs::write(cache_dir.join(format!("{}.log", key)), output)?;
+            fs::write(sidecar(&cache_dir, key, LOG_SUFFIX), output)?;
+        }
+
+        // Write provenance if present, and drop a stale one otherwise so a
+        // re-run without provenance can never replay the previous run's.
+        match provenance {
+            Some(provenance) => {
+                fs::write(sidecar(&cache_dir, key, PROVENANCE_SUFFIX), provenance)?;
+            }
+            None => {
+                let _ = fs::remove_file(sidecar(&cache_dir, key, PROVENANCE_SUFFIX));
+            }
         }
 
         Ok(())
@@ -82,7 +111,10 @@ impl Cache {
     fn cleanup(&self, dir: &Path, keep: usize) -> Result<()> {
         let mut entries: Vec<_> = crate::paths::read_dir_within(dir, Path::new("."))?
             .filter_map(|e| e.ok())
-            .filter(|e| !e.file_name().to_string_lossy().ends_with(".log"))
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                !name.ends_with(LOG_SUFFIX) && !name.ends_with(PROVENANCE_SUFFIX)
+            })
             .collect();
 
         entries.sort_by_key(|e| {
@@ -94,8 +126,13 @@ impl Cache {
         if entries.len() > keep {
             for entry in entries.iter().take(entries.len() - keep) {
                 let _ = fs::remove_file(entry.path());
-                let log_path = entry.path().with_extension("log");
-                let _ = fs::remove_file(log_path);
+                // Suffix-append, not `with_extension`: a key carrying a dot
+                // (`audit-<lock>-2026-08-22` style keys are dot-free today, but
+                // nothing enforces it) would otherwise have its own tail
+                // replaced and leave the sidecars orphaned.
+                let key = entry.file_name().to_string_lossy().to_string();
+                let _ = fs::remove_file(sidecar(dir, &key, LOG_SUFFIX));
+                let _ = fs::remove_file(sidecar(dir, &key, PROVENANCE_SUFFIX));
             }
         }
 
@@ -103,9 +140,17 @@ impl Cache {
     }
 }
 
+fn sidecar(cache_dir: &Path, key: &str, suffix: &str) -> PathBuf {
+    cache_dir.join(format!("{key}{suffix}"))
+}
+
 pub struct CachedResult {
     pub status: String,
     pub output: Option<String>,
+    /// Serialized provenance of the run that populated this entry, verbatim as
+    /// the caller stored it. `None` for entries written before the sidecar
+    /// existed, or for a check that produced no provenance.
+    pub provenance: Option<String>,
 }
 
 /// Generate a content-based cache key for TypeScript checks.
@@ -192,6 +237,7 @@ mod tests {
         let result = CachedResult {
             status: "passed".to_string(),
             output: Some("test output".to_string()),
+            provenance: None,
         };
         assert_eq!(result.status, "passed");
         assert_eq!(result.output, Some("test output".to_string()));
@@ -202,9 +248,108 @@ mod tests {
         let result = CachedResult {
             status: "failed".to_string(),
             output: None,
+            provenance: None,
         };
         assert_eq!(result.status, "failed");
         assert!(result.output.is_none());
+    }
+
+    #[test]
+    fn cache_round_trips_the_provenance_sidecar() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Cache {
+            dir: temp_dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        cache
+            .set(
+                "check",
+                "key",
+                "passed",
+                Some("out"),
+                Some(r#"{"cwd":"/repo"}"#),
+            )
+            .unwrap();
+
+        let result = cache.get("check", "key").unwrap();
+        assert_eq!(result.provenance.as_deref(), Some(r#"{"cwd":"/repo"}"#));
+    }
+
+    #[test]
+    fn cache_entry_without_provenance_sidecar_reads_back_as_none() {
+        // Backwards compatibility: entries written before the sidecar existed
+        // have only the status (+ log) files. Reading them must yield an unknown
+        // provenance rather than failing the lookup.
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Cache {
+            dir: temp_dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        let legacy_dir = temp_dir.path().join("check");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(legacy_dir.join("legacy-key"), "passed").unwrap();
+        fs::write(legacy_dir.join("legacy-key.log"), "out").unwrap();
+
+        let result = cache.get("check", "legacy-key").unwrap();
+        assert_eq!(result.status, "passed");
+        assert_eq!(result.output.as_deref(), Some("out"));
+        assert!(result.provenance.is_none());
+    }
+
+    #[test]
+    fn cache_set_without_provenance_drops_a_stale_sidecar() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Cache {
+            dir: temp_dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        cache
+            .set(
+                "check",
+                "key",
+                "passed",
+                Some("out"),
+                Some(r#"{"cwd":"/old"}"#),
+            )
+            .unwrap();
+        cache
+            .set("check", "key", "passed", Some("out"), None)
+            .unwrap();
+
+        assert!(cache.get("check", "key").unwrap().provenance.is_none());
+    }
+
+    #[test]
+    fn cleanup_does_not_count_sidecars_as_cache_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Cache {
+            dir: temp_dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        // 5 entries, each with a log + provenance sidecar. Counting sidecars as
+        // entries would push the total past `keep` and evict live entries.
+        for i in 0..5 {
+            cache
+                .set(
+                    "check",
+                    &format!("key{i}"),
+                    "passed",
+                    Some("out"),
+                    Some(r#"{"cwd":"/repo"}"#),
+                )
+                .unwrap();
+        }
+
+        for i in 0..5 {
+            let entry = cache
+                .get("check", &format!("key{i}"))
+                .unwrap_or_else(|| panic!("key{i} must survive cleanup"));
+            assert_eq!(entry.provenance.as_deref(), Some(r#"{"cwd":"/repo"}"#));
+        }
     }
 
     #[test]
@@ -238,7 +383,7 @@ mod tests {
         };
 
         cache
-            .set("test_check", "key123", "passed", Some("output text"))
+            .set("test_check", "key123", "passed", Some("output text"), None)
             .unwrap();
 
         let result = cache.get("test_check", "key123").unwrap();
@@ -254,7 +399,9 @@ mod tests {
             enabled: true,
         };
 
-        cache.set("test_check", "key456", "failed", None).unwrap();
+        cache
+            .set("test_check", "key456", "failed", None, None)
+            .unwrap();
 
         let result = cache.get("test_check", "key456").unwrap();
         assert_eq!(result.status, "failed");
@@ -269,7 +416,7 @@ mod tests {
             enabled: false,
         };
 
-        let result = cache.set("test", "key", "passed", Some("output"));
+        let result = cache.set("test", "key", "passed", Some("output"), None);
         assert!(result.is_ok());
 
         // Enable cache to verify nothing was written
@@ -288,10 +435,14 @@ mod tests {
             enabled: true,
         };
 
-        cache.set("check1", "key1", "passed", Some("out1")).unwrap();
-        cache.set("check2", "key2", "failed", Some("out2")).unwrap();
         cache
-            .set("check3", "key3", "warnings", Some("out3"))
+            .set("check1", "key1", "passed", Some("out1"), None)
+            .unwrap();
+        cache
+            .set("check2", "key2", "failed", Some("out2"), None)
+            .unwrap();
+        cache
+            .set("check3", "key3", "warnings", Some("out3"), None)
             .unwrap();
 
         assert_eq!(cache.get("check1", "key1").unwrap().status, "passed");
@@ -307,8 +458,12 @@ mod tests {
             enabled: true,
         };
 
-        cache.set("check", "key", "passed", Some("old")).unwrap();
-        cache.set("check", "key", "failed", Some("new")).unwrap();
+        cache
+            .set("check", "key", "passed", Some("old"), None)
+            .unwrap();
+        cache
+            .set("check", "key", "failed", Some("new"), None)
+            .unwrap();
 
         let result = cache.get("check", "key").unwrap();
         assert_eq!(result.status, "failed");
@@ -380,7 +535,13 @@ mod tests {
 
         // Add more than 5 entries - cleanup should run without error
         for i in 0..8 {
-            let result = cache.set("check", &format!("key{}", i), "passed", Some("output"));
+            let result = cache.set(
+                "check",
+                &format!("key{}", i),
+                "passed",
+                Some("output"),
+                None,
+            );
             assert!(result.is_ok());
         }
 
@@ -541,8 +702,12 @@ mod tests {
             enabled: true,
         };
 
-        cache.set("check", "key1", "passed", Some("out1")).unwrap();
-        cache.set("check", "key2", "failed", Some("out2")).unwrap();
+        cache
+            .set("check", "key1", "passed", Some("out1"), None)
+            .unwrap();
+        cache
+            .set("check", "key2", "failed", Some("out2"), None)
+            .unwrap();
 
         let result1 = cache.get("check", "key1").unwrap();
         let result2 = cache.get("check", "key2").unwrap();
