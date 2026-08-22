@@ -201,6 +201,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Rewording a comment inside a declaration is no longer a signature change.**
+  Declarations were compared on their verbatim text, comments and all, so a
+  remove+re-add of a byte-identical public signature whose internal comment had
+  been rewritten came out as a `ChangedSignature` — a breaking-change claim
+  about text no consumer can observe. Pairing now compares a comment-free view
+  of the same lines while `BREAKING_CHANGES.md` keeps showing the declaration as
+  written. String and char literals stay in that view: a literal is code, so a
+  changed `pub const GREETING: &str = "hello";` still surfaces.
+- **A brace in a test function's signature no longer ends its test context.**
+  The perf tracker treated the first `{` after a test marker as the item's body
+  opener, but a brace in type or pattern position — `fn run() -> Buffer<{ LIMIT
+  }>`, or the extractor idiom `fn handler(Parameters(Req { field }):
+  Parameters<Req>)` — balances before any body exists. The next line then looked
+  like the item closing again, so the context ended at the signature and every
+  loop and query in the test body was reported as a production perf regression.
+  The body opener is now the first brace outside the signature's bracket
+  nesting.
 - **`report.json` names the origin of every quality-failure detail.**
   `gate.quality_failure_details[]` carried `name` + `classification` while
   `MERGE_GATE.json` has carried `origin` (`"failure"` / `"warning"`) since

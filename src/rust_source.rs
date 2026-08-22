@@ -25,8 +25,23 @@ pub(crate) struct SourceScanner {
 
 impl SourceScanner {
     /// The code part of `line`, continuing any construct still open.
+    ///
+    /// Literal BODIES are dropped along with the comments, because this view
+    /// exists for delimiter counting: a brace typed inside a string is text, not
+    /// structure.
     pub(crate) fn code_only<'a>(&mut self, line: &'a str) -> Cow<'a, str> {
-        scan(line, &mut self.state)
+        scan(line, &mut self.state, Literals::Drop)
+    }
+
+    /// The same, with string and char literals kept verbatim.
+    ///
+    /// For callers that compare source rather than count delimiters. Dropping a
+    /// literal is right for a delimiter tracker and wrong for an identity:
+    /// `pub const GREETING: &str = "hello";` and the same line ending `"bye";`
+    /// are not the same declaration, and reading them as one would pair a real
+    /// value change away as an unchanged re-add.
+    pub(crate) fn code_with_literals<'a>(&mut self, line: &'a str) -> Cow<'a, str> {
+        scan(line, &mut self.state, Literals::Keep)
     }
 
     /// Forget a comment or literal left open: the next line is not contiguous
@@ -39,6 +54,27 @@ impl SourceScanner {
     /// carrying fixes. The residue never outlives the hunk.
     pub(crate) fn reset(&mut self) {
         self.state = ScanState::default();
+    }
+}
+
+/// What a scan does with the literals it resolves.
+///
+/// Both views resolve comments and literals identically — only the output
+/// differs, so a scanner's carried state advances the same way whichever one a
+/// caller asks for.
+#[derive(Clone, Copy)]
+enum Literals {
+    /// Emit nothing for a literal: it is text, and its delimiters are not syntax.
+    Drop,
+    /// Emit the literal verbatim, opening and closing delimiters included.
+    Keep,
+}
+
+impl Literals {
+    fn emit(self, out: &mut String, literal: &str) {
+        if matches!(self, Literals::Keep) {
+            out.push_str(literal);
+        }
     }
 }
 
@@ -60,10 +96,11 @@ enum OpenLiteral {
     Raw { hashes: usize },
 }
 
-/// One pass over `line`, dropping comments and blanking literal contents.
+/// One pass over `line`, dropping comments and treating literals per `literals`.
 ///
 /// `state` is what earlier lines left open — a nested block comment, a string
-/// literal — and is updated in place.
+/// literal — and is updated in place. It advances identically for both
+/// `literals` modes: the mode decides what is written out, never what is read.
 ///
 /// Comments and literals are resolved in the SAME pass, which is what keeps a
 /// delimiter from being read in the wrong language: `"http://x"` is a string,
@@ -73,7 +110,7 @@ enum OpenLiteral {
 /// (including `'\u{7b}'`) are recognised; a `'` that does not close as a char
 /// literal is a lifetime and is left alone. A char literal cannot span lines,
 /// so only strings are carried.
-fn scan<'a>(line: &'a str, state: &mut ScanState) -> Cow<'a, str> {
+fn scan<'a>(line: &'a str, state: &mut ScanState, literals: Literals) -> Cow<'a, str> {
     let bytes = line.as_bytes();
     if state.block_comment_depth == 0
         && state.open_literal.is_none()
@@ -91,9 +128,13 @@ fn scan<'a>(line: &'a str, state: &mut ScanState) -> Cow<'a, str> {
         match literal_close(line, 0, open) {
             Some(end) => {
                 state.open_literal = None;
+                literals.emit(&mut out, &line[..end]);
                 i = end;
             }
-            None => return Cow::Owned(out),
+            None => {
+                literals.emit(&mut out, line);
+                return Cow::Owned(out);
+            }
         }
     }
 
@@ -113,9 +154,13 @@ fn scan<'a>(line: &'a str, state: &mut ScanState) -> Cow<'a, str> {
 
         if let Some(raw) = raw_string_start(line, i) {
             match literal_close(line, raw.body_start, raw.open) {
-                Some(end) => i = end,
+                Some(end) => {
+                    literals.emit(&mut out, &line[i..end]);
+                    i = end;
+                }
                 None => {
                     state.open_literal = Some(raw.open);
+                    literals.emit(&mut out, &line[i..]);
                     return Cow::Owned(out);
                 }
             }
@@ -124,14 +169,21 @@ fn scan<'a>(line: &'a str, state: &mut ScanState) -> Cow<'a, str> {
 
         match bytes[i] {
             b'"' => match literal_close(line, i + 1, OpenLiteral::Normal) {
-                Some(end) => i = end,
+                Some(end) => {
+                    literals.emit(&mut out, &line[i..end]);
+                    i = end;
+                }
                 None => {
                     state.open_literal = Some(OpenLiteral::Normal);
+                    literals.emit(&mut out, &line[i..]);
                     return Cow::Owned(out);
                 }
             },
             b'\'' => match char_literal_end(line, i) {
-                Some(end) => i = end,
+                Some(end) => {
+                    literals.emit(&mut out, &line[i..end]);
+                    i = end;
+                }
                 None => {
                     out.push('\'');
                     i += 1;
@@ -306,6 +358,48 @@ mod tests {
             "fn f<'a>(x: &'a str) {"
         );
         assert_eq!(code_only("if depth > 0 {"), "if depth > 0 {");
+    }
+
+    #[test]
+    fn the_literal_keeping_view_drops_only_the_comments() {
+        fn kept(line: &str) -> String {
+            SourceScanner::default()
+                .code_with_literals(line)
+                .into_owned()
+        }
+
+        // Same comment resolution as `code_only` …
+        assert_eq!(kept("let x = 1; // trailing {"), "let x = 1; ");
+        assert_eq!(
+            kept("let x = 1; /* mid */ let y = 2;"),
+            "let x = 1;  let y = 2;"
+        );
+        // … but the literal is source, not a delimiter to be silenced.
+        assert_eq!(kept("let s = \"} {\";"), "let s = \"} {\";");
+        assert_eq!(kept("let c = '}';"), "let c = '}';");
+        assert_eq!(kept("let r = r#\"}\"#;"), "let r = r#\"}\"#;");
+        assert_eq!(kept("let b = br##\"}\"##;"), "let b = br##\"}\"##;");
+        // A `//` inside a raw string is still literal text on either view.
+        assert_eq!(
+            kept("let s = r#\"a \" b // c\"#; {"),
+            "let s = r#\"a \" b // c\"#; {"
+        );
+        // A lifetime is not a literal and is untouched by either view.
+        assert_eq!(kept("fn f<'a>(x: &'a str) {"), "fn f<'a>(x: &'a str) {");
+    }
+
+    #[test]
+    fn the_literal_keeping_view_carries_an_open_literal_across_lines() {
+        let mut scanner = SourceScanner::default();
+        assert_eq!(
+            scanner.code_with_literals("let s = \"start {"),
+            "let s = \"start {"
+        );
+        assert_eq!(
+            scanner.code_with_literals("still inside }"),
+            "still inside }"
+        );
+        assert_eq!(scanner.code_with_literals("end\"; // tail"), "end\"; ");
     }
 
     #[test]

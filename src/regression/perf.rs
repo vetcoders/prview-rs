@@ -391,6 +391,9 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
     let mut in_test = false;
     let mut depth: i32 = 0;
     let mut seen_open = false;
+    // Bracket nesting of the annotated item's SIGNATURE, tracked only until its
+    // body opens. A brace inside `(…)`, `[…]` or `<…>` is not the body.
+    let mut sig_depth: i32 = 0;
     // Block comments and string literals span lines, so the reader is stateful
     // for this hunk. Hunks are not contiguous, and this function is called per
     // hunk, so the scanner starts clean here and is never carried past the
@@ -426,6 +429,7 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
             in_test = true;
             depth = 0;
             seen_open = false;
+            sig_depth = 0;
         }
 
         if is_added {
@@ -433,35 +437,76 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
         }
 
         if in_test {
+            let mut prev = '\0';
             for ch in code.chars() {
                 match ch {
                     '{' => {
                         depth += 1;
-                        seen_open = true;
+                        // Only a brace OUTSIDE the signature's brackets opens
+                        // the body. `fn run() -> Buffer<{ LIMIT }>` and
+                        // `fn run(Params(Req { field }): Params<Req>)` both
+                        // balance a brace pair in type or pattern position,
+                        // before any body exists; reading one as the opener made
+                        // the very next line look like the item closing again,
+                        // so the context ended at the signature and the whole
+                        // test body was recorded as production.
+                        seen_open |= sig_depth == 0;
                     }
                     '}' => depth -= 1,
+                    _ if !seen_open => track_signature_brackets(ch, prev, &mut sig_depth),
                     _ => {}
                 }
+                prev = ch;
             }
             if seen_open && depth <= 0 {
                 in_test = false;
                 depth = 0;
                 seen_open = false;
-            } else if !seen_open && ends_the_annotated_item(trimmed) {
+                sig_depth = 0;
+            } else if !seen_open && sig_depth == 0 && ends_the_annotated_item(trimmed) {
                 // Not every test item has a body. `#[cfg(test)] mod tests;` and
                 // `#[cfg(test)] use crate::helper;` never open a brace, so the
                 // "balanced again" close above could not fire and the context
                 // stayed open over the rest of the hunk — every production loop
                 // and query below it was recorded as test-only and vanished from
                 // the signal. Such an item ends at its `;`, and so does the
-                // context it opened.
+                // context it opened. A `;` still inside the signature's brackets
+                // (`fn f(x: [u8;\n N])`) is not that end.
                 in_test = false;
                 depth = 0;
+                sig_depth = 0;
             }
         }
     }
 
     flags
+}
+
+/// Advance the signature's bracket nesting by one character.
+///
+/// Called only before the annotated item's body opens, which is the one region
+/// where `<` is reliably a generic opener rather than a comparison: signatures
+/// do not compare. `->` is spelled with the same `>`, so a return arrow must not
+/// be read as closing an angle bracket. The depth is clamped at zero because a
+/// hunk may start mid-signature and hand the tracker a closer whose opener it
+/// never saw; erring toward zero makes the next brace read as the body opener,
+/// which ENDS the test context — a phantom perf signal costs a reviewer a
+/// glance, while a context stuck open mutes real production code.
+///
+/// Braces in type or pattern position are rare but real: across the local
+/// crates.io registry (59,974 files, 1,697,077 `fn` signatures) 1,191 signatures
+/// carry one, 715 of them with the body opener on a later line — the shape that
+/// actually breaks the tracker — and 59 of those signatures are test-annotated.
+/// The dominant idiom is not the const generic `Buffer<{ LIMIT }>` but the
+/// destructured extractor parameter, `fn handler(Parameters(Req { field }):
+/// Parameters<Req>)`, as written by `rmcp`, `leptos` and `sqlx`.
+fn track_signature_brackets(ch: char, prev: char, sig_depth: &mut i32) {
+    match ch {
+        '(' | '[' | '<' => *sig_depth += 1,
+        '>' if prev == '-' => {}
+        ')' | ']' | '>' => *sig_depth = (*sig_depth - 1).max(0),
+        _ => {}
+    }
 }
 
 /// Does this line finish a body-less item that a test marker annotated?
@@ -1395,6 +1440,100 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         );
         assert_eq!(result.query_in_loop_count, 0);
         assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_const_generic_braces_in_a_signature_do_not_open_the_body() {
+        // `Buffer<{ LIMIT }>` balances a brace pair in TYPE position, before the
+        // body exists. Counting it as the item's opener let the very next line
+        // look like the item closing again, so the test context ended at the
+        // signature and every loop in the body was recorded as production.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{ LIMIT }>
+ {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a const-generic brace in the signature must not close the test context"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_destructured_parameter_does_not_open_the_body() {
+        // The idiom the corpus actually shows: an extractor parameter matched by
+        // pattern, as `rmcp`, `leptos` and `sqlx` write their handlers. The brace
+        // pair sits inside the parameter list, lines before the body exists.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[tokio::test]
+ async fn slow_tool(
+     Parameters(SlowToolRequest { sleep_ms }): Parameters<SlowToolRequest>,
+ ) -> Result<(), Error> {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a destructured parameter must not close the test context"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_const_generic_signature_still_closes_at_its_real_body_end() {
+        // The other direction, and the reason the fix cannot simply ignore
+        // braces in signatures: once the real body opener is found the context
+        // must still end where the body ends, or production code after the test
+        // is muted.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{ LIMIT }>
+ {
+     let n = 1;
+ }
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "production code after the test body must not stay muted"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
     }
 
     #[test]
