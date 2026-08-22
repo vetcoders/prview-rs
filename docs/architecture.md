@@ -418,7 +418,10 @@ Every check records a `CheckProvenance` alongside its result: `command`,
   - `foreign` — a directory that is neither this repository's working tree nor
     one of its worktrees. Being outside `repo_root` is not proof of a snapshot,
     and labelling a different checkout `snapshot` would certify its verdict as
-    the reviewed commit's.
+    the reviewed commit's. Position does not settle it in the other direction
+    either: repository identity is checked **first**, so a vendored checkout, a
+    submodule or an in-repo symlink to another clone is `foreign` even though it
+    sits below `repo_root` — `target_sha` there is the other project's `HEAD`.
 
 Both are resolved from the directory the command actually ran in, by the single
 `resolve_scan_substrate(cwd, repo_root)` helper, so a change in where a check

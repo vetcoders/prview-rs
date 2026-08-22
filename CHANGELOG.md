@@ -226,7 +226,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `node_modules`; cargo and Semgrep read nothing through it, so a mixed
   repository no longer downgrades their provenance, and the Python checks run
   against the per-commit `UV_PROJECT_ENVIRONMENT` rather than the linked
-  `.venv`, so they stay `snapshot` too.
+  `.venv`, so they stay `snapshot` too. Repository identity is now settled
+  before position, in both directions: a check running in a vendored checkout, a
+  submodule or an in-repo symlink to another clone used to be recorded as this
+  repository's `local-clean`/`local-dirty` tree with the OTHER project's `HEAD`
+  as `target_sha`, because sitting below `repo_root` was taken as proof. Such a
+  directory is `foreign` wherever it sits.
 
 ### Changed
 
