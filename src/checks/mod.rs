@@ -41,8 +41,11 @@ pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TreeState {
-    /// Ephemeral `git worktree` of THIS repository materialising the reviewed
+    /// A tree materialised from THIS repository's objects at the reviewed
     /// target commit, unmodified — the scanned bytes are exactly `target_sha`.
+    /// Either the ephemeral `git worktree` the language checks share, or the
+    /// `git archive` extraction the Loctree heuristics scan; both carry the
+    /// commit's tree and nothing from the working directory.
     Snapshot,
     /// Same worktree, but it carries changes the run itself produced (a
     /// generated `Cargo.lock`, a tool writing into the checkout) — the scanned

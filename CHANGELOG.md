@@ -50,6 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `00_summary/RUN.json` and `report.json`. They are additive and optional:
   consumers of older packs (and of checks that ran outside a git repository)
   keep parsing unchanged, so no artifact `schema_version` bump is required.
+  The synthetic `heuristics_loctree` gate is covered too: it runs in-process
+  rather than as a subprocess, but it still scans a tree — the `git archive`
+  extraction of the target commit, or `repo_root` when no snapshot could be
+  made — and its `PROVENANCE.json` row used to be entirely null, leaving one of
+  the pack's gating signals unauditable. `HeuristicsResult` now carries the
+  commit its analysis root was extracted from along with the scan's start and
+  end times (all additive and optional).
 
 ### Fixed
 

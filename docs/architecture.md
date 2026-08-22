@@ -378,8 +378,9 @@ Every check records a `CheckProvenance` alongside its result: `command`,
 - `target_sha` — commit whose tree the check scanned (the snapshot's detached
   commit, or the repo `HEAD` for an in-place scan).
 - `tree_state` — which tree, and whether it still matches its commit:
-  - `snapshot` — ephemeral worktree **of this repository** at the reviewed
-    commit, unmodified;
+  - `snapshot` — a tree materialised **from this repository's objects** at the
+    reviewed commit, unmodified: the ephemeral worktree the language checks
+    share, or the `git archive` extraction the Loctree heuristics scan;
   - `snapshot-dirty` — the same worktree after the run wrote into it (a
     generated `Cargo.lock`, a tool writing into the checkout), so the scanned
     bytes are **not** exactly `target_sha`. The dependency symlinks prview
@@ -487,7 +488,12 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   digest. Only the dirty subset is hashed. It is a stable fingerprint, not a
   capture of a specific `git status --porcelain` stdout;
 - `checks[]` — one row per check: `{id, cwd, target_sha, tree_state, started_at,
-  cached}`, with `null` fields for a check that produced no provenance.
+  cached}`, with `null` fields for a check that produced no provenance. The
+  synthetic `heuristics_loctree` row is included: Loctree runs in-process rather
+  than as a subprocess (`command` is `loctree (in-process)`), but it still reads
+  a tree — the `git archive` extraction of the target commit in snapshot mode,
+  or `repo_root` when no snapshot could be made — and a gating signal whose
+  substrate is unstated is unauditable.
 
 The worktree state is frozen **per run**, and a `--watch` iteration is a run:
 each iteration re-reads the working tree before its checks, so the pack it emits

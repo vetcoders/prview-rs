@@ -190,9 +190,66 @@ pub(crate) struct DashboardContextInput<'a> {
     clean_comparison: CleanComparison,
 }
 
+/// Provenance for the synthetic `heuristics_loctree` result.
+///
+/// The gate is synthetic, the substrate is not: heuristics scan either an
+/// extracted target tree or the local working tree, and PROVENANCE.json's whole
+/// job is to name the tree behind every gating signal. Leaving these rows null
+/// made one of the pack's gates the only unauditable one.
+///
+/// Three cases, and none of them guesses:
+/// - an analysis root WITH the commit it was extracted from — `git archive`
+///   writes the commit's tree and nothing else, so the bytes are exactly that
+///   commit (`snapshot`);
+/// - an analysis root with no recorded commit (a result deserialized from a
+///   pack written before `analysis_sha` existed) — the directory is reported,
+///   the substrate stays unknown;
+/// - no analysis root — the scan ran in `repo_root`, classified like any other
+///   in-place scan.
+fn heuristics_provenance(
+    heuristics: &HeuristicsResult,
+    config: &Config,
+) -> Option<crate::checks::CheckProvenance> {
+    use crate::checks::{ScanSubstrate, TreeState, resolve_scan_substrate};
+
+    let (cwd, substrate) = match heuristics.analysis_root.as_deref() {
+        Some(root) => (
+            root.to_string(),
+            match heuristics.analysis_sha.as_deref() {
+                Some(sha) => ScanSubstrate {
+                    target_sha: Some(sha.to_string()),
+                    tree_state: Some(TreeState::Snapshot),
+                },
+                None => ScanSubstrate::default(),
+            },
+        ),
+        None => (
+            config.repo_root.display().to_string(),
+            // Loctree consumes no dependency tree of its own — it reads source.
+            resolve_scan_substrate(&config.repo_root, &config.repo_root, &[]),
+        ),
+    };
+
+    Some(crate::checks::CheckProvenance {
+        // Loctree runs in-process as a library, so there is no argv to record.
+        command: "loctree (in-process)".to_string(),
+        tool_version: None,
+        cwd,
+        target_sha: substrate.target_sha,
+        tree_state: substrate.tree_state,
+        exit_code: None,
+        // Absent only in results built before the scan recorded its own timing
+        // (older packs, hand-built fixtures).
+        started_at: heuristics.started_at.clone().unwrap_or_default(),
+        finished_at: heuristics.finished_at.clone().unwrap_or_default(),
+        hard_fail_signatures: Vec::new(),
+        cache_key: None,
+    })
+}
+
 /// Build a synthetic CheckResult for heuristics_loctree so it appears in
 /// report.json checks[] and dashboard checks table alongside real checks.
-fn build_heuristics_check(heuristics: Option<&HeuristicsResult>) -> CheckResult {
+fn build_heuristics_check(heuristics: Option<&HeuristicsResult>, config: &Config) -> CheckResult {
     use crate::checks::CheckStatus;
     match heuristics {
         Some(heuristics)
@@ -223,7 +280,7 @@ fn build_heuristics_check(heuristics: Option<&HeuristicsResult>) -> CheckResult 
                 duration: std::time::Duration::ZERO,
                 output,
                 cached: false,
-                provenance: None,
+                provenance: heuristics_provenance(heuristics, config),
             }
         }
         _ => CheckResult {
@@ -259,7 +316,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     .to_rfc3339();
 
     // Build extended checks list including synthetic heuristics check
-    let heuristics_check = build_heuristics_check(heuristics);
+    let heuristics_check = build_heuristics_check(heuristics, config);
     let mut all_checks: Vec<CheckResult> = checks.to_vec();
     all_checks.push(heuristics_check);
     let context_artifacts = plan_context_artifacts(config, diffs, &all_checks);

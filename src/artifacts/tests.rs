@@ -1029,6 +1029,76 @@ fn checks_status_includes_loctree_heuristics_when_available() {
 }
 
 #[test]
+fn synthetic_heuristics_check_records_the_tree_it_scanned() {
+    // heuristics_loctree gates the pack like any other check, so PROVENANCE.json
+    // must be able to name the tree behind it. In snapshot mode that is the
+    // extracted target tree — `git archive` writes the commit and nothing else,
+    // so the scan really is exactly that commit.
+    use crate::checks::TreeState;
+    use crate::heuristics::{HeuristicsResult, HeuristicsSummary, LoctreeAnalysis};
+
+    let heuristics = HeuristicsResult {
+        loctree: Some(LoctreeAnalysis {
+            available: true,
+            ..Default::default()
+        }),
+        summary: HeuristicsSummary {
+            total_files: 12,
+            ..Default::default()
+        },
+        analysis_root: Some("/tmp/prview/repo/abc1234-1".to_string()),
+        analysis_sha: Some("abc1234abc1234abc1234abc1234abc1234abc12".to_string()),
+        started_at: Some("2026-08-22T10:00:00+02:00".to_string()),
+        finished_at: Some("2026-08-22T10:00:04+02:00".to_string()),
+        ..Default::default()
+    };
+
+    let config = create_test_config(PolicyConfig::default());
+    let prov = build_heuristics_check(Some(&heuristics), &config)
+        .provenance
+        .expect("a gating signal must name its substrate");
+
+    assert_eq!(prov.cwd, "/tmp/prview/repo/abc1234-1");
+    assert_eq!(
+        prov.target_sha.as_deref(),
+        Some("abc1234abc1234abc1234abc1234abc1234abc12"),
+    );
+    assert_eq!(prov.tree_state, Some(TreeState::Snapshot));
+    assert_eq!(prov.started_at, "2026-08-22T10:00:00+02:00");
+}
+
+#[test]
+fn synthetic_heuristics_check_leaves_an_unnamed_snapshot_unknown() {
+    // A pack written before the analysis commit was recorded still has its
+    // analysis root. Report the directory, and stop there: guessing that it
+    // holds the target commit is exactly the false certification the manifest
+    // exists to prevent.
+    use crate::heuristics::{HeuristicsResult, HeuristicsSummary, LoctreeAnalysis};
+
+    let heuristics = HeuristicsResult {
+        loctree: Some(LoctreeAnalysis {
+            available: true,
+            ..Default::default()
+        }),
+        summary: HeuristicsSummary {
+            total_files: 12,
+            ..Default::default()
+        },
+        analysis_root: Some("/tmp/prview/repo/older-pack".to_string()),
+        ..Default::default()
+    };
+
+    let config = create_test_config(PolicyConfig::default());
+    let prov = build_heuristics_check(Some(&heuristics), &config)
+        .provenance
+        .expect("the scanned directory is known even when its commit is not");
+
+    assert_eq!(prov.cwd, "/tmp/prview/repo/older-pack");
+    assert_eq!(prov.target_sha, None);
+    assert_eq!(prov.tree_state, None);
+}
+
+#[test]
 fn synthetic_heuristics_check_skips_zero_file_scan() {
     use crate::heuristics::{HeuristicsResult, HeuristicsSummary, LoctreeAnalysis};
 
@@ -1044,7 +1114,8 @@ fn synthetic_heuristics_check_skips_zero_file_scan() {
         ..Default::default()
     };
 
-    let check = build_heuristics_check(Some(&heuristics));
+    let config = create_test_config(PolicyConfig::default());
+    let check = build_heuristics_check(Some(&heuristics), &config);
 
     assert_eq!(check.name, "heuristics_loctree");
     assert_eq!(check.status, CheckStatus::Skipped);
