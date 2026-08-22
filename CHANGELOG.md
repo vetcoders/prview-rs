@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Check provenance now records the tree each gate actually scanned: `target_sha`
+  (the commit whose tree the check read) and `tree_state` (`snapshot`,
+  `local-clean` or `local-dirty`). Previously `cwd` was the only substrate
+  signal, so an artifact pack could not prove whether a gate saw the reviewed
+  commit or an operator's uncommitted working tree. Both fields are resolved
+  from the directory the command ran in and surface in
+  `20_quality/<gate>.result.json`, `20_quality/full-checks.log`,
+  `00_summary/RUN.json` and `report.json`. They are additive and optional:
+  consumers of older packs (and of checks that ran outside a git repository)
+  keep parsing unchanged, so no artifact `schema_version` bump is required.
+
 ### Fixed
 
 - `Pytest` now runs in the reviewed target snapshot instead of `config.repo_root`.

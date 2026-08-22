@@ -869,6 +869,12 @@ fn generate_checks_log(dir: &Path, checks: &[CheckResult]) -> Result<()> {
             content.push_str(&format!("Command: {}\n", prov.command));
             content.push_str(&format!("Exit code: {:?}\n", prov.exit_code));
             content.push_str(&format!("CWD: {}\n", prov.cwd));
+            if let Some(ref sha) = prov.target_sha {
+                content.push_str(&format!("Target SHA: {}\n", sha));
+            }
+            if let Some(state) = prov.tree_state {
+                content.push_str(&format!("Tree state: {}\n", state.as_str()));
+            }
             if !prov.hard_fail_signatures.is_empty() {
                 content.push_str(&format!(
                     "Hard fail signatures: {}\n",
@@ -958,6 +964,12 @@ fn generate_gate_results(dir: &Path, checks: &[CheckResult]) -> Result<()> {
             result["started_at"] = json!(prov.started_at);
             result["finished_at"] = json!(prov.finished_at);
             result["hard_fail_signatures"] = json!(prov.hard_fail_signatures);
+            if let Some(ref sha) = prov.target_sha {
+                result["target_sha"] = json!(sha);
+            }
+            if let Some(state) = prov.tree_state {
+                result["tree_state"] = json!(state.as_str());
+            }
             if let Some(ref ver) = prov.tool_version {
                 result["tool_version"] = json!(ver);
             }
@@ -1102,6 +1114,15 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             if let Some(ref prov) = c.provenance {
                 entry["exit_code"] = json!(prov.exit_code);
                 entry["hard_fail_signatures"] = json!(prov.hard_fail_signatures);
+                // Which tree this gate actually read: without it the run record
+                // cannot prove the gate saw the reviewed commit rather than an
+                // uncommitted local tree.
+                if let Some(ref sha) = prov.target_sha {
+                    entry["target_sha"] = json!(sha);
+                }
+                if let Some(state) = prov.tree_state {
+                    entry["tree_state"] = json!(state.as_str());
+                }
             }
             entry
         })

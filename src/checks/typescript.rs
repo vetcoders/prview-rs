@@ -269,16 +269,21 @@ impl Check for TypeScriptCheck {
             duration: start.elapsed(),
             output: combined.clone(),
             cached: false,
-            provenance: Some(CheckProvenance {
-                command: format!("{} tsc --noEmit", js_runner),
-                tool_version: None,
-                cwd: run_dir.display().to_string(),
-                exit_code: output.status.code(),
-                started_at,
-                finished_at,
-                hard_fail_signatures: find_hard_fail_signatures(&combined),
-                cache_key: self.cache_key(config),
-            }),
+            provenance: Some(
+                CheckProvenance {
+                    command: format!("{} tsc --noEmit", js_runner),
+                    tool_version: None,
+                    cwd: run_dir.display().to_string(),
+                    exit_code: output.status.code(),
+                    started_at,
+                    finished_at,
+                    hard_fail_signatures: find_hard_fail_signatures(&combined),
+                    cache_key: self.cache_key(config),
+                    target_sha: None,
+                    tree_state: None,
+                }
+                .with_scan_substrate(run_dir, &config.repo_root),
+            ),
         })
     }
 }
@@ -351,16 +356,21 @@ impl Check for ESLintCheck {
             duration: start.elapsed(),
             output: filtered_output.clone(),
             cached: false,
-            provenance: Some(CheckProvenance {
-                command: format!("{} eslint {}", js_runner, args.join(" ")),
-                tool_version: None,
-                cwd: run_dir.display().to_string(),
-                exit_code: output.status.code(),
-                started_at,
-                finished_at,
-                hard_fail_signatures: find_hard_fail_signatures(&combined),
-                cache_key: self.cache_key(config),
-            }),
+            provenance: Some(
+                CheckProvenance {
+                    command: format!("{} eslint {}", js_runner, args.join(" ")),
+                    tool_version: None,
+                    cwd: run_dir.display().to_string(),
+                    exit_code: output.status.code(),
+                    started_at,
+                    finished_at,
+                    hard_fail_signatures: find_hard_fail_signatures(&combined),
+                    cache_key: self.cache_key(config),
+                    target_sha: None,
+                    tree_state: None,
+                }
+                .with_scan_substrate(run_dir, &config.repo_root),
+            ),
         })
     }
 }
@@ -493,16 +503,21 @@ impl Check for VitestCheck {
             duration: start.elapsed(),
             output: combined.clone(),
             cached: false,
-            provenance: Some(CheckProvenance {
-                command: cmd_str,
-                tool_version: None,
-                cwd: run_dir.display().to_string(),
-                exit_code: output.status.code(),
-                started_at,
-                finished_at,
-                hard_fail_signatures: find_hard_fail_signatures(&combined),
-                cache_key: self.cache_key(config),
-            }),
+            provenance: Some(
+                CheckProvenance {
+                    command: cmd_str,
+                    tool_version: None,
+                    cwd: run_dir.display().to_string(),
+                    exit_code: output.status.code(),
+                    started_at,
+                    finished_at,
+                    hard_fail_signatures: find_hard_fail_signatures(&combined),
+                    cache_key: self.cache_key(config),
+                    target_sha: None,
+                    tree_state: None,
+                }
+                .with_scan_substrate(run_dir, &config.repo_root),
+            ),
         })
     }
 }
@@ -588,16 +603,21 @@ impl Check for StylelintCheck {
             duration: start.elapsed(),
             output: filtered_output.clone(),
             cached: false,
-            provenance: Some(CheckProvenance {
-                command: format!("{} stylelint {}", js_runner, args.join(" ")),
-                tool_version: None,
-                cwd: run_dir.display().to_string(),
-                exit_code: output.status.code(),
-                started_at,
-                finished_at,
-                hard_fail_signatures: find_hard_fail_signatures(&combined),
-                cache_key: self.cache_key(config),
-            }),
+            provenance: Some(
+                CheckProvenance {
+                    command: format!("{} stylelint {}", js_runner, args.join(" ")),
+                    tool_version: None,
+                    cwd: run_dir.display().to_string(),
+                    exit_code: output.status.code(),
+                    started_at,
+                    finished_at,
+                    hard_fail_signatures: find_hard_fail_signatures(&combined),
+                    cache_key: self.cache_key(config),
+                    target_sha: None,
+                    tree_state: None,
+                }
+                .with_scan_substrate(run_dir, &config.repo_root),
+            ),
         })
     }
 }

@@ -33,17 +33,129 @@ pub use semgrep::SemgrepCheck;
 pub(crate) use semgrep::output_reports_scan_errors as semgrep_output_reports_scan_errors;
 pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 
+/// Which tree a check's command actually read.
+///
+/// Provenance without this is not auditable: `cwd` alone cannot tell a reviewer
+/// whether the bytes a gate scanned were the reviewed commit or whatever the
+/// operator happened to have uncommitted on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TreeState {
+    /// Ephemeral `git worktree` materialising the reviewed target commit — the
+    /// scanned bytes are exactly `target_sha`.
+    Snapshot,
+    /// The repo's own working tree with no uncommitted changes — the scanned
+    /// bytes are exactly `target_sha`.
+    LocalClean,
+    /// The repo's own working tree carrying uncommitted changes — the scanned
+    /// bytes are NOT exactly `target_sha`.
+    LocalDirty,
+}
+
+impl TreeState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::LocalClean => "local-clean",
+            Self::LocalDirty => "local-dirty",
+        }
+    }
+}
+
+/// The substrate a check ran against: the commit whose tree was scanned, and
+/// whether that tree was a snapshot or the live local working tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanSubstrate {
+    pub target_sha: Option<String>,
+    pub tree_state: Option<TreeState>,
+}
+
+/// Resolve the substrate `cwd` sits on — the single source of truth every check
+/// records through its provenance.
+///
+/// `target_sha` is the commit checked out in `cwd` (the snapshot's detached
+/// commit, or the repo's `HEAD` for an in-place scan). `tree_state` classifies
+/// `cwd` against `repo_root`: a directory outside the repo root is an ephemeral
+/// target snapshot, one inside it is the live working tree, clean or dirty per
+/// `git status --porcelain` (untracked files included).
+///
+/// Best effort: a `cwd` that is not in a git repository yields `None` for both
+/// fields rather than a guess, so an unknown substrate stays visibly unknown.
+pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path) -> ScanSubstrate {
+    let Ok(repo) = git2::Repository::discover(cwd) else {
+        return ScanSubstrate::default();
+    };
+
+    let target_sha = repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map(|commit| commit.id().to_string())
+        .ok();
+
+    let is_external =
+        crate::paths::normalize_to_repo_relative(&cwd.display().to_string(), repo_root).is_external;
+
+    let tree_state = if is_external {
+        TreeState::Snapshot
+    } else if working_tree_is_dirty(&repo) {
+        TreeState::LocalDirty
+    } else {
+        TreeState::LocalClean
+    };
+
+    ScanSubstrate {
+        target_sha,
+        tree_state: Some(tree_state),
+    }
+}
+
+/// `git status --porcelain` is non-empty (untracked files count, ignored ones
+/// do not). A repository whose status cannot be read is reported as clean —
+/// the substrate classification must never fail a check.
+fn working_tree_is_dirty(repo: &git2::Repository) -> bool {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .include_ignored(false)
+        .include_unmodified(false);
+    repo.statuses(Some(&mut opts))
+        .map(|statuses| !statuses.is_empty())
+        .unwrap_or(false)
+}
+
 /// Provenance data for a check execution (Artifact Pack v1)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckProvenance {
     pub command: String,
     pub tool_version: Option<String>,
     pub cwd: String,
+    /// Commit whose tree the check scanned. Additive and optional: absent from
+    /// artifacts written before this field existed, and when the substrate is
+    /// not a git repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_sha: Option<String>,
+    /// Whether `cwd` was a target snapshot or the live local tree. Additive and
+    /// optional — see `target_sha`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_state: Option<TreeState>,
     pub exit_code: Option<i32>,
     pub started_at: String,
     pub finished_at: String,
     pub hard_fail_signatures: Vec<String>,
     pub cache_key: Option<String>,
+}
+
+impl CheckProvenance {
+    /// Record the substrate the check ran on, resolved from the directory the
+    /// command actually ran in. Checks that build their provenance literally
+    /// (rather than through [`ProvenanceBuilder`]) chain this so the resolution
+    /// logic stays in one place.
+    #[must_use]
+    pub fn with_scan_substrate(mut self, cwd: &Path, repo_root: &Path) -> Self {
+        let substrate = resolve_scan_substrate(cwd, repo_root);
+        self.target_sha = substrate.target_sha;
+        self.tree_state = substrate.tree_state;
+        self
+    }
 }
 
 /// A check that was configured but could not run
@@ -786,6 +898,9 @@ pub struct ProvenanceBuilder<'a> {
     pub cmd: &'a str,
     pub args: &'a [&'a str],
     pub cwd: &'a Path,
+    /// Repo root of the run. Classifies the substrate `cwd` sits on, and is the
+    /// base for the repo-relative `cwd` rendering.
+    pub repo_root: &'a Path,
     pub output: &'a Output,
     pub combined_output: &'a str,
     pub started_at: &'a str,
@@ -793,17 +908,22 @@ pub struct ProvenanceBuilder<'a> {
     pub cache_key: Option<String>,
 }
 
-impl<'a> ProvenanceBuilder<'a> {
+impl ProvenanceBuilder<'_> {
+    /// Record `cwd` verbatim (absolute path as the command saw it).
     pub fn build(self) -> CheckProvenance {
-        self.build_with_repo_root(None)
+        let cwd = self.cwd.display().to_string();
+        self.build_with_cwd_display(cwd)
     }
 
-    pub fn build_with_repo_root(self, repo_root: Option<&Path>) -> CheckProvenance {
-        let cwd_str = self.cwd.display().to_string();
-        let cwd_display = match repo_root {
-            Some(root) => crate::paths::normalize_path_display(&cwd_str, root),
-            None => cwd_str,
-        };
+    /// Record `cwd` relative to the repo root (`[external]/…` when the command
+    /// ran outside it, e.g. in a target snapshot).
+    pub fn build_repo_relative_cwd(self) -> CheckProvenance {
+        let cwd =
+            crate::paths::normalize_path_display(&self.cwd.display().to_string(), self.repo_root);
+        self.build_with_cwd_display(cwd)
+    }
+
+    fn build_with_cwd_display(self, cwd_display: String) -> CheckProvenance {
         CheckProvenance {
             command: format!("{} {}", self.cmd, self.args.join(" ")),
             tool_version: None,
@@ -813,7 +933,10 @@ impl<'a> ProvenanceBuilder<'a> {
             finished_at: self.finished_at.to_string(),
             hard_fail_signatures: find_hard_fail_signatures(self.combined_output),
             cache_key: self.cache_key,
+            target_sha: None,
+            tree_state: None,
         }
+        .with_scan_substrate(self.cwd, self.repo_root)
     }
 }
 
@@ -1020,6 +1143,109 @@ mod tests {
         config.use_cache = false;
         config.create_zip = false;
         config
+    }
+
+    /// Minimal git fixture: an initialised repo with one commit, returning the
+    /// temp dir and the commit id.
+    fn repo_with_one_commit() -> (tempfile::TempDir, String) {
+        use crate::git::cmd::git_cmd;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {:?} failed", args);
+        };
+
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "prview@example.test"]);
+        run_git(&["config", "user.name", "prview test"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("tracked.txt"), "one\n").expect("write fixture");
+        run_git(&["add", "tracked.txt"]);
+        run_git(&["commit", "-q", "-m", "one"]);
+
+        let out = git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .expect("rev-parse");
+        assert!(out.status.success());
+        let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        (tmp, sha)
+    }
+
+    #[test]
+    fn scan_substrate_of_a_target_snapshot_names_the_snapshot_commit() {
+        // A snapshot-backed check scans an ephemeral worktree of the reviewed
+        // commit. Provenance must name THAT commit and mark the tree as a
+        // snapshot — otherwise an artifact cannot prove which tree was scanned.
+        let (repo, first) = repo_with_one_commit();
+        let root = repo.path();
+
+        let snapshot =
+            crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
+        let substrate = resolve_scan_substrate(&snapshot.worktree_path, root);
+
+        assert_eq!(substrate.target_sha.as_deref(), Some(first.as_str()));
+        assert_eq!(substrate.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[test]
+    fn scan_substrate_of_a_clean_local_tree_is_head() {
+        // Target == HEAD: the check reads the local tree in place. With nothing
+        // uncommitted, the scanned bytes really are HEAD.
+        let (repo, head) = repo_with_one_commit();
+        let root = repo.path();
+
+        let substrate = resolve_scan_substrate(root, root);
+
+        assert_eq!(substrate.target_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(substrate.tree_state, Some(TreeState::LocalClean));
+    }
+
+    #[test]
+    fn scan_substrate_of_a_dirty_local_tree_is_flagged() {
+        // The audit-critical case: the check ran on HEAD's working tree, but the
+        // tree carried uncommitted edits, so the scanned bytes are NOT HEAD. The
+        // provenance must say so rather than claim a clean HEAD scan.
+        let (repo, head) = repo_with_one_commit();
+        let root = repo.path();
+
+        std::fs::write(root.join("tracked.txt"), "edited\n").expect("dirty the tree");
+        let substrate = resolve_scan_substrate(root, root);
+        assert_eq!(substrate.target_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(substrate.tree_state, Some(TreeState::LocalDirty));
+
+        // An untracked file is dirt too — `git status --porcelain` lists it.
+        std::fs::write(root.join("tracked.txt"), "one\n").expect("restore");
+        assert_eq!(
+            resolve_scan_substrate(root, root).tree_state,
+            Some(TreeState::LocalClean),
+            "restoring the tracked file must return the tree to clean",
+        );
+        std::fs::write(root.join("untracked.txt"), "new\n").expect("write untracked");
+        assert_eq!(
+            resolve_scan_substrate(root, root).tree_state,
+            Some(TreeState::LocalDirty),
+        );
+    }
+
+    #[test]
+    fn scan_substrate_outside_a_repository_stays_unknown() {
+        // No git repo: report nothing rather than guessing a substrate.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        if git2::Repository::discover(tmp.path()).is_ok() {
+            // TMPDIR itself lives inside a repository on this machine — the
+            // no-repo case cannot be staged here.
+            return;
+        }
+        let substrate = resolve_scan_substrate(tmp.path(), tmp.path());
+        assert_eq!(substrate, ScanSubstrate::default());
     }
 
     #[test]

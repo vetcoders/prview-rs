@@ -94,16 +94,21 @@ impl Check for RuffCheck {
             duration: start.elapsed(),
             output: combined.clone(),
             cached: false,
-            provenance: Some(CheckProvenance {
-                command: cmd_str.to_string(),
-                tool_version: None,
-                cwd: run_dir.display().to_string(),
-                exit_code: output.status.code(),
-                started_at,
-                finished_at,
-                hard_fail_signatures: find_hard_fail_signatures(&combined),
-                cache_key: self.cache_key(config),
-            }),
+            provenance: Some(
+                CheckProvenance {
+                    command: cmd_str.to_string(),
+                    tool_version: None,
+                    cwd: run_dir.display().to_string(),
+                    exit_code: output.status.code(),
+                    started_at,
+                    finished_at,
+                    hard_fail_signatures: find_hard_fail_signatures(&combined),
+                    cache_key: self.cache_key(config),
+                    target_sha: None,
+                    tree_state: None,
+                }
+                .with_scan_substrate(run_dir, &config.repo_root),
+            ),
         })
     }
 }
@@ -187,16 +192,21 @@ impl Check for MypyCheck {
             duration: start.elapsed(),
             output: combined.clone(),
             cached: false,
-            provenance: Some(CheckProvenance {
-                command: cmd_str.to_string(),
-                tool_version: None,
-                cwd: run_dir.display().to_string(),
-                exit_code: output.status.code(),
-                started_at,
-                finished_at,
-                hard_fail_signatures: find_hard_fail_signatures(&combined),
-                cache_key: self.cache_key(config),
-            }),
+            provenance: Some(
+                CheckProvenance {
+                    command: cmd_str.to_string(),
+                    tool_version: None,
+                    cwd: run_dir.display().to_string(),
+                    exit_code: output.status.code(),
+                    started_at,
+                    finished_at,
+                    hard_fail_signatures: find_hard_fail_signatures(&combined),
+                    cache_key: self.cache_key(config),
+                    target_sha: None,
+                    tree_state: None,
+                }
+                .with_scan_substrate(run_dir, &config.repo_root),
+            ),
         })
     }
 }
@@ -272,16 +282,21 @@ impl Check for PytestCheck {
             duration: start.elapsed(),
             output: combined.clone(),
             cached: false,
-            provenance: Some(CheckProvenance {
-                command: cmd_str.to_string(),
-                tool_version: None,
-                cwd: run_dir.display().to_string(),
-                exit_code: output.status.code(),
-                started_at,
-                finished_at,
-                hard_fail_signatures: find_hard_fail_signatures(&combined),
-                cache_key: self.cache_key(config),
-            }),
+            provenance: Some(
+                CheckProvenance {
+                    command: cmd_str.to_string(),
+                    tool_version: None,
+                    cwd: run_dir.display().to_string(),
+                    exit_code: output.status.code(),
+                    started_at,
+                    finished_at,
+                    hard_fail_signatures: find_hard_fail_signatures(&combined),
+                    cache_key: self.cache_key(config),
+                    target_sha: None,
+                    tree_state: None,
+                }
+                .with_scan_substrate(run_dir, &config.repo_root),
+            ),
         })
     }
 }

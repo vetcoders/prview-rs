@@ -252,6 +252,27 @@ directly (`off_head_target_commit()`) and key on the commit id whenever it
 differs from `HEAD` — otherwise a `--pr` run would hit an entry a previous local
 run stored under a working-tree hash and serve the local checkout's verdict.
 
+#### Check provenance
+
+Every non-cached check records a `CheckProvenance` alongside its result:
+`command`, `tool_version`, `cwd`, `exit_code`, `started_at`/`finished_at`,
+`hard_fail_signatures`, `cache_key`, plus the substrate it read:
+
+- `target_sha` — commit whose tree the check scanned (the snapshot's detached
+  commit, or the repo `HEAD` for an in-place scan).
+- `tree_state` — `snapshot` (ephemeral worktree of the reviewed commit),
+  `local-clean` (repo working tree, nothing uncommitted) or `local-dirty` (repo
+  working tree with uncommitted changes — the scanned bytes are **not** exactly
+  `target_sha`).
+
+Both are resolved from the directory the command actually ran in, by the single
+`resolve_scan_substrate(cwd, repo_root)` helper, so a change in where a check
+runs is reflected in its provenance without per-check bookkeeping. Both are
+optional and additive: they are absent from packs generated before they existed,
+and when the scan directory is not inside a git repository. They surface in
+`20_quality/<gate>.result.json`, `20_quality/full-checks.log`,
+`00_summary/RUN.json` (`checks[]`) and `report.json` (`checks[]`).
+
 ### mcp/
 
 The MCP server (`prview mcp`) is a thin contract adapter over the prview core.

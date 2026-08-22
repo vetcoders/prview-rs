@@ -216,13 +216,14 @@ impl Check for CargoCheck {
                     cmd: "cargo",
                     args,
                     cwd,
+                    repo_root: &config.repo_root,
                     output: &output,
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
     }
@@ -293,13 +294,14 @@ impl Check for ClippyCheck {
                     cmd: "cargo",
                     args,
                     cwd,
+                    repo_root: &config.repo_root,
                     output: &output,
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
     }
@@ -397,13 +399,14 @@ impl Check for CargoTestCheck {
                     cmd: "cargo",
                     args,
                     cwd,
+                    repo_root: &config.repo_root,
                     output: &output,
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
     }
@@ -475,13 +478,14 @@ impl Check for RustfmtCheck {
                     cmd: "cargo",
                     args,
                     cwd,
+                    repo_root: &config.repo_root,
                     output: &output,
                     combined_output: &result_output,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
     }
@@ -583,13 +587,14 @@ impl Check for CargoAuditCheck {
                     cmd: "cargo",
                     args,
                     cwd,
+                    repo_root: &config.repo_root,
                     output: &output,
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
     }
@@ -774,13 +779,14 @@ impl Check for CargoGeigerCheck {
                     cmd: "cargo",
                     args,
                     cwd,
+                    repo_root: &config.repo_root,
                     output: &output,
                     combined_output: &combined,
                     started_at: &started_at,
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_with_repo_root(Some(&config.repo_root)),
+                .build_repo_relative_cwd(),
             ),
         })
     }
