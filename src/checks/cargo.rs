@@ -748,11 +748,17 @@ fn substrate_manifest_and_lock(
     ))
 }
 
-/// Whether every dependency the manifest declares is already in the lock.
+/// Whether the lock already answers every dependency the manifest declares.
 ///
-/// A dependency the lock has never heard of is one cargo has to resolve. Anything
-/// unparsable answers "covered": the stamp exists to bound a KNOWN gap, not to
-/// churn the cache on a file this code failed to read.
+/// Two ways it does not: a dependency the lock has never heard of, and one whose
+/// locked version no longer satisfies the requirement the manifest asks for
+/// (`serde = "1"` bumped to `"2"` over a lock still pinning 1.x). Both send cargo
+/// back to the registry when it runs, since nothing here passes `--locked`.
+///
+/// Anything unparsable answers "covered": the stamp exists to bound a KNOWN gap,
+/// not to churn the cache on a file this code failed to read. A `[patch]` or
+/// `[replace]` that redirects a dependency to a version outside its requirement
+/// reads as uncovered — the cost of that is one extra cache miss a day.
 fn lock_covers_manifest(manifest: &str, lock: &str) -> bool {
     let (Ok(manifest), Ok(lock)) = (
         toml::from_str::<toml::Table>(manifest),
@@ -763,27 +769,66 @@ fn lock_covers_manifest(manifest: &str, lock: &str) -> bool {
     let Some(packages) = lock.get("package").and_then(|packages| packages.as_array()) else {
         return true;
     };
-    let locked: std::collections::HashSet<&str> = packages
-        .iter()
-        .filter_map(|package| package.get("name").and_then(|name| name.as_str()))
-        .collect();
+    let mut locked: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for package in packages {
+        let Some(name) = package.get("name").and_then(|name| name.as_str()) else {
+            continue;
+        };
+        let versions = locked.entry(name).or_default();
+        if let Some(version) = package.get("version").and_then(|version| version.as_str()) {
+            versions.push(version);
+        }
+    }
 
-    declared_dependencies(&manifest)
-        .iter()
-        .all(|name| locked.contains(name.as_str()))
+    for (name, requirement) in declared_dependencies(&manifest) {
+        let Some(versions) = locked.get(name.as_str()) else {
+            return false;
+        };
+        // No requirement to check: a path or git dependency, or one inherited
+        // from the workspace, which the root manifest states instead.
+        let Some(requirement) = requirement else {
+            continue;
+        };
+        let Ok(requirement) = semver::VersionReq::parse(&requirement) else {
+            continue;
+        };
+        let satisfied = versions
+            .iter()
+            .any(|version| match semver::Version::parse(version) {
+                Ok(version) => requirement.matches(&version),
+                // A version this parser cannot read answers nothing, so it
+                // counts as satisfying rather than as proof of staleness.
+                Err(_) => true,
+            });
+        if !satisfied {
+            return false;
+        }
+    }
+    true
 }
 
-/// Every crate name the manifest depends on, following `package = "..."` renames
-/// to the name the lockfile would record.
-fn declared_dependencies(manifest: &toml::Table) -> Vec<String> {
+/// Every crate the manifest depends on — the name the lockfile would record
+/// (following a `package = "..."` rename) and the version requirement asked of
+/// it, when one is stated at all.
+fn declared_dependencies(manifest: &toml::Table) -> Vec<(String, Option<String>)> {
     dependency_specs(manifest)
         .into_iter()
         .map(|(key, spec)| {
-            spec.as_table()
-                .and_then(|spec| spec.get("package"))
-                .and_then(|package| package.as_str())
-                .unwrap_or(key)
-                .to_string()
+            let (name, requirement) = match spec {
+                // `dep = "1.2"` is the requirement, spelled short.
+                toml::Value::String(requirement) => (key, Some(requirement.clone())),
+                _ => (
+                    spec.as_table()
+                        .and_then(|spec| spec.get("package"))
+                        .and_then(|package| package.as_str())
+                        .unwrap_or(key),
+                    spec.as_table()
+                        .and_then(|spec| spec.get("version"))
+                        .and_then(|version| version.as_str())
+                        .map(str::to_string),
+                ),
+            };
+            (name.to_string(), requirement)
         })
         .collect()
 }
@@ -3159,6 +3204,35 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             cargo_content_hash(&config),
             reviewed_substrate_key(&config).expect("reviewed key"),
             "a lock that covers the manifest keeps the permanent, content-addressed key",
+        );
+    }
+
+    /// The name being locked is not the same as the requirement being met. A
+    /// commit that bumps `serde = "1"` to `"2"` over a lock still pinning 1.x
+    /// leaves cargo to resolve that dependency from the registry, exactly as a
+    /// dependency the lock had never heard of.
+    #[test]
+    fn a_locked_version_the_manifest_no_longer_accepts_is_not_a_pin() {
+        let lock = "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+                    [[package]]\nname = \"x\"\nversion = \"0.0.0\"\n";
+        let manifest = |requirement: &str| {
+            format!(
+                "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+                 serde = {{ version = \"{requirement}\", features = [\"derive\"] }}\n"
+            )
+        };
+
+        assert!(
+            !lock_covers_manifest(&manifest("2"), lock),
+            "a requirement the locked version cannot satisfy sends cargo to the registry",
+        );
+        assert!(
+            lock_covers_manifest(&manifest("1"), lock),
+            "a requirement the lock already satisfies keeps the commit a complete key",
+        );
+        assert!(
+            lock_covers_manifest(&manifest("not a requirement"), lock),
+            "an unreadable requirement answers nothing and must not churn the key",
         );
     }
 

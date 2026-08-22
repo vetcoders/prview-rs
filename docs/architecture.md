@@ -403,15 +403,18 @@ not churn the key.
 
 Existence is not a pin, so the lockfile is also checked against the manifest:
 every dependency the cargo root's `Cargo.toml` declares must already appear in
-the lock's package list, renames (`package = "..."`) followed to the name the
-lock records. A target that adds a dependency without regenerating `Cargo.lock`
-sends cargo to the registry exactly as a missing lock does — no cargo command
-here passes `--locked`, which is what would assert otherwise — and now gets the
-same day stamp. The test is name-level and deliberately under-reports: it does
-not read a workspace member's own manifest, and a bumped requirement whose name
-is still locked reads as covered. Under-reporting is the behaviour that was there
-before; over-reporting would cost one extra cache miss a day, so anything that
-does not parse counts as covered.
+the lock's package list — renames (`package = "..."`) followed to the name the
+lock records — **and** the locked version must still satisfy the requirement the
+manifest asks for, parsed with `semver`, cargo's own parser. A target that adds
+a dependency without regenerating `Cargo.lock`, or bumps `serde = "1"` to `"2"`
+over a lock still pinning 1.x, sends cargo to the registry exactly as a missing
+lock does — no cargo command here passes `--locked`, which is what would assert
+otherwise — and now gets the same day stamp. The test deliberately
+under-reports: it does not read a workspace member's own manifest. It can also
+over-report, when a `[patch]` or `[replace]` redirects a dependency outside its
+stated requirement. Under-reporting is the behaviour that was there before;
+over-reporting costs one extra cache miss a day, so anything that does not parse
+— manifest, lock, requirement or locked version — counts as covered.
 
 A cache key is a **file name**: `Cache::set` writes `<cache_dir>/<check>/<key>`
 and creates only the check-level directory. The root therefore travels hashed

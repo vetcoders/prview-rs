@@ -164,7 +164,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   date* is not a pin either: a target that adds a dependency without
   regenerating `Cargo.lock` still sends cargo to the registry, since no cargo
   command here passes `--locked`. The manifest's declared dependencies are now
-  checked against the lock's package list (renames followed), and a lock the
+  checked against the lock's package list (renames followed) *and* against the
+  versions it pins — a `serde = "1"` bumped to `"2"` over a lock still holding
+  1.x is as unresolved as a dependency the lock never heard of — so a lock the
   manifest has outgrown carries the same day stamp. The
   root is hashed rather than spelled out because a cache key is a file name —
   `crates/core` written verbatim named a file in a directory nothing creates, so
