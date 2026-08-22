@@ -28,7 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own `HEAD` and, when dirty, by a recursive digest of its own dirty subset
   (three levels of nesting deep) rather than by the bare fact that a directory
   is there; each run freezes its own state, and under `--watch` every iteration
-  re-reads the tree it is about to analyse.
+  re-reads the tree it is about to analyse. Paths are taken from git's raw
+  bytes: a filename that is not valid UTF-8 is fingerprinted by those bytes and
+  its content read through an OS-native path, where a single `<non-utf8>`
+  placeholder previously merged every such entry into one line whose content
+  lookup found nothing.
   The file is listed in `AI_INDEX.md`'s reading order, right after the gate
   verdict it explains — and in the documented contract for it
   (`docs/contracts/ai_index.md`) and the artifact-pack inventory in `README.md`,
@@ -43,7 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that never ran: a check ruled out during eligibility (tests disabled, a tool
   missing) was omitted entirely, which reads exactly like a gate that was never
   part of the run. Such a check now gets a row with every substrate field null
-  and a `skipped` reason; rows for checks that ran carry `skipped: null`. A
+  and a `skipped` reason; rows for checks that ran carry `skipped: null`. Those
+  rows identify the gate through the canonical name→id mapper, like every other
+  id in the pack: a skipped check was labelled with a naive slug of its display
+  name, so the same configured gate appeared as `typescript` when skipped and
+  `tsc` when it ran (likewise `cargo_check`/`cargo`, `vitest`/`tests`) and could
+  not be correlated. `REPORT.json.checks_skipped[]` is corrected with it. A
   reviewer holding
   only the artifacts no longer has to reconstruct the run's substrate from
   scattered gate files. Purely additive: no existing pack file changed shape,
@@ -155,7 +164,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   date* is not a pin either: a target that adds a dependency without
   regenerating `Cargo.lock` still sends cargo to the registry, since no cargo
   command here passes `--locked`. The manifest's declared dependencies are now
-  checked against the lock's package list (renames followed), and a lock the
+  checked against the lock's package list (renames followed) *and* against the
+  versions it pins — a `serde = "1"` bumped to `"2"` over a lock still holding
+  1.x is as unresolved as a dependency the lock never heard of — so a lock the
   manifest has outgrown carries the same day stamp. The
   root is hashed rather than spelled out because a cache key is a file name —
   `crates/core` written verbatim named a file in a directory nothing creates, so
@@ -178,7 +189,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cargo root and replaces `Cargo.toml` *itself* with a link to an external
   manifest: git stores a symlink as a blob, so a plain tree lookup accepted it.
   A manifest must now be a regular file, and the containment check resolves the
-  manifest alongside the directory for the cases the tree lookup cannot cover.
+  manifest alongside the directory for the cases the tree lookup cannot cover —
+  and `Cargo.lock` with them, because cargo follows a symlinked lockfile even
+  under `--locked`, so a reviewed commit tracking its lock as a link to an
+  external file had its entire dependency graph resolved from another project's
+  pins.
   A **local** review is one of those cases and was reached by neither guard —
   the local plan returns before the containment check runs — so a checkout
   tracking `Cargo.toml` as a link to an external manifest had cargo build a
@@ -192,9 +207,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provenance row. Every local path an off-`HEAD` run's cargo root manifest names
   (dependencies, dev, build, `[workspace.dependencies]`, `[target.*]`, `[patch]`,
   `[replace]`) is now resolved against the snapshot, and one that leaves it is
-  refused with the dependency named. Local reviews are untouched: a path
-  dependency on a sibling checkout is an ordinary local setup, and a local run
-  claims nothing about a commit's contents.
+  refused with the dependency named — and not only the root manifest's, since
+  `cargo check` at a workspace root builds its members: every manifest within
+  three levels of the cargo root is read the same way, through a bounded walk
+  that never enters a symlinked directory and skips `target/` and `.git/`. A
+  member manifest that is itself a link out of the snapshot is refused with
+  them. Local reviews are untouched: a path dependency on a sibling checkout is
+  an ordinary local setup, and a local run claims nothing about a commit's
+  contents.
 - A cargo root that the reviewed branch moved (a root crate pushed into
   `backend/`, a member renamed) is no longer projected into the snapshot
   verbatim. The locally detected path does not exist there, so cargo failed on a

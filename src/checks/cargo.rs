@@ -188,7 +188,11 @@ fn manifest_stays_in_root(cwd: PathBuf) -> Result<PathBuf> {
 ///
 /// The directory is not the whole answer: a root that stays inside the snapshot
 /// can still hold a `Cargo.toml` that is itself a link to an external manifest,
-/// and cargo reads the manifest, not the directory. Both are therefore resolved.
+/// and cargo reads the manifest, not the directory. The same is true of
+/// `Cargo.lock` — cargo follows a symlinked lockfile even under `--locked`, so a
+/// reviewed commit tracking its lock as a link to an external file had the whole
+/// dependency graph resolved from another project's pins while provenance
+/// recorded an exact `snapshot` scan. All three are therefore resolved.
 /// The tree-level guard in [`resolve_reviewed_cargo_root`] already rejects such a
 /// manifest for an off-HEAD review; this is the same refusal on the materialised
 /// bytes, for the paths that guard cannot reach (a repo whose tree git could not
@@ -204,13 +208,13 @@ fn contained_in_snapshot(cwd: PathBuf, scan_dir: &Path) -> Result<PathBuf> {
     let Ok(root) = scan_dir.canonicalize() else {
         return Ok(cwd);
     };
-    for target in [cwd.clone(), cwd.join("Cargo.toml")] {
+    for target in [cwd.clone(), cwd.join("Cargo.toml"), cwd.join("Cargo.lock")] {
         let Ok(resolved) = target.canonicalize() else {
             continue;
         };
         if !resolved.starts_with(&root) {
             anyhow::bail!(
-                "cargo root {} resolves outside the reviewed snapshot ({}), so a verdict earned \
+                "{} resolves outside the reviewed snapshot ({}), so a verdict earned \
                  there would describe another tree",
                 target.display(),
                 scan_dir.display(),
@@ -234,37 +238,103 @@ fn contained_in_snapshot(cwd: PathBuf, scan_dir: &Path) -> Result<PathBuf> {
 /// tree as it stands, and a path dependency on a sibling checkout is an ordinary
 /// local setup; nothing there claims the verdict describes a commit's contents.
 ///
-/// The check is static and reads only this manifest: a workspace member's own
-/// dependencies are not followed, and neither is anything a build script does.
-/// It refuses what it can prove escapes rather than pretending to be complete —
-/// running `cargo metadata` to resolve the true graph would need the network,
-/// the registry and a second full resolve per check.
+/// The root manifest is not the only one cargo reads. `cargo check` at a
+/// workspace root builds its members, and a member declares its own
+/// dependencies, so every manifest within [`MEMBER_MANIFEST_DEPTH`] of the cargo
+/// root is held to the same rule. That walk is the whole cost: no subprocess, no
+/// registry, no resolve. What it still does not cover is a member outside that
+/// subtree, a `[patch]` in `.cargo/config.toml`, and anything a build script
+/// does — it refuses what it can prove escapes rather than pretending to be
+/// complete, because resolving the true graph means `cargo metadata`, a
+/// network-capable second resolve for each of six gates.
 fn dependency_paths_stay_in_snapshot(cwd: &Path, scan_dir: &Path) -> Result<()> {
-    let (Ok(root), Ok(manifest)) = (
-        scan_dir.canonicalize(),
-        std::fs::read_to_string(cwd.join("Cargo.toml")),
-    ) else {
-        return Ok(());
-    };
-    let Ok(manifest) = toml::from_str::<toml::Table>(&manifest) else {
+    let Ok(root) = scan_dir.canonicalize() else {
         return Ok(());
     };
 
-    for (name, declared) in manifest_dependency_paths(&manifest) {
-        // An absolute declared path replaces the root, which is the case at issue.
-        let Ok(resolved) = cwd.join(&declared).canonicalize() else {
-            continue;
-        };
-        if !resolved.starts_with(&root) {
+    for manifest_dir in manifest_dirs_below(cwd, MEMBER_MANIFEST_DEPTH) {
+        let manifest_path = manifest_dir.join("Cargo.toml");
+        // A member manifest that is itself a link out of the snapshot is the
+        // same escape as an escaping dependency, one file earlier.
+        if let Ok(resolved) = manifest_path.canonicalize()
+            && !resolved.starts_with(&root)
+        {
             anyhow::bail!(
-                "dependency `{name}` at {declared}, declared in {}, resolves outside the reviewed \
-                 snapshot ({}), so cargo would compile source the reviewed commit does not contain",
-                cwd.join("Cargo.toml").display(),
+                "the manifest at {} resolves outside the reviewed snapshot ({}), so cargo would \
+                 read a project the reviewed commit does not contain",
+                manifest_path.display(),
                 scan_dir.display(),
             );
         }
+        let Ok(manifest) = std::fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(manifest) = toml::from_str::<toml::Table>(&manifest) else {
+            continue;
+        };
+
+        for (name, declared) in manifest_dependency_paths(&manifest) {
+            // An absolute declared path replaces the root, which is the case at
+            // issue; a relative one is resolved against ITS own manifest.
+            let Ok(resolved) = manifest_dir.join(&declared).canonicalize() else {
+                continue;
+            };
+            if !resolved.starts_with(&root) {
+                anyhow::bail!(
+                    "dependency `{name}` at {declared}, declared in {}, resolves outside the \
+                     reviewed snapshot ({}), so cargo would compile source the reviewed commit \
+                     does not contain",
+                    manifest_path.display(),
+                    scan_dir.display(),
+                );
+            }
+        }
     }
     Ok(())
+}
+
+/// How far below the cargo root a workspace member's manifest is looked for.
+///
+/// Members live a level or two down (`crates/core`, `services/api/worker`);
+/// past that the walk costs more than it proves.
+const MEMBER_MANIFEST_DEPTH: usize = 3;
+
+/// Directories at or below `root` that carry a `Cargo.toml`.
+///
+/// Symlinked directories are never entered: the snapshot links dependency
+/// scaffolding (`node_modules`) in, and a link is not part of the reviewed tree.
+/// `target/` and `.git/` hold no manifest cargo would read as a member.
+fn manifest_dirs_below(root: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    collect_manifest_dirs(root, depth, &mut found);
+    found
+}
+
+fn collect_manifest_dirs(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if dir.join("Cargo.toml").is_file() {
+        found.push(dir.to_path_buf());
+    }
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `symlink_metadata` does not follow, so a linked directory is not a
+        // directory here and is skipped.
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        if matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("target" | ".git")
+        ) {
+            continue;
+        }
+        collect_manifest_dirs(&path, depth - 1, found);
+    }
 }
 
 /// Every local path a manifest points cargo at, dependencies and overrides alike,
@@ -744,11 +814,17 @@ fn substrate_manifest_and_lock(
     ))
 }
 
-/// Whether every dependency the manifest declares is already in the lock.
+/// Whether the lock already answers every dependency the manifest declares.
 ///
-/// A dependency the lock has never heard of is one cargo has to resolve. Anything
-/// unparsable answers "covered": the stamp exists to bound a KNOWN gap, not to
-/// churn the cache on a file this code failed to read.
+/// Two ways it does not: a dependency the lock has never heard of, and one whose
+/// locked version no longer satisfies the requirement the manifest asks for
+/// (`serde = "1"` bumped to `"2"` over a lock still pinning 1.x). Both send cargo
+/// back to the registry when it runs, since nothing here passes `--locked`.
+///
+/// Anything unparsable answers "covered": the stamp exists to bound a KNOWN gap,
+/// not to churn the cache on a file this code failed to read. A `[patch]` or
+/// `[replace]` that redirects a dependency to a version outside its requirement
+/// reads as uncovered — the cost of that is one extra cache miss a day.
 fn lock_covers_manifest(manifest: &str, lock: &str) -> bool {
     let (Ok(manifest), Ok(lock)) = (
         toml::from_str::<toml::Table>(manifest),
@@ -759,27 +835,66 @@ fn lock_covers_manifest(manifest: &str, lock: &str) -> bool {
     let Some(packages) = lock.get("package").and_then(|packages| packages.as_array()) else {
         return true;
     };
-    let locked: std::collections::HashSet<&str> = packages
-        .iter()
-        .filter_map(|package| package.get("name").and_then(|name| name.as_str()))
-        .collect();
+    let mut locked: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for package in packages {
+        let Some(name) = package.get("name").and_then(|name| name.as_str()) else {
+            continue;
+        };
+        let versions = locked.entry(name).or_default();
+        if let Some(version) = package.get("version").and_then(|version| version.as_str()) {
+            versions.push(version);
+        }
+    }
 
-    declared_dependencies(&manifest)
-        .iter()
-        .all(|name| locked.contains(name.as_str()))
+    for (name, requirement) in declared_dependencies(&manifest) {
+        let Some(versions) = locked.get(name.as_str()) else {
+            return false;
+        };
+        // No requirement to check: a path or git dependency, or one inherited
+        // from the workspace, which the root manifest states instead.
+        let Some(requirement) = requirement else {
+            continue;
+        };
+        let Ok(requirement) = semver::VersionReq::parse(&requirement) else {
+            continue;
+        };
+        let satisfied = versions
+            .iter()
+            .any(|version| match semver::Version::parse(version) {
+                Ok(version) => requirement.matches(&version),
+                // A version this parser cannot read answers nothing, so it
+                // counts as satisfying rather than as proof of staleness.
+                Err(_) => true,
+            });
+        if !satisfied {
+            return false;
+        }
+    }
+    true
 }
 
-/// Every crate name the manifest depends on, following `package = "..."` renames
-/// to the name the lockfile would record.
-fn declared_dependencies(manifest: &toml::Table) -> Vec<String> {
+/// Every crate the manifest depends on — the name the lockfile would record
+/// (following a `package = "..."` rename) and the version requirement asked of
+/// it, when one is stated at all.
+fn declared_dependencies(manifest: &toml::Table) -> Vec<(String, Option<String>)> {
     dependency_specs(manifest)
         .into_iter()
         .map(|(key, spec)| {
-            spec.as_table()
-                .and_then(|spec| spec.get("package"))
-                .and_then(|package| package.as_str())
-                .unwrap_or(key)
-                .to_string()
+            let (name, requirement) = match spec {
+                // `dep = "1.2"` is the requirement, spelled short.
+                toml::Value::String(requirement) => (key, Some(requirement.clone())),
+                _ => (
+                    spec.as_table()
+                        .and_then(|spec| spec.get("package"))
+                        .and_then(|package| package.as_str())
+                        .unwrap_or(key),
+                    spec.as_table()
+                        .and_then(|spec| spec.get("version"))
+                        .and_then(|version| version.as_str())
+                        .map(str::to_string),
+                ),
+            };
+            (name.to_string(), requirement)
         })
         .collect()
 }
@@ -2725,6 +2840,39 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         );
     }
 
+    /// Cargo follows a symlinked `Cargo.lock` even under `--locked`, so a
+    /// reviewed commit tracking its lock as a link to an external file had the
+    /// whole dependency graph resolved from another project's pins — under this
+    /// commit's cache key and a `snapshot` provenance row.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_lockfile_never_escapes_the_snapshot() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(scan_dir.path(), true);
+        std::os::unix::fs::symlink(
+            outside.path().join("Cargo.lock"),
+            scan_dir.path().join("Cargo.lock"),
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a lockfile pointing out of the reviewed tree must not pin this run");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("Cargo.lock") && err.contains("outside the reviewed snapshot"),
+            "the refusal must name the escaping lockfile: {err}",
+        );
+    }
+
     /// The root and its manifest being contained says nothing about what that
     /// manifest DECLARES. An absolute `path` dependency (or one that climbs out
     /// of the snapshot) has cargo compile a directory the reviewed commit does
@@ -2759,6 +2907,47 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         assert!(
             err.contains("outside the reviewed snapshot") && err.contains("foreign"),
             "the refusal must name the escaping dependency: {err}",
+        );
+    }
+
+    /// `cargo check` at a workspace root builds its MEMBERS, and a member
+    /// declares its own dependencies. Reading only the root manifest left a
+    /// member free to point cargo at an absolute path outside the snapshot,
+    /// under an exact `snapshot` provenance row.
+    #[test]
+    fn a_member_path_dependency_outside_the_snapshot_is_refused() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        std::fs::create_dir_all(scan_dir.path().join("crates/member")).unwrap();
+        std::fs::write(
+            scan_dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/member\"]\nresolver=\"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            scan_dir.path().join("crates/member/Cargo.toml"),
+            format!(
+                "[package]\nname=\"member\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+                 foreign = {{ path = \"{}\" }}\n",
+                outside.path().display(),
+            ),
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a member may not point the workspace build at a foreign directory");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("crates/member") && err.contains("outside the reviewed snapshot"),
+            "the refusal must name the member manifest that declares it: {err}",
         );
     }
 
@@ -3122,6 +3311,35 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             cargo_content_hash(&config),
             reviewed_substrate_key(&config).expect("reviewed key"),
             "a lock that covers the manifest keeps the permanent, content-addressed key",
+        );
+    }
+
+    /// The name being locked is not the same as the requirement being met. A
+    /// commit that bumps `serde = "1"` to `"2"` over a lock still pinning 1.x
+    /// leaves cargo to resolve that dependency from the registry, exactly as a
+    /// dependency the lock had never heard of.
+    #[test]
+    fn a_locked_version_the_manifest_no_longer_accepts_is_not_a_pin() {
+        let lock = "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+                    [[package]]\nname = \"x\"\nversion = \"0.0.0\"\n";
+        let manifest = |requirement: &str| {
+            format!(
+                "[package]\nname=\"x\"\nversion=\"0.0.0\"\n\n[dependencies]\n\
+                 serde = {{ version = \"{requirement}\", features = [\"derive\"] }}\n"
+            )
+        };
+
+        assert!(
+            !lock_covers_manifest(&manifest("2"), lock),
+            "a requirement the locked version cannot satisfy sends cargo to the registry",
+        );
+        assert!(
+            lock_covers_manifest(&manifest("1"), lock),
+            "a requirement the lock already satisfies keeps the commit a complete key",
+        );
+        assert!(
+            lock_covers_manifest(&manifest("not a requirement"), lock),
+            "an unreadable requirement answers nothing and must not churn the key",
         );
     }
 

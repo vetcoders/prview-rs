@@ -267,6 +267,16 @@ pruning is housekeeping, so a root held by another live review is left to it,
 and this run only records its own use. A mark that lands outside the lock still
 wins: each candidate is re-read immediately before it is removed.
 
+One window stays open deliberately. Because the losing review marks outside the
+lock, its mark can land between the sweeper's final re-read and its
+`remove_dir_all`. Closing it would mean marking under the lock, i.e. every
+off-`HEAD` Python review waiting on another process's housekeeping. The window
+is one `remove_dir_all` wide, opens only for an environment that is idle for a
+day, outside the working set, and being started at that instant, and its
+consequence is a loud `uv` failure on one gate — never a verdict attributed to
+the wrong substrate. Marking under a bounded-wait acquisition is the fix if that
+failure is ever observed.
+
 Nothing is pre-created — uv rejects an existing directory that is not a valid
 environment, so the directory tree only ever comes from uv itself.
 
@@ -331,7 +341,11 @@ tree closes that by construction — trees are not traversed through symlinks, s
 such a root simply has no entries to find — and `contained_in_snapshot()` settles
 containment on the resolved paths for the cases git cannot answer (an injected
 scan dir, an unreadable repo), refusing rather than earning a verdict outside
-the reviewed tree. Canonicalisation is the test only; the path itself is passed
+the reviewed tree. It resolves three paths, not one: the directory, its
+`Cargo.toml`, and its `Cargo.lock`. Cargo follows a symlinked lockfile even
+under `--locked`, so a reviewed commit tracking its lock as a link to an
+external file had the entire dependency graph resolved from another project's
+pins while the pack reported an exact `snapshot` scan. Canonicalisation is the test only; the path itself is passed
 through unchanged, so provenance keeps reporting the directory as the run saw it.
 
 What the contained manifest *declares* is the next step out.
@@ -344,9 +358,18 @@ reviewed commit does not contain while provenance reports `snapshot`, so the run
 is refused with the dependency named. Only off-`HEAD` runs are held to this: a
 local review is about the working tree as it stands, where a path dependency on
 a sibling checkout is an ordinary setup and no claim is made about a commit's
-contents. The check is static and reads only that one manifest — a member's own
-dependencies are not followed — because resolving the true graph means
-`cargo metadata`, a network-capable second resolve per check.
+contents.
+
+`cargo check` at a workspace root builds its members, and a member declares its
+own dependencies, so every manifest within three levels of the cargo root is
+read the same way — a bounded directory walk that never enters a symlinked
+directory (the snapshot links `node_modules` in) and skips `target/` and
+`.git/`. A member manifest that is itself a link out of the snapshot is refused
+with them. What the walk still does not cover is a member outside that subtree,
+a `[patch]` in `.cargo/config.toml`, and anything a build script does: it
+refuses what it can prove escapes rather than pretending to be complete, because
+resolving the true graph means `cargo metadata`, a network-capable second
+resolve for each of six gates.
 
 Whether cargo applies at all is decided by the **reviewed** commit, not by the
 local profile. `config.profile.has_cargo` describes the checkout, so reviewing a
@@ -399,15 +422,18 @@ not churn the key.
 
 Existence is not a pin, so the lockfile is also checked against the manifest:
 every dependency the cargo root's `Cargo.toml` declares must already appear in
-the lock's package list, renames (`package = "..."`) followed to the name the
-lock records. A target that adds a dependency without regenerating `Cargo.lock`
-sends cargo to the registry exactly as a missing lock does — no cargo command
-here passes `--locked`, which is what would assert otherwise — and now gets the
-same day stamp. The test is name-level and deliberately under-reports: it does
-not read a workspace member's own manifest, and a bumped requirement whose name
-is still locked reads as covered. Under-reporting is the behaviour that was there
-before; over-reporting would cost one extra cache miss a day, so anything that
-does not parse counts as covered.
+the lock's package list — renames (`package = "..."`) followed to the name the
+lock records — **and** the locked version must still satisfy the requirement the
+manifest asks for, parsed with `semver`, cargo's own parser. A target that adds
+a dependency without regenerating `Cargo.lock`, or bumps `serde = "1"` to `"2"`
+over a lock still pinning 1.x, sends cargo to the registry exactly as a missing
+lock does — no cargo command here passes `--locked`, which is what would assert
+otherwise — and now gets the same day stamp. The test deliberately
+under-reports: it does not read a workspace member's own manifest. It can also
+over-report, when a `[patch]` or `[replace]` redirects a dependency outside its
+stated requirement. Under-reporting is the behaviour that was there before;
+over-reporting costs one extra cache miss a day, so anything that does not parse
+— manifest, lock, requirement or locked version — counts as covered.
 
 A cache key is a **file name**: `Cache::set` writes `<cache_dir>/<check>/<key>`
 and creates only the check-level directory. The root therefore travels hashed
@@ -552,7 +578,11 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   when the path is gone, `unreadable` on an IO error. Paths alone
   identify *which* files are modified, not *how*; two runs that touch the same
   files with different content are different substrates and must not share a
-  digest. Only the dirty subset is hashed. It is a stable fingerprint, not a
+  digest. The path itself comes from git's raw bytes, not from the UTF-8 view:
+  a name that is not valid UTF-8 is written as `<non-utf8:<sha256 of the
+  bytes>>` and its content is still read through an OS-native path, because the
+  single placeholder they shared before collapsed every such entry onto one line
+  with an `absent` body. Only the dirty subset is hashed. It is a stable fingerprint, not a
   capture of a specific `git status --porcelain` stdout;
 - `checks[]` — one row per configured check: `{id, cwd, target_sha, tree_state,
   started_at, cached, skipped}`, with `null` fields for a check that produced no
@@ -560,7 +590,11 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   one that did not: a gate ruled out during eligibility (tests disabled, a tool
   absent) never reaches RUN.json's `checks[]`, and omitting it here too made a
   deliberate skip indistinguishable from a gate that was never part of the run.
-  Those rows have every substrate field `null`, because nothing was read. The
+  Those rows have every substrate field `null`, because nothing was read. Their
+  `id` comes from the same canonical mapper as every executed row
+  (`check_id_from_name`): a skipped gate is `tsc`, `cargo` or `tests`, never the
+  slug of its display name, so a consumer can pair the skip with the gate it
+  belongs to. `REPORT.json.checks_skipped[]` carries the same id. The
   synthetic `heuristics_loctree` row is included: Loctree runs in-process rather
   than as a subprocess (`command` is `loctree (in-process)`), but it still reads
   a tree — the `git archive` extraction of the target commit in snapshot mode,

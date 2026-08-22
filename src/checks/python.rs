@@ -206,6 +206,17 @@ const UV_PRUNE_LOCK: &str = ".prview-prune.lock";
 /// sweep itself. (`prune_uv_envs` re-reads each candidate immediately before
 /// removing it, so a mark that lands outside the lock still wins.)
 ///
+/// That leaves one window open by choice: a review that could not take the lock
+/// marks OUTSIDE it, so its mark can land between the sweeper's final re-read
+/// and its `remove_dir_all`. Closing it means marking under the lock, which
+/// turns every off-`HEAD` Python review into a waiter on another process's
+/// housekeeping. The trade is not worth it here: the window is the width of one
+/// `remove_dir_all` call, it only opens for an environment simultaneously idle
+/// for a day, outside the working set, and being started right now — and its
+/// consequence is a loud `uv` failure on one gate, never a verdict attributed to
+/// the wrong substrate. If that failure is ever actually seen, marking under a
+/// bounded-wait acquisition is the fix.
+///
 /// Nothing is created here: an absent root means no environment exists yet, and
 /// pre-creating the directory would leave uv an empty non-environment to reject.
 fn mark_and_prune_uv_envs(root: &Path, env_dir: &Path) {
