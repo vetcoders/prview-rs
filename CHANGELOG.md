@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Pytest` now runs in the reviewed target snapshot instead of `config.repo_root`.
+  When reviewing a PR or a remote branch, `repo_root` still points at whatever is
+  checked out locally, so pytest executed the *local* branch's tests and reported
+  their failures against the PR — a false failure from unrelated code, even when
+  the PR's own tests were green. Ruff, Mypy and the JS checks were moved onto the
+  target snapshot earlier; `Pytest` was the one check left behind, and is now
+  registered as a shared-snapshot check alongside them. Local reviews, where the
+  target resolves to `HEAD`, are unaffected. Its recorded `provenance.cwd` now
+  reports the directory the run actually used.
+
 ### Changed
 
 - Bumped the bundled `loctree` structural-analysis crate from `0.8` to `0.13.0`.
