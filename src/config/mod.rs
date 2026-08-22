@@ -1245,11 +1245,21 @@ fn detect_python_source(repo_root: &Path) -> bool {
 }
 
 fn is_runtime_python_file(repo_root: &Path, path: &Path) -> bool {
-    if path.extension().is_none_or(|ext| ext != "py") {
+    is_runtime_python_path(path.strip_prefix(repo_root).unwrap_or(path))
+}
+
+/// Whether a REPO-RELATIVE path is Python the project actually runs, as opposed
+/// to tooling, fixtures or vendored code.
+///
+/// Split out from [`is_runtime_python_file`] because the same question has to be
+/// asked of a git TREE, where no filesystem path exists: deciding whether the
+/// reviewed commit is still a Python project must not consult the operator's
+/// checkout (see `missing_reviewed_python_project` in `checks::python`).
+pub(crate) fn is_runtime_python_path(rel: &Path) -> bool {
+    if rel.extension().is_none_or(|ext| ext != "py") {
         return false;
     }
 
-    let rel = path.strip_prefix(repo_root).unwrap_or(path);
     let parts: Vec<String> = rel
         .components()
         .map(|component| component.as_os_str().to_string_lossy().to_string())

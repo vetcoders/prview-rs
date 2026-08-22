@@ -789,6 +789,48 @@ impl Repository {
         Ok(())
     }
 
+    /// Whether ANY regular file in the tree of `commit_ref` satisfies `matches`,
+    /// stopping at the first hit. The predicate receives the repo-relative path.
+    ///
+    /// Symlinks and gitlinks are skipped, as in [`Self::regular_file_at_commit`]:
+    /// only bytes the reviewed commit actually carries count as its content.
+    ///
+    /// Unlike [`Self::dirs_containing_at_commit`] this walk is deliberately NOT
+    /// depth-bounded. Callers use it to conclude ABSENCE ("the reviewed commit
+    /// has no Python source anywhere"), and a bounded search cannot prove that —
+    /// it would only manufacture confident false skips for deep layouts.
+    pub fn any_file_at_commit(
+        &self,
+        commit_ref: &str,
+        matches: impl Fn(&Path) -> bool,
+    ) -> Result<bool> {
+        let tree = self.inner.revparse_single(commit_ref)?.peel_to_tree()?;
+        let mut found = false;
+        let walked = tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            if entry.kind() != Some(git2::ObjectType::Blob)
+                || entry.filemode() == i32::from(git2::FileMode::Link)
+            {
+                return git2::TreeWalkResult::Ok;
+            }
+            let Some(name) = entry.name() else {
+                return git2::TreeWalkResult::Ok;
+            };
+            if matches(Path::new(&format!("{dir}{name}"))) {
+                found = true;
+                return git2::TreeWalkResult::Abort;
+            }
+            git2::TreeWalkResult::Ok
+        });
+        // A hit is an answer even if aborting the walk surfaced as an error;
+        // only an EMPTY result depends on the walk having completed, and
+        // concluding absence from a failed walk is what callers must not do.
+        if found {
+            return Ok(true);
+        }
+        walked?;
+        Ok(false)
+    }
+
     /// Read file content at a specific commit/ref
     pub fn file_at_commit(&self, commit_ref: &str, file_path: &str) -> Result<String> {
         let obj = self.inner.revparse_single(commit_ref)?;
