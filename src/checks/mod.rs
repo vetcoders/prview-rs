@@ -41,23 +41,34 @@ pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TreeState {
-    /// Ephemeral `git worktree` materialising the reviewed target commit — the
-    /// scanned bytes are exactly `target_sha`.
+    /// Ephemeral `git worktree` of THIS repository materialising the reviewed
+    /// target commit, unmodified — the scanned bytes are exactly `target_sha`.
     Snapshot,
+    /// Same worktree, but it carries changes the run itself produced (a
+    /// generated `Cargo.lock`, a tool writing into the checkout) — the scanned
+    /// bytes are NOT exactly `target_sha`.
+    SnapshotDirty,
     /// The repo's own working tree with no uncommitted changes — the scanned
     /// bytes are exactly `target_sha`.
     LocalClean,
     /// The repo's own working tree carrying uncommitted changes — the scanned
     /// bytes are NOT exactly `target_sha`.
     LocalDirty,
+    /// A directory that is neither this repository's working tree nor one of its
+    /// worktrees (e.g. a `cargo_root` configured outside the repo). Whatever
+    /// `target_sha` names, it belongs to a DIFFERENT checkout: the scanned bytes
+    /// say nothing about the reviewed commit.
+    Foreign,
 }
 
 impl TreeState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Snapshot => "snapshot",
+            Self::SnapshotDirty => "snapshot-dirty",
             Self::LocalClean => "local-clean",
             Self::LocalDirty => "local-dirty",
+            Self::Foreign => "foreign",
         }
     }
 }
@@ -75,12 +86,27 @@ pub struct ScanSubstrate {
 ///
 /// `target_sha` is the commit checked out in `cwd` (the snapshot's detached
 /// commit, or the repo's `HEAD` for an in-place scan). `tree_state` classifies
-/// `cwd` against `repo_root`: a directory outside the repo root is an ephemeral
-/// target snapshot, one inside it is the live working tree, clean or dirty per
-/// `git status --porcelain` (untracked files included).
+/// `cwd` against `repo_root` along two axes — WHICH tree it is, and whether that
+/// tree still matches its commit:
+///
+/// - inside `repo_root`: the live working tree, `local-clean` / `local-dirty`;
+/// - outside it, but a linked worktree of the SAME repository: a target
+///   snapshot, `snapshot` / `snapshot-dirty`. Being external is not by itself
+///   proof of a snapshot, and a snapshot is not immutable — a check can write
+///   into it (a generated `Cargo.lock`), after which its bytes are no longer
+///   exactly `target_sha`;
+/// - outside it and NOT a worktree of this repository: `foreign` — a different
+///   checkout whose bytes say nothing about the reviewed commit.
+///
+/// Dirtiness is `git status --porcelain` (untracked files count, ignored ones do
+/// not). In a snapshot the dependency symlinks prview itself creates
+/// ([`SNAPSHOT_SCAFFOLDING`]) are excluded: they are the tool's own scaffolding,
+/// not a modification of the reviewed tree.
 ///
 /// Best effort: a `cwd` that is not in a git repository yields `None` for both
-/// fields rather than a guess, so an unknown substrate stays visibly unknown.
+/// fields rather than a guess, and a status that cannot be read yields a `None`
+/// `tree_state` — an unknown substrate stays visibly unknown instead of being
+/// certified clean.
 pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path) -> ScanSubstrate {
     let Ok(repo) = git2::Repository::discover(cwd) else {
         return ScanSubstrate::default();
@@ -95,31 +121,75 @@ pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path) -> ScanSubstrate {
     let is_external =
         crate::paths::normalize_to_repo_relative(&cwd.display().to_string(), repo_root).is_external;
 
-    let tree_state = if is_external {
-        TreeState::Snapshot
-    } else if working_tree_is_dirty(&repo) {
-        TreeState::LocalDirty
+    let tree_state = if !is_external {
+        working_tree_is_dirty(&repo, &[]).map(|dirty| {
+            if dirty {
+                TreeState::LocalDirty
+            } else {
+                TreeState::LocalClean
+            }
+        })
+    } else if !belongs_to_repo(&repo, repo_root) {
+        Some(TreeState::Foreign)
     } else {
-        TreeState::LocalClean
+        working_tree_is_dirty(&repo, SNAPSHOT_SCAFFOLDING).map(|dirty| {
+            if dirty {
+                TreeState::SnapshotDirty
+            } else {
+                TreeState::Snapshot
+            }
+        })
     };
 
     ScanSubstrate {
         target_sha,
-        tree_state: Some(tree_state),
+        tree_state,
     }
 }
 
-/// `git status --porcelain` is non-empty (untracked files count, ignored ones
-/// do not). A repository whose status cannot be read is reported as clean —
-/// the substrate classification must never fail a check.
-fn working_tree_is_dirty(repo: &git2::Repository) -> bool {
+/// Paths prview itself materialises inside a target snapshot (see
+/// `create_worktree_snapshot`): symlinks to the operator's dependency caches, so
+/// a review does not reinstall them. They are never part of the reviewed commit
+/// and must not make the snapshot look modified.
+const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
+
+/// True when `repo` is the repository rooted at `repo_root` — its own working
+/// tree or one of its linked worktrees, which share a common git directory.
+///
+/// A directory merely being outside `repo_root` proves nothing: an external
+/// `cargo_root` discovers a DIFFERENT repository, and labelling that a snapshot
+/// of the reviewed commit is exactly the false-provenance this record exists to
+/// prevent.
+fn belongs_to_repo(repo: &git2::Repository, repo_root: &Path) -> bool {
+    let Ok(main) = git2::Repository::discover(repo_root) else {
+        return false;
+    };
+    canonical(repo.commondir()) == canonical(main.commondir())
+}
+
+fn canonical(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `git status --porcelain` is non-empty, ignoring `exempt` top-level paths
+/// (untracked files count, ignored ones do not).
+///
+/// `None` when the status cannot be read — an index lock, a permissions error or
+/// a malformed repository. That is an UNKNOWN tree state, not a clean one:
+/// reporting "clean" there would let provenance certify that the scanned bytes
+/// match the commit precisely when nothing could be verified.
+fn working_tree_is_dirty(repo: &git2::Repository, exempt: &[&str]) -> Option<bool> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .include_ignored(false)
         .include_unmodified(false);
-    repo.statuses(Some(&mut opts))
-        .map(|statuses| !statuses.is_empty())
-        .unwrap_or(false)
+    let statuses = repo.statuses(Some(&mut opts)).ok()?;
+    Some(statuses.iter().any(|entry| {
+        let path = entry.path().unwrap_or_default();
+        !exempt
+            .iter()
+            .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    }))
 }
 
 /// Provenance data for a check execution (Artifact Pack v1)
@@ -1262,6 +1332,94 @@ mod tests {
         assert_eq!(
             resolve_scan_substrate(root, root).tree_state,
             Some(TreeState::LocalDirty),
+        );
+    }
+
+    #[test]
+    fn scan_substrate_of_a_mutated_snapshot_is_not_certified_clean() {
+        // A snapshot is not immutable: a check can write into it (cargo
+        // generating a `Cargo.lock` the repo does not track). `snapshot` means
+        // "bytes exactly equal target_sha", so a worktree carrying generated
+        // files must not keep that label just because it sits outside repo_root.
+        let (repo, first) = repo_with_one_commit();
+        let root = repo.path();
+
+        let snapshot =
+            crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
+        assert_eq!(
+            resolve_scan_substrate(&snapshot.worktree_path, root).tree_state,
+            Some(TreeState::Snapshot),
+            "a freshly materialised snapshot is exactly the commit",
+        );
+
+        std::fs::write(snapshot.worktree_path.join("Cargo.lock"), "# generated\n")
+            .expect("write generated file");
+        let substrate = resolve_scan_substrate(&snapshot.worktree_path, root);
+        assert_eq!(substrate.target_sha.as_deref(), Some(first.as_str()));
+        assert_eq!(
+            substrate.tree_state,
+            Some(TreeState::SnapshotDirty),
+            "a command that wrote into the snapshot must not be recorded as a clean commit scan",
+        );
+    }
+
+    #[test]
+    fn scan_substrate_of_a_snapshot_ignores_prview_scaffolding() {
+        // prview symlinks node_modules/.venv into the snapshot itself. That is
+        // the tool's own scaffolding, never part of the reviewed commit, so it
+        // must not flip every JS/Python review to a dirty snapshot.
+        let (repo, first) = repo_with_one_commit();
+        let root = repo.path();
+        std::fs::create_dir(root.join("node_modules")).expect("node_modules");
+        std::fs::write(root.join("node_modules/marker"), "dep\n").expect("dep file");
+
+        let snapshot =
+            crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
+        if !snapshot.worktree_path.join("node_modules").exists() {
+            // Symlinking is unix-only; nothing to assert elsewhere.
+            return;
+        }
+
+        assert_eq!(
+            resolve_scan_substrate(&snapshot.worktree_path, root).tree_state,
+            Some(TreeState::Snapshot),
+            "prview's own dependency symlinks are not a modification of the reviewed tree",
+        );
+    }
+
+    #[test]
+    fn scan_substrate_of_a_foreign_checkout_is_not_a_snapshot() {
+        // Being outside repo_root does NOT make a directory a snapshot of the
+        // reviewed commit: an external cargo_root is a different repository
+        // entirely. Labelling it `snapshot` would certify a foreign tree's
+        // verdict as the reviewed commit's.
+        let (repo, _) = repo_with_one_commit();
+        let (other, other_head) = repo_with_one_commit();
+
+        let substrate = resolve_scan_substrate(other.path(), repo.path());
+        assert_eq!(substrate.target_sha.as_deref(), Some(other_head.as_str()));
+        assert_eq!(substrate.tree_state, Some(TreeState::Foreign));
+    }
+
+    #[test]
+    fn unreadable_status_is_unknown_not_clean() {
+        // An index lock, a permissions error or a malformed repository must not
+        // be reported as "no uncommitted changes" — that would certify bytes
+        // nobody could verify.
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        std::fs::write(root.join(".git/index"), b"not an index at all").expect("corrupt the index");
+
+        let opened = git2::Repository::discover(root).expect("repo still opens");
+        assert_eq!(
+            working_tree_is_dirty(&opened, &[]),
+            None,
+            "a status that cannot be read is unknown, not clean",
+        );
+        assert_eq!(
+            resolve_scan_substrate(root, root).tree_state,
+            None,
+            "an unknown substrate must stay visibly unknown in provenance",
         );
     }
 
