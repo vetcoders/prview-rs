@@ -236,11 +236,28 @@ The Python checks add one step on top of that symlink. `uv run` synchronises the
 project environment before executing, so a reviewed commit whose dependencies
 differ from the local branch would install into — and remove packages from — the
 operator's active `.venv` through the snapshot symlink. `plan_python_run()`
-therefore sets `UV_PROJECT_ENVIRONMENT` to `Config::uv_env_dir()`
-(`~/.prview/uv-env/<repo>`) for off-`HEAD` runs: the reviewed dependency set is
-still installed and judged, in a prview-owned per-repo environment kept warm
-across runs. A local review sets no override and uses the checkout's own
+therefore sets `UV_PROJECT_ENVIRONMENT` to `Config::uv_env_dir_for()`
+(`~/.prview/uv-env/<repo>/<target-sha>`) for off-`HEAD` runs: the reviewed
+dependency set is still installed and judged, in a prview-owned environment kept
+warm across runs. A local review sets no override and uses the checkout's own
 environment exactly as before.
+
+That environment is per reviewed **commit**, not per repository. `uv run` syncs
+before executing and releases the environment lock while the child command runs,
+so two concurrent prview processes reviewing different commits of one repo would
+take turns installing incompatible dependency sets into a shared directory, each
+resynchronising under the other's running pytest. Runs of the *same* commit still
+share, which is the reuse that pays for the cache.
+
+Per-commit directories are bounded, or a busy repository would leave a
+virtualenv behind for every commit ever reviewed. Each run refreshes a
+`.prview-used` marker inside the environment it uses (reuse only writes deep
+inside, so directory mtime alone would understate activity), and
+`prune_uv_envs()` drops what is outside the working set: the three most recently
+used always survive, and nothing used within the last 24 hours is removed, so a
+concurrent or slow review cannot have its environment deleted mid-run. Nothing
+is pre-created — uv rejects an existing directory that is not a valid
+environment, so the directory tree only ever comes from uv itself.
 
 The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,
 `Cargo audit`, `Cargo geiger`) run in the snapshot as well, but with one extra
@@ -271,6 +288,17 @@ cargo checks with a reason naming the unreachable root
 operator's unrelated checkout and filing the result under the reviewed commit.
 No verdict is the honest answer where a foreign tree's verdict was the bug.
 
+Whether cargo applies at all is decided by the **reviewed** commit, not by the
+local profile. `config.profile.has_cargo` describes the checkout, so reviewing a
+branch that dropped its last `Cargo.toml` from a Rust checkout used to run every
+cargo gate and report cargo's own "could not find `Cargo.toml`" as the target's
+verdict. `missing_reviewed_cargo_manifest()` asks the target commit's tree
+instead — the snapshot carries exactly that tree, so no worktree is materialised
+to answer it — and skips with a reason when neither the mapped cargo root nor
+the repo root has a manifest there. When git cannot answer at all (unreadable
+repo, unresolvable ref) nothing is skipped: an unverifiable claim may no more
+become a skip than a verdict.
+
 Cache keys follow the same substrate. Cached results are looked up **before**
 the shared snapshot exists, so cargo cache keys resolve the target commit
 directly (`off_head_target_commit()`) and key on the commit id whenever it
@@ -278,9 +306,17 @@ differs from `HEAD` — otherwise a `--pr` run would hit an entry a previous loc
 run stored under a working-tree hash and serve the local checkout's verdict. The
 commit is not the whole substrate, though: the same commit checked from the
 workspace root and from a configured member yields different results, so the
-repo-relative cargo root travels in the key beside it
-(`commit-<sha>-root:<path>`) — the discriminator the local hash path already
-carried.
+repo-relative cargo root travels in the key beside it — the discriminator the
+local hash path already carried.
+
+A cache key is a **file name**: `Cache::set` writes `<cache_dir>/<check>/<key>`
+and creates only the check-level directory. The root therefore travels hashed
+(`commit-<sha>-root-<hash>`, `-root-self` for the repo root) rather than
+verbatim. A nested root such as `crates/core` used to put a separator straight
+into the key, so every store targeted a directory nothing had created: the write
+failed, the lookup missed, and the most expensive gates in the tool recomputed
+on every review of a workspace member. The same encoding removes the colon these
+keys carried, which is an illegal file-name character on Windows.
 
 **Known limitation — submodules.** `create_worktree_snapshot()` runs
 `git worktree add` only, so gitlink directories stay empty. A Cargo workspace
