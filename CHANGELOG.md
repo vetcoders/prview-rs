@@ -84,7 +84,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pub mod b { pub struct Config }` is added in the same file was cancelled as a
   no-op remove+re-add; the pairing now also requires compatible inline-module
   scopes (tracked per diff side, hunk-local — an unseen `mod` opener leaves the
-  scope unknown and pairs as before).
+  scope unknown and pairs as before). That module tracker now reads code only:
+  a brace inside a comment or a string/char literal (`// }`, `"{"`, `'}'`) used
+  to open or close a module scope that does not exist, so a removal and its
+  unrelated same-named addition landed in the same phantom scope and cancelled
+  each other — the breaking change vanished from the report. The literal/comment
+  scanner is shared with perf-regression test-context tracking (`rust_source`),
+  so both brace trackers agree on what counts as syntax.
 - Multi-line public declarations are compared in full. `pub struct Config<` with
   a changed bound on the next line used to hide behind its identical opening
   line, because only that line was compared. Continuation lines are now
@@ -95,6 +101,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declarations also produce signature changes, a `pub struct Limit` and a
   `pub const Limit` in one file were rendered as one row plus a bogus
   "feature-gated variant" note. The grouping key now carries the symbol kind.
+- A skipped `semgrep` run keeps its diagnostic. The tool/config-error skip reason
+  was built from stderr alone, but under `--json` semgrep reports rule and config
+  failures in the stdout payload's `errors[]` and can leave stderr empty — so the
+  one explanation available was discarded and the policy engine received the bare
+  "semgrep exited 2 with no findings payload" sentence. The excerpt is now taken
+  from stderr, else the payload's `errors[]` (reading `message` / `long_msg` /
+  `short_msg` / `type`, whichever the semgrep version emits), else raw stdout, so
+  a crash traceback printed on stdout also survives.
 - Coverage no longer reports an unmeasured scan as perfect. A diff with zero
   changed source files produced `0/0 (100%)` in `AI_INDEX.md`,
   `coverage-delta.txt`, and the dashboard; it now reads `not measured`, and the
@@ -168,6 +182,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unknown_merge_recommendation` and sets `normalized: true` instead of dropping
   the unparsable field on the floor. The `--json` summary keeps
   `schema_version: "cli-json/v1"`: `caveats` is additive and omitted when empty.
+  A verdict the CLI collapsed to `BLOCK` now also forces the axes derived beside
+  it: `allow_merge` is `false` and `merge_recommendation` is `Block` regardless
+  of what the same unreliable decision block claimed. A pack with an unreadable
+  verdict but `allow_merge: true` and `merge_recommendation: "approve"` used to
+  publish `verdict: "BLOCK"` next to an approval — breaking the
+  `allow_merge == (verdict == "PASS")` invariant — and, because
+  `compute_exit_code` keys off the recommendation, `--ci` exited `0` on it.
 - Human stdout no longer prints "All checks passed!" when no gate artifact was
   readable. The raw check tally is not a verdict; the summary now names the
   missing truth.

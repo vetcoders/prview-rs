@@ -158,10 +158,18 @@ impl ModScope {
         self.depth = 0;
     }
 
+    /// Feed one diff payload line to this side's tracker.
+    ///
+    /// Only the CODE part is counted. A brace inside a literal or a comment is
+    /// data: `const CLOSE: &str = "}";` inside `mod a` used to pop the module,
+    /// leaving a later removal of `a::Config` with an unknown scope — which
+    /// pairs with anything, so an unrelated `b::Config` addition cancelled a
+    /// real API removal.
     fn feed(&mut self, payload: &str) {
-        let opened = mod_opening_name(payload.trim());
+        let code = crate::rust_source::code_only(payload);
+        let opened = mod_opening_name(code.trim());
         let start_depth = self.depth;
-        for ch in payload.chars() {
+        for ch in code.chars() {
             match ch {
                 '{' => self.depth += 1,
                 '}' => self.depth -= 1,
@@ -1459,6 +1467,66 @@ mod tests {
         assert!(
             removed_symbol_types(&findings).contains(&"struct".to_string()),
             "removal from mod a must survive an unrelated add in mod b, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn literal_and_comment_braces_do_not_pop_the_module_scope() {
+        // A brace inside a literal or a comment is data. Counting it popped
+        // `mod a` early, so the removal of `a::Config` carried an unknown scope
+        // and paired with the unrelated addition of `b::Config` — the real API
+        // removal disappeared from the report.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " pub mod a {",
+                " const CLOSE: &str = \"}\";",
+                " // trailing brace in a comment }",
+                "-    pub struct Config {",
+                "-        pub x: u32,",
+                "-    }",
+                " }",
+                " pub mod b {",
+                "+    pub struct Config {",
+                "+        pub x: u32,",
+                "+    }",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a brace in a literal or comment must not merge two module scopes, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn literal_brace_does_not_invent_a_module_scope() {
+        // The mirror direction: an unmatched `{` in a literal used to deepen the
+        // tracked scope, so a later removal and addition in the SAME module
+        // looked like two different namespaces and a plain no-op re-add was
+        // reported as a breaking removal.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " pub mod a {",
+                " const OPEN: &str = \"{\";",
+                "-    pub struct Config {",
+                "+    pub struct Config {",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "an identical re-add in one module is not breaking, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }
