@@ -302,6 +302,66 @@ fn generated_merge_gate_passes_repo_validator() {
         .success();
 }
 
+/// Accepting schema `2.2` without checking the field that defines it lets a pack
+/// omit, mistype, or invent an `origin` and still pass its own contract gate.
+/// Consumers are told to filter `quality_failure_details` on
+/// `origin == "failure"`, so an unvalidated origin makes a real failure
+/// indistinguishable from a warning.
+#[test]
+fn validator_rejects_schema_two_two_without_a_usable_origin() {
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+
+    let payload = run_json_quiet(repo, &["feature/json-contract", "main"]);
+    let output_dir = Path::new(
+        payload["output_dir"]
+            .as_str()
+            .expect("output_dir should be a string"),
+    );
+    let merge_gate = output_dir.join("00_summary/MERGE_GATE.json");
+    let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
+
+    let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
+    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    assert_eq!(
+        original["schema_version"].as_str(),
+        Some("2.2"),
+        "this test pins the schema that introduced `origin`"
+    );
+
+    let broken_details = [
+        serde_json::json!([{ "name": "Clippy", "classification": "introduced" }]),
+        serde_json::json!([{ "name": "Clippy", "classification": "introduced", "origin": "failed" }]),
+        serde_json::json!([{ "name": "Clippy", "classification": "introduced", "origin": true }]),
+        serde_json::json!([{ "name": "Clippy", "classification": "introduced", "origin": null }]),
+        serde_json::json!(["Clippy"]),
+    ];
+
+    for details in broken_details {
+        let mut gate = original.clone();
+        gate["decision"]["quality_failure_details"] = details.clone();
+        std::fs::write(
+            &merge_gate,
+            serde_json::to_string_pretty(&gate).expect("serialize gate"),
+        )
+        .expect("write gate");
+
+        Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert()
+            .failure();
+    }
+
+    // The shape the emitter actually writes still validates.
+    std::fs::write(&merge_gate, &raw).expect("restore gate");
+    Command::new("python3")
+        .arg(&validator)
+        .arg(&merge_gate)
+        .assert()
+        .success();
+}
+
 /// Resolve an executable by scanning `PATH` (test helper; no external crate).
 #[cfg(unix)]
 fn resolve_in_path(bin: &str) -> Option<std::path::PathBuf> {

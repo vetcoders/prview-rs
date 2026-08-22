@@ -39,7 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`"failure"` / `"warning"`), which is what lets a reader make sense of
   `introduced_quality_failures: ["Rustfmt"]` sitting next to
   `quality_pass: true`. This is an additive field, so `MERGE_GATE.json` is
-  `schema_version: "2.2"` and `tools/validate_merge_gate.py` accepts it.
+  `schema_version: "2.2"` and `tools/validate_merge_gate.py` accepts it — and,
+  from 2.2, requires it: an entry that omits `origin`, mistypes it, or spells it
+  anything other than `failure` / `warning` now fails the contract validator,
+  because a consumer told to filter on `origin == "failure"` cannot do that on a
+  pack where the field is optional.
 
 - Perf regression detection now resolves inline Rust test context (`#[cfg(test)]`,
   `mod tests`, `#[test]`) **per hit line** instead of per hunk. A production hot
@@ -59,7 +63,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   module — or the reverse. Trailing comments are stripped before both the marker
   match and the brace tracking, so `let x = 1; // #[cfg(test)]` no longer opens
   test context and a `{` inside a comment no longer shifts the scope; a `//`
-  inside a string literal is still code.
+  inside a string literal is still code. String and char literals are blanked
+  for the same reason: `const CLOSE: &str = "}"` in a test module used to close
+  the scope early and report every later test hit as production, and an
+  unmatched `{` in a literal held it open and muted real production hits.
+  Normal, raw (`r#"…"#`) and byte-string literals as well as char literals
+  (`'}'`, `'\u{7b}'`) are recognised; lifetimes are not mistaken for char
+  literals. A literal spanning several diff lines is out of scope for this
+  per-line scanner.
+- Breaking-change detection pairs duplicate declarations one-to-one. `cfg`-gated
+  variants share (file, kind, name), and the pairing search never consumed its
+  match, so every removal cancelled against the same unchanged re-add: the
+  addition that actually replaced one of them stayed unpaired and its signature
+  change was never reported, while a genuine removal could be cancelled by an
+  addition already spent on another. Exact matches are now claimed first, each
+  addition is consumed once, and one cancelled removal retires exactly one
+  finding.
 - Breaking-change detection no longer loses a removal to a same-named symbol in
   another inline module. `pub mod a { pub struct Config }` deleted while
   `pub mod b { pub struct Config }` is added in the same file was cancelled as a
@@ -117,9 +136,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read and reported with a `schema_forward_compat:` caveat — on every known
   MAJOR, so a `1.9` pack is now caveated instead of accepted in silence — and the
   MCP surface marks that read `normalized: true`, as the documented contract
-  already promised. An absent `schema_version` stays accepted: pre-2.1 packs
+  already promised. Version components must also be spelled canonically:
+  `u32::from_str` accepts leading zeros and a leading `+`, so `02.2`, `2.02` and
+  `+2.2` all parsed to the known `(2, 2)` and were read as the current schema
+  while the validator rejects those exact strings. An absent `schema_version` stays accepted: pre-2.1 packs
   predate the field, and the documented `ALLOW`/`HOLD` verdict tolerance is
   unchanged.
+- **A wrongly typed decision signal is a normalization, not an absent field.**
+  `verdict: "PASS"` beside `merge_recommendation: 7` used to collapse through
+  `as_str()` into "no recommendation", so the `prview mcp` adapter returned a
+  decision derived from the surviving signal with `normalized: false` and no
+  caveat — a field ignored in silence, which the MCP contract forbids. Each
+  decision signal now distinguishes absent from present-but-untypable and emits
+  an `unreadable_verdict:` / `unreadable_merge_recommendation:` /
+  `unreadable_allow_merge:` caveat with `normalized: true`. A pack with no
+  usable signal at all is still `storage_corrupt`.
 - **Unknown verdicts are reported instead of silently absorbed.** The CLI still
   collapses an unrecognized verdict to `BLOCK`, but now says so through a new
   optional `caveats` array on the `--json` summary (`unknown_verdict: …`) — the

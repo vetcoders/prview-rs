@@ -18,6 +18,25 @@ VALID_PROFILES = {"auto", "js", "rust", "python", "mixed", "generic"}
 # `HOLD` synonym is retired: legacy_verdict() now emits CONDITIONAL for every
 # review-required/degraded run, so a freshly generated gate never carries HOLD.
 VALID_VERDICTS = {"PASS", "CONDITIONAL", "BLOCK"}
+# schema 2.2: quality_failure_details entries name which check status produced
+# them. Only "failure" entries may fail the quality gate, so a consumer told to
+# filter on origin == "failure" cannot do that if the field is absent, mistyped,
+# or spelled something else.
+VALID_QUALITY_FAILURE_ORIGINS = {"failure", "warning"}
+
+
+def schema_at_least(raw: Any, minimum: tuple[int, int]) -> bool:
+    """Whether `raw` is a canonical MAJOR.MINOR at or above `minimum`.
+
+    Mirrors the reader in `src/gate.rs`: components are compared as written, so
+    a non-canonical spelling is never treated as a version at all.
+    """
+    if not isinstance(raw, str):
+        return False
+    parts = raw.split(".")
+    if len(parts) != 2 or not all(p.isdigit() and (p == "0" or not p.startswith("0")) for p in parts):
+        return False
+    return (int(parts[0]), int(parts[1])) >= minimum
 
 
 def err(msg: str) -> None:
@@ -247,6 +266,26 @@ def validate(path: Path) -> list[str]:
                     "decision.allow_merge must equal (verdict == 'PASS'): "
                     f"got allow_merge={allow_merge} with verdict={verdict!r}"
                 )
+        # From schema 2.2 the origin is part of the contract, not an extra: it is
+        # the only thing that explains an entry in `introduced_quality_failures`
+        # sitting next to `quality_pass: true`.
+        if schema_at_least(data.get("schema_version"), (2, 2)):
+            details = decision.get("quality_failure_details")
+            if not isinstance(details, list):
+                issues.append("decision.quality_failure_details must be an array")
+            else:
+                for idx, detail in enumerate(details):
+                    ctx = f"decision.quality_failure_details[{idx}]"
+                    if not isinstance(detail, dict):
+                        issues.append(f"{ctx} must be an object")
+                        continue
+                    origin = detail.get("origin")
+                    if origin not in VALID_QUALITY_FAILURE_ORIGINS:
+                        issues.append(
+                            f"{ctx}.origin must be one of "
+                            f"{sorted(VALID_QUALITY_FAILURE_ORIGINS)} (schema 2.2)"
+                        )
+
         if not isinstance(decision.get("blocking_issues"), list):
             issues.append("decision.blocking_issues must be an array")
         else:
