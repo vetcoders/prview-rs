@@ -86,6 +86,7 @@ impl Check for SemgrepCheck {
                     cmd: "semgrep",
                     args: &args,
                     cwd,
+                    repo_root: &config.repo_root,
                     output: &output,
                     combined_output: &combined,
                     started_at: &started_at,

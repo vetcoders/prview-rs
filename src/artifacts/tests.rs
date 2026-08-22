@@ -1419,6 +1419,8 @@ fn merge_gate_splits_preexisting_quality_failures_from_inline_findings() {
                 finished_at: "2026-01-01T00:00:01Z".to_string(),
                 hard_fail_signatures: vec![],
                 cache_key: None,
+                target_sha: None,
+                tree_state: None,
             }),
         },
         // Satisfy required Rust quality signals so they don't add unclassified gaps
@@ -2136,6 +2138,55 @@ fn failures_summary_is_written_when_no_checks_failed() {
 }
 
 #[test]
+fn gate_result_json_carries_the_scanned_tree_provenance() {
+    // The substrate a gate ran on must survive into the artifact: without
+    // target_sha + tree_state a reader cannot tell whether the gate saw the
+    // reviewed commit or an uncommitted local tree. Absent fields stay absent
+    // (older packs and non-git substrates must not grow null keys).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = CheckResult {
+        name: "Ruff".to_string(),
+        status: CheckStatus::Passed,
+        duration: Duration::from_secs(1),
+        output: String::new(),
+        cached: false,
+        provenance: Some(CheckProvenance {
+            command: "ruff check .".to_string(),
+            tool_version: None,
+            cwd: "[external]/tmp/snapshot".to_string(),
+            exit_code: Some(0),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            finished_at: "2026-01-01T00:00:01Z".to_string(),
+            hard_fail_signatures: vec![],
+            cache_key: None,
+            target_sha: Some("a".repeat(40)),
+            tree_state: Some(crate::checks::TreeState::Snapshot),
+        }),
+    };
+
+    generate_gate_results(tmp.path(), std::slice::from_ref(&base)).expect("gate results");
+    let value: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("ruff.result.json")).expect("read json"),
+    )
+    .expect("parse json");
+    assert_eq!(value["target_sha"].as_str(), Some("a".repeat(40).as_str()));
+    assert_eq!(value["tree_state"].as_str(), Some("snapshot"));
+
+    let mut unknown = base;
+    if let Some(prov) = unknown.provenance.as_mut() {
+        prov.target_sha = None;
+        prov.tree_state = None;
+    }
+    generate_gate_results(tmp.path(), &[unknown]).expect("gate results");
+    let value: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("ruff.result.json")).expect("read json"),
+    )
+    .expect("parse json");
+    assert!(value.get("target_sha").is_none());
+    assert!(value.get("tree_state").is_none());
+}
+
+#[test]
 fn gate_result_json_has_failed_tests_for_cargo_test() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let checks = vec![CheckResult {
@@ -2167,6 +2218,8 @@ test result: FAILED. 0 passed; 1 failed
             finished_at: "2026-01-01T00:00:01Z".to_string(),
             hard_fail_signatures: vec!["SIGABRT".to_string()],
             cache_key: None,
+            target_sha: None,
+            tree_state: None,
         }),
     }];
 
@@ -2218,6 +2271,8 @@ test result: FAILED. 0 passed; 1 failed
             finished_at: "2026-01-01T00:00:01Z".to_string(),
             hard_fail_signatures: vec!["SIGABRT".to_string()],
             cache_key: None,
+            target_sha: None,
+            tree_state: None,
         }),
     }];
 
@@ -2296,6 +2351,8 @@ fn inline_findings_emits_one_sarif_result_per_cargo_audit_advisory() {
             finished_at: "2026-01-01T00:00:01Z".to_string(),
             hard_fail_signatures: vec![],
             cache_key: None,
+            target_sha: None,
+            tree_state: None,
         }),
     }];
 
