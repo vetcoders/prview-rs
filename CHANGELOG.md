@@ -29,13 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   there; each run freezes its own state, and under `--watch` every iteration
   re-reads the tree it is about to analyse.
   The file is listed in `AI_INDEX.md`'s reading order, right after the gate
-  verdict it explains. A reviewer holding only the artifacts no longer has to
-  reconstruct the run's substrate from scattered gate files. Purely additive: no
-  existing pack file changed shape, the manifest hashes it like any other
-  artifact, and the sanity `required_files` check now requires it.
+  verdict it explains — and in the documented contract for it
+  (`docs/contracts/ai_index.md`) and the artifact-pack inventory in `README.md`,
+  so a consumer implementing the contract can discover that the file is required
+  and where it belongs. `worktree.clean` is nullable: a status that could not be
+  read is reported as unknown rather than as a clean tree. A reviewer holding
+  only the artifacts no longer has to reconstruct the run's substrate from
+  scattered gate files. Purely additive: no existing pack file changed shape,
+  the manifest hashes it like any other artifact, and the sanity
+  `required_files` check now requires it.
 - Check provenance now records the tree each gate actually scanned: `target_sha`
   (the commit whose tree the check read) and `tree_state` (`snapshot`,
-  `snapshot-dirty`, `local-clean`, `local-dirty` or `foreign`). Previously `cwd`
+  `snapshot-dirty`, `snapshot-borrowed-deps`, `local-clean`, `local-dirty` or
+  `foreign`). Previously `cwd`
   was the only substrate
   signal, so an artifact pack could not prove whether a gate saw the reviewed
   commit or an operator's uncommitted working tree. Both fields are resolved
@@ -58,7 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cache can never pair one run's result with another run's provenance. Entries
   written by an older prview are still read in their previous multi-file form
   (no cache invalidation, no cold rebuild) and are collapsed into the new shape
-  the first time the key is rewritten.
+  the first time the key is rewritten. A check that *errors* keeps its substrate
+  too: a command that times out or crashes used to produce a row with a null
+  `cwd`, `target_sha` and `tree_state`, which are precisely the rows where
+  "which tree produced this error" is the first question asked. The error path
+  now reconstructs the directory the check was about to read without
+  materialising anything, while stating what it does not know — `command` reads
+  `<no command recorded>`, and an off-`HEAD` check whose own worktree is already
+  gone keeps no provenance rather than naming the local checkout it was not
+  reading.
 - `Pytest` now runs in the reviewed target snapshot instead of `config.repo_root`.
   When reviewing a PR or a remote branch, `repo_root` still points at whatever is
   checked out locally, so pytest executed the *local* branch's tests and reported
@@ -67,7 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target snapshot earlier; `Pytest` was the one check left behind, and is now
   registered as a shared-snapshot check alongside them. Local reviews, where the
   target resolves to `HEAD`, are unaffected. Its recorded `provenance.cwd` now
-  reports the directory the run actually used.
+  reports the directory the run actually used. Whether the Python checks apply
+  at all is decided by the reviewed commit as well: a target that removed its
+  last `pyproject.toml` and Python sources is still reviewed from a Python
+  checkout, and pytest exited 5 for "no tests collected" — a blocking failure
+  for a target the check no longer applies to, with Ruff and Mypy passing
+  vacuously beside it. All three now skip with a reason when the reviewed tree
+  carries no Python, resolved from git without materialising a worktree, and
+  fail open whenever git cannot answer.
 - The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,
   `Cargo audit`, `Cargo geiger`) now run against the reviewed target snapshot
   instead of the local checkout. When reviewing a PR or a remote branch, they
@@ -119,7 +140,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an external directory, which carries no `..` and passed the lexical check:
   resolving the root from the git tree cannot follow a symlink out of the
   reviewed commit, and a resolved path that still leaves the snapshot is refused
-  instead of producing a foreign tree's verdict cached under that commit.
+  instead of producing a foreign tree's verdict cached under that commit. The
+  same holds one path component deeper, for a reviewed commit that keeps the
+  cargo root and replaces `Cargo.toml` *itself* with a link to an external
+  manifest: git stores a symlink as a blob, so a plain tree lookup accepted it.
+  A manifest must now be a regular file, and the containment check resolves the
+  manifest alongside the directory for the cases the tree lookup cannot cover.
 - A cargo root that the reviewed branch moved (a root crate pushed into
   `backend/`, a member renamed) is no longer projected into the snapshot
   verbatim. The locally detected path does not exist there, so cargo failed on a
@@ -145,7 +171,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status that fails to read (an index lock, a permissions error, a malformed
   repository) recorded `local-clean` — the claim that the scanned bytes exactly
   match the commit, made precisely when nothing could be checked. It now records
-  no `tree_state` at all, the same "visibly unknown" the non-git case uses.
+  no `tree_state` at all, the same "visibly unknown" the non-git case uses. The
+  pack-level `worktree.clean` had the same gap and is now `null` in that case
+  instead of `true`: the value is published as a fact in `PROVENANCE.json` and
+  decides whether out-of-diff failures are downgraded to pre-existing, so
+  certifying an uninspected tree could silence real findings. A run with no git
+  repository at all still reports `true` — nothing can be uncommitted without
+  one, and such a run has no diff baseline to downgrade against anyway.
 - A snapshot that a check wrote into is no longer recorded as an exact commit
   scan. `tree_state: snapshot` was assigned to any directory outside the repo
   root, so a generated `Cargo.lock` (or any tool writing into the checkout) left
@@ -154,7 +186,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reviewed commit. Snapshots are now verified against their own status
   (`snapshot` / `snapshot-dirty`, ignoring the `node_modules` and `.venv`
   symlinks prview itself creates), and a directory that is not a worktree of
-  this repository is recorded as `foreign`.
+  this repository is recorded as `foreign`. Those ignored symlinks are not free
+  of consequence either: prview links the *operator's* dependencies into the
+  snapshot rather than installing what the target's lockfile pins, so `tsc`,
+  ESLint, Stylelint and Vitest read a compiler, plugins, type definitions and a
+  runtime from the local checkout while the pack certified an exact target-tree
+  scan — for a dependency-changing PR, the case where the two differ most. A
+  snapshot that carries those links is now `snapshot-borrowed-deps`: the
+  reviewed source is exactly the target, the dependencies are borrowed. A repo
+  with no local dependency tree links nothing and stays `snapshot`.
 
 ### Changed
 
