@@ -331,7 +331,11 @@ tree closes that by construction — trees are not traversed through symlinks, s
 such a root simply has no entries to find — and `contained_in_snapshot()` settles
 containment on the resolved paths for the cases git cannot answer (an injected
 scan dir, an unreadable repo), refusing rather than earning a verdict outside
-the reviewed tree. Canonicalisation is the test only; the path itself is passed
+the reviewed tree. It resolves three paths, not one: the directory, its
+`Cargo.toml`, and its `Cargo.lock`. Cargo follows a symlinked lockfile even
+under `--locked`, so a reviewed commit tracking its lock as a link to an
+external file had the entire dependency graph resolved from another project's
+pins while the pack reported an exact `snapshot` scan. Canonicalisation is the test only; the path itself is passed
 through unchanged, so provenance keeps reporting the directory as the run saw it.
 
 What the contained manifest *declares* is the next step out.

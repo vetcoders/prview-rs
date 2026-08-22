@@ -183,7 +183,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cargo root and replaces `Cargo.toml` *itself* with a link to an external
   manifest: git stores a symlink as a blob, so a plain tree lookup accepted it.
   A manifest must now be a regular file, and the containment check resolves the
-  manifest alongside the directory for the cases the tree lookup cannot cover.
+  manifest alongside the directory for the cases the tree lookup cannot cover —
+  and `Cargo.lock` with them, because cargo follows a symlinked lockfile even
+  under `--locked`, so a reviewed commit tracking its lock as a link to an
+  external file had its entire dependency graph resolved from another project's
+  pins.
   A **local** review is one of those cases and was reached by neither guard —
   the local plan returns before the containment check runs — so a checkout
   tracking `Cargo.toml` as a link to an external manifest had cargo build a

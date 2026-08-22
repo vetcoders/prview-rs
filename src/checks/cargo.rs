@@ -188,7 +188,11 @@ fn manifest_stays_in_root(cwd: PathBuf) -> Result<PathBuf> {
 ///
 /// The directory is not the whole answer: a root that stays inside the snapshot
 /// can still hold a `Cargo.toml` that is itself a link to an external manifest,
-/// and cargo reads the manifest, not the directory. Both are therefore resolved.
+/// and cargo reads the manifest, not the directory. The same is true of
+/// `Cargo.lock` — cargo follows a symlinked lockfile even under `--locked`, so a
+/// reviewed commit tracking its lock as a link to an external file had the whole
+/// dependency graph resolved from another project's pins while provenance
+/// recorded an exact `snapshot` scan. All three are therefore resolved.
 /// The tree-level guard in [`resolve_reviewed_cargo_root`] already rejects such a
 /// manifest for an off-HEAD review; this is the same refusal on the materialised
 /// bytes, for the paths that guard cannot reach (a repo whose tree git could not
@@ -204,13 +208,13 @@ fn contained_in_snapshot(cwd: PathBuf, scan_dir: &Path) -> Result<PathBuf> {
     let Ok(root) = scan_dir.canonicalize() else {
         return Ok(cwd);
     };
-    for target in [cwd.clone(), cwd.join("Cargo.toml")] {
+    for target in [cwd.clone(), cwd.join("Cargo.toml"), cwd.join("Cargo.lock")] {
         let Ok(resolved) = target.canonicalize() else {
             continue;
         };
         if !resolved.starts_with(&root) {
             anyhow::bail!(
-                "cargo root {} resolves outside the reviewed snapshot ({}), so a verdict earned \
+                "{} resolves outside the reviewed snapshot ({}), so a verdict earned \
                  there would describe another tree",
                 target.display(),
                 scan_dir.display(),
@@ -2722,6 +2726,39 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             inside,
             "cargo must not follow a symlink out of the reviewed tree, got {}",
             cwd.display(),
+        );
+    }
+
+    /// Cargo follows a symlinked `Cargo.lock` even under `--locked`, so a
+    /// reviewed commit tracking its lock as a link to an external file had the
+    /// whole dependency graph resolved from another project's pins — under this
+    /// commit's cache key and a `snapshot` provenance row.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_lockfile_never_escapes_the_snapshot() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_crate(scan_dir.path(), true);
+        std::os::unix::fs::symlink(
+            outside.path().join("Cargo.lock"),
+            scan_dir.path().join("Cargo.lock"),
+        )
+        .unwrap();
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a lockfile pointing out of the reviewed tree must not pin this run");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("Cargo.lock") && err.contains("outside the reviewed snapshot"),
+            "the refusal must name the escaping lockfile: {err}",
         );
     }
 
