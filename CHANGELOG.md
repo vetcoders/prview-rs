@@ -28,7 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own `HEAD` and, when dirty, by a recursive digest of its own dirty subset
   (three levels of nesting deep) rather than by the bare fact that a directory
   is there; each run freezes its own state, and under `--watch` every iteration
-  re-reads the tree it is about to analyse.
+  re-reads the tree it is about to analyse. Paths are taken from git's raw
+  bytes: a filename that is not valid UTF-8 is fingerprinted by those bytes and
+  its content read through an OS-native path, where a single `<non-utf8>`
+  placeholder previously merged every such entry into one line whose content
+  lookup found nothing.
   The file is listed in `AI_INDEX.md`'s reading order, right after the gate
   verdict it explains — and in the documented contract for it
   (`docs/contracts/ai_index.md`) and the artifact-pack inventory in `README.md`,

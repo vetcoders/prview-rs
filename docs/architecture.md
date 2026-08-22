@@ -556,7 +556,11 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   when the path is gone, `unreadable` on an IO error. Paths alone
   identify *which* files are modified, not *how*; two runs that touch the same
   files with different content are different substrates and must not share a
-  digest. Only the dirty subset is hashed. It is a stable fingerprint, not a
+  digest. The path itself comes from git's raw bytes, not from the UTF-8 view:
+  a name that is not valid UTF-8 is written as `<non-utf8:<sha256 of the
+  bytes>>` and its content is still read through an OS-native path, because the
+  single placeholder they shared before collapsed every such entry onto one line
+  with an `absent` body. Only the dirty subset is hashed. It is a stable fingerprint, not a
   capture of a specific `git status --porcelain` stdout;
 - `checks[]` — one row per configured check: `{id, cwd, target_sha, tree_state,
   started_at, cached, skipped}`, with `null` fields for a check that produced no

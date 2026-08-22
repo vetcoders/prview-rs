@@ -832,16 +832,60 @@ fn render_status_fingerprint(
     let mut lines: Vec<String> = statuses
         .iter()
         .map(|entry| {
-            let path = entry.path().unwrap_or("<non-utf8>").to_string();
-            let content = workdir.map_or_else(
-                || "unknown".to_string(),
-                |dir| content_fingerprint(&dir.join(&path), depth),
-            );
-            format!("{} {path}\0{content}", status_codes(entry.status()))
+            // Git stores names as bytes. `path()` gives up on anything that is
+            // not UTF-8, which rendered every such entry as one literal
+            // placeholder and looked up its content at a path that does not
+            // exist: two runs dirtying different unrepresentable names, or the
+            // same one differently, produced the same digest.
+            let bytes = entry.path_bytes();
+            let label = status_path_label(bytes);
+            let content = match (workdir, os_relative_path(bytes)) {
+                (Some(dir), Some(relative)) => content_fingerprint(&dir.join(relative), depth),
+                _ => "unknown".to_string(),
+            };
+            format!("{} {label}\0{content}", status_codes(entry.status()))
         })
         .collect();
     lines.sort();
     lines.join("\n")
+}
+
+/// How a dirty path is written into the digest.
+///
+/// UTF-8 names appear as themselves. A name that is not UTF-8 appears as the
+/// hash of its bytes, so two different unrepresentable names stay two different
+/// lines — the placeholder they used to share made them one.
+fn status_path_label(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    match std::str::from_utf8(bytes) {
+        Ok(path) => path.to_string(),
+        Err(_) => {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            format!("<non-utf8:{:x}>", hasher.finalize())
+        }
+    }
+}
+
+/// A status entry's path as the OS names it, so a name git cannot render as
+/// UTF-8 still resolves to the file it points at.
+///
+/// Windows paths are UTF-16 with no byte-oriented API to rebuild them from, so
+/// an unrepresentable name there stays unreadable rather than guessed at — the
+/// path still contributes to the digest through its hashed bytes.
+fn os_relative_path(bytes: &[u8]) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes)
+            .ok()
+            .map(std::path::PathBuf::from)
+    }
 }
 
 /// Fingerprint the bytes currently at `path`, without loading the file whole.
@@ -1854,6 +1898,57 @@ mod tests {
             capture_worktree_provenance(tmp.path()).clean,
             Some(false),
             "an untracked file makes a fresh read dirty"
+        );
+    }
+
+    /// Git names files in bytes. A name that is not UTF-8 used to render as one
+    /// literal placeholder whose content lookup resolved to `absent`, so two
+    /// runs dirtying different such names — or the same name with different
+    /// bytes in it — claimed the same substrate.
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_dirty_paths_are_told_apart() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // Labels are told apart everywhere, including on filesystems that
+        // refuse such names outright (APFS rejects them with EILSEQ).
+        assert_ne!(
+            status_path_label(b"bad-\xff.txt"),
+            status_path_label(b"bad-\xfe.txt"),
+            "two different unrepresentable names must not share one line",
+        );
+        assert_eq!(
+            status_path_label(b"src/main.rs"),
+            "src/main.rs",
+            "a representable path is written as itself",
+        );
+
+        let digest_for = |name: &[u8], body: &[u8]| -> Option<String> {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            git2::Repository::init(tmp.path()).expect("init repo");
+            let path = tmp
+                .path()
+                .join(std::ffi::OsStr::from_bytes(name).to_os_string());
+            // The filesystem may reject the name (APFS enforces UTF-8); the
+            // digest question only exists where it does not.
+            std::fs::write(&path, body).ok()?;
+            capture_worktree_provenance(tmp.path()).status_digest
+        };
+
+        let (Some(first), Some(second), Some(recontented)) = (
+            digest_for(b"bad-\xff.txt", b"one"),
+            digest_for(b"bad-\xfe.txt", b"one"),
+            digest_for(b"bad-\xff.txt", b"two"),
+        ) else {
+            return;
+        };
+        assert_ne!(
+            first, second,
+            "two different unrepresentable names are two different substrates",
+        );
+        assert_ne!(
+            first, recontented,
+            "the same unrepresentable name with different content is a different substrate",
         );
     }
 
