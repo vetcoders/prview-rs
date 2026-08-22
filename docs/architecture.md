@@ -763,8 +763,33 @@ and char literals verbatim: a literal is code, so `pub const GREETING: &str =
 delimiter trackers, which want a brace inside a string silenced, and
 `code_with_literals` for callers comparing source.
 
+The identity separates its lines with the character that separated them: a
+newline, not a space. A literal spanning two physical lines otherwise compared
+equal to the same literal rewritten with a space in it, and a changed public
+constant paired away as an unchanged re-add. (Indentation INSIDE such a literal
+is already gone by then — lines reach the accumulator trimmed — so two multi-line
+literals differing only in leading whitespace still read as one.)
+
+A declaration ends at a `;` or a body `{` outside its brackets. Square brackets
+count for the same reason parentheses do: an array type states its length with a
+`;`, as in `pub const TABLE: [u8; 2] = [`, and reading that as the terminator
+finalized both diff sides at their identical opener — the changed values below
+produced no finding at all. Measured over the local crates.io registry, 719
+public `const`/`static` declarations in 126 crates open a multi-line initializer
+on a line whose type carries such a `;`.
+
+Inline module names keep their raw-identifier prefix. `mod r#type` and
+`mod r#match` were both recorded as `r`, so two namespaces looked like one and a
+removal from the first was cancelled by an unrelated addition in the second.
+
 Pairing is scoped: two declarations pair only when their inline `mod` path and
-their `#[cfg(…)]` guard may be the same. The guard is the WHOLE conjunction of
+their `#[cfg(…)]` guard may be the same. **Accepted limit (measured):** the
+attribute's delimiter counter does not resolve block comments, so a `/* ) */`
+inside a multi-line predicate counts as syntax and could balance the attribute
+early. Resolving it needs a per-side scanner reset with the guard plus a second
+view (the guard's identity must keep literals a delimiter view drops); across the
+local crates.io registry a block comment opens inside a `cfg` predicate zero
+times, so the limit is recorded rather than paid for. The guard is the WHOLE conjunction of
 the attributes stacked above the declaration, sorted — `#[cfg(unix)]
 #[cfg(feature = "x")]` and `#[cfg(windows)] #[cfg(feature = "x")]` are different
 guards, while reordering the same two is not. An unseen scope or guard is
@@ -815,10 +840,16 @@ not by taking the first `{`. A brace in type or pattern position —
 body exists, so reading it as the opener made the very next line look like the
 item closing again: the context ended at the signature and the whole test body
 was classified as production. Inside a signature `<` is reliably a generic
-opener (signatures do not compare), with `->` excluded so a return arrow is not
-read as a closing angle bracket; the depth is clamped at zero so a hunk starting
-mid-signature errs toward closing the context rather than muting production
-code. Measured over the local crates.io registry: of 1,697,077 `fn` signatures,
+opener — but only where one can be: a `<` counts as opening a generic when it
+FOLLOWS what it parameterises (`Buffer<`, `Vec<`, `fn f<`, `::<`), and a `<`
+after whitespace is a comparison, which a const argument may hold
+(`Buffer<{ 1 < 2 }>`). Counting that comparison left the depth stuck above zero,
+the real body brace read as another type-level brace, and the context never
+closed — muting every production hit after the test. `->` is excluded so a return
+arrow is not read as a closing angle bracket; closers stay unconditional and the
+depth is clamped at zero, so a `<` this rule misjudges — like a hunk starting
+mid-signature — can only end the context early, never hold it open and mute
+production code. Measured over the local crates.io registry: of 1,697,077 `fn` signatures,
 1,191 carry a brace in that position and 715 place the body opener on a later
 line — the shape that actually breaks the tracker — 59 of them test-annotated.
 

@@ -201,6 +201,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A changed multi-line array constant surfaces again.** An array type states
+  its length with a `;` — `pub const TABLE: [u8; 2] = [` — and the declaration
+  accumulator accepted that `;` as the terminator. Both sides of a diff
+  finalized at their identical opener, paired as an unchanged re-add, and the
+  changed values below produced no finding at all. Square brackets are now
+  counted like parentheses before a `;` ends a declaration.
+- **A literal spanning two lines is no longer the same value as one with a
+  space.** The comparison identity joined physical lines with a space, including
+  the lines a literal spans, so a rewritten public constant paired away as an
+  unchanged re-add. Lines are now separated by the boundary that separated them.
+- **A raw-identifier module is its own scope.** The inline-module parser stopped
+  at the `#`, recording both `mod r#type` and `mod r#match` as `r`: two
+  namespaces looked like one, and a removal from the first was cancelled by an
+  unrelated addition in the second.
+- **A comparison inside a const argument no longer holds a test context open.**
+  The perf tracker counted the `<` of `Buffer<{ 1 < 2 }>` as a generic opener,
+  leaving the signature depth stuck above zero so the real body brace was read
+  as another type-level brace. The context never closed and every production
+  loop and query after the test was muted. A `<` now opens a generic only where
+  one can be — directly after what it parameterises.
 - **Rewording a comment inside a declaration is no longer a signature change.**
   Declarations were compared on their verbatim text, comments and all, so a
   remove+re-add of a byte-identical public signature whose internal comment had
@@ -413,8 +433,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/*` inside a string literal stays data: `format!("{}/*.{}", dir, ext)` is a
   glob pattern, and reading it as a comment opener would swallow the rest of the
   hunk — a far more common line in real diffs than a block comment is. A *string*
-  literal spanning several diff lines is still out of scope for this per-line
-  scanner.
+  literal spanning several diff lines is carried the same way a block comment is:
+  the scanner keeps one open across lines, so a brace inside a multi-line
+  template or JSON fixture never reaches a delimiter tracker as syntax. What ends
+  the carrying is the hunk boundary, where the text stops being contiguous.
 - Breaking-change detection pairs duplicate declarations one-to-one. `cfg`-gated
   variants share (file, kind, name), and the pairing search never consumed its
   match, so every removal cancelled against the same unchanged re-add: the

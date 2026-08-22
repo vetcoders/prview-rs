@@ -277,12 +277,21 @@ fn mod_opening_name(trimmed: &str) -> Option<String> {
     if !rest.starts_with(char::is_whitespace) {
         return None;
     }
+    let rest = rest.trim_start();
+    // A module may be named with a keyword through a raw identifier. Stopping at
+    // the `#` recorded `r#type` and `r#match` both as `r`, so two different
+    // namespaces looked like one and a removal from the first paired away
+    // against an unrelated addition in the second. The prefix is kept in the
+    // name because it is part of how the path is written.
+    let (prefix, rest) = match rest.strip_prefix("r#") {
+        Some(after) => ("r#", after),
+        None => ("", rest),
+    };
     let name: String = rest
-        .trim_start()
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect();
-    (!name.is_empty()).then_some(name)
+    (!name.is_empty()).then(|| format!("{prefix}{name}"))
 }
 
 /// May a removal in `removed_scope` and an addition in `added_scope` describe
@@ -881,6 +890,20 @@ fn gates_the_item(attribute: &str) -> bool {
 /// Delimiters inside a string literal are text, not structure: `#[doc = "a ("]`
 /// closes on its own line. Escapes are honoured so a `\"` does not end the
 /// string early.
+///
+/// ACCEPTED LIMIT (measured, do not re-litigate). A block comment's contents are
+/// NOT resolved here, so `/* ) */` inside a multi-line `#[cfg(…)]` predicate
+/// counts as syntax. Enough stray closers in such a comment would balance the
+/// attribute early, the real continuation would then read as a new item and
+/// clear the pending guard, and differently guarded declarations could pair as
+/// if both were unguarded. Resolving it needs what the other trackers use — a
+/// [`SourceScanner`](crate::rust_source::SourceScanner) per side, reset with
+/// this guard, plus a SECOND view because the guard's identity must keep the
+/// literals a delimiter view drops. That machinery buys nothing measurable: over
+/// the local crates.io registry (59,974 files, 2,025 crates) a block comment
+/// opens inside a `cfg` predicate exactly ZERO times. The 12 nearby hits are the
+/// reverse shape — a whole `#[cfg(…)]` commented OUT, `/* #[cfg(test)]` — which
+/// never enters this counter because the line does not start with `#[`.
 fn delimiter_depth(line: &str, depth: usize) -> usize {
     let mut depth = depth;
     let mut in_string = false;
@@ -1024,7 +1047,13 @@ impl PendingDecl {
             return;
         }
         if !self.decl.identity.is_empty() {
-            self.decl.identity.push(' ');
+            // The lines are separated by the character that actually separated
+            // them. Joining with a space made a literal spanning two lines
+            // compare equal to the same literal rewritten with a space in it, so
+            // a changed public constant paired away as an unchanged re-add. The
+            // identity is only ever compared, never displayed, so the newline
+            // costs nothing and says what the source said.
+            self.decl.identity.push('\n');
         }
         self.decl.identity.push_str(line);
     }
@@ -1084,8 +1113,14 @@ fn declaration_complete(code: &str) -> bool {
     let mut depth: i32 = 0;
     for ch in code.chars() {
         match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
+            // Square brackets are counted for the same reason parentheses are:
+            // an array type states its length with a `;` — `pub const TABLE:
+            // [u8; 2] = [` — and reading that as the terminator finalized the
+            // declaration at its opener. Both sides of a diff then held the same
+            // opener text, paired as an unchanged re-add, and a changed
+            // initializer below produced no finding at all.
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
             '{' if depth <= 0 => return true,
             ';' if depth <= 0 => return true,
             _ => {}
@@ -1835,6 +1870,37 @@ mod tests {
     }
 
     #[test]
+    fn raw_identifier_modules_are_different_scopes() {
+        // A module may be named with a keyword through a raw identifier. The
+        // scope parser stopped at the `#`, so `r#type` and `r#match` were both
+        // recorded as `r`: two different namespaces looked like one, and the
+        // removal of `r#type::Config` was cancelled by the unrelated addition of
+        // `r#match::Config`.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " pub mod r#type {",
+                "-    pub struct Config {",
+                "-        pub x: u32,",
+                "-    }",
+                " }",
+                " pub mod r#match {",
+                "+    pub struct Config {",
+                "+        pub x: u32,",
+                "+    }",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "removal from mod r#type must survive an add in mod r#match, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn literal_and_comment_braces_do_not_pop_the_module_scope() {
         // A brace inside a literal or a comment is data. Counting it popped
         // `mod a` early, so the removal of `a::Config` carried an unknown scope
@@ -2475,6 +2541,114 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "rewording a comment is not an API change, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_changed_multiline_array_constant_surfaces() {
+        // `[u8; 2]` states a length with a `;`, inside the TYPE. Accepting that
+        // `;` as the declaration's terminator finalized both sides at their
+        // identical opener, the exact-match pass paired them, and the changed
+        // values below vanished.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const TABLE: [u8; 2] = [",
+                "-    1, 2,",
+                "-];",
+                "+pub const TABLE: [u8; 2] = [",
+                "+    3, 4,",
+                "+];",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::ChangedSignature { before, after }
+                    if before.contains("1, 2") && after.contains("3, 4")
+            )),
+            "a changed multiline array constant must surface, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_reemitted_multiline_array_constant_is_still_a_no_op() {
+        // The tolerant direction: reading the whole initializer must not turn a
+        // verbatim re-emission into a removal.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const TABLE: [u8; 2] = [",
+                "-    1, 2,",
+                "-];",
+                "+pub const TABLE: [u8; 2] = [",
+                "+    1, 2,",
+                "+];",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "an unchanged re-emission is not breaking, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_newline_inside_a_literal_is_not_the_same_value_as_a_space() {
+        // The identity joined physical lines with a space, INCLUDING the ones a
+        // literal spans. A constant written across two lines therefore compared
+        // equal to the same constant rewritten with a space, and the exact-match
+        // pass consumed the addition: a changed public value left no finding.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const BANNER: &str = \"a",
+                "-b\";",
+                "+pub const BANNER: &str = \"a b\";",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "collapsing a literal's newline into a space changes the value, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_multiline_literal_reemitted_unchanged_is_still_a_no_op() {
+        // The tolerant direction: the same constant re-emitted across the same
+        // physical lines must stay a no-op.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const BANNER: &str = \"a",
+                "-b\";",
+                "+pub const BANNER: &str = \"a",
+                "+b\";",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "an unchanged multiline literal is not breaking, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

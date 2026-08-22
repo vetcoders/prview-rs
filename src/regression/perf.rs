@@ -502,7 +502,18 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
 /// Parameters<Req>)`, as written by `rmcp`, `leptos` and `sqlx`.
 fn track_signature_brackets(ch: char, prev: char, sig_depth: &mut i32) {
     match ch {
-        '(' | '[' | '<' => *sig_depth += 1,
+        '(' | '[' => *sig_depth += 1,
+        // A generic opener FOLLOWS the thing it parameterises — `Buffer<`,
+        // `Vec<`, `fn f<`, `::<`. A `<` after whitespace is a comparison, and a
+        // const argument may hold one: `Buffer<{ 1 < 2 }>`. Counting that
+        // comparison left the depth stuck above zero, so the real body brace
+        // read as another type-level brace and the context never closed —
+        // muting every production hit after the test. Closers stay unconditional
+        // (minus the `->` arrow) and the depth is clamped, so a `<` this rule
+        // misjudges can only end the context early, never hold it open.
+        '<' if prev.is_alphanumeric() || prev == '_' || prev == '>' || prev == ':' => {
+            *sig_depth += 1;
+        }
         '>' if prev == '-' => {}
         ')' | ']' | '>' => *sig_depth = (*sig_depth - 1).max(0),
         _ => {}
@@ -1502,6 +1513,38 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         );
         assert_eq!(result.query_in_loop_count, 0);
         assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_comparison_inside_const_braces_does_not_hold_the_context_open() {
+        // A `<` inside a const argument is a comparison, not a generic opener.
+        // Counting it left the signature's bracket depth stuck above zero, the
+        // real body brace was then read as another type-level brace, and the
+        // context never closed — muting every production hit after the test,
+        // which is the error direction that HIDES work.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{ 1 < 2 }> {
+     let n = 1;
+ }
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "production code after the test must not be muted by a comparison in a const argument"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
     }
 
     #[test]
