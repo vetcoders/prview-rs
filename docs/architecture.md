@@ -415,9 +415,21 @@ Scans added lines in diff patches for 11 risky patterns:
 - `generate_pattern_scan(dir, diffs, repo)` — produces `PATTERN_SCAN.json` with per-pattern
   aggregation, prod/test split counts, and sample contexts
 
-Scanned patterns: `unwrap`, `println`/`print`, `dbg`, `todo`/`FIXME`/`HACK`/`XXX`,
+Scanned patterns: `unwrap`, `println`/`print`/`eprintln`/`eprint`, `dbg`,
+`todo`/`FIXME`/`HACK`/`XXX`,
 `@ts-ignore`/`@ts-expect-error`/`@ts-nocheck`, `eslint-disable`, `console.log`/`error`/`warn`,
 bare `catch`, `unsafe`, `#[allow(...)]`, `as unknown as`/`as any`.
+
+Every needle is matched with word boundaries, and each side is bounded only
+where the NEEDLE has an identifier edge — that is the only side a longer
+identifier can swallow it from. `todo!(` is already right-bounded by its `(`
+but must be left-bounded, so `mytodo!(…)` is not a TODO marker; `.unwrap()`
+starts with `.` and must NOT be left-bounded, or `value.unwrap()` would stop
+matching. Bounding only needles made entirely of identifier characters left
+`todo!(`, `dbg!(`, `println!(`, `console.log(`, `unsafe {` and `as any` on raw
+substring matching — the last of which reported every `has any` in a doc
+comment as a type cast. The `eprint` family is listed explicitly because it used
+to be caught by accident: `eprintln!(` CONTAINS `println!(`.
 
 Full-file `#[cfg(test)]` / `#[test]` context seeding: reads the complete file at the
 target commit and builds a set of line numbers inside test blocks, using string/comment-aware
