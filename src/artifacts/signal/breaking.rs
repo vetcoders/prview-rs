@@ -534,25 +534,35 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     // Pairing additionally requires compatible inline-module scopes, so a
     // removal in one module is not cancelled by an unrelated same-named
     // declaration added in another module of the same file.
+    //
+    // Pairing is one-to-one: an addition is consumed once. `cfg`-gated variants
+    // share (file, kind, name), so a non-consuming search let every removal
+    // cancel against the same unchanged re-add — the addition that actually
+    // replaced one of them was left unpaired and its change went unreported.
+    // Exact matches are claimed first (pass 1) so an unchanged re-add is never
+    // spent on a removal that a different addition replaces.
+    let mut added_used = vec![false; added_syms.len()];
+    let mut unpaired_removed = Vec::new();
+
     for removed in &removed_syms {
-        let Some(added) = added_syms.iter().find(|added| {
-            added.file == removed.file
-                && added.symbol_type == removed.symbol_type
-                && added.name == removed.name
-                && scopes_may_pair(&removed.scope, &added.scope)
-        }) else {
+        match find_pairable_addition(&added_syms, &added_used, removed, true) {
+            Some(index) => {
+                added_used[index] = true;
+                drop_removal_finding(&mut findings, removed);
+            }
+            None => unpaired_removed.push(removed),
+        }
+    }
+
+    for removed in unpaired_removed {
+        let Some(index) = find_pairable_addition(&added_syms, &added_used, removed, false) else {
             continue;
         };
+        added_used[index] = true;
+        let added = &added_syms[index];
 
-        // Either way the removed-symbol finding is a false positive: drop it.
-        findings.retain(|f| {
-            !(f.file == removed.file
-                && matches!(
-                    &f.kind,
-                    BreakingKind::RemovedSymbol { symbol_type } if *symbol_type == removed.symbol_type
-                )
-                && f.line == removed.text)
-        });
+        // The removed-symbol finding is a false positive either way: drop it.
+        drop_removal_finding(&mut findings, removed);
 
         if added.text != removed.text {
             findings.push(BreakingFinding {
@@ -568,6 +578,47 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
     }
 
     findings
+}
+
+/// Index of the first not-yet-consumed addition that may pair with `removed`.
+///
+/// `require_identical_text` restricts the search to a declaration re-emitted
+/// verbatim, which is what makes the two-pass pairing stable when several
+/// declarations share (file, kind, name).
+fn find_pairable_addition(
+    added_syms: &[SymbolDecl],
+    added_used: &[bool],
+    removed: &SymbolDecl,
+    require_identical_text: bool,
+) -> Option<usize> {
+    added_syms.iter().enumerate().find_map(|(index, added)| {
+        (!added_used[index]
+            && added.file == removed.file
+            && added.symbol_type == removed.symbol_type
+            && added.name == removed.name
+            && scopes_may_pair(&removed.scope, &added.scope)
+            && (!require_identical_text || added.text == removed.text))
+            .then_some(index)
+    })
+}
+
+/// Drop ONE removed-symbol finding matching `removed`.
+///
+/// One removal cancelled by one addition retires exactly one finding: two
+/// identical `cfg`-gated removals against a single re-add must leave the second
+/// one reported.
+fn drop_removal_finding(findings: &mut Vec<BreakingFinding>, removed: &SymbolDecl) {
+    let matching = findings.iter().position(|f| {
+        f.file == removed.file
+            && matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { symbol_type } if *symbol_type == removed.symbol_type
+            )
+            && f.line == removed.text
+    });
+    if let Some(index) = matching {
+        findings.remove(index);
+    }
 }
 
 /// Start or continue accumulating a public declaration on one diff side.
@@ -1168,6 +1219,68 @@ mod tests {
                 findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn duplicate_declarations_pair_one_to_one() {
+        // cfg-gated variants share (file, kind, name). Pairing scanned the added
+        // side without consuming the match, so every removal cancelled against
+        // the SAME unchanged addition: the real `u32 -> u64` change paired with
+        // nothing and vanished, and the widening went unreported.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub type Value = u32;",
+                "-pub type Value = u32;",
+                "+pub type Value = u32;",
+                "+pub type Value = u64;",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "the second removal must pair with the leftover addition: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(changes[0].0, "pub type Value = u32;");
+        assert_eq!(changes[0].1, "pub type Value = u64;");
+    }
+
+    #[test]
+    fn unpaired_duplicate_removal_stays_a_removal() {
+        // Two removals, one addition: one removal is genuinely gone. Consuming
+        // the addition must leave the second removal reported, not silently
+        // cancelled by an addition already spent on the first.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub type Value = u32;",
+                "-pub type Value = u16;",
+                "+pub type Value = u32;",
+            ],
+        )]);
+
+        assert_eq!(
+            removed_symbol_types(&findings),
+            vec!["type alias".to_string()],
+            "exactly one removal survives: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(&f.kind, BreakingKind::ChangedSignature { .. })),
+            "the identical pair is a no-op, not a signature change: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
     }
 
     #[test]
