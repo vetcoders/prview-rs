@@ -217,6 +217,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an `unreadable_verdict:` / `unreadable_merge_recommendation:` /
   `unreadable_allow_merge:` caveat with `normalized: true`. A pack with no
   usable signal at all is still `storage_corrupt`.
+- **The CLI reader names wrongly typed signals too, and refuses to approve on
+  them.** The `unreadable_*` discipline above shipped on the MCP surface only;
+  the CLI still went through `as_str()` / `as_bool()`, so `verdict: 7` was
+  reported as `unknown_verdict: … carries no verdict` (a claim about a field that
+  was in fact present), `merge_recommendation: 7` fell through to
+  `review_required`, and `allow_merge: "true"` silently became `false`. Worse,
+  a pack with a valid `verdict: "PASS"` beside a mistyped `merge_recommendation`
+  published a `PASS` derived from a decision block the reader had only partly
+  read. Both readers now share `gate::readable_signal`: a present-but-untypable
+  field emits the same `unreadable_<field>:` caveat on `--json`, and — matching
+  the unknown-verdict rule already in place — forces every derived axis
+  conservative (`verdict: "BLOCK"`, `allow_merge: false`,
+  `merge_recommendation: block`, `--ci` exit `1`). A well-typed pack gains no
+  caveat and is unaffected.
 - **Unknown verdicts are reported instead of silently absorbed.** The CLI still
   collapses an unrecognized verdict to `BLOCK`, but now says so through a new
   optional `caveats` array on the `--json` summary (`unknown_verdict: …`) — the

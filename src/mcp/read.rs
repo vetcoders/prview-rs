@@ -4,6 +4,7 @@
 //! (`~/.prview/`) or a run's artifact pack. No review logic lives here — the
 //! MCP surface only reads truth the core already wrote.
 
+use crate::gate::{JsonKind, readable_signal};
 use crate::mcp::types::{ToolError, error_class};
 use crate::storage::{RunEntry, RunIndex};
 use std::path::{Path, PathBuf};
@@ -674,67 +675,6 @@ fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// JSON type a decision signal is expected to carry.
-#[derive(Clone, Copy)]
-enum JsonKind {
-    String,
-    Boolean,
-}
-
-impl JsonKind {
-    fn matches(self, value: &serde_json::Value) -> bool {
-        match self {
-            Self::String => value.is_string(),
-            Self::Boolean => value.is_boolean(),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::String => "a string",
-            Self::Boolean => "a boolean",
-        }
-    }
-}
-
-/// Human-readable JSON type name, for saying what was found instead.
-fn json_type_name(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
-    }
-}
-
-/// A decision signal, or `None` plus a caveat when it is present with the wrong
-/// JSON type.
-///
-/// Absence is the one state the adapter accepts in silence — it is the
-/// documented shape of an older pack. A field that IS there but cannot be typed
-/// is a different thing entirely, and collapsing the two through `as_str()` let
-/// the reader ignore a signal while reporting a clean passthrough.
-fn readable_signal<'v>(
-    field: &str,
-    value: Option<&'v serde_json::Value>,
-    want: JsonKind,
-    caveats: &mut Vec<String>,
-) -> Option<&'v serde_json::Value> {
-    let present = value?;
-    if want.matches(present) {
-        return Some(present);
-    }
-    caveats.push(format!(
-        "unreadable_{field}: MERGE_GATE.json {field} is {}, not {}; it was ignored when deriving \
-         this decision",
-        json_type_name(present),
-        want.label()
-    ));
-    None
 }
 
 /// Read and normalize a run's merge decision (R1). Missing/invalid
