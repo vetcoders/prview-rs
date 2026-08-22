@@ -190,9 +190,66 @@ pub(crate) struct DashboardContextInput<'a> {
     clean_comparison: CleanComparison,
 }
 
+/// Provenance for the synthetic `heuristics_loctree` result.
+///
+/// The gate is synthetic, the substrate is not: heuristics scan either an
+/// extracted target tree or the local working tree, and PROVENANCE.json's whole
+/// job is to name the tree behind every gating signal. Leaving these rows null
+/// made one of the pack's gates the only unauditable one.
+///
+/// Three cases, and none of them guesses:
+/// - an analysis root WITH the commit it was extracted from — `git archive`
+///   writes the commit's tree and nothing else, so the bytes are exactly that
+///   commit (`snapshot`);
+/// - an analysis root with no recorded commit (a result deserialized from a
+///   pack written before `analysis_sha` existed) — the directory is reported,
+///   the substrate stays unknown;
+/// - no analysis root — the scan ran in `repo_root`, classified like any other
+///   in-place scan.
+fn heuristics_provenance(
+    heuristics: &HeuristicsResult,
+    config: &Config,
+) -> Option<crate::checks::CheckProvenance> {
+    use crate::checks::{ScanSubstrate, TreeState, resolve_scan_substrate};
+
+    let (cwd, substrate) = match heuristics.analysis_root.as_deref() {
+        Some(root) => (
+            root.to_string(),
+            match heuristics.analysis_sha.as_deref() {
+                Some(sha) => ScanSubstrate {
+                    target_sha: Some(sha.to_string()),
+                    tree_state: Some(TreeState::Snapshot),
+                },
+                None => ScanSubstrate::default(),
+            },
+        ),
+        None => (
+            config.repo_root.display().to_string(),
+            // Loctree consumes no dependency tree of its own — it reads source.
+            resolve_scan_substrate(&config.repo_root, &config.repo_root, &[]),
+        ),
+    };
+
+    Some(crate::checks::CheckProvenance {
+        // Loctree runs in-process as a library, so there is no argv to record.
+        command: "loctree (in-process)".to_string(),
+        tool_version: None,
+        cwd,
+        target_sha: substrate.target_sha,
+        tree_state: substrate.tree_state,
+        exit_code: None,
+        // Absent only in results built before the scan recorded its own timing
+        // (older packs, hand-built fixtures).
+        started_at: heuristics.started_at.clone().unwrap_or_default(),
+        finished_at: heuristics.finished_at.clone().unwrap_or_default(),
+        hard_fail_signatures: Vec::new(),
+        cache_key: None,
+    })
+}
+
 /// Build a synthetic CheckResult for heuristics_loctree so it appears in
 /// report.json checks[] and dashboard checks table alongside real checks.
-fn build_heuristics_check(heuristics: Option<&HeuristicsResult>) -> CheckResult {
+fn build_heuristics_check(heuristics: Option<&HeuristicsResult>, config: &Config) -> CheckResult {
     use crate::checks::CheckStatus;
     match heuristics {
         Some(heuristics)
@@ -223,7 +280,7 @@ fn build_heuristics_check(heuristics: Option<&HeuristicsResult>) -> CheckResult 
                 duration: std::time::Duration::ZERO,
                 output,
                 cached: false,
-                provenance: None,
+                provenance: heuristics_provenance(heuristics, config),
             }
         }
         _ => CheckResult {
@@ -259,7 +316,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     .to_rfc3339();
 
     // Build extended checks list including synthetic heuristics check
-    let heuristics_check = build_heuristics_check(heuristics);
+    let heuristics_check = build_heuristics_check(heuristics, config);
     let mut all_checks: Vec<CheckResult> = checks.to_vec();
     all_checks.push(heuristics_check);
     let context_artifacts = plan_context_artifacts(config, diffs, &all_checks);
@@ -1113,26 +1170,36 @@ struct ProvenanceJsonInput<'a> {
     worktree_status_digest: Option<&'a str>,
 }
 
-/// The baseline the pack's diff was actually produced from.
+/// Every baseline the pack's diffs were actually produced from, named.
 ///
 /// `resolved_bases` holds the base *tips* the operator named. When the branches
 /// have diverged the patch is generated from the merge base instead
 /// (`Repository::resolve_diff_bases`), so recording a tip here would name a
 /// commit no diff in the pack was computed against — the contradiction of a file
-/// whose whole job is to state what was compared. Reading the value off the diff
-/// itself makes that impossible by construction.
+/// whose whole job is to state what was compared. Reading the values off the
+/// diffs themselves makes that impossible by construction.
 ///
-/// Falls back to the first resolved base when there is no diff at all: an empty
-/// diff set means either `--current-only` (no base, `None`) or a base pointing
-/// at the target commit, where the tip IS the baseline.
-fn provenance_base_sha<'a>(
+/// One entry per diff: `--base a --base b` produces a patch per base, each with
+/// its own merge base, and collapsing them to one row left a reviewer unable to
+/// say which commit the second patch came from.
+///
+/// Falls back to the resolved bases when there is no diff at all: an empty diff
+/// set means either `--current-only` (no base, so no rows) or a base pointing at
+/// the target commit, where the tip IS the baseline.
+fn provenance_bases<'a>(
     diffs: &'a [Diff],
     resolved_bases: &'a [ResolvedRef],
-) -> Option<&'a str> {
+) -> Vec<(&'a str, &'a str)> {
+    if diffs.is_empty() {
+        return resolved_bases
+            .iter()
+            .map(|base| (base.name.as_str(), base.commit_id.as_str()))
+            .collect();
+    }
     diffs
-        .first()
-        .map(|diff| diff.base_commit_id.as_str())
-        .or_else(|| resolved_bases.first().map(|base| base.commit_id.as_str()))
+        .iter()
+        .map(|diff| (diff.base.as_str(), diff.base_commit_id.as_str()))
+        .collect()
 }
 
 /// PROVENANCE.json — pack-level record of WHAT was analysed.
@@ -1174,14 +1241,25 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
         })
         .collect();
 
+    let bases = provenance_bases(diffs, resolved_bases);
+    let base_rows: Vec<serde_json::Value> = bases
+        .iter()
+        .map(|(name, sha)| json!({ "name": name, "sha": sha }))
+        .collect();
+
     let provenance = json!({
         "schema_version": "1.0",
         "generated_at": chrono::Local::now().to_rfc3339(),
         // Commit whose tree the pack judges.
         "target_sha": resolved_target.commit_id,
-        // The commit the patch was really computed against — the merge base when
-        // the branches diverged, not the base tip the operator named.
-        "base_sha": provenance_base_sha(diffs, resolved_bases),
+        // The commit the FIRST patch was really computed against — the merge
+        // base when the branches diverged, not the base tip the operator named.
+        // Kept for consumers that predate `bases[]`; it is that array's first
+        // `sha` by construction, so the two cannot disagree.
+        "base_sha": bases.first().map(|(_, sha)| *sha),
+        // Every baseline, named: a multi-base run produces one patch per base,
+        // and a reviewer holding the pack must be able to place each of them.
+        "bases": base_rows,
         // Commit checked out locally. Equal to target_sha for an ordinary local
         // review; different when a fetched ref is analysed (`--pr`/`--remote`).
         "head_sha": repo.head_commit_id().ok(),

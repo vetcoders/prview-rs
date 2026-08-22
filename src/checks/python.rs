@@ -133,6 +133,10 @@ const UV_ENV_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// environment) still counts as recent activity.
 const UV_ENV_USED_MARKER: &str = ".prview-used";
 
+/// Serialises marking and pruning across processes. A plain file, so
+/// [`prune_uv_envs`]'s directory filter passes over it.
+const UV_PRUNE_LOCK: &str = ".prview-prune.lock";
+
 /// Record this environment as used and drop the ones that are neither recent nor
 /// part of the working set.
 ///
@@ -143,16 +147,33 @@ const UV_ENV_USED_MARKER: &str = ".prview-used";
 /// and nothing used within [`UV_ENV_MIN_AGE`] is touched, so a concurrent (or
 /// merely slow) review cannot have its environment deleted underneath it.
 ///
+/// Age alone does not make the bound safe, because two reviews run
+/// concurrently: one process can read an environment's timestamp just before
+/// another refreshes it, and then delete the directory once that other process
+/// has already started `uv run`. Marking and pruning are therefore one critical
+/// section, serialised across processes by [`UV_PRUNE_LOCK`] — no other prview
+/// can observe this root between our mark and our sweep.
+///
+/// The lock is opportunistic. Pruning is housekeeping, so a root already locked
+/// by a live review is simply left to that review: we still record OUR use,
+/// which is what protects this environment from the next sweep, and skip the
+/// sweep itself. (`prune_uv_envs` re-reads each candidate immediately before
+/// removing it, so a mark that lands outside the lock still wins.)
+///
 /// Nothing is created here: an absent root means no environment exists yet, and
 /// pre-creating the directory would leave uv an empty non-environment to reject.
 fn mark_and_prune_uv_envs(root: &Path, env_dir: &Path) {
     if !root.is_dir() {
         return;
     }
+    let lock = crate::storage::acquire_lock_at(&root.join(UV_PRUNE_LOCK)).ok();
     if env_dir.is_dir() {
         let _ = std::fs::write(env_dir.join(UV_ENV_USED_MARKER), b"");
     }
-    prune_uv_envs(root, UV_ENVS_KEPT, UV_ENV_MIN_AGE);
+    if lock.is_some() {
+        prune_uv_envs(root, UV_ENVS_KEPT, UV_ENV_MIN_AGE);
+    }
+    drop(lock);
 }
 
 /// Pure half of [`mark_and_prune_uv_envs`]: remove environments beyond the
@@ -171,11 +192,19 @@ fn prune_uv_envs(root: &Path, keep: usize, min_age: Duration) {
     // Newest first, so the tail is what the working set does not cover.
     envs.sort_by_key(|(used, _)| std::cmp::Reverse(*used));
     let now = std::time::SystemTime::now();
+    let idle_for = |used| now.duration_since(used).unwrap_or_default();
     for (used, path) in envs.into_iter().skip(keep) {
-        let idle = now.duration_since(used).unwrap_or_default();
-        if idle >= min_age {
-            let _ = std::fs::remove_dir_all(path);
+        if idle_for(used) < min_age {
+            continue;
         }
+        // Re-read immediately before deleting. The listing above is a snapshot,
+        // and a review that could not take the prune lock still marks the
+        // environment it is about to use; that mark must beat a verdict formed
+        // from a stat taken before it landed.
+        if idle_for(last_used(&path)) < min_age {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 
@@ -286,7 +315,7 @@ impl Check for RuffCheck {
                     target_sha: None,
                     tree_state: None,
                 }
-                .with_scan_substrate(run_dir, &config.repo_root),
+                .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
         })
     }
@@ -387,7 +416,7 @@ impl Check for MypyCheck {
                     target_sha: None,
                     tree_state: None,
                 }
-                .with_scan_substrate(run_dir, &config.repo_root),
+                .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
         })
     }
@@ -493,7 +522,7 @@ impl Check for PytestCheck {
                     target_sha: None,
                     tree_state: None,
                 }
-                .with_scan_substrate(run_dir, &config.repo_root),
+                .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
         })
     }
@@ -717,6 +746,59 @@ mod tests {
         assert!(
             envs[2].is_dir() && envs[3].is_dir(),
             "the newest environments are the working set",
+        );
+    }
+
+    /// The age floor alone does not make pruning safe: two reviews run at once,
+    /// and one can read an environment's timestamp just before the other
+    /// refreshes it, then delete the directory after that other review's
+    /// `uv run` has begun. While another live process holds the root, this one
+    /// records its own use and touches nothing else.
+    #[test]
+    fn a_review_holding_the_prune_lock_keeps_the_sweep_to_itself() {
+        let root = tempfile::tempdir().expect("uv-env root");
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+        let mut envs = Vec::new();
+        for name in ["one", "two", "three", "four", "five"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            // Idle well past the age floor and beyond the working set, so an
+            // unguarded sweep would delete them.
+            let marker = std::fs::File::create(dir.join(UV_ENV_USED_MARKER)).unwrap();
+            marker.set_modified(long_ago).unwrap();
+            envs.push(dir);
+        }
+
+        // Another live prview is mid-sweep: our own pid is unquestionably alive,
+        // so the lock cannot be mistaken for an abandoned one.
+        std::fs::write(
+            root.path().join(UV_PRUNE_LOCK),
+            format!(
+                "{}:{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ),
+        )
+        .unwrap();
+
+        mark_and_prune_uv_envs(root.path(), &envs[0]);
+
+        for dir in &envs {
+            assert!(
+                dir.is_dir(),
+                "a locked root belongs to the review holding it: {dir:?}",
+            );
+        }
+        assert!(
+            envs[0].join(UV_ENV_USED_MARKER).exists(),
+            "our own use must still be recorded — that is what protects it next sweep",
+        );
+        assert!(
+            root.path().join(UV_PRUNE_LOCK).is_file(),
+            "a lock we never acquired must not be cleared on the way out",
         );
     }
 

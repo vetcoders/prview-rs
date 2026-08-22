@@ -83,6 +83,7 @@ impl Check for SemgrepCheck {
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
+                    check: self.name(),
                     cmd: "semgrep",
                     args: &args,
                     cwd,

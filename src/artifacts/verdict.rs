@@ -800,7 +800,7 @@ pub(crate) fn capture_worktree_provenance(repo_root: &std::path::Path) -> Worktr
     };
 
     let workdir = repo.workdir().map(|dir| dir.to_path_buf());
-    let fingerprint = render_status_fingerprint(&statuses, workdir.as_deref());
+    let fingerprint = render_status_fingerprint(&statuses, workdir.as_deref(), 0);
     let mut hasher = Sha256::new();
     hasher.update(fingerprint.as_bytes());
 
@@ -817,20 +817,25 @@ pub(crate) fn capture_worktree_provenance(repo_root: &std::path::Path) -> Worktr
 /// digest claimed two materially different substrates were the same one. Each
 /// entry therefore carries a fingerprint of the bytes on disk right now:
 /// `blob:<len>:<sha256>` for a regular file, the hashed target for a symlink,
-/// `dir` for a directory (a submodule gitlink), `absent` for a deleted path and
-/// `unreadable` when the bytes cannot be read.
+/// `dir` for an ordinary directory, `gitlink:…` for a nested repository (see
+/// [`nested_repo_fingerprint`]), `absent` for a deleted path and `unreadable`
+/// when the bytes cannot be read.
 ///
 /// Only the dirty subset is read — a clean tree hashes nothing, and every scan
 /// prview runs afterwards (semgrep, loctree, the language checks) reads far more
 /// of the tree than this does.
-fn render_status_fingerprint(statuses: &git2::Statuses<'_>, workdir: Option<&Path>) -> String {
+fn render_status_fingerprint(
+    statuses: &git2::Statuses<'_>,
+    workdir: Option<&Path>,
+    depth: usize,
+) -> String {
     let mut lines: Vec<String> = statuses
         .iter()
         .map(|entry| {
             let path = entry.path().unwrap_or("<non-utf8>").to_string();
             let content = workdir.map_or_else(
                 || "unknown".to_string(),
-                |dir| content_fingerprint(&dir.join(&path)),
+                |dir| content_fingerprint(&dir.join(&path), depth),
             );
             format!("{} {path}\0{content}", status_codes(entry.status()))
         })
@@ -840,7 +845,7 @@ fn render_status_fingerprint(statuses: &git2::Statuses<'_>, workdir: Option<&Pat
 }
 
 /// Fingerprint the bytes currently at `path`, without loading the file whole.
-fn content_fingerprint(path: &Path) -> String {
+fn content_fingerprint(path: &Path, depth: usize) -> String {
     use sha2::{Digest, Sha256};
 
     let Ok(meta) = std::fs::symlink_metadata(path) else {
@@ -859,7 +864,7 @@ fn content_fingerprint(path: &Path) -> String {
         };
     }
     if meta.is_dir() {
-        return nested_repo_fingerprint(path);
+        return nested_repo_fingerprint(path, depth);
     }
 
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -895,7 +900,18 @@ fn content_fingerprint(path: &Path) -> String {
 /// ever run for a directory the superproject ALREADY reported as dirty, so it
 /// costs nothing on a clean tree. Anything unreadable degrades to a coarser
 /// marker rather than a false match.
-fn nested_repo_fingerprint(path: &Path) -> String {
+///
+/// A dirty nested repository is fingerprinted the same way the superproject is,
+/// recursively: `HEAD` plus a clean/dirty flag still collides, because a
+/// submodule parked on one commit with two different sets of uncommitted edits
+/// is two different trees for every scan that follows. The recursion reads only
+/// the nested repository's own dirty subset, so the bound is the same one that
+/// makes the top-level walk affordable, and it stops at
+/// [`NESTED_REPO_MAX_DEPTH`] — beyond that the coarse `dirty` marker returns,
+/// which is exactly what this function reported before, never something weaker.
+fn nested_repo_fingerprint(path: &Path, depth: usize) -> String {
+    use sha2::{Digest, Sha256};
+
     // `open`, not `discover`: a plain directory must not resolve to the
     // superproject and report ITS head as the directory's content.
     let Ok(repo) = git2::Repository::open(path) else {
@@ -911,17 +927,33 @@ fn nested_repo_fingerprint(path: &Path) -> String {
         .map_or_else(|| "unborn".to_string(), |oid| oid.to_string());
 
     let mut opts = git2::StatusOptions::new();
-    // Untracked directories are not expanded here: whether ANY entry exists is
-    // the whole question, so there is no reason to walk a vendored tree deeply.
-    opts.include_untracked(true).recurse_untracked_dirs(false);
-    let state = match repo.statuses(Some(&mut opts)) {
-        Ok(statuses) if statuses.is_empty() => "clean",
-        Ok(_) => "dirty",
-        Err(_) => "unknown",
+    // Untracked directories ARE expanded, as at the top level: the entries are
+    // what gets hashed, so an unexpanded directory would hide exactly the
+    // difference this fingerprint is here to catch.
+    opts.include_untracked(true).recurse_untracked_dirs(true);
+    let statuses = match repo.statuses(Some(&mut opts)) {
+        Ok(statuses) => statuses,
+        Err(_) => return format!("gitlink:{head}:unknown"),
     };
+    if statuses.is_empty() {
+        return format!("gitlink:{head}:clean");
+    }
+    if depth >= NESTED_REPO_MAX_DEPTH {
+        return format!("gitlink:{head}:dirty");
+    }
 
-    format!("gitlink:{head}:{state}")
+    let inner = render_status_fingerprint(&statuses, repo.workdir(), depth + 1);
+    let mut hasher = Sha256::new();
+    hasher.update(inner.as_bytes());
+    format!("gitlink:{head}:dirty:{:x}", hasher.finalize())
 }
+
+/// How many levels of nested repository the digest descends into.
+///
+/// A submodule holding a submodule is ordinary; a chain deep enough to matter
+/// for cost is not, and a cap keeps a pathological (or symlink-looped) nesting
+/// from turning one status read into an unbounded walk.
+const NESTED_REPO_MAX_DEPTH: usize = 3;
 
 /// The `XY` status pair in the shape of `git status --porcelain`: index status
 /// first, worktree status second, an untracked entry as `??`.

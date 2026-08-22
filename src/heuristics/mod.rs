@@ -20,6 +20,22 @@ pub struct HeuristicsResult {
     pub summary: HeuristicsSummary,
     /// Path used for analysis (snapshot or repo root). None = local cwd.
     pub analysis_root: Option<String>,
+    /// Commit the analysed tree was extracted from, when `analysis_root` is a
+    /// `git archive` snapshot. Assigned by the caller that owns the snapshot,
+    /// because `run_all` is handed a bare path and cannot know which commit it
+    /// materialises; read off `AnalysisSnapshot::sha` rather than the ref the
+    /// operator named, so it cannot drift from the tree that was scanned.
+    ///
+    /// Absent when the scan ran in the working tree, and absent in results
+    /// deserialized from packs written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_sha: Option<String>,
+    /// When the scan started and finished (RFC 3339). `None` when no scan ran,
+    /// and in results deserialized from older packs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
     /// Regression delta (base vs target heuristics). None if no base available.
     pub regression: Option<HeuristicsRegression>,
 }
@@ -84,6 +100,7 @@ pub async fn run_all(config: &Config, analysis_root: Option<&Path>) -> Result<He
         });
     }
     let root = analysis_root.unwrap_or(&config.repo_root);
+    let started_at = chrono::Local::now().to_rfc3339();
     let emit_human_stdout = !config.json && !config.quiet;
 
     if emit_human_stdout {
@@ -142,9 +159,13 @@ pub async fn run_all(config: &Config, analysis_root: Option<&Path>) -> Result<He
     }
 
     // run_all owns analysis-root provenance: record the directory that was
-    // actually scanned so the serialized result is self-describing and callers
-    // do not have to re-assert it.
+    // actually scanned, and when, so the serialized result is self-describing
+    // and callers do not have to re-assert it. The commit behind that directory
+    // is the one thing run_all cannot see — the caller holding the snapshot
+    // fills in `analysis_sha`.
     result.analysis_root = analysis_root.map(|p| p.to_string_lossy().into_owned());
+    result.started_at = Some(started_at);
+    result.finished_at = Some(chrono::Local::now().to_rfc3339());
     Ok(result)
 }
 

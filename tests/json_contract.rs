@@ -571,6 +571,14 @@ fn generated_pack_carries_pack_level_provenance() {
         provenance["base_sha"].is_string(),
         "the diff baseline must be recorded"
     );
+    // Every baseline, named: a multi-base run produces one patch per base, and
+    // the scalar is the array's first entry rather than a second truth.
+    let bases = provenance["bases"]
+        .as_array()
+        .expect("every baseline must be recorded");
+    assert!(!bases.is_empty(), "a run with a diff has a baseline");
+    assert!(bases[0]["name"].is_string(), "a baseline is named");
+    assert_eq!(bases[0]["sha"], provenance["base_sha"]);
 
     // The fixture repo is committed clean before the run; the digest is present
     // either way, so an audit can distinguish two differently-dirty runs.

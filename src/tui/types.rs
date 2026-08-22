@@ -1444,6 +1444,7 @@ mod tests {
             summary: HeuristicsSummary::default(),
             analysis_root: None,
             regression: None,
+            ..Default::default()
         };
 
         state.set_heuristics(&result);
@@ -1470,6 +1471,7 @@ mod tests {
             summary: HeuristicsSummary::default(),
             analysis_root: None,
             regression: None,
+            ..Default::default()
         };
 
         state.set_heuristics(&result);

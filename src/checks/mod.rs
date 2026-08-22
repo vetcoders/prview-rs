@@ -41,8 +41,11 @@ pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TreeState {
-    /// Ephemeral `git worktree` of THIS repository materialising the reviewed
+    /// A tree materialised from THIS repository's objects at the reviewed
     /// target commit, unmodified — the scanned bytes are exactly `target_sha`.
+    /// Either the ephemeral `git worktree` the language checks share, or the
+    /// `git archive` extraction the Loctree heuristics scan; both carry the
+    /// commit's tree and nothing from the working directory.
     Snapshot,
     /// Same worktree, but it carries changes the run itself produced (a
     /// generated `Cargo.lock`, a tool writing into the checkout) — the scanned
@@ -111,14 +114,15 @@ pub struct ScanSubstrate {
 /// not). In a snapshot the dependency symlinks prview itself creates
 /// ([`SNAPSHOT_SCAFFOLDING`]) are excluded: they are the tool's own scaffolding,
 /// not a modification of the reviewed tree. They are not free of consequence
-/// either — a snapshot that carries them is `snapshot-borrowed-deps`, because
-/// the tools read the operator's dependencies rather than the target's.
+/// either — a snapshot is `snapshot-borrowed-deps` when it carries a link THIS
+/// command could actually consume, named by `consumable` (see
+/// [`consumable_scaffolding`]).
 ///
 /// Best effort: a `cwd` that is not in a git repository yields `None` for both
 /// fields rather than a guess, and a status that cannot be read yields a `None`
 /// `tree_state` — an unknown substrate stays visibly unknown instead of being
 /// certified clean.
-pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path) -> ScanSubstrate {
+pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path, consumable: &[&str]) -> ScanSubstrate {
     let Ok(repo) = git2::Repository::discover(cwd) else {
         return ScanSubstrate::default();
     };
@@ -145,7 +149,9 @@ pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path) -> ScanSubstrate {
     } else {
         working_tree_is_dirty(&repo, SNAPSHOT_SCAFFOLDING).map(|dirty| match dirty {
             true => TreeState::SnapshotDirty,
-            false if borrows_local_dependencies(&repo) => TreeState::SnapshotBorrowedDeps,
+            false if borrows_local_dependencies(&repo, consumable) => {
+                TreeState::SnapshotBorrowedDeps
+            }
             false => TreeState::Snapshot,
         })
     };
@@ -162,23 +168,47 @@ pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path) -> ScanSubstrate {
 /// and must not make the snapshot look modified.
 const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
 
-/// Whether the snapshot actually CARRIES scaffolding links, i.e. whether the
-/// tools that ran there read the operator's dependencies rather than the ones
-/// the reviewed commit's lockfile pins.
+/// Which scaffolding links a given check could actually READ.
+///
+/// Presence of a link is not consumption of it, and the two must not be
+/// confused: a mixed repository has `node_modules` linked into every snapshot,
+/// but a cargo or semgrep run resolves nothing through it. Labelling those runs
+/// `snapshot-borrowed-deps` states a mixed substrate that never existed — the
+/// same class of false claim, pointing the other way, as certifying an exact
+/// scan.
+///
+/// The JS checks resolve their compiler, plugins, type definitions and runtime
+/// through `node_modules` (`local_js_bin` looks in `node_modules/.bin` first),
+/// so for them a linked tree is genuinely the operator's.
+///
+/// The Python checks return NOTHING, deliberately. The snapshot still links
+/// `.venv` — `create_worktree_snapshot` does not know who will run there — but
+/// `plan_python_run` points `UV_PROJECT_ENVIRONMENT` at a prview-owned
+/// per-commit directory, so an off-HEAD Python command installs and reads the
+/// reviewed dependency set, never the link. Without uv the commands come off
+/// `PATH` and use the ambient interpreter, which is not the link either. Should
+/// that redirect ever be removed, `.venv` belongs back in this list.
+fn consumable_scaffolding(check: &str) -> &'static [&'static str] {
+    match check {
+        "TypeScript" | "ESLint" | "Vitest" | "Stylelint" => &["node_modules"],
+        _ => &[],
+    }
+}
+
+/// Whether the snapshot actually CARRIES a link this command could consume.
 ///
 /// Presence, not policy: an off-HEAD review of a repo with no local
 /// `node_modules` installs nothing and links nothing, and stays an exact
-/// snapshot scan. Only a link that exists could have been followed.
+/// snapshot scan. Only a link that exists AND is consumable could have been
+/// followed.
 ///
 /// Checked at the WORKTREE ROOT, not at the check's `cwd` — a cargo member runs
 /// in a subdirectory while the scaffolding sits at the top of the snapshot.
-fn borrows_local_dependencies(repo: &git2::Repository) -> bool {
+fn borrows_local_dependencies(repo: &git2::Repository, consumable: &[&str]) -> bool {
     let Some(root) = repo.workdir() else {
         return false;
     };
-    SNAPSHOT_SCAFFOLDING
-        .iter()
-        .any(|name| root.join(name).is_symlink())
+    consumable.iter().any(|name| root.join(name).is_symlink())
 }
 
 /// True when `repo` is the repository rooted at `repo_root` — its own working
@@ -247,9 +277,13 @@ impl CheckProvenance {
     /// command actually ran in. Checks that build their provenance literally
     /// (rather than through [`ProvenanceBuilder`]) chain this so the resolution
     /// logic stays in one place.
+    ///
+    /// `check` is the check's own [`Check::name`]: which dependency links the
+    /// classification may hold against this run is a property of the command,
+    /// not of the directory (see [`consumable_scaffolding`]).
     #[must_use]
-    pub fn with_scan_substrate(mut self, cwd: &Path, repo_root: &Path) -> Self {
-        let substrate = resolve_scan_substrate(cwd, repo_root);
+    pub fn with_scan_substrate(mut self, check: &str, cwd: &Path, repo_root: &Path) -> Self {
+        let substrate = resolve_scan_substrate(cwd, repo_root, consumable_scaffolding(check));
         self.target_sha = substrate.target_sha;
         self.tree_state = substrate.tree_state;
         self
@@ -730,16 +764,22 @@ const NO_COMMAND_RECORDED: &str = "<no command recorded>";
 /// own worktree, which is gone by the time the error surfaces, and inventing a
 /// path for it would put a fabricated substrate in the manifest.
 ///
-/// For a cargo member the answer is the snapshot root rather than the member
-/// subdirectory. `target_sha` and `tree_state` are identical either way, and
-/// round 4 guarantees the member sits inside that root.
+/// A cargo check does not run at the scan root: a workspace member, or a crate
+/// the reviewed commit moved, sits in a subdirectory of it. That resolution is
+/// shared with `plan_cargo_run` rather than approximated here, so the manifest
+/// names the directory the command was actually headed for.
 fn errored_check_scan_dir(name: &str, config: &Config) -> Option<std::path::PathBuf> {
-    if let Some(scan_dir) = &config.scan_dir_override {
-        return uses_shared_scan_dir(name).then(|| scan_dir.clone());
-    }
-    off_head_target_commit(config)
-        .is_none()
-        .then(|| config.repo_root.clone())
+    let scan_dir = if let Some(scan_dir) = &config.scan_dir_override {
+        uses_shared_scan_dir(name).then(|| scan_dir.clone())?
+    } else {
+        off_head_target_commit(config)
+            .is_none()
+            .then(|| config.repo_root.clone())?
+    };
+    Some(match is_cargo_target_check(name) {
+        true => cargo::planned_cargo_cwd(config, &scan_dir),
+        false => scan_dir,
+    })
 }
 
 /// Provenance for a check that errored: no command, but the substrate it was
@@ -769,7 +809,7 @@ fn errored_check_provenance(
             target_sha: None,
             tree_state: None,
         }
-        .with_scan_substrate(&scan_dir, &config.repo_root),
+        .with_scan_substrate(name, &scan_dir, &config.repo_root),
     )
 }
 
@@ -1081,6 +1121,10 @@ pub fn tool_spawn_failure_in_output(output: &str) -> bool {
 
 /// Build provenance from a command execution
 pub struct ProvenanceBuilder<'a> {
+    /// The check's own [`Check::name`] — decides which dependency links the
+    /// substrate classification may hold against this run (see
+    /// [`consumable_scaffolding`]).
+    pub check: &'a str,
     pub cmd: &'a str,
     pub args: &'a [&'a str],
     pub cwd: &'a Path,
@@ -1122,7 +1166,7 @@ impl ProvenanceBuilder<'_> {
             target_sha: None,
             tree_state: None,
         }
-        .with_scan_substrate(self.cwd, self.repo_root)
+        .with_scan_substrate(self.check, self.cwd, self.repo_root)
     }
 }
 
@@ -1375,7 +1419,11 @@ mod tests {
 
         let snapshot =
             crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
-        let substrate = resolve_scan_substrate(&snapshot.worktree_path, root);
+        let substrate = resolve_scan_substrate(
+            &snapshot.worktree_path,
+            root,
+            consumable_scaffolding("TypeScript"),
+        );
 
         assert_eq!(substrate.target_sha.as_deref(), Some(first.as_str()));
         assert_eq!(substrate.tree_state, Some(TreeState::Snapshot));
@@ -1388,7 +1436,7 @@ mod tests {
         let (repo, head) = repo_with_one_commit();
         let root = repo.path();
 
-        let substrate = resolve_scan_substrate(root, root);
+        let substrate = resolve_scan_substrate(root, root, consumable_scaffolding("TypeScript"));
 
         assert_eq!(substrate.target_sha.as_deref(), Some(head.as_str()));
         assert_eq!(substrate.tree_state, Some(TreeState::LocalClean));
@@ -1403,20 +1451,20 @@ mod tests {
         let root = repo.path();
 
         std::fs::write(root.join("tracked.txt"), "edited\n").expect("dirty the tree");
-        let substrate = resolve_scan_substrate(root, root);
+        let substrate = resolve_scan_substrate(root, root, consumable_scaffolding("TypeScript"));
         assert_eq!(substrate.target_sha.as_deref(), Some(head.as_str()));
         assert_eq!(substrate.tree_state, Some(TreeState::LocalDirty));
 
         // An untracked file is dirt too — `git status --porcelain` lists it.
         std::fs::write(root.join("tracked.txt"), "one\n").expect("restore");
         assert_eq!(
-            resolve_scan_substrate(root, root).tree_state,
+            resolve_scan_substrate(root, root, consumable_scaffolding("TypeScript")).tree_state,
             Some(TreeState::LocalClean),
             "restoring the tracked file must return the tree to clean",
         );
         std::fs::write(root.join("untracked.txt"), "new\n").expect("write untracked");
         assert_eq!(
-            resolve_scan_substrate(root, root).tree_state,
+            resolve_scan_substrate(root, root, consumable_scaffolding("TypeScript")).tree_state,
             Some(TreeState::LocalDirty),
         );
     }
@@ -1433,14 +1481,23 @@ mod tests {
         let snapshot =
             crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
         assert_eq!(
-            resolve_scan_substrate(&snapshot.worktree_path, root).tree_state,
+            resolve_scan_substrate(
+                &snapshot.worktree_path,
+                root,
+                consumable_scaffolding("TypeScript")
+            )
+            .tree_state,
             Some(TreeState::Snapshot),
             "a freshly materialised snapshot is exactly the commit",
         );
 
         std::fs::write(snapshot.worktree_path.join("Cargo.lock"), "# generated\n")
             .expect("write generated file");
-        let substrate = resolve_scan_substrate(&snapshot.worktree_path, root);
+        let substrate = resolve_scan_substrate(
+            &snapshot.worktree_path,
+            root,
+            consumable_scaffolding("TypeScript"),
+        );
         assert_eq!(substrate.target_sha.as_deref(), Some(first.as_str()));
         assert_eq!(
             substrate.tree_state,
@@ -1472,7 +1529,12 @@ mod tests {
             return;
         }
 
-        let tree_state = resolve_scan_substrate(&snapshot.worktree_path, root).tree_state;
+        let tree_state = resolve_scan_substrate(
+            &snapshot.worktree_path,
+            root,
+            consumable_scaffolding("TypeScript"),
+        )
+        .tree_state;
         assert_ne!(
             tree_state,
             Some(TreeState::SnapshotDirty),
@@ -1486,6 +1548,83 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_is_only_borrowed_for_the_checks_that_read_the_link() {
+        // The mirror of the overclaim above: a mixed repository links
+        // `node_modules` into EVERY snapshot, but a cargo or Python command
+        // resolves nothing through it. Labelling those runs
+        // `snapshot-borrowed-deps` reports a mixed substrate that never
+        // existed — a false claim in the other direction.
+        let (repo, first) = repo_with_one_commit();
+        let root = repo.path();
+        std::fs::create_dir(root.join("node_modules")).expect("node_modules");
+        std::fs::write(root.join("node_modules/marker"), "dep\n").expect("dep file");
+
+        let snapshot =
+            crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
+        if !snapshot.worktree_path.join("node_modules").exists() {
+            // Symlinking is unix-only; nothing to assert elsewhere.
+            return;
+        }
+
+        let state = |check: &str| {
+            resolve_scan_substrate(&snapshot.worktree_path, root, consumable_scaffolding(check))
+                .tree_state
+        };
+
+        assert_eq!(
+            state("TypeScript"),
+            Some(TreeState::SnapshotBorrowedDeps),
+            "tsc resolves its compiler and types through the linked tree",
+        );
+        for check in ["Cargo check", "Clippy", "Cargo test", "Semgrep"] {
+            assert_eq!(
+                state(check),
+                Some(TreeState::Snapshot),
+                "{check} reads nothing through node_modules, so its scan is exactly the commit",
+            );
+        }
+        for check in ["Ruff", "Mypy", "Pytest"] {
+            assert_eq!(
+                state(check),
+                Some(TreeState::Snapshot),
+                "{check} runs against the per-commit UV_PROJECT_ENVIRONMENT, not a linked tree",
+            );
+        }
+    }
+
+    #[test]
+    fn checks_that_install_nothing_locally_consume_no_scaffolding() {
+        // Guards the classification table itself: the cargo, semgrep and Python
+        // commands must stay out of the consumable list. The Python entry is the
+        // load-bearing one — it is empty only because `plan_python_run`
+        // redirects uv away from the linked `.venv`.
+        for check in [
+            "Cargo check",
+            "Clippy",
+            "Rustfmt",
+            "Cargo test",
+            "Cargo audit",
+            "Cargo geiger",
+            "Semgrep",
+            "Ruff",
+            "Mypy",
+            "Pytest",
+        ] {
+            assert!(
+                consumable_scaffolding(check).is_empty(),
+                "{check} does not read prview's dependency links",
+            );
+        }
+        for check in ["TypeScript", "ESLint", "Vitest", "Stylelint"] {
+            assert_eq!(
+                consumable_scaffolding(check),
+                &["node_modules"],
+                "{check} resolves its toolchain through node_modules",
+            );
+        }
+    }
+
+    #[test]
     fn a_snapshot_without_scaffolding_stays_an_exact_scan() {
         // The borrowed-deps state is about links that EXIST. A review of a repo
         // with no local dependency tree links nothing, so nothing was borrowed
@@ -1496,7 +1635,12 @@ mod tests {
             crate::git::create_worktree_snapshot(root, &first).expect("worktree snapshot");
 
         assert_eq!(
-            resolve_scan_substrate(&snapshot.worktree_path, root).tree_state,
+            resolve_scan_substrate(
+                &snapshot.worktree_path,
+                root,
+                consumable_scaffolding("TypeScript")
+            )
+            .tree_state,
             Some(TreeState::Snapshot),
         );
     }
@@ -1510,7 +1654,11 @@ mod tests {
         let (repo, _) = repo_with_one_commit();
         let (other, other_head) = repo_with_one_commit();
 
-        let substrate = resolve_scan_substrate(other.path(), repo.path());
+        let substrate = resolve_scan_substrate(
+            other.path(),
+            repo.path(),
+            consumable_scaffolding("TypeScript"),
+        );
         assert_eq!(substrate.target_sha.as_deref(), Some(other_head.as_str()));
         assert_eq!(substrate.tree_state, Some(TreeState::Foreign));
     }
@@ -1531,7 +1679,7 @@ mod tests {
             "a status that cannot be read is unknown, not clean",
         );
         assert_eq!(
-            resolve_scan_substrate(root, root).tree_state,
+            resolve_scan_substrate(root, root, consumable_scaffolding("TypeScript")).tree_state,
             None,
             "an unknown substrate must stay visibly unknown in provenance",
         );
@@ -1546,7 +1694,8 @@ mod tests {
             // no-repo case cannot be staged here.
             return;
         }
-        let substrate = resolve_scan_substrate(tmp.path(), tmp.path());
+        let substrate =
+            resolve_scan_substrate(tmp.path(), tmp.path(), consumable_scaffolding("TypeScript"));
         assert_eq!(substrate, ScanSubstrate::default());
     }
 
@@ -2389,6 +2538,66 @@ test result: ok. 2 passed; 0 failed
         assert_eq!(
             prov.command, NO_COMMAND_RECORDED,
             "the absence of a command must be stated, not invented",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_errored_cargo_check_reports_the_member_it_was_headed_for() {
+        // Reconstructing the substrate from the shared scan dir is right for a
+        // check that runs at the snapshot root, but a cargo workspace member
+        // runs one directory down. Collapsing every cargo run to the root
+        // reported a directory the command never entered.
+        use async_trait::async_trait;
+
+        struct TimingOutCargo;
+
+        #[async_trait]
+        impl Check for TimingOutCargo {
+            fn name(&self) -> &str {
+                "Cargo check"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                anyhow::bail!("cargo {TIMEOUT_MARKER} 600s")
+            }
+            fn cache_key(&self, _config: &Config) -> Option<String> {
+                None
+            }
+        }
+
+        let write_member = |root: &std::path::Path| {
+            let member = root.join("crates/core");
+            std::fs::create_dir_all(member.join("src")).expect("member");
+            std::fs::write(
+                member.join("Cargo.toml"),
+                "[package]\nname = \"m\"\nversion = \"0.0.0\"\n",
+            )
+            .expect("manifest");
+        };
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        write_member(repo_root.path());
+        write_member(scan_dir.path());
+
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().join("crates/core"));
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(tmp.path().to_path_buf(), true);
+        let result = execute_live_check(Box::new(TimingOutCargo), &config, &cache).await;
+
+        let prov = result
+            .provenance
+            .expect("an errored cargo check keeps its substrate");
+        assert_eq!(
+            prov.cwd,
+            scan_dir.path().join("crates/core").display().to_string(),
+            "the member the command was headed for, not the snapshot root",
         );
     }
 

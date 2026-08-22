@@ -282,7 +282,7 @@ impl Check for TypeScriptCheck {
                     target_sha: None,
                     tree_state: None,
                 }
-                .with_scan_substrate(run_dir, &config.repo_root),
+                .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
         })
     }
@@ -369,7 +369,7 @@ impl Check for ESLintCheck {
                     target_sha: None,
                     tree_state: None,
                 }
-                .with_scan_substrate(run_dir, &config.repo_root),
+                .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
         })
     }
@@ -516,7 +516,7 @@ impl Check for VitestCheck {
                     target_sha: None,
                     tree_state: None,
                 }
-                .with_scan_substrate(run_dir, &config.repo_root),
+                .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
         })
     }
@@ -616,7 +616,7 @@ impl Check for StylelintCheck {
                     target_sha: None,
                     tree_state: None,
                 }
-                .with_scan_substrate(run_dir, &config.repo_root),
+                .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
         })
     }

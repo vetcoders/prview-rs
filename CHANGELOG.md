@@ -25,15 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dirty path, not just its status code and name, so two runs that modify the
   same files differently are distinguishable — including a nested repository,
   which git reports as a single entry and which therefore fingerprints by its
-  own `HEAD` and working state rather than by the bare fact that a directory is
-  there; each run freezes its own state, and under `--watch` every iteration
+  own `HEAD` and, when dirty, by a recursive digest of its own dirty subset
+  (three levels of nesting deep) rather than by the bare fact that a directory
+  is there; each run freezes its own state, and under `--watch` every iteration
   re-reads the tree it is about to analyse.
   The file is listed in `AI_INDEX.md`'s reading order, right after the gate
   verdict it explains — and in the documented contract for it
   (`docs/contracts/ai_index.md`) and the artifact-pack inventory in `README.md`,
   so a consumer implementing the contract can discover that the file is required
   and where it belongs. `worktree.clean` is nullable: a status that could not be
-  read is reported as unknown rather than as a clean tree. A reviewer holding
+  read is reported as unknown rather than as a clean tree. `bases[]` names every
+  baseline the pack's patches were produced from as `{name, sha}`: a multi-base
+  run (`--base a --base b`) generates one patch per base, each with its own merge
+  base, and a single scalar left every patch after the first unplaceable.
+  `base_sha` remains, derived from that array's first entry, so existing
+  consumers keep working and the two cannot disagree. A reviewer holding
   only the artifacts no longer has to reconstruct the run's substrate from
   scattered gate files. Purely additive: no existing pack file changed shape,
   the manifest hashes it like any other artifact, and the sanity
@@ -50,6 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `00_summary/RUN.json` and `report.json`. They are additive and optional:
   consumers of older packs (and of checks that ran outside a git repository)
   keep parsing unchanged, so no artifact `schema_version` bump is required.
+  The synthetic `heuristics_loctree` gate is covered too: it runs in-process
+  rather than as a subprocess, but it still scans a tree — the `git archive`
+  extraction of the target commit, or `repo_root` when no snapshot could be
+  made — and its `PROVENANCE.json` row used to be entirely null, leaving one of
+  the pack's gating signals unauditable. `HeuristicsResult` now carries the
+  commit its analysis root was extracted from along with the scan's start and
+  end times (all additive and optional).
 
 ### Fixed
 
@@ -72,7 +85,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   materialising anything, while stating what it does not know — `command` reads
   `<no command recorded>`, and an off-`HEAD` check whose own worktree is already
   gone keeps no provenance rather than naming the local checkout it was not
-  reading.
+  reading. Cargo checks report the directory they were actually headed for
+  rather than the scan root: a workspace member, or a crate the reviewed commit
+  moved, runs one directory down, and that resolution is now shared with the
+  planner instead of collapsed away.
 - `Pytest` now runs in the reviewed target snapshot instead of `config.repo_root`.
   When reviewing a PR or a remote branch, `repo_root` still points at whatever is
   checked out locally, so pytest executed the *local* branch's tests and reported
@@ -146,6 +162,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest: git stores a symlink as a blob, so a plain tree lookup accepted it.
   A manifest must now be a regular file, and the containment check resolves the
   manifest alongside the directory for the cases the tree lookup cannot cover.
+  A **local** review is one of those cases and was reached by neither guard —
+  the local plan returns before the containment check runs — so a checkout
+  tracking `Cargo.toml` as a link to an external manifest had cargo build a
+  foreign project while provenance recorded the local checkout. The manifest is
+  now resolved against the cargo root before a local plan is returned; an
+  externally configured `cargo_root` whose own manifest sits inside it is still
+  a legitimate local setup and is unaffected.
 - A cargo root that the reviewed branch moved (a root crate pushed into
   `backend/`, a member renamed) is no longer projected into the snapshot
   verbatim. The locally detected path does not exist there, so cargo failed on a
@@ -165,8 +188,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory would resynchronise incompatible dependency sets under each other's
   running pytest. Runs of the same commit still reuse a warm environment, and
   the growth is bounded: the three most recently used environments survive, and
-  nothing used in the last 24 hours is ever removed. Local reviews set no
-  override.
+  nothing used in the last 24 hours is ever removed. That age floor is enforced
+  under a `.prview-prune.lock` file at the environment root, so a second review
+  cannot read a timestamp just before this one refreshes it and then delete the
+  directory out from under a running `uv run`; a root already locked by a live
+  review is left alone entirely. Local reviews set no override.
 - Provenance no longer certifies a tree it could not verify. A working-tree
   status that fails to read (an index lock, a permissions error, a malformed
   repository) recorded `local-clean` — the claim that the scanned bytes exactly
@@ -194,7 +220,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scan — for a dependency-changing PR, the case where the two differ most. A
   snapshot that carries those links is now `snapshot-borrowed-deps`: the
   reviewed source is exactly the target, the dependencies are borrowed. A repo
-  with no local dependency tree links nothing and stays `snapshot`.
+  with no local dependency tree links nothing and stays `snapshot`, and the
+  label is applied per check rather than per directory — a link only counts
+  against a command that can read it. The JS checks resolve their toolchain
+  through `node_modules`; cargo and Semgrep read nothing through it, so a mixed
+  repository no longer downgrades their provenance, and the Python checks run
+  against the per-commit `UV_PROJECT_ENVIRONMENT` rather than the linked
+  `.venv`, so they stay `snapshot` too.
 
 ### Changed
 

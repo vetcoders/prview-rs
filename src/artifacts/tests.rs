@@ -1029,6 +1029,76 @@ fn checks_status_includes_loctree_heuristics_when_available() {
 }
 
 #[test]
+fn synthetic_heuristics_check_records_the_tree_it_scanned() {
+    // heuristics_loctree gates the pack like any other check, so PROVENANCE.json
+    // must be able to name the tree behind it. In snapshot mode that is the
+    // extracted target tree — `git archive` writes the commit and nothing else,
+    // so the scan really is exactly that commit.
+    use crate::checks::TreeState;
+    use crate::heuristics::{HeuristicsResult, HeuristicsSummary, LoctreeAnalysis};
+
+    let heuristics = HeuristicsResult {
+        loctree: Some(LoctreeAnalysis {
+            available: true,
+            ..Default::default()
+        }),
+        summary: HeuristicsSummary {
+            total_files: 12,
+            ..Default::default()
+        },
+        analysis_root: Some("/tmp/prview/repo/abc1234-1".to_string()),
+        analysis_sha: Some("abc1234abc1234abc1234abc1234abc1234abc12".to_string()),
+        started_at: Some("2026-08-22T10:00:00+02:00".to_string()),
+        finished_at: Some("2026-08-22T10:00:04+02:00".to_string()),
+        ..Default::default()
+    };
+
+    let config = create_test_config(PolicyConfig::default());
+    let prov = build_heuristics_check(Some(&heuristics), &config)
+        .provenance
+        .expect("a gating signal must name its substrate");
+
+    assert_eq!(prov.cwd, "/tmp/prview/repo/abc1234-1");
+    assert_eq!(
+        prov.target_sha.as_deref(),
+        Some("abc1234abc1234abc1234abc1234abc1234abc12"),
+    );
+    assert_eq!(prov.tree_state, Some(TreeState::Snapshot));
+    assert_eq!(prov.started_at, "2026-08-22T10:00:00+02:00");
+}
+
+#[test]
+fn synthetic_heuristics_check_leaves_an_unnamed_snapshot_unknown() {
+    // A pack written before the analysis commit was recorded still has its
+    // analysis root. Report the directory, and stop there: guessing that it
+    // holds the target commit is exactly the false certification the manifest
+    // exists to prevent.
+    use crate::heuristics::{HeuristicsResult, HeuristicsSummary, LoctreeAnalysis};
+
+    let heuristics = HeuristicsResult {
+        loctree: Some(LoctreeAnalysis {
+            available: true,
+            ..Default::default()
+        }),
+        summary: HeuristicsSummary {
+            total_files: 12,
+            ..Default::default()
+        },
+        analysis_root: Some("/tmp/prview/repo/older-pack".to_string()),
+        ..Default::default()
+    };
+
+    let config = create_test_config(PolicyConfig::default());
+    let prov = build_heuristics_check(Some(&heuristics), &config)
+        .provenance
+        .expect("the scanned directory is known even when its commit is not");
+
+    assert_eq!(prov.cwd, "/tmp/prview/repo/older-pack");
+    assert_eq!(prov.target_sha, None);
+    assert_eq!(prov.tree_state, None);
+}
+
+#[test]
 fn synthetic_heuristics_check_skips_zero_file_scan() {
     use crate::heuristics::{HeuristicsResult, HeuristicsSummary, LoctreeAnalysis};
 
@@ -1044,7 +1114,8 @@ fn synthetic_heuristics_check_skips_zero_file_scan() {
         ..Default::default()
     };
 
-    let check = build_heuristics_check(Some(&heuristics));
+    let config = create_test_config(PolicyConfig::default());
+    let check = build_heuristics_check(Some(&heuristics), &config);
 
     assert_eq!(check.name, "heuristics_loctree");
     assert_eq!(check.status, CheckStatus::Skipped);
@@ -5077,6 +5148,63 @@ fn provenance_json_base_sha_is_the_commit_the_diff_used() {
 }
 
 #[test]
+fn provenance_json_records_every_baseline_of_a_multi_base_run() {
+    // `--base a --base b` produces one patch per base, each with its own merge
+    // base. Recording only the first left the second patch unplaceable: the
+    // pack contains a diff whose baseline the manifest never names.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let diff = |base: &str, base_commit: &str| Diff {
+        target: "feature/provenance".to_string(),
+        base: base.to_string(),
+        target_commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        base_commit_id: base_commit.to_string(),
+        files: vec![],
+        stats: DiffStats {
+            files_changed: 0,
+            additions: 0,
+            deletions: 0,
+            copied: 0,
+        },
+        commits: vec![],
+    };
+    let first = "1111111111111111111111111111111111111111";
+    let second = "2222222222222222222222222222222222222222";
+    let diffs = vec![diff("origin/main", first), diff("origin/release", second)];
+
+    let json = write_provenance_fixture_with_diffs(repo_tmp.path(), out.path(), &[], &diffs);
+
+    let bases = json["bases"].as_array().expect("bases array");
+    assert_eq!(bases.len(), 2, "one row per patch in the pack");
+    assert_eq!(bases[0]["name"], "origin/main");
+    assert_eq!(bases[0]["sha"], first);
+    assert_eq!(bases[1]["name"], "origin/release");
+    assert_eq!(bases[1]["sha"], second);
+    assert_eq!(
+        json["base_sha"], first,
+        "the scalar stays the first baseline, so older consumers keep reading it",
+    );
+}
+
+#[test]
+fn provenance_json_bases_fall_back_to_resolved_refs_without_a_diff() {
+    // No diff at all (`--current-only`, or a base pointing at the target): the
+    // resolved refs are then the only baselines there are, and the array must
+    // still agree with the scalar.
+    let (repo_tmp, _head) = provenance_fixture_repo();
+    let out = tempfile::tempdir().expect("out tempdir");
+
+    let json = write_provenance_fixture_with_diffs(repo_tmp.path(), out.path(), &[], &[]);
+
+    let bases = json["bases"].as_array().expect("bases array");
+    assert_eq!(bases.len(), 1);
+    assert_eq!(bases[0]["name"], "origin/main");
+    assert_eq!(bases[0]["sha"], PROVENANCE_BASE_TIP);
+    assert_eq!(json["base_sha"], PROVENANCE_BASE_TIP);
+}
+
+#[test]
 fn provenance_json_worktree_reflects_dirty_tree() {
     let (repo_tmp, _head) = provenance_fixture_repo();
     let out = tempfile::tempdir().expect("out tempdir");
@@ -5165,5 +5293,24 @@ fn worktree_digest_separates_nested_repositories_by_their_own_state() {
     assert_ne!(
         moved.status_digest, dirty.status_digest,
         "edits inside a nested repository change what a scan would read",
+    );
+
+    // Same HEAD, same dirty paths, different bytes: a clean/dirty flag says
+    // these are the same substrate, and cargo (or any other check that compiles
+    // the vendored tree) reads different code in each.
+    fs::write(nested.join("scratch.rs"), "pub fn something_else() {}\n").expect("nested rewrite");
+    let differently_dirty = capture_worktree_provenance(repo);
+    assert_ne!(
+        dirty.status_digest, differently_dirty.status_digest,
+        "a nested repository dirtied differently is a different substrate",
+    );
+
+    // And it is still a function of the tree: restoring the bytes restores the
+    // fingerprint.
+    fs::write(nested.join("scratch.rs"), "pub fn draft() {}\n").expect("nested restore");
+    assert_eq!(
+        capture_worktree_provenance(repo).status_digest,
+        dirty.status_digest,
+        "the same nested tree must fingerprint identically",
     );
 }

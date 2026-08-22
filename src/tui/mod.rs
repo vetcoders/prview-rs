@@ -341,9 +341,10 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
     // Run heuristics
     let heuristics = if let Some(ref snap) = target_snap {
         let analysis_root = snap.path.clone();
-        // `run_all` records analysis-root provenance itself, so no
-        // post-assignment is needed here.
+        // `run_all` records analysis-root provenance itself; only this scope
+        // knows which commit that root was extracted from.
         let mut result = crate::heuristics::run_all(&config, Some(analysis_root.as_path())).await?;
+        result.analysis_sha = Some(snap.sha.clone());
 
         // Base snapshot regression
         if let Some(ref base_snap) = base_snap

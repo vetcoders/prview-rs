@@ -255,8 +255,19 @@ virtualenv behind for every commit ever reviewed. Each run refreshes a
 inside, so directory mtime alone would understate activity), and
 `prune_uv_envs()` drops what is outside the working set: the three most recently
 used always survive, and nothing used within the last 24 hours is removed, so a
-concurrent or slow review cannot have its environment deleted mid-run. Nothing
-is pre-created — uv rejects an existing directory that is not a valid
+concurrent or slow review cannot have its environment deleted mid-run.
+
+Age alone would not be enough, because the reviews are concurrent: one process
+can read an environment's timestamp just before another refreshes it and then
+delete the directory once that other review's `uv run` has begun. Marking and
+pruning are therefore a single critical section, serialised across processes by
+a `.prview-prune.lock` file at the root (the same atomic
+create-new-plus-liveness lock the run index uses). The lock is opportunistic —
+pruning is housekeeping, so a root held by another live review is left to it,
+and this run only records its own use. A mark that lands outside the lock still
+wins: each candidate is re-read immediately before it is removed.
+
+Nothing is pre-created — uv rejects an existing directory that is not a valid
 environment, so the directory tree only ever comes from uv itself.
 
 The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,
@@ -378,8 +389,9 @@ Every check records a `CheckProvenance` alongside its result: `command`,
 - `target_sha` — commit whose tree the check scanned (the snapshot's detached
   commit, or the repo `HEAD` for an in-place scan).
 - `tree_state` — which tree, and whether it still matches its commit:
-  - `snapshot` — ephemeral worktree **of this repository** at the reviewed
-    commit, unmodified;
+  - `snapshot` — a tree materialised **from this repository's objects** at the
+    reviewed commit, unmodified: the ephemeral worktree the language checks
+    share, or the `git archive` extraction the Loctree heuristics scan;
   - `snapshot-dirty` — the same worktree after the run wrote into it (a
     generated `Cargo.lock`, a tool writing into the checkout), so the scanned
     bytes are **not** exactly `target_sha`. The dependency symlinks prview
@@ -392,9 +404,14 @@ Every check records a `CheckProvenance` alongside its result: `command`,
     while the compiler, plugins, type definitions and runtime the tools loaded
     came from the local checkout. A dependency-changing PR is where those
     differ, so such a run is not reported as an exact snapshot scan. Reported
-    only when the links actually exist — a repo with no local dependency tree
-    links nothing and stays `snapshot`. Installing the target's own dependencies
-    instead is a network operation of unbounded cost and is not attempted;
+    only when the links actually exist **and the check reads them** — a repo with
+    no local dependency tree links nothing and stays `snapshot`, and so does a
+    cargo or Semgrep run in a mixed repository that merely happens to have
+    `node_modules` linked. The JS checks (TypeScript, ESLint, Vitest, Stylelint)
+    resolve their toolchain through `node_modules`; the Python checks resolve
+    theirs through the per-commit `UV_PROJECT_ENVIRONMENT` prview points uv at,
+    never the linked `.venv`. Installing the target's own dependencies instead is
+    a network operation of unbounded cost and is not attempted;
   - `local-clean` — repo working tree, nothing uncommitted;
   - `local-dirty` — repo working tree with uncommitted changes — the scanned
     bytes are **not** exactly `target_sha`;
@@ -449,13 +466,17 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
 "what did *this pack* judge", once, for a reviewer holding only the artifacts:
 
 - `target_sha` — commit whose tree the pack judges;
-- `base_sha` — the baseline the diff was actually generated from, i.e. the
-  **merge base** taken from the first diff (`Diff.base_commit_id`), not the tip
-  of the base branch. The two differ whenever the base moved ahead of the branch
-  point, and the patch, the changed-file list and every diff-scoped gate are all
-  computed against the merge base — so recording the tip would describe a
-  comparison the pack never made. It falls back to the first resolved base ref
-  only when there is no diff at all;
+- `bases[]` — every baseline the pack's patches were generated from, as
+  `{name, sha}` in diff order. Each `sha` is the **merge base** taken from its
+  diff (`Diff.base_commit_id`), not the tip of the base branch. The two differ
+  whenever the base moved ahead of the branch point, and the patch, the
+  changed-file list and every diff-scoped gate are all computed against the merge
+  base — so recording the tip would describe a comparison the pack never made. A
+  multi-base run (`--base a --base b`) produces one patch per base, so it gets
+  one row per base; with no diff at all the resolved base refs are the only
+  baselines there are and fill the array instead;
+- `base_sha` — the first entry's `sha`, kept for consumers that predate
+  `bases[]`. It is derived from that array, so the two cannot disagree;
 - `head_sha` — commit checked out locally (equal to `target_sha` for an ordinary
   local review, different under `--pr`/`--remote`);
 - `worktree.clean` — whether the local tree had uncommitted changes, frozen
@@ -473,16 +494,23 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   `XY <path>\0<content>`, where `<content>` fingerprints the file the entry
   points at: `blob:<len>:<sha256>` for a regular file (streamed, so a large file
   is not held in memory), `symlink:<sha256>` over the link target,
-  `gitlink:<head>:<clean|dirty>` for a nested repository (git never recurses
-  into one, so a submodule is a single status entry — its own `HEAD` and status
-  are what tell two of them apart), `dir` for an ordinary directory, `absent`
+  `gitlink:<head>:<clean|dirty:<sha256>|unknown>` for a nested repository (git
+  never recurses into one, so a submodule is a single status entry — its own
+  `HEAD` and, when it is dirty, a recursive digest of its own dirty subset are
+  what tell two of them apart; the recursion stops after three levels of
+  nesting and falls back to a bare `dirty`), `dir` for an ordinary directory, `absent`
   when the path is gone, `unreadable` on an IO error. Paths alone
   identify *which* files are modified, not *how*; two runs that touch the same
   files with different content are different substrates and must not share a
   digest. Only the dirty subset is hashed. It is a stable fingerprint, not a
   capture of a specific `git status --porcelain` stdout;
 - `checks[]` — one row per check: `{id, cwd, target_sha, tree_state, started_at,
-  cached}`, with `null` fields for a check that produced no provenance.
+  cached}`, with `null` fields for a check that produced no provenance. The
+  synthetic `heuristics_loctree` row is included: Loctree runs in-process rather
+  than as a subprocess (`command` is `loctree (in-process)`), but it still reads
+  a tree — the `git archive` extraction of the target commit in snapshot mode,
+  or `repo_root` when no snapshot could be made — and a gating signal whose
+  substrate is unstated is unauditable.
 
 The worktree state is frozen **per run**, and a `--watch` iteration is a run:
 each iteration re-reads the working tree before its checks, so the pack it emits
