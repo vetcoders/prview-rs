@@ -170,12 +170,26 @@ Readers accept a pack by MAJOR version and say what they had to normalize:
 | absent | Accepted silently — pre-2.1 packs predate the field |
 | known MAJOR (`1`, `2`), same-or-older MINOR | Accepted silently |
 | known MAJOR, newer MINOR | Accepted with a `schema_forward_compat:` caveat; unknown fields ignored |
-| unknown MAJOR, unparsable version, or a non-string value | Fail loud |
+| unknown MAJOR, unparsable version, a non-canonical spelling (`02.2`, `+2.2`), or a non-string value | Fail loud |
 
 A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
 never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with
 an `unknown_verdict:` caveat, and the MCP adapter ignores it for ranking, emits
 the same caveat, and sets `normalized: true`.
+
+The accepted version set is exactly the one `tools/validate_merge_gate.py`
+accepts, compared as written — a spelling that merely parses to a known tuple
+(`02.2`, `2.02`, `+2.2`) is rejected, so "readable by prview" cannot drift away
+from "valid per the contract validator". From schema 2.2 the validator also
+requires every `quality_failure_details` entry to carry an `origin` of exactly
+`failure` or `warning`: consumers are told to filter on it, which they cannot do
+if a pack may omit or mistype it.
+
+A decision signal present with the wrong JSON type (`merge_recommendation: 7`,
+`allow_merge: "false"`) is not the same as an absent one. The MCP adapter names
+it with an `unreadable_<field>:` caveat and sets `normalized: true`; the CLI
+falls back to its conservative default (`BLOCK` / no merge) and reports the
+normalization.
 
 ## Blocking rules
 

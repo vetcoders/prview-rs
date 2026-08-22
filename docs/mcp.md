@@ -212,6 +212,12 @@ case sets `normalized: true`:
   but outside the known vocabulary, so it was ignored when deriving the decision.
   A gate whose decision has NO recognizable signal at all is still a fail-loud
   `storage_corrupt`.
+- `unreadable_verdict:` / `unreadable_merge_recommendation:` /
+  `unreadable_allow_merge:` — the field was present with the wrong JSON type
+  (`merge_recommendation: 7`, `allow_merge: "false"`). A wrongly typed field is
+  not an absent one: it is ignored for ranking, but it is named, and the
+  remaining signals still have to yield a decision or the pack is
+  `storage_corrupt`.
 - `schema_forward_compat:` — the pack's `schema_version` is a newer MINOR of a
   known MAJOR; it is read, and fields this build does not know are ignored. An
   unknown MAJOR is `storage_corrupt`, and so is a `schema_version` that is

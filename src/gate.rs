@@ -24,12 +24,31 @@ const MERGE_GATE_KNOWN_SCHEMAS: &[(u32, u32)] = &[(1, 0), (2, 0), (2, 1), (2, 2)
 /// Parse a strict `MAJOR.MINOR` version. Anything else — a bare `2`, a trailing
 /// dot, or a third component like `2.1.3` — is NOT this contract's version
 /// shape and must not be silently truncated into one.
+///
+/// Each component must also be spelled canonically. `u32::from_str` accepts a
+/// leading `+` and leading zeros, so `02.02` and `+2.2` would parse to the same
+/// `(2, 2)` as `2.2` and be read as a known schema — while
+/// `tools/validate_merge_gate.py` compares the raw string and rejects them. The
+/// accepted set must BE the validator's set, not a superset that happens to
+/// parse into it.
 fn parse_major_minor(version: &str) -> Option<(u32, u32)> {
     let (major, minor) = version.split_once('.')?;
     if minor.contains('.') {
         return None;
     }
-    Some((major.parse().ok()?, minor.parse().ok()?))
+    Some((canonical_u32(major)?, canonical_u32(minor)?))
+}
+
+/// Parse a decimal component written exactly as the validator would compare it:
+/// digits only, and no leading zero unless the component IS `0`.
+fn canonical_u32(component: &str) -> Option<u32> {
+    if component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if component.len() > 1 && component.starts_with('0') {
+        return None;
+    }
+    component.parse().ok()
 }
 
 /// Newest MINOR this build knows for `major`, if the MAJOR is known at all.
@@ -281,6 +300,24 @@ mod tests {
                 "`{raw}` is not MAJOR.MINOR and must fail loud"
             );
         }
+    }
+
+    #[test]
+    fn schema_check_rejects_non_canonical_component_spelling() {
+        // `u32::from_str` accepts leading zeros and a leading `+`, so `02.02`,
+        // `2.02` and `+2.2` all normalized to the known `(2, 2)` and were read
+        // as the current schema — while the validator rejects those exact
+        // strings. The accepted set has to be the validator's set, not a
+        // superset that happens to parse.
+        for raw in ["02.2", "2.02", "+2.2", "2.+2", "02.02", " 2.2", "2.2 "] {
+            assert!(
+                check_merge_gate_schema(Some(raw)).is_err(),
+                "`{raw}` is not canonical MAJOR.MINOR and must fail loud"
+            );
+        }
+        // The canonical spellings, including a genuine zero component, stay read.
+        assert_eq!(check_merge_gate_schema(Some("2.0")).unwrap(), None);
+        assert_eq!(check_merge_gate_schema(Some("1.0")).unwrap(), None);
     }
 
     #[test]

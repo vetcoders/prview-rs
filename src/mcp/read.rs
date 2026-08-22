@@ -676,6 +676,67 @@ fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// JSON type a decision signal is expected to carry.
+#[derive(Clone, Copy)]
+enum JsonKind {
+    String,
+    Boolean,
+}
+
+impl JsonKind {
+    fn matches(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Boolean => value.is_boolean(),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::String => "a string",
+            Self::Boolean => "a boolean",
+        }
+    }
+}
+
+/// Human-readable JSON type name, for saying what was found instead.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// A decision signal, or `None` plus a caveat when it is present with the wrong
+/// JSON type.
+///
+/// Absence is the one state the adapter accepts in silence — it is the
+/// documented shape of an older pack. A field that IS there but cannot be typed
+/// is a different thing entirely, and collapsing the two through `as_str()` let
+/// the reader ignore a signal while reporting a clean passthrough.
+fn readable_signal<'v>(
+    field: &str,
+    value: Option<&'v serde_json::Value>,
+    want: JsonKind,
+    caveats: &mut Vec<String>,
+) -> Option<&'v serde_json::Value> {
+    let present = value?;
+    if want.matches(present) {
+        return Some(present);
+    }
+    caveats.push(format!(
+        "unreadable_{field}: MERGE_GATE.json {field} is {}, not {}; it was ignored when deriving \
+         this decision",
+        json_type_name(present),
+        want.label()
+    ));
+    None
+}
+
 /// Read and normalize a run's merge decision (R1). Missing/invalid
 /// `MERGE_GATE.json` is a fail-loud `storage_corrupt`, never a silent default.
 pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
@@ -706,15 +767,36 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
         )
     })?;
 
-    let raw_merge = decision
-        .get("merge_recommendation")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let raw_verdict = decision
-        .get("verdict")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let raw_allow = decision.get("allow_merge").and_then(|v| v.as_bool());
+    // A field present with the wrong JSON type is NOT an absent field. Reading
+    // it through `as_str()` / `as_bool()` collapsed the two, and "absent" is the
+    // one state the adapter accepts in silence — so `merge_recommendation: 7`
+    // beside a valid verdict produced a confident passthrough that had quietly
+    // ignored a signal. Keep the two apart and name what was ignored.
+    let mut unknown_signal_caveats = Vec::new();
+
+    let raw_merge = readable_signal(
+        "merge_recommendation",
+        decision.get("merge_recommendation"),
+        JsonKind::String,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_str())
+    .map(str::to_string);
+    let raw_verdict = readable_signal(
+        "verdict",
+        decision.get("verdict"),
+        JsonKind::String,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_str())
+    .map(str::to_string);
+    let raw_allow = readable_signal(
+        "allow_merge",
+        decision.get("allow_merge"),
+        JsonKind::Boolean,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_bool());
 
     let merge_rank = raw_merge.as_deref().and_then(rank_from_merge_rec);
     let verdict_rank = raw_verdict.as_deref().and_then(rank_from_verdict);
@@ -725,7 +807,6 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // the value is still not used to rank, but the reader stops pretending it
     // read the pack cleanly. Legacy `ALLOW`/`HOLD` are recognized vocabulary,
     // so they never land here.
-    let mut unknown_signal_caveats = Vec::new();
     if let Some(raw) = raw_verdict.as_deref()
         && verdict_rank.is_none()
     {
@@ -1137,6 +1218,64 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    #[test]
+    fn wrongly_typed_decision_signal_is_reported_not_dropped() {
+        // `verdict: "PASS"` with `merge_recommendation: 7`: `as_str()` mapped the
+        // malformed field onto "absent", so the unknown-signal branch never saw
+        // it and the adapter returned a clean `normalized: false` decision
+        // derived from the surviving signal — a pack field ignored in silence.
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "bases": ["main"],
+                "decision": { "verdict": "PASS", "merge_recommendation": 7, "allow_merge": true }
+            }),
+        );
+
+        let d = read_decision(dir.path()).expect("one readable signal keeps the pack readable");
+        assert!(
+            d.caveats
+                .iter()
+                .any(|c| c.starts_with("unreadable_merge_recommendation:")),
+            "the ignored field must be named: {:?}",
+            d.caveats
+        );
+        assert!(
+            d.normalized,
+            "a decision that ignored a field is not a passthrough"
+        );
+    }
+
+    #[test]
+    fn wrongly_typed_allow_merge_is_reported_not_dropped() {
+        // Same defect on the third signal: a non-boolean `allow_merge` was
+        // dropped by `as_bool()` and the conservativeness it should have raised
+        // simply disappeared.
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "bases": ["main"],
+                "decision": {
+                    "verdict": "PASS",
+                    "merge_recommendation": "approve",
+                    "allow_merge": "false"
+                }
+            }),
+        );
+
+        let d = read_decision(dir.path()).expect("both ranked signals are readable");
+        assert!(
+            d.caveats
+                .iter()
+                .any(|c| c.starts_with("unreadable_allow_merge:")),
+            "the ignored field must be named: {:?}",
+            d.caveats
+        );
+        assert!(d.normalized);
     }
 
     #[test]
