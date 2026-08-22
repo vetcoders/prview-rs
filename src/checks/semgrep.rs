@@ -81,7 +81,7 @@ impl Check for SemgrepCheck {
         // (policy/engine.rs reads `result.output` verbatim as the reason) shows
         // *why* it was skipped rather than a wall of stderr noise.
         let output_text = if status == CheckStatus::Skipped && !output.status.success() {
-            format_tool_error_reason(output.status.code(), &stderr)
+            format_tool_error_reason(output.status.code(), &stdout, &stderr)
         } else {
             combined.clone()
         };
@@ -192,18 +192,70 @@ fn output_has_findings_payload(stdout: &str) -> bool {
         .is_some_and(|results| !results.is_empty())
 }
 
-/// Human-readable skip reason for a semgrep tool/config error: the exit code
-/// plus a short stderr excerpt, so a reviewer (and the policy engine, which
-/// reads `CheckResult.output` verbatim as the skip reason) sees why the check
-/// did not run rather than a raw stdout/stderr dump.
-fn format_tool_error_reason(exit_code: Option<i32>, stderr: &str) -> String {
-    let excerpt: String = stderr
-        .lines()
+/// First excerpt in `candidates` that carries any text.
+fn first_nonempty<const N: usize>(candidates: [String; N]) -> String {
+    candidates
+        .into_iter()
+        .find(|candidate| !candidate.is_empty())
+        .unwrap_or_default()
+}
+
+/// Up to five non-empty lines of raw tool output, on one line.
+fn text_excerpt(text: &str) -> String {
+    text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .take(5)
         .collect::<Vec<_>>()
-        .join(" | ");
+        .join(" | ")
+}
+
+/// Messages from a semgrep `--json` payload's `errors[]`, if it carries any.
+///
+/// Field naming varies across semgrep versions, so the first of
+/// `message` / `long_msg` / `short_msg` / `type` that is present wins.
+fn json_errors_excerpt(stdout: &str) -> String {
+    let Some(start) = stdout.find('{') else {
+        return String::new();
+    };
+    let mut de = serde_json::Deserializer::from_str(&stdout[start..]);
+    let Ok(parsed) = serde_json::Value::deserialize(&mut de) else {
+        return String::new();
+    };
+    let Some(errors) = parsed.get("errors").and_then(|e| e.as_array()) else {
+        return String::new();
+    };
+
+    errors
+        .iter()
+        .filter_map(|error| {
+            ["message", "long_msg", "short_msg", "type"]
+                .iter()
+                .find_map(|field| error.get(field).and_then(|v| v.as_str()))
+        })
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .take(5)
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Human-readable skip reason for a semgrep tool/config error: the exit code
+/// plus a short excerpt of whatever diagnostic the run produced — stderr when
+/// there is any, otherwise the stdout payload's `errors[]`, otherwise raw
+/// stdout — so a reviewer (and the policy engine, which reads
+/// `CheckResult.output` verbatim as the skip reason) sees why the check did not
+/// run rather than a raw stdout/stderr dump or a generic sentence.
+fn format_tool_error_reason(exit_code: Option<i32>, stdout: &str, stderr: &str) -> String {
+    // Under `--json` semgrep reports config/rule failures in the stdout payload's
+    // `errors[]` and can leave stderr completely empty, so reading stderr alone
+    // discarded the only diagnostic there was and the policy engine received the
+    // generic "no findings payload" sentence as its skip reason.
+    let excerpt = first_nonempty([
+        text_excerpt(stderr),
+        json_errors_excerpt(stdout),
+        text_excerpt(stdout),
+    ]);
 
     let exit_label = exit_code
         .map(|code| code.to_string())
@@ -576,6 +628,7 @@ mod tests {
     fn format_tool_error_reason_includes_exit_code_and_stderr_excerpt() {
         let reason = format_tool_error_reason(
             Some(2),
+            "",
             "Invalid configuration file\nsemgrep: error while validating rules\n",
         );
         assert!(reason.contains('2'), "reason must surface the exit code");
@@ -591,9 +644,49 @@ mod tests {
 
     #[test]
     fn format_tool_error_reason_handles_missing_exit_code_and_empty_stderr() {
-        let reason = format_tool_error_reason(None, "");
+        let reason = format_tool_error_reason(None, "", "");
         assert!(reason.contains("unknown"));
         assert!(reason.contains("tool/config error"));
+    }
+
+    #[test]
+    fn format_tool_error_reason_reads_json_errors_from_stdout() {
+        // With `--json`, semgrep puts its diagnostics in the stdout payload's
+        // `errors[]` and can leave stderr empty. Reading stderr alone threw the
+        // only explanation away and handed the policy engine the generic "no
+        // findings payload" line as the skip reason.
+        let stdout = r#"{"results":[],"errors":[
+            {"type":"InvalidRuleSchemaError","message":"invalid rule: missing key `pattern`"},
+            {"type":"SemgrepError","long_msg":"config auto is unreachable"}
+        ]}"#;
+        let reason = format_tool_error_reason(Some(2), stdout, "");
+
+        assert!(
+            reason.contains("invalid rule: missing key `pattern`"),
+            "the JSON error must reach the skip reason: {reason}"
+        );
+        assert!(
+            reason.contains("config auto is unreachable"),
+            "a second error must not be dropped: {reason}"
+        );
+        assert!(reason.contains("tool/config error"), "{reason}");
+    }
+
+    #[test]
+    fn format_tool_error_reason_falls_back_to_non_json_stdout() {
+        // A crashing semgrep can print a traceback on stdout with nothing on
+        // stderr; that text is still the only diagnostic there is.
+        let reason = format_tool_error_reason(Some(2), "Traceback (most recent call last)\n", "");
+        assert!(
+            reason.contains("Traceback"),
+            "non-JSON stdout is still a diagnostic: {reason}"
+        );
+    }
+
+    #[test]
+    fn format_tool_error_reason_prefers_stderr_when_both_carry_text() {
+        let reason = format_tool_error_reason(Some(2), "{\"results\":[],\"errors\":[]}", "boom\n");
+        assert!(reason.contains("boom"), "{reason}");
     }
 
     #[test]
