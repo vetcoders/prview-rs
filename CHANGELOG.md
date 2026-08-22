@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A long signature change is no longer swallowed by the accumulation cap.**
+  Declaration text stopped accumulating after eight continuation lines, which
+  cuts inside the real distribution of `pub` signatures: two long declarations
+  that agree on their opener and those eight lines finalized to the SAME
+  truncated text, so the exact-match pass paired them as an unchanged re-add and
+  a parameter, bound or return type changed on the ninth line or later produced
+  no finding at all. The bound is now 32 lines and is documented as what it is —
+  a runaway valve for static bodies and generated data tables, not a display
+  width.
 - **A `cfg` predicate wrapped across lines still guards its declaration.** The
   breaking-change pairing recorded only the opener of `#[cfg(any(`, and the first
   continuation line then looked like a new item and cleared the guard: both sides

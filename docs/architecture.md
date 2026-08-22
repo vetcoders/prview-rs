@@ -287,6 +287,14 @@ silent re-addition. A re-add in a *different* file is a module move and becomes
 `RelocatedSymbol`, which is reported but deliberately excluded from breaking
 escalation.
 
+Declarations are compared on their FULL text, continuation lines joined, up to
+`MAX_DECL_CONTINUATION_LINES` (32) — a runaway bound for static bodies and
+generated data tables, not a display width. The bound used to be eight lines,
+which cut inside the real distribution of `pub` signatures: two long
+declarations agreeing on their opener and first eight lines finalized to the
+same truncated text and paired as an unchanged re-add, so a parameter, bound or
+return type changed below the cut produced no finding at all.
+
 Pairing is scoped: two declarations pair only when their inline `mod` path and
 their `#[cfg(…)]` guard may be the same. The guard is the WHOLE conjunction of
 the attributes stacked above the declaration, sorted — `#[cfg(unix)]

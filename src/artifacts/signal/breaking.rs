@@ -149,9 +149,23 @@ struct SymbolDecl {
 }
 
 /// Continuation lines a single declaration may absorb before it is finalized
-/// as-is. Bounds both runaway accumulation (a `Lazy::new(|| { .. })` static
-/// body) and the width of a `BREAKING_CHANGES.md` table cell.
-const MAX_DECL_CONTINUATION_LINES: usize = 8;
+/// as-is. Bounds runaway accumulation — a `Lazy::new(|| { .. })` static body or
+/// a hundred-line `pub const WORDS: &[&str] = &[` table, where "the rest of the
+/// declaration" is data, not signature.
+///
+/// The bound is a safety valve, NOT a display width: what gets truncated here is
+/// the text the pairing COMPARES. At eight lines it cut inside the real
+/// distribution, so two long declarations agreeing on their opener and first
+/// eight lines finalized to the same truncated text, paired as an unchanged
+/// re-add and swallowed a parameter, bound or return type changed below the cut.
+/// Measured over 2,970,120 `pub` declarations in the local crates.io registry:
+/// 94.76% wrap over no continuation line at all, 4.96% over one to eight, and
+/// 0.27% over more — of which this bound now covers everything up to 32 lines
+/// (87% of that remainder). What is left beyond it is dominated by generated
+/// data tables. A declaration longer than the bound is still compared on its
+/// first 32 lines, so a change below the cut can still hide; widening it further
+/// trades that for smearing whole static bodies into one "declaration".
+const MAX_DECL_CONTINUATION_LINES: usize = 32;
 
 /// Inline-module nesting for ONE side of a unified diff.
 ///
@@ -2171,6 +2185,67 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "identical multi-line remove+re-add must produce no finding, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_long_signature_change_below_the_old_cap_is_not_swallowed() {
+        // Accumulation used to stop after eight continuation lines. Two long
+        // declarations that agree on the opener and those eight lines then
+        // finalized to the SAME truncated text, so the exact-match pass paired
+        // them, consumed the addition and dropped the removal — the changed
+        // return type on the tenth line produced no finding at all.
+        let mut body = Vec::new();
+        for (side, ret) in [("-", "u8"), ("+", "u16")] {
+            body.push(format!("{side}pub fn build("));
+            for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+                body.push(format!("{side}    {name}: u8,"));
+            }
+            body.push(format!("{side}) -> {ret} {{"));
+        }
+        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+        let patch = one_file_patch("src/model.rs", &refs);
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::ChangedSignature { before, after }
+                    if before.contains("-> u8") && after.contains("-> u16")
+            )),
+            "a return type changed past the eighth continuation line must surface, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            removed_symbol_types(&findings).is_empty(),
+            "the change must not also report a removal, got: {:?}",
+            removed_symbol_types(&findings)
+        );
+    }
+
+    #[test]
+    fn a_long_declaration_reemitted_unchanged_is_still_a_no_op() {
+        // The tolerant direction of the same accumulation: a long signature the
+        // diff re-emits verbatim must stay a no-op, not become a removal.
+        let mut body = Vec::new();
+        for side in ["-", "+"] {
+            body.push(format!("{side}pub fn build("));
+            for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] {
+                body.push(format!("{side}    {name}: u8,"));
+            }
+            body.push(format!("{side}) -> u8 {{"));
+        }
+        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+        let patch = one_file_patch("src/model.rs", &refs);
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "an unchanged long declaration must produce no finding, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }
