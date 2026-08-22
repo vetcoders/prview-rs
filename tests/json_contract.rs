@@ -69,6 +69,24 @@ fn gate_help_documents_exit_code_contract() {
 }
 
 #[test]
+fn fail_on_warnings_is_documented_and_scoped_to_ci() {
+    // The escape hatch for the warning→failure change: warnings no longer break
+    // `--ci` on their own, so a team that wants that exit asks for it. It is
+    // meaningless outside `--ci`, and clap says so loudly instead of no-opping.
+    Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--fail-on-warnings"));
+
+    Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .arg("--fail-on-warnings")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--ci"));
+}
+
+#[test]
 fn gate_json_emits_verdict_and_caveats_from_merge_gate() {
     let temp = create_fixture_repo();
     let repo = temp.path();

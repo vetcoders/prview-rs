@@ -1344,6 +1344,7 @@ test result: FAILED. 0 passed; 1 failed
         use crate::artifacts::signal::CoverageDelta;
         use crate::artifacts::{
             CheckGateEntry, DashboardContext, QualityFailureClass, QualityFailureDetail,
+            QualityFailureOrigin,
         };
         use crate::cli::ExecutionMode;
         use crate::config::test_config;
@@ -1372,6 +1373,7 @@ test result: FAILED. 0 passed; 1 failed
             quality_failure_details: vec![QualityFailureDetail {
                 name: "ESLint".to_string(),
                 classification: QualityFailureClass::Preexisting,
+                origin: QualityFailureOrigin::Failure,
             }],
             policy_mode: "warn",
             blocking_issues: vec![],

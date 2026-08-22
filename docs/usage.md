@@ -291,6 +291,18 @@ introduced.
 | `--no-color` | Disable ANSI colors |
 | `--no-zip` | Skip ZIP creation |
 | `--no-dashboard` | Skip HTML dashboard generation |
+| `--soft-exit` | Always exit 0, whatever the checks found |
+| `--fail-on-warnings` | With `--ci`: also exit 1 when any check reports warnings |
+
+### `--ci` exit codes
+
+`--ci` is the strict variant of the plain review run: it exits `1` on a `BLOCK`
+verdict or a broken quality gate, and `0` otherwise. Warning-level signals — a
+formatter delta, an unmaintained-crate advisory, lint warnings — are advisory:
+they keep the verdict at `CONDITIONAL` and surface as review caveats, but they
+do not fail the process. Add `--fail-on-warnings` to opt into exit `1` for them;
+the flag requires `--ci` and does not affect `prview gate`, whose exit codes come
+from the gate contract (see `docs/gate-playbook.md`).
 
 ## Examples
 

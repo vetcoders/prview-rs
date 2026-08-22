@@ -43,7 +43,9 @@ which command you run. Two contract lines, deliberately distinct:
   hard failure (`BLOCK` or a broken quality gate); a `CONDITIONAL` verdict —
   including a breaking-only `CONDITIONAL` — exits `0`, exactly as it does for any
   other `CONDITIONAL` cause. This is the historical review contract and does not
-  change with breaking-change escalation.
+  change with breaking-change escalation. Warning-level checks are advisory and
+  do not break the quality gate, so a warnings-only run exits `0`; add
+  `--fail-on-warnings` to opt into exit `1` for them.
 * **`prview gate`** — the contractual enforcement path. `CONDITIONAL` exits `1`,
   and `prview gate --strict` exits `2` (see the exit-code contract above).
 
