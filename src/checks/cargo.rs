@@ -123,22 +123,35 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
 /// Containment is therefore settled on the real, resolved paths, after the
 /// snapshot exists.
 ///
+/// The directory is not the whole answer: a root that stays inside the snapshot
+/// can still hold a `Cargo.toml` that is itself a link to an external manifest,
+/// and cargo reads the manifest, not the directory. Both are therefore resolved.
+/// The tree-level guard in [`resolve_reviewed_cargo_root`] already rejects such a
+/// manifest for an off-HEAD review; this is the same refusal on the materialised
+/// bytes, for the paths that guard cannot reach (a local review, or a repo whose
+/// tree git could not be asked about).
+///
 /// A path that cannot be canonicalised (nothing there yet) is left alone: cargo
 /// reporting a missing directory is a truthful local failure, not a foreign
 /// tree's verdict. The path itself is returned unchanged — canonicalisation is
 /// the test, not the answer, and resolving it would rewrite the directory
 /// provenance reports (`/var` → `/private/var` on macOS).
 fn contained_in_snapshot(cwd: PathBuf, scan_dir: &Path) -> Result<PathBuf> {
-    let (Ok(resolved), Ok(root)) = (cwd.canonicalize(), scan_dir.canonicalize()) else {
+    let Ok(root) = scan_dir.canonicalize() else {
         return Ok(cwd);
     };
-    if !resolved.starts_with(&root) {
-        anyhow::bail!(
-            "cargo root {} resolves outside the reviewed snapshot ({}), so a verdict earned there \
-             would describe another tree",
-            cwd.display(),
-            scan_dir.display(),
-        );
+    for target in [cwd.clone(), cwd.join("Cargo.toml")] {
+        let Ok(resolved) = target.canonicalize() else {
+            continue;
+        };
+        if !resolved.starts_with(&root) {
+            anyhow::bail!(
+                "cargo root {} resolves outside the reviewed snapshot ({}), so a verdict earned \
+                 there would describe another tree",
+                target.display(),
+                scan_dir.display(),
+            );
+        }
     }
     Ok(cwd)
 }
@@ -265,7 +278,11 @@ const CARGO_ROOT_DISCOVERY_DEPTH: usize = 2;
 /// about is not a thing to guess. Walking the tree also settles containment for
 /// free — git trees are not traversed through symlinks, so a root the reviewed
 /// commit replaced with a symlink to an external directory has no entries here
-/// and simply does not resolve.
+/// and simply does not resolve. The manifest itself is held to the same standard
+/// by [`crate::git::Repository::regular_file_at_commit`]: a `Cargo.toml` replaced
+/// with a link to an external file is not a manifest this review can trust, and
+/// resolving it would let cargo read foreign code under the reviewed commit's
+/// cache key.
 fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
     let (Some(commit), Some(relative)) = (
         off_head_target_commit(config),
@@ -284,7 +301,7 @@ fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
         } else {
             format!("{candidate}/Cargo.toml")
         };
-        match repo.path_exists_at_commit(&commit, &path) {
+        match repo.regular_file_at_commit(&commit, &path) {
             Ok(true) => return ReviewedCargoRoot::Resolved(candidate.to_string()),
             Ok(false) => {}
             // The question could not be asked — do not answer it.
@@ -402,7 +419,7 @@ fn substrate_has_lockfile(config: &Config) -> bool {
                 format!("{dir}/Cargo.lock")
             };
             // An unanswerable lookup counts as locked: see the doc comment.
-            repo.path_exists_at_commit(commit.as_str(), &path)
+            repo.regular_file_at_commit(commit.as_str(), &path)
                 .unwrap_or(true)
         });
     }
@@ -2239,6 +2256,88 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             inside,
             "cargo must not follow a symlink out of the reviewed tree, got {}",
             cwd.display(),
+        );
+    }
+
+    /// A directory symlink is not the only escape the reviewed commit controls.
+    /// It can keep the expected cargo root and replace `Cargo.toml` ITSELF with a
+    /// link to an external manifest: the tree lookup finds an entry (git stores a
+    /// symlink as a blob), and cargo then builds whatever that manifest points
+    /// at, under the reviewed commit's cache key.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_reviewed_manifest_is_not_a_cargo_project() {
+        use crate::git::cmd::git_cmd;
+
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+
+        let (repo, _first) = repo_with_two_commits();
+        let root = repo.path();
+        std::os::unix::fs::symlink(outside.path().join("Cargo.toml"), root.join("Cargo.toml"))
+            .expect("symlink");
+        commit_all(root, "manifest replaced by a link");
+        let target = String::from_utf8(
+            git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string();
+        // Move HEAD past the reviewed commit so the review is off-HEAD.
+        std::fs::write(root.join("later.txt"), "after\n").expect("write");
+        commit_all(root, "after");
+
+        let config = test_config_builder()
+            .repo_root(root)
+            .profile(test_rust_profile(true))
+            .target(Some(&target))
+            .build();
+
+        let reason = missing_reviewed_cargo_manifest(&config)
+            .expect("a manifest that is a link out of the tree must not resolve to a project");
+        assert!(
+            reason.contains("not a cargo project"),
+            "the skip must say the reviewed commit carries no manifest: {reason}",
+        );
+    }
+
+    /// The same refusal on materialised bytes, for the paths the tree guard does
+    /// not cover: the cargo root itself stays inside the snapshot, so only
+    /// resolving the manifest catches the escape.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_symlinked_manifest_inside_the_snapshot_is_still_refused() {
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        write_crate(outside.path(), true);
+
+        let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
+        std::fs::create_dir_all(scan_dir.path().join("src")).expect("src");
+        std::fs::write(scan_dir.path().join("src/main.rs"), "fn main() {}\n").expect("main");
+        std::os::unix::fs::symlink(
+            outside.path().join("Cargo.toml"),
+            scan_dir.path().join("Cargo.toml"),
+        )
+        .expect("symlink");
+
+        let repo_root = tempfile::tempdir().expect("repo_root tempdir");
+        write_crate(repo_root.path(), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().to_path_buf());
+        config.scan_dir_override = Some(scan_dir.path().to_path_buf());
+
+        let Err(err) = plan_cargo_run(&config) else {
+            panic!("a manifest resolving outside the snapshot must not be built");
+        };
+        assert!(
+            err.to_string().contains("outside the reviewed snapshot"),
+            "unexpected error: {err}",
         );
     }
 

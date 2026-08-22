@@ -701,17 +701,31 @@ impl Repository {
         &self.path
     }
 
-    /// Whether `file_path` exists in the tree of `commit_ref`.
+    /// Whether `file_path` is a REGULAR FILE in the tree of `commit_ref`.
     ///
     /// Answers "does the REVIEWED commit contain this file" without materialising
     /// a worktree — the snapshot carries exactly this tree, so the tree lookup is
     /// the same answer for a fraction of the cost. An `Err` means the question
     /// could not be asked (unreadable repo, unknown ref), which callers must not
     /// confuse with a confirmed absence.
-    pub fn path_exists_at_commit(&self, commit_ref: &str, file_path: &str) -> Result<bool> {
+    ///
+    /// A symlink answers `false`. Git stores one as a blob whose bytes are the
+    /// link target, so mere existence in the tree says nothing about what a tool
+    /// would end up reading: a `Cargo.toml` the reviewed commit replaced with a
+    /// link to an external manifest exists here, yet cargo would follow it out of
+    /// the snapshot and earn a foreign tree's verdict under the reviewed commit.
+    /// Callers ask this to decide whether the reviewed tree really carries a file
+    /// they can trust, and only a regular file answers that. This matches
+    /// [`Self::dirs_containing_at_commit`], which ignores symlink entries for the
+    /// same reason.
+    pub fn regular_file_at_commit(&self, commit_ref: &str, file_path: &str) -> Result<bool> {
         let safe_path = crate::paths::validate_repo_relative_str(file_path)?;
         let tree = self.inner.revparse_single(commit_ref)?.peel_to_tree()?;
-        Ok(tree.get_path(safe_path).is_ok())
+        let Ok(entry) = tree.get_path(safe_path) else {
+            return Ok(false);
+        };
+        Ok(entry.kind() == Some(git2::ObjectType::Blob)
+            && entry.filemode() != i32::from(git2::FileMode::Link))
     }
 
     /// Directories of `commit_ref` that contain `file_name`, repo-relative and
