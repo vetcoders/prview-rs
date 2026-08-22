@@ -142,6 +142,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the validator rejects those exact strings. An absent `schema_version` stays accepted: pre-2.1 packs
   predate the field, and the documented `ALLOW`/`HOLD` verdict tolerance is
   unchanged.
+- **A versioned pack without a `decision` object is a corrupt artifact.** The CLI
+  reader fell back to treating the gate's ROOT as the decision, so a pack that
+  states `schema_version: "2.2"` and then carries no `decision` (or a non-object
+  one) normalized quietly to `BLOCK` / `allow_merge: false` with an
+  `unknown_verdict:` caveat — a verdict nothing in the pack ever stated. It now
+  exits `3`, matching `tools/validate_merge_gate.py` (which requires `decision`
+  at every version) and the `prview mcp` adapter (which already returned
+  `storage_corrupt`). A pack with NO `schema_version` predates the field and
+  keeps the legacy tolerance: its root is still read as the decision.
 - **A wrongly typed decision signal is a normalization, not an absent field.**
   `verdict: "PASS"` beside `merge_recommendation: 7` used to collapse through
   `as_str()` into "no recommendation", so the `prview mcp` adapter returned a

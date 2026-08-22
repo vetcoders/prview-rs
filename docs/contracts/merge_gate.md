@@ -167,10 +167,17 @@ Readers accept a pack by MAJOR version and say what they had to normalize:
 
 | `schema_version` on disk | Reader behavior |
 |---|---|
-| absent | Accepted silently — pre-2.1 packs predate the field |
+| absent | Accepted silently — pre-2.1 packs predate the field, and their root object is read as the `decision` |
 | known MAJOR (`1`, `2`), same-or-older MINOR | Accepted silently |
 | known MAJOR, newer MINOR | Accepted with a `schema_forward_compat:` caveat; unknown fields ignored |
 | unknown MAJOR, unparsable version, a non-canonical spelling (`02.2`, `+2.2`), or a non-string value | Fail loud |
+
+A pack that STATES a `schema_version` must also carry the `decision` object that
+schema is built around. A missing or non-object `decision` there is a corrupt
+artifact, not a normalization: the CLI exits `3` and the MCP adapter returns
+`storage_corrupt`, matching `tools/validate_merge_gate.py`, which requires
+`decision` at every version. Only a pack with NO `schema_version` keeps the
+legacy tolerance of reading its root as the decision.
 
 A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
 never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with

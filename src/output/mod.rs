@@ -322,13 +322,38 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     })?;
 
     let mut caveats = Vec::new();
+    // A readable `schema_version` also settles the pack's SHAPE below: from 2.1
+    // the contract has a `decision` object, and a pack that states its version
+    // is claiming that contract.
+    let schema_stated = value.get("schema_version").is_some();
     if let Some(caveat) = crate::gate::check_merge_gate_schema_field(value.get("schema_version"))
         .with_context(|| format!("merge gate artifact {}", gate_path.display()))?
     {
         caveats.push(caveat);
     }
 
-    let decision = value.get("decision").unwrap_or(&value);
+    let decision = match value.get("decision") {
+        Some(decision) if decision.is_object() => decision,
+        // Packs with no `schema_version` predate the field, and reading their
+        // root as the decision is the documented legacy read-back surface.
+        _ if !schema_stated => &value,
+        // A pack that names its schema and then omits (or mistypes) the object
+        // that schema is built around is structurally broken. Reading the root
+        // instead produced a verdict nothing in the pack stated — a
+        // re-derivation wearing a reader's clothes, which is exactly what the
+        // fail-loud contract removed. `tools/validate_merge_gate.py` rejects
+        // such a pack and the MCP adapter calls it `storage_corrupt`; the CLI
+        // must not be the one surface that shrugs.
+        _ => anyhow::bail!(
+            "merge gate artifact {} states schema_version {} but carries no `decision` object — \
+             the pack is corrupt and no verdict can be read from it",
+            gate_path.display(),
+            value
+                .get("schema_version")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+        ),
+    };
     // Canonical verdict vocabulary (PV-03/04): PASS / CONDITIONAL / BLOCK. Legacy
     // ALLOW/HOLD tokens from pre-2.1 runs are folded onto the unified set so the
     // CLI `--json` surface speaks the same language as MERGE_GATE.json.
@@ -1915,6 +1940,55 @@ api-router/app/core/cache.py
                 "{err:#} for {bad}"
             );
         }
+    }
+
+    #[test]
+    fn versioned_pack_without_a_decision_object_is_an_error() {
+        // From 2.1 the pack states its schema, and that schema has a `decision`
+        // object — `tools/validate_merge_gate.py` requires one and the MCP
+        // reader errors without one. Treating the root as the decision instead
+        // let a structurally broken pack normalize quietly to BLOCK/false with
+        // a caveat, which is a re-derived verdict wearing a reader's clothes.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        for bad in [
+            r#"{"schema_version":"2.2"}"#,
+            r#"{"schema_version":"2.2","decision":null}"#,
+            r#"{"schema_version":"2.2","decision":[]}"#,
+            r#"{"schema_version":"2.2","decision":"PASS"}"#,
+            r#"{"schema_version":"1.0","verdict":"PASS","allow_merge":true}"#,
+        ] {
+            std::fs::write(temp.path().join("00_summary/MERGE_GATE.json"), bad).unwrap();
+            let err = read_merge_gate_summary(temp.path())
+                .expect_err("a versioned pack without a decision object must fail loud");
+            assert!(
+                format!("{err:#}").contains("decision"),
+                "the error must name the missing object: {err:#} for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn unversioned_pack_still_reads_the_root_as_its_decision() {
+        // The other direction: a pack with NO `schema_version` predates the
+        // field and is the documented legacy read-back surface. Tightening the
+        // structural check must not retire it.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        std::fs::write(
+            temp.path().join("00_summary/MERGE_GATE.json"),
+            r#"{"verdict":"ALLOW","allow_merge":true,"quality_pass":true}"#,
+        )
+        .unwrap();
+
+        let summary = read_merge_gate_summary(temp.path()).expect("legacy pack stays readable");
+        assert_eq!(summary.verdict, "PASS");
+        assert!(summary.allow_merge);
+        assert!(
+            summary.caveats.is_empty(),
+            "a legacy pack read as intended raises no caveat: {:?}",
+            summary.caveats
+        );
     }
 
     #[test]
