@@ -201,6 +201,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`report.json` names the origin of every quality-failure detail.**
+  `gate.quality_failure_details[]` carried `name` + `classification` while
+  `MERGE_GATE.json` has carried `origin` (`"failure"` / `"warning"`) since
+  schema 2.2, so the two artifacts of ONE run disagreed about what "failure"
+  meant: a consumer reading `introduced_quality_failures: ["Rustfmt"]` next to
+  `quality_pass: true` in `report.json` had nothing to reconcile them with. The
+  field is additive and `report.json` stays `schema_version: "2.0"` — that major
+  is itself unreleased, so no consumer has ever seen a 2.0 without it.
 - **A `cfg_attr` that applies a `cfg` is part of the guard.** The guard filter
   recognized only the literal `#[cfg(` spelling, so
   `#[cfg_attr(feature = "a", cfg(unix))]` — which gates the item exactly as a

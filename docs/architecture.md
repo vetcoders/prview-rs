@@ -810,6 +810,17 @@ the loctree counters becoming omittable for the same reason — is why
 `report.json` carries `schema_version: "2.0"`: a decoder written against `1.0`,
 where the ratio was always a number, does not parse every pack.
 
+`report.json`'s `gate.quality_failure_details[]` mirrors `MERGE_GATE.json`'s
+`decision.quality_failure_details[]` field for field — `name`, `classification`
+and `origin` (`"failure"` or `"warning"`). The origin is what makes
+`introduced_quality_failures: ["Rustfmt"]` and `quality_pass: true` readable
+together: the arrays admit warning-level baseline signals so the pre-existing
+downgrade can be computed for them, and only a `"failure"` origin can fail the
+quality gate. Emitting it in the gate artifact but not in `report.json` left the
+two artifacts of one run disagreeing about what "failure" meant. The field is
+additive and `report.json` stays `schema_version: "2.0"` — that major is
+unreleased, so no consumer has ever seen a 2.0 without it.
+
 Four-strategy filename heuristic matching:
 1. Exact stem match: `foo.rs` <-> `foo_test.rs` / `test_foo.rs` / `foo.test.ts`
 2. Path-mirrored: `src/foo/bar.rs` <-> `tests/foo/bar.rs`
