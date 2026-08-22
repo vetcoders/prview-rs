@@ -267,6 +267,16 @@ pruning is housekeeping, so a root held by another live review is left to it,
 and this run only records its own use. A mark that lands outside the lock still
 wins: each candidate is re-read immediately before it is removed.
 
+One window stays open deliberately. Because the losing review marks outside the
+lock, its mark can land between the sweeper's final re-read and its
+`remove_dir_all`. Closing it would mean marking under the lock, i.e. every
+off-`HEAD` Python review waiting on another process's housekeeping. The window
+is one `remove_dir_all` wide, opens only for an environment that is idle for a
+day, outside the working set, and being started at that instant, and its
+consequence is a loud `uv` failure on one gate — never a verdict attributed to
+the wrong substrate. Marking under a bounded-wait acquisition is the fix if that
+failure is ever observed.
+
 Nothing is pre-created — uv rejects an existing directory that is not a valid
 environment, so the directory tree only ever comes from uv itself.
 
