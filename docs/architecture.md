@@ -322,6 +322,17 @@ workspace root and from a configured member yields different results, so the
 repo-relative cargo root travels in the key beside it — the discriminator the
 local hash path already carried.
 
+A commit is a permanent key only for what the commit CONTAINS. When the
+reviewed tree carries no `Cargo.lock`, cargo resolves the dependency graph as it
+runs, against a registry that keeps moving, so a semver-compatible release can
+change what builds while an entry keyed on the commit alone replays the old
+verdict until eviction. `unlocked_substrate_stamp()` appends the day whenever no
+lockfile is proven present (in the reviewed tree via git, in the working tree via
+the filesystem) — the shape `Cargo audit` already uses for advisories, which age
+the same way. Repeated runs within a session still hit; tomorrow's run resolves
+again. A lookup git cannot answer counts as locked, so an unrelated failure does
+not churn the key.
+
 A cache key is a **file name**: `Cache::set` writes `<cache_dir>/<check>/<key>`
 and creates only the check-level directory. The root therefore travels hashed
 (`commit-<sha>-root-<hash>`, `-root-self` for the repo root) rather than
@@ -414,8 +425,11 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   working-tree status, from the *same* read as `clean`. Each line is
   `XY <path>\0<content>`, where `<content>` fingerprints the file the entry
   points at: `blob:<len>:<sha256>` for a regular file (streamed, so a large file
-  is not held in memory), `symlink:<sha256>` over the link target, `dir`,
-  `absent` when the path is gone, `unreadable` on an IO error. Paths alone
+  is not held in memory), `symlink:<sha256>` over the link target,
+  `gitlink:<head>:<clean|dirty>` for a nested repository (git never recurses
+  into one, so a submodule is a single status entry — its own `HEAD` and status
+  are what tell two of them apart), `dir` for an ordinary directory, `absent`
+  when the path is gone, `unreadable` on an IO error. Paths alone
   identify *which* files are modified, not *how*; two runs that touch the same
   files with different content are different substrates and must not share a
   digest. Only the dirty subset is hashed. It is a stable fingerprint, not a
