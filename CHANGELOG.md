@@ -201,6 +201,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A brace in a test function's signature no longer ends its test context.**
+  The perf tracker treated the first `{` after a test marker as the item's body
+  opener, but a brace in type or pattern position — `fn run() -> Buffer<{ LIMIT
+  }>`, or the extractor idiom `fn handler(Parameters(Req { field }):
+  Parameters<Req>)` — balances before any body exists. The next line then looked
+  like the item closing again, so the context ended at the signature and every
+  loop and query in the test body was reported as a production perf regression.
+  The body opener is now the first brace outside the signature's bracket
+  nesting.
 - **`report.json` names the origin of every quality-failure detail.**
   `gate.quality_failure_details[]` carried `name` + `classification` while
   `MERGE_GATE.json` has carried `origin` (`"failure"` / `"warning"`) since

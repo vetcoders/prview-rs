@@ -796,6 +796,20 @@ at the `;` ending the item the marker annotates. Waiting for a brace that never
 comes left the context open for the rest of the hunk, and every production loop
 and query below it was recorded as test-only and dropped from the signal.
 
+Which brace opens that body is decided against the signature's bracket nesting,
+not by taking the first `{`. A brace in type or pattern position —
+`fn run() -> Buffer<{ LIMIT }>`, or the extractor idiom
+`fn handler(Parameters(Req { field }): Parameters<Req>)` — balances before any
+body exists, so reading it as the opener made the very next line look like the
+item closing again: the context ended at the signature and the whole test body
+was classified as production. Inside a signature `<` is reliably a generic
+opener (signatures do not compare), with `->` excluded so a return arrow is not
+read as a closing angle bracket; the depth is clamped at zero so a hunk starting
+mid-signature errs toward closing the context rather than muting production
+code. Measured over the local crates.io registry: of 1,697,077 `fn` signatures,
+1,191 carry a brace in that position and 715 place the body opener on a later
+line — the shape that actually breaks the tracker — 59 of them test-annotated.
+
 #### signal/coverage.rs — coverage delta computation
 
 Cross-references changed source files with test files to estimate test coverage:
