@@ -1,4 +1,4 @@
-# MERGE_GATE Contract (schema 2.1)
+# MERGE_GATE Contract (schema 2.2)
 
 `MERGE_GATE.json` is the policy-aware merge decision emitted at
 `00_summary/MERGE_GATE.json`. It is the single machine-readable verdict surface
@@ -11,7 +11,7 @@ document disagree, the code is the contract and this document is the bug.
 
 | Field | Type | Notes |
 |---|---|---|
-| `schema_version` | string | `"2.1"` |
+| `schema_version` | string | `"2.2"` |
 | `generated_at` | string | RFC 3339 local datetime |
 | `bridge_stage` | integer | `0..4` |
 | `target` | string | Resolved target branch name (not raw CLI input) |
@@ -112,7 +112,7 @@ authoritative axes — `analysis_status` (confidence) and `merge_recommendation`
 | `preexisting_quality_failures` | string[] | Pre-existing failures |
 | `mixed_quality_failures` | string[] | Mixed-provenance failures |
 | `unclassified_quality_failures` | string[] | Failures with unknown provenance |
-| `quality_failure_details` | object[] | `[{ name, classification }]` |
+| `quality_failure_details` | object[] | `[{ name, classification, origin }]`; `origin` is `"failure"` or `"warning"` (schema 2.2) |
 | `decision_reason` | string | Human-readable reason for the verdict |
 | `review_caveats` | string[] | Non-blocking caveats requiring reviewer attention |
 | `blocking_issues` | string[] | Issues that block the merge |
@@ -139,6 +139,13 @@ by `derive_decision` (`src/artifacts/verdict.rs`), which calls
   `recommended_merge`. No caller sets these fields independently.
 - **`policy_allow_merge` is a distinct axis** ("policy did not hard-block") and
   is not conflated with `allow_merge` or the recommendation.
+- **Only `origin: "failure"` entries may fail the quality gate.** Warning-level
+  checks enter `quality_failures` (and its classification arrays) so the
+  pre-existing downgrade can be computed for them, but they never flip
+  `quality_pass`. Reading `introduced_quality_failures` without `origin` is what
+  made `quality_pass: true` look like a contradiction; a consumer that wants
+  "what actually failed" filters `quality_failure_details` on
+  `origin == "failure"`.
 - **An executed check always carries its result artifact and log** (non-null
   `evidence` + `log`); a non-executed check carries non-null placeholders, never
   `null` evidence.
@@ -163,7 +170,7 @@ Readers accept a pack by MAJOR version and say what they had to normalize:
 | absent | Accepted silently — pre-2.1 packs predate the field |
 | known MAJOR (`1`, `2`), same-or-older MINOR | Accepted silently |
 | known MAJOR, newer MINOR | Accepted with a `schema_forward_compat:` caveat; unknown fields ignored |
-| unknown or unparsable MAJOR | Fail loud |
+| unknown MAJOR, unparsable version, or a non-string value | Fail loud |
 
 A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
 never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with

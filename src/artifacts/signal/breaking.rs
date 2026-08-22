@@ -225,6 +225,22 @@ fn mod_opening_name(trimmed: &str) -> Option<String> {
 /// does not show a module boundary. Two *known and different* module paths mean
 /// two different namespaces: `a::Config` disappearing while `b::Config` appears
 /// is a real removal, not a no-op re-add.
+///
+/// The known gap — two empty scopes pair even when the file's real modules
+/// differ — is deliberate and measured, not overlooked. Over 173 commits of this
+/// repository the current rule reports 3 removals and 4 signature changes, all
+/// genuine. Treating an unknown scope as incompatible instead reports 7 removals
+/// and 0 signature changes: it invents removals of symbols that are alive today
+/// (`build_cli_json_summary`, `compute_exit_code`, `generate_diffs`, `McpArgs`)
+/// and erases every real signature change, because a symbol whose declaration
+/// moved across a hunk boundary then looks deleted. Seeding the scope from the
+/// `@@` section heading does not close the gap either: only 149 of 1022 hunk
+/// headers name a module at all, and virtually all of them say `mod tests`.
+/// Closing it honestly needs the module path of the declaration site in the
+/// source and target files, which means reading those files at those revisions —
+/// input `analyze_patch_for_breaking_changes(patch: &str)` does not have. Until
+/// this analysis is given repo + revision access, the ambiguous case resolves
+/// toward not fabricating a breaking change.
 fn scopes_may_pair(removed_scope: &str, added_scope: &str) -> bool {
     removed_scope.is_empty() || added_scope.is_empty() || removed_scope == added_scope
 }

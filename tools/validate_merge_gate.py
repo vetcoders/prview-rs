@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate MERGE_GATE.json contract (schema 1.0/2.0/2.1)."""
+"""Validate MERGE_GATE.json contract (schema 1.0/2.0/2.1/2.2)."""
 
 from __future__ import annotations
 
@@ -105,8 +105,8 @@ def validate(path: Path) -> list[str]:
 
     if not isinstance(data["schema_version"], str):
         issues.append("schema_version must be a string")
-    elif data["schema_version"] not in ("1.0", "2.0", "2.1"):
-        issues.append("schema_version must be '1.0', '2.0', or '2.1'")
+    elif data["schema_version"] not in ("1.0", "2.0", "2.1", "2.2"):
+        issues.append("schema_version must be '1.0', '2.0', '2.1', or '2.2'")
     require_iso_datetime(data["generated_at"], "generated_at", issues)
     if (
         isinstance(data["bridge_stage"], bool)

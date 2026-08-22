@@ -34,7 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ALLOW WITH REVIEW` instead of `HOLD`, and the gate reason gets a separate
   honest sentence (`2 warning signals: 1 pre-existing, 1 introduced`). Real
   failures (`Failed`/`Error`) are unchanged and still fail closed on
-  `introduced`, `mixed`, and `unclassified`.
+  `introduced`, `mixed`, and `unclassified`. The origin is now stated on the
+  wire: `decision.quality_failure_details[]` carries `origin`
+  (`"failure"` / `"warning"`), which is what lets a reader make sense of
+  `introduced_quality_failures: ["Rustfmt"]` sitting next to
+  `quality_pass: true`. This is an additive field, so `MERGE_GATE.json` is
+  `schema_version: "2.2"` and `tools/validate_merge_gate.py` accepts it.
 
 - Perf regression detection now resolves inline Rust test context (`#[cfg(test)]`,
   `mod tests`, `#[test]`) **per hit line** instead of per hunk. A production hot
@@ -51,7 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declaration lines each contributed an opening brace while sharing one closing
   brace). A hit is now also paired only with a nearby loop in the *same*
   context, so a production statement cannot borrow a loop from an adjacent test
-  module — or the reverse.
+  module — or the reverse. Trailing comments are stripped before both the marker
+  match and the brace tracking, so `let x = 1; // #[cfg(test)]` no longer opens
+  test context and a `{` inside a comment no longer shifts the scope; a `//`
+  inside a string literal is still code.
 - Breaking-change detection no longer loses a removal to a same-named symbol in
   another inline module. `pub mod a { pub struct Config }` deleted while
   `pub mod b { pub struct Config }` is added in the same file was cancelled as a
@@ -100,10 +108,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previous run reports the failure instead of resurrecting a plausible verdict.
 - **`MERGE_GATE.json` readers check `schema_version`.** A pack with an unknown or
   unparsable MAJOR is rejected fail-loud (`exit 3` on the CLI, `storage_corrupt`
-  on the MCP surface). A newer MINOR of a known MAJOR is read and reported with a
-  `schema_forward_compat:` caveat. An absent `schema_version` stays accepted:
-  pre-2.1 packs predate the field, and the documented `ALLOW`/`HOLD` verdict
-  tolerance is unchanged.
+  on the MCP surface), and so is a `schema_version` that is present but is not a
+  `MAJOR.MINOR` string — a number, an object, or an explicit `null` used to be
+  read as "field absent", i.e. as a legacy pack, which is the opposite of what it
+  means. A version with extra components (`2.1.3`) is rejected rather than
+  truncated to `2.1`, so "readable by prview" cannot drift away from the exact
+  set `tools/validate_merge_gate.py` accepts. A newer MINOR of a known MAJOR is
+  read and reported with a `schema_forward_compat:` caveat — on every known
+  MAJOR, so a `1.9` pack is now caveated instead of accepted in silence — and the
+  MCP surface marks that read `normalized: true`, as the documented contract
+  already promised. An absent `schema_version` stays accepted: pre-2.1 packs
+  predate the field, and the documented `ALLOW`/`HOLD` verdict tolerance is
+  unchanged.
 - **Unknown verdicts are reported instead of silently absorbed.** The CLI still
   collapses an unrecognized verdict to `BLOCK`, but now says so through a new
   optional `caveats` array on the `--json` summary (`unknown_verdict: …`) — the
@@ -116,12 +132,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readable. The raw check tally is not a verdict; the summary now names the
   missing truth.
 
-- **report.json schema (additive, one field now nullable).**
+- **`report.json` schema_version: `1.0` → `2.0`.**
   `quality.coverage.heuristic_ratio` is `null` when nothing was measured
   (previously a misleading `1.0`) and is accompanied by new `measured: bool`
-  and optional `not_measured_reason` fields. No field was removed or renamed.
-  Consumers reading `heuristic_ratio` must handle `null` — the bundled
-  dashboard PR-comment generator renders it as `not measured`, and
+  and optional `not_measured_reason` fields; `quality.heuristics` omits its
+  counters on a skipped scan. No field was removed or renamed, but a field that
+  was always a number can now be `null` and counters can now be absent, so a
+  decoder written against `1.0` does not parse every pack — that is a MAJOR, not
+  an additive MINOR. Consumers reading `heuristic_ratio` must handle `null` —
+  the bundled dashboard PR-comment generator renders it as `not measured`, and
   `history.rs` already treats a missing value as "no baseline".
 
 - Bumped the bundled `loctree` structural-analysis crate from `0.8` to `0.13.0`.

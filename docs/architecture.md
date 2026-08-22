@@ -305,7 +305,10 @@ Cross-references changed source files with test files to estimate test coverage:
 omit the coverage surface entirely — never as a percentage. A real `0/N`
 (N > 0) stays a genuine `0%` measurement. In `report.json`,
 `quality.coverage.heuristic_ratio` is `null` in the unmeasured case and is
-paired with `measured: false` + `not_measured_reason`.
+paired with `measured: false` + `not_measured_reason`. That nullability — with
+the loctree counters becoming omittable for the same reason — is why
+`report.json` carries `schema_version: "2.0"`: a decoder written against `1.0`,
+where the ratio was always a number, does not parse every pack.
 
 Four-strategy filename heuristic matching:
 1. Exact stem match: `foo.rs` <-> `foo_test.rs` / `test_foo.rs` / `foo.test.ts`

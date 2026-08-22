@@ -1,4 +1,4 @@
-//! report.json v1 generator
+//! report.json v2 generator
 //!
 //! Single source of truth for the dashboard and external tooling.
 //! All data the dashboard needs is serialized here; the HTML renderer
@@ -1076,7 +1076,11 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         .collect();
 
     Report {
-        schema_version: "1.0",
+        // 2.0, not 1.1: `quality.coverage.heuristic_ratio` became nullable and
+        // the loctree counters became omittable, so a decoder written against
+        // 1.0 no longer parses every pack. Calling that additive would repeat,
+        // at the schema level, the "0/0 is 100%" lie the change removed.
+        schema_version: "2.0",
         meta,
         gate,
         checks: check_entries,
@@ -1812,6 +1816,28 @@ test result: FAILED. 0 passed; 1 failed
         // Schema compatibility: the counters stay present for existing readers.
         assert_eq!(cov["matched"].as_u64(), Some(0));
         assert_eq!(cov["total"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn report_schema_version_states_the_nullable_shape() {
+        // The unmeasured cut changed `heuristic_ratio` from a plain number to a
+        // nullable one, and made the loctree counters omittable. Both are shape
+        // changes a strict 1.0 decoder cannot survive, so leaving the stamp at
+        // "1.0" makes report.json misdescribe itself — the same class of lie the
+        // cut was fixing one level down. MINOR would promise old decoders keep
+        // working, which is exactly what stopped being true, so this is a MAJOR.
+        let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        let json = skip_as_zero_report(&ctx, None);
+
+        assert!(
+            json["quality"]["coverage"]["heuristic_ratio"].is_null(),
+            "precondition: the nullable shape is what the version must describe"
+        );
+        assert_eq!(
+            json["schema_version"].as_str(),
+            Some("2.0"),
+            "a nullable field and omittable counters are not an additive change"
+        );
     }
 
     #[test]

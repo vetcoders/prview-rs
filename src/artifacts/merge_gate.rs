@@ -285,6 +285,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             "quality_failure_details": quality_failures.details.iter().map(|detail| json!({
                 "name": detail.name,
                 "classification": detail.classification.as_str(),
+                "origin": detail.origin.as_str(),
             })).collect::<Vec<_>>(),
             "decision_reason": decision.reason,
             "review_caveats": all_review_caveats,
