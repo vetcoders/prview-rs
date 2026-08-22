@@ -195,7 +195,7 @@ fn cargo_content_hash(config: &Config) -> String {
         base
     } else {
         format!(
-            "{}-root:{}",
+            "{}-root-{}",
             base,
             cache::cargo_lock_hash(&config.repo_root)
         )
@@ -227,12 +227,40 @@ fn reviewed_substrate_key(config: &Config) -> Option<String> {
 /// Pure half of [`reviewed_substrate_key`].
 fn reviewed_substrate_key_for(commit: &str, local_root: &Path, repo_root: &Path) -> Option<String> {
     let relative = repo_relative_cargo_root(local_root, repo_root)?;
-    let root = if relative.as_os_str().is_empty() {
-        ".".to_string()
-    } else {
-        relative.display().to_string()
-    };
-    Some(format!("commit-{commit}-root:{root}"))
+    Some(format!(
+        "commit-{commit}-root-{}",
+        cargo_root_token(&relative)
+    ))
+}
+
+/// The repo-relative cargo root as a git-style path (`crates/core`, empty string
+/// for the repo root itself) — the form git trees and cache keys both need.
+fn cargo_root_path(relative: &Path) -> String {
+    relative
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The cargo root as ONE file-name-safe cache-key component.
+///
+/// A cache key is a file name (`<cache_dir>/<check>/<key>`), and `Cache::set`
+/// creates only the check-level directory. A nested root written verbatim put a
+/// separator inside the key, so the write targeted a directory that never
+/// existed: every store failed and check/clippy/audit/geiger — the slowest gates
+/// in the tool — recomputed on every review of a workspace member. Hashing the
+/// path keeps the discriminator exact while staying one component; `self` marks
+/// the repo root, and cannot be confused with a hash (hex has no `s`).
+fn cargo_root_token(relative: &Path) -> String {
+    let path = cargo_root_path(relative);
+    if path.is_empty() {
+        return "self".to_string();
+    }
+    cache::key_token(&path)
 }
 
 /// Source hash for source-only cargo checks (rustfmt): the reviewed commit when
@@ -1829,14 +1857,73 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             "workspace root and member must not share one reviewed-substrate key",
         );
         assert!(root_key.contains(commit) && member_key.contains(commit));
+        assert_eq!(
+            member_key,
+            format!("commit-{commit}-root-{}", cache::key_token("crates/core")),
+            "the member key must name exactly its own root",
+        );
         assert!(
-            member_key.ends_with("root:crates/core"),
-            "unexpected member key: {member_key}",
+            root_key.ends_with("-root-self"),
+            "the repo root must be named, not hashed away: {root_key}",
+        );
+        // Two different roots must never collide onto one key.
+        assert_ne!(
+            reviewed_substrate_key_for(commit, Path::new("/repo/crates/core"), repo_root),
+            reviewed_substrate_key_for(commit, Path::new("/repo/crates/cli"), repo_root),
         );
         // A relative `.` root is the repo root itself — same substrate, same key.
         assert_eq!(
             reviewed_substrate_key_for(commit, Path::new("."), repo_root),
             Some(root_key),
+        );
+    }
+
+    /// A cache key is a FILE NAME. `crates/core` used to travel into it
+    /// verbatim, so the key named a file inside a directory `Cache::set` never
+    /// creates: every write failed silently and the most expensive checks in the
+    /// tool recomputed on every single review of a workspace member.
+    #[test]
+    fn reviewed_substrate_key_is_usable_as_a_file_name() {
+        let key = reviewed_substrate_key_for(
+            "abc123",
+            Path::new("/repo/crates/core"),
+            Path::new("/repo"),
+        )
+        .expect("member key");
+        assert!(
+            !key.contains('/') && !key.contains('\\') && !key.contains(':'),
+            "a cache key must be a single path component, got: {key}",
+        );
+
+        // End to end: the key a nested root produces must survive a real cache
+        // round-trip, which is what the embedded separator broke.
+        let dir = tempfile::tempdir().expect("cache tempdir");
+        let cache = crate::cache::Cache::with_dir(dir.path().to_path_buf(), true);
+        cache
+            .set("Clippy", &key, "passed", Some("out"), None)
+            .expect("a nested-root key must be storable");
+        assert_eq!(
+            cache.get("Clippy", &key).expect("cache hit").status,
+            "passed",
+        );
+    }
+
+    /// The local (non-reviewed) member key carried the same colon, which is an
+    /// illegal file-name character on Windows. Both key paths are file names and
+    /// both must stay portable.
+    #[test]
+    fn local_member_cache_key_is_usable_as_a_file_name() {
+        let repo_root = tempfile::tempdir().expect("repo tempdir");
+        write_crate(&repo_root.path().join("crates/core"), true);
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = repo_root.path().to_path_buf();
+        config.profile.cargo_root = Some(repo_root.path().join("crates/core"));
+
+        let key = cargo_content_hash(&config);
+        assert!(
+            !key.contains('/') && !key.contains('\\') && !key.contains(':'),
+            "a cache key must be a single path component, got: {key}",
         );
     }
 

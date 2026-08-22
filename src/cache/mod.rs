@@ -244,6 +244,21 @@ pub fn python_hash(repo_root: &Path) -> String {
     format!("{}-{}", config_hash, src_hash)
 }
 
+/// Encode arbitrary text as ONE file-name-safe cache-key component.
+///
+/// Cache keys are file names: `Cache::set` writes `<cache_dir>/<check>/<key>`
+/// and creates only the check-level directory. A key carrying a path separator
+/// therefore names a file in a directory nobody made — the write fails, nothing
+/// is ever cached, and the most expensive checks recompute on every run. A colon
+/// is legal on unix but illegal on Windows, which would break the same keys
+/// there. Hashing sidesteps both without capping how long the source value may
+/// be.
+pub fn key_token(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(&hasher.finalize()[..8])
+}
+
 fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
     let mut hasher = Sha256::new();
     // Escape glob metacharacters in the repo root so a path like `repo[old]` is
