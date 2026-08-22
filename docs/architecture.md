@@ -434,7 +434,7 @@ the signal modules for data computation.
 
 Generates `dashboard.html` — a visual summary of the PR with checks, findings, and
 file stats. Split across `mod.rs` (layout/orchestration), `sections.rs` (panel
-rendering), `assets.rs` (embedded CSS/JS/fonts), and `tests.rs`/`trends_tests.rs`.
+rendering), `assets.rs` (embedded CSS/JS (system font stack)), and `tests.rs`/`trends_tests.rs`.
 
 ### heuristics/
 
