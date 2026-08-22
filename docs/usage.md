@@ -137,7 +137,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: vetcoders/prview-rs@main # pin to a released tag once one ships `prview gate`
+      - uses: vetcoders/prview-rs@v0.6.0 # pin to a released tag
         id: prview
         with:
           strict: "true"
@@ -154,9 +154,8 @@ separated `args`.
 
 The Action prefers `cargo-binstall` when that binary is already available on the
 runner and falls back to `cargo install prview --locked --force`. Set `version`
-to a published release that contains `prview gate`, or `latest` for the newest
-release. The gate command is not in the `0.5.0` crate; until a release that
-includes it is published, install the action from `main`.
+to a published release that contains `prview gate` (`0.6.0` or newer), or
+`latest` for the newest release.
 
 SARIF upload requires `permissions: security-events: write`. prview writes
 `30_context/INLINE_FINDINGS.sarif` only when there are inline findings or

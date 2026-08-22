@@ -339,6 +339,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config, and other non-source files now count toward the snapshot), so the
   `LOCTREE` heuristics stats (`total_files`, `total_loc`, `by_language`) report
   higher, broader numbers than under 0.8 for the same tree.
+||||||| 5177ace
+### Changed
+
+- Bumped the bundled `loctree` structural-analysis crate from `0.8` to `0.13.0`.
+  The public API prview consumes (`analyzer::{cycles, dead_parrots, twins}`,
+  `snapshot::{Snapshot, project_cache_dir, run_init, SNAPSHOT_SCHEMA_VERSION}`,
+  `args::ParsedArgs`) is source-compatible — no call sites changed. The snapshot
+  schema version is now decoupled from the crate version (pinned at `0.11.0`
+  instead of tracking `CARGO_PKG_VERSION`); prview's `major.minor` schema gate
+  handles the transition, so stale `0.8`-era caches are re-scanned automatically.
+  loctree 0.13 also widens file-type coverage in the scan (markdown, shell,
+  config, and other non-source files now count toward the snapshot), so the
+  `LOCTREE` heuristics stats (`total_files`, `total_loc`, `by_language`) report
+  higher, broader numbers than under 0.8 for the same tree.
+
+### Security
+- bump ammonia 4.1.3 → 4.1.4 (RUSTSEC-2026-0213: XSS via SVG `animate`/`set` attributes)
+
 
 ## [0.6.0] - 2026-07-07
 
@@ -360,7 +378,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - refactor(githooks): collapse pre-push gate invocation to one line
 - docs(gate): add rollout playbook and hook recipes
 - docs(changelog): record loctree 0.13 adaptation
-- build(deps): bump loctree 0.8 → 0.13.0
+- build(deps): bump loctree 0.8 → 0.13.0 — source-compatible; stale 0.8-era caches are rescanned automatically via the schema gate, and the wider file-type scan coverage broadens the `LOCTREE` heuristics totals (`total_files`, `total_loc`, `by_language`) for the same tree
 
 ### Fixed
 - fail fast without gate subcommand

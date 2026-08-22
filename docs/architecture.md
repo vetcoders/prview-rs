@@ -47,7 +47,7 @@ prview-rs/
 │   │   │   ├── eslint.rs      # ESLint JSON parser
 │   │   │   └── stylelint.rs   # Stylelint JSON parser
 │   │   ├── signal/        # Domain-specific signal generators (16 modules)
-│   │   └── dashboard.rs   # HTML dashboard generation
+│   │   └── dashboard/     # HTML dashboard generation (mod.rs, sections.rs, assets.rs, tests)
 │   ├── mcp/               # MCP server over stdio (agent integrations)
 │   │   ├── mod.rs         # Tool router + tool handlers
 │   │   ├── run.rs         # run_review: spawn prview subprocess, quick/deep
@@ -868,10 +868,11 @@ Compact review summaries (`PR_REVIEW.md`, `FAILURES_SUMMARY.md`, `AI_INDEX.md`) 
 per-finding SARIF generation are orchestrated by `artifacts/mod.rs`, which calls into
 the signal modules for data computation.
 
-### artifacts/dashboard.rs
+### artifacts/dashboard/
 
 Generates `dashboard.html` — a visual summary of the PR with checks, findings, and
-file stats.
+file stats. Split across `mod.rs` (layout/orchestration), `sections.rs` (panel
+rendering), `assets.rs` (embedded CSS/JS (system font stack)), and `tests.rs`/`trends_tests.rs`.
 
 ### heuristics/
 

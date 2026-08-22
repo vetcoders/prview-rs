@@ -8,11 +8,11 @@ inputs:
     default: "false"
   version:
     description: >-
-      prview crate version to install (for example "0.5.0"), or "latest" for the
-      newest published release. The gate command ships from the release line that
-      first introduced `prview gate`; pin to that release once it is published.
-      "latest" is a resilient default: it never fails to resolve a pinned version
-      that does not yet exist on crates.io.
+      prview crate version to install (for example "0.6.0"), or "latest" for the
+      newest published release. `prview gate` shipped starting with the 0.6.0
+      release; pin to "0.6.0" or newer. "latest" is a resilient default: it
+      never fails to resolve a pinned version that does not yet exist on
+      crates.io.
     required: false
     default: "latest"
   args:
@@ -78,7 +78,7 @@ runs:
           if [ -z "$installed_version" ]; then
             installed_version="unknown version"
           fi
-          echo "installed ${installed_version} has no \`gate\` subcommand; pin a source build / wait for 0.6.0" >&2
+          echo "installed ${installed_version} has no \`gate\` subcommand; set version to \"0.6.0\" or newer" >&2
           exit 3
         fi
 
