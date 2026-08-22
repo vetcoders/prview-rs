@@ -69,8 +69,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unmatched `{` in a literal held it open and muted real production hits.
   Normal, raw (`r#"…"#`) and byte-string literals as well as char literals
   (`'}'`, `'\u{7b}'`) are recognised; lifetimes are not mistaken for char
-  literals. A literal spanning several diff lines is out of scope for this
-  per-line scanner.
+  literals. Block comments count too, and they are tracked ACROSS lines —
+  commenting a block of code out is exactly how an unbalanced brace ends up
+  inside a comment, and a `/* … } … */` spread over three lines closed the test
+  scope early (or, with a `{`, held it open and muted real production hits). A
+  `/*` inside a string literal stays data: `format!("{}/*.{}", dir, ext)` is a
+  glob pattern, and reading it as a comment opener would swallow the rest of the
+  hunk — a far more common line in real diffs than a block comment is. A *string*
+  literal spanning several diff lines is still out of scope for this per-line
+  scanner.
 - Breaking-change detection pairs duplicate declarations one-to-one. `cfg`-gated
   variants share (file, kind, name), and the pairing search never consumed its
   match, so every removal cancelled against the same unchanged re-add: the
@@ -90,7 +97,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unrelated same-named addition landed in the same phantom scope and cancelled
   each other — the breaking change vanished from the report. The literal/comment
   scanner is shared with perf-regression test-context tracking (`rust_source`),
-  so both brace trackers agree on what counts as syntax.
+  so both brace trackers agree on what counts as syntax, block comments spanning
+  lines included.
+- Breaking-change detection no longer cancels a removal against a re-add under a
+  DIFFERENT `cfg`. `#[cfg(feature = "a")] pub struct Config;` replaced by the
+  same struct under feature `b` is an exact text match, so the pairing dropped
+  the removal — but `Config` really did disappear for anyone building with
+  feature `a`. The guard standing above a declaration is now part of its pairing
+  identity (whitespace-insensitive, so a reformatted attribute is not a
+  different predicate). A guard the diff never showed on one side stays unknown
+  and pairs as before, the same tolerance an unseen `mod` opener gets: the
+  attribute often sits on a context line, and reading "not shown" as "no cfg"
+  would turn ordinary re-adds into phantom removals.
+- A public declaration no longer ends at a delimiter inside its own literal.
+  `pub const TEMPLATE: &str = r#"{` opens a multi-line raw string, and reading
+  that `{` as the declaration's body opener finalized a truncated declaration —
+  identical on both diff sides, so the removal was cancelled and the literal
+  change the patch actually made produced no finding at all. Completion is now
+  judged on code only, and the accumulated text is scanned as a whole, so a
+  literal spanning continuation lines closes the declaration where it really
+  ends.
 - Multi-line public declarations are compared in full. `pub struct Config<` with
   a changed bound on the next line used to hide behind its identical opening
   line, because only that line was compared. Continuation lines are now
@@ -101,6 +127,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declarations also produce signature changes, a `pub struct Limit` and a
   `pub const Limit` in one file were rendered as one row plus a bogus
   "feature-gated variant" note. The grouping key now carries the symbol kind.
+- The pattern scan no longer reports an identifier as a TODO marker. Word
+  boundaries were read byte-wise over ASCII only, so `$` — an identifier
+  character in JavaScript/TypeScript and the macro metavariable sigil in Rust —
+  and every non-ASCII letter counted as a boundary: `const $TODO = false` and an
+  identifier abutting a Unicode letter were both reported, inflating `prod_hits`
+  and the risk score with exactly the false positives bounded matching exists to
+  exclude. Boundaries are now read per character over the union of identifier
+  characters the scanned languages accept.
 - A skipped `semgrep` run keeps its diagnostic. The tool/config-error skip reason
   was built from stderr alone, but under `--json` semgrep reports rule and config
   failures in the stdout payload's `errors[]` and can leave stderr empty — so the
@@ -109,6 +143,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from stderr, else the payload's `errors[]` (reading `message` / `long_msg` /
   `short_msg` / `type`, whichever the semgrep version emits), else raw stdout, so
   a crash traceback printed on stdout also survives.
+- `report.json` distinguishes a disabled heuristics run from a broken scanner.
+  `--quick` and `--no-heuristics` short-circuit the scan to a default result
+  that the caller still passes on, so the report described the intentional skip
+  as `skip_reason: "loctree analysis unavailable"` — a tool failure that never
+  happened — and pointed `log_path` at a zero-filled stub, while the
+  `"heuristics not run"` reason was unreachable from the production path. A run
+  that never asked for heuristics now reads `heuristics not run` and omits both
+  `total_files` and `log_path`. No field changed shape, so `report.json` stays
+  `schema_version: "2.0"`.
 - Coverage no longer reports an unmeasured scan as perfect. A diff with zero
   changed source files produced `0/0 (100%)` in `AI_INDEX.md`,
   `coverage-delta.txt`, and the dashboard; it now reads `not measured`, and the

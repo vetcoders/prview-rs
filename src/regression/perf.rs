@@ -20,7 +20,7 @@
 //! loop from an adjacent test module (or the reverse).
 
 use super::RegressionContext;
-use crate::rust_source::code_only;
+use crate::rust_source::SourceScanner;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -391,6 +391,10 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
     let mut in_test = false;
     let mut depth: i32 = 0;
     let mut seen_open = false;
+    // A block comment spans lines, so the reader is stateful for this hunk.
+    // Hunks are not contiguous, and this function is called per hunk, so the
+    // scanner starts clean here and is never carried past the hunk boundary.
+    let mut scanner = SourceScanner::default();
 
     for line in hunk.lines() {
         if is_diff_metadata_line(line) {
@@ -408,10 +412,11 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
             .or_else(|| line.strip_prefix(' '))
             .unwrap_or(line);
 
-        // Comments (whole-line, doc, or trailing) are not code: neither their
-        // markers nor their braces may move the scope. A full-line comment
-        // reduces to an empty slice here, which is inert on both counts.
-        let code = code_only(payload);
+        // Comments (whole-line, doc, trailing, or a `/* … */` still open from
+        // an earlier line) are not code: neither their markers nor their braces
+        // may move the scope. A commented-out line reduces to an empty slice
+        // here, which is inert on both counts.
+        let code = scanner.code_only(payload);
         let trimmed = code.trim();
 
         // Only the outermost marker opens the context, so nested `#[test]`
@@ -1313,6 +1318,94 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         assert!(
             result.perf_regression_suspected,
             "a production query-in-loop after the test module must stay reported"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+    }
+
+    #[test]
+    fn test_braces_in_block_comments_do_not_move_test_scope() {
+        // Commenting out a block of code is what block comments are FOR, so a
+        // `}` inside one is ordinary. Counting it closed the test scope early
+        // and reported the test-only query-in-loop below it as production.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[cfg(test)]
+ mod tests {
++    /* removed the tail of the old case:
++    }
++    */
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a brace inside a block comment must not leak a test hit into production"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+    }
+
+    #[test]
+    fn test_open_brace_in_block_comment_does_not_hold_test_scope_open() {
+        // The mirror failure: a `{` inside a block comment kept the test scope
+        // open past the end of the module and muted the production hit below.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[cfg(test)]
+ mod tests {
++    /* old shape:
++    fn f() {
++    */
++}
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a production query-in-loop after the test module must stay reported"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+    }
+
+    #[test]
+    fn test_glob_pattern_is_not_a_block_comment() {
+        // `format!("{}/*.{}")` carries `/*` inside a string literal. Reading it
+        // as a comment opener would swallow the rest of the hunk and mute every
+        // production hit after it — a worse failure than the one block-comment
+        // tracking fixes, and a far more common line in real diffs.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
++let pattern = format!("{}/*.{}", dir, ext);
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a glob pattern must not open a block comment over the rest of the hunk"
         );
         assert_eq!(result.query_in_loop_count, 1);
     }
