@@ -800,7 +800,8 @@ pub(crate) fn capture_worktree_provenance(repo_root: &std::path::Path) -> Worktr
     };
 
     let workdir = repo.workdir().map(|dir| dir.to_path_buf());
-    let fingerprint = render_status_fingerprint(&statuses, workdir.as_deref(), 0);
+    let mut budget = FingerprintBudget::new(FINGERPRINT_BYTE_BUDGET);
+    let fingerprint = render_status_fingerprint(&statuses, workdir.as_deref(), 0, &mut budget);
     let mut hasher = Sha256::new();
     hasher.update(fingerprint.as_bytes());
 
@@ -828,8 +829,15 @@ fn render_status_fingerprint(
     statuses: &git2::Statuses<'_>,
     workdir: Option<&Path>,
     depth: usize,
+    budget: &mut FingerprintBudget,
 ) -> String {
-    let mut lines: Vec<String> = statuses
+    // Sort BEFORE reading. The budget is spent in iteration order, so which
+    // entries are hashed and which are stat-fingerprinted must not depend on
+    // the order git happens to hand them over: the same tree has to produce the
+    // same digest every time. The key is the status pair plus the path, both
+    // unique per entry, so the resulting order is the one sorting the rendered
+    // lines produced before.
+    let mut entries: Vec<(String, Option<std::path::PathBuf>)> = statuses
         .iter()
         .map(|entry| {
             // Git stores names as bytes. `path()` gives up on anything that is
@@ -838,16 +846,75 @@ fn render_status_fingerprint(
             // exist: two runs dirtying different unrepresentable names, or the
             // same one differently, produced the same digest.
             let bytes = entry.path_bytes();
-            let label = status_path_label(bytes);
-            let content = match (workdir, os_relative_path(bytes)) {
-                (Some(dir), Some(relative)) => content_fingerprint(&dir.join(relative), depth),
-                _ => "unknown".to_string(),
+            let key = format!(
+                "{} {}",
+                status_codes(entry.status()),
+                status_path_label(bytes)
+            );
+            let path = match (workdir, os_relative_path(bytes)) {
+                (Some(dir), Some(relative)) => Some(dir.join(relative)),
+                _ => None,
             };
-            format!("{} {label}\0{content}", status_codes(entry.status()))
+            (key, path)
         })
         .collect();
-    lines.sort();
-    lines.join("\n")
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    entries
+        .into_iter()
+        .map(|(key, path)| {
+            let content = match path {
+                Some(path) => content_fingerprint(&path, depth, budget),
+                None => "unknown".to_string(),
+            };
+            format!("{key}\0{content}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How many bytes one capture may read to fingerprint dirty content.
+///
+/// The read used to be unbounded, and `recurse_untracked_dirs` means an
+/// untracked directory is expanded entry by entry: one forgotten dataset, model
+/// checkpoint or vendored bundle in the working tree and prview hashed gigabytes
+/// before the first check even started — and this capture is deliberately taken
+/// before any of them run, so nobody is doing anything else meanwhile.
+///
+/// Measured on this crate's release build, 256 MiB of `sha256` takes ~1 s
+/// (0.94 s / 1.55 s / 1.14 s over three passes on a warm cache) and ~15 s in a
+/// debug build. A second of ceiling for a step nobody waits on deliberately is
+/// the trade: ordinary review-sized dirt (a handful of edited sources) is
+/// nowhere near it, so no existing digest changes, and everything past it is
+/// described rather than read.
+const FINGERPRINT_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// The read allowance left in one capture, shared across every dirty entry and
+/// every nested repository the walk descends into — the bound is on the whole
+/// digest, not on each file.
+struct FingerprintBudget {
+    remaining: u64,
+}
+
+impl FingerprintBudget {
+    fn new(bytes: u64) -> Self {
+        Self { remaining: bytes }
+    }
+
+    /// Reserve `len` bytes, or refuse. A file too large for what is left is
+    /// never read *partially*: a half-hashed file would be rendered as a whole
+    /// one, which is precisely the collision this digest exists to avoid.
+    /// Refusing also leaves the allowance intact, so the small files that follow
+    /// a huge one are still fingerprinted by content.
+    fn take(&mut self, len: u64) -> bool {
+        match self.remaining.checked_sub(len) {
+            Some(left) => {
+                self.remaining = left;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// How a dirty path is written into the digest.
@@ -889,26 +956,79 @@ fn os_relative_path(bytes: &[u8]) -> Option<std::path::PathBuf> {
 }
 
 /// Fingerprint the bytes currently at `path`, without loading the file whole.
-fn content_fingerprint(path: &Path, depth: usize) -> String {
-    use sha2::{Digest, Sha256};
-
+///
+/// `budget` is the run-wide allowance for bytes actually read (see
+/// [`FingerprintBudget`]); a file that does not fit is described from its
+/// metadata instead.
+fn content_fingerprint(path: &Path, depth: usize, budget: &mut FingerprintBudget) -> String {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         // The path is gone (a deletion) — that IS its state.
         return "absent".to_string();
     };
 
     if meta.is_symlink() {
-        return match std::fs::read_link(path) {
-            Ok(target) => {
-                let mut hasher = Sha256::new();
-                hasher.update(target.as_os_str().as_encoded_bytes());
-                format!("symlink:{:x}", hasher.finalize())
-            }
-            Err(_) => "unreadable".to_string(),
-        };
+        return symlink_fingerprint(path, budget);
     }
     if meta.is_dir() {
-        return nested_repo_fingerprint(path, depth);
+        return nested_repo_fingerprint(path, depth, budget);
+    }
+    if !meta.is_file() {
+        // A fifo, socket or device node in the worktree. Git lists it like any
+        // other untracked entry, and opening it is at best meaningless and at
+        // worst a permanent block on a reader that never gets a writer.
+        return "special".to_string();
+    }
+
+    file_fingerprint(path, meta.len(), budget)
+}
+
+/// Fingerprint a symlink by both halves of what it is.
+///
+/// The link's own content — as git stores it — is the target *path*, and a link
+/// retargeted at identical bytes is still a different tree. But everything the
+/// checks read through it lives at the far end, and hashing the pathname alone
+/// let all of that change between two runs under one unchanged digest.
+///
+/// The target is resolved exactly one logical hop, through the link itself:
+/// `metadata` follows the whole chain, and a loop or a dangling link comes back
+/// as an error rather than a walk. Only a regular file is read; a directory is
+/// recorded as such without descending (an absolute link can leave the repo
+/// entirely), and a device or fifo is never opened.
+fn symlink_fingerprint(path: &Path, budget: &mut FingerprintBudget) -> String {
+    use sha2::{Digest, Sha256};
+
+    let Ok(target) = std::fs::read_link(path) else {
+        return "unreadable".to_string();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(target.as_os_str().as_encoded_bytes());
+    let link = format!("{:x}", hasher.finalize());
+
+    let reached = match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => file_fingerprint(path, meta.len(), budget),
+        Ok(meta) if meta.is_dir() => "dir".to_string(),
+        Ok(_) => "special".to_string(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => "absent".to_string(),
+        Err(_) => "unreadable".to_string(),
+    };
+
+    format!("symlink:{link}:{reached}")
+}
+
+/// Hash a regular file's bytes, or describe it from its metadata when reading
+/// it would blow the run's [`FingerprintBudget`].
+///
+/// `stat:` is deliberately a different word from `blob:`: it is not a content
+/// hash and must never be read as one. Two runs where an over-budget file
+/// changed while keeping both its size and its mtime do collide — a far
+/// narrower window than the constant "too big" marker an alternative would
+/// have used, which would have made *every* oversized file equal to every
+/// other.
+fn file_fingerprint(path: &Path, len: u64, budget: &mut FingerprintBudget) -> String {
+    use sha2::{Digest, Sha256};
+
+    if !budget.take(len) {
+        return stat_fingerprint(path, len);
     }
 
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -916,18 +1036,34 @@ fn content_fingerprint(path: &Path, depth: usize) -> String {
     };
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
-    let mut len: u64 = 0;
+    let mut read: u64 = 0;
     loop {
         match std::io::Read::read(&mut file, &mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                len += n as u64;
+                read += n as u64;
                 hasher.update(&buf[..n]);
+                if read > len {
+                    // The file grew under the reader. Stop at what the budget
+                    // was granted for rather than following it indefinitely; a
+                    // partial hash would be labelled as a whole one.
+                    return stat_fingerprint(path, read);
+                }
             }
             Err(_) => return "unreadable".to_string(),
         }
     }
-    format!("blob:{len}:{:x}", hasher.finalize())
+    format!("blob:{read}:{:x}", hasher.finalize())
+}
+
+/// Describe a file that was not read: its size and modification time.
+fn stat_fingerprint(path: &Path, len: u64) -> String {
+    let mtime = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(|| "unknown".to_string(), |age| age.as_nanos().to_string());
+    format!("stat:{len}:{mtime}")
 }
 
 /// Fingerprint a directory that the status walk did not descend into.
@@ -953,7 +1089,7 @@ fn content_fingerprint(path: &Path, depth: usize) -> String {
 /// makes the top-level walk affordable, and it stops at
 /// [`NESTED_REPO_MAX_DEPTH`] — beyond that the coarse `dirty` marker returns,
 /// which is exactly what this function reported before, never something weaker.
-fn nested_repo_fingerprint(path: &Path, depth: usize) -> String {
+fn nested_repo_fingerprint(path: &Path, depth: usize, budget: &mut FingerprintBudget) -> String {
     use sha2::{Digest, Sha256};
 
     // `open`, not `discover`: a plain directory must not resolve to the
@@ -986,7 +1122,9 @@ fn nested_repo_fingerprint(path: &Path, depth: usize) -> String {
         return format!("gitlink:{head}:dirty");
     }
 
-    let inner = render_status_fingerprint(&statuses, repo.workdir(), depth + 1);
+    // The nested walk spends the SAME allowance as the top level: the bound is
+    // on one capture's total reading, not on each repository it descends into.
+    let inner = render_status_fingerprint(&statuses, repo.workdir(), depth + 1, budget);
     let mut hasher = Sha256::new();
     hasher.update(inner.as_bytes());
     format!("gitlink:{head}:dirty:{:x}", hasher.finalize())
@@ -1947,6 +2085,154 @@ mod tests {
         assert_ne!(
             first, recontented,
             "the same unrepresentable name with different content is a different substrate",
+        );
+    }
+
+    /// A dirty symlink used to be fingerprinted by the *pathname* it points at,
+    /// so everything the checks would actually read through it — the bytes at
+    /// the far end — could change between two runs while the digest stayed
+    /// identical. Two materially different substrates, one fingerprint: exactly
+    /// the collision this digest exists to prevent.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_is_fingerprinted_by_what_it_reaches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("target.txt");
+        let link = tmp.path().join("link.txt");
+        std::fs::write(&target, b"one").expect("write target");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let mut budget = FingerprintBudget::new(FINGERPRINT_BYTE_BUDGET);
+        let before = content_fingerprint(&link, 0, &mut budget);
+        std::fs::write(&target, b"two").expect("rewrite target");
+        let after = content_fingerprint(&link, 0, &mut budget);
+        assert_ne!(
+            before, after,
+            "content reached through the link is part of the substrate",
+        );
+
+        // The link's own identity still counts: a link of the same name
+        // pointing somewhere else is a different tree even when the two targets
+        // happen to hold the same bytes.
+        let other = tmp.path().join("other.txt");
+        std::fs::write(&other, b"two").expect("write other");
+        std::fs::remove_file(&link).expect("drop link");
+        std::os::unix::fs::symlink(&other, &link).expect("relink");
+        assert_ne!(
+            after,
+            content_fingerprint(&link, 0, &mut budget),
+            "a link retargeted at identical bytes is still a different link",
+        );
+
+        // A dangling link is a state of its own, and nothing is read for it.
+        std::fs::remove_file(&other).expect("drop other");
+        assert!(
+            content_fingerprint(&link, 0, &mut budget).ends_with("absent"),
+            "a link with nothing at the far end must say so",
+        );
+    }
+
+    /// A symlink's fingerprint used to be the hash of the path it names, so
+    /// the bytes a scan actually reads through it could change completely while
+    /// the digest swore the substrate was identical.
+    #[test]
+    #[cfg(unix)]
+    fn a_dirty_symlinks_content_is_part_of_the_substrate() {
+        let outside = tempfile::tempdir().expect("target tempdir");
+        let target = outside.path().join("payload.txt");
+        let tmp = tempfile::tempdir().expect("repo tempdir");
+        git2::Repository::init(tmp.path()).expect("init repo");
+
+        std::fs::write(&target, b"one").expect("write target");
+        std::os::unix::fs::symlink(&target, tmp.path().join("link")).expect("symlink");
+        let first = capture_worktree_provenance(tmp.path())
+            .status_digest
+            .expect("digest");
+
+        // Same link, same name, same length — only the bytes behind it differ.
+        std::fs::write(&target, b"two").expect("rewrite target");
+        let second = capture_worktree_provenance(tmp.path())
+            .status_digest
+            .expect("digest");
+
+        assert_ne!(
+            first, second,
+            "the content reached through a dirty symlink is what the checks read",
+        );
+    }
+
+    /// The digest is taken before any check runs, so its reading is the review's
+    /// own latency. It used to be unbounded: one untracked dataset or vendored
+    /// bundle in the dirty subset and prview hashed it whole before starting.
+    #[test]
+    fn fingerprinting_stops_reading_once_the_budget_is_spent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let big = tmp.path().join("big.bin");
+        std::fs::write(&big, vec![7u8; 4096]).expect("write big");
+
+        // Budget below the file's size: it is described, not read.
+        let mut spent = FingerprintBudget::new(1024);
+        let described = content_fingerprint(&big, 0, &mut spent);
+        assert!(
+            described.starts_with("stat:4096:"),
+            "an over-budget file is described from its metadata, got {described}",
+        );
+        assert_eq!(
+            spent.remaining, 1024,
+            "a refused read must leave the allowance intact",
+        );
+
+        // A small file after it still gets a real content hash — the refusal
+        // bounds the reading, it does not blind the rest of the capture.
+        let small = tmp.path().join("small.txt");
+        std::fs::write(&small, b"hello").expect("write small");
+        assert!(
+            content_fingerprint(&small, 0, &mut spent).starts_with("blob:5:"),
+            "the entries after an oversized one are still hashed",
+        );
+
+        // With room, the same file is hashed as before — no existing digest
+        // changes because of the bound.
+        let mut ample = FingerprintBudget::new(FINGERPRINT_BYTE_BUDGET);
+        assert!(
+            content_fingerprint(&big, 0, &mut ample).starts_with("blob:4096:"),
+            "a file that fits the budget is still fingerprinted by content",
+        );
+        assert_eq!(
+            ample.remaining,
+            FINGERPRINT_BYTE_BUDGET - 4096,
+            "a granted read must be charged to the allowance",
+        );
+
+        // `stat:` is not a constant marker: two oversized files of different
+        // sizes stay distinguishable, where one "too big" token would have made
+        // every large file equal to every other.
+        let bigger = tmp.path().join("bigger.bin");
+        std::fs::write(&bigger, vec![7u8; 8192]).expect("write bigger");
+        assert_ne!(
+            described,
+            content_fingerprint(&bigger, 0, &mut spent),
+            "two different oversized files must not collapse into one line",
+        );
+    }
+
+    /// The budget is spent entry by entry, so which files get hashed and which
+    /// get described depends on the order they are visited — and the digest of
+    /// one unchanged tree must not depend on the order git happens to report.
+    #[test]
+    fn one_tree_digests_the_same_way_on_every_capture() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git2::Repository::init(tmp.path()).expect("init repo");
+        for name in ["a.bin", "b.bin", "c.bin", "d.bin"] {
+            std::fs::write(tmp.path().join(name), vec![1u8; 4096]).expect("write");
+        }
+
+        let first = capture_worktree_provenance(tmp.path()).status_digest;
+        let second = capture_worktree_provenance(tmp.path()).status_digest;
+        assert!(first.is_some());
+        assert_eq!(
+            first, second,
+            "the same tree must fingerprint identically on every capture",
         );
     }
 
