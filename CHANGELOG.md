@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - refactor(githooks): collapse pre-push gate invocation to one line
 - docs(gate): add rollout playbook and hook recipes
 - docs(changelog): record loctree 0.13 adaptation
-- build(deps): bump loctree 0.8 → 0.13.0
+- build(deps): bump loctree 0.8 → 0.13.0 — source-compatible; stale 0.8-era caches are rescanned automatically via the schema gate, and the wider file-type scan coverage broadens the `LOCTREE` heuristics totals (`total_files`, `total_loc`, `by_language`) for the same tree
 
 ### Fixed
 - fail fast without gate subcommand
