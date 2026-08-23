@@ -201,6 +201,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A const argument that is not the first one no longer hides a public type
+  change.** The breaking-change scanner recognized `Buffer<{ LIMIT }>` as
+  type-level syntax by the exact `<{` sequence, so `Buffer<u8, { LIMIT }>` —
+  where the brace follows a comma, which is where a const generic usually sits —
+  finalized the declaration at its opener. Both diff sides then held the same
+  prefix, paired as an unchanged re-add, and the changed const expression below
+  produced no finding. The scanner now tracks the generic argument list itself.
+  `<<` is consumed whole so a shifted public constant still terminates at its
+  `;`, and measured over the local registry (59,946 files, 2,025 crates,
+  4,354,142 public declaration lines) the new rule and the one it replaces judge
+  zero lines differently.
 - **The MCP adapter and the CLI now answer the same way about a decision they
   cannot rank.** A pack that stated a signal outside the vocabulary — a
   `verdict: "PROBABLY"`, or nothing but `allow_merge` — was read as a

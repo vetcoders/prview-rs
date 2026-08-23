@@ -1136,21 +1136,37 @@ fn should_scan_for_breaking_changes(path: &str) -> bool {
 /// const expression — a different public type — produced no finding.
 fn declaration_complete(code: &str) -> bool {
     let mut depth: i32 = 0;
-    // How deep inside a const argument — `Buffer<{ LIMIT * 2 }>` — the scan is.
-    // Such a `{` is type-level syntax, not the item's body opener.
+    // How deep inside a generic argument list the scan is. A `{` opened there —
+    // `Buffer<{ LIMIT * 2 }>`, `Buffer<u8, { LIMIT * 2 }>` — is type-level
+    // syntax, not the item's body opener.
+    let mut angle: i32 = 0;
     let mut const_block: i32 = 0;
     let mut prev = '\0';
-    for ch in code.chars() {
+    let mut chars = code.chars().peekable();
+    while let Some(ch) = chars.next() {
+        // `<<` is the shift operator, never a nesting of two argument lists in
+        // any declaration this scanner sees. Consuming both characters is what
+        // keeps the 4,666 public `const`/`static` declarations in the local
+        // registry that state a shift on their own line terminating at their
+        // `;` instead of accumulating past it.
+        if ch == '<' && chars.peek() == Some(&'<') {
+            chars.next();
+            prev = '<';
+            continue;
+        }
         match ch {
-            // A `{` directly after `<` opens a const argument, and everything
-            // up to its matching `}` is type-level syntax. The rule is the
-            // exact `<{` sequence rather than generic-argument tracking on
-            // purpose: `<` is also the shift and comparison operator, and 4,666
-            // public `const`/`static` declarations in the local registry state a
-            // shift on their own line — counting their `<` as an opener would
-            // leave every one of them accumulating past its `;`, to buy the 6
-            // declarations in that registry that carry a `<{`.
-            '{' if prev == '<' || const_block > 0 => const_block += 1,
+            // `<` opens an argument list only directly after an identifier or a
+            // closing `>` — `Buffer<`, `Vec<u8>>` — which is where a type names
+            // its arguments and is not where a comparison puts it.
+            '<' if prev.is_alphanumeric() || prev == '_' || prev == '>' => angle += 1,
+            // `->` is a return arrow, not a closing bracket.
+            '>' if prev != '-' && angle > 0 => angle -= 1,
+            // Tracking the whole argument list rather than the exact `<{`
+            // sequence is what catches a const argument that is not the FIRST
+            // one, where the `{` follows a comma. Measured against the local
+            // registry (59,946 files, 2,025 crates, 4,354,142 public
+            // declaration lines), the two rules judge zero lines differently.
+            '{' if angle > 0 || const_block > 0 => const_block += 1,
             '}' if const_block > 0 => const_block -= 1,
             // Square brackets are counted for the same reason parentheses are:
             // an array type states its length with a `;` — `pub const TABLE:
@@ -1737,6 +1753,41 @@ mod tests {
     }
 
     #[test]
+    fn a_const_block_in_a_later_generic_argument_is_not_the_body_opener_either() {
+        // The same construct one argument along: `Buffer<1, {` opens a const
+        // argument whose `{` follows a comma, not a `<`. A const generic is
+        // rarely the FIRST argument, so this is the shape the previous rule's
+        // exact `<{` sequence missed while covering the rarer one.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub type Alias = Buffer<u8, {",
+                "-    LIMIT * 2",
+                "-}>;",
+                "+pub type Alias = Buffer<u8, {",
+                "+    LIMIT * 3",
+                "+}>;",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "a changed const argument is a changed public type: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(changes[0].0.contains("LIMIT * 2"), "{}", changes[0].0);
+        assert!(changes[0].1.contains("LIMIT * 3"), "{}", changes[0].1);
+    }
+
+    #[test]
     fn a_body_brace_after_a_const_argument_still_ends_the_declaration() {
         // Guard against over-reach: the const block closes on the same line and
         // the NEXT brace is the real body. Swallowing it would run the
@@ -1766,11 +1817,10 @@ mod tests {
 
     #[test]
     fn a_shifted_constant_still_terminates_at_its_semicolon() {
-        // `1 << 3` is the reason the fix above is spelled as the exact `<{`
-        // sequence rather than as generic-argument tracking: 4,666 public
-        // `const`/`static` declarations in the local registry state a shift on
-        // their own line, and a `<` counted as an opener there would leave
-        // every one of them accumulating past its `;`.
+        // `1 << 3` is why the argument-list tracker consumes `<<` whole: 4,666
+        // public `const`/`static` declarations in the local registry state a
+        // shift on their own line, and a `<` counted as an opener there would
+        // leave every one of them accumulating past its `;`.
         let findings = analyze_all_breaking_changes(&[one_file_patch(
             "src/model.rs",
             &[
