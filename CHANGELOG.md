@@ -201,6 +201,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The contract validator now certifies the reconciliation, not just the
+  shape.** `tools/validate_merge_gate.py` checked each decision field on its own,
+  so a pack stating `verdict: "PASS"` beside `analysis_status: "incomplete"`, a
+  `block` recommendation and `policy_allow_merge: false` validated OK — while
+  every reader normalizes that same artifact to `BLOCK`. The readers were already
+  protected; the hole was in CERTIFICATION. From schema 2.2 the validator ports
+  their whole rule: it requires the remaining decision axes (`analysis_status`,
+  `merge_recommendation`, `policy_allow_merge`) with the vocabularies the typed
+  enums emit, and rejects a `verdict` milder than the most conservative axis
+  stated beside it. The rule is one-directional on purpose: a HARSHER verdict is
+  legal, because a semgrep scan that passes with parse errors writes `approve`
+  beside `degraded` and the contract turns that into `CONDITIONAL`. A test in
+  `src/policy/engine.rs` pins both enum spellings to the words the validator
+  lists. Probed against 3,547 real packs on disk (2,039 at schema 2.2): no
+  legitimate pack is rejected.
+- **Bytes inside a literal now traverse the whole `cfg`-attribute pipeline
+  verbatim.** The accumulator glued an attribute's physical lines together with
+  nothing between them, and the caller trimmed each line before the tracker saw
+  it, so both the line break and a continuation's indentation vanished from
+  inside the value: `#[cfg(api = "a\nb")]` produced the same guard as
+  `#[cfg(api = "ab")]`, and a declaration that really left one configuration
+  paired with its re-add under another. This is the third finding of one shape,
+  after the delimiter count and the whitespace strip, so it is closed as an
+  invariant rather than patched again. The tracker now takes the raw line, joins
+  a physical break with `\n` exactly when a literal is open across it, and trims
+  nowhere — after the dense view there is no whitespace left outside a literal,
+  so a trim could only eat value. Layout outside a literal is still normalized:
+  re-indenting or re-wrapping a predicate is the same gate. Of 568,128 `cfg`
+  attributes in the local crates.io registry, 4 carry a literal spanning a line
+  break, 2 of them gate an item, and none collide.
 - **An unreadable `checks` list is not an empty one.** `checks` present but not
   an array left the warning tally at zero and fell back to the checks the run
   itself executed — which on an unchanged `--update` run is none — so

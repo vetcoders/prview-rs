@@ -447,3 +447,88 @@ fn display_status_label(status: &str) -> String {
         None => status.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two enum decision axes reach MERGE_GATE.json through `serde`, and
+    /// `tools/validate_merge_gate.py` mirrors their spellings as a closed,
+    /// case-sensitive vocabulary — the same arrangement `CheckStatus::EMITTED`
+    /// has with `VALID_CHECK_STATUSES`. Renaming a variant without touching the
+    /// validator would leave the contract gate certifying a word no reader
+    /// ranks, so pin the wire spelling where the rename would happen.
+    #[test]
+    fn the_decision_axes_serialize_to_the_words_the_validator_knows() {
+        let analysis = [
+            (AnalysisStatus::Complete, "complete"),
+            (AnalysisStatus::Degraded, "degraded"),
+            (AnalysisStatus::Incomplete, "incomplete"),
+        ];
+        for (status, spelling) in analysis {
+            assert_eq!(
+                serde_json::to_value(status).expect("serialize analysis status"),
+                serde_json::Value::String(spelling.to_string()),
+                "VALID_ANALYSIS_STATUSES in tools/validate_merge_gate.py lists {spelling}"
+            );
+        }
+
+        let recommendations = [
+            (MergeRecommendation::Approve, "approve"),
+            (MergeRecommendation::ReviewRequired, "review_required"),
+            (MergeRecommendation::Block, "block"),
+        ];
+        for (recommendation, spelling) in recommendations {
+            assert_eq!(
+                serde_json::to_value(recommendation).expect("serialize recommendation"),
+                serde_json::Value::String(spelling.to_string()),
+                "VALID_MERGE_RECOMMENDATIONS in tools/validate_merge_gate.py lists {spelling}"
+            );
+        }
+    }
+
+    /// The rank table the validator ports. Every `verdict` the emitter derives
+    /// is the MAX rank of the axes it derived it from, which is what lets the
+    /// contract gate reject a verdict milder than its own axes.
+    #[test]
+    fn the_derived_verdict_is_the_most_conservative_axis() {
+        let rank = |verdict: &str| match verdict {
+            "PASS" => 1,
+            "CONDITIONAL" => 2,
+            _ => 3,
+        };
+        for recommendation in [
+            MergeRecommendation::Approve,
+            MergeRecommendation::ReviewRequired,
+            MergeRecommendation::Block,
+        ] {
+            for analysis in [
+                AnalysisStatus::Complete,
+                AnalysisStatus::Degraded,
+                AnalysisStatus::Incomplete,
+            ] {
+                for quality_pass in [true, false] {
+                    let recommendation_rank = match recommendation {
+                        MergeRecommendation::Approve => 1,
+                        MergeRecommendation::ReviewRequired => 2,
+                        MergeRecommendation::Block => 3,
+                    };
+                    // Only values that RULE OUT a milder outcome state a rank:
+                    // `complete` and `quality_pass: true` are preconditions of
+                    // PASS, not grants of it.
+                    let analysis_rank = if analysis == AnalysisStatus::Complete {
+                        1
+                    } else {
+                        2
+                    };
+                    let quality_rank = if quality_pass { 1 } else { 2 };
+                    assert_eq!(
+                        rank(recommendation.legacy_verdict(analysis, quality_pass)),
+                        recommendation_rank.max(analysis_rank).max(quality_rank),
+                        "{recommendation:?} + {analysis:?} + quality_pass={quality_pass}"
+                    );
+                }
+            }
+        }
+    }
+}

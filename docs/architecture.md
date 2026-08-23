@@ -929,6 +929,27 @@ attributes in the local registry only 3 carry whitespace inside a value literal,
 and none of them collide. Both directions still cost what they always did, and
 the hiding one is not worth leaving open for a one-line rule.
 
+Those were three findings of one shape — a delimiter, a space, a line break —
+so the rule is stated once as an INVARIANT rather than patched a fourth time:
+**bytes inside a literal traverse the whole attribute pipeline verbatim.** It
+holds by enumeration, not by testing shapes, because the pipeline alters text in
+exactly two places and both defer to the same `ScanState`. The delimiter count
+runs on `code_only`, a view with no literal bytes in it at all, so trimming or
+counting there cannot reach a value. The guard text runs on
+`code_with_literals_dense`, whose only subtractive rule sits in the one `scan`
+arm reached solely outside every literal and comment; each literal is emitted as
+an unmodified slice. Everything downstream — `gates_the_item`, the sort, the
+dedup, `cfgs_may_pair` — compares whole strings and transforms nothing. So the
+line's raw bytes now reach the tracker (trimming at the caller ate a
+continuation's indentation before it could be asked whether it was inside a
+value), no `.trim()` survives inside the tracker (after the dense view there is
+no whitespace left outside a literal, so a trim there could only eat value), and
+the physical break is joined with a `\n` exactly when the previous line left a
+literal open — gluing it unconditionally made `#[cfg(api = "a\nb")]` the same
+guard as `#[cfg(api = "ab")]`. Measured like its siblings and just as rare: of
+568,128 `cfg` attributes in the local registry, 4 carry a literal spanning a line
+break, 2 of them gate an item, and none collide.
+
 The guard is the WHOLE conjunction of
 the attributes stacked above the declaration, sorted — `#[cfg(unix)]
 #[cfg(feature = "x")]` and `#[cfg(windows)] #[cfg(feature = "x")]` are different
