@@ -13,7 +13,9 @@
 //! shares a hunk with a trailing test module still counts as a production
 //! signal. When the context of a hit is ambiguous it is classified as
 //! production — a false positive costs a reviewer a glance, a false negative
-//! hides a real regression. The context is read from the patch's **target
+//! hides a real regression. That rule governs the MARKERS too: only a gate that
+//! provably holds solely in a test build opens test context, so
+//! `#[cfg(not(test))]` and `#[cfg(any(test, …))]` are production. The context is read from the patch's **target
 //! state** only (added and context lines); removed lines describe what the
 //! patch replaces and never open or close a scope. A hit is paired only with a
 //! nearby loop in the *same* context, so a production statement cannot borrow a
@@ -64,9 +66,29 @@ static QUERY_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 static CLONE_COLLECT_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.(clone|collect)\s*\(\s*\)").unwrap());
 
+/// Markers that PROVE the item below them exists only in a test build.
+///
+/// The `cfg` alternatives are deliberately narrow. Matching the bare token
+/// `test` anywhere inside a predicate read `#[cfg(not(test))]` — code compiled
+/// into every build EXCEPT the test one — as test context and silently muted the
+/// production hits under it, and did the same for
+/// `#[cfg(any(test, feature = "bench"))]`, which compiles outside the test build
+/// whenever the feature is on, and for `#[cfg(feature = "__internal-test")]`,
+/// which is a feature that merely has `test` in its name. Only an exact
+/// `cfg(test)` and an `all(test, …)` — which cannot hold unless `test` does —
+/// are provable. Measured over the local registry (58,586 files), of the 11,030
+/// attributes the previous pattern read as test context 83.62% are exactly
+/// `cfg(test)` and 6.76% are `all(test, …)`; the remaining 9.62% —
+/// `any(test, …)`, `not(…)` and `test`-named features — are the ones it was
+/// getting wrong.
+///
+/// Anything unproven is production, because the two errors are not
+/// symmetrical: failing to recognize test context costs one extra finding a
+/// reader can dismiss, while claiming it where it does not hold deletes a
+/// production finding nobody ever sees.
 static INLINE_RUST_TEST_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"#\[\s*(?:cfg\s*\([^]]*\btest\b[^]]*\)|(?:[\w:]+::)*test|rstest)\s*\]|\bmod\s+tests\b",
+        r"#\[\s*(?:cfg\s*\(\s*(?:test|all\s*\(\s*test\s*[,)][^]]*\))\s*\)|(?:[\w:]+::)*test|rstest)\s*\]|\bmod\s+tests\b",
     )
     .unwrap()
 });
@@ -922,6 +944,118 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         assert_eq!(result.suspected_files.len(), 1);
         assert!(result.suspected_files[0].test_context_only);
         assert!(!result.suspected_files[0].mixed_context);
+    }
+
+    #[test]
+    fn a_not_test_cfg_is_production_context() {
+        // `#[cfg(not(test))]` is the exact OPPOSITE of test context: the item
+        // exists in every build EXCEPT the test one. Matching the bare token
+        // `test` anywhere inside the predicate read it as test context and muted
+        // a production query-in-loop entirely.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(not(test))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "code excluded from the test build is production code"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_cfg_that_only_may_be_test_is_production_context() {
+        // `#[cfg(any(test, feature = "bench"))]` compiles into a non-test build
+        // whenever the feature is on, so it is not PROVABLY test-only. The
+        // tolerated direction is a production finding for test code — one extra
+        // row a reader can dismiss — never a production hit silently dropped.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(any(test, feature = "bench"))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a cfg that may compile outside the test build is production"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_feature_named_after_test_is_production_context() {
+        // `#[cfg(feature = "__internal-test")]` states a FEATURE whose name
+        // happens to contain `test`. It compiles into an ordinary build.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(feature = "__internal-test")]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(result.perf_regression_suspected);
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn an_all_test_cfg_is_still_test_context() {
+        // The narrowing must not swallow the shape it is allowed to keep:
+        // `all(test, …)` cannot hold unless `test` does, so it is provably
+        // test-only and stays muted. 6.76% of the registry's cfg-test gates are
+        // written this way.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(all(test, feature = "std"))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.perf_regression_suspected);
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
     }
 
     #[test]

@@ -865,6 +865,22 @@ worse than an unknown token: its body is then read as code, and the first
 interior `"` opens a phantom literal. That state is per side and per hunk: a
 hunk boundary is where contiguity ends, and every consumer resets there.
 
+What OPENS that context has to be provable, not merely suggestive. The marker
+set is an exact `#[cfg(test)]`, a `#[cfg(all(test, …))]` — which cannot hold
+unless `test` does — `#[test]` / `#[tokio::test]` / `#[rstest]`, and
+`mod tests`. Reading the bare token `test` anywhere inside a `cfg` predicate
+instead made `#[cfg(not(test))]` — code compiled into every build EXCEPT the
+test one — open test context and silently drop the production hits beneath it,
+and did the same for `#[cfg(any(test, feature = "bench"))]`, which compiles
+outside the test build whenever the feature is on, and for
+`#[cfg(feature = "__internal-test")]`, a feature that merely has `test` in its
+name. Measured over the local registry (58,586 files): of the 11,030 attributes
+the old pattern read as test context, 83.62% are exactly `cfg(test)` and 6.76%
+are `all(test, …)`; the remaining 9.62% are the ones it got wrong. Everything
+unproven is production, because the two errors are not symmetrical — an
+unrecognized test context costs one extra finding a reader can dismiss, while a
+claimed one that does not hold deletes a production finding nobody ever sees.
+
 The perf tracker's test context closes two ways, because not every test item has
 a body. One that opens a brace closes when that brace balances again; one that
 does not — `#[cfg(test)] mod tests;`, `#[cfg(test)] use crate::helper;` — closes

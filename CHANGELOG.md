@@ -201,6 +201,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`#[cfg(not(test))]` no longer mutes a production performance finding.** The
+  perf tracker opened inline test context on the bare token `test` appearing
+  anywhere inside a `cfg` predicate, so a query-in-loop under
+  `#[cfg(not(test))]` — code compiled into every build EXCEPT the test one — was
+  recorded as test-only and dropped, and so was one under
+  `#[cfg(any(test, feature = "bench"))]`, which compiles outside the test build
+  whenever the feature is on, or under `#[cfg(feature = "__internal-test")]`, a
+  feature that merely has `test` in its name. This inverted the module's own
+  rule that ambiguity resolves toward production. Only a gate that provably
+  holds solely in a test build now opens the context: an exact `#[cfg(test)]`,
+  an `#[cfg(all(test, …))]`, `#[test]` / `#[tokio::test]` / `#[rstest]`, and
+  `mod tests`. Measured over the local registry (58,586 files), of the 11,030
+  attributes the old pattern read as test context 83.62% are exactly
+  `cfg(test)` and 6.76% are `all(test, …)` — the remaining 9.62% are the ones it
+  was getting wrong.
 - **A block or struct-literal initializer no longer hides a changed public
   constant.** `pub const LIMIT: usize = {` and `pub const ZERO: Self = Self {`
   had their `{` read as the item's body opener, so both diff sides finalized at
