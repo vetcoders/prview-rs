@@ -31,6 +31,7 @@ pub use cargo::{
 pub use python::{MypyCheck, PytestCheck, RuffCheck};
 pub use semgrep::SemgrepCheck;
 pub(crate) use semgrep::output_reports_scan_errors as semgrep_output_reports_scan_errors;
+pub(crate) use semgrep::scan_error_paths as semgrep_scan_error_paths;
 pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 
 /// Which tree a check's command actually read.

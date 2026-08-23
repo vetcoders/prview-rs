@@ -408,6 +408,61 @@ pub(crate) fn cargo_audit_review_caveats(checks: &[CheckResult]) -> Vec<String> 
         .unwrap_or_default()
 }
 
+pub(crate) fn semgrep_partial_parse_review_caveats(checks: &[CheckResult]) -> Vec<String> {
+    let Some(check) = checks
+        .iter()
+        .find(|check| check.name.eq_ignore_ascii_case("semgrep scan"))
+        .filter(|check| crate::checks::semgrep_output_reports_scan_errors(&check.output))
+    else {
+        return Vec::new();
+    };
+
+    let paths = crate::checks::semgrep_scan_error_paths(&check.output);
+    let detail = if paths.is_empty() {
+        "affected file names were not present in Semgrep output".to_string()
+    } else {
+        let shown = paths
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if paths.len() > 10 {
+            format!("{shown}, +{} more", paths.len() - 10)
+        } else {
+            shown
+        }
+    };
+    vec![format!(
+        "Semgrep analysis was partial; incompletely parsed files: {detail}"
+    )]
+}
+
+pub(super) fn cargo_audit_baseline_review_caveats(inline: &InlineFindingsSummary) -> Vec<String> {
+    inline
+        .dashboard_findings
+        .iter()
+        .find(|finding| finding.check_id == "cargo_audit_baseline")
+        .map(|finding| vec![finding.message.clone()])
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+#[test]
+fn semgrep_partial_caveat_names_unparsed_files() {
+    let checks = [CheckResult {
+        name: "Semgrep scan".to_string(),
+        status: CheckStatus::Warnings,
+        duration: std::time::Duration::ZERO,
+        output: r#"{"results":[],"errors":[{"path":"src/ffi.rs"}]}"#.to_string(),
+        cached: false,
+        provenance: None,
+    }];
+    let caveats = semgrep_partial_parse_review_caveats(&checks);
+    assert_eq!(caveats.len(), 1);
+    assert!(caveats[0].contains("src/ffi.rs"));
+}
+
 pub(crate) fn build_merge_decision_view(
     policy_allow_merge: bool,
     quality_pass: bool,

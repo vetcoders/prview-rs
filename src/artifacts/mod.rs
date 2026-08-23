@@ -144,6 +144,7 @@ struct RunJsonInput<'a> {
     artifacts_root: &'a Path,
     config: &'a Config,
     checks: &'a [CheckResult],
+    skipped_checks: &'a [crate::checks::SkippedCheck],
     heuristics: Option<&'a HeuristicsResult>,
     resolved_target: &'a ResolvedRef,
     resolved_bases: &'a [ResolvedRef],
@@ -249,7 +250,10 @@ fn heuristics_provenance(
 
 /// Build a synthetic CheckResult for heuristics_loctree so it appears in
 /// report.json checks[] and dashboard checks table alongside real checks.
-fn build_heuristics_check(heuristics: Option<&HeuristicsResult>, config: &Config) -> CheckResult {
+pub(super) fn build_heuristics_check(
+    heuristics: Option<&HeuristicsResult>,
+    config: &Config,
+) -> CheckResult {
     use crate::checks::CheckStatus;
     match heuristics {
         Some(heuristics)
@@ -270,10 +274,22 @@ fn build_heuristics_check(heuristics: Option<&HeuristicsResult>, config: &Config
             } else {
                 CheckStatus::Passed
             };
-            let output = format!(
-                "dead_exports={}, cycles={}, unused_symbols={}, exact_twins={}, total_files={}, total_loc={}",
-                dead, cycles, parrots, twins, loctree.stats.total_files, loctree.stats.total_loc
-            );
+            let output = if status == CheckStatus::Skipped {
+                format!(
+                    "no files scanned; dead_exports={}, cycles={}, unused_symbols={}, exact_twins={}, total_files=0, total_loc={}",
+                    dead, cycles, parrots, twins, loctree.stats.total_loc
+                )
+            } else {
+                format!(
+                    "dead_exports={}, cycles={}, unused_symbols={}, exact_twins={}, total_files={}, total_loc={}",
+                    dead,
+                    cycles,
+                    parrots,
+                    twins,
+                    loctree.stats.total_files,
+                    loctree.stats.total_loc
+                )
+            };
             CheckResult {
                 name: "heuristics_loctree".to_string(),
                 status,
@@ -287,7 +303,13 @@ fn build_heuristics_check(heuristics: Option<&HeuristicsResult>, config: &Config
             name: "heuristics_loctree".to_string(),
             status: crate::checks::CheckStatus::Skipped,
             duration: std::time::Duration::ZERO,
-            output: "Loctree heuristics not available".to_string(),
+            output: if config.is_fast_remote_only_standard() {
+                "fast remote-only preset".to_string()
+            } else if !config.run_heuristics {
+                "heuristics disabled".to_string()
+            } else {
+                "heuristics unavailable".to_string()
+            },
             cached: false,
             provenance: None,
         },
@@ -490,12 +512,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
 
     // Root-level content generators
     let t = Instant::now();
-    generate_checks_status_json(&out_dir, config, &all_checks, heuristics)?;
+    generate_checks_status_json(&out_dir, config, &all_checks, &skipped_checks)?;
     generate_pr_review(
         &out_dir,
         config,
         diffs,
         &all_checks,
+        &skipped_checks,
         &coverage_delta,
         heuristics,
     )?;
@@ -701,6 +724,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         artifacts_root: &out_dir,
         config,
         checks: &all_checks,
+        skipped_checks: &skipped_checks,
         heuristics,
         resolved_target,
         resolved_bases,
@@ -1311,6 +1335,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
         artifacts_root,
         config,
         checks,
+        skipped_checks,
         heuristics,
         resolved_target,
         resolved_bases,
@@ -1322,16 +1347,17 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
         regression,
     } = input;
 
+    let policy_summary =
+        crate::policy::engine::PolicyEngine::new(config).evaluate_all(checks, skipped_checks);
     let check_results: Vec<serde_json::Value> = checks
         .iter()
-        .map(|c| {
-            let gate_id = check_id_from_name(&c.name);
-            let class = gate_class_for_check(c.status);
+        .zip(&policy_summary.evaluations)
+        .map(|(c, evaluation)| {
             let mut entry = json!({
-                "gate": gate_id,
+                "gate": evaluation.check_id,
                 "name": c.name,
-                "status": c.status.as_str(),
-                "class": gate_class_to_str(class),
+                "status": evaluation.raw_status,
+                "class": gate_class_to_str(evaluation.gate_class),
                 "duration_secs": c.duration.as_secs_f32(),
                 "cached": c.cached,
             });
@@ -1933,51 +1959,29 @@ fn generate_checks_status_json(
     dir: &Path,
     config: &Config,
     checks: &[CheckResult],
-    heuristics: Option<&HeuristicsResult>,
+    skipped_checks: &[crate::checks::SkippedCheck],
 ) -> Result<()> {
     use serde_json::json;
-    use std::collections::HashMap;
-
-    let ran: HashMap<String, &CheckResult> =
-        checks.iter().map(|c| (c.name.to_lowercase(), c)).collect();
-
-    let all_profile_checks = crate::checks::get_checks_for_profile(config);
     let mut status_map = serde_json::Map::new();
+    let policy_summary =
+        crate::policy::engine::PolicyEngine::new(config).evaluate_all(checks, skipped_checks);
 
-    for check in &all_profile_checks {
-        let name = check.name();
-        let id = check_id_from_name(name);
-
-        if let Some(result) = ran.get(&name.to_lowercase()) {
-            let status_str = result.status.as_str().to_string();
-            status_map.insert(id, json!(status_str));
-        } else {
-            let reason = match check.check_eligibility(config) {
-                crate::checks::CheckEligibility::Skip(r) => r,
-                crate::checks::CheckEligibility::Run => "unknown skip reason".to_string(),
+    for evaluation in policy_summary.evaluations {
+        let status = if evaluation.raw_status == crate::checks::CheckStatus::Skipped.as_str() {
+            let reason = evaluation.reason.as_deref().unwrap_or("reason unavailable");
+            let reason = if evaluation.check_id == "heuristics_loctree"
+                && reason.starts_with("no files scanned;")
+            {
+                "no files scanned"
+            } else {
+                reason
             };
-            status_map.insert(id, json!(format!("skipped ({})", reason)));
-        }
+            format!("skipped ({})", reason)
+        } else {
+            evaluation.raw_status
+        };
+        status_map.insert(evaluation.check_id, json!(status));
     }
-
-    let heuristics_status = if !config.run_heuristics {
-        if config.is_fast_remote_only_standard() {
-            "skipped (fast remote-only preset)".to_string()
-        } else {
-            "skipped (heuristics disabled)".to_string()
-        }
-    } else if let Some(h) = heuristics {
-        if h.summary.total_files == 0 {
-            "skipped (no files scanned)".to_string()
-        } else if h.summary.dead_exports > 0 || h.summary.circular_imports > 0 {
-            "warnings".to_string()
-        } else {
-            "passed".to_string()
-        }
-    } else {
-        "skipped (heuristics unavailable)".to_string()
-    };
-    status_map.insert("heuristics_loctree".to_string(), json!(heuristics_status));
 
     fs::write(
         dir.join("checks-status.json"),

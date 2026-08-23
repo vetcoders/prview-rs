@@ -147,7 +147,17 @@ a valid completed review). Response:
   "blocking_issues": [],
   "caveats": [],
   "gates": [
-    { "id": "cargo_test", "status": "PASS", "reason": null, "evidence": null }
+    {
+      "id": "cargo_test",
+      "status": "passed",
+      "execution_state": "executed",
+      "outcome": "passed",
+      "blocking": false,
+      "merge_impact": "approve",
+      "confidence_impact": "complete",
+      "reason": null,
+      "evidence": "20_quality/cargo_test.result.json"
+    }
   ],
   "artifact_paths": {
     "pack": "/Users/tester/.prview/runs/<repo>/<branch>/20260701-120000-a1b2c3d",
@@ -269,7 +279,17 @@ Completed response:
   "blocking_issues": [],
   "caveats": [],
   "gates": [
-    { "id": "clippy", "status": "PASS", "reason": null, "evidence": null }
+    {
+      "id": "clippy",
+      "status": "passed",
+      "execution_state": "executed",
+      "outcome": "passed",
+      "blocking": false,
+      "merge_impact": "approve",
+      "confidence_impact": "complete",
+      "reason": null,
+      "evidence": "20_quality/clippy.result.json"
+    }
   ],
   "generated_at": "2026-07-01T12:00:03+02:00",
   "schema_version": "prview.mcp.v1"

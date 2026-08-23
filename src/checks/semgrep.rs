@@ -174,6 +174,50 @@ pub(crate) fn output_reports_scan_errors(output: &str) -> bool {
         .is_some_and(|errors| !errors.is_empty())
 }
 
+/// Files Semgrep names inside its JSON `errors[]` payload. Semgrep versions use
+/// several shapes (`path`, `location.path`, or span `file` fields), so collect
+/// path-like leaves recursively and deduplicate them in stable order.
+pub(crate) fn scan_error_paths(output: &str) -> Vec<String> {
+    fn collect(value: &serde_json::Value, paths: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if matches!(key.as_str(), "path" | "file")
+                        && let Some(path) = value.as_str()
+                        && !path.trim().is_empty()
+                        && !paths.iter().any(|existing| existing == path)
+                    {
+                        paths.push(path.to_string());
+                    }
+                    collect(value, paths);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, paths);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(start) = output.find('{') else {
+        return Vec::new();
+    };
+    let mut de = serde_json::Deserializer::from_str(&output[start..]);
+    let Ok(parsed) = serde_json::Value::deserialize(&mut de) else {
+        return Vec::new();
+    };
+    let Some(errors) = parsed.get("errors").and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for error in errors {
+        collect(error, &mut paths);
+    }
+    paths
+}
+
 /// True when `stdout` carries a parsable JSON payload with at least one entry
 /// in `results` — i.e. semgrep actually produced findings, as opposed to a
 /// non-zero exit with no results at all (config/tool error). Used to
@@ -614,6 +658,21 @@ mod tests {
         // bytes and miss the errors; the streaming reader must still see them.
         let combined = "{\"results\":[],\"errors\":[{\"type\":[\"PartialParsing\",[]]}]}\nsome semgrep stderr noise\n";
         assert!(output_reports_scan_errors(combined));
+    }
+
+    #[test]
+    fn scan_error_paths_handles_semgrep_error_shapes_and_deduplicates() {
+        let output = r#"{
+          "errors": [
+            {"path":"src/lib.rs"},
+            {"location":{"path":"src/parser.rs"}},
+            {"spans":[{"file":"src/lib.rs"},{"file":"src/ffi.rs"}]}
+          ]
+        } trailing stderr"#;
+        assert_eq!(
+            scan_error_paths(output),
+            vec!["src/lib.rs", "src/parser.rs", "src/ffi.rs"]
+        );
     }
 
     #[test]

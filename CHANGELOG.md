@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The three check inventories now project the policy evaluation captured by the
+  run instead of re-running eligibility while artifacts are written.
+  `RUN.json.checks[]` remains executed-only, while `MERGE_GATE.json` and
+  `checks-status.json` retain configured pre-run skips and their original
+  reasons. PR review and dashboard skip rows explicitly state that PrView did
+  not execute the check and that no external CI status is implied.
+- Risk heatmap aggregation now covers the full changed-file set instead of the
+  first ten displayed risk rows. MCP verdict gate rows additively retain the
+  execution, outcome, blocking, merge-impact, and confidence-impact axes from
+  `MERGE_GATE.json`.
+- Cargo-audit caveats classify vulnerability and informational advisory keys as
+  new, pre-existing, resolved, or unknown-baseline. A changed `Cargo.lock` uses
+  a valid base audit report; tool or report failure remains unknown rather than
+  being treated as an empty baseline. Semgrep partial-analysis caveats now name
+  files reported under its JSON `errors[]` payload.
+
 ## [0.7.0] - 2026-08-23
 
 ### Added

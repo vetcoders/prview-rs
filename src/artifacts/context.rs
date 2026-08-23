@@ -146,48 +146,22 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         .iter()
         .any(|c| check_id_from_name(&c.name) == "heuristics_loctree")
     {
-        let severity = config.policy.severity_for("heuristics_loctree");
-        let (status_class, dead, cycles) = if let Some(h) = heuristics {
-            let dead = h.summary.dead_exports;
-            let cycles = h.summary.circular_imports;
-            if h.summary.total_files == 0 {
-                (GateClass::Skip, dead, cycles)
-            } else {
-                let class = if dead > 0 || cycles > 0 {
-                    GateClass::Info
-                } else {
-                    GateClass::Pass
-                };
-                (class, dead, cycles)
-            }
-        } else {
-            (GateClass::Skip, 0, 0)
-        };
-        let blocking = config.policy.is_blocking(severity, status_class);
+        let result = super::build_heuristics_check(heuristics, config);
+        let evaluation = engine.evaluate_run(&result);
+        let blocking = matches!(evaluation.merge_impact, MergeRecommendation::Block);
         if blocking {
             record_blocking_issue(
                 &mut blocking_issues,
                 &mut worst_merge,
-                format!(
-                    "Loctree heuristics (dead_exports={}, cycles={})",
-                    dead, cycles
-                ),
+                format!("Loctree heuristics ({})", result.output),
             );
         }
-        let name = if let Some(h) = heuristics {
-            format!(
-                "Loctree heuristics (dead={}, cycles={})",
-                h.summary.dead_exports, h.summary.circular_imports
-            )
-        } else {
-            "Loctree heuristics (skipped)".to_string()
-        };
         check_gates.push(CheckGateEntry {
-            name,
-            id: "heuristics_loctree".to_string(),
+            name: evaluation.name,
+            id: evaluation.check_id,
             blocking,
-            class: gate_class_to_str(status_class),
-            severity: policy_severity_to_str(severity),
+            class: gate_class_to_str(evaluation.gate_class),
+            severity: policy_severity_to_str(evaluation.severity),
         });
     }
 
@@ -224,6 +198,8 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
     ));
     review_caveats.extend(rust_quality_review_caveats(config, checks));
     review_caveats.extend(cargo_audit_review_caveats(checks));
+    review_caveats.extend(cargo_audit_baseline_review_caveats(inline));
+    review_caveats.extend(semgrep_partial_parse_review_caveats(checks));
     review_caveats.extend(skipped_requested_security_review_caveats(
         config,
         checks,
@@ -238,7 +214,12 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         ));
     }
 
-    let findings = inline.dashboard_findings.clone();
+    let findings = inline
+        .dashboard_findings
+        .iter()
+        .filter(|finding| is_operator_finding(finding))
+        .cloned()
+        .collect::<Vec<_>>();
     // Discover per-file diff files
     let per_file_dir = diff_dir.join("per-file-diffs");
     let per_file_diff_files = if per_file_dir.exists() {

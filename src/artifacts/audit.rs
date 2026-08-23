@@ -207,6 +207,59 @@ pub(crate) fn cargo_audit_finding_key(finding: &CargoAuditFinding) -> (String, S
     )
 }
 
+/// Every advisory-like item in cargo-audit JSON, including informational
+/// `warnings` categories. The key includes the locked version so dependency
+/// changes cannot launder a finding as pre-existing.
+pub(crate) fn cargo_audit_all_advisory_keys(
+    output: &str,
+) -> std::collections::HashSet<(String, String, String)> {
+    let mut keys: std::collections::HashSet<_> = parse_cargo_audit_findings(output)
+        .iter()
+        .map(cargo_audit_finding_key)
+        .collect();
+    let Some(parsed) = extract_embedded_json(output) else {
+        return keys;
+    };
+    let Some(warnings) = parsed.get("warnings").and_then(|value| value.as_object()) else {
+        return keys;
+    };
+    for entries in warnings.values().filter_map(|value| value.as_array()) {
+        for entry in entries {
+            let advisory_id = entry
+                .pointer("/advisory/id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("cargo-audit-warning");
+            let package_name = entry
+                .pointer("/package/name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown-package");
+            let package_version = entry
+                .pointer("/package/version")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            keys.insert((
+                advisory_id.to_string(),
+                package_name.to_string(),
+                package_version.to_string(),
+            ));
+        }
+    }
+    keys
+}
+
+/// Parse a complete cargo-audit report for baseline comparison. A spawned
+/// process can fail while still returning UTF-8 (including an empty string),
+/// which must remain an unknown baseline rather than masquerade as a clean one.
+fn cargo_audit_baseline_keys(
+    output: &str,
+) -> Option<std::collections::HashSet<(String, String, String)>> {
+    let parsed = extract_embedded_json(output)?;
+    parsed
+        .pointer("/vulnerabilities/list")
+        .and_then(|value| value.as_array())?;
+    Some(cargo_audit_all_advisory_keys(output))
+}
+
 pub(crate) fn get_base_cargo_audit_findings(
     repo: Option<&crate::git::Repository>,
     diffs: &[crate::git::Diff],
@@ -239,12 +292,8 @@ pub(crate) fn get_base_cargo_audit_findings(
     }
 
     let output = child.wait_with_output().ok()?;
-    if let Ok(out_str) = String::from_utf8(output.stdout) {
-        let findings = parse_cargo_audit_findings(&out_str);
-        Some(findings.iter().map(cargo_audit_finding_key).collect())
-    } else {
-        None
-    }
+    let out_str = String::from_utf8(output.stdout).ok()?;
+    cargo_audit_baseline_keys(&out_str)
 }
 
 pub(crate) fn parse_cargo_audit_findings(output: &str) -> Vec<CargoAuditFinding> {
@@ -503,5 +552,32 @@ mod tests {
             base_set.contains(&cargo_audit_finding_key(&unchanged)),
             "an identical (advisory, package, version) stays pre-existing"
         );
+    }
+
+    #[test]
+    fn all_advisory_keys_include_informational_warnings() {
+        let output = r#"{
+          "vulnerabilities":{"list":[]},
+          "warnings":{"unmaintained":[{
+            "advisory":{"id":"RUSTSEC-2024-0001"},
+            "package":{"name":"demo","version":"1.2.3"}
+          }]}
+        }"#;
+        let keys = cargo_audit_all_advisory_keys(output);
+        assert!(keys.contains(&(
+            "RUSTSEC-2024-0001".to_string(),
+            "demo".to_string(),
+            "1.2.3".to_string()
+        )));
+    }
+
+    #[test]
+    fn baseline_keys_reject_failed_or_incomplete_tool_output() {
+        assert!(cargo_audit_baseline_keys("").is_none());
+        assert!(cargo_audit_baseline_keys("cargo audit failed").is_none());
+        assert!(cargo_audit_baseline_keys(r#"{"error":"database unavailable"}"#).is_none());
+
+        let clean = r#"{"vulnerabilities":{"list":[]},"warnings":{}}"#;
+        assert_eq!(cargo_audit_baseline_keys(clean), Some(Default::default()));
     }
 }

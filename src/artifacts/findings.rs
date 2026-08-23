@@ -9,6 +9,30 @@ pub(super) struct InlineFindingsSummary {
     pub(super) dashboard_findings: Vec<DashboardFinding>,
 }
 
+pub(super) fn is_operator_finding(finding: &DashboardFinding) -> bool {
+    matches!(finding.level, "error" | "warning")
+}
+
+fn cargo_audit_baseline_counts(
+    current: &std::collections::HashSet<(String, String, String)>,
+    cargo_lock_changed: bool,
+    base: Option<&std::collections::HashSet<(String, String, String)>>,
+) -> Option<(usize, usize, usize, usize)> {
+    let counts = if !cargo_lock_changed {
+        (0, current.len(), 0, 0)
+    } else if let Some(base) = base {
+        (
+            current.difference(base).count(),
+            current.intersection(base).count(),
+            base.difference(current).count(),
+            0,
+        )
+    } else {
+        (0, 0, 0, current.len())
+    };
+    (counts != (0, 0, 0, 0)).then_some(counts)
+}
+
 /// Effective gate class for the aggregate INLINE_FINDINGS gate.
 ///
 /// The raw `status` field counts *every* SARIF row, so a scan whose findings
@@ -207,41 +231,24 @@ pub(super) fn build_heuristics_gate_check(
     heuristics: Option<&HeuristicsResult>,
 ) -> (serde_json::Value, Option<String>) {
     use serde_json::json;
-
-    let severity = config.policy.severity_for("heuristics_loctree");
-    let (status, class, dead, cycles) = if !config.run_heuristics {
-        ("skipped", GateClass::Skip, 0usize, 0usize)
-    } else if let Some(h) = heuristics {
-        let dead = h.summary.dead_exports;
-        let cycles = h.summary.circular_imports;
-        if h.summary.total_files == 0 {
-            // Loctree ran but scanned no files — treat as SKIP, not PASS
-            ("skipped", GateClass::Skip, dead, cycles)
-        } else if dead > 0 || cycles > 0 {
-            ("warnings", GateClass::Info, dead, cycles)
-        } else {
-            ("passed", GateClass::Pass, dead, cycles)
-        }
-    } else {
-        ("skipped", GateClass::Skip, 0usize, 0usize)
-    };
-
-    let blocking = config.policy.is_blocking(severity, class);
+    let result = super::build_heuristics_check(heuristics, config);
+    let evaluation = crate::policy::engine::PolicyEngine::new(config).evaluate_run(&result);
+    let blocking = matches!(
+        evaluation.merge_impact,
+        crate::policy::engine::MergeRecommendation::Block
+    );
     let blocking_issue = if blocking {
-        Some(format!(
-            "Loctree heuristics (dead_exports={}, cycles={})",
-            dead, cycles
-        ))
+        Some(format!("Loctree heuristics ({})", result.output))
     } else {
         None
     };
 
     let check = json!({
-        "id": "heuristics_loctree",
+        "id": evaluation.check_id,
         "name": "Loctree Heuristics",
-        "status": status,
-        "class": gate_class_to_str(class),
-        "severity": policy_severity_to_str(severity),
+        "status": evaluation.raw_status,
+        "class": gate_class_to_str(evaluation.gate_class),
+        "severity": policy_severity_to_str(evaluation.severity),
         "blocking": blocking,
         "duration_secs": 0.0,
         "cached": false,
@@ -387,10 +394,35 @@ pub(super) fn generate_inline_findings(
         // Cargo audit: keep existing structured parsing in its own run.
         if check.name.eq_ignore_ascii_case("cargo audit") {
             let audit_findings = parse_cargo_audit_findings(&check.output);
+            let current_advisories = cargo_audit_all_advisory_keys(&check.output);
+            let cargo_lock_changed = diffs
+                .iter()
+                .flat_map(|diff| &diff.files)
+                .any(|file| file.path.ends_with("Cargo.lock"));
+            let base_audit_cache = cargo_lock_changed
+                .then(|| get_base_cargo_audit_findings(repo, diffs))
+                .flatten();
+
+            if let Some((new, preexisting, resolved, unknown_baseline)) =
+                cargo_audit_baseline_counts(
+                    &current_advisories,
+                    cargo_lock_changed,
+                    base_audit_cache.as_ref(),
+                )
+            {
+                dashboard_findings.push(DashboardFinding {
+                    level: "note",
+                    check_name: "Cargo audit baseline".to_string(),
+                    check_id: "cargo_audit_baseline".to_string(),
+                    message: format!(
+                        "Cargo audit baseline: new={new}, pre-existing={preexisting}, resolved={resolved}, unknown-baseline={unknown_baseline}"
+                    ),
+                    in_diff: Some(false),
+                });
+            }
             if !audit_findings.is_empty() {
                 let location = cargo_audit_location_for_check(check);
                 let _audit_in_diff_fallback = is_in_diff("Cargo.lock");
-                let base_audit_cache = get_base_cargo_audit_findings(repo, diffs);
 
                 for finding in &audit_findings {
                     match finding.sarif_level {
@@ -849,6 +881,35 @@ mod tests {
             message: "finding".to_string(),
             in_diff,
         }
+    }
+
+    #[test]
+    fn baseline_metadata_is_not_an_operator_finding() {
+        let metadata = DashboardFinding {
+            level: "note",
+            check_name: "Cargo audit baseline".to_string(),
+            check_id: "cargo_audit_baseline".to_string(),
+            message: "Cargo audit baseline: new=0, pre-existing=1".to_string(),
+            in_diff: Some(false),
+        };
+        assert!(!is_operator_finding(&metadata));
+        assert!(is_operator_finding(&err(Some(true))));
+    }
+
+    #[test]
+    fn cargo_audit_baseline_counts_all_resolved_when_head_is_clean() {
+        let current = std::collections::HashSet::new();
+        let base = std::iter::once((
+            "RUSTSEC-2024-0001".to_string(),
+            "demo".to_string(),
+            "1.2.3".to_string(),
+        ))
+        .collect();
+
+        assert_eq!(
+            cargo_audit_baseline_counts(&current, true, Some(&base)),
+            Some((0, 0, 1, 0))
+        );
     }
 
     #[test]

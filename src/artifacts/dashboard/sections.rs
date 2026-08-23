@@ -1407,7 +1407,7 @@ pub(super) fn build_checks_section(checks: &[CheckResult], ctx: &DashboardContex
             let _ = write!(
                 items,
                 "<span style=\"display:inline-flex;align-items:center;gap:4px;padding:2px 8px;background:var(--surface-2);border-radius:var(--radius-sm);font-size:11px;font-family:var(--mono)\">\
-                <span class=\"badge badge-muted\" style=\"font-size:9px\">SKIP</span> {} <span style=\"color:var(--faint)\">— {}</span></span>",
+                <span class=\"badge badge-muted\" style=\"font-size:9px\">SKIP</span> {} <span style=\"color:var(--faint)\">— Not executed by this PrView run. Reason: {}. External CI status not included.</span></span>",
                 escape_html(&sc.name),
                 escape_html(&sc.reason),
             );

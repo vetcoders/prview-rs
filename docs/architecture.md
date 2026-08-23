@@ -213,6 +213,20 @@ Implementations:
 - `MypyCheck` - `mypy`
 - `PytestCheck` - `pytest`
 
+Cargo-audit baseline comparison covers vulnerability findings and the
+informational warning families (`unmaintained`, `unsound`, `notice`, and future
+warning keys). Its identity is `(advisory id, package, locked version)`: an
+unchanged lock makes current advisories pre-existing without another tool run;
+a changed lock is compared against `cargo audit` over the base revision's
+lockfile. The decision caveat always enumerates counts for `new`,
+`pre-existing`, `resolved`, and `unknown-baseline`.
+
+Semgrep's `errors[]` remains a completeness signal independently of findings.
+Path-like `path`, `location.path`, and span `file` fields are collected into a
+stable deduplicated list and emitted in decision caveats. A partial parser run
+therefore cannot look like a complete clean scan merely because `results[]` is
+empty.
+
 In standard execution mode, tests and lint are enabled by default, unless a
 preset (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*` disables them.
 
@@ -631,6 +645,18 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   a tree — the `git archive` extraction of the target commit in snapshot mode,
   or `repo_root` when no snapshot could be made — and a gating signal whose
   substrate is unstated is unauditable.
+
+The three check inventories are projections of the same policy evaluations,
+but intentionally answer different questions. `00_summary/RUN.json.checks[]`
+contains only checks that produced a `CheckResult`, so `outcome.checks_run` is
+the number of executed (including cache-replayed and runtime-skipped) checks,
+not the number configured. `00_summary/MERGE_GATE.json.checks[]` additionally
+contains checks ruled out before execution, with their policy state and reason.
+The legacy root `checks-status.json` is a compact id-to-status projection of
+that same complete evaluation list. It never reruns eligibility while artifacts
+are being written; doing so could report a different reason from the run that
+actually happened. Pre-run skip provenance remains in `PROVENANCE.json` as
+described above.
 
 The worktree state is frozen **per run**, and a `--watch` iteration is a run:
 each iteration re-reads the working tree before its checks, so the pack it emits
@@ -1214,7 +1240,11 @@ Python `from … import`, and generic string literals. Only source files are sca
 - `compute_file_risk_scores(diffs, coverage, breaking)` — computes composite risk
   scores from multiple signals. Scoring factors: deleted (+20), security-path (+15),
   hotspot (+10), breaking (+10), uncovered (+5), has-test (-10).
-  Returns top 10 files sorted by score descending. Test files are excluded.
+  Returns every risky file sorted by score descending; presentation consumers
+  may truncate that list, but `RiskHeatmap.total_risk_score` and the risk level
+  always aggregate the full deduplicated PR surface. The original diff path is
+  retained as the join key even when the displayed path is normalized. Test
+  files are excluded.
 
 #### signal/i18n.rs — locale key parity analysis
 

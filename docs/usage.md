@@ -257,7 +257,20 @@ findings outside the diff do not degrade the merge verdict. If the worktree is
 dirty or the merge-base is unavailable, prview falls back to a full scan and the
 artifact classifier still separates introduced from pre-existing findings.
 Semgrep parse/scan errors remain surfaced even when no rule findings are
-introduced.
+introduced. When Semgrep reports paths in `errors[]`, the merge decision caveats
+name the files that were only partially parsed, so the reviewer does not need to
+open the raw tool log to discover the analysis gap.
+
+Cargo-audit advisories are baseline-classified as `new`, `pre-existing`,
+`resolved`, or `unknown-baseline`. If `Cargo.lock` did not change, every current
+advisory is safely pre-existing. If it changed, prview audits the base lockfile
+and compares advisory, package, and locked version; inability to establish that
+base remains explicit as `unknown-baseline`.
+
+An intentionally omitted check is described as “Not executed by this PrView
+run. External CI status not included.” The reason from this run is retained;
+prview never treats an absent local execution as evidence that an external CI
+job passed or failed.
 
 ### Profiles
 
