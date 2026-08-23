@@ -105,8 +105,10 @@ def check_quality_pass_agrees_with_details(
     """
     quality_pass = decision.get("quality_pass")
     if not isinstance(quality_pass, bool):
-        # Absent is legal on packs written before the field existed, and a
-        # mistyped one is the readers' problem, not a cross-field contradiction.
+        # From 2.2 the caller has already required a boolean, so a non-boolean
+        # is reported once as a type error rather than twice. Below 2.2 this
+        # function is not reached at all: absence there is an old pack, not a
+        # contradiction, and there is no cross-field claim to check.
         return []
     gating = [
         detail.get("name")
@@ -337,6 +339,18 @@ def validate(path: Path) -> list[str]:
         # `{"origin": "failure"}` -- an anonymous, unclassified failure -- pass
         # its own contract gate.
         if schema_at_least(data.get("schema_version"), (2, 2)):
+            # `quality_pass` is a documented decision axis and the 2.2 writer
+            # emits it unconditionally, as a boolean, from a single `json!`
+            # literal -- so a 2.2 pack that omits it or states it as a string is
+            # not an old pack, it is a broken one. Absence stays forgiven BELOW
+            # 2.2, where readers derive the flag from the reconciled verdict; a
+            # 2.2 pack gets no such benefit of the doubt. Type-checking here also
+            # puts the validator back in step with the readers, which normalize a
+            # present-but-unreadable signal to BLOCK: without this the contract
+            # gate certified an artifact the CLI and MCP both refuse to trust.
+            issues.extend(ensure_keys(decision, ["quality_pass"], "decision"))
+            if "quality_pass" in decision:
+                require_boolean(decision.get("quality_pass"), "decision.quality_pass", issues)
             details = decision.get("quality_failure_details")
             if not isinstance(details, list):
                 issues.append("decision.quality_failure_details must be an array")

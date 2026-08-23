@@ -521,7 +521,7 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                 &mut pending_removed,
                 &mut removed_syms,
                 &mut findings,
-                trimmed,
+                content,
                 &DeclSite {
                     file: &current_file,
                     scope: &before_scope,
@@ -555,7 +555,7 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                 &mut pending_added,
                 &mut added_syms,
                 &mut findings,
-                trimmed,
+                content,
                 &DeclSite {
                     file: &current_file,
                     scope: &after_scope,
@@ -616,9 +616,9 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             &mut pending_removed,
             &mut removed_syms,
             &mut findings,
-            trimmed,
+            content,
         );
-        continue_pending_decl(&mut pending_added, &mut added_syms, &mut findings, trimmed);
+        continue_pending_decl(&mut pending_added, &mut added_syms, &mut findings, content);
         before_cfg.feed(trimmed);
         after_cfg.feed(trimmed);
         before_scope.feed(content);
@@ -1034,20 +1034,27 @@ struct PendingDecl {
 /// the after text, so they have to extend whatever each side already has open —
 /// but a `pub` item that first appears on a context line is unchanged by the
 /// patch and must not become a declaration on either side.
+///
+/// Takes the line RAW — with its indentation still on it. Everything but the
+/// identity view wants it normalized, and normalizing is this function's job
+/// rather than the caller's: the identity is the one reader for which a line's
+/// edge whitespace can be value instead of layout, and a caller that has already
+/// trimmed cannot tell the two apart any more.
 fn continue_pending_decl(
     pending: &mut Option<PendingDecl>,
     collected: &mut Vec<SymbolDecl>,
     findings: &mut Vec<BreakingFinding>,
-    trimmed: &str,
+    raw: &str,
 ) -> bool {
     let Some(open) = pending.as_mut() else {
         return false;
     };
+    let trimmed = raw.trim();
     if !open.decl.text.ends_with('(') && !trimmed.is_empty() {
         open.decl.text.push(' ');
     }
     open.decl.text.push_str(trimmed);
-    open.push_code(trimmed);
+    open.push_code(raw);
     open.decl.continuation_lines += 1;
     if declaration_complete(&open.code)
         || open.decl.continuation_lines >= MAX_DECL_CONTINUATION_LINES
@@ -1057,17 +1064,19 @@ fn continue_pending_decl(
     true
 }
 
+/// Takes the line RAW, for the reason given on [`continue_pending_decl`].
 fn accumulate_decl(
     pending: &mut Option<PendingDecl>,
     collected: &mut Vec<SymbolDecl>,
     findings: &mut Vec<BreakingFinding>,
-    trimmed: &str,
+    raw: &str,
     site: &DeclSite<'_>,
 ) {
-    if continue_pending_decl(pending, collected, findings, trimmed) {
+    if continue_pending_decl(pending, collected, findings, raw) {
         return;
     }
 
+    let trimmed = raw.trim();
     let Some((symbol_type, name)) = classify_pub_declaration(trimmed) else {
         return;
     };
@@ -1088,7 +1097,7 @@ fn accumulate_decl(
         completeness: crate::rust_source::SourceScanner::default(),
         identity: crate::rust_source::SourceScanner::default(),
     };
-    open.push_code(trimmed);
+    open.push_code(raw);
     if declaration_complete(&open.code) {
         emit_decl(open.decl, collected, findings);
     } else {
@@ -1097,26 +1106,43 @@ fn accumulate_decl(
 }
 
 impl PendingDecl {
-    /// Read one more physical line into both derived views.
-    fn push_code(&mut self, trimmed: &str) {
+    /// Read one more physical line, RAW, into both derived views.
+    fn push_code(&mut self, raw: &str) {
+        // The completeness view counts delimiters, so indentation is noise: it
+        // gets the normalized line.
+        let trimmed = raw.trim();
         self.code.push_str(&self.completeness.code_only(trimmed));
         // The line ended: whatever the scanner still carries is a literal or a
         // block comment, never a line comment.
         self.code.push(' ');
 
         // Read BEFORE this line is scanned: a literal the PREVIOUS line left
-        // open makes the break between the two part of the value rather than
-        // layout.
+        // open makes the break between the two — and the whitespace at THIS
+        // line's leading edge — part of the value rather than layout.
         let continues_literal = self.identity.carries_literal();
 
+        // The identity is fed the raw line and normalized per edge, because the
+        // two edges are not the same question. Trimming both unconditionally
+        // made re-indenting the inside of a multiline constant a no-op, hiding a
+        // changed public value; keeping both would make every rustfmt pass a
+        // wall of phantom signature changes.
+        let scanned = self.identity.code_with_literals(raw);
+        // Read AFTER: the trailing edge is value only while the literal is still
+        // open at the end of the line.
+        let ends_in_literal = self.identity.carries_literal();
+        let mut line: &str = &scanned;
+        if !continues_literal {
+            line = line.trim_start();
+        }
         // A line that is nothing but a comment contributes nothing to the
         // identity, and a line whose code ends where its comment begins must not
         // contribute the whitespace between them either — otherwise `a: u8, //x`
         // and `a: u8,// y` would read as different declarations. Inside a
         // literal there is no comment to strip and a blank line is a blank line
         // in the value, so it is kept.
-        let line = self.identity.code_with_literals(trimmed);
-        let line = line.trim();
+        if !ends_in_literal {
+            line = line.trim_end();
+        }
         if line.is_empty() && !continues_literal {
             return;
         }
@@ -3537,6 +3563,117 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "an unchanged multiline literal is not breaking, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn re_indenting_a_literal_s_continuation_line_changes_the_value() {
+        // The identity trimmed every continuation line unconditionally, so the
+        // leading whitespace of a line INSIDE a literal — which is value, not
+        // layout — never reached the comparison. Re-indenting the second half of
+        // a public constant produced two identical identities and the exact-match
+        // pass consumed the addition: a changed public value left no finding.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const BANNER: &str = \"a",
+                "- b\";",
+                "+pub const BANNER: &str = \"a",
+                "+   b\";",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "indentation inside a literal is part of the value, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trailing_whitespace_inside_a_literal_changes_the_value_too() {
+        // The other edge of the same line. Whitespace before the break belongs to
+        // the value whenever the literal is still open at the end of the line,
+        // and trimming it collapsed a constant ending in a space onto one that
+        // does not.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const BANNER: &str = \"a ",
+                "-b\";",
+                "+pub const BANNER: &str = \"a",
+                "+b\";",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "trailing whitespace inside a literal is part of the value, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn re_indenting_a_continuation_line_outside_a_literal_is_still_a_no_op() {
+        // The guard on the tolerance the trimming bought: outside a literal the
+        // whitespace at a line edge is layout, and re-indenting a continuation
+        // states the same API. Feeding the raw line everywhere would have turned
+        // every rustfmt pass into a wall of phantom signature changes.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub type Alias =",
+                "-    u32;",
+                "+pub type Alias =",
+                "+        u32;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "indentation outside a literal is layout, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_gap_before_a_trailing_comment_is_still_not_part_of_the_identity() {
+        // The second half of that guard: a line whose code ends where its comment
+        // begins must not contribute the whitespace between them either. The
+        // comment is dropped from the identity, so the line ends outside a
+        // literal and its trailing edge is normalized like any other layout.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn run(",
+                "-    a: u8, // first",
+                "-) {",
+                "+pub fn run(",
+                "+    a: u8,// second",
+                "+) {",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a comment is not the signature, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

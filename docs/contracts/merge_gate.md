@@ -262,6 +262,16 @@ requires every `quality_failure_details` entry to carry an `origin` of exactly
 `failure` or `warning`: consumers are told to filter on it, which they cannot do
 if a pack may omit or mistype it.
 
+From 2.2 it also REQUIRES `quality_pass` and requires it to be a boolean. The
+2.2 writer emits the field unconditionally, from a single object literal, as a
+Rust `bool` — so a pack that claims 2.2 and omits it, or states it as `"false"`,
+is not an old pack but a broken one. Absence stays forgiven below 2.2, where the
+readers derive the flag instead, and that carve-out is deliberate: tightening it
+would reject every pack written before the field existed. Type-checking it here
+is what puts the validator back in step with the readers, which normalize a
+present-but-unreadable signal to BLOCK — without it the contract gate certified
+an artifact the CLI and MCP both refuse to trust.
+
 From the same version it also cross-checks `quality_pass` against those details,
 because the two are one fact written twice: the emitter sets the flag to
 `!QualityFailureSummary::has_new_failures()` and then serializes the very

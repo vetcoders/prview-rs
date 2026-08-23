@@ -800,9 +800,21 @@ different declaration from `pub type Alias = u32;`, so a purely cosmetic reflow
 was reported as a `ChangedSignature` whose "before" and "after" were the same
 string. By the same rule a line contributing no code is dropped from the
 identity — a comment-only line says nothing about the API — unless a literal is
-open, where a blank line is a blank line in the value. (Indentation INSIDE such
-a literal is already gone by then — lines reach the accumulator trimmed — so two
-multi-line literals differing only in leading whitespace still read as one.)
+open, where a blank line is a blank line in the value.
+
+Whitespace at a line's edges follows the same rule, one edge at a time: the
+leading edge is kept when the PREVIOUS line left a literal open, the trailing
+edge when THIS line does. Lines reached the accumulator already trimmed, so
+re-indenting the inside of a multi-line public constant produced two identical
+identities and the changed value paired away as an unchanged re-add. Trimming
+neither edge would be worse in the other direction — every reflow would become a
+phantom `ChangedSignature`, and a trailing comment's leading gap would make `a:
+u8, // x` a different declaration from `a: u8,// y`. The per-edge rule keeps
+whitespace only where a literal is open across it, which is exactly where it is
+part of the value: measured over the local crates.io registry, of 200,553
+multi-line public declarations only 640 continuation lines sit at a literal edge
+at all, and 272 of those carry edge whitespace the old view dropped. No
+formatter re-indents inside a string literal, because that changes the program.
 
 A declaration ends at a `;` or a body `{` outside its brackets. Square brackets
 count for the same reason parentheses do: an array type states its length with a
@@ -1040,6 +1052,24 @@ same registry, of the 618 `fn` signatures whose brackets hold a brace, 6 put a
 comparison. Those 6 reached the right verdict before only through the clamp —
 the path's `>` closed the outer list, and the outer list's own `>` was then
 clamped away — and now reach it by construction.
+
+The item's own top-level `=` is the second such boundary, and by frequency the
+larger one. After it the item states a VALUE, so both angle characters are
+operators, and tracking is frozen for the rest of the item. A body-less item ends
+at its `;` — the close that tests whether the signature's brackets are balanced —
+so a counted comparison there could not be undone by anything: the context stayed
+open and every production hit below the test was recorded as test-only, which
+over-detects test context and HIDES work. `#[cfg(test)] const ENABLED: bool =
+1<2;` is the reported shape, but the corpus idiom is the compact SHIFT, because
+this tracker (unlike the declaration scanner) has no rule consuming `<<` whole.
+Measured over the local registry on the same code-only view the tracker reads,
+excluding lines with lifetimes, which this model cannot lex: of 2,206,540
+single-line `const`/`static`/`type` declarations ending at their own `;`, 1,069
+left the bracket depth stuck open under the old rule — dominated by
+`const Reverse = 1<<8;` as objc2 generates its bitflags — and 64 still do. Those
+64 are not a residual bug but the protection working: an array type wrapping to
+the next line (`pub static X: [[u16; N];`) must hold its depth open so that `;`
+is not mistaken for the end of the item.
 
 #### signal/coverage.rs — coverage delta computation
 

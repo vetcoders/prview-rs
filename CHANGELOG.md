@@ -201,6 +201,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Re-indenting the inside of a multi-line public constant is a value change
+  again.** Continuation lines reached the breaking-change accumulator already
+  trimmed, so whitespace at a line edge INSIDE a string literal — which is value,
+  not layout — never reached the comparison. Two literals differing only in their
+  indentation produced identical identities, and the exact-match pass consumed
+  the addition: a changed public value left no finding at all. The accumulator
+  now takes the raw line and normalizes per edge — the leading edge is kept when
+  the previous line left a literal open, the trailing edge when the line itself
+  does — so a reflow outside a literal stays the no-op it must be, and a trailing
+  comment's leading gap still contributes nothing. Measured over the local
+  crates.io registry, of 200,553 multi-line public declarations 640 continuation
+  lines sit at a literal edge and 272 carry whitespace the old view dropped.
+- **`tools/validate_merge_gate.py` now requires a boolean `quality_pass` from
+  schema 2.2.** The validator checked the field's agreement with the failure
+  details but never its presence or type, so a 2.2 pack stating
+  `quality_pass: "false"` — or omitting it — was certified clean while both
+  decision readers normalize a present-but-unreadable signal to BLOCK. The
+  contract gate was therefore passing artifacts the CLI and MCP refuse to trust.
+  The 2.2 writer emits the field unconditionally as a boolean, so requiring it
+  there is safe; absence stays forgiven below 2.2, where readers derive the flag
+  instead.
+- **A body-less test item can now end its own test context.** After a top-level
+  `=` an item states a value, but the perf tracker kept reading `<` as a generic
+  opener there, so `#[cfg(test)] const ENABLED: bool = 1<2;` left the signature's
+  bracket depth above zero — the very thing the `;` close tests. The item could
+  not end the context it opened, and every loop or query below it was recorded as
+  test-only and dropped from the signal. Angle tracking now stops at the item's
+  top-level `=`, the same rule the declaration scanner already applies. The
+  reported shape is a comparison, but the corpus idiom is the compact shift
+  (`const Reverse = 1<<8;`, as objc2 generates its bitflags): of 2,206,540
+  single-line `const`/`static`/`type` declarations in the local crates.io
+  registry that end at their own `;`, 1,069 left the depth stuck open before this
+  change and 64 still do — and those 64 are an array type wrapping to the next
+  line, where holding the depth open is exactly right.
 - **A turbofish return type no longer hides a changed public signature.**
   `pub fn run() -> Buffer::<{` is a valid return type — rustc accepts
   `Type::<…>` in type position — but its `<` follows a `:`, which the scanner did

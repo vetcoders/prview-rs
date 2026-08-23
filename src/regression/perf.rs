@@ -509,6 +509,9 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
     // expression or pattern text, where `<` and `>` are operators, so signature
     // tracking is frozen while one is open.
     let mut sig_block: i32 = 0;
+    // Has the annotated item passed a top-level `=`? After one it states a
+    // VALUE, so `<` and `>` there are operators too.
+    let mut sig_initializes = false;
     // Unclosed `[` of an attribute being scanned, and whether the previous
     // character was the `#`/`#!` that opens one. Both persist across lines: an
     // attribute may wrap, and its braces are never the item's body.
@@ -562,6 +565,7 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
             seen_open = false;
             sig_depth = 0;
             sig_block = 0;
+            sig_initializes = false;
             attr_depth = 0;
             attr_sigil = false;
         }
@@ -572,7 +576,8 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
 
         if in_test {
             let mut prev = '\0';
-            for ch in code.chars() {
+            let mut chars = code.chars().peekable();
+            while let Some(ch) = chars.next() {
                 // An attribute's brackets are its own: `#[case(Case { id: 1 })]`
                 // stacked under a test marker carries braces that belong to the
                 // attribute, never to the annotated item. Letting them through
@@ -620,8 +625,26 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
                         depth -= 1;
                         sig_block = (sig_block - 1).max(0);
                     }
+                    // A top-level `=` ends the signature and starts a VALUE. The
+                    // `<` after it is a comparison or a shift, never a generic
+                    // opener, and counting one left `sig_depth` above zero — the
+                    // very thing the `;` close tests — so a body-less item like
+                    // `#[cfg(test)] const ENABLED: bool = 1<2;` could not end its
+                    // own context and muted every production hit below it. Only a
+                    // TOP-LEVEL `=` counts: inside brackets it states a default
+                    // (`fn f<const N: usize = 4>`) or an associated type
+                    // (`Iterator<Item = u8>`), and `==`, `=>` and the compound
+                    // assignments are not initializers at all.
+                    '=' if !seen_open
+                        && sig_depth == 0
+                        && sig_block == 0
+                        && !matches!(chars.peek(), Some(&('=' | '>')))
+                        && !"=!<>+-*/%&|^".contains(prev) =>
+                    {
+                        sig_initializes = true;
+                    }
                     _ if !seen_open && sig_block == 0 => {
-                        track_signature_brackets(ch, prev, &mut sig_depth);
+                        track_signature_brackets(ch, prev, sig_initializes, &mut sig_depth);
                     }
                     _ => {}
                 }
@@ -633,6 +656,7 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
                 seen_open = false;
                 sig_depth = 0;
                 sig_block = 0;
+                sig_initializes = false;
             } else if !seen_open && sig_depth == 0 && ends_the_annotated_item(trimmed) {
                 // Not every test item has a body. `#[cfg(test)] mod tests;` and
                 // `#[cfg(test)] use crate::helper;` never open a brace, so the
@@ -646,6 +670,7 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
                 depth = 0;
                 sig_depth = 0;
                 sig_block = 0;
+                sig_initializes = false;
             }
         }
     }
@@ -671,7 +696,7 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
 /// The dominant idiom is not the const generic `Buffer<{ LIMIT }>` but the
 /// destructured extractor parameter, `fn handler(Parameters(Req { field }):
 /// Parameters<Req>)`, as written by `rmcp`, `leptos` and `sqlx`.
-fn track_signature_brackets(ch: char, prev: char, sig_depth: &mut i32) {
+fn track_signature_brackets(ch: char, prev: char, initializes: bool, sig_depth: &mut i32) {
     match ch {
         '(' | '[' => *sig_depth += 1,
         // A generic opener FOLLOWS the thing it parameterises — `Buffer<`,
@@ -685,10 +710,19 @@ fn track_signature_brackets(ch: char, prev: char, sig_depth: &mut i32) {
         // unconditional (minus the `->` arrow) and the depth is clamped, so a
         // `<` this rule still misjudges can only end the context early, never
         // hold it open.
-        '<' if prev.is_alphanumeric() || prev == '_' || prev == '>' || prev == ':' => {
+        //
+        // The second boundary is the item's top-level `=`. After one the item
+        // states a VALUE, so both angle characters are operators there — and a
+        // counted comparison in a body-less initializer
+        // (`#[cfg(test)] const ENABLED: bool = 1<2;`) left the depth above zero,
+        // which is precisely what the `;` close tests, so the item could not end
+        // its own context and muted every production hit below it.
+        '<' if !initializes
+            && (prev.is_alphanumeric() || prev == '_' || prev == '>' || prev == ':') =>
+        {
             *sig_depth += 1;
         }
-        '>' if prev == '-' => {}
+        '>' if prev == '-' || initializes => {}
         ')' | ']' | '>' => *sig_depth = (*sig_depth - 1).max(0),
         _ => {}
     }
@@ -1987,6 +2021,96 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         );
         assert_eq!(result.query_in_loop_count, 1);
         assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_comparison_in_a_bodyless_initializer_closes_its_test_context() {
+        // A body-less item may state a VALUE, and after its top-level `=` the
+        // `<` is a comparison, not a generic opener. Counting it left the
+        // signature's bracket depth above zero, which is exactly what the `;`
+        // close checks, so the item's own semicolon could not end the context —
+        // and every production hit below the test was recorded as test-only.
+        // Over-detection of test context is the direction that HIDES work.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ const ENABLED: bool = 1<2;
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a body-less initializer must not mute the production code below it"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_generic_bodyless_initializer_still_closes_its_test_context() {
+        // The same item whose initializer genuinely names generics. A turbofish
+        // closes what it opens, so freezing the angle tracking after the `=`
+        // cannot leave this one stuck either.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ static NAMES: Vec<String> = Vec::<String>::new();
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a generic initializer must not mute the production code below it"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_generic_signature_is_still_tracked_before_any_equals() {
+        // The guard on the new rule: `=` only stops angle tracking AFTER it is
+        // seen at top level. A generic in an ordinary signature is untouched, so
+        // a const argument's brace still does not read as the body opener and
+        // the context still spans the whole test function.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{ LIMIT }>
+ {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a const-generic signature must still hold its test context open"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
     }
 
     #[test]
