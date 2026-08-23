@@ -529,7 +529,7 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                     side: DiffSide::Removed,
                 },
             );
-            before_cfg.feed(trimmed);
+            before_cfg.feed(content);
 
             // JS/TS exports
             if trimmed.starts_with("export ") || trimmed.starts_with("export default") {
@@ -563,7 +563,7 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
                     side: DiffSide::Added,
                 },
             );
-            after_cfg.feed(trimmed);
+            after_cfg.feed(content);
 
             after_scope.feed(content);
 
@@ -610,8 +610,11 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
         // `-old: u16,` / `+new: u32,` / shared `) {` is one signature change on
         // each side; truncating at the first shared line paired the identical
         // openers and swallowed the break entirely.
+        // Every reader on this branch now takes the line raw and normalizes what
+        // it alone is entitled to: the accumulator keeps a literal's edges, the
+        // guard tracker keeps a literal's bytes, and the scope tracker counts
+        // braces. A shared pre-trim would decide that for all three.
         let content = line.strip_prefix(' ').unwrap_or(line);
-        let trimmed = content.trim();
         continue_pending_decl(
             &mut pending_removed,
             &mut removed_syms,
@@ -619,8 +622,8 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             content,
         );
         continue_pending_decl(&mut pending_added, &mut added_syms, &mut findings, content);
-        before_cfg.feed(trimmed);
-        after_cfg.feed(trimmed);
+        before_cfg.feed(content);
+        after_cfg.feed(content);
         before_scope.feed(content);
         after_scope.feed(content);
     }
@@ -872,26 +875,40 @@ impl CfgGuard {
         self.open = None;
     }
 
-    /// Advance this side past `trimmed`.
+    /// Advance this side past `raw`.
     ///
     /// Call it AFTER the line has been offered to the declaration accumulator: a
     /// declaration is guarded by the attribute above it, not by one on its own
     /// line.
-    fn feed(&mut self, trimmed: &str) {
+    ///
+    /// Takes the line RAW, with its indentation still on it. Trimming at the
+    /// caller ate a continuation line's leading whitespace before this tracker
+    /// could ask whether that whitespace was inside a value.
+    fn feed(&mut self, raw: &str) {
         // Both scanners read every line, in step: they carry the same open
         // constructs and differ only in what they emit.
-        let counted = self.depth_scanner.code_only(trimmed);
+        let counted = self.depth_scanner.code_only(raw);
         let counted = counted.trim().to_string();
-        // Already whitespace-free outside its literals, which is why nothing
-        // here filters the text a second time: a blanket filter reached INSIDE
-        // the literals too, and `#[cfg(api = "a b")]` normalized to the same
-        // guard as `#[cfg(api = "ab")]`. The space is part of the value the
-        // compiler matches on, so a struct that really left builds configured
-        // with `--cfg 'api="a b"'` paired with its re-add under another value.
-        let resolved = self.text_scanner.code_with_literals_dense(trimmed);
-        let trimmed = resolved.trim();
+
+        // Read BEFORE this line is scanned: a literal the PREVIOUS line left
+        // open makes the break between the two — and this line's leading
+        // whitespace — part of the value rather than layout.
+        let continues_literal = self.text_scanner.carries_literal();
+        // The dense view has ALREADY removed every byte of whitespace outside
+        // the literals, so what is left at this line's edges can only be inside
+        // one. That is why nothing here trims: a `.trim()` at this point cannot
+        // reach layout any more, only value.
+        let resolved = self.text_scanner.code_with_literals_dense(raw);
+        let line: &str = &resolved;
         if let Some(open) = self.open.as_mut() {
-            open.text.push_str(trimmed);
+            // The physical break is layout everywhere but inside a literal,
+            // where it is a byte of the value: gluing the lines unconditionally
+            // made `#[cfg(api = "a\nb")]` the same guard as `#[cfg(api = "ab")]`
+            // and paired a configuration-specific removal away.
+            if continues_literal {
+                open.text.push('\n');
+            }
+            open.text.push_str(line);
             open.depth = delimiter_depth(&counted, open.depth);
             open.lines += 1;
             if open.depth == 0 {
@@ -906,8 +923,8 @@ impl CfgGuard {
             return;
         }
 
-        if trimmed.starts_with("#[") {
-            let text = trimmed.to_string();
+        if line.starts_with("#[") {
+            let text = line.to_string();
             let depth = delimiter_depth(&counted, 0);
             if depth == 0 {
                 self.record(text);
@@ -921,7 +938,7 @@ impl CfgGuard {
             return;
         }
 
-        if breaks_attribute_run(trimmed) {
+        if breaks_attribute_run(line) {
             self.guards = None;
         }
     }
@@ -3017,6 +3034,143 @@ mod tests {
         assert!(
             removed_symbol_types(&findings).contains(&"struct".to_string()),
             "two cfg values are two gates, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_line_break_inside_a_cfg_value_is_part_of_the_gate() {
+        // The accumulator glued an attribute's physical lines together with
+        // nothing between them, so a value written across two lines collapsed
+        // onto the same guard as the same value written with the break removed.
+        // `--cfg 'api="a\nb"'` and `--cfg 'api="ab"'` are different
+        // configurations, so the struct that really left the first one paired
+        // with its re-add under the second and produced no finding.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(api = \"a",
+                "-b\")]",
+                "-pub struct Config;",
+                "+#[cfg(api = \"ab\")]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a break inside a value is value, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_line_break_inside_a_raw_cfg_value_is_part_of_the_gate_too() {
+        // The same through the raw-string form, which reaches the accumulator by
+        // a different branch of the scanner. A rule that held for one spelling of
+        // a literal and not the other would be a coincidence, not an invariant.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(api = r#\"a",
+                "-b\"#)]",
+                "-pub struct Config;",
+                "+#[cfg(api = r#\"ab\"#)]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a break inside a raw value is value too, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn indentation_inside_a_cfg_value_is_part_of_the_gate() {
+        // The third byte the pipeline used to eat: the caller trimmed every line
+        // before the tracker saw it, so a continuation line's leading whitespace
+        // never reached the guard even though it sits inside the value.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(api = \"a",
+                "-  b\")]",
+                "-pub struct Config;",
+                "+#[cfg(api = \"a",
+                "+b\")]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "indentation inside a value is value, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_multiline_cfg_value_reemitted_unchanged_is_still_a_no_op() {
+        // The tolerant direction of the same rule: keeping those bytes must not
+        // start inventing gates. The identical attribute re-emitted across the
+        // identical lines is one guard on both sides.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(api = \"a",
+                "-b\")]",
+                "-pub struct Config;",
+                "+#[cfg(api = \"a",
+                "+b\")]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "an unchanged re-emission is not breaking, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn re_indenting_a_wrapped_predicate_is_still_only_layout() {
+        // The guard on the widening: OUTSIDE a literal the indentation of a
+        // continuation line is formatting. Feeding raw lines without that split
+        // would make every rustfmt pass over a wrapped `cfg` a different gate,
+        // and split ordinary re-adds into phantom removals.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(any(",
+                "-    feature = \"a\",",
+                "-    feature = \"b\"",
+                "-))]",
+                "-pub struct Config;",
+                "+#[cfg(any(",
+                "+        feature = \"a\",",
+                "+        feature = \"b\"",
+                "+))]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "re-indenting a wrapped predicate is not a different gate, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

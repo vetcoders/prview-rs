@@ -201,6 +201,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bytes inside a literal now traverse the whole `cfg`-attribute pipeline
+  verbatim.** The accumulator glued an attribute's physical lines together with
+  nothing between them, and the caller trimmed each line before the tracker saw
+  it, so both the line break and a continuation's indentation vanished from
+  inside the value: `#[cfg(api = "a\nb")]` produced the same guard as
+  `#[cfg(api = "ab")]`, and a declaration that really left one configuration
+  paired with its re-add under another. This is the third finding of one shape,
+  after the delimiter count and the whitespace strip, so it is closed as an
+  invariant rather than patched again. The tracker now takes the raw line, joins
+  a physical break with `\n` exactly when a literal is open across it, and trims
+  nowhere — after the dense view there is no whitespace left outside a literal,
+  so a trim could only eat value. Layout outside a literal is still normalized:
+  re-indenting or re-wrapping a predicate is the same gate. Of 568,128 `cfg`
+  attributes in the local crates.io registry, 4 carry a literal spanning a line
+  break, 2 of them gate an item, and none collide.
 - **An unreadable `checks` list is not an empty one.** `checks` present but not
   an array left the warning tally at zero and fell back to the checks the run
   itself executed — which on an unchanged `--update` run is none — so
