@@ -316,6 +316,43 @@ forces `quality_pass: false`" would reject a legitimate pack, and a validator
 that cries wolf on genuine output gates nothing. A pack that omits
 `quality_pass` entirely is left alone, per the absence rule below.
 
+### The reconciliation is certified, not only read
+
+From 2.2 the validator requires the remaining decision axes on the same
+argument, and with the same vocabularies: `analysis_status` (`complete` /
+`degraded` / `incomplete`), `merge_recommendation` (`approve` /
+`review_required` / `block`) and a boolean `policy_allow_merge`. All three come
+out of the same object literal as `quality_pass`, from the typed enums in
+`src/policy/engine.rs`, so a 2.2 pack missing one is broken rather than old. The
+two enum vocabularies are case-sensitive and canonical-only — like
+`checks[].status`, and unlike the READERS, which fold case and still accept the
+retired `hold` spelling when reading an artifact off disk. That tolerance exists
+for packs already written; the validator certifies freshly emitted ones. A test
+in `src/policy/engine.rs` pins each variant's wire spelling to the word the
+validator lists, so a rename cannot silently drift the two apart.
+
+Requiring them is what makes the last certification rule possible: **the
+validator rejects a `verdict` milder than the axes stated beside it.** The rank
+table above is the readers' rule, and the emitter's `legacy_verdict` produces
+exactly the same number from the other direction, so a healthy `verdict` IS the
+maximum rank of its own axes. Until this was ported, the contract gate certified
+packs no reader would honour — `verdict: "PASS"` beside
+`analysis_status: "incomplete"`, `merge_recommendation: "block"` and
+`policy_allow_merge: false` validated OK, while every reader normalized the same
+artifact to `BLOCK`. Readers were already protected; the hole was in
+CERTIFICATION, which is a different claim: that the artifact is what it says it
+is.
+
+The rule is deliberately ONE-DIRECTIONAL. A verdict HARSHER than its other axes
+is legal and must stay so: a semgrep scan that passes with parse errors writes
+`merge_recommendation: "approve"` beside `analysis_status: "degraded"`, which the
+contract turns into `CONDITIONAL`, so "the verdict equals the maximum of the
+OTHER axes" would reject a pack the emitter really produces. A harsher verdict
+also misleads no one — every reader publishes it as stated. It is the permissive
+direction that certifies a permission the artifact never earned. (The readers
+still NAME the harsher case with a `core_inconsistency:` caveat; that is a report
+about a pack, not a rejection of it.)
+
 A decision signal present with the wrong JSON type (`merge_recommendation: 7`,
 `allow_merge: "false"`) is not the same as an absent one. Absence is the state a
 reader forgives, because it is the shape of an older pack; a field that is there

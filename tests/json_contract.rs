@@ -759,6 +759,344 @@ fn validator_rejects_a_checks_list_that_is_not_an_array() {
         .success();
 }
 
+/// The decision axes the 2.2 writer emits unconditionally, from the typed enums
+/// in `src/policy/engine.rs`. A 2.2 pack missing one is broken rather than old —
+/// and the reconciliation the next test pins can only compare axes that are
+/// there and readable in the first place.
+#[test]
+fn validator_requires_the_decision_axes_schema_two_two_emits() {
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+
+    let payload = run_json_quiet(repo, &["feature/json-contract", "main"]);
+    let output_dir = Path::new(
+        payload["output_dir"]
+            .as_str()
+            .expect("output_dir should be a string"),
+    );
+    let merge_gate = output_dir.join("00_summary/MERGE_GATE.json");
+    let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
+
+    let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
+    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    assert_eq!(
+        original["schema_version"].as_str(),
+        Some("2.2"),
+        "these requirements are scoped to 2.2"
+    );
+    for axis in [
+        "analysis_status",
+        "merge_recommendation",
+        "policy_allow_merge",
+    ] {
+        assert!(
+            original["decision"].get(axis).is_some(),
+            "the emitter writes {axis}: {:?}",
+            original["decision"]
+        );
+    }
+
+    // (axis, value, must_validate) — `None` removes the key entirely.
+    let cases: [(&str, Option<serde_json::Value>, bool); 20] = [
+        ("analysis_status", None, false),
+        ("merge_recommendation", None, false),
+        ("policy_allow_merge", None, false),
+        // Case is not a spelling the emitter has ever written, and neither is a
+        // word outside the enum. Same rule as `checks[].status`.
+        (
+            "analysis_status",
+            Some(serde_json::json!("COMPLETE")),
+            false,
+        ),
+        (
+            "analysis_status",
+            Some(serde_json::json!("Degraded")),
+            false,
+        ),
+        ("analysis_status", Some(serde_json::json!("partial")), false),
+        ("analysis_status", Some(serde_json::json!(7)), false),
+        ("analysis_status", Some(serde_json::json!(null)), false),
+        (
+            "merge_recommendation",
+            Some(serde_json::json!("APPROVE")),
+            false,
+        ),
+        (
+            "merge_recommendation",
+            Some(serde_json::json!("Review_Required")),
+            false,
+        ),
+        // The retired pre-2.1 synonym. Readers still fold it when reading a pack
+        // off disk; a freshly emitted one may not spell it that way.
+        (
+            "merge_recommendation",
+            Some(serde_json::json!("hold")),
+            false,
+        ),
+        ("merge_recommendation", Some(serde_json::json!(true)), false),
+        ("policy_allow_merge", Some(serde_json::json!("true")), false),
+        ("policy_allow_merge", Some(serde_json::json!(1)), false),
+        ("policy_allow_merge", Some(serde_json::json!(null)), false),
+        // Every canonical spelling stays accepted, so this is a vocabulary and
+        // not a single-value pin. All three confidence values sit at or below
+        // the CONDITIONAL this pack states, so none of them trips the
+        // reconciliation rule the next test covers.
+        ("analysis_status", Some(serde_json::json!("complete")), true),
+        ("analysis_status", Some(serde_json::json!("degraded")), true),
+        (
+            "analysis_status",
+            Some(serde_json::json!("incomplete")),
+            true,
+        ),
+        (
+            "merge_recommendation",
+            Some(serde_json::json!("approve")),
+            true,
+        ),
+        // `block` is canonical too, but only beside a BLOCK verdict — the next
+        // test states it there.
+        ("policy_allow_merge", Some(serde_json::json!(true)), true),
+    ];
+
+    for (axis, value, must_validate) in cases {
+        let mut gate = original.clone();
+        match value {
+            Some(value) => gate["decision"][axis] = value,
+            None => {
+                gate["decision"]
+                    .as_object_mut()
+                    .expect("decision object")
+                    .remove(axis);
+            }
+        }
+        std::fs::write(
+            &merge_gate,
+            serde_json::to_string_pretty(&gate).expect("serialize gate"),
+        )
+        .expect("write gate");
+
+        let assertion = Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert();
+        if must_validate {
+            assertion.success();
+        } else {
+            assertion.failure();
+        }
+    }
+
+    // The shape the emitter actually writes still validates.
+    std::fs::write(&merge_gate, &raw).expect("restore gate");
+    Command::new("python3")
+        .arg(&validator)
+        .arg(&merge_gate)
+        .assert()
+        .success();
+}
+
+/// The reconciliation contract itself, ported from the readers into the
+/// certification gate.
+///
+/// Both readers derive a decision by taking the most conservative axis the pack
+/// states, so a `verdict` milder than that maximum is one no consumer will
+/// honour: the artifact certifies one outcome and everything downstream computes
+/// another. The reported payload — `PASS` beside an `incomplete` analysis, a
+/// `block` recommendation and `policy_allow_merge: false` — validated OK before
+/// this rule existed.
+///
+/// The opposite direction is deliberately still legal, and asserted below: a
+/// semgrep scan that passes with parse errors writes `approve` beside `degraded`
+/// and the contract turns that into `CONDITIONAL`, so a verdict harsher than its
+/// neighbours is a pack the emitter really produces.
+#[test]
+fn validator_rejects_a_verdict_its_own_axes_contradict() {
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+
+    let payload = run_json_quiet(repo, &["feature/json-contract", "main"]);
+    let output_dir = Path::new(
+        payload["output_dir"]
+            .as_str()
+            .expect("output_dir should be a string"),
+    );
+    let merge_gate = output_dir.join("00_summary/MERGE_GATE.json");
+    let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
+
+    let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
+    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+
+    let gating_detail = serde_json::json!([
+        { "name": "Clippy", "classification": "introduced", "origin": "failure" }
+    ]);
+
+    let with = |base: &serde_json::Value, patch: serde_json::Value| {
+        let mut decision = base.clone();
+        for (key, value) in patch.as_object().expect("patch object") {
+            decision[key] = value.clone();
+        }
+        decision
+    };
+    // A clean pass, the shape every conflicting axis below is measured against.
+    // Built by patching the emitted decision so the fields this rule says
+    // nothing about — `decision_reason`, the legacy mirrors, the caveats — stay
+    // exactly as the writer left them.
+    let clean = with(
+        &original["decision"],
+        serde_json::json!({
+            "verdict": "PASS",
+            "allow_merge": true,
+            "merge_recommendation": "approve",
+            "analysis_status": "complete",
+            "quality_pass": true,
+            "policy_allow_merge": true,
+            "blocking_issues": [],
+            "quality_failure_details": [],
+        }),
+    );
+
+    // (decision patch over `clean`, must_validate)
+    let cases: [(serde_json::Value, bool); 15] = [
+        // The reported payload, verbatim.
+        (
+            serde_json::json!({
+                "analysis_status": "incomplete",
+                "merge_recommendation": "block",
+                "policy_allow_merge": false,
+            }),
+            false,
+        ),
+        // One axis at a time, so the rule is not passing on the strength of the
+        // others. Each of these rules `PASS` out by itself.
+        (
+            serde_json::json!({ "merge_recommendation": "review_required" }),
+            false,
+        ),
+        (
+            serde_json::json!({ "merge_recommendation": "block" }),
+            false,
+        ),
+        (serde_json::json!({ "analysis_status": "degraded" }), false),
+        (
+            serde_json::json!({ "analysis_status": "incomplete" }),
+            false,
+        ),
+        (
+            serde_json::json!({
+                "quality_pass": false,
+                "quality_failure_details": gating_detail,
+            }),
+            false,
+        ),
+        (serde_json::json!({ "policy_allow_merge": false }), false),
+        // The blocker axis stated by its other half. `allow_merge` is already
+        // false here, so the pre-existing "no merge beside a blocking issue"
+        // rule is satisfied and only the reconciliation can reject this.
+        (
+            serde_json::json!({
+                "verdict": "CONDITIONAL",
+                "allow_merge": false,
+                "merge_recommendation": "review_required",
+                "blocking_issues": ["Semgrep (failed)"],
+            }),
+            false,
+        ),
+        // A CONDITIONAL that is still milder than a stated block.
+        (
+            serde_json::json!({
+                "verdict": "CONDITIONAL",
+                "allow_merge": false,
+                "merge_recommendation": "block",
+                "policy_allow_merge": false,
+                "blocking_issues": ["Semgrep (failed)"],
+            }),
+            false,
+        ),
+        // Legal shapes. The clean pass itself, untouched.
+        (serde_json::json!({}), true),
+        // CONDITIONAL because the recommendation says so.
+        (
+            serde_json::json!({
+                "verdict": "CONDITIONAL",
+                "allow_merge": false,
+                "merge_recommendation": "review_required",
+            }),
+            true,
+        ),
+        // CONDITIONAL because the analysis was degraded, while the recommendation
+        // still approves — the harsher-verdict shape a passing semgrep scan with
+        // parse errors writes.
+        (
+            serde_json::json!({
+                "verdict": "CONDITIONAL",
+                "allow_merge": false,
+                "analysis_status": "degraded",
+            }),
+            true,
+        ),
+        // CONDITIONAL because quality failed, recommendation still approving.
+        (
+            serde_json::json!({
+                "verdict": "CONDITIONAL",
+                "allow_merge": false,
+                "quality_pass": false,
+                "quality_failure_details": gating_detail,
+            }),
+            true,
+        ),
+        // A healthy BLOCK: every axis at the same rank.
+        (
+            serde_json::json!({
+                "verdict": "BLOCK",
+                "allow_merge": false,
+                "merge_recommendation": "block",
+                "analysis_status": "incomplete",
+                "policy_allow_merge": false,
+                "blocking_issues": ["Semgrep (failed)"],
+            }),
+            true,
+        ),
+        // A BLOCK whose blocker is stated only as a policy flag.
+        (
+            serde_json::json!({
+                "verdict": "BLOCK",
+                "allow_merge": false,
+                "merge_recommendation": "block",
+                "policy_allow_merge": false,
+            }),
+            true,
+        ),
+    ];
+
+    for (patch, must_validate) in cases {
+        let mut gate = original.clone();
+        gate["decision"] = with(&clean, patch.clone());
+        std::fs::write(
+            &merge_gate,
+            serde_json::to_string_pretty(&gate).expect("serialize gate"),
+        )
+        .expect("write gate");
+
+        let assertion = Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert();
+        if must_validate {
+            assertion.success();
+        } else {
+            assertion.failure();
+        }
+    }
+
+    // The shape the emitter actually writes still validates.
+    std::fs::write(&merge_gate, &raw).expect("restore gate");
+    Command::new("python3")
+        .arg(&validator)
+        .arg(&merge_gate)
+        .assert()
+        .success();
+}
+
 /// Resolve an executable by scanning `PATH` (test helper; no external crate).
 #[cfg(unix)]
 fn resolve_in_path(bin: &str) -> Option<std::path::PathBuf> {

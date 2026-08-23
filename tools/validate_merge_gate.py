@@ -45,6 +45,33 @@ VALID_QUALITY_FAILURE_CLASSES = {
 # field folds case because its writer has shipped legacy spellings; this one has
 # only ever emitted lowercase.
 VALID_CHECK_STATUSES = {"passed", "failed", "warnings", "skipped", "error"}
+# The two enum axes of `decision`, spelled exactly as serde writes them. Mirror
+# `AnalysisStatus` and `MergeRecommendation` in src/policy/engine.rs -- both
+# `#[serde(rename_all = "snake_case")]`, and a test there pins every variant to
+# the spelling below.
+#
+# Case-SENSITIVE and canonical-only, like VALID_CHECK_STATUSES and unlike the
+# READERS, which fold case and still accept the retired `hold` spelling when
+# reading a pack off disk. That tolerance exists for artifacts already written;
+# this file certifies freshly emitted ones, and the 2.2 emitter has only ever
+# written these.
+VALID_ANALYSIS_STATUSES = {"complete", "degraded", "incomplete"}
+VALID_MERGE_RECOMMENDATIONS = {"approve", "review_required", "block"}
+# Conservativeness rank of one decision axis: 1 = clean pass, 2 = held below a
+# pass, 3 = blocked. Mirrors `rank_from_verdict`, `rank_from_merge_rec` and
+# `rank_from_analysis_status` in src/gate.rs, which both readers reconcile
+# through.
+#
+# MEMBERSHIP RULE: an axis ranks only when its value RULES OUT a milder outcome.
+# `complete` and `quality_pass: true` are preconditions of PASS, not grants of
+# it -- a complete, quality-clean run is still held at CONDITIONAL by a
+# review-required recommendation -- so neither states a rank, and neither
+# appears in these tables.
+VERDICT_RANK = {"PASS": 1, "CONDITIONAL": 2, "BLOCK": 3}
+MERGE_RECOMMENDATION_RANK = {"approve": 1, "review_required": 2, "block": 3}
+ANALYSIS_STATUS_RANK = {"degraded": 2, "incomplete": 2}
+# Mirrors `verdict_from_rank`: the word the readers publish for a rank.
+VERDICT_FROM_RANK = {rank: verdict for verdict, rank in VERDICT_RANK.items()}
 
 
 def schema_at_least(raw: Any, minimum: tuple[int, int]) -> bool:
@@ -141,6 +168,104 @@ def check_quality_pass_agrees_with_details(
             "'pre-existing': got quality_pass=false with no such entry"
         ]
     return []
+
+
+def check_decision_axes_agree_on_the_verdict(decision: dict[str, Any]) -> list[str]:
+    """Reject a `verdict` milder than the axes stated beside it.
+
+    Both readers reconcile a decision the same way: take the MAX rank across the
+    axes the pack states, then publish every axis from that one number. So a
+    verdict below that maximum is not a verdict any reader will honour -- the
+    pack certifies one outcome and every consumer of it computes another. The
+    reported hole was exactly that: `verdict: "PASS"` beside
+    `analysis_status: "incomplete"`, `merge_recommendation: "block"` and
+    `policy_allow_merge: false` validated OK, so an artifact both readers
+    normalize to BLOCK carried a green certification.
+
+    The emitter cannot produce such a pack. It derives `verdict` through
+    `MergeRecommendation::legacy_verdict`, whose result is the same maximum:
+
+      * `block` -> `BLOCK`                : rank 3
+      * `review_required` -> `CONDITIONAL`: rank 2
+      * `approve` + complete + quality    : rank 1 (`PASS`)
+      * `approve` + degraded/quality fail : rank 2 (`CONDITIONAL`)
+
+    `allow_merge` is `verdict == "PASS"`, so it never exceeds the verdict it
+    sits beside; and `blocking_issues`/`policy_allow_merge` rank 3 because a
+    blocking issue is pushed only for a check whose `PolicyConclusion` is
+    `Blocked`, whose `merge_impact` is `Block` -- a stated blocker IS a stated
+    `block` recommendation.
+
+    DELIBERATE LIMIT: only the permissive direction is rejected. A verdict
+    HARSHER than its other axes is legal -- a semgrep scan that passes with
+    parse errors leaves `merge_recommendation: "approve"` beside
+    `analysis_status: "degraded"`, which the contract turns into `CONDITIONAL`
+    -- so "verdict equals the max of the OTHER axes" would reject a pack the
+    emitter really writes. A harsher verdict also fools nobody: every reader
+    publishes it as stated. It is the milder direction that certifies a
+    permission the artifact never earned.
+
+    Only axes whose own type and vocabulary already validated are ranked, so a
+    malformed axis is reported once as a shape error rather than twice. An axis
+    the pack does not state is not ranked either -- absence states nothing, and
+    from 2.2 the caller has already required every axis this reads.
+    """
+    verdict = decision.get("verdict")
+    verdict_rank = VERDICT_RANK.get(verdict) if isinstance(verdict, str) else None
+    if verdict_rank is None:
+        return []
+
+    stated: list[tuple[str, int]] = [(f"verdict={verdict!r}", verdict_rank)]
+
+    recommendation = decision.get("merge_recommendation")
+    if isinstance(recommendation, str) and recommendation in MERGE_RECOMMENDATION_RANK:
+        stated.append(
+            (
+                f"merge_recommendation={recommendation!r}",
+                MERGE_RECOMMENDATION_RANK[recommendation],
+            )
+        )
+
+    allow_merge = decision.get("allow_merge")
+    if isinstance(allow_merge, bool):
+        stated.append((f"allow_merge={allow_merge}", 1 if allow_merge else 2))
+
+    # Only the FALSE of these two states a rank -- see the membership rule above.
+    if decision.get("quality_pass") is False:
+        stated.append(("quality_pass=False", 2))
+
+    analysis_status = decision.get("analysis_status")
+    if isinstance(analysis_status, str) and analysis_status in ANALYSIS_STATUS_RANK:
+        stated.append(
+            (
+                f"analysis_status={analysis_status!r}",
+                ANALYSIS_STATUS_RANK[analysis_status],
+            )
+        )
+
+    # The blocker axis, stated twice by the emitter
+    # (`policy_allow_merge = blocking_issues.is_empty()`). It is ONE axis: a pack
+    # carrying both must not count it twice, and one carrying either is covered.
+    blocking_issues = decision.get("blocking_issues")
+    if decision.get("policy_allow_merge") is False:
+        stated.append(("policy_allow_merge=False", 3))
+    elif isinstance(blocking_issues, list) and blocking_issues:
+        stated.append((f"{len(blocking_issues)} blocking_issues", 3))
+
+    # `stated` includes the verdict's own rank, so this is the milder-direction
+    # test and nothing else: the maximum can only exceed the verdict when some
+    # OTHER axis rules the verdict out.
+    final_rank = max(rank for _, rank in stated)
+    if verdict_rank >= final_rank:
+        return []
+
+    axes = ", ".join(name for name, _ in stated)
+    return [
+        f"decision.verdict is milder than the axes beside it: {axes}. The most "
+        "conservative axis a pack states is the verdict it may publish (rank "
+        f"{final_rank}), and every reader reconciles this decision to "
+        f"{VERDICT_FROM_RANK[final_rank]!r}"
+    ]
 
 
 def require_iso_datetime(value: Any, ctx: str, issues: list[str]) -> None:
@@ -364,6 +489,36 @@ def validate(path: Path) -> list[str]:
             issues.extend(ensure_keys(decision, ["quality_pass"], "decision"))
             if "quality_pass" in decision:
                 require_boolean(decision.get("quality_pass"), "decision.quality_pass", issues)
+            # The remaining decision axes, on the same argument. All three come
+            # out of the same 2.2 `json!` literal, unconditionally and from the
+            # typed enums, so a 2.2 pack missing one is broken rather than old --
+            # and the reconciliation below can only reject a verdict its axes
+            # contradict if the axes are actually there to read. Absence stays
+            # forgiven BELOW 2.2, where a reader derives what the pack omits.
+            issues.extend(
+                ensure_keys(
+                    decision,
+                    ["analysis_status", "merge_recommendation", "policy_allow_merge"],
+                    "decision",
+                )
+            )
+            if "analysis_status" in decision:
+                if decision.get("analysis_status") not in VALID_ANALYSIS_STATUSES:
+                    issues.append(
+                        "decision.analysis_status must be one of "
+                        f"{sorted(VALID_ANALYSIS_STATUSES)} (schema 2.2)"
+                    )
+            if "merge_recommendation" in decision:
+                if decision.get("merge_recommendation") not in VALID_MERGE_RECOMMENDATIONS:
+                    issues.append(
+                        "decision.merge_recommendation must be one of "
+                        f"{sorted(VALID_MERGE_RECOMMENDATIONS)} (schema 2.2)"
+                    )
+            if "policy_allow_merge" in decision:
+                require_boolean(
+                    decision.get("policy_allow_merge"), "decision.policy_allow_merge", issues
+                )
+            issues.extend(check_decision_axes_agree_on_the_verdict(decision))
             details = decision.get("quality_failure_details")
             if not isinstance(details, list):
                 issues.append("decision.quality_failure_details must be an array")
