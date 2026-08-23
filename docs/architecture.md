@@ -892,8 +892,24 @@ Inline module names keep their raw-identifier prefix. `mod r#type` and
 `mod r#match` were both recorded as `r`, so two namespaces looked like one and a
 removal from the first was cancelled by an unrelated addition in the second.
 
-Pairing is scoped: two declarations pair only when their inline `mod` path and
-their `#[cfg(…)]` guard may be the same. The guard tracker resolves comments away
+Pairing is scoped: two declarations pair only when their declaration site and
+their `#[cfg(…)]` guard may be the same. The site is the inline `mod` path AND
+the `impl` owner, tracked on one stack because they answer one question — which
+namespace does this item belong to? An associated `pub const VALUE` moving from
+`impl A` to `impl B` in the same file used to be an exact pairing on file, kind,
+name and text, with an empty scope on both sides, so `A::VALUE` disappeared from
+the report along with the removal. The owner is recorded as TEXT — everything
+before the body brace, whitespace collapsed — and nothing about it is parsed.
+The asymmetry is the whole rule: two KNOWN and different owners never pair, but
+an owner the hunk did not show stays unknown and pairs with anything, which is
+the accepted limit for an unseen opener and is not narrowed here. Over 211
+commits of this repository the reports are identical with and without the owner;
+over 708 crates.io release pairs removals move 30,555 → 30,694 and signature
+changes 53,938 → 53,805, so the change mostly reclassifies a real owner change
+from "signature changed" to "`A::x` removed". Its limit is the mirror of the
+`cfg` one: the same owner written with a different path qualifier reads as two
+(40 of 2,784 blocked pairings, all in one crate), and resolving that would mean
+parsing types. The guard tracker resolves comments away
 before it reads anything, with one per-side scanner reset with the guard, so a
 block comment is not syntax on either count: `/** … */` standing between the
 `cfg` and the item it guards no longer reads as a new item and clears the guard,
