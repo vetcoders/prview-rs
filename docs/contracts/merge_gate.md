@@ -259,8 +259,8 @@ A decision signal present with the wrong JSON type (`merge_recommendation: 7`,
 reader forgives, because it is the shape of an older pack; a field that is there
 and cannot be typed is a field the reader FAILED to read, and saying nothing
 about it publishes a confidence the read does not have. Both readers name it
-with an `unreadable_<field>:` caveat — `verdict`, `merge_recommendation` and
-`allow_merge`. The MCP adapter additionally sets `normalized: true`; the CLI
+with an `unreadable_<field>:` caveat — `verdict`, `merge_recommendation`,
+`allow_merge` and `quality_pass`. The MCP adapter additionally sets `normalized: true`; the CLI
 forces every decision axis conservative (`verdict: "BLOCK"`,
 `allow_merge: false`, `merge_recommendation: block`, and therefore `--ci`
 exit `1`), because a decision derived from a block this reader only partly read
@@ -294,7 +294,15 @@ at all, because a quality-clean run is still held at `CONDITIONAL` by a
 breaking-change escalation and one axis may not soften a verdict the others
 agree on; and an ABSENT `quality_pass` states nothing either, per the same
 per-field tolerance that governs the other signals — reading it as `false`
-would turn every pack written before the field into a `CONDITIONAL`.
+would turn every pack written before the field into a `CONDITIONAL`. Those two
+states leave a third between them, and `quality_pass` is typed through the same
+`gate::readable_signal` as the other axes so it does not fall into it: a
+`quality_pass` that is PRESENT but not a boolean is neither a stated `false` nor
+an older pack. Read with a bare `as_bool()` it was indistinguishable from
+absent, so the string `"false"` bought a silent approval on both surfaces —
+the one shape that defeats the paragraph above. It now normalizes to `BLOCK`
+with an `unreadable_quality_pass:` caveat, like any other signal the reader
+could not type.
 
 The `core_inconsistency:` caveat reports a disagreement the pack actually
 states, so the comparison is made per axis rather than against the winning rank:

@@ -232,8 +232,9 @@ case sets `normalized: true`:
   present but unrankable — including a lone `allow_merge` — is a decision the
   pack gave, and it is normalized with a caveat rather than called corrupt.
 - `unreadable_verdict:` / `unreadable_merge_recommendation:` /
-  `unreadable_allow_merge:` — the field was present with the wrong JSON type
-  (`merge_recommendation: 7`, `allow_merge: "false"`). A wrongly typed field is
+  `unreadable_allow_merge:` / `unreadable_quality_pass:` — the field was present
+  with the wrong JSON type (`merge_recommendation: 7`, `allow_merge: "false"`,
+  `quality_pass: "false"`). A wrongly typed field is
   not an absent one: it is ignored for ranking, but it is named, and the
   decision is normalized conservatively around it. The pack is
   `storage_corrupt` only when no signal was stated at all.

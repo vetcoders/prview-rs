@@ -215,6 +215,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context line is unchanged by the patch. `MAX_DECL_CONTINUATION_LINES` (32)
   still bounds growth and a hunk header still finalizes both sides, so the
   reconstruction stays inside the hunk that emitted it.
+- **A `quality_pass` that cannot be typed is no longer read as absent.** Both
+  readers took that axis with a bare `as_bool()`, which returns nothing for a
+  present-but-mistyped value just as it does for a missing one — so a pack
+  stating `quality_pass: "false"` beside a clean approval was read as a pack
+  written before the field existed, and published `PASS` with `allow_merge: true`
+  and no caveat at all, on the CLI and the MCP surface alike. `quality_pass` now
+  goes through the same `gate::readable_signal` as `verdict`,
+  `merge_recommendation` and `allow_merge`: a stated-but-unreadable axis
+  normalizes to `BLOCK` and is named by an `unreadable_quality_pass:` caveat. An
+  absent `quality_pass` is still silent and still states no rank, so packs
+  written before the field are unaffected.
 - **A failed quality axis can no longer be published as a `PASS`.** The
   conservative reconciliation ranked `verdict`, `merge_recommendation` and
   `allow_merge` but read `quality_pass` separately, afterwards — so a pack
