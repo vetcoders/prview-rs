@@ -23,6 +23,18 @@ VALID_VERDICTS = {"PASS", "CONDITIONAL", "BLOCK"}
 # filter on origin == "failure" cannot do that if the field is absent, mistyped,
 # or spelled something else.
 VALID_QUALITY_FAILURE_ORIGINS = {"failure", "warning"}
+# The other two fields of the same entry. `name` is what a consumer reports and
+# what the per-classification arrays are keyed by, so an empty one names no
+# check at all; `classification` decides whether the entry gated this diff, and
+# only `introduced`/`mixed`/`unclassified` do. Mirrors
+# `QualityFailureClass::as_str` in src/artifacts/verdict.rs -- note the hyphen in
+# `pre-existing`, which the sibling COUNT field spells `preexisting_*`.
+VALID_QUALITY_FAILURE_CLASSES = {
+    "introduced",
+    "pre-existing",
+    "mixed",
+    "unclassified",
+}
 
 
 def schema_at_least(raw: Any, minimum: tuple[int, int]) -> bool:
@@ -266,9 +278,13 @@ def validate(path: Path) -> list[str]:
                     "decision.allow_merge must equal (verdict == 'PASS'): "
                     f"got allow_merge={allow_merge} with verdict={verdict!r}"
                 )
-        # From schema 2.2 the origin is part of the contract, not an extra: it is
-        # the only thing that explains an entry in `introduced_quality_failures`
-        # sitting next to `quality_pass: true`.
+        # From schema 2.2 the whole entry is part of the contract, not an extra.
+        # `origin` is the only thing that explains an entry in
+        # `introduced_quality_failures` sitting next to `quality_pass: true`;
+        # `name` is what a consumer reports; `classification` is what decides
+        # whether the entry gated this diff. Validating only one of the three let
+        # `{"origin": "failure"}` -- an anonymous, unclassified failure -- pass
+        # its own contract gate.
         if schema_at_least(data.get("schema_version"), (2, 2)):
             details = decision.get("quality_failure_details")
             if not isinstance(details, list):
@@ -279,6 +295,13 @@ def validate(path: Path) -> list[str]:
                     if not isinstance(detail, dict):
                         issues.append(f"{ctx} must be an object")
                         continue
+                    require_non_empty_string(detail.get("name"), f"{ctx}.name", issues)
+                    classification = detail.get("classification")
+                    if classification not in VALID_QUALITY_FAILURE_CLASSES:
+                        issues.append(
+                            f"{ctx}.classification must be one of "
+                            f"{sorted(VALID_QUALITY_FAILURE_CLASSES)} (schema 2.2)"
+                        )
                     origin = detail.get("origin")
                     if origin not in VALID_QUALITY_FAILURE_ORIGINS:
                         issues.append(

@@ -112,7 +112,7 @@ authoritative axes — `analysis_status` (confidence) and `merge_recommendation`
 | `preexisting_quality_failures` | string[] | Pre-existing failures |
 | `mixed_quality_failures` | string[] | Mixed-provenance failures |
 | `unclassified_quality_failures` | string[] | Failures with unknown provenance |
-| `quality_failure_details` | object[] | `[{ name, classification, origin }]`; `origin` is `"failure"` or `"warning"` (schema 2.2) |
+| `quality_failure_details` | object[] | `[{ name, classification, origin }]` — `name` a non-empty check name, `classification` one of `introduced` \| `pre-existing` \| `mixed` \| `unclassified`, `origin` `"failure"` \| `"warning"` (schema 2.2) |
 | `decision_reason` | string | Human-readable reason for the verdict |
 | `review_caveats` | string[] | Non-blocking caveats requiring reviewer attention |
 | `blocking_issues` | string[] | Issues that block the merge |
@@ -145,7 +145,15 @@ by `derive_decision` (`src/artifacts/verdict.rs`), which calls
   `quality_pass`. Reading `introduced_quality_failures` without `origin` is what
   made `quality_pass: true` look like a contradiction; a consumer that wants
   "what actually failed" filters `quality_failure_details` on
-  `origin == "failure"`.
+  `origin == "failure"`. All three fields of the entry are validated, not just
+  the one that names the schema: `tools/validate_merge_gate.py` requires a
+  non-empty `name` and a `classification` from the emitted vocabulary, so
+  `{"origin": "failure"}` — a failure naming no check and stating no provenance
+  — is rejected rather than passed through as contract-clean. The
+  classification vocabulary is pinned to `QualityFailureClass::as_str`
+  (`src/artifacts/verdict.rs`); note that the value is `pre-existing` while the
+  sibling count field is `preexisting_quality_failures`, and an unvalidated
+  `classification` is exactly where that drift would hide.
 - **An executed check always carries its result artifact and log** (non-null
   `evidence` + `log`); a non-executed check carries non-null placeholders, never
   `null` evidence.
@@ -259,8 +267,8 @@ A decision signal present with the wrong JSON type (`merge_recommendation: 7`,
 reader forgives, because it is the shape of an older pack; a field that is there
 and cannot be typed is a field the reader FAILED to read, and saying nothing
 about it publishes a confidence the read does not have. Both readers name it
-with an `unreadable_<field>:` caveat — `verdict`, `merge_recommendation` and
-`allow_merge`. The MCP adapter additionally sets `normalized: true`; the CLI
+with an `unreadable_<field>:` caveat — `verdict`, `merge_recommendation`,
+`allow_merge` and `quality_pass`. The MCP adapter additionally sets `normalized: true`; the CLI
 forces every decision axis conservative (`verdict: "BLOCK"`,
 `allow_merge: false`, `merge_recommendation: block`, and therefore `--ci`
 exit `1`), because a decision derived from a block this reader only partly read
@@ -294,7 +302,15 @@ at all, because a quality-clean run is still held at `CONDITIONAL` by a
 breaking-change escalation and one axis may not soften a verdict the others
 agree on; and an ABSENT `quality_pass` states nothing either, per the same
 per-field tolerance that governs the other signals — reading it as `false`
-would turn every pack written before the field into a `CONDITIONAL`.
+would turn every pack written before the field into a `CONDITIONAL`. Those two
+states leave a third between them, and `quality_pass` is typed through the same
+`gate::readable_signal` as the other axes so it does not fall into it: a
+`quality_pass` that is PRESENT but not a boolean is neither a stated `false` nor
+an older pack. Read with a bare `as_bool()` it was indistinguishable from
+absent, so the string `"false"` bought a silent approval on both surfaces —
+the one shape that defeats the paragraph above. It now normalizes to `BLOCK`
+with an `unreadable_quality_pass:` caveat, like any other signal the reader
+could not type.
 
 The `core_inconsistency:` caveat reports a disagreement the pack actually
 states, so the comparison is made per axis rather than against the winning rank:

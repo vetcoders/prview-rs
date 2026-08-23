@@ -703,6 +703,17 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
         &mut unknown_signal_caveats,
     )
     .and_then(|v| v.as_bool());
+    // Read here rather than next to its rank below, so that a mistyped value
+    // reaches `mistyped_signal` on the line after this one. A bare `as_bool()`
+    // read `quality_pass: "false"` as absent: no caveat, no rank, and the
+    // surface answered `approve` while the pack said the quality axis failed.
+    let raw_quality_pass = readable_signal(
+        "quality_pass",
+        decision.get("quality_pass"),
+        JsonKind::Boolean,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_bool());
 
     // Whether any signal was present and could not be TYPED. Captured before
     // the vocabulary caveats below join the same list, because the two are
@@ -770,7 +781,7 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // either, so a pack written before the field reads exactly as it always did.
     // This is the CLI's rule, mirrored, because a pack this adapter approved
     // while the CLI held it is the same split the reader parity work closed.
-    let raw_quality_pass = decision.get("quality_pass").and_then(|v| v.as_bool());
+    // (Read above, with the other typed signals.)
     let quality_rank = match raw_quality_pass {
         Some(false) => Some(2),
         _ => None,

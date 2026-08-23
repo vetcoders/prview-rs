@@ -201,6 +201,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A signature edited in place is no longer swallowed by the context lines
+  around it.** A hunk interleaves two texts, and the scanner reconstructs both:
+  the before side is context ∪ removed lines, the after side is context ∪ added
+  lines. It used to end BOTH pending declarations at the first line from the
+  other side, so the everyday shape of an edited signature — `pub fn f(`
+  retouched on both sides, a shared `x: u8,`, then `-old: u16,` / `+new: u32,`
+  and a shared `) {` — finalized to two identical openers, paired as an
+  unchanged re-add, and reported the parameter change nowhere. A `-` line now
+  extends only the removed side, a `+` line only the added side, and a context
+  line extends whichever side still has a declaration open. Context lines only
+  CONTINUE a declaration and never start one: a `pub` item first seen on a
+  context line is unchanged by the patch. `MAX_DECL_CONTINUATION_LINES` (32)
+  still bounds growth and a hunk header still finalizes both sides, so the
+  reconstruction stays inside the hunk that emitted it.
+- **A `quality_pass` that cannot be typed is no longer read as absent.** Both
+  readers took that axis with a bare `as_bool()`, which returns nothing for a
+  present-but-mistyped value just as it does for a missing one — so a pack
+  stating `quality_pass: "false"` beside a clean approval was read as a pack
+  written before the field existed, and published `PASS` with `allow_merge: true`
+  and no caveat at all, on the CLI and the MCP surface alike. `quality_pass` now
+  goes through the same `gate::readable_signal` as `verdict`,
+  `merge_recommendation` and `allow_merge`: a stated-but-unreadable axis
+  normalizes to `BLOCK` and is named by an `unreadable_quality_pass:` caveat. An
+  absent `quality_pass` is still silent and still states no rank, so packs
+  written before the field are unaffected.
 - **A failed quality axis can no longer be published as a `PASS`.** The
   conservative reconciliation ranked `verdict`, `merge_recommendation` and
   `allow_merge` but read `quality_pass` separately, afterwards — so a pack
@@ -235,11 +260,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature that merely has `test` in its name. This inverted the module's own
   rule that ambiguity resolves toward production. Only a gate that provably
   holds solely in a test build now opens the context: an exact `#[cfg(test)]`,
-  an `#[cfg(all(test, …))]`, `#[test]` / `#[tokio::test]` / `#[rstest]`, and
-  `mod tests`. Measured over the local registry (58,586 files), of the 11,030
-  attributes the old pattern read as test context 83.62% are exactly
-  `cfg(test)` and 6.76% are `all(test, …)` — the remaining 9.62% are the ones it
-  was getting wrong.
+  an `#[cfg(all(…))]` naming `test` among its operands, `#[test]` /
+  `#[tokio::test]` / `#[rstest]`, and `mod tests`. Measured over the local
+  registry (58,586 files), of the 11,030 attributes the old pattern read as test
+  context 83.62% are exactly `cfg(test)` and 6.76% are `all(…, test, …)` — the
+  remaining 9.62% are the ones it was getting wrong. `all` is commutative, so
+  the operand's position carries no meaning: `all(feature = "bench", test)` is
+  read exactly like `all(test, feature = "bench")`, where matching only the
+  first operand made the same predicate production or test context depending on
+  how it was written (72 further attributes over that registry, none lost). The
+  operand must be a direct one, so `all(not(test), …)` — which proves the
+  opposite — and `all(any(test, …), …)` stay production.
 - **A block or struct-literal initializer no longer hides a changed public
   constant.** `pub const LIMIT: usize = {` and `pub const ZERO: Self = Self {`
   had their `{` read as the item's body opener, so both diff sides finalized at
@@ -537,7 +568,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from 2.2, requires it: an entry that omits `origin`, mistypes it, or spells it
   anything other than `failure` / `warning` now fails the contract validator,
   because a consumer told to filter on `origin == "failure"` cannot do that on a
-  pack where the field is optional.
+  pack where the field is optional. The validator checks the whole entry, not
+  only the field that names the schema: `name` must be a non-empty string and
+  `classification` one of `introduced` / `pre-existing` / `mixed` /
+  `unclassified`, the vocabulary `QualityFailureClass::as_str` emits. Validating
+  `origin` alone let `{"origin": "failure"}` — a failure naming no check and
+  stating no provenance — pass its own contract gate, and let `classification`
+  drift to any string at all, including the `preexisting` spelling used by the
+  sibling count field rather than the `pre-existing` the emitter writes.
 - Perf regression detection now resolves inline Rust test context (`#[cfg(test)]`,
   `mod tests`, `#[test]`) **per hit line** instead of per hunk. A production hot
   path that merely shared a hunk with a test module was classified as

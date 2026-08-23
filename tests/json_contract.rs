@@ -302,11 +302,13 @@ fn generated_merge_gate_passes_repo_validator() {
         .success();
 }
 
-/// Accepting schema `2.2` without checking the field that defines it lets a pack
-/// omit, mistype, or invent an `origin` and still pass its own contract gate.
+/// Accepting schema `2.2` without checking the fields that define it lets a pack
+/// omit, mistype, or invent any of them and still pass its own contract gate.
 /// Consumers are told to filter `quality_failure_details` on
 /// `origin == "failure"`, so an unvalidated origin makes a real failure
-/// indistinguishable from a warning.
+/// indistinguishable from a warning; and an entry validated on `origin` alone
+/// could be `{"origin": "failure"}` — a failure with no check name and no
+/// classification, which no consumer can report or act on.
 #[test]
 fn validator_rejects_schema_two_two_without_a_usable_origin() {
     let temp = create_fixture_repo();
@@ -335,6 +337,20 @@ fn validator_rejects_schema_two_two_without_a_usable_origin() {
         serde_json::json!([{ "name": "Clippy", "classification": "introduced", "origin": true }]),
         serde_json::json!([{ "name": "Clippy", "classification": "introduced", "origin": null }]),
         serde_json::json!(["Clippy"]),
+        // The entry the origin-only check waved through: a failure that names
+        // no check and states no classification.
+        serde_json::json!([{ "origin": "failure" }]),
+        // `name` present but useless.
+        serde_json::json!([{ "name": "", "classification": "introduced", "origin": "failure" }]),
+        serde_json::json!([{ "name": "   ", "classification": "introduced", "origin": "failure" }]),
+        serde_json::json!([{ "name": 7, "classification": "introduced", "origin": "failure" }]),
+        // `classification` outside the emitted vocabulary. `preexisting` is the
+        // spelling of the sibling COUNT field, not of this value — the emitter
+        // writes `pre-existing`, and accepting any string hid that drift.
+        serde_json::json!([{ "name": "Clippy", "classification": "preexisting", "origin": "failure" }]),
+        serde_json::json!([{ "name": "Clippy", "classification": "", "origin": "failure" }]),
+        serde_json::json!([{ "name": "Clippy", "classification": true, "origin": "failure" }]),
+        serde_json::json!([{ "name": "Clippy", "origin": "failure" }]),
     ];
 
     for details in broken_details {
@@ -351,6 +367,29 @@ fn validator_rejects_schema_two_two_without_a_usable_origin() {
             .arg(&merge_gate)
             .assert()
             .failure();
+    }
+
+    // Every classification the emitter can write must validate — the vocabulary
+    // is pinned to `QualityFailureClass::as_str`, so a validator that spelled
+    // one of them differently would reject a pack prview itself produced.
+    for classification in ["introduced", "pre-existing", "mixed", "unclassified"] {
+        let mut gate = original.clone();
+        gate["decision"]["quality_failure_details"] = serde_json::json!([{
+            "name": "Clippy",
+            "classification": classification,
+            "origin": "failure",
+        }]);
+        std::fs::write(
+            &merge_gate,
+            serde_json::to_string_pretty(&gate).expect("serialize gate"),
+        )
+        .expect("write gate");
+
+        Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert()
+            .success();
     }
 
     // The shape the emitter actually writes still validates.

@@ -742,6 +742,20 @@ declarations agreeing on their opener and first eight lines finalized to the
 same truncated text and paired as an unchanged re-add, so a parameter, bound or
 return type changed below the cut produced no finding at all.
 
+A hunk interleaves two texts, and the accumulators reconstruct both: the before
+side is context ∪ removed lines, the after side is context ∪ added lines. So a
+`-` line never touches the added accumulator, a `+` line never touches the
+removed one, and a context line EXTENDS whichever side still has a declaration
+open. Ending both accumulators at the first line from the other side truncated
+every declaration a patch edits in place — `pub fn f(` and a shared `x: u8,`
+followed by `-old: u16,` / `+new: u32,` finalized to two identical openers,
+paired as an unchanged re-add, and the parameter change was reported nowhere.
+Context lines only ever CONTINUE a declaration; a `pub` item that first appears
+on one is unchanged by the patch and must not open an accumulator, which keeps
+the reconstruction inside the hunk that emitted it. The bound is unchanged:
+`MAX_DECL_CONTINUATION_LINES` still caps growth, and a hunk header or a new file
+still finalizes both sides.
+
 Where a declaration ENDS is decided on a separate, comment-resolved view of the
 same lines, fed through the pending declaration's own `SourceScanner` one
 physical line at a time. The joined text has no line breaks, so scanning it as a
@@ -879,8 +893,9 @@ interior `"` opens a phantom literal. That state is per side and per hunk: a
 hunk boundary is where contiguity ends, and every consumer resets there.
 
 What OPENS that context has to be provable, not merely suggestive. The marker
-set is an exact `#[cfg(test)]`, a `#[cfg(all(test, …))]` — which cannot hold
-unless `test` does — `#[test]` / `#[tokio::test]` / `#[rstest]`, and
+set is an exact `#[cfg(test)]`, a `#[cfg(all(…))]` with `test` among its
+operands — which cannot hold unless `test` does — `#[test]` / `#[tokio::test]` /
+`#[rstest]`, and
 `mod tests`. Reading the bare token `test` anywhere inside a `cfg` predicate
 instead made `#[cfg(not(test))]` — code compiled into every build EXCEPT the
 test one — open test context and silently drop the production hits beneath it,
@@ -889,7 +904,15 @@ outside the test build whenever the feature is on, and for
 `#[cfg(feature = "__internal-test")]`, a feature that merely has `test` in its
 name. Measured over the local registry (58,586 files): of the 11,030 attributes
 the old pattern read as test context, 83.62% are exactly `cfg(test)` and 6.76%
-are `all(test, …)`; the remaining 9.62% are the ones it got wrong. Everything
+are `all(…, test, …)`; the remaining 9.62% are the ones it got wrong. `all` is
+commutative, so the operand's position carries no meaning and reading only the
+first one made `all(feature = "bench", test)` production while
+`all(test, feature = "bench")` was test context; accepting it anywhere adds 72
+attributes over that registry and removes none. The operand must be a DIRECT
+one, so nothing before it may open a nested predicate — `all(not(test), …)`
+proves the opposite of itself and `all(any(test, …), …)` proves nothing. That
+also drops `all(not(windows), test)`, an under-detection kept deliberately
+rather than growing a paren-matching parser. Everything
 unproven is production, because the two errors are not symmetrical — an
 unrecognized test context costs one extra finding a reader can dismiss, while a
 claimed one that does not hold deletes a production finding nobody ever sees.

@@ -419,8 +419,19 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     .and_then(Value::as_str);
     // Read as an OPTION, not through `unwrap_or(false)`: the reconciliation
     // below has to tell a pack that states a failed quality axis from one
-    // written before the field existed.
-    let raw_quality_pass = decision.get("quality_pass").and_then(Value::as_bool);
+    // written before the field existed. It goes through `readable_signal` for
+    // the third case those two hide between them — a `quality_pass` that is
+    // PRESENT but not a boolean. Reading it with a bare `as_bool()` made
+    // `"false"` indistinguishable from absent and published an approval with no
+    // caveat at all; a stated-but-unreadable axis now normalizes to BLOCK like
+    // every other one.
+    let raw_quality_pass = crate::gate::readable_signal(
+        "quality_pass",
+        decision.get("quality_pass"),
+        crate::gate::JsonKind::Boolean,
+        &mut unreadable,
+    )
+    .and_then(Value::as_bool);
     // Whether the verdict below is what the pack said or what this reader had to
     // substitute for it. A substituted verdict cannot leave the OTHER decision
     // axes reading whatever the same unreliable decision block claimed: that
@@ -2740,6 +2751,49 @@ api-router/app/core/cache.py
                 "the two readers must agree on {bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_quality_axis_that_cannot_be_typed_is_not_read_as_absent() {
+        // The gap between the two states the previous test relies on: a
+        // `quality_pass` that is PRESENT but not a boolean. `as_bool()` returned
+        // `None` for it, which is exactly what an OLDER pack looks like, so the
+        // string `"false"` bought a clean approval with no caveat at all — on
+        // both surfaces. A stated-but-unreadable axis is now a mistyped signal
+        // like every other one: BLOCK, and named.
+        let pack = pack_with_gate(
+            r#"{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":"false"}"#,
+        );
+
+        let cli = read_merge_gate_summary(pack.path()).expect("readable");
+        assert_eq!(
+            cli.verdict, "BLOCK",
+            "a signal that cannot be typed normalizes to BLOCK"
+        );
+        assert!(!cli.allow_merge);
+        assert!(
+            cli.caveats
+                .iter()
+                .any(|c| c.starts_with("unreadable_quality_pass:")),
+            "the unreadable axis must be named: {:?}",
+            cli.caveats
+        );
+
+        let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+        assert_eq!(
+            mcp.verdict, cli.verdict,
+            "the two readers must not disagree"
+        );
+        assert_eq!(mcp.merge_recommendation, "block");
+        assert!(!mcp.allow_merge);
+        assert!(mcp.normalized);
+        assert!(
+            mcp.caveats
+                .iter()
+                .any(|c| c.starts_with("unreadable_quality_pass:")),
+            "the unreadable axis must be named: {:?}",
+            mcp.caveats
+        );
     }
 
     #[test]

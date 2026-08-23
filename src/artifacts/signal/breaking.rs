@@ -509,7 +509,9 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
 
         // Removed lines
         if let Some(content) = removed_content {
-            finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
+            // A `-` line is absent from the after text, so it neither extends
+            // nor ends whatever the added side has open: the two accumulators
+            // reconstruct two independent texts out of one interleaved hunk.
             let trimmed = content.trim();
 
             // Record EVERY public symbol kind for remove+re-add pairing, not
@@ -544,9 +546,6 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             before_scope.feed(content);
             continue;
         }
-
-        // A pending declaration is finalized by any line from the other side.
-        finalize_decl(&mut pending_removed, &mut removed_syms, &mut findings);
 
         // Added lines — track public declarations for signature comparison + env requirements
         if let Some(content) = added_content {
@@ -606,11 +605,20 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
             continue;
         }
 
-        // Context (or non-hunk) line: it belongs to both sides, and it ends any
-        // declaration that was still accumulating on the added side.
-        finalize_decl(&mut pending_added, &mut added_syms, &mut findings);
+        // Context (or non-hunk) line: it belongs to BOTH sides, so it extends a
+        // declaration open on either of them. `pub fn f(` / shared `x: u8,` /
+        // `-old: u16,` / `+new: u32,` / shared `) {` is one signature change on
+        // each side; truncating at the first shared line paired the identical
+        // openers and swallowed the break entirely.
         let content = line.strip_prefix(' ').unwrap_or(line);
         let trimmed = content.trim();
+        continue_pending_decl(
+            &mut pending_removed,
+            &mut removed_syms,
+            &mut findings,
+            trimmed,
+        );
+        continue_pending_decl(&mut pending_added, &mut added_syms, &mut findings, trimmed);
         before_cfg.feed(trimmed);
         after_cfg.feed(trimmed);
         before_scope.feed(content);
@@ -999,6 +1007,37 @@ struct PendingDecl {
 /// A declaration in progress absorbs `trimmed` as a continuation line; otherwise
 /// `trimmed` may open a new one. Either way the declaration is emitted as soon
 /// as it is complete (or once it has absorbed [`MAX_DECL_CONTINUATION_LINES`]).
+/// Feed one more physical line into a declaration that is already accumulating
+/// on this side, and report whether there was one.
+///
+/// This is the *continuation-only* half of [`accumulate_decl`]: it never starts
+/// a declaration. Context lines of a unified hunk belong to both the before and
+/// the after text, so they have to extend whatever each side already has open —
+/// but a `pub` item that first appears on a context line is unchanged by the
+/// patch and must not become a declaration on either side.
+fn continue_pending_decl(
+    pending: &mut Option<PendingDecl>,
+    collected: &mut Vec<SymbolDecl>,
+    findings: &mut Vec<BreakingFinding>,
+    trimmed: &str,
+) -> bool {
+    let Some(open) = pending.as_mut() else {
+        return false;
+    };
+    if !open.decl.text.ends_with('(') && !trimmed.is_empty() {
+        open.decl.text.push(' ');
+    }
+    open.decl.text.push_str(trimmed);
+    open.push_code(trimmed);
+    open.decl.continuation_lines += 1;
+    if declaration_complete(&open.code)
+        || open.decl.continuation_lines >= MAX_DECL_CONTINUATION_LINES
+    {
+        finalize_decl(pending, collected, findings);
+    }
+    true
+}
+
 fn accumulate_decl(
     pending: &mut Option<PendingDecl>,
     collected: &mut Vec<SymbolDecl>,
@@ -1006,18 +1045,7 @@ fn accumulate_decl(
     trimmed: &str,
     site: &DeclSite<'_>,
 ) {
-    if let Some(open) = pending.as_mut() {
-        if !open.decl.text.ends_with('(') && !trimmed.is_empty() {
-            open.decl.text.push(' ');
-        }
-        open.decl.text.push_str(trimmed);
-        open.push_code(trimmed);
-        open.decl.continuation_lines += 1;
-        if declaration_complete(&open.code)
-            || open.decl.continuation_lines >= MAX_DECL_CONTINUATION_LINES
-        {
-            finalize_decl(pending, collected, findings);
-        }
+    if continue_pending_decl(pending, collected, findings, trimmed) {
         return;
     }
 
@@ -1941,6 +1969,80 @@ mod tests {
         );
         assert!(changes[0].0.contains("LIMIT * 2"), "{}", changes[0].0);
         assert!(changes[0].1.contains("LIMIT * 3"), "{}", changes[0].1);
+    }
+
+    #[test]
+    fn a_shared_context_line_does_not_truncate_both_sides_of_a_declaration() {
+        // A context line belongs to BOTH versions, so it continues whatever each
+        // side was accumulating. Finalizing on it left both accumulators at the
+        // identical opener — only its comment was reworded — they paired as an
+        // unchanged re-add, and the changed parameter below was ignored because
+        // a continuation line does not start a declaration. The signature break
+        // vanished from the pack.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/api.rs",
+            &[
+                "-pub fn handler( // takes the old width",
+                "+pub fn handler( // takes the new width",
+                "     first: u8,",
+                "-    second: u16,",
+                "+    second: u32,",
+                " ) -> bool {",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "the changed parameter is a signature change: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(changes[0].0.contains("u16"), "{}", changes[0].0);
+        assert!(changes[0].1.contains("u32"), "{}", changes[0].1);
+    }
+
+    #[test]
+    fn an_opposite_side_line_does_not_truncate_a_pending_declaration() {
+        // The same rule for the other interleaving: a `-` line is not part of
+        // the added declaration and a `+` line is not part of the removed one,
+        // so neither ENDS the other — it simply is not fed to it. Finalizing
+        // there cut both declarations at their identical first line.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/api.rs",
+            &[
+                "-pub fn handler(",
+                "+pub fn handler(",
+                "-    first: u8,",
+                "+    first: u8,",
+                "-    second: u16,",
+                "+    second: u32,",
+                "-) -> bool {",
+                "+) -> bool {",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "the changed parameter is a signature change: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(changes[0].0.contains("u16"), "{}", changes[0].0);
+        assert!(changes[0].1.contains("u32"), "{}", changes[0].1);
     }
 
     #[test]
