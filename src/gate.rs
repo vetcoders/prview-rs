@@ -132,6 +132,7 @@ pub fn check_merge_gate_schema_field(field: Option<&serde_json::Value>) -> Resul
 pub(crate) enum JsonKind {
     String,
     Boolean,
+    Array,
 }
 
 impl JsonKind {
@@ -139,6 +140,7 @@ impl JsonKind {
         match self {
             Self::String => value.is_string(),
             Self::Boolean => value.is_boolean(),
+            Self::Array => value.is_array(),
         }
     }
 
@@ -146,6 +148,7 @@ impl JsonKind {
         match self {
             Self::String => "a string",
             Self::Boolean => "a boolean",
+            Self::Array => "an array",
         }
     }
 }
@@ -311,6 +314,28 @@ pub fn rank_from_verdict(s: &str) -> Option<u8> {
         "CONDITIONAL" => 2,
         _ => 1,
     })
+}
+
+/// Conservativeness rank of a stated `analysis_status`, or `None` when the
+/// value states nothing this contract can rank.
+///
+/// `complete` is a PRECONDITION of `PASS`, not a grant of it: a complete
+/// analysis still ends at `BLOCK` when policy blocks, so reading it as rank 1
+/// would let one axis soften a verdict the others agree on — the same asymmetry
+/// as `quality_pass: true`. `degraded` and `incomplete` rule `PASS` out, so both
+/// rank 2. Anything else is outside the vocabulary and cannot rank at all;
+/// callers name it with an `unknown_analysis_status:` caveat rather than
+/// letting it vanish, exactly as they do for `merge_recommendation`.
+pub(crate) fn rank_from_analysis_status(s: &str) -> Option<u8> {
+    match s {
+        "degraded" | "incomplete" => Some(2),
+        _ => None,
+    }
+}
+
+/// Whether a stated `analysis_status` is one this contract defines.
+pub(crate) fn known_analysis_status(s: &str) -> bool {
+    matches!(s, "complete" | "degraded" | "incomplete")
 }
 
 pub fn merge_rec_from_rank(rank: u8) -> &'static str {

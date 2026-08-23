@@ -215,6 +215,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context line is unchanged by the patch. `MAX_DECL_CONTINUATION_LINES` (32)
   still bounds growth and a hunk header still finalizes both sides, so the
   reconstruction stays inside the hunk that emitted it.
+- **An incomplete analysis or a stated blocker can no longer be published as an
+  approval.** The conservative reconciliation ranked `verdict`,
+  `merge_recommendation`, `allow_merge` and `quality_pass`, but read
+  `analysis_status` only afterwards for display and `blocking_issues` only for
+  passthrough — so a pack shaped `verdict: "PASS"`, `merge_recommendation:
+  "approve"`, `allow_merge: true`, `quality_pass: true` published a clean
+  approval even when it also stated `analysis_status: "incomplete"` or listed a
+  blocking issue, on the CLI and the MCP surface alike. The contract permits
+  `PASS` only when the analysis is `complete`, and an entry reaches
+  `blocking_issues` only from a check whose `merge_impact` is `Block`. Both now
+  rank: `degraded`/`incomplete` as `CONDITIONAL`, a non-empty `blocking_issues`
+  (and its restatement `policy_allow_merge: false`) as `BLOCK`, each named in the
+  `core_inconsistency:` caveat and typed through `gate::readable_signal` so a
+  mistyped one normalizes conservatively. `analysis_status: "complete"`,
+  `policy_allow_merge: true` and an empty `blocking_issues` state no rank — they
+  are preconditions of a `PASS`, not grants of one — and absence still states
+  nothing, so older packs read exactly as before.
+- **The decision axes are now enumerated in the contract.** Every field the
+  `decision` object may carry has a row in the ranking table of
+  `docs/contracts/merge_gate.md` saying whether it ranks and why, under one rule:
+  an axis states a rank only when its value RULES OUT a more permissive outcome.
+  The deliberate exclusions are recorded with their reasons — `recommended_merge`
+  restates `merge_recommendation`, `recommended_label` has an open vocabulary,
+  the `quality_failures` arrays are populated by warning-origin entries that
+  never flip `quality_pass`, and `quality_failure_details` is the evidence behind
+  that axis rather than an axis of its own. A field added to `decision` without a
+  row is an unfinished change.
 - **A `quality_pass` that cannot be typed is no longer read as absent.** Both
   readers took that axis with a bare `as_bool()`, which returns nothing for a
   present-but-mistyped value just as it does for a missing one — so a pack

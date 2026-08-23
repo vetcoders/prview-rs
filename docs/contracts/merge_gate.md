@@ -267,8 +267,8 @@ A decision signal present with the wrong JSON type (`merge_recommendation: 7`,
 reader forgives, because it is the shape of an older pack; a field that is there
 and cannot be typed is a field the reader FAILED to read, and saying nothing
 about it publishes a confidence the read does not have. Both readers name it
-with an `unreadable_<field>:` caveat — `verdict`, `merge_recommendation`,
-`allow_merge` and `quality_pass`. The MCP adapter additionally sets `normalized: true`; the CLI
+with an `unreadable_<field>:` caveat — every axis in the ranking table below.
+The MCP adapter additionally sets `normalized: true`; the CLI
 forces every decision axis conservative (`verdict: "BLOCK"`,
 `allow_merge: false`, `merge_recommendation: block`, and therefore `--ci`
 exit `1`), because a decision derived from a block this reader only partly read
@@ -312,6 +312,57 @@ the one shape that defeats the paragraph above. It now normalizes to `BLOCK`
 with an `unreadable_quality_pass:` caveat, like any other signal the reader
 could not type.
 
+### Which fields rank, and which deliberately do not
+
+One rule decides membership: **an axis states a rank only when its value RULES
+OUT a more permissive outcome.** A value that merely fails to forbid something
+states nothing — that is why `quality_pass: true` is silent, and it is the same
+reason `analysis_status: "complete"` is. Both are PRECONDITIONS of `PASS`, not
+grants of it: a quality-clean, fully-analysed run is still a `BLOCK` when policy
+blocks it, and letting either speak in the permissive direction would let one
+axis soften a verdict the others agree on.
+
+The decision object is closed, so every field it may carry is accounted for
+here. This table is the contract; a field added to `decision` without a row is
+an unfinished change.
+
+| Field | Rank | Rule |
+|---|---|---|
+| `verdict` | 1 / 2 / 3 | `PASS` \| `CONDITIONAL` \| `BLOCK`, via `gate::rank_from_verdict` |
+| `merge_recommendation` | 1 / 2 / 3 | `approve` \| `review_required` \| `block`, via `gate::rank_from_merge_rec` |
+| `allow_merge` | 1 / 2 | `false` rules out `PASS`; `true` ranks 1 and so never raises |
+| `quality_pass` | 2 | Only `false` ranks — `PASS` requires quality to pass |
+| `analysis_status` | 2 | Only `degraded` / `incomplete` rank — `PASS` requires `complete` |
+| `blocking_issues` | 3 | Non-empty ranks — see below |
+| `policy_allow_merge` | 3 | Only `false` ranks — the same fact as a non-empty `blocking_issues` |
+| `recommended_merge` | — | Legacy restatement of `merge_recommendation == approve`; ranking it counts one axis twice |
+| `recommended_label` | — | Human label with an open vocabulary (`e.g.` in its own row); nothing to rank against |
+| `quality_failures` and its four classification arrays | — | Non-empty ≠ failed: warning-origin entries populate them without flipping `quality_pass`, which is precisely the false positive `origin` was added to prevent |
+| `quality_failure_details` | — | The evidence BEHIND `quality_pass`, not an independent axis; ranking it would recompute that axis from parts and re-introduce the same warning/failure conflation |
+| `decision_reason` | — | Prose |
+| `review_caveats` | — | Non-blocking by definition |
+
+`blocking_issues` ranks 3 rather than 2 because a blocker is not a doubt: an
+entry appears there only when a check reached `PolicyConclusion::Blocked`, whose
+`merge_impact` is `Block`, so a pack listing one has already stated a `BLOCK`
+whether or not its `verdict` field agrees. `policy_allow_merge` is the same fact
+written twice — the emitter computes `policy_allow_merge =
+blocking_issues.is_empty()` — so both are read and both rank, which costs
+nothing when they agree and covers a pack that states only one. This does not
+conflate `policy_allow_merge` with `allow_merge`: the two remain distinct axes,
+and only the value that rules `PASS` out speaks. An empty `blocking_issues` and
+`policy_allow_merge: true` state nothing at all, because "policy did not
+hard-block" is not "merge is allowed".
+
+Every ranking axis is typed through `gate::readable_signal`, so present-but-
+unreadable is a third state distinct from both a stated value and an absent one:
+`blocking_issues: "Clippy"` (a string, not an array) or `analysis_status: 7`
+normalizes to `BLOCK` with an `unreadable_<field>:` caveat instead of being
+mistaken for a pack written before the field. A stated `analysis_status` outside
+`complete` / `degraded` / `incomplete` cannot rank, so it is excluded and named
+with an `unknown_analysis_status:` caveat — the rule already applied to
+`merge_recommendation`.
+
 The `core_inconsistency:` caveat reports a disagreement the pack actually
 states, so the comparison is made per axis rather than against the winning rank:
 the two textual axes are compared to the published verdict, and `allow_merge` to
@@ -323,7 +374,14 @@ it did not contain. `quality_pass` needs no comparison of its own: ranking 2
 when false, it makes any axis claiming 1 beside it disagree with the winning
 rank already, and a healthy `BLOCK` or `CONDITIONAL` pack states it in agreement
 with everything else. It is named in the caveat all the same, so a reader can
-see which axis forced the downgrade. A pack whose verdict was substituted
+see which axis forced the downgrade. The same holds for `analysis_status`,
+`blocking_issues` and `policy_allow_merge`: each ranks in one direction only, so
+a healthy pack states them in agreement with the winning rank — a `BLOCK` pack
+naming its blocker beside `policy_allow_merge: false` and a `complete` analysis
+is exactly what this tool writes and reports no contradiction — while a pack
+that states one of them AGAINST a permissive verdict is caught by the textual
+axes disagreeing with the rank it forced. All three are named in the caveat.
+A pack whose verdict was substituted
 reports the substitution (`unknown_verdict:`, `unreadable_<field>:`) and is not
 additionally accused of contradicting itself.
 
