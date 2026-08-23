@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `--fail-on-warnings`: opt-in escape hatch that makes `--ci` exit `1` when any
+  check reports warnings. It is only meaningful together with `--ci` (clap
+  rejects it otherwise) and it restores the pre-change CI behaviour for teams
+  that want a warnings-clean trunk. `prview gate` is untouched — its exit codes
+  come from the verdict contract, not from this flag.
 - `00_summary/PROVENANCE.json` — a pack-level record of *what was analysed*,
   next to the per-check rows that record *where each gate ran*. It carries the
   `target_sha` the pack judges, the `base_sha` it diffed against — the merge
@@ -78,8 +83,877 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit its analysis root was extracted from along with the scan's start and
   end times (all additive and optional).
 
+### Changed
+
+- **`--ci` exit code for a warnings-only run: `1` → `0`.** Warning-level checks
+  no longer break `quality_pass`, and `--ci` still exits `1` only on `BLOCK` or a
+  broken quality gate — so a run whose worst signal is a warning now exits `0`.
+  Pass `--ci --fail-on-warnings` to keep the old exit. Runs with a real failure,
+  and every `prview gate` exit code, are unchanged.
+- **BREAKING (behavioral): an unreadable `MERGE_GATE.json` is now an execution
+  error, not a guessed verdict.** `prview --json` / `--ci` used to fall back to
+  re-deriving the decision from the in-memory policy engine when the gate
+  artifact was missing or unparsable, publishing `allow_merge = recommendation
+  != block` — the only path in the codebase where `allow_merge: true` could
+  coexist with a `CONDITIONAL` verdict, contradicting the documented
+  `allow_merge == (verdict == "PASS")` invariant. That fallback is removed:
+  a missing, unparsable, or unknown-schema gate artifact now prints an error and
+  exits `3`, the same execution-error code `prview gate` already used. This also
+  applies to `--update` runs that re-read an earlier pack, so a truncated
+  previous run reports the failure instead of resurrecting a plausible verdict.
+- **`MERGE_GATE.json` readers check `schema_version`.** A pack with an unknown or
+  unparsable MAJOR is rejected fail-loud (`exit 3` on the CLI, `storage_corrupt`
+  on the MCP surface), and so is a `schema_version` that is present but is not a
+  `MAJOR.MINOR` string — a number, an object, or an explicit `null` used to be
+  read as "field absent", i.e. as a legacy pack, which is the opposite of what it
+  means. A version with extra components (`2.1.3`) is rejected rather than
+  truncated to `2.1`, so "readable by prview" cannot drift away from the exact
+  set `tools/validate_merge_gate.py` accepts. A newer MINOR of a known MAJOR is
+  read and reported with a `schema_forward_compat:` caveat — on every known
+  MAJOR, so a `1.9` pack is now caveated instead of accepted in silence — and the
+  MCP surface marks that read `normalized: true`, as the documented contract
+  already promised. Version components must also be spelled canonically:
+  `u32::from_str` accepts leading zeros and a leading `+`, so `02.2`, `2.02` and
+  `+2.2` all parsed to the known `(2, 2)` and were read as the current schema
+  while the validator rejects those exact strings. An absent `schema_version` stays accepted: pre-2.1 packs
+  predate the field, and the documented `ALLOW`/`HOLD` verdict tolerance is
+  unchanged.
+- **A versioned pack without a `decision` object is a corrupt artifact.** The CLI
+  reader fell back to treating the gate's ROOT as the decision, so a pack that
+  states `schema_version: "2.2"` and then carries no `decision` (or a non-object
+  one) normalized quietly to `BLOCK` / `allow_merge: false` with an
+  `unknown_verdict:` caveat — a verdict nothing in the pack ever stated. It now
+  exits `3`, matching `tools/validate_merge_gate.py` (which requires `decision`
+  at every version) and the `prview mcp` adapter (which already returned
+  `storage_corrupt`). A pack with NO `schema_version` predates the field and
+  keeps the legacy tolerance: its root is still read as the decision.
+- **The legacy tolerance is now whole on both readers.** The `prview mcp` adapter
+  required a `decision` object unconditionally, so a genuine pre-2.1 pack — no
+  `schema_version`, signals at the root — was answered `storage_corrupt` by the
+  MCP surface while the CLI read the very same file and printed a verdict. One
+  artifact cannot be simultaneously readable and corrupt depending on which
+  surface asks. Both readers now select the decision object through a single
+  `gate::select_decision_object`: `decision` when it is an object, the root when
+  the pack states no `schema_version`, and fail-loud otherwise. The corruption
+  rule for versioned packs is unchanged; only the disagreement is gone.
+- **A wrongly typed decision signal is a normalization, not an absent field.**
+  `verdict: "PASS"` beside `merge_recommendation: 7` used to collapse through
+  `as_str()` into "no recommendation", so the `prview mcp` adapter returned a
+  decision derived from the surviving signal with `normalized: false` and no
+  caveat — a field ignored in silence, which the MCP contract forbids. Each
+  decision signal now distinguishes absent from present-but-untypable and emits
+  an `unreadable_verdict:` / `unreadable_merge_recommendation:` /
+  `unreadable_allow_merge:` caveat with `normalized: true`. A pack with no
+  usable signal at all is still `storage_corrupt`.
+- **The CLI reader names wrongly typed signals too, and refuses to approve on
+  them.** The `unreadable_*` discipline above shipped on the MCP surface only;
+  the CLI still went through `as_str()` / `as_bool()`, so `verdict: 7` was
+  reported as `unknown_verdict: … carries no verdict` (a claim about a field that
+  was in fact present), `merge_recommendation: 7` fell through to
+  `review_required`, and `allow_merge: "true"` silently became `false`. Worse,
+  a pack with a valid `verdict: "PASS"` beside a mistyped `merge_recommendation`
+  published a `PASS` derived from a decision block the reader had only partly
+  read. Both readers now share `gate::readable_signal`: a present-but-untypable
+  field emits the same `unreadable_<field>:` caveat on `--json`, and — matching
+  the unknown-verdict rule already in place — forces every derived axis
+  conservative (`verdict: "BLOCK"`, `allow_merge: false`,
+  `merge_recommendation: block`, `--ci` exit `1`). A well-typed pack gains no
+  caveat and is unaffected.
+- **Unknown verdicts are reported instead of silently absorbed.** The CLI still
+  collapses an unrecognized verdict to `BLOCK`, but now says so through a new
+  optional `caveats` array on the `--json` summary (`unknown_verdict: …`) — the
+  reader no longer presents a normalization as something it read. The MCP
+  `verdict` surface likewise reports `unknown_verdict` /
+  `unknown_merge_recommendation` and sets `normalized: true` instead of dropping
+  the unparsable field on the floor. The `--json` summary keeps
+  `schema_version: "cli-json/v1"`: `caveats` is additive and omitted when empty.
+  A verdict the CLI collapsed to `BLOCK` now also forces the axes derived beside
+  it: `allow_merge` is `false` and `merge_recommendation` is `Block` regardless
+  of what the same unreliable decision block claimed. A pack with an unreadable
+  verdict but `allow_merge: true` and `merge_recommendation: "approve"` used to
+  publish `verdict: "BLOCK"` next to an approval — breaking the
+  `allow_merge == (verdict == "PASS")` invariant — and, because
+  `compute_exit_code` keys off the recommendation, `--ci` exited `0` on it.
+- Human stdout no longer prints "All checks passed!" when no gate artifact was
+  readable. The raw check tally is not a verdict; the summary now names the
+  missing truth.
+- **`report.json` schema_version: `1.0` → `2.0`.**
+  `quality.coverage.heuristic_ratio` is `null` when nothing was measured
+  (previously a misleading `1.0`) and is accompanied by new `measured: bool`
+  and optional `not_measured_reason` fields; `quality.heuristics` omits its
+  counters on a skipped scan. No field was removed or renamed, but a field that
+  was always a number can now be `null` and counters can now be absent, so a
+  decoder written against `1.0` does not parse every pack — that is a MAJOR, not
+  an additive MINOR. Consumers reading `heuristic_ratio` must handle `null` —
+  the bundled dashboard PR-comment generator renders it as `not measured`, and
+  `history.rs` already treats a missing value as "no baseline".
+- Bumped the bundled `loctree` structural-analysis crate from `0.8` to `0.13.0`.
+  The public API prview consumes (`analyzer::{cycles, dead_parrots, twins}`,
+  `snapshot::{Snapshot, project_cache_dir, run_init, SNAPSHOT_SCHEMA_VERSION}`,
+  `args::ParsedArgs`) is source-compatible — no call sites changed. The snapshot
+  schema version is now decoupled from the crate version (pinned at `0.11.0`
+  instead of tracking `CARGO_PKG_VERSION`); prview's `major.minor` schema gate
+  handles the transition, so stale `0.8`-era caches are re-scanned automatically.
+  loctree 0.13 also widens file-type coverage in the scan (markdown, shell,
+  config, and other non-source files now count toward the snapshot), so the
+  `LOCTREE` heuristics stats (`total_files`, `total_loc`, `by_language`) report
+  higher, broader numbers than under 0.8 for the same tree.
+
 ### Fixed
 
+- **The blocker flag and the blocker list are certified as one fact.** The
+  emitter computes `policy_allow_merge = blocking_issues.is_empty()` after the
+  last entry is pushed and writes both verbatim, but the contract validator used
+  that relation only in the harsher direction — a listed blocker raises the
+  verdict a pack must clear — which left the two halves free to contradict each
+  other outright. `policy_allow_merge: true` beside a listed blocker certified
+  clean, telling a reader that trusts the flag that policy let the merge through
+  while the list beside it named what blocked it. From schema 2.2, where both
+  fields are required, `tools/validate_merge_gate.py` enforces the equivalence in
+  both directions: `true` with blockers and `false` without them are both
+  rejected. This completes the reconciliation port rather than adding a rule to
+  it — same shape as the `quality_pass` / `quality_failure_details` equivalence,
+  and distinct from the older "no `allow_merge: true` beside a blocker" check,
+  which is about the merge verdict rather than the policy flag it derives from. A
+  test in `src/artifacts/merge_gate.rs` pins the flag to the list across the
+  emitted packs, so a second input to the flag fails the emitter instead of
+  making the validator reject prview's own output. Probed against every pack on
+  disk: no pack from a real run is rejected.
+- **An `impl` owner is part of a declaration's site.** A `pub` associated item
+  moved between two impl blocks in one file — `pub const VALUE` leaving `impl A`
+  and appearing in `impl B` — matched on file, kind, name and text with an empty
+  scope on both sides, so the exact pairing consumed it and `A::VALUE` vanished
+  from the report entirely. Impl owners now ride the same stack as inline
+  modules, recorded as the header text with whitespace collapsed and nothing
+  parsed. The asymmetry is deliberate: two KNOWN and different owners never pair,
+  while an owner the hunk never showed stays unknown and pairs with anything, so
+  the accepted unseen-opener limit is untouched. Over 211 commits of this
+  repository the reports are identical before and after; over 708 crates.io
+  release pairs removals move 30,555 → 30,694 and signature changes 53,938 →
+  53,805, i.e. mostly a reclassification of a real owner change. Recorded limit,
+  mirroring the `cfg` operand-ordering one: the same owner written with a
+  different path qualifier reads as two owners (40 of 2,784 blocked pairings,
+  all in one crate) — closing it means parsing types.
+- **The contract validator now certifies the reconciliation, not just the
+  shape.** `tools/validate_merge_gate.py` checked each decision field on its own,
+  so a pack stating `verdict: "PASS"` beside `analysis_status: "incomplete"`, a
+  `block` recommendation and `policy_allow_merge: false` validated OK — while
+  every reader normalizes that same artifact to `BLOCK`. The readers were already
+  protected; the hole was in CERTIFICATION. From schema 2.2 the validator ports
+  their whole rule: it requires the remaining decision axes (`analysis_status`,
+  `merge_recommendation`, `policy_allow_merge`) with the vocabularies the typed
+  enums emit, and rejects a `verdict` milder than the most conservative axis
+  stated beside it. The rule is one-directional on purpose: a HARSHER verdict is
+  legal, because a semgrep scan that passes with parse errors writes `approve`
+  beside `degraded` and the contract turns that into `CONDITIONAL`. A test in
+  `src/policy/engine.rs` pins both enum spellings to the words the validator
+  lists. Probed against 3,547 real packs on disk (2,039 at schema 2.2): no
+  legitimate pack is rejected.
+- **Bytes inside a literal now traverse the whole `cfg`-attribute pipeline
+  verbatim.** The accumulator glued an attribute's physical lines together with
+  nothing between them, and the caller trimmed each line before the tracker saw
+  it, so both the line break and a continuation's indentation vanished from
+  inside the value: `#[cfg(api = "a\nb")]` produced the same guard as
+  `#[cfg(api = "ab")]`, and a declaration that really left one configuration
+  paired with its re-add under another. This is the third finding of one shape,
+  after the delimiter count and the whitespace strip, so it is closed as an
+  invariant rather than patched again. The tracker now takes the raw line, joins
+  a physical break with `\n` exactly when a literal is open across it, and trims
+  nowhere — after the dense view there is no whitespace left outside a literal,
+  so a trim could only eat value. Layout outside a literal is still normalized:
+  re-indenting or re-wrapping a predicate is the same gate. Of 568,128 `cfg`
+  attributes in the local crates.io registry, 4 carry a literal spanning a line
+  break, 2 of them gate an item, and none collide.
+- **An unreadable `checks` list is not an empty one.** `checks` present but not
+  an array left the warning tally at zero and fell back to the checks the run
+  itself executed — which on an unchanged `--update` run is none — so
+  `--ci --fail-on-warnings --update` exited `0` on a reused pack whose warning
+  list the reader could not read. It now counts as at least one warning and says
+  so in the existing `unreadable_checks:` caveat. This is the r27 rule one level
+  up, on the container instead of an entry, and no legacy carve-out applies:
+  `checks` has been emitted since schema 1.0 and `validate_merge_gate.py` has
+  always required an array there, so a non-array was never a valid shape. An
+  ABSENT `checks` keeps its tolerance — a pack that states no list may simply
+  predate this build.
+- **Whitespace inside a `cfg` value is part of the gate.** The guard tracker
+  normalized an attribute by stripping whitespace from its whole text, literals
+  included, so `#[cfg(api = "a b")]` and `#[cfg(api = "ab")]` produced one guard:
+  a declaration that really left builds configured with `--cfg 'api="a b"'`
+  paired with its re-add under another value and produced no finding. The strip
+  is now `SourceScanner`'s own dense view, which removes spacing only where it
+  can see the spacing is outside every literal, so reformatting an attribute is
+  still not a different gate. A fix by construction rather than by frequency: of
+  524,530 gating attributes in the local crates.io registry only 3 carry
+  whitespace inside a value literal, and none of them collide.
+- **A check status outside the emitted vocabulary is unreadable, not clean.**
+  `checks[].status` is a closed, case-sensitive set — `passed`, `failed`,
+  `warnings`, `skipped`, `error` — but the CLI tallied warnings by comparing
+  against the single string `"warnings"`, so any other spelling counted as "not a
+  warning" and `--ci --fail-on-warnings --update` exited `0` on a reused pack
+  whose warning signal it could not read. `tools/validate_merge_gate.py` accepted
+  any non-empty string there, so such an artifact even passed the repository
+  gate. Both sides now name the vocabulary: the reader counts an unrecognized
+  status toward the tally and raises an `unreadable_check_status:` caveat naming
+  the checks, and the validator rejects the pack. Case is deliberately not
+  folded — normalizing `"WARNINGS"` silently would hide that the pack is
+  off-contract, and the tally is the same either way. The vocabulary lives as
+  `CheckStatus::EMITTED` next to `CheckStatus::as_str`, with a test pinning the
+  two together.
+- **An attribute's delimiters are counted with its literals removed.** The
+  `cfg`-guard tracker resolved comments away with a carried scanner but counted
+  brackets with a literal state of its own, reset at every line — so a literal
+  opened on an earlier line was invisible to it. A `)` typed inside a multi-line
+  `#[doc = r#"…"#]` balanced the attribute early and the literal's remaining
+  lines then cleared the pending `cfg`; a `#[must_use = "… \` continued onto the
+  next line had its own closing quote read as an opener, swallowing the `]`, so
+  the attribute never closed and absorbed the real `#[cfg(…)]` below it. Either
+  way both diff sides came out unguarded, the identical declaration text paired,
+  and a configuration-specific removal produced no finding. The counter now runs
+  on a literal-free view from a second scanner walking the same lines, while the
+  guard text keeps its literals so `feature = "a"` and `feature = "b"` stay two
+  gates. Measured over the local crates.io registry: of 237,368 `cfg`-guarded
+  attribute runs reaching a public declaration, 8,793 wrap, 90 carry a literal
+  spanning the break, 13 a raw string, and 9 balanced wrongly.
+- **Re-indenting the inside of a multi-line public constant is a value change
+  again.** Continuation lines reached the breaking-change accumulator already
+  trimmed, so whitespace at a line edge INSIDE a string literal — which is value,
+  not layout — never reached the comparison. Two literals differing only in their
+  indentation produced identical identities, and the exact-match pass consumed
+  the addition: a changed public value left no finding at all. The accumulator
+  now takes the raw line and normalizes per edge — the leading edge is kept when
+  the previous line left a literal open, the trailing edge when the line itself
+  does — so a reflow outside a literal stays the no-op it must be, and a trailing
+  comment's leading gap still contributes nothing. Measured over the local
+  crates.io registry, of 200,553 multi-line public declarations 640 continuation
+  lines sit at a literal edge and 272 carry whitespace the old view dropped.
+- **`tools/validate_merge_gate.py` now requires a boolean `quality_pass` from
+  schema 2.2.** The validator checked the field's agreement with the failure
+  details but never its presence or type, so a 2.2 pack stating
+  `quality_pass: "false"` — or omitting it — was certified clean while both
+  decision readers normalize a present-but-unreadable signal to BLOCK. The
+  contract gate was therefore passing artifacts the CLI and MCP refuse to trust.
+  The 2.2 writer emits the field unconditionally as a boolean, so requiring it
+  there is safe; absence stays forgiven below 2.2, where readers derive the flag
+  instead.
+- **A body-less test item can now end its own test context.** After a top-level
+  `=` an item states a value, but the perf tracker kept reading `<` as a generic
+  opener there, so `#[cfg(test)] const ENABLED: bool = 1<2;` left the signature's
+  bracket depth above zero — the very thing the `;` close tests. The item could
+  not end the context it opened, and every loop or query below it was recorded as
+  test-only and dropped from the signal. Angle tracking now stops at the item's
+  top-level `=`, the same rule the declaration scanner already applies. The
+  reported shape is a comparison, but the corpus idiom is the compact shift
+  (`const Reverse = 1<<8;`, as objc2 generates its bitflags): of 2,206,540
+  single-line `const`/`static`/`type` declarations in the local crates.io
+  registry that end at their own `;`, 1,069 left the depth stuck open before this
+  change and 64 still do — and those 64 are an array type wrapping to the next
+  line, where holding the depth open is exactly right.
+- **A turbofish return type no longer hides a changed public signature.**
+  `pub fn run() -> Buffer::<{` is a valid return type — rustc accepts
+  `Type::<…>` in type position — but its `<` follows a `:`, which the scanner did
+  not accept as opening a generic argument list. The list went uncounted, the
+  const block's `{` read as the item's body opener, and both diff sides
+  finalized at that identical prefix: they paired as an unchanged re-add and a
+  changed const argument, which is a changed public return type, produced no
+  finding at all. `:` now joins an identifier and a closing `>` as a predecessor
+  that opens a list; whitespace still does not, so a comparison is still not a
+  list. Verdict-neutral where it is not needed — over all 4,334,018 public
+  declaration lines in the local crates.io registry the old and new rules
+  disagree on none, because a turbofish that closes on its own line nets out
+  either way. What changes is a list left open at end of line.
+- **`tools/validate_merge_gate.py` now rejects a `quality_pass` that
+  contradicts its own evidence.** The flag and `quality_failure_details` are one
+  fact written twice — the emitter sets `quality_pass` to
+  `!QualityFailureSummary::has_new_failures()` and serializes the very details
+  that answer it — but the validator checked each side's shape and never
+  compared them. `quality_pass: true` beside
+  `{"origin": "failure", "classification": "introduced"}` therefore certified
+  clean, and both decision readers trust the permissive scalar, so a
+  validator-clean pack could approve an explicitly introduced failure. The check
+  is an equivalence: `quality_pass` is true if and only if no detail has
+  `origin: "failure"` with a classification other than `pre-existing`. The
+  `pre-existing` carve-out is load-bearing — a failure that predates the diff is
+  emitted beside `quality_pass: true` on purpose, so the simpler one-way rule
+  would have rejected packs prview itself writes. Packs without the field are
+  untouched.
+- **A compactly written comparison in a const argument no longer mutes
+  production code.** The perf tracker judged `<` a generic opener whenever it
+  followed an identifier, which reads `Buffer<{ 1 < 2 }>` correctly and the same
+  type written `Buffer<{1<2}>` wrongly — `<` after a digit looks exactly like `<`
+  after an identifier. The signature's bracket depth then stayed above zero, the
+  real body brace read as another type-level brace, the test context never
+  closed, and every loop or query below the test was recorded as test-only and
+  dropped from the signal. Spacing is formatting, so it can no longer decide the
+  verdict: bracket tracking is now frozen inside a brace opened within the
+  signature, where a const argument holds an expression and a destructured
+  parameter holds a pattern and `<`/`>` are operators in both.
+- **A comparison inside a const argument no longer swallows the item body.**
+  `pub fn run() -> Buffer<{ 1 < 2 }> {` counted the comparison as another
+  generic opener, the argument list's own `>` closed only that phantom level,
+  and the depth was still above zero at the real body brace — which read as a
+  further const argument, absorbed the body, and turned a body-only rewrite into
+  a phantom `ChangedSignature`. Inside a const block `<` and `>` are operators,
+  so the generic depth is now frozen there. Nothing is lost: whatever such a
+  block states about generics closes what it opens — a turbofish
+  (`{ size_of::<u32>() }`) or a qualified path (`Uint<{ <Self>::LIMBS / 2 }>`),
+  which are also the only shapes the local crates.io corpus carries. Those
+  survived the previous rule by cancellation, the block's stray `>` closing the
+  outer list; they now reach the same verdict by construction.
+- **A signature edited in place is no longer swallowed by the context lines
+  around it.** A hunk interleaves two texts, and the scanner reconstructs both:
+  the before side is context ∪ removed lines, the after side is context ∪ added
+  lines. It used to end BOTH pending declarations at the first line from the
+  other side, so the everyday shape of an edited signature — `pub fn f(`
+  retouched on both sides, a shared `x: u8,`, then `-old: u16,` / `+new: u32,`
+  and a shared `) {` — finalized to two identical openers, paired as an
+  unchanged re-add, and reported the parameter change nowhere. A `-` line now
+  extends only the removed side, a `+` line only the added side, and a context
+  line extends whichever side still has a declaration open. Context lines only
+  CONTINUE a declaration and never start one: a `pub` item first seen on a
+  context line is unchanged by the patch. `MAX_DECL_CONTINUATION_LINES` (32)
+  still bounds growth and a hunk header still finalizes both sides, so the
+  reconstruction stays inside the hunk that emitted it.
+- **Braces in a stacked test attribute no longer end the test context.** An
+  attribute's brackets belong to the attribute, never to the item it annotates,
+  but the brace scan read them as the annotated item's: with `#[rstest]` stacked
+  over a brace-bearing `#[case(…)]`, the attribute's `{` was taken as the body
+  opener and its `}` closed the context on the same line, so the test function
+  below was classified as production and a query in its loop surfaced as a
+  phantom regression. The scan now tracks attribute depth per character and
+  skips what is inside one. The plain `#[case(Case { id: 1 })]` was safe only by
+  accident — its `[` and `(` hold the signature depth above zero — while
+  `#[case(1 > 0, 2 > 1, Case { id: 1 })]` clamps that depth back to zero first
+  and reaches the bug; skipping attributes removes the class rather than the one
+  shape.
+- **A legacy `PASS` pack no longer fails `--ci` on the CLI while the MCP adapter
+  approves it.** A decision written before `quality_pass` existed —
+  `{"verdict": "PASS", "merge_recommendation": "approve", "allow_merge": true}`
+  — reconciled correctly to `PASS`, because an absent field adds no rank, but the
+  summary then published `quality_pass: false` from a bare default, derived
+  `analysis_status: incomplete` from that, and exited `1` under `--ci`. The two
+  readers answered the same artifact differently. Ranking an absent field and
+  publishing one are separate questions: an absent axis is now derived from the
+  reconciled outcome, so a reconciled `PASS` — which the contract permits only
+  when quality passes and the analysis is complete — publishes both, and a
+  decision held below `PASS` stays conservative on both. The absent/mistyped
+  split is untouched: an unreadable value normalizes the decision to `BLOCK`, so
+  nothing can be inferred as passing from it.
+- **An incomplete analysis or a stated blocker can no longer be published as an
+  approval.** The conservative reconciliation ranked `verdict`,
+  `merge_recommendation`, `allow_merge` and `quality_pass`, but read
+  `analysis_status` only afterwards for display and `blocking_issues` only for
+  passthrough — so a pack shaped `verdict: "PASS"`, `merge_recommendation:
+  "approve"`, `allow_merge: true`, `quality_pass: true` published a clean
+  approval even when it also stated `analysis_status: "incomplete"` or listed a
+  blocking issue, on the CLI and the MCP surface alike. The contract permits
+  `PASS` only when the analysis is `complete`, and an entry reaches
+  `blocking_issues` only from a check whose `merge_impact` is `Block`. Both now
+  rank: `degraded`/`incomplete` as `CONDITIONAL`, a non-empty `blocking_issues`
+  (and its restatement `policy_allow_merge: false`) as `BLOCK`, each named in the
+  `core_inconsistency:` caveat and typed through `gate::readable_signal` so a
+  mistyped one normalizes conservatively. `analysis_status: "complete"`,
+  `policy_allow_merge: true` and an empty `blocking_issues` state no rank — they
+  are preconditions of a `PASS`, not grants of one — and absence still states
+  nothing, so older packs read exactly as before.
+- **The decision axes are now enumerated in the contract.** Every field the
+  `decision` object may carry has a row in the ranking table of
+  `docs/contracts/merge_gate.md` saying whether it ranks and why, under one rule:
+  an axis states a rank only when its value RULES OUT a more permissive outcome.
+  The deliberate exclusions are recorded with their reasons — `recommended_merge`
+  restates `merge_recommendation`, `recommended_label` has an open vocabulary,
+  the `quality_failures` arrays are populated by warning-origin entries that
+  never flip `quality_pass`, and `quality_failure_details` is the evidence behind
+  that axis rather than an axis of its own. A field added to `decision` without a
+  row is an unfinished change.
+- **A `quality_pass` that cannot be typed is no longer read as absent.** Both
+  readers took that axis with a bare `as_bool()`, which returns nothing for a
+  present-but-mistyped value just as it does for a missing one — so a pack
+  stating `quality_pass: "false"` beside a clean approval was read as a pack
+  written before the field existed, and published `PASS` with `allow_merge: true`
+  and no caveat at all, on the CLI and the MCP surface alike. `quality_pass` now
+  goes through the same `gate::readable_signal` as `verdict`,
+  `merge_recommendation` and `allow_merge`: a stated-but-unreadable axis
+  normalizes to `BLOCK` and is named by an `unreadable_quality_pass:` caveat. An
+  absent `quality_pass` is still silent and still states no rank, so packs
+  written before the field are unaffected.
+- **A failed quality axis can no longer be published as a `PASS`.** The
+  conservative reconciliation ranked `verdict`, `merge_recommendation` and
+  `allow_merge` but read `quality_pass` separately, afterwards — so a pack
+  shaped `verdict: "PASS"`, `merge_recommendation: "approve"`,
+  `allow_merge: true`, `quality_pass: false` published a clean approval with
+  `allow_merge: true`, on the CLI and on the MCP surface alike, where automation
+  could act on it. A stated `quality_pass: false` now ranks as `CONDITIONAL` on
+  both readers, exactly like `allow_merge: false`, and is named in the
+  `core_inconsistency:` caveat. `quality_pass: true` still states no rank — a
+  quality-clean run is held at `CONDITIONAL` by a breaking-change escalation, so
+  one axis may not soften a verdict the others agree on — and an ABSENT
+  `quality_pass` still states nothing, so packs written before the field are
+  read exactly as before.
+- **A `|` in a declaration no longer breaks the `BREAKING_CHANGES.md` tables.**
+  Declaration text went into a markdown table verbatim, and Rust states bitwise
+  or, patterns and closures with the table's own delimiter — so a row reporting
+  `pub const MASK: u32 = READ | WRITE;` opened extra columns and rendered as
+  garbage exactly where the declaration mattered. Every cell carrying source
+  text now escapes `|` as `\|`, which is what GitHub's table parser needs: it
+  splits on unescaped pipes before any inline markup runs, so a code span was
+  never protection. The span is also fenced by a backtick run longer than any
+  inside the cell, so a declaration stating a backtick of its own —
+  `pub const TEMPLATE: &str = r#"`value`"#;` — no longer closes its own code
+  span partway through and renders the remainder as prose.
+- **`#[cfg(not(test))]` no longer mutes a production performance finding.** The
+  perf tracker opened inline test context on the bare token `test` appearing
+  anywhere inside a `cfg` predicate, so a query-in-loop under
+  `#[cfg(not(test))]` — code compiled into every build EXCEPT the test one — was
+  recorded as test-only and dropped, and so was one under
+  `#[cfg(any(test, feature = "bench"))]`, which compiles outside the test build
+  whenever the feature is on, or under `#[cfg(feature = "__internal-test")]`, a
+  feature that merely has `test` in its name. This inverted the module's own
+  rule that ambiguity resolves toward production. Only a gate that provably
+  holds solely in a test build now opens the context: an exact `#[cfg(test)]`,
+  an `#[cfg(all(…))]` naming `test` among its operands, `#[test]` /
+  `#[tokio::test]` / `#[rstest]`, and `mod tests`. Measured over the local
+  registry (58,586 files), of the 11,030 attributes the old pattern read as test
+  context 83.62% are exactly `cfg(test)` and 6.76% are `all(…, test, …)` — the
+  remaining 9.62% are the ones it was getting wrong. `all` is commutative, so
+  the operand's position carries no meaning: `all(feature = "bench", test)` is
+  read exactly like `all(test, feature = "bench")`, where matching only the
+  first operand made the same predicate production or test context depending on
+  how it was written (72 further attributes over that registry, none lost). The
+  operand must be a direct one, so `all(not(test), …)` — which proves the
+  opposite — and `all(any(test, …), …)` stay production. The predicate is also
+  read as a whole attribute rather than per physical line: rustfmt wraps a long
+  one, and a `#[cfg(all(` / `feature = "bench",` / `test` / `))]` spread over
+  four lines matched on none of them, so its test-only item was read as
+  production and its query-in-loop surfaced as a phantom regression. The lines
+  of one attribute are now joined and matched once, on the line that closes it,
+  bounded to 8 lines so an attribute that never closes is dropped instead of
+  swallowing the rest of the hunk. The shape is rare — 10 occurrences over that
+  registry, every one a genuine `all(test, …)` gate.
+- **A block or struct-literal initializer no longer hides a changed public
+  constant.** `pub const LIMIT: usize = {` and `pub const ZERO: Self = Self {`
+  had their `{` read as the item's body opener, so both diff sides finalized at
+  their identical first line, paired as an unchanged re-add, and a changed
+  expression inside the block produced no finding at all. After a top-level `=`
+  the item states a value and runs to its `;`, and a `;` inside the initializer
+  terminates a statement rather than the declaration. Only a top-level `=`
+  counts — inside a generic argument list one states a default
+  (`struct Foo<const N: usize = 4>`) or an associated type
+  (`impl Iterator<Item = u8>`), both still followed by a real body brace.
+  Measured over the local registry (58,586 files, 1,960 crates, 4,334,320 public
+  declaration lines) this changes the verdict on 2,465 lines, every sampled one
+  a public constant with a multi-line struct-literal or block initializer.
+- **A reflowed declaration is no longer reported as a changed signature.** The
+  comparison identity preserved every physical line break, so
+  `pub type Alias =` followed by `u32;` was a different declaration from
+  `pub type Alias = u32;` — a purely cosmetic rewrap produced a
+  `ChangedSignature` whose "before" and "after" printed as the same string, and
+  could escalate the verdict. A break is now kept only where the previous line
+  left a string literal open, which is where it is part of the value; elsewhere
+  the lines are joined with a space. For the same reason a line contributing no
+  code is still dropped from the identity except inside a literal, where a blank
+  line is a blank line in the value.
+- **A const argument that is not the first one no longer hides a public type
+  change.** The breaking-change scanner recognized `Buffer<{ LIMIT }>` as
+  type-level syntax by the exact `<{` sequence, so `Buffer<u8, { LIMIT }>` —
+  where the brace follows a comma, which is where a const generic usually sits —
+  finalized the declaration at its opener. Both diff sides then held the same
+  prefix, paired as an unchanged re-add, and the changed const expression below
+  produced no finding. The scanner now tracks the generic argument list itself.
+  `<<` is consumed whole so a shifted public constant still terminates at its
+  `;`, and measured over the local registry (59,946 files, 2,025 crates,
+  4,354,142 public declaration lines) the new rule and the one it replaces judge
+  zero lines differently.
+- **The MCP adapter and the CLI now answer the same way about a decision they
+  cannot rank.** A pack that stated a signal outside the vocabulary — a
+  `verdict: "PROBABLY"`, or nothing but `allow_merge` — was read as a
+  conservative `BLOCK` summary by the CLI and refused as `storage_corrupt` by
+  `prview mcp`, one artifact with two answers. `storage_corrupt` is now reserved
+  for a decision block stating none of `verdict`, `merge_recommendation` and
+  `allow_merge`; a stated-but-unrankable signal is a decision the pack gave, and
+  the adapter normalizes it exactly as the CLI does, with a caveat and
+  `normalized: true`. The substitution governs the axes published beside it, so
+  an unreadable verdict beside `merge_recommendation: "approve"` no longer reads
+  as an approval on the MCP surface while the CLI blocks on the same bytes.
+- **A self-consistent `BLOCK` pack no longer reports contradicting itself.**
+  Both readers compared `allow_merge` to the numeric rank of the winning
+  verdict, but `allow_merge` has two values and `false` ranks as `CONDITIONAL` —
+  so `verdict: "BLOCK"` beside `merge_recommendation: "block"` and
+  `allow_merge: false`, the shape every blocking run writes, raised a
+  `core_inconsistency:` caveat naming a disagreement that was not there. The
+  check now compares the textual axes to the published verdict and `allow_merge`
+  to the flag actually published.
+- **`--ci` strictness no longer depends on which preset the run resolves to.**
+  `--update` outranks `--ci` when the execution preset is picked, so
+  `prview --ci --fail-on-warnings --update` published `execution_mode: "update"`
+  — and the exit code read its strictness off that label. Both `--ci` exits, the
+  `!quality_pass` one and the warning hardening clap insists on `--ci` for, were
+  therefore inert for exactly the combination CI jobs use. Strictness now follows
+  the flag the caller typed. On top of that, an `--update` run with no new
+  commits forced exit `0` outright: it reuses the previous pack and reports it,
+  so a second invocation turned a warning-carrying — or outright `BLOCK` — pack
+  green. Such a run now derives its exit from the pack it reused, like every
+  other run; `--soft-exit` stays the one deliberate way to ask for `0`.
+  (`output::compute_exit_code` takes the strictness explicitly as a result.)
+- **A `MERGE_GATE.json` decision that states nothing is corrupt, not a BLOCK.**
+  A pack shaped `{"schema_version":"2.2","decision":{}}` passed the CLI's
+  structural check — the object is there and it is an object — and then
+  normalized to `BLOCK` and published a summary with `--ci` exit `1`, for an
+  artifact that never gave a verdict. The other three readers already refused
+  it: the MCP adapter with `storage_corrupt`, `prview gate` on deserialization,
+  and `tools/validate_merge_gate.py` on its required fields. The CLI now
+  requires at least one of `verdict`, `merge_recommendation` or `allow_merge`
+  and exits `3` without them, so the readers agree on the same pack. Presence is
+  the test, not recognizability: a stated `verdict: "PROBABLY"` is still read
+  and still collapses to `BLOCK` with its caveat.
+- **A block comment no longer takes a `cfg` guard down with it.** The guard
+  tracker read `/** Configuration for the a build. */` standing between
+  `#[cfg(feature = "a")]` and the item it guards as a new item, so both sides of
+  a diff came out unguarded, the identical declaration text paired as an
+  unchanged re-add, and a struct that really disappeared for the `a` build
+  produced no finding at all. Comments are now resolved away before the tracker
+  reads a line, by the same per-side scanner the declaration accumulator uses:
+  the comment reaches it as the blank line it is, wrapped over as many lines as
+  it likes. The same resolution retires the recorded limit on the attribute's
+  delimiter counter — `/* ))) */` inside a wrapped `#[cfg(any(` predicate no
+  longer balances the attribute early. Literals stay in that view, because
+  `#[cfg(feature = "a")]` and `#[cfg(feature = "b")]` are different gates.
+- **A const argument in a type no longer ends the declaration.** `pub type Alias
+  = Buffer<{` opens a const argument, but the accumulator read that `{` as the
+  item's body opener and finalized there. Both diff sides held the same
+  truncated prefix, paired as an unchanged re-add, and a changed const
+  expression on the lines below — a different public type — produced no finding.
+  A `{` directly after a `<` is now carried to its matching `}`. The rule is
+  that exact sequence rather than generic-argument tracking, because `<` is also
+  the shift operator: 4,666 public `const`/`static` declarations in the local
+  registry state a shift on their own line, against 6 that carry a `<{`.
+- **A changed multi-line array constant surfaces again.** An array type states
+  its length with a `;` — `pub const TABLE: [u8; 2] = [` — and the declaration
+  accumulator accepted that `;` as the terminator. Both sides of a diff
+  finalized at their identical opener, paired as an unchanged re-add, and the
+  changed values below produced no finding at all. Square brackets are now
+  counted like parentheses before a `;` ends a declaration.
+- **A literal spanning two lines is no longer the same value as one with a
+  space.** The comparison identity joined physical lines with a space, including
+  the lines a literal spans, so a rewritten public constant paired away as an
+  unchanged re-add. Lines are now separated by the boundary that separated them.
+- **A raw-identifier module is its own scope.** The inline-module parser stopped
+  at the `#`, recording both `mod r#type` and `mod r#match` as `r`: two
+  namespaces looked like one, and a removal from the first was cancelled by an
+  unrelated addition in the second.
+- **A comparison inside a const argument no longer holds a test context open.**
+  The perf tracker counted the `<` of `Buffer<{ 1 < 2 }>` as a generic opener,
+  leaving the signature depth stuck above zero so the real body brace was read
+  as another type-level brace. The context never closed and every production
+  loop and query after the test was muted. A `<` now opens a generic only where
+  one can be — directly after what it parameterises.
+- **Rewording a comment inside a declaration is no longer a signature change.**
+  Declarations were compared on their verbatim text, comments and all, so a
+  remove+re-add of a byte-identical public signature whose internal comment had
+  been rewritten came out as a `ChangedSignature` — a breaking-change claim
+  about text no consumer can observe. Pairing now compares a comment-free view
+  of the same lines while `BREAKING_CHANGES.md` keeps showing the declaration as
+  written. String and char literals stay in that view: a literal is code, so a
+  changed `pub const GREETING: &str = "hello";` still surfaces.
+- **A brace in a test function's signature no longer ends its test context.**
+  The perf tracker treated the first `{` after a test marker as the item's body
+  opener, but a brace in type or pattern position — `fn run() -> Buffer<{ LIMIT
+  }>`, or the extractor idiom `fn handler(Parameters(Req { field }):
+  Parameters<Req>)` — balances before any body exists. The next line then looked
+  like the item closing again, so the context ended at the signature and every
+  loop and query in the test body was reported as a production perf regression.
+  The body opener is now the first brace outside the signature's bracket
+  nesting.
+- **`report.json` names the origin of every quality-failure detail.**
+  `gate.quality_failure_details[]` carried `name` + `classification` while
+  `MERGE_GATE.json` has carried `origin` (`"failure"` / `"warning"`) since
+  schema 2.2, so the two artifacts of ONE run disagreed about what "failure"
+  meant: a consumer reading `introduced_quality_failures: ["Rustfmt"]` next to
+  `quality_pass: true` in `report.json` had nothing to reconcile them with. The
+  field is additive and `report.json` stays `schema_version: "2.0"` — that major
+  is itself unreleased, so no consumer has ever seen a 2.0 without it.
+- **A `cfg_attr` that applies a `cfg` is part of the guard.** The guard filter
+  recognized only the literal `#[cfg(` spelling, so
+  `#[cfg_attr(feature = "a", cfg(unix))]` — which gates the item exactly as a
+  `cfg` does — was dropped from BOTH sides' identity: the declaration text then
+  paired, and a symbol that really left one configuration produced no finding at
+  all. `cfg_attr` now joins the conjunction when it applies a `cfg`, and only
+  then: `#[cfg_attr(unix, derive(Debug))]` decides an attribute on the item, not
+  the item, and a gate invented there would split an ordinary re-add into a
+  phantom removal.
+- **A trailing `//` no longer swallows the rest of a declaration.** Continuation
+  lines are joined with a space, and the joined text was then scanned as one
+  piece — so a comment on any continuation line commented out every line
+  appended after it. `declaration_complete` never saw the closing `)` or the
+  body `{`, the accumulator ran on into the body, and a body-only rewrite of a
+  commented multi-line signature was reported as a `ChangedSignature` that never
+  happened. Completeness is now decided on a separate view of the same lines,
+  read one physical line at a time, which ends a `//` where it really ends while
+  still carrying an open literal or `/* … */` across the lines.
+- **Every risky-pattern needle is word-bounded, not just the plain words.**
+  Bounded matching was applied only to needles made entirely of identifier
+  characters, so `todo!(`, `dbg!(`, `println!(`, `console.log(`, `unsafe {` and
+  `as any` kept raw substring matching: `mytodo!(…)` was reported as a TODO
+  marker and every `has any` in a doc comment as a type cast — the exact
+  substring false positives bounded matching exists to exclude. Each side of a
+  needle is now bounded where the needle itself has an identifier edge, which
+  leaves `.unwrap()` matching `value.unwrap()` and `eslint-disable` matching
+  `eslint-disable-next-line`. `eprintln!`/`eprint!` are now listed explicitly:
+  they used to be caught only because `eprintln!(` contains `println!(`.
+- **A test marker on a body-less item no longer mutes the rest of its hunk.**
+  The performance-regression tracker closed a test context only when its opening
+  brace balanced again, but `#[cfg(test)] mod tests;` and `#[cfg(test)] use
+  crate::helper;` never open one. The context stayed active for the remainder of
+  the hunk, so production loops and queries added below such a declaration were
+  recorded as test-only and disappeared from the signal. A context opened over an
+  item that ends at its `;` now closes there.
+- **A long signature change is no longer swallowed by the accumulation cap.**
+  Declaration text stopped accumulating after eight continuation lines, which
+  cuts inside the real distribution of `pub` signatures: two long declarations
+  that agree on their opener and those eight lines finalized to the SAME
+  truncated text, so the exact-match pass paired them as an unchanged re-add and
+  a parameter, bound or return type changed on the ninth line or later produced
+  no finding at all. The bound is now 32 lines and is documented as what it is —
+  a runaway valve for static bodies and generated data tables, not a display
+  width.
+- **A `cfg` predicate wrapped across lines still guards its declaration.** The
+  breaking-change pairing recorded only the opener of `#[cfg(any(`, and the first
+  continuation line then looked like a new item and cleared the guard: both sides
+  of the diff came out unguarded, so a `pub` item that really disappeared for one
+  configuration paired with its re-add under a different one and left no finding
+  at all — the exact false negative the guard was added to prevent. Attributes
+  are now accumulated to their balanced close, which also makes a wrapped
+  predicate compare equal to its single-line spelling, and a wrapped
+  `#[derive(…)]` no longer takes the `cfg` above it down with it.
+- **One verdict vocabulary now answers for every reader surface.** The CLI
+  matched a stored verdict case-sensitively while the MCP adapter ranked it
+  through an uppercase fold, so a pack stating `verdict: "pass"` was a clean
+  `PASS` to MCP automation and an unknown verdict normalized to `BLOCK` on the
+  CLI — the same artifact approved by one reader and rejected by the other, which
+  is the divergence the shared reconciliation exists to prevent. `APPROVE`
+  diverged identically, case aside. A third surface was worse: `prview gate`
+  compared the folded summary verdict against the pack's RAW string, so any
+  legacy or non-canonical spelling (`ALLOW`, `HOLD`, `pass`) failed loud as a
+  "gate verdict mismatch" on a pack both other readers accept. The vocabulary
+  moved into `gate::canonical_verdict` and all three surfaces fold through it;
+  `rank_from_verdict` is now derived from it, so ranking and folding cannot drift
+  apart. `GateVerdict` stays a strict parser of canonical spellings and is fed
+  the folded value.
+- **Raw C string literals are read as raw strings.** The diff scanner accepted
+  the `r` and `br` raw prefixes but not `cr` (Rust 1.77), so `cr#"…"#` was not
+  recognized as an opener: the prefix leaked into the code text and the first
+  interior `"` opened a phantom ordinary string, leaving every brace in the
+  literal's body to be counted as syntax — the same failure as an untracked
+  multi-line literal, which pops a `mod` scope early and can cancel a real API
+  removal. Unlike the raw forms, `b"…"` and `c"…"` escape exactly like an
+  ordinary string and were already blanked correctly. The construct is real
+  outside this tree: 38 `cr#"…"#` sites across 11 crates in a 2025-crate
+  crates.io sample, including `syn` and `proc-macro2`.
+- **String literals are tracked across lines, like block comments already were.**
+  The diff scanner blanked a literal only on the line that opened it, so the tail
+  of a multi-line template or JSON fixture reached the delimiter trackers as
+  code: its closing `"` read as an OPENER and the `}` in front of it as syntax.
+  That popped `mod a` one level early, left a removed `a::Config` with an unknown
+  scope, and an unknown scope pairs with anything — so an unrelated `b::Config`
+  addition cancelled a real API removal. The construct is not exotic here: 241
+  multi-line literals live in this tree and 168 carry a brace in their body, and
+  replaying the last 201 commits shows 29 hunk sides whose brace counting this
+  corrects (21 of them in the scope-popped-early direction, the one that HIDES a
+  breaking change). The scanner now carries an open normal or raw literal, with
+  the raw delimiter's own hash count, and forgets it at the same hunk boundary
+  where it forgets an open comment. The residual cost of carrying is a hunk that
+  STARTS mid-literal, measured at 1 in 872 over the same history, and it cannot
+  outlive the hunk.
+- **The `cfg` guard of a declaration is the whole stack of attributes above it.**
+  Stacked `#[cfg(…)]` attributes are Rust's `AND`, but only the last one was
+  recorded, so `#[cfg(unix)] #[cfg(feature = "x")] pub struct Config;` replaced
+  by the same struct under `#[cfg(windows)] #[cfg(feature = "x")]` compared equal
+  on the shared feature alone: the removal paired with the re-add and the API
+  that disappeared for Unix builds was never reported. The guard is now the
+  complete conjunction, sorted — reordering two attributes gates the item
+  identically and is not an API change.
+- **Contradictory decision signals are reconciled by conservativeness, not by
+  field order.** A gate stating `verdict: "BLOCK"` beside
+  `merge_recommendation: "approve"` is correctly typed and in vocabulary, so
+  none of the unreadable/unknown guards fired and the CLI simply believed each
+  field in turn — publishing a `BLOCK` verdict next to an `Approve`
+  recommendation and, because `compute_exit_code` keys off the recommendation,
+  exiting `0` on a gate whose own canonical artifact said BLOCK. Both readers now
+  rank every stated axis through the shared `gate::rank_from_verdict` /
+  `gate::rank_from_merge_rec` (1 = pass, 2 = hold, 3 = block), publish all axes
+  from the highest rank, and name the contradiction with a `core_inconsistency:`
+  caveat. `allow_merge: true` beside `review_required` no longer buys a `PASS`
+  either, which is the `allow_merge == (verdict == "PASS")` invariant holding on
+  contradictory packs too. A recommendation outside the vocabulary cannot rank,
+  so it is excluded and named with `unknown_merge_recommendation:` — the caveat
+  the MCP surface already emitted and the CLI did not.
+- **A gate whose root is not a JSON object is corrupt on both readers.** The
+  legacy tolerance says WHERE a schema-less pack's decision sits, not that
+  anything parseable counts as one. A `MERGE_GATE.json` holding an array, a
+  scalar or `null` was read by the CLI as a decision with every signal missing,
+  which normalized to `BLOCK` and returned a successful summary — for an artifact
+  the MCP reader rejected as `storage_corrupt`. Both now fail loud (`exit 3` /
+  `storage_corrupt`) with a message that names the actual defect.
+- **`--ci --fail-on-warnings` counts the warnings it promised to count.** The
+  flag read `Report.checks` — the list the CLI itself executed — while the
+  artifact run appends `public_api_diff`, `unsafe_audit`, `ghost_refs` and the
+  synthetic `heuristics_loctree` to the list `MERGE_GATE.json` is built from, and
+  none of those ever returns to the CLI. A run whose only warning came from one
+  of them exited `0` under a flag that promises to fail when any check warns. The
+  exit now keys off the pack's canonical `checks[]`, and the `--json` summary
+  states both numbers: `checks_summary.warned` (what the CLI ran) and the new
+  additive `checks_summary.warned_in_pack` (the complete count), which is never
+  smaller. A pack with no readable `checks` array falls back to the CLI tally and
+  says so with an `unreadable_checks:` caveat.
+- A warning is no longer reported as a failed quality check. A baseline-signal
+  check that reports `Warnings` (cargo-audit raising an unmaintained-crate
+  advisory, `rustfmt`, `eslint`, `ruff`, `prettier`, `stylelint`, `semgrep`) is
+  admitted to the quality summary so the pre-existing downgrade can be computed
+  for it — but when it produced no locatable finding it classified as
+  `unclassified`, which flipped `quality_pass` to `false` and printed
+  "N quality checks failed" for output that never contained a failure. Warning
+  entries now carry their origin and are excluded from the failure gate whatever
+  they classify as: `quality_pass` stays `true`, `decision.analysis_status` stays
+  `complete` instead of being degraded, the dashboard hero reads
+  `ALLOW WITH REVIEW` instead of `HOLD`, and the gate reason gets a separate
+  honest sentence (`2 warning signals: 1 pre-existing, 1 introduced`). Real
+  failures (`Failed`/`Error`) are unchanged and still fail closed on
+  `introduced`, `mixed`, and `unclassified`. The origin is now stated on the
+  wire: `decision.quality_failure_details[]` carries `origin`
+  (`"failure"` / `"warning"`), which is what lets a reader make sense of
+  `introduced_quality_failures: ["Rustfmt"]` sitting next to
+  `quality_pass: true`. This is an additive field, so `MERGE_GATE.json` is
+  `schema_version: "2.2"` and `tools/validate_merge_gate.py` accepts it — and,
+  from 2.2, requires it: an entry that omits `origin`, mistypes it, or spells it
+  anything other than `failure` / `warning` now fails the contract validator,
+  because a consumer told to filter on `origin == "failure"` cannot do that on a
+  pack where the field is optional. The validator checks the whole entry, not
+  only the field that names the schema: `name` must be a non-empty string and
+  `classification` one of `introduced` / `pre-existing` / `mixed` /
+  `unclassified`, the vocabulary `QualityFailureClass::as_str` emits. Validating
+  `origin` alone let `{"origin": "failure"}` — a failure naming no check and
+  stating no provenance — pass its own contract gate, and let `classification`
+  drift to any string at all, including the `preexisting` spelling used by the
+  sibling count field rather than the `pre-existing` the emitter writes.
+- Perf regression detection now resolves inline Rust test context (`#[cfg(test)]`,
+  `mod tests`, `#[test]`) **per hit line** instead of per hunk. A production hot
+  path that merely shared a hunk with a test module was classified as
+  `test_context_only` and silently dropped from the reviewer-facing signal
+  (`perf_regression_suspected` and the risk score both ignore test-only
+  suspects). Test context now opens at its marker and closes when the braces
+  opened after it balance out, commented-out markers no longer open it, and any
+  ambiguity resolves toward production — a false positive costs a reviewer a
+  glance, a false negative hides a real regression. The scope is read from the
+  patch's **target state** only: a `#[cfg(test)]` that the patch *deletes* no
+  longer opens test context over the added production code, and a renamed test
+  function no longer leaves the scope permanently open (its removed and added
+  declaration lines each contributed an opening brace while sharing one closing
+  brace). A hit is now also paired only with a nearby loop in the *same*
+  context, so a production statement cannot borrow a loop from an adjacent test
+  module — or the reverse. Trailing comments are stripped before both the marker
+  match and the brace tracking, so `let x = 1; // #[cfg(test)]` no longer opens
+  test context and a `{` inside a comment no longer shifts the scope; a `//`
+  inside a string literal is still code. String and char literals are blanked
+  for the same reason: `const CLOSE: &str = "}"` in a test module used to close
+  the scope early and report every later test hit as production, and an
+  unmatched `{` in a literal held it open and muted real production hits.
+  Normal, raw (`r#"…"#`) and byte-string literals as well as char literals
+  (`'}'`, `'\u{7b}'`) are recognised; lifetimes are not mistaken for char
+  literals. Block comments count too, and they are tracked ACROSS lines —
+  commenting a block of code out is exactly how an unbalanced brace ends up
+  inside a comment, and a `/* … } … */` spread over three lines closed the test
+  scope early (or, with a `{`, held it open and muted real production hits). A
+  `/*` inside a string literal stays data: `format!("{}/*.{}", dir, ext)` is a
+  glob pattern, and reading it as a comment opener would swallow the rest of the
+  hunk — a far more common line in real diffs than a block comment is. A *string*
+  literal spanning several diff lines is carried the same way a block comment is:
+  the scanner keeps one open across lines, so a brace inside a multi-line
+  template or JSON fixture never reaches a delimiter tracker as syntax. What ends
+  the carrying is the hunk boundary, where the text stops being contiguous.
+- Breaking-change detection pairs duplicate declarations one-to-one. `cfg`-gated
+  variants share (file, kind, name), and the pairing search never consumed its
+  match, so every removal cancelled against the same unchanged re-add: the
+  addition that actually replaced one of them stayed unpaired and its signature
+  change was never reported, while a genuine removal could be cancelled by an
+  addition already spent on another. Exact matches are now claimed first, each
+  addition is consumed once, and one cancelled removal retires exactly one
+  finding.
+- Breaking-change detection no longer loses a removal to a same-named symbol in
+  another inline module. `pub mod a { pub struct Config }` deleted while
+  `pub mod b { pub struct Config }` is added in the same file was cancelled as a
+  no-op remove+re-add; the pairing now also requires compatible inline-module
+  scopes (tracked per diff side, hunk-local — an unseen `mod` opener leaves the
+  scope unknown and pairs as before). That module tracker now reads code only:
+  a brace inside a comment or a string/char literal (`// }`, `"{"`, `'}'`) used
+  to open or close a module scope that does not exist, so a removal and its
+  unrelated same-named addition landed in the same phantom scope and cancelled
+  each other — the breaking change vanished from the report. The literal/comment
+  scanner is shared with perf-regression test-context tracking (`rust_source`),
+  so both brace trackers agree on what counts as syntax, block comments spanning
+  lines included.
+- Breaking-change detection no longer cancels a removal against a re-add under a
+  DIFFERENT `cfg`. `#[cfg(feature = "a")] pub struct Config;` replaced by the
+  same struct under feature `b` is an exact text match, so the pairing dropped
+  the removal — but `Config` really did disappear for anyone building with
+  feature `a`. The guard standing above a declaration is now part of its pairing
+  identity (whitespace-insensitive, so a reformatted attribute is not a
+  different predicate). A guard the diff never showed on one side stays unknown
+  and pairs as before, the same tolerance an unseen `mod` opener gets: the
+  attribute often sits on a context line, and reading "not shown" as "no cfg"
+  would turn ordinary re-adds into phantom removals.
+- A public declaration no longer ends at a delimiter inside its own literal.
+  `pub const TEMPLATE: &str = r#"{` opens a multi-line raw string, and reading
+  that `{` as the declaration's body opener finalized a truncated declaration —
+  identical on both diff sides, so the removal was cancelled and the literal
+  change the patch actually made produced no finding at all. Completion is now
+  judged on code only, and the accumulated text is scanned as a whole, so a
+  literal spanning continuation lines closes the declaration where it really
+  ends.
+- Multi-line public declarations are compared in full. `pub struct Config<` with
+  a changed bound on the next line used to hide behind its identical opening
+  line, because only that line was compared. Continuation lines are now
+  accumulated on both diff sides — for every symbol kind, not just `pub fn` —
+  up to 8 lines, and `BREAKING_CHANGES.md` shows the full declaration.
+- `BREAKING_CHANGES.md` no longer collapses two different symbol kinds into one
+  row. Changed signatures were grouped by (file, name); now that non-fn
+  declarations also produce signature changes, a `pub struct Limit` and a
+  `pub const Limit` in one file were rendered as one row plus a bogus
+  "feature-gated variant" note. The grouping key now carries the symbol kind.
+- The pattern scan no longer reports an identifier as a TODO marker. Word
+  boundaries were read byte-wise over ASCII only, so `$` — an identifier
+  character in JavaScript/TypeScript and the macro metavariable sigil in Rust —
+  and every non-ASCII letter counted as a boundary: `const $TODO = false` and an
+  identifier abutting a Unicode letter were both reported, inflating `prod_hits`
+  and the risk score with exactly the false positives bounded matching exists to
+  exclude. Boundaries are now read per character over the union of identifier
+  characters the scanned languages accept.
+- A skipped `semgrep` run keeps its diagnostic. The tool/config-error skip reason
+  was built from stderr alone, but under `--json` semgrep reports rule and config
+  failures in the stdout payload's `errors[]` and can leave stderr empty — so the
+  one explanation available was discarded and the policy engine received the bare
+  "semgrep exited 2 with no findings payload" sentence. The excerpt is now taken
+  from stderr, else the payload's `errors[]` (reading `message` / `long_msg` /
+  `short_msg` / `type`, whichever the semgrep version emits), else raw stdout, so
+  a crash traceback printed on stdout also survives.
+- `report.json` distinguishes a disabled heuristics run from a broken scanner.
+  `--quick` and `--no-heuristics` short-circuit the scan to a default result
+  that the caller still passes on, so the report described the intentional skip
+  as `skip_reason: "loctree analysis unavailable"` — a tool failure that never
+  happened — and pointed `log_path` at a zero-filled stub, while the
+  `"heuristics not run"` reason was unreachable from the production path. A run
+  that never asked for heuristics now reads `heuristics not run` and omits both
+  `total_files` and `log_path`. No field changed shape, so `report.json` stays
+  `schema_version: "2.0"`.
+- Coverage no longer reports an unmeasured scan as perfect. A diff with zero
+  changed source files produced `0/0 (100%)` in `AI_INDEX.md`,
+  `coverage-delta.txt`, and the dashboard; it now reads `not measured`, and the
+  coverage card/chip/section is omitted instead of showing a fabricated 100%.
+  A real `0/N` (N > 0) is still a genuine `0%` measurement.
+- `report.json` no longer zero-fills skipped analysis. `quality.heuristics` now
+  carries `status` (`"measured"` / `"skipped"`), an optional `skip_reason`, and
+  `total_files`; a loctree run that scanned no files (or never ran) omits
+  `dead_exports`, `cycles`, `twins`, and `unused_symbols` instead of emitting
+  zeros indistinguishable from a clean scan. This matches the SKIP semantics
+  `MERGE_GATE.json` and `heuristics_loctree.result.json` already used.
 - Cached check results now carry provenance. A cache hit used to return
   `provenance: None`, so the fastest runs — the ones where every gate is served
   from cache — were the only ones with no audit trail at all: no command, no
@@ -326,23 +1200,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `target_sha`, because sitting below `repo_root` was taken as proof. Such a
   directory is `foreign` wherever it sits.
 
-### Changed
-
-- Bumped the bundled `loctree` structural-analysis crate from `0.8` to `0.13.0`.
-  The public API prview consumes (`analyzer::{cycles, dead_parrots, twins}`,
-  `snapshot::{Snapshot, project_cache_dir, run_init, SNAPSHOT_SCHEMA_VERSION}`,
-  `args::ParsedArgs`) is source-compatible — no call sites changed. The snapshot
-  schema version is now decoupled from the crate version (pinned at `0.11.0`
-  instead of tracking `CARGO_PKG_VERSION`); prview's `major.minor` schema gate
-  handles the transition, so stale `0.8`-era caches are re-scanned automatically.
-  loctree 0.13 also widens file-type coverage in the scan (markdown, shell,
-  config, and other non-source files now count toward the snapshot), so the
-  `LOCTREE` heuristics stats (`total_files`, `total_loc`, `by_language`) report
-  higher, broader numbers than under 0.8 for the same tree.
-
 ### Security
-- bump ammonia 4.1.3 → 4.1.4 (RUSTSEC-2026-0213: XSS via SVG `animate`/`set` attributes)
 
+- bump ammonia 4.1.3 → 4.1.4 (RUSTSEC-2026-0213: XSS via SVG `animate`/`set` attributes)
 
 ## [0.6.0] - 2026-07-07
 

@@ -17,6 +17,12 @@ they must not parse stdout.
 Use `prview gate --json` when CI needs a machine-readable summary, artifact
 paths, or SARIF path discovery. Pass/fail still comes from the process exit code.
 
+Exit `3` covers every way the run can end without a trustworthy verdict — the
+review failing to execute, and the pack's `00_summary/MERGE_GATE.json` being
+missing, unparsable, or stamped with a `schema_version` this build cannot read.
+Plain `prview --ci` uses the same code for the same conditions: it never
+re-derives a verdict when the gate artifact cannot be read.
+
 ## Breaking-change escalation
 
 A genuine breaking API change in the diff — a removed public symbol, a changed
@@ -43,7 +49,11 @@ which command you run. Two contract lines, deliberately distinct:
   hard failure (`BLOCK` or a broken quality gate); a `CONDITIONAL` verdict —
   including a breaking-only `CONDITIONAL` — exits `0`, exactly as it does for any
   other `CONDITIONAL` cause. This is the historical review contract and does not
-  change with breaking-change escalation.
+  change with breaking-change escalation. Warning-level checks are advisory and
+  do not break the quality gate, so a warnings-only run exits `0`; add
+  `--fail-on-warnings` to opt into exit `1` for them. Both `--ci` exits hold
+  whatever preset the run resolves to — `--ci --update` is still strict, and an
+  `--update` run with no new commits takes its exit from the pack it reused.
 * **`prview gate`** — the contractual enforcement path. `CONDITIONAL` exits `1`,
   and `prview gate --strict` exits `2` (see the exit-code contract above).
 

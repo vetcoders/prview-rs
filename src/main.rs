@@ -110,7 +110,16 @@ async fn run() -> Result<()> {
     // Normal run
     let report = app.run().await?;
 
-    let cli_summary = prview::output::build_cli_json_summary(&app.config, &report);
+    // The verdict comes from the pack's MERGE_GATE.json and nowhere else. If it
+    // cannot be read, prview cannot report a verdict — that is an execution
+    // error (exit 3, same contract as `prview gate`), never a guessed summary.
+    let cli_summary = match prview::output::build_cli_json_summary(&app.config, &report) {
+        Ok(summary) => summary,
+        Err(err) => {
+            display_error(&err);
+            std::process::exit(prview::gate::GATE_EXECUTION_ERROR_EXIT_CODE);
+        }
+    };
 
     // JSON output mode. Human summaries are emitted by App::run(); do not
     // print them a second time here.
@@ -118,14 +127,30 @@ async fn run() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&cli_summary)?);
     }
 
-    // Exit with appropriate code. An unchanged --update run re-checked nothing,
-    // so it exits 0 regardless of --json — previously the human path exited 0
-    // while the JSON path derived its code from an empty gate.
-    let exit_code = if report.unchanged || cli.soft_exit {
+    // An unchanged `--update` run re-checked nothing, but it REPORTS the pack it
+    // reused, and the exit code follows the summary it just published — the same
+    // rule every other run obeys. Forcing 0 here made a second `--ci
+    // --fail-on-warnings` invocation turn green over a pack that still warned,
+    // and it swallowed a reused BLOCK just as quietly. The original reason for
+    // the shortcut is gone: the code was derived from an EMPTY gate back when a
+    // missing pack was re-derived, and an unreadable pack now exits 3 above.
+    // `--soft-exit` stays the one deliberate way to ask for 0.
+    let exit_code = if cli.soft_exit {
         0
     } else {
-        prview::output::compute_exit_code(&cli_summary)
+        prview::output::compute_exit_code(&cli_summary, cli.ci, cli.fail_on_warnings)
     };
+
+    // A human unchanged run prints "Nothing to update." and no verdict, so say
+    // which verdict the exit code came from instead of failing wordlessly.
+    if report.unchanged && !cli.json && !cli.quiet && exit_code != 0 {
+        println!(
+            "{} Reused verdict: {} (exit {})",
+            "ℹ".blue(),
+            cli_summary.verdict,
+            exit_code
+        );
+    }
 
     std::process::exit(exit_code);
 }
@@ -144,12 +169,15 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     run_cli.quiet = true;
     run_cli.json = false;
     run_cli.soft_exit = false;
+    // `gate` forces `ci = false` and derives its exit from the gate contract, so
+    // the `--ci`-scoped warnings escape hatch must not leak into it.
+    run_cli.fail_on_warnings = false;
 
     let mut config = Config::from_cli(&run_cli)?;
     config.apply_gate_profile();
     let app = App::from_config(config)?;
     let report = app.run().await.context("gate review run failed")?;
-    let cli_summary = prview::output::build_cli_json_summary(&app.config, &report);
+    let cli_summary = prview::output::build_cli_json_summary(&app.config, &report)?;
     let merge_gate_path = report
         .artifacts_dir
         .join("00_summary")

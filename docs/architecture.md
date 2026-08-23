@@ -709,13 +709,433 @@ Types and functions used across multiple signal modules:
 Heuristic scan of diffs for API-breaking changes:
 
 - `BreakingRisk` enum (`High`, `Medium`, `Low`) — publicness heuristic based on file path depth and barrel/re-export file detection
-- `BreakingFinding` struct with `BreakingKind` (`RemovedSymbol`, `ChangedSignature`, `NewEnvRequirement`)
+- `BreakingFinding` struct with `BreakingKind` (`RemovedSymbol`, `RelocatedSymbol`, `ChangedSignature`, `NewEnvRequirement`)
 - `analyze_all_breaking_changes(patches)` — returns all findings from multiple patch texts
 - `write_breaking_changes(dir, findings)` — writes `BREAKING_CHANGES.md` if findings are non-empty
 
 Scans for removed `pub` symbols (fn, struct, enum, trait, type, const, static),
-JS/TS `export` removals, signature changes (same function name with different params),
-and new environment variable requirements. Only scans code files (not tests, config, docs).
+JS/TS `export` removals, signature changes, and new environment variable
+requirements. Only scans code files (not tests, config, docs).
+
+Remove + re-add pairing (applies to every `pub` symbol kind above, not just
+functions): when a declaration is removed and re-added for the same name and
+kind, an identical declaration line is a diff artifact and yields no finding,
+while a changed one yields a single `ChangedSignature` — never a removal plus a
+silent re-addition. A re-add in a *different* file is a module move and becomes
+`RelocatedSymbol`, which is reported but deliberately excluded from breaking
+escalation.
+
+**Accepted limit (deferred to 0.8).** The scan sees only the declaration LINES a
+diff emitted. An enum variant, a trait method or a struct field removed below an
+unchanged `pub enum` / `pub trait` / `pub struct` opener is a breaking change
+prview does not report: the opener was never emitted as `-`/`+`, so nothing
+enters pairing to begin with. Reporting it needs the item's body from BOTH
+commits, which a diff-only scanner does not have — the fix is the repo-backed
+breaking analysis planned for 0.8, and this limit was reviewed and accepted
+deliberately rather than papered over with a deeper heuristic.
+
+Declarations are compared on their FULL text, continuation lines joined, up to
+`MAX_DECL_CONTINUATION_LINES` (32) — a runaway bound for static bodies and
+generated data tables, not a display width. The bound used to be eight lines,
+which cut inside the real distribution of `pub` signatures: two long
+declarations agreeing on their opener and first eight lines finalized to the
+same truncated text and paired as an unchanged re-add, so a parameter, bound or
+return type changed below the cut produced no finding at all.
+
+A hunk interleaves two texts, and the accumulators reconstruct both: the before
+side is context ∪ removed lines, the after side is context ∪ added lines. So a
+`-` line never touches the added accumulator, a `+` line never touches the
+removed one, and a context line EXTENDS whichever side still has a declaration
+open. Ending both accumulators at the first line from the other side truncated
+every declaration a patch edits in place — `pub fn f(` and a shared `x: u8,`
+followed by `-old: u16,` / `+new: u32,` finalized to two identical openers,
+paired as an unchanged re-add, and the parameter change was reported nowhere.
+Context lines only ever CONTINUE a declaration; a `pub` item that first appears
+on one is unchanged by the patch and must not open an accumulator, which keeps
+the reconstruction inside the hunk that emitted it. The bound is unchanged:
+`MAX_DECL_CONTINUATION_LINES` still caps growth, and a hunk header or a new file
+still finalizes both sides.
+
+Where a declaration ENDS is decided on a separate, comment-resolved view of the
+same lines, fed through the pending declaration's own `SourceScanner` one
+physical line at a time. The joined text has no line breaks, so scanning it as a
+whole let a `//` on any continuation line comment out every line appended after
+it: the closing `)` and the body `{` were never seen and the accumulator ran on
+into the body, so a body-only rewrite came out as a phantom `ChangedSignature`.
+Feeding line by line ends a `//` where it really ends while the scanner still
+carries an open literal or `/* … */` across the continuation lines.
+
+`BREAKING_CHANGES.md` renders those declarations into markdown tables, so every
+cell carrying source text has its `|` escaped as `\|`. Rust states bitwise or,
+patterns and closures with that character, and a declaration like
+`pub const MASK: u32 = READ | WRITE;` written verbatim opened new columns —
+the row rendered as garbage exactly where the declaration was interesting.
+GitHub's table parser splits on unescaped pipes before any inline markup runs,
+so a code span is no protection. The span itself is fenced by a backtick run
+LONGER than any inside the cell, because a declaration may state a backtick of
+its own — `pub const TEMPLATE: &str = r#"`value`"#;` — and a single-backtick
+span ends at the first interior one, leaving the rest of the declaration to
+render as prose. When the content itself begins or ends with a backtick the
+fence carries one space of padding, which CommonMark strips back off.
+
+Display text and comparison identity are separate. `BREAKING_CHANGES.md` and a
+`ChangedSignature` show the declaration verbatim, comments included, because a
+reader shown a change should see the source as written; pairing COMPARES a
+comment-free view of the same lines. A comment inside a declaration is not part
+of the API, and rewording one used to come out as a `ChangedSignature` — a
+breaking-change claim about text no consumer can observe. That view keeps string
+and char literals verbatim: a literal is code, so `pub const GREETING: &str =
+"hello";` and the same line ending `"bye";` must stay different declarations.
+`SourceScanner` therefore offers both resolutions — `code_only` for the
+delimiter trackers, which want a brace inside a string silenced, and
+`code_with_literals` for callers comparing source.
+
+The identity keeps a physical line break only where the break is part of the
+value — that is, where the previous line left a string literal open. A literal
+spanning two physical lines otherwise compared equal to the same literal
+rewritten with a space in it, and a changed public constant paired away as an
+unchanged re-add. Everywhere else the break is layout and the lines are joined
+with a space: keeping it there made `pub type Alias =` followed by `u32;` a
+different declaration from `pub type Alias = u32;`, so a purely cosmetic reflow
+was reported as a `ChangedSignature` whose "before" and "after" were the same
+string. By the same rule a line contributing no code is dropped from the
+identity — a comment-only line says nothing about the API — unless a literal is
+open, where a blank line is a blank line in the value.
+
+Whitespace at a line's edges follows the same rule, one edge at a time: the
+leading edge is kept when the PREVIOUS line left a literal open, the trailing
+edge when THIS line does. Lines reached the accumulator already trimmed, so
+re-indenting the inside of a multi-line public constant produced two identical
+identities and the changed value paired away as an unchanged re-add. Trimming
+neither edge would be worse in the other direction — every reflow would become a
+phantom `ChangedSignature`, and a trailing comment's leading gap would make `a:
+u8, // x` a different declaration from `a: u8,// y`. The per-edge rule keeps
+whitespace only where a literal is open across it, which is exactly where it is
+part of the value: measured over the local crates.io registry, of 200,553
+multi-line public declarations only 640 continuation lines sit at a literal edge
+at all, and 272 of those carry edge whitespace the old view dropped. No
+formatter re-indents inside a string literal, because that changes the program.
+
+A declaration ends at a `;` or a body `{` outside its brackets. Square brackets
+count for the same reason parentheses do: an array type states its length with a
+`;`, as in `pub const TABLE: [u8; 2] = [`, and reading that as the terminator
+finalized both diff sides at their identical opener — the changed values below
+produced no finding at all. Measured over the local crates.io registry, 719
+public `const`/`static` declarations in 126 crates open a multi-line initializer
+on a line whose type carries such a `;`.
+
+A `{` in type position is not that body brace. `pub type Alias = Buffer<{` opens
+a const argument, and finalizing there truncated both diff sides to the same
+prefix, so a changed const expression below — a different public type — paired
+away as an unchanged re-add. The scanner tracks the generic argument list
+itself, so a const argument that is not the first one — `Buffer<u8, {`, where
+the brace follows a comma — is recognized as well; a const generic is rarely the
+leading argument, which made that the common half of the construct. `<` opens a
+list only directly after an identifier, a closing `>`, or a `:`, `->` never
+closes one, and `<<` is consumed whole, because `<` is also the shift operator
+and the 4,666 public `const`/`static` declarations in the local registry that
+state a shift on their own line must still terminate at their `;`. Measured over
+that registry (59,946 files, 2,025 crates, 4,354,142 public declaration lines),
+argument-list tracking and the narrower `<{` sequence rule it replaced judge zero
+lines differently.
+
+The `:` in that rule admits the TURBOFISH spelling of the same construct.
+`pub fn run() -> Buffer::<{` is a valid return type — rustc accepts `Type::<…>`
+in type position without a warning — but its `<` follows a `:`, so the list went
+uncounted, the const block's `{` read as the item's body opener, and both diff
+sides finalized at that identical prefix. They paired as an unchanged re-add and
+a changed const argument, which is a changed public return type, was reported
+nowhere: the direction that HIDES a break. Only `:` joins the openers, never
+whitespace, so a comparison is still not a list. The widening is verdict-neutral
+where it is not needed: `::<` appears on 557 public declaration lines in the
+registry and a `:` immediately before a `<` on exactly one — inside a string
+literal, which the code-only view never shows this scanner — and running both
+rules over all 4,334,018 public declaration lines produces zero disagreements,
+because a turbofish that closes on its own line (`size_of::<T>()`) nets to the
+same depth counted or ignored. What changes is the list left OPEN at end of line,
+which the accumulator carries into the next one; two public declarations in the
+registry wrap a turbofish that way today.
+
+INSIDE that const argument the same characters are operators, so the generic
+depth is frozen there. `pub fn run() -> Buffer<{ 1 < 2 }> {` counted the
+comparison as another opener, the argument list's own `>` closed only that
+phantom level, and the depth was still above zero at the item's real body brace
+— which therefore read as a further const argument and swallowed the body,
+turning a body-only rewrite into a phantom `ChangedSignature`. Freezing costs
+nothing, because whatever a const block states about generics is balanced
+against itself: a turbofish (`{ size_of::<u32>() }`) and a qualified path
+(`Uint<{ <Self>::LIMBS / 2 }>`, the shape crypto-bigint carries) close what they
+open. Those are also the only shapes the corpus holds — across 58,614 files,
+61 declaration or field lines put a const argument's braces around a `<` or `>`,
+43 of them a turbofish and 18 a qualified path or a shift, and none a bare
+comparison. The previous rule survived all of them by cancellation, the block's
+stray `>` closing the outer list and the outer list's `>` then finding nothing
+left; the freeze reaches the same verdict by construction instead.
+
+Nor is the `{` of an initializer that body brace. After a top-level `=` the item
+states a VALUE and runs to its `;`, so `pub const LIMIT: usize = {` and
+`pub const ZERO: Self = Self {` open an initializer, not an item body — and a
+`;` inside it terminates a statement, not the declaration. Finalizing at that
+brace truncated both diff sides to their identical first line, they paired as an
+unchanged re-add, and a changed expression inside the block produced no finding.
+Only a TOP-LEVEL `=` counts: inside a generic argument list one states a default
+(`struct Foo<const N: usize = 4>`) or an associated type
+(`impl Iterator<Item = u8>`), and both are followed by a body brace that must
+still end the declaration; `==`, `=>` and the compound assignments are excluded
+too. This is the widest of the brace rules by frequency — measured over the
+local registry (58,586 files, 1,960 crates, 4,334,320 public declaration lines),
+2,465 lines change verdict, every sampled one a public constant whose
+initializer is a struct literal or block spanning several lines. What such a
+declaration accumulates is still bounded by `MAX_DECL_CONTINUATION_LINES`.
+
+Inline module names keep their raw-identifier prefix. `mod r#type` and
+`mod r#match` were both recorded as `r`, so two namespaces looked like one and a
+removal from the first was cancelled by an unrelated addition in the second.
+
+Pairing is scoped: two declarations pair only when their declaration site and
+their `#[cfg(…)]` guard may be the same. The site is the inline `mod` path AND
+the `impl` owner, tracked on one stack because they answer one question — which
+namespace does this item belong to? An associated `pub const VALUE` moving from
+`impl A` to `impl B` in the same file used to be an exact pairing on file, kind,
+name and text, with an empty scope on both sides, so `A::VALUE` disappeared from
+the report along with the removal. The owner is recorded as TEXT — everything
+before the body brace, whitespace collapsed — and nothing about it is parsed.
+The asymmetry is the whole rule: two KNOWN and different owners never pair, but
+an owner the hunk did not show stays unknown and pairs with anything, which is
+the accepted limit for an unseen opener and is not narrowed here. Over 211
+commits of this repository the reports are identical with and without the owner;
+over 708 crates.io release pairs removals move 30,555 → 30,694 and signature
+changes 53,938 → 53,805, so the change mostly reclassifies a real owner change
+from "signature changed" to "`A::x` removed". Its limit is the mirror of the
+`cfg` one: the same owner written with a different path qualifier reads as two
+(40 of 2,784 blocked pairings, all in one crate), and resolving that would mean
+parsing types. The guard tracker resolves comments away
+before it reads anything, with one per-side scanner reset with the guard, so a
+block comment is not syntax on either count: `/** … */` standing between the
+`cfg` and the item it guards no longer reads as a new item and clears the guard,
+and `/* ))) */` inside a wrapped predicate no longer balances the attribute
+early. The guard TEXT keeps literals, because `#[cfg(feature = "a")]` and
+`#[cfg(feature = "b")]` are different gates and a literal-dropping view would
+make them one; the DELIMITER COUNT drops them, from a second scanner walking the
+same lines in step. Counting a literal's brackets as syntax broke the tracker
+both ways. A `)` typed inside a multi-line `#[doc = r#"…"#]` balanced the
+attribute early, and the literal's remaining lines then read as ordinary items
+and cleared the pending `cfg`. The reverse cost more: the counter carried its
+literal state per LINE, so a literal opened earlier was forgotten and its own
+closing quote read as an opener — `#[must_use = "… \` continued onto the next
+line swallowed the `]` after `…"`, the attribute never closed, and everything
+below it, the real `#[cfg(…)]` included, was absorbed as continuation. Measured
+over the local crates.io registry, of 237,368 `cfg`-guarded attribute runs
+reaching a public declaration, 8,793 wrap across lines, 90 carry a literal
+spanning the break, 13 of those a raw string, and 9 balanced wrongly under the
+per-line state — all 9 of the line-continuation shape, in `rustix` and
+`wit-bindgen`.
+
+Spacing follows the same split. Whitespace outside the literals is formatting —
+`#[cfg(feature="a")]`, `#[cfg(feature = "a")]` and the same predicate wrapped
+across four lines are ONE guard, and reading them as three would report removals
+that never happened. Whitespace inside a literal is value: `--cfg 'api="a b"'`
+and `--cfg 'api="ab"'` are different configurations, so the two attributes are
+different gates. The tracker stripped it from the whole attribute text, literals
+included, which made those two one guard and paired a struct that really left
+one configuration with its re-add under another. The strip is now the scanner's
+own dense view, so it cannot reach inside a value while normalizing layout.
+This one is a fix by construction rather than by frequency: of 524,530 gating
+attributes in the local registry only 3 carry whitespace inside a value literal,
+and none of them collide. Both directions still cost what they always did, and
+the hiding one is not worth leaving open for a one-line rule.
+
+Those were three findings of one shape — a delimiter, a space, a line break —
+so the rule is stated once as an INVARIANT rather than patched a fourth time:
+**bytes inside a literal traverse the whole attribute pipeline verbatim.** It
+holds by enumeration, not by testing shapes, because the pipeline alters text in
+exactly two places and both defer to the same `ScanState`. The delimiter count
+runs on `code_only`, a view with no literal bytes in it at all, so trimming or
+counting there cannot reach a value. The guard text runs on
+`code_with_literals_dense`, whose only subtractive rule sits in the one `scan`
+arm reached solely outside every literal and comment; each literal is emitted as
+an unmodified slice. Everything downstream — `gates_the_item`, the sort, the
+dedup, `cfgs_may_pair` — compares whole strings and transforms nothing. So the
+line's raw bytes now reach the tracker (trimming at the caller ate a
+continuation's indentation before it could be asked whether it was inside a
+value), no `.trim()` survives inside the tracker (after the dense view there is
+no whitespace left outside a literal, so a trim there could only eat value), and
+the physical break is joined with a `\n` exactly when the previous line left a
+literal open — gluing it unconditionally made `#[cfg(api = "a\nb")]` the same
+guard as `#[cfg(api = "ab")]`. Measured like its siblings and just as rare: of
+568,128 `cfg` attributes in the local registry, 4 carry a literal spanning a line
+break, 2 of them gate an item, and none collide.
+
+The guard is the WHOLE conjunction of
+the attributes stacked above the declaration, sorted — `#[cfg(unix)]
+#[cfg(feature = "x")]` and `#[cfg(windows)] #[cfg(feature = "x")]` are different
+guards, while reordering the same two is not. An unseen scope or guard is
+`None`, which pairs with anything: the diff may simply not have re-emitted the
+context line on that side.
+
+An attribute is read to its balanced close, not to the end of its first line. A
+predicate wrapped as `#[cfg(any(` + feature lines + `))]` is one guard, equal to
+its single-line spelling — whitespace and line breaks are formatting, not a
+different gate. Reading only the opener left the continuation line looking like a
+new item, which cleared the guard and let a declaration that really disappeared
+for one configuration pair with its re-add under another. Any other wrapped
+attribute (`#[derive(…)]`) is carried the same way so it cannot take the `cfg`
+above it down with it; an attribute that never closes within
+`MAX_ATTRIBUTE_CONTINUATION_LINES` falls back to the tolerant `None`.
+
+`cfg_attr` counts as a guard exactly when it applies a `cfg`:
+`#[cfg_attr(feature = "a", cfg(unix))]` gates the item as surely as `#[cfg(unix)]`
+does, so it joins the conjunction, while `#[cfg_attr(unix, derive(Debug))]` decides
+an attribute ON the item and stays out — inventing a gate there would split an
+ordinary re-add into a phantom removal. The two families separate cleanly on the
+whitespace-stripped substring `,cfg(`: of the 44,562 `cfg_attr` attributes in the
+local crates.io registry, 189 apply a `cfg` (12 crates, the `portable-atomic`
+idiom) and none of them carry that substring inside a string literal.
+
+Reordering operands INSIDE one predicate is an accepted limit. Stacked
+attributes are sorted, so `#[cfg(unix)] #[cfg(feature = "x")]` pairs either way
+round, but `#[cfg(any(unix, windows))]` rewritten as `#[cfg(any(windows, unix))]`
+is compared as text, does not pair, and reports a phantom `RemovedSymbol` under
+an untouched declaration. Normalizing it means canonicalizing arbitrarily nested
+predicates — a `cfg` parser — and the measurement says the parser would not earn
+its risk. Across 708 consecutive-version pairs in the local registry, whole
+releases and so far wider than any diff this scanner reads, 32 `cfg` attributes
+were reordered at all, in 2 crates; across the 393 patch-level bumps among them,
+the closest available proxy for a PR-sized change, zero. Of the 32, only 6 are
+reachable by sorting an attribute's direct operands: the dominant real shape is
+`not(any(a, b, c))`, with the reorder one level down. A bounded sort would close
+a fifth of an already absent class while looking complete, which is worse than a
+limit written down — and the error direction here is the tolerable one, a
+phantom removal being visible in review rather than a real removal pairing away
+in silence.
+
+Both the module path and the perf tracker's test-context scope are counted over
+CODE only, via the shared scanner in `src/rust_source.rs`. It resolves comments
+and literals in ONE pass — `"http://x"` is a string and `format!("{}/*.{}")` is
+a glob, not a comment — and carries an open `/* … */` **or an open string
+literal** across lines, so a brace inside a multi-line template or JSON fixture
+never reaches a delimiter tracker as syntax. Every raw form is recognized —
+`r`, `br` and `cr`, with any hash count — because an unrecognized raw opener is
+worse than an unknown token: its body is then read as code, and the first
+interior `"` opens a phantom literal. That state is per side and per hunk: a
+hunk boundary is where contiguity ends, and every consumer resets there.
+
+What OPENS that context has to be provable, not merely suggestive. The marker
+set is an exact `#[cfg(test)]`, a `#[cfg(all(…))]` with `test` among its
+operands — which cannot hold unless `test` does — `#[test]` / `#[tokio::test]` /
+`#[rstest]`, and
+`mod tests`. Reading the bare token `test` anywhere inside a `cfg` predicate
+instead made `#[cfg(not(test))]` — code compiled into every build EXCEPT the
+test one — open test context and silently drop the production hits beneath it,
+and did the same for `#[cfg(any(test, feature = "bench"))]`, which compiles
+outside the test build whenever the feature is on, and for
+`#[cfg(feature = "__internal-test")]`, a feature that merely has `test` in its
+name. Measured over the local registry (58,586 files): of the 11,030 attributes
+the old pattern read as test context, 83.62% are exactly `cfg(test)` and 6.76%
+are `all(…, test, …)`; the remaining 9.62% are the ones it got wrong. `all` is
+commutative, so the operand's position carries no meaning and reading only the
+first one made `all(feature = "bench", test)` production while
+`all(test, feature = "bench")` was test context; accepting it anywhere adds 72
+attributes over that registry and removes none. The operand must be a DIRECT
+one, so nothing before it may open a nested predicate — `all(not(test), …)`
+proves the opposite of itself and `all(any(test, …), …)` proves nothing. That
+also drops `all(not(windows), test)`, an under-detection kept deliberately
+rather than growing a paren-matching parser. Everything
+unproven is production, because the two errors are not symmetrical — an
+unrecognized test context costs one extra finding a reader can dismiss, while a
+claimed one that does not hold deletes a production finding nobody ever sees.
+
+The pattern describes a complete `#[…]`, so it is matched against a complete
+one. Attributes wrap — rustfmt breaks a long predicate over several lines — and
+running the pattern per physical line meant a wrapped
+`#[cfg(all(` / `feature = "bench",` / `test` / `))]` matched on no line at all,
+leaving a test-only item read as production. An `AttributeAccumulator` joins the
+lines of one attribute and matches once, on the line that closes it, counting
+brackets on the same comment- and literal-resolved view the rest of the scan
+uses so a `]` inside a string or a trailing comment cannot close it early. It
+only ever CONTINUES: a wrapped attribute is bounded by
+`MAX_ATTRIBUTE_CONTINUATION_LINES` (8), and one that never closes is dropped
+rather than allowed to swallow the rest of the hunk — nothing was proven, and an
+unproven gate is production. The shape is rare: 10 occurrences over the same
+58,614-file registry, all of them genuine `all(test, …)` gates. It is a P2
+because its error direction is the mild one — a phantom finding a reader can
+dismiss, not a muted production hit.
+
+An attribute's brackets are its own, and the brace scan skips them by tracking
+attribute depth per character. `#[rstest]` stacked with
+`#[case(Case { id: 1 })]` carries braces that belong to the attribute, never to
+the annotated item, and letting them through made the `{` a body opener whose
+`}` closed the test context on the same line — the test function below then read
+as production. The plain shape survived by luck, because the attribute's `[` and
+`(` hold `sig_depth` above zero; two clamping `>` comparisons
+(`#[case(1 > 0, 2 > 1, Case { id: 1 })]`) drive it back to zero first and the
+brace lands where the opener is accepted. Skipping the attribute outright
+removes the class instead of the one shape that reaches it. This is separate
+from the line-level `AttributeAccumulator` above and deliberately so: that one
+answers "is this LINE part of an unterminated attribute" for the marker match,
+while the brace scan needs "is this CHARACTER inside one". The depth persists
+across lines, since attributes wrap; literals are already resolved away, so a
+`]` inside a string cannot close one early.
+
+The perf tracker's test context closes two ways, because not every test item has
+a body. One that opens a brace closes when that brace balances again; one that
+does not — `#[cfg(test)] mod tests;`, `#[cfg(test)] use crate::helper;` — closes
+at the `;` ending the item the marker annotates. Waiting for a brace that never
+comes left the context open for the rest of the hunk, and every production loop
+and query below it was recorded as test-only and dropped from the signal.
+
+Which brace opens that body is decided against the signature's bracket nesting,
+not by taking the first `{`. A brace in type or pattern position —
+`fn run() -> Buffer<{ LIMIT }>`, or the extractor idiom
+`fn handler(Parameters(Req { field }): Parameters<Req>)` — balances before any
+body exists, so reading it as the opener made the very next line look like the
+item closing again: the context ended at the signature and the whole test body
+was classified as production. Inside a signature `<` is reliably a generic
+opener — but only where one can be: a `<` counts as opening a generic when it
+FOLLOWS what it parameterises (`Buffer<`, `Vec<`, `fn f<`, `::<`), and a `<`
+after whitespace is a comparison. `->` is excluded so a return arrow is not read
+as a closing angle bracket; closers stay unconditional and the depth is clamped
+at zero, so a `<` this rule misjudges — like a hunk starting mid-signature — can
+only end the context early, never hold it open and mute production code.
+Measured over the local crates.io registry: of 1,697,077 `fn` signatures, 1,191
+carry a brace in that position and 715 place the body opener on a later line —
+the shape that actually breaks the tracker — 59 of them test-annotated.
+
+Spacing is where that rule stops being a boundary, so the boundary is drawn
+around it: signature tracking is FROZEN inside a brace opened within those
+brackets. A const argument holds an expression (`Buffer<{ 1 < 2 }>`) and a
+destructured parameter holds a pattern, and in both `<` and `>` are operators.
+The spacing heuristic reads the spaced spelling correctly and the compact
+`Buffer<{1<2}>` — the same type, formatted without spaces — wrongly, because `<`
+after a digit is indistinguishable from `<` after an identifier. Counting that
+comparison left the depth stuck above zero, the real body brace read as another
+type-level brace, and the context never closed, muting every production hit
+after the test — the direction that HIDES work. Freezing costs nothing, because
+what such a brace states about generics closes what it opens. Measured over the
+same registry, of the 618 `fn` signatures whose brackets hold a brace, 6 put a
+`<` or `>` inside it, all of them the qualified path
+`Uint<{ <Self>::LIMBS / 2 }>` as crypto-bigint writes it, and none the compact
+comparison. Those 6 reached the right verdict before only through the clamp —
+the path's `>` closed the outer list, and the outer list's own `>` was then
+clamped away — and now reach it by construction.
+
+The item's own top-level `=` is the second such boundary, and by frequency the
+larger one. After it the item states a VALUE, so both angle characters are
+operators, and tracking is frozen for the rest of the item. A body-less item ends
+at its `;` — the close that tests whether the signature's brackets are balanced —
+so a counted comparison there could not be undone by anything: the context stayed
+open and every production hit below the test was recorded as test-only, which
+over-detects test context and HIDES work. `#[cfg(test)] const ENABLED: bool =
+1<2;` is the reported shape, but the corpus idiom is the compact SHIFT, because
+this tracker (unlike the declaration scanner) has no rule consuming `<<` whole.
+Measured over the local registry on the same code-only view the tracker reads,
+excluding lines with lifetimes, which this model cannot lex: of 2,206,540
+single-line `const`/`static`/`type` declarations ending at their own `;`, 1,069
+left the bracket depth stuck open under the old rule — dominated by
+`const Reverse = 1<<8;` as objc2 generates its bitflags — and 64 still do. Those
+64 are not a residual bug but the protection working: an array type wrapping to
+the next line (`pub static X: [[u16; N];`) must hold its depth open so that `;`
+is not mistaken for the end of the item.
 
 #### signal/coverage.rs — coverage delta computation
 
@@ -727,6 +1147,29 @@ Cross-references changed source files with test files to estimate test coverage:
 - `CoveragePair` struct — a matched (source file, test file) pair with the match strategy used
 - `compute_coverage_signal(diffs, repo_root, repo)` — the canonical computation function
 - `generate_coverage_delta(dir, signal)` — renders `coverage-delta.txt` from a pre-computed signal
+- `format_coverage_pct(Option<u32>)` — the one renderer for the percentage; `None` becomes `not measured`
+
+**Unmeasured is not 100%.** `coverage_pct` / `CoverageDelta::pct` are
+`Option<u32>` and are `None` whenever no changed source file was evaluated
+(`total_source_files == 0`). Consumers must render that as "not measured" or
+omit the coverage surface entirely — never as a percentage. A real `0/N`
+(N > 0) stays a genuine `0%` measurement. In `report.json`,
+`quality.coverage.heuristic_ratio` is `null` in the unmeasured case and is
+paired with `measured: false` + `not_measured_reason`. That nullability — with
+the loctree counters becoming omittable for the same reason — is why
+`report.json` carries `schema_version: "2.0"`: a decoder written against `1.0`,
+where the ratio was always a number, does not parse every pack.
+
+`report.json`'s `gate.quality_failure_details[]` mirrors `MERGE_GATE.json`'s
+`decision.quality_failure_details[]` field for field — `name`, `classification`
+and `origin` (`"failure"` or `"warning"`). The origin is what makes
+`introduced_quality_failures: ["Rustfmt"]` and `quality_pass: true` readable
+together: the arrays admit warning-level baseline signals so the pre-existing
+downgrade can be computed for them, and only a `"failure"` origin can fail the
+quality gate. Emitting it in the gate artifact but not in `report.json` left the
+two artifacts of one run disagreeing about what "failure" meant. The field is
+additive and `report.json` stays `schema_version: "2.0"` — that major is
+unreleased, so no consumer has ever seen a 2.0 without it.
 
 Four-strategy filename heuristic matching:
 1. Exact stem match: `foo.rs` <-> `foo_test.rs` / `test_foo.rs` / `foo.test.ts`
@@ -789,9 +1232,21 @@ Scans added lines in diff patches for 11 risky patterns:
 - `generate_pattern_scan(dir, diffs, repo)` — produces `PATTERN_SCAN.json` with per-pattern
   aggregation, prod/test split counts, and sample contexts
 
-Scanned patterns: `unwrap`, `println`/`print`, `dbg`, `todo`/`FIXME`/`HACK`/`XXX`,
+Scanned patterns: `unwrap`, `println`/`print`/`eprintln`/`eprint`, `dbg`,
+`todo`/`FIXME`/`HACK`/`XXX`,
 `@ts-ignore`/`@ts-expect-error`/`@ts-nocheck`, `eslint-disable`, `console.log`/`error`/`warn`,
 bare `catch`, `unsafe`, `#[allow(...)]`, `as unknown as`/`as any`.
+
+Every needle is matched with word boundaries, and each side is bounded only
+where the NEEDLE has an identifier edge — that is the only side a longer
+identifier can swallow it from. `todo!(` is already right-bounded by its `(`
+but must be left-bounded, so `mytodo!(…)` is not a TODO marker; `.unwrap()`
+starts with `.` and must NOT be left-bounded, or `value.unwrap()` would stop
+matching. Bounding only needles made entirely of identifier characters left
+`todo!(`, `dbg!(`, `println!(`, `console.log(`, `unsafe {` and `as any` on raw
+substring matching — the last of which reported every `has any` in a doc
+comment as a type cast. The `eprint` family is listed explicitly because it used
+to be caught by accident: `eprintln!(` CONTAINS `println!(`.
 
 Full-file `#[cfg(test)]` / `#[test]` context seeding: reads the complete file at the
 target commit and builds a set of line numbers inside test blocks, using string/comment-aware
@@ -879,6 +1334,26 @@ rendering), `assets.rs` (embedded CSS/JS (system font stack)), and `tests.rs`/`t
 Structural code analysis:
 - `loctree.rs` — universal heuristic (works with any profile): cycles, dead
   exports, unused symbols, exact twins across Rust/JS/TS/Python
+
+**A zero-file scan is a skip, not a clean run.** Loctree can report
+`available: true` while `summary.total_files == 0`. Every consumer treats that
+as SKIP: `MERGE_GATE.json` and `20_quality/heuristics_loctree.result.json` emit
+status `skipped`/`SKIP`, and `report.json`'s `quality.heuristics` emits
+`status: "skipped"` with a `skip_reason` and omits `dead_exports`, `cycles`,
+`twins`, and `unused_symbols` rather than writing zeros that read as results.
+
+**A disabled scan is not a broken scanner.** `--quick` and `--no-heuristics`
+short-circuit `heuristics::run_all` to a default result, which the caller still
+passes on, so `report.json` used to describe an intentional skip as
+`skip_reason: "loctree analysis unavailable"` — a tool failure that never
+happened — and hand the reader a `log_path` pointing at a zero-filled stub. The
+three skips are now distinguishable in `quality.heuristics`:
+
+| `skip_reason` | meaning | `total_files` | `log_path` |
+|---|---|---|---|
+| `heuristics not run` | not asked for (`--quick`, `--no-heuristics`) | absent | absent |
+| `loctree analysis unavailable` | asked for, scanner failed | present | present |
+| `loctree scanned no files` | ran, measured nothing | `0` | present |
 
 ### cache/mod.rs
 

@@ -75,11 +75,22 @@ impl Check for SemgrepCheck {
 
         let status = classify_semgrep_status(output.status.success(), &stdout, &combined);
 
+        // A tool/config error (non-zero exit, no findings payload) is
+        // classified Skipped above; give it a reason-carrying output instead
+        // of the raw combined dump, so the gate's skip-reason plumbing
+        // (policy/engine.rs reads `result.output` verbatim as the reason) shows
+        // *why* it was skipped rather than a wall of stderr noise.
+        let output_text = if status == CheckStatus::Skipped && !output.status.success() {
+            format_tool_error_reason(output.status.code(), &stdout, &stderr)
+        } else {
+            combined.clone()
+        };
+
         Ok(CheckResult {
             name: self.name().to_string(),
             status,
             duration: start.elapsed(),
-            output: combined.clone(),
+            output: output_text,
             cached: false,
             provenance: Some(
                 ProvenanceBuilder {
@@ -113,11 +124,24 @@ impl Check for SemgrepCheck {
 ///
 /// Any non-empty `errors[]` (parse errors / partial parsing) downgrades a
 /// successful scan to `Warnings`, making degraded coverage a visible review
-/// signal instead of a silent pass. A non-zero exit (real findings with
-/// `--error`, or a tool crash) remains a `Failed`.
+/// signal instead of a silent pass.
+///
+/// A non-zero exit is ambiguous on its own: `--error` makes semgrep exit 1
+/// when it found real results, but semgrep also exits non-zero (commonly 2)
+/// on a config/tool error — an invalid ruleset, a crash — where it never
+/// produced a findings payload at all. Counting the latter as a code `Failed`
+/// makes a broken scanner look like a regression in the PR's own code
+/// (TOOL-VS-CODE). So a non-zero exit is only `Failed` when stdout carries a
+/// parsable payload with at least one actual result; otherwise it is a tool
+/// error and classifies `Skipped`, mirroring the missing-tool pattern already
+/// used for ruff/mypy (`checks/python.rs`).
 fn classify_semgrep_status(command_succeeded: bool, stdout: &str, _combined: &str) -> CheckStatus {
     if !command_succeeded {
-        return CheckStatus::Failed;
+        return if output_has_findings_payload(stdout) {
+            CheckStatus::Failed
+        } else {
+            CheckStatus::Skipped
+        };
     }
 
     if output_reports_scan_errors(stdout) {
@@ -148,6 +172,106 @@ pub(crate) fn output_reports_scan_errors(output: &str) -> bool {
         .get("errors")
         .and_then(|errors| errors.as_array())
         .is_some_and(|errors| !errors.is_empty())
+}
+
+/// True when `stdout` carries a parsable JSON payload with at least one entry
+/// in `results` — i.e. semgrep actually produced findings, as opposed to a
+/// non-zero exit with no results at all (config/tool error). Used to
+/// distinguish a genuine `--error` exit (real findings in the code, stays
+/// `Failed`) from a tool/config error exit (no payload, classifies `Skipped`
+/// as a tool error rather than a code failure).
+fn output_has_findings_payload(stdout: &str) -> bool {
+    let Some(start) = stdout.find('{') else {
+        return false;
+    };
+    let mut de = serde_json::Deserializer::from_str(&stdout[start..]);
+    let Ok(parsed) = serde_json::Value::deserialize(&mut de) else {
+        return false;
+    };
+    parsed
+        .get("results")
+        .and_then(|results| results.as_array())
+        .is_some_and(|results| !results.is_empty())
+}
+
+/// First excerpt in `candidates` that carries any text.
+fn first_nonempty<const N: usize>(candidates: [String; N]) -> String {
+    candidates
+        .into_iter()
+        .find(|candidate| !candidate.is_empty())
+        .unwrap_or_default()
+}
+
+/// Up to five non-empty lines of raw tool output, on one line.
+fn text_excerpt(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(5)
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Messages from a semgrep `--json` payload's `errors[]`, if it carries any.
+///
+/// Field naming varies across semgrep versions, so the first of
+/// `message` / `long_msg` / `short_msg` / `type` that is present wins.
+fn json_errors_excerpt(stdout: &str) -> String {
+    let Some(start) = stdout.find('{') else {
+        return String::new();
+    };
+    let mut de = serde_json::Deserializer::from_str(&stdout[start..]);
+    let Ok(parsed) = serde_json::Value::deserialize(&mut de) else {
+        return String::new();
+    };
+    let Some(errors) = parsed.get("errors").and_then(|e| e.as_array()) else {
+        return String::new();
+    };
+
+    errors
+        .iter()
+        .filter_map(|error| {
+            ["message", "long_msg", "short_msg", "type"]
+                .iter()
+                .find_map(|field| error.get(field).and_then(|v| v.as_str()))
+        })
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .take(5)
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Human-readable skip reason for a semgrep tool/config error: the exit code
+/// plus a short excerpt of whatever diagnostic the run produced — stderr when
+/// there is any, otherwise the stdout payload's `errors[]`, otherwise raw
+/// stdout — so a reviewer (and the policy engine, which reads
+/// `CheckResult.output` verbatim as the skip reason) sees why the check did not
+/// run rather than a raw stdout/stderr dump or a generic sentence.
+fn format_tool_error_reason(exit_code: Option<i32>, stdout: &str, stderr: &str) -> String {
+    // Under `--json` semgrep reports config/rule failures in the stdout payload's
+    // `errors[]` and can leave stderr completely empty, so reading stderr alone
+    // discarded the only diagnostic there was and the policy engine received the
+    // generic "no findings payload" sentence as its skip reason.
+    let excerpt = first_nonempty([
+        text_excerpt(stderr),
+        json_errors_excerpt(stdout),
+        text_excerpt(stdout),
+    ]);
+
+    let exit_label = exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if excerpt.is_empty() {
+        format!(
+            "semgrep exited {exit_label} with no findings payload (tool/config error, not a code failure)"
+        )
+    } else {
+        format!(
+            "semgrep exited {exit_label} with no findings payload (tool/config error, not a code failure): {excerpt}"
+        )
+    }
 }
 
 /// Build the `semgrep scan` argument list. Excludes build/vendor artifacts —
@@ -437,12 +561,40 @@ mod tests {
     }
 
     #[test]
-    fn non_zero_exit_is_failed() {
-        let stdout = r#"{"version":"1.135.0","results":[],"errors":[]}"#;
+    fn non_zero_exit_with_findings_payload_is_failed() {
+        // `--error` makes semgrep exit 1 when it found real results: that is a
+        // genuine code failure, not a tool error.
+        let stdout = r#"{"version":"1.135.0","results":[{"check_id":"rust.lang.security.blah","path":"src/x.rs","start":{"line":1}}],"errors":[]}"#;
         let combined = format!("{stdout}\n");
         assert_eq!(
             classify_semgrep_status(false, stdout, &combined),
             CheckStatus::Failed
+        );
+    }
+
+    #[test]
+    fn non_zero_exit_with_no_payload_is_skipped_as_tool_error() {
+        // exit 2 with no results at all (invalid ruleset / crash): a tool or
+        // config error, not a code regression — must not be Failed
+        // (TOOL-VS-CODE, verify-ledger claim #8).
+        let stdout = "";
+        let combined = "Invalid configuration file\nsemgrep: error while validating rules\n";
+        assert_eq!(
+            classify_semgrep_status(false, stdout, combined),
+            CheckStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn non_zero_exit_with_empty_results_array_is_skipped_as_tool_error() {
+        // A JSON payload that parses but carries zero results is still "no
+        // findings" — a non-zero exit alongside it is a tool error, not a
+        // code failure hiding behind an empty result set.
+        let stdout = r#"{"version":"1.135.0","results":[],"errors":[]}"#;
+        let combined = format!("{stdout}\n");
+        assert_eq!(
+            classify_semgrep_status(false, stdout, &combined),
+            CheckStatus::Skipped
         );
     }
 
@@ -462,6 +614,81 @@ mod tests {
         // bytes and miss the errors; the streaming reader must still see them.
         let combined = "{\"results\":[],\"errors\":[{\"type\":[\"PartialParsing\",[]]}]}\nsome semgrep stderr noise\n";
         assert!(output_reports_scan_errors(combined));
+    }
+
+    #[test]
+    fn output_has_findings_payload_detects_nonempty_results() {
+        let with_results = r#"{"results":[{"check_id":"x"}],"errors":[]}"#;
+        let empty_results = r#"{"results":[],"errors":[]}"#;
+        assert!(output_has_findings_payload(with_results));
+        assert!(!output_has_findings_payload(empty_results));
+        assert!(!output_has_findings_payload("not json"));
+        assert!(!output_has_findings_payload(""));
+    }
+
+    #[test]
+    fn format_tool_error_reason_includes_exit_code_and_stderr_excerpt() {
+        let reason = format_tool_error_reason(
+            Some(2),
+            "",
+            "Invalid configuration file\nsemgrep: error while validating rules\n",
+        );
+        assert!(reason.contains('2'), "reason must surface the exit code");
+        assert!(
+            reason.contains("Invalid configuration file"),
+            "reason must surface a stderr excerpt"
+        );
+        assert!(
+            reason.contains("tool/config error"),
+            "reason must name it as a tool error, not a code failure"
+        );
+    }
+
+    #[test]
+    fn format_tool_error_reason_handles_missing_exit_code_and_empty_stderr() {
+        let reason = format_tool_error_reason(None, "", "");
+        assert!(reason.contains("unknown"));
+        assert!(reason.contains("tool/config error"));
+    }
+
+    #[test]
+    fn format_tool_error_reason_reads_json_errors_from_stdout() {
+        // With `--json`, semgrep puts its diagnostics in the stdout payload's
+        // `errors[]` and can leave stderr empty. Reading stderr alone threw the
+        // only explanation away and handed the policy engine the generic "no
+        // findings payload" line as the skip reason.
+        let stdout = r#"{"results":[],"errors":[
+            {"type":"InvalidRuleSchemaError","message":"invalid rule: missing key `pattern`"},
+            {"type":"SemgrepError","long_msg":"config auto is unreachable"}
+        ]}"#;
+        let reason = format_tool_error_reason(Some(2), stdout, "");
+
+        assert!(
+            reason.contains("invalid rule: missing key `pattern`"),
+            "the JSON error must reach the skip reason: {reason}"
+        );
+        assert!(
+            reason.contains("config auto is unreachable"),
+            "a second error must not be dropped: {reason}"
+        );
+        assert!(reason.contains("tool/config error"), "{reason}");
+    }
+
+    #[test]
+    fn format_tool_error_reason_falls_back_to_non_json_stdout() {
+        // A crashing semgrep can print a traceback on stdout with nothing on
+        // stderr; that text is still the only diagnostic there is.
+        let reason = format_tool_error_reason(Some(2), "Traceback (most recent call last)\n", "");
+        assert!(
+            reason.contains("Traceback"),
+            "non-JSON stdout is still a diagnostic: {reason}"
+        );
+    }
+
+    #[test]
+    fn format_tool_error_reason_prefers_stderr_when_both_carry_text() {
+        let reason = format_tool_error_reason(Some(2), "{\"results\":[],\"errors\":[]}", "boom\n");
+        assert!(reason.contains("boom"), "{reason}");
     }
 
     #[test]

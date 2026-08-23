@@ -290,6 +290,39 @@ introduced.
 | `--no-color` | Disable ANSI colors |
 | `--no-zip` | Skip ZIP creation |
 | `--no-dashboard` | Skip HTML dashboard generation |
+| `--soft-exit` | Always exit 0, whatever the checks found |
+| `--fail-on-warnings` | With `--ci`: also exit 1 when any check reports warnings |
+
+### `--ci` exit codes
+
+`--ci` is the strict variant of the plain review run: it exits `1` on a `BLOCK`
+verdict or a broken quality gate, and `0` otherwise. Warning-level signals — a
+formatter delta, an unmaintained-crate advisory, lint warnings — are advisory:
+they keep the verdict at `CONDITIONAL` and surface as review caveats, but they
+do not fail the process. Add `--fail-on-warnings` to opt into exit `1` for them;
+the flag requires `--ci` and does not affect `prview gate`, whose exit codes come
+from the gate contract (see `docs/gate-playbook.md`).
+
+`--fail-on-warnings` counts the artifact pack's check list, not the CLI's own.
+The artifact run generates further checks — `public_api_diff`, `unsafe_audit`,
+`ghost_refs` and the synthetic `heuristics_loctree` — which reach
+`MERGE_GATE.json` and the dashboard but never the in-memory report the plain
+tally is built from. The `--json` summary states both numbers:
+`checks_summary.warned` is what the CLI ran, `checks_summary.warned_in_pack` is
+the complete count the flag keys off, and it is always the larger of the two.
+
+Strictness follows the `--ci` you typed, not the preset label the run reports.
+`--update` outranks `--ci` when the execution preset is resolved, so
+`prview --ci --fail-on-warnings --update` publishes `mode.execution_mode:
+"update"` — and reading strictness off that label made both `--ci` exits
+(`!quality_pass` and the warning hardening) silently inert for exactly the
+combination CI jobs use.
+
+An `--update` run that finds no new commits reuses the previous pack, and its
+exit code is derived from that pack like any other run's: a reused `BLOCK` or a
+reused warning under `--fail-on-warnings` exits non-zero rather than reporting a
+green second invocation over an artifact nothing re-checked. `--soft-exit`
+remains the one way to ask for `0` regardless.
 
 ## Examples
 
@@ -337,6 +370,15 @@ it carries the verdict, `output_dir`, a short `checks_summary`, `top_failures`,
 `context_artifacts`, and paths to artifacts. Full detail stays in the run files
 on disk, especially the canonical `RUN.json` and `MERGE_GATE.json` pair, plus
 `PR_REVIEW.md`.
+
+The verdict fields (`verdict`, `allow_merge`, `quality_pass`,
+`merge_recommendation`, `analysis_status`) are read from the run's
+`00_summary/MERGE_GATE.json` and from nowhere else. If that artifact is missing,
+unparsable, or stamped with a `schema_version` this build cannot read, prview
+reports an execution error and exits `3` instead of re-deriving a verdict —
+including on `--update` runs that re-read an earlier pack. A newer MINOR schema
+within a known MAJOR is accepted and reported through the optional `caveats`
+array, which also carries any verdict the reader had to normalize.
 
 ## Output
 

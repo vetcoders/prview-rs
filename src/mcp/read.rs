@@ -4,6 +4,10 @@
 //! (`~/.prview/`) or a run's artifact pack. No review logic lives here — the
 //! MCP surface only reads truth the core already wrote.
 
+use crate::gate::{
+    JsonKind, merge_rec_from_rank, rank_from_merge_rec, rank_from_verdict, readable_signal,
+    verdict_from_rank,
+};
 use crate::mcp::types::{ToolError, error_class};
 use crate::storage::{RunEntry, RunIndex};
 use std::path::{Path, PathBuf};
@@ -623,48 +627,6 @@ pub struct NormalizedDecision {
     pub normalized: bool,
 }
 
-/// Conservativeness rank: BLOCK(3) > HOLD/review_required(2) > APPROVE/PASS(1).
-fn rank_from_merge_rec(s: &str) -> Option<u8> {
-    match s.to_ascii_lowercase().as_str() {
-        "block" => Some(3),
-        "review_required" | "hold" => Some(2),
-        "approve" => Some(1),
-        _ => None,
-    }
-}
-
-fn rank_from_verdict(s: &str) -> Option<u8> {
-    match s.to_ascii_uppercase().as_str() {
-        "BLOCK" => Some(3),
-        // `CONDITIONAL` is the unified core vocabulary (PV-03/04); `HOLD` is the
-        // retired legacy synonym, still recognized so the adapter stays a safe
-        // read-back net for pre-2.1 runs on disk.
-        "CONDITIONAL" | "HOLD" => Some(2),
-        // `ALLOW` is the retired pre-2.1 verdict synonym for a clean pass (folded
-        // to `PASS` on the CLI `--json` surface in `output::read_merge_gate_summary`).
-        // The adapter recognizes it for the same reason it recognizes `HOLD`:
-        // a legacy gate on disk must still normalize instead of failing loud.
-        "PASS" | "APPROVE" | "ALLOW" => Some(1),
-        _ => None,
-    }
-}
-
-fn merge_rec_from_rank(rank: u8) -> &'static str {
-    match rank {
-        3 => "block",
-        2 => "review_required",
-        _ => "approve",
-    }
-}
-
-fn verdict_from_rank(rank: u8) -> &'static str {
-    match rank {
-        3 => "BLOCK",
-        2 => "CONDITIONAL",
-        _ => "PASS",
-    }
-}
-
 fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {
     value
         .and_then(|v| v.as_array())
@@ -692,62 +654,260 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
             format!("MERGE_GATE.json is not valid JSON: {e}"),
         )
     })?;
-    let decision = value.get("decision").ok_or_else(|| {
+    // A pack whose schema this build does not know cannot be normalized
+    // honestly: an unknown MAJOR is fail-loud, a newer MINOR is tolerated but
+    // carries a caveat. An absent `schema_version` is the documented pre-2.1
+    // read-back surface and is accepted silently.
+    let schema_caveat = crate::gate::check_merge_gate_schema_field(value.get("schema_version"))
+        .map_err(|e| ToolError::new(error_class::STORAGE_CORRUPT, e.to_string()))?;
+
+    // A pack with no `schema_version` predates the field and its ROOT is the
+    // decision — the same legacy tolerance the CLI reader and the contract keep.
+    // Demanding a nested `decision` at every version made the one shape the
+    // contract explicitly tolerates come back `storage_corrupt` from this
+    // surface while the CLI read it fine.
+    let decision = crate::gate::select_decision_object(&value).map_err(|shape| {
         ToolError::new(
             error_class::STORAGE_CORRUPT,
-            "MERGE_GATE.json missing `decision` object",
+            format!("MERGE_GATE.json {}", shape.describe()),
         )
     })?;
 
-    let raw_merge = decision
-        .get("merge_recommendation")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let raw_verdict = decision
-        .get("verdict")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let raw_allow = decision.get("allow_merge").and_then(|v| v.as_bool());
+    // A field present with the wrong JSON type is NOT an absent field. Reading
+    // it through `as_str()` / `as_bool()` collapsed the two, and "absent" is the
+    // one state the adapter accepts in silence — so `merge_recommendation: 7`
+    // beside a valid verdict produced a confident passthrough that had quietly
+    // ignored a signal. Keep the two apart and name what was ignored.
+    let mut unknown_signal_caveats = Vec::new();
+
+    let raw_merge = readable_signal(
+        "merge_recommendation",
+        decision.get("merge_recommendation"),
+        JsonKind::String,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_str())
+    .map(str::to_string);
+    let raw_verdict = readable_signal(
+        "verdict",
+        decision.get("verdict"),
+        JsonKind::String,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_str())
+    .map(str::to_string);
+    let raw_allow = readable_signal(
+        "allow_merge",
+        decision.get("allow_merge"),
+        JsonKind::Boolean,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_bool());
+    // Read here rather than next to its rank below, so that a mistyped value
+    // reaches `mistyped_signal` on the line after this one. A bare `as_bool()`
+    // read `quality_pass: "false"` as absent: no caveat, no rank, and the
+    // surface answered `approve` while the pack said the quality axis failed.
+    let raw_quality_pass = readable_signal(
+        "quality_pass",
+        decision.get("quality_pass"),
+        JsonKind::Boolean,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_bool());
+    // The confidence and blocker axes, mirroring the CLI. All three are read
+    // here so a mistyped one reaches `mistyped_signal` below; `blocking_issues`
+    // was previously read only at the very end, for passthrough, so a stated
+    // blocker never touched the decision this adapter returned.
+    let raw_analysis_status = readable_signal(
+        "analysis_status",
+        decision.get("analysis_status"),
+        JsonKind::String,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_str().map(str::to_string));
+    let raw_policy_allow_merge = readable_signal(
+        "policy_allow_merge",
+        decision.get("policy_allow_merge"),
+        JsonKind::Boolean,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_bool());
+    let raw_blocking_issues = readable_signal(
+        "blocking_issues",
+        decision.get("blocking_issues"),
+        JsonKind::Array,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_array())
+    .map(|issues| issues.len());
+
+    // Whether any signal was present and could not be TYPED. Captured before
+    // the vocabulary caveats below join the same list, because the two are
+    // different failures with the same consequence.
+    let mistyped_signal = !unknown_signal_caveats.is_empty();
 
     let merge_rank = raw_merge.as_deref().and_then(rank_from_merge_rec);
     let verdict_rank = raw_verdict.as_deref().and_then(rank_from_verdict);
 
-    // Need at least one decision signal to build a truthful surface.
-    if merge_rank.is_none() && verdict_rank.is_none() {
+    // A present-but-unrecognized signal used to vanish into the `flatten()`
+    // below, so the caller saw a confident surface derived from the OTHER
+    // signal with no hint that a field had been dropped. Record it instead:
+    // the value is still not used to rank, but the reader stops pretending it
+    // read the pack cleanly. Legacy `ALLOW`/`HOLD` are recognized vocabulary,
+    // so they never land here.
+    if let Some(raw) = raw_verdict.as_deref()
+        && verdict_rank.is_none()
+    {
+        unknown_signal_caveats.push(format!(
+            "unknown_verdict: MERGE_GATE.json verdict `{raw}` is not in the \
+             PASS/CONDITIONAL/BLOCK vocabulary; normalized to BLOCK"
+        ));
+    }
+    // An absent verdict is named too, exactly as the CLI names it: the decision
+    // this adapter returns is then the reader's substitution, not the pack's.
+    if raw_verdict.is_none() && decision.get("verdict").is_none() {
+        unknown_signal_caveats.push(
+            "unknown_verdict: MERGE_GATE.json decision carries no `verdict`; normalized to BLOCK"
+                .to_string(),
+        );
+    }
+    if let Some(raw) = raw_merge.as_deref()
+        && merge_rank.is_none()
+    {
+        unknown_signal_caveats.push(format!(
+            "unknown_merge_recommendation: MERGE_GATE.json merge_recommendation `{raw}` is not in \
+             the approve/review_required/block vocabulary; it was ignored when deriving this \
+             decision"
+        ));
+    }
+    if let Some(raw) = raw_analysis_status.as_deref()
+        && !crate::gate::known_analysis_status(raw)
+    {
+        unknown_signal_caveats.push(format!(
+            "unknown_analysis_status: MERGE_GATE.json analysis_status `{raw}` is not in the \
+             complete/degraded/incomplete vocabulary; it was ignored when deriving this decision"
+        ));
+    }
+
+    // Corrupt means the decision states NOTHING — not that what it states is
+    // unrankable. The presence test is the CLI's, field for field: a pack that
+    // named a verdict outside the vocabulary, or nothing but `allow_merge`, DID
+    // state a decision, and calling it corrupt here while the CLI published a
+    // summary for it left the same artifact readable on one surface and broken
+    // on the other.
+    if !["verdict", "merge_recommendation", "allow_merge"]
+        .iter()
+        .any(|field| decision.get(*field).is_some())
+    {
         return Err(ToolError::new(
             error_class::STORAGE_CORRUPT,
-            "MERGE_GATE.json decision has no recognizable merge_recommendation or verdict",
+            "MERGE_GATE.json decision states no verdict, merge_recommendation or allow_merge",
         ));
     }
 
     // allow_merge=false raises conservativeness to at least HOLD; allow=true
     // never lowers it (a permissive flag can't override a block/hold signal).
     let allow_rank = raw_allow.map(|allow| if allow { 1 } else { 2 });
+    // `quality_pass: false` says "not a PASS" — the contract permits `PASS` only
+    // when quality passes — so it ranks 2, like `allow_merge: false`. `true`
+    // states no rank of its own: a quality-clean run is still held at
+    // CONDITIONAL by a breaking-change escalation. Absence states nothing
+    // either, so a pack written before the field reads exactly as it always did.
+    // This is the CLI's rule, mirrored, because a pack this adapter approved
+    // while the CLI held it is the same split the reader parity work closed.
+    // (Read above, with the other typed signals.)
+    let quality_rank = match raw_quality_pass {
+        Some(false) => Some(2),
+        _ => None,
+    };
+    // Same rule on the confidence axis: only `degraded`/`incomplete` rule `PASS`
+    // out and therefore rank. `complete` is a precondition of `PASS`, not a
+    // grant of it, so it stays silent like `quality_pass: true`.
+    let analysis_rank = raw_analysis_status
+        .as_deref()
+        .and_then(crate::gate::rank_from_analysis_status);
+    // A stated blocker is a stated BLOCK: `blocking_issues` is non-empty only
+    // when a check reached `PolicyConclusion::Blocked`, whose `merge_impact` is
+    // `Block`. `policy_allow_merge: false` is the same fact — the emitter writes
+    // `policy_allow_merge = blocking_issues.is_empty()`. Neither says anything
+    // permissive: "policy did not hard-block" is explicitly NOT `allow_merge`.
+    let blocker_rank = (raw_policy_allow_merge == Some(false)
+        || raw_blocking_issues.is_some_and(|len| len > 0))
+    .then_some(3);
 
-    let final_rank = [merge_rank, verdict_rank, allow_rank]
-        .into_iter()
-        .flatten()
-        .max()
-        .unwrap_or(2);
+    // A verdict this reader had to SUBSTITUTE — absent, outside the vocabulary,
+    // or present with the wrong JSON type — governs everything derived beside
+    // it, and so does any other signal that could not be typed. This is the
+    // CLI's `normalized_to_block` rule, mirrored: a decision derived from a
+    // block the reader only partly read is not one either surface may publish
+    // as permissive, and the two surfaces answering that differently is how one
+    // pack came to be a `PASS` for MCP automation and a `BLOCK` on the CLI.
+    let normalized_to_block = mistyped_signal || verdict_rank.is_none();
+
+    let stated_ranks: Vec<u8> = [
+        merge_rank,
+        verdict_rank,
+        allow_rank,
+        quality_rank,
+        analysis_rank,
+        blocker_rank,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let final_rank = if normalized_to_block {
+        3
+    } else {
+        stated_ranks.iter().copied().max().unwrap_or(3)
+    };
 
     let allow_merge = final_rank == 1;
 
-    // Inconsistent iff the raw signals disagree on conservativeness, or the raw
-    // allow_merge flag contradicts the final (derived) recommendation.
-    let signal_ranks: Vec<u8> = [merge_rank, verdict_rank].into_iter().flatten().collect();
-    let signals_disagree = signal_ranks.iter().any(|&r| r != final_rank);
-    let allow_contradicts = raw_allow.map(|a| a != allow_merge).unwrap_or(false);
-    let normalized = signals_disagree || allow_contradicts;
+    // Only the PACK's own axes can be inconsistent with each other; a verdict
+    // this reader substituted is already named by its own caveat, and calling
+    // the substitution an inconsistency would blame the artifact for the
+    // reader's normalization.
+    //
+    // `allow_merge` raises the rank but is not compared as one: `false` says
+    // "not a PASS" — `>= 2`, never 3 — so treating it as an exact rank would
+    // call every healthy BLOCK pack inconsistent with itself. It contradicts the
+    // decision only when the DERIVED flag disagrees with the stated one.
+    let textual_ranks: Vec<u8> = [merge_rank, verdict_rank].into_iter().flatten().collect();
+    let signals_disagree =
+        !normalized_to_block && textual_ranks.iter().any(|&rank| rank != final_rank);
+    let allow_contradicts =
+        !normalized_to_block && raw_allow.map(|a| a != allow_merge).unwrap_or(false);
+    // An ignored signal is itself a normalization: the returned decision is not
+    // a faithful passthrough of what the pack says. A forward schema is the same
+    // situation one level up — the pack was written by a build this one does not
+    // fully know, so the read is best-effort and the caveat must be backed by the
+    // flag consumers actually branch on.
+    let normalized = signals_disagree
+        || allow_contradicts
+        || !unknown_signal_caveats.is_empty()
+        || schema_caveat.is_some();
 
-    let mut caveats = Vec::new();
-    if normalized {
+    let mut caveats = schema_caveat.into_iter().collect::<Vec<_>>();
+    caveats.append(&mut unknown_signal_caveats);
+    if signals_disagree || allow_contradicts {
         caveats.push(format!(
-            "core_inconsistency: original allow_merge={}, merge_recommendation={}, verdict={}",
+            "core_inconsistency: original allow_merge={}, merge_recommendation={}, verdict={}, \
+             quality_pass={}, analysis_status={}, blocking_issues={}, policy_allow_merge={}",
             raw_allow
                 .map(|b| b.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             raw_merge.as_deref().unwrap_or("null"),
             raw_verdict.as_deref().unwrap_or("null"),
+            raw_quality_pass
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            raw_analysis_status.as_deref().unwrap_or("null"),
+            raw_blocking_issues
+                .map(|len| len.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            raw_policy_allow_merge
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "null".to_string()),
         ));
     }
     caveats.extend(string_array(decision.get("review_caveats")));
@@ -922,6 +1082,309 @@ mod tests {
             !d.normalized,
             "ALLOW+allow_merge:true is self-consistent, no core_inconsistency"
         );
+    }
+
+    #[test]
+    fn unknown_verdict_is_reported_as_normalized_with_caveat() {
+        // An unrecognized verdict used to vanish into the rank `flatten()`: the
+        // decision was derived from `merge_recommendation` alone and returned as
+        // a clean passthrough, with nothing telling the caller a field had been
+        // dropped. It must surface as an explicit `unknown_verdict` caveat — and
+        // it must also govern the decision published beside it. Deriving a PASS
+        // from the surviving `approve` was this adapter reading one pack as an
+        // approval while the CLI, on the same bytes, substituted BLOCK.
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "bases": ["main"],
+                "decision": {
+                    "merge_recommendation": "approve",
+                    "verdict": "MAYBE",
+                    "allow_merge": true
+                }
+            }),
+        );
+        let d = read_decision(dir.path()).unwrap();
+        assert_eq!(
+            d.verdict, "BLOCK",
+            "a substituted verdict governs every axis derived beside it"
+        );
+        assert_eq!(d.merge_recommendation, "block");
+        assert!(
+            !d.allow_merge,
+            "the pack's `allow_merge: true` does not stand"
+        );
+        assert!(d.normalized, "an ignored signal is a normalization");
+        let caveat = d
+            .caveats
+            .iter()
+            .find(|c| c.starts_with("unknown_verdict:"))
+            .expect("unknown_verdict caveat present");
+        assert!(caveat.contains("MAYBE"), "{caveat}");
+    }
+
+    #[test]
+    fn unknown_merge_recommendation_is_reported_with_caveat() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "bases": ["main"],
+                "decision": {
+                    "merge_recommendation": "probably_fine",
+                    "verdict": "BLOCK",
+                    "allow_merge": false
+                }
+            }),
+        );
+        let d = read_decision(dir.path()).unwrap();
+        assert_eq!(d.verdict, "BLOCK");
+        assert!(d.normalized);
+        assert!(
+            d.caveats
+                .iter()
+                .any(|c| c.starts_with("unknown_merge_recommendation:")),
+            "caveats: {:?}",
+            d.caveats
+        );
+    }
+
+    #[test]
+    fn legacy_verdict_synonyms_raise_no_unknown_verdict_caveat() {
+        // The documented pre-2.1 tolerance is a safety net, not a hole: ALLOW and
+        // HOLD are recognized vocabulary and must never be reported as unknown.
+        for verdict in ["ALLOW", "HOLD"] {
+            let dir = tempfile::tempdir().unwrap();
+            write_gate(
+                dir.path(),
+                &serde_json::json!({
+                    "bases": ["main"],
+                    "decision": { "verdict": verdict, "allow_merge": verdict == "ALLOW" }
+                }),
+            );
+            let d = read_decision(dir.path()).unwrap();
+            assert!(
+                !d.caveats.iter().any(|c| c.starts_with("unknown_verdict:")),
+                "legacy `{verdict}` must stay tolerated: {:?}",
+                d.caveats
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_schema_major_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "schema_version": "9.0",
+                "bases": ["main"],
+                "decision": { "verdict": "PASS", "allow_merge": true }
+            }),
+        );
+        let err = read_decision(dir.path()).expect_err("unknown major must fail loud");
+        assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+        assert!(err.message.contains("9.0"), "{}", err.message);
+    }
+
+    #[test]
+    fn newer_schema_minor_is_tolerated_with_caveat() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "schema_version": "2.9",
+                "bases": ["main"],
+                "decision": { "verdict": "PASS", "merge_recommendation": "approve", "allow_merge": true }
+            }),
+        );
+        let d = read_decision(dir.path()).expect("newer minor is readable");
+        assert_eq!(d.verdict, "PASS");
+        assert!(
+            d.caveats
+                .iter()
+                .any(|c| c.starts_with("schema_forward_compat:")),
+            "caveats: {:?}",
+            d.caveats
+        );
+    }
+
+    #[test]
+    fn forward_schema_read_is_marked_normalized() {
+        // docs/mcp.md: "Anything the adapter could not read is named rather than
+        // dropped, and every such case sets `normalized: true`" — and it lists
+        // `schema_forward_compat:` among them. A caveat next to
+        // `normalized: false` tells the client the decision was passed through
+        // unchanged while simultaneously admitting fields were ignored.
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "schema_version": "2.9",
+                "bases": ["main"],
+                "decision": { "verdict": "PASS", "merge_recommendation": "approve", "allow_merge": true }
+            }),
+        );
+        let d = read_decision(dir.path()).expect("newer minor is readable");
+        assert!(
+            d.caveats
+                .iter()
+                .any(|c| c.starts_with("schema_forward_compat:")),
+            "caveats: {:?}",
+            d.caveats
+        );
+        assert!(
+            d.normalized,
+            "a forward-schema read ignored unknown fields; that is a normalization"
+        );
+    }
+
+    #[test]
+    fn non_string_schema_version_is_storage_corrupt() {
+        // Same defect as the CLI reader: `as_str()` turned a present-but-
+        // wrongly-typed field into "absent", which is the silently-accepted
+        // legacy path.
+        for bad in [
+            serde_json::json!(2.1),
+            serde_json::json!(null),
+            serde_json::json!({ "major": 2 }),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_gate(
+                dir.path(),
+                &serde_json::json!({
+                    "schema_version": bad,
+                    "bases": ["main"],
+                    "decision": { "verdict": "PASS", "allow_merge": true }
+                }),
+            );
+            let err = read_decision(dir.path()).expect_err("non-string schema must fail loud");
+            assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+            assert!(
+                err.message.contains("schema_version"),
+                "{} for {bad}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_root_shaped_pack_is_read_not_called_corrupt() {
+        // A pack with no `schema_version` predates the field, and reading its
+        // ROOT as the decision is the documented legacy read-back surface — the
+        // CLI reader and `docs/contracts/merge_gate.md` both keep it. This
+        // adapter demanded a nested `decision` object at every version, so the
+        // one pack shape the contract explicitly tolerates came back
+        // `storage_corrupt`.
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({ "verdict": "ALLOW", "allow_merge": true }),
+        );
+
+        let d = read_decision(dir.path()).expect("a legacy root-shaped pack is readable");
+        assert_eq!(d.verdict, "PASS");
+        assert!(d.allow_merge, "{d:?}");
+    }
+
+    #[test]
+    fn a_non_object_gate_root_is_corrupt_on_both_readers() {
+        // The legacy root tolerance covers a pack whose decision fields sit at
+        // the root — not a pack that is an array, a scalar or `null`. Those
+        // carry no fields to read, and the two readers must agree they are
+        // corrupt rather than one of them inventing a normalized BLOCK.
+        for root in ["[1,2,3]", "\"BLOCK\"", "null", "7"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("00_summary")).unwrap();
+            std::fs::write(dir.path().join("00_summary/MERGE_GATE.json"), root).unwrap();
+
+            let err = read_decision(dir.path()).expect_err("a non-object gate root is corrupt");
+            assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+            assert!(err.message.contains("not a JSON object"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn a_versioned_pack_without_a_decision_object_stays_corrupt() {
+        // The other half of the same rule: once a pack names its schema, the
+        // object that schema is built around is mandatory. Reading the root
+        // there would publish a verdict nothing in the pack stated.
+        for decision in [None, Some(serde_json::json!("PASS"))] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gate = serde_json::json!({
+                "schema_version": "2.2",
+                "verdict": "ALLOW",
+                "allow_merge": true
+            });
+            if let Some(decision) = decision.clone() {
+                gate["decision"] = decision;
+            }
+            write_gate(dir.path(), &gate);
+
+            let err = read_decision(dir.path())
+                .expect_err("a versioned pack with no decision object is corrupt");
+            assert_eq!(err.class, error_class::STORAGE_CORRUPT);
+            assert!(err.message.contains("decision"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn wrongly_typed_decision_signal_is_reported_not_dropped() {
+        // `verdict: "PASS"` with `merge_recommendation: 7`: `as_str()` mapped the
+        // malformed field onto "absent", so the unknown-signal branch never saw
+        // it and the adapter returned a clean `normalized: false` decision
+        // derived from the surviving signal — a pack field ignored in silence.
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "bases": ["main"],
+                "decision": { "verdict": "PASS", "merge_recommendation": 7, "allow_merge": true }
+            }),
+        );
+
+        let d = read_decision(dir.path()).expect("one readable signal keeps the pack readable");
+        assert!(
+            d.caveats
+                .iter()
+                .any(|c| c.starts_with("unreadable_merge_recommendation:")),
+            "the ignored field must be named: {:?}",
+            d.caveats
+        );
+        assert!(
+            d.normalized,
+            "a decision that ignored a field is not a passthrough"
+        );
+    }
+
+    #[test]
+    fn wrongly_typed_allow_merge_is_reported_not_dropped() {
+        // Same defect on the third signal: a non-boolean `allow_merge` was
+        // dropped by `as_bool()` and the conservativeness it should have raised
+        // simply disappeared.
+        let dir = tempfile::tempdir().unwrap();
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "bases": ["main"],
+                "decision": {
+                    "verdict": "PASS",
+                    "merge_recommendation": "approve",
+                    "allow_merge": "false"
+                }
+            }),
+        );
+
+        let d = read_decision(dir.path()).expect("both ranked signals are readable");
+        assert!(
+            d.caveats
+                .iter()
+                .any(|c| c.starts_with("unreadable_allow_merge:")),
+            "the ignored field must be named: {:?}",
+            d.caveats
+        );
+        assert!(d.normalized);
     }
 
     #[test]

@@ -95,7 +95,7 @@ fn mock_ctx() -> DashboardContext {
         check_gates: vec![],
         breaking: vec![],
         coverage: super::super::CoverageDelta {
-            pct: 100,
+            pct: Some(100),
             total_source: 1,
             covered_count: 1,
             uncovered: vec![],

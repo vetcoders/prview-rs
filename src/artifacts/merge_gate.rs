@@ -245,7 +245,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         .count();
 
     let gate = json!({
-        "schema_version": "2.1",
+        "schema_version": crate::gate::MERGE_GATE_SCHEMA_VERSION,
         "generated_at": chrono::Local::now().to_rfc3339(),
         "bridge_stage": config.bridge_stage,
         "target": resolved_target.name,
@@ -285,6 +285,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             "quality_failure_details": quality_failures.details.iter().map(|detail| json!({
                 "name": detail.name,
                 "classification": detail.classification.as_str(),
+                "origin": detail.origin.as_str(),
             })).collect::<Vec<_>>(),
             "decision_reason": decision.reason,
             "review_caveats": all_review_caveats,
@@ -500,7 +501,7 @@ mod tests {
         CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: Vec::new(),
             covered: Vec::new(),
             non_code_count: 0,
@@ -960,6 +961,46 @@ mod tests {
     }
 
     #[test]
+    fn the_blocker_flag_is_the_blocker_list_written_twice() {
+        // `tools/validate_merge_gate.py` certifies
+        // `policy_allow_merge == blocking_issues.is_empty()` as an equivalence,
+        // rejecting a pack that states one without the other. That is only sound
+        // while the flag is derived from the list and from nothing else, as it is
+        // above. Should the flag ever gain a second input, this pin fails here
+        // — in the emitter that changed — instead of the validator silently
+        // rejecting packs prview itself still writes.
+        let packs = [
+            run_gate_with_skipped_policy_check(
+                "cargo_audit",
+                "Cargo audit",
+                "security disabled",
+                crate::policy::PolicySeverity::Block,
+            ),
+            run_gate_with_skipped_policy_check(
+                "cargo_audit",
+                "Cargo audit",
+                "tool not installed (cargo-audit is missing)",
+                crate::policy::PolicySeverity::Block,
+            ),
+            run_gate_with_cargo_test_finding(false),
+            run_gate_with_semgrep_finding(false, false),
+        ];
+
+        for gate in packs {
+            let decision = &gate["decision"];
+            let no_blockers = decision["blocking_issues"]
+                .as_array()
+                .expect("blocking_issues array")
+                .is_empty();
+            assert_eq!(
+                decision["policy_allow_merge"].as_bool(),
+                Some(no_blockers),
+                "policy_allow_merge must mirror an empty blocking_issues: {decision}"
+            );
+        }
+    }
+
+    #[test]
     fn preexisting_semgrep_finding_outside_diff_does_not_degrade_verdict() {
         let gate = run_gate_with_semgrep_finding(false, false);
 
@@ -1130,6 +1171,45 @@ mod tests {
             gate["decision"]["preexisting_quality_failures"][0].as_str(),
             Some("Rustfmt")
         );
+    }
+
+    #[test]
+    fn preexisting_only_rustfmt_keeps_strict_gate_exit_zero() {
+        // Regression guard for the warning→failure cut: the gate exit contract is
+        // unchanged. The pre-existing-only rustfmt pack is a PASS, and `prview
+        // gate --strict` must still exit 0 on it — the same artifact the adapter
+        // in `gate.rs` reads, run through the same verdict → exit mapping.
+        use crate::gate::{GateVerdict, gate_exit_code};
+
+        let gate = run_gate_with_rustfmt_warning(false);
+        let verdict = GateVerdict::try_from(
+            gate["decision"]["verdict"]
+                .as_str()
+                .expect("verdict is a string"),
+        )
+        .expect("verdict is contract vocabulary");
+
+        assert_eq!(verdict, GateVerdict::Pass);
+        assert_eq!(gate_exit_code(verdict, true), 0);
+        assert_eq!(gate_exit_code(verdict, false), 0);
+    }
+
+    #[test]
+    fn introduced_warning_keeps_strict_gate_exit_two() {
+        // The other half of the contract: an in-diff warning stays CONDITIONAL,
+        // so `--strict` still exits 2. Warnings became honest, not toothless.
+        use crate::gate::{GateVerdict, gate_exit_code};
+
+        let gate = run_gate_with_rustfmt_warning(true);
+        let verdict = GateVerdict::try_from(
+            gate["decision"]["verdict"]
+                .as_str()
+                .expect("verdict is a string"),
+        )
+        .expect("verdict is contract vocabulary");
+
+        assert_eq!(verdict, GateVerdict::Conditional);
+        assert_eq!(gate_exit_code(verdict, true), 2);
     }
 
     #[test]

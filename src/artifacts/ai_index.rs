@@ -64,8 +64,10 @@ pub(crate) fn generate_ai_index(
     )?;
     writeln!(
         md,
-        "- Coverage signal: {}/{} changed code files ({}%)",
-        coverage.covered_count, coverage.total_source, coverage.pct
+        "- Coverage signal: {}/{} changed code files ({})",
+        coverage.covered_count,
+        coverage.total_source,
+        crate::artifacts::signal::format_coverage_pct(coverage.pct)
     )?;
     let gate_path = Path::new("00_summary/MERGE_GATE.json");
     if dir.join(gate_path).exists()

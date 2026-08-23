@@ -215,6 +215,19 @@ pub struct Cli {
     #[arg(long = "soft-exit")]
     pub soft_exit: bool,
 
+    /// In --ci mode, also exit 1 when any check reports warnings
+    #[arg(
+        long = "fail-on-warnings",
+        requires = "ci",
+        conflicts_with = "soft_exit",
+        long_help = "Make --ci exit 1 when any check reports warnings, not only on a hard \
+                     failure. Warning-level signals (rustfmt deltas, an unmaintained-crate \
+                     advisory, lint warnings) are advisory by default and exit 0. This flag \
+                     restores the stricter pre-0.7 CI behaviour for teams that want a \
+                     warnings-clean trunk."
+    )]
+    pub fail_on_warnings: bool,
+
     /// Regex pattern to filter which tests to run (passed to the test runner, e.g. vitest --grep)
     #[arg(long = "tests-pattern", value_name = "REGEX")]
     pub tests_pattern: Option<String>,
@@ -607,6 +620,7 @@ mod tests {
             no_dashboard: false,
             current_only: false,
             soft_exit: false,
+            fail_on_warnings: false,
             tests_pattern: None,
             pr_url: None,
             policy_file: None,

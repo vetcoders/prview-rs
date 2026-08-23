@@ -2759,8 +2759,13 @@ const JS_SUFFIX: &str = r##"
             }
 
             if (quality.coverage) {
-                var pct = Math.round(quality.coverage.heuristic_ratio * 100);
-                comment += '**Coverage heuristic:** ' + pct + '% (' + quality.coverage.matched + '/' + quality.coverage.total + ')\n\n';
+                // heuristic_ratio is null when nothing was measured (0 changed
+                // source files) - do not round null into a 0%/100% claim.
+                var ratio = quality.coverage.heuristic_ratio;
+                var covLabel = (ratio === null || ratio === undefined)
+                    ? 'not measured'
+                    : Math.round(ratio * 100) + '%';
+                comment += '**Coverage heuristic:** ' + covLabel + ' (' + quality.coverage.matched + '/' + quality.coverage.total + ')\n\n';
             }
 
             var hotspots = (diff.files || [])

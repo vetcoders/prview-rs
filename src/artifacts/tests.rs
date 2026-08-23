@@ -440,7 +440,7 @@ fn merge_gate_blocks_failed_cargo_audit_in_warn_mode_when_severity_is_block() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -520,7 +520,7 @@ fn merge_gate_executed_cargo_check_carries_real_evidence_and_log() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1152,7 +1152,7 @@ fn merge_gate_marks_heuristics_disabled_as_not_run() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1202,7 +1202,7 @@ fn merge_gate_files_field_omits_inline_findings_path_when_no_findings() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1259,7 +1259,7 @@ fn merge_gate_includes_inline_findings_path_when_sarif_exists() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1327,7 +1327,7 @@ fn merge_gate_surfaces_review_caveats_when_merge_needs_review() {
     let coverage = CoverageDelta {
         total_source: 4,
         covered_count: 1,
-        pct: 25,
+        pct: Some(25),
         uncovered: vec![crate::artifacts::signal::CoverageFile {
             status: 'M',
             path: "src/lib.rs".to_string(),
@@ -1387,7 +1387,7 @@ fn build_review_caveats_include_orphaned_test_candidates() {
     let coverage = CoverageDelta {
         total_source: 2,
         covered_count: 2,
-        pct: 100,
+        pct: Some(100),
         uncovered: vec![],
         covered: vec![],
         non_code_count: 0,
@@ -1442,7 +1442,7 @@ fn merge_gate_splits_introduced_and_preexisting_inline_findings() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1535,7 +1535,7 @@ fn merge_gate_splits_preexisting_quality_failures_from_inline_findings() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1638,7 +1638,7 @@ fn merge_gate_reason_mentions_preexisting_failures_under_merge_with_review() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1716,7 +1716,7 @@ fn merge_gate_marks_skipped_rust_quality_signals_as_review_caveats() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1783,7 +1783,7 @@ fn merge_gate_surfaces_skipped_cargo_geiger_when_security_was_requested() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1855,7 +1855,7 @@ fn merge_gate_surfaces_runtime_skipped_cargo_geiger() {
             &CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,
@@ -1888,10 +1888,14 @@ fn merge_gate_surfaces_runtime_skipped_cargo_geiger() {
 
 #[test]
 fn merge_gate_surfaces_cargo_audit_informational_warnings_as_review_caveat() {
+    // The status here used to be `Passed`, which was a fiction: a cargo-audit run
+    // carrying an unmaintained-crate advisory reports `Warnings`. The injected
+    // `Passed` kept the check out of the quality summary entirely and therefore
+    // masked the warning→failure bug this test now also guards.
     let config = create_test_config(PolicyConfig::default());
     let checks = vec![CheckResult {
             name: "Cargo audit".to_string(),
-            status: CheckStatus::Passed,
+            status: CheckStatus::Warnings,
             duration: Duration::from_secs(1),
             output: r#"{"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{"unmaintained":[{"kind":"unmaintained","package":{"name":"paste","version":"1.0.15"},"advisory":{"id":"RUSTSEC-2024-0436"}}]}}"#.to_string(),
             cached: false,
@@ -1920,7 +1924,7 @@ fn merge_gate_surfaces_cargo_audit_informational_warnings_as_review_caveat() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -1947,6 +1951,134 @@ fn merge_gate_surfaces_cargo_audit_informational_warnings_as_review_caveat() {
             .is_some_and(|items| items.iter().any(|item| item
                 .as_str()
                 .is_some_and(|text| text.contains("paste (unmaintained)"))))
+    );
+
+    // A warning-level check that produced no locatable finding classifies as
+    // `Unclassified`, but it is a WARNING — it must not be counted as a failed
+    // quality check. Before the origin split this exact shape flipped
+    // `quality_pass` to false and printed "1 quality check failed".
+    assert_eq!(
+        gate["decision"]["quality_pass"].as_bool(),
+        Some(true),
+        "an unlocated warning is not a quality failure: {}",
+        gate["decision"]
+    );
+    assert!(
+        !raw.contains("quality check failed") && !raw.contains("quality checks failed"),
+        "MERGE_GATE.json must not describe warnings as failed quality checks: {raw}"
+    );
+    // The verdict itself is unchanged: Warnings still reach the policy engine as
+    // an advisory signal, so the run stays CONDITIONAL — only the label is honest.
+    assert_eq!(
+        gate["decision"]["verdict"].as_str(),
+        Some("CONDITIONAL"),
+        "warning-level advisory keeps the CONDITIONAL verdict"
+    );
+    // …and the analysis is no longer degraded by a phantom quality failure.
+    assert_eq!(
+        gate["decision"]["analysis_status"].as_str(),
+        Some("complete"),
+        "no failed check means the analysis is complete, not degraded"
+    );
+}
+
+#[test]
+fn merge_gate_names_the_origin_of_every_quality_failure_entry() {
+    // The origin split lives in memory only until the pack states it. Read from
+    // disk, `introduced_quality_failures: ["Rustfmt"]` next to `quality_pass:
+    // true` is a pack contradicting itself: the array claims a failure, the flag
+    // claims nothing failed, and nothing in the JSON explains which is right.
+    let config = create_test_config(PolicyConfig::default());
+    let checks = vec![
+        CheckResult {
+            name: "Rustfmt".to_string(),
+            status: CheckStatus::Warnings,
+            duration: Duration::from_secs(1),
+            output: "Diff in src/new.rs at line 1".to_string(),
+            cached: false,
+            provenance: None,
+        },
+        CheckResult {
+            name: "Clippy".to_string(),
+            status: CheckStatus::Failed,
+            duration: Duration::from_secs(1),
+            output: "src/new.rs:1: error".to_string(),
+            cached: false,
+            provenance: None,
+        },
+    ];
+    let inline = InlineFindingsSummary {
+        status: "passed".to_string(),
+        findings_count: 0,
+        dashboard_findings: vec![],
+    };
+    let resolved_target = ResolvedRef {
+        name: "main".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    generate_merge_gate_test!(
+        tmp.path(),
+        &config,
+        &checks,
+        None,
+        &inline,
+        &[],
+        &CoverageDelta {
+            total_source: 0,
+            covered_count: 0,
+            pct: None,
+            uncovered: vec![],
+            covered: vec![],
+            non_code_count: 0,
+            ghost_tests: vec![],
+        },
+        &[],
+        &resolved_target,
+        &[],
+    )
+    .expect("merge gate");
+
+    let raw = std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate");
+    let gate: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+
+    let details = gate["decision"]["quality_failure_details"]
+        .as_array()
+        .expect("details array");
+    let origin_of = |name: &str| {
+        details
+            .iter()
+            .find(|detail| detail["name"] == name)
+            .unwrap_or_else(|| panic!("`{name}` missing from quality_failure_details: {details:?}"))
+            ["origin"]
+            .as_str()
+            .map(str::to_string)
+    };
+    assert_eq!(
+        origin_of("Rustfmt"),
+        Some("warning".to_string()),
+        "a warning-level entry must say so on the wire: {gate}"
+    );
+    assert_eq!(
+        origin_of("Clippy"),
+        Some("failure".to_string()),
+        "a hard failure must stay distinguishable from a warning: {gate}"
+    );
+
+    // A new readable field is a MINOR schema change; a pack that carries it and
+    // still claims 2.1 lies to `tools/validate_merge_gate.py` and to any reader
+    // deciding whether `origin` can be trusted to be present.
+    assert_eq!(
+        gate["schema_version"].as_str(),
+        Some(crate::gate::MERGE_GATE_SCHEMA_VERSION),
+        "the pack stamps the schema this build writes"
+    );
+    assert_eq!(
+        crate::gate::MERGE_GATE_SCHEMA_VERSION,
+        "2.2",
+        "adding `origin` to quality_failure_details bumps the MINOR"
     );
 }
 
@@ -1980,7 +2112,7 @@ fn merge_gate_does_not_fail_fast_remote_only_for_expected_rust_gaps() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -2063,7 +2195,7 @@ fn merge_gate_blocks_missing_rust_quality_signal_when_policy_sets_block() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -2128,7 +2260,7 @@ fn merge_gate_skipped_cargo_geiger_with_ignore_severity_produces_no_caveat() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -2668,7 +2800,7 @@ fn pr_review_summarizes_cargo_audit_without_dumping_json() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -2757,7 +2889,7 @@ fn pr_review_surfaces_cargo_audit_informational_warnings_when_check_passes() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -2906,6 +3038,70 @@ fn is_pathish_candidate_rejects_code_fragments() {
 }
 
 #[test]
+fn ai_index_coverage_signal_says_not_measured_for_zero_of_zero() {
+    use crate::artifacts::signal::COVERAGE_NOT_MEASURED;
+    use crate::git::DiffStats;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = tmp.path();
+    let config = create_test_config(PolicyConfig::default());
+    let diffs = vec![Diff {
+        base: "main".to_string(),
+        target: "feat/x".to_string(),
+        base_commit_id: "aaa".to_string(),
+        target_commit_id: "bbb".to_string(),
+        files: vec![],
+        stats: DiffStats {
+            files_changed: 0,
+            additions: 0,
+            deletions: 0,
+            copied: 0,
+        },
+        commits: vec![],
+    }];
+
+    let empty = CoverageDelta {
+        total_source: 0,
+        covered_count: 0,
+        pct: None,
+        uncovered: vec![],
+        covered: vec![],
+        non_code_count: 0,
+        ghost_tests: vec![],
+    };
+    generate_ai_index(out, &config, &diffs, &[], &empty).expect("ai index");
+    let index = std::fs::read_to_string(out.join("AI_INDEX.md")).expect("AI_INDEX.md");
+    assert!(
+        index.contains(&format!(
+            "Coverage signal: 0/0 changed code files ({COVERAGE_NOT_MEASURED})"
+        )),
+        "0/0 must be labelled not-measured, got:\n{index}"
+    );
+    assert!(
+        !index.contains("(100%)"),
+        "0/0 must never render as 100%, got:\n{index}"
+    );
+
+    // 0/N stays a real 0% measurement.
+    let measured = CoverageDelta {
+        total_source: 4,
+        covered_count: 0,
+        pct: Some(0),
+        uncovered: vec![],
+        covered: vec![],
+        non_code_count: 0,
+        ghost_tests: vec![],
+    };
+    generate_ai_index(out, &config, &diffs, &[], &measured).expect("ai index");
+    let index = std::fs::read_to_string(out.join("AI_INDEX.md")).expect("AI_INDEX.md");
+    assert!(
+        index.contains("Coverage signal: 0/4 changed code files (0%)"),
+        "0/N must render as 0%, got:\n{index}"
+    );
+    assert!(!index.contains(COVERAGE_NOT_MEASURED));
+}
+
+#[test]
 fn generate_ai_index_writes_reading_order_and_verdict() {
     use crate::git::DiffStats;
 
@@ -2939,7 +3135,7 @@ fn generate_ai_index_writes_reading_order_and_verdict() {
     let coverage = CoverageDelta {
         total_source: 0,
         covered_count: 0,
-        pct: 100,
+        pct: None,
         uncovered: vec![],
         covered: vec![],
         non_code_count: 0,
@@ -3120,7 +3316,7 @@ fn pr_review_counts_code_test_and_non_code_separately() {
         &CoverageDelta {
             total_source: 1,
             covered_count: 1,
-            pct: 100,
+            pct: Some(100),
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -3177,7 +3373,7 @@ fn pr_review_uses_coverage_delta_for_warning_summary() {
         &CoverageDelta {
             total_source: 4,
             covered_count: 1,
-            pct: 25,
+            pct: Some(25),
             uncovered: vec![crate::artifacts::signal::CoverageFile {
                 status: 'M',
                 path: "src/lib.rs".to_string(),
@@ -3241,7 +3437,7 @@ fn pr_review_surfaces_quick_wins_for_rust_signal_gaps_and_cargo_audit() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -4124,6 +4320,7 @@ fn quality_failure_summary_has_new_failures_with_introduced() {
         &mut summary,
         "ESLint".to_string(),
         QualityFailureClass::Introduced,
+        QualityFailureOrigin::Failure,
     );
     assert!(summary.has_new_failures());
 }
@@ -4135,6 +4332,7 @@ fn quality_failure_summary_has_new_failures_with_mixed() {
         &mut summary,
         "ESLint".to_string(),
         QualityFailureClass::Mixed,
+        QualityFailureOrigin::Failure,
     );
     assert!(summary.has_new_failures());
 }
@@ -4146,6 +4344,7 @@ fn quality_failure_summary_has_new_failures_with_unclassified() {
         &mut summary,
         "cargo test".to_string(),
         QualityFailureClass::Unclassified,
+        QualityFailureOrigin::Failure,
     );
     assert!(summary.has_new_failures());
 }
@@ -4157,11 +4356,13 @@ fn quality_failure_summary_no_new_failures_when_only_preexisting() {
         &mut summary,
         "Cargo audit".to_string(),
         QualityFailureClass::Preexisting,
+        QualityFailureOrigin::Failure,
     );
     push_quality_failure(
         &mut summary,
         "ESLint".to_string(),
         QualityFailureClass::Preexisting,
+        QualityFailureOrigin::Failure,
     );
     assert!(!summary.has_new_failures());
     // quality_failures still lists them (backward compat)
@@ -4249,7 +4450,7 @@ fn preexisting_failures_do_not_block_gate() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -4356,7 +4557,7 @@ fn introduced_failures_still_block_gate() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,
@@ -4476,7 +4677,7 @@ fn mixed_failures_include_both_preexisting_and_introduced_in_output() {
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
-            pct: 0,
+            pct: None,
             uncovered: vec![],
             covered: vec![],
             non_code_count: 0,

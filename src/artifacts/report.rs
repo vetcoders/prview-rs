@@ -1,4 +1,4 @@
-//! report.json v1 generator
+//! report.json v2 generator
 //!
 //! Single source of truth for the dashboard and external tooling.
 //! All data the dashboard needs is serialized here; the HTML renderer
@@ -178,10 +178,20 @@ struct GateReason {
     message: String,
 }
 
+/// One quality-summary entry, mirroring `MERGE_GATE.json`'s `decision`.
+///
+/// `origin` carries the same truth here as it does there, and for the same
+/// reason: the entry arrays mix hard failures with warning-level baseline
+/// signals, so a consumer reading `introduced_quality_failures: ["Rustfmt"]`
+/// next to `quality_pass: true` sees a pack that contradicts itself unless the
+/// detail says which status produced the entry. Emitting it in one artifact and
+/// not the other left the two readers of the same run disagreeing about what
+/// "failure" means.
 #[derive(Serialize)]
 struct GateQualityFailureDetail {
     name: String,
     classification: &'static str,
+    origin: &'static str,
 }
 
 #[derive(Serialize)]
@@ -458,6 +468,17 @@ struct Quality {
 #[derive(Serialize)]
 struct HeuristicsSection {
     available: bool,
+    /// `"measured"` only when loctree actually scanned at least one file.
+    /// Mirrors the `heuristics_loctree` gate status so a zero-file scan can
+    /// never be read as a clean scan (SKIP-AS-ZERO).
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skip_reason: Option<&'static str>,
+    /// Files loctree actually scanned. `None` when heuristics never ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_files: Option<usize>,
+    /// Counts are present only for a measured scan. `None` (field omitted)
+    /// means "not measured" — never a zero that pretends to be a result.
     #[serde(skip_serializing_if = "Option::is_none")]
     dead_exports: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -488,7 +509,12 @@ struct BreakingSection {
 
 #[derive(Serialize)]
 struct CoverageSection {
-    heuristic_ratio: f64,
+    /// `null` when there were no changed source files to evaluate. 0/0 is an
+    /// absence of measurement, not a perfect ratio.
+    heuristic_ratio: Option<f64>,
+    measured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_measured_reason: Option<&'static str>,
     matched: usize,
     total: usize,
     txt_path: &'static str,
@@ -686,6 +712,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             .map(|detail| GateQualityFailureDetail {
                 name: detail.name.clone(),
                 classification: detail.classification.as_str(),
+                origin: detail.origin.as_str(),
             })
             .collect(),
         policy_mode: ctx.policy_mode.to_string(),
@@ -862,15 +889,39 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         .filter(|b| matches!(b.kind, BreakingKind::ChangedSignature { .. }))
         .count();
 
-    let heuristics_section = match input.heuristics {
+    // A disabled run is not a broken scanner. `heuristics::run_all`
+    // short-circuits to a DEFAULT result when `run_heuristics` is off, and the
+    // caller still passes it, so `Some(..)` alone cannot tell "loctree failed"
+    // from "loctree was never asked to run". Only the config knows.
+    let heuristics_input = input
+        .config
+        .run_heuristics
+        .then_some(input.heuristics)
+        .flatten();
+
+    let heuristics_section = match heuristics_input {
         Some(h) => {
             let loctree = h.loctree.as_ref();
+            let available = loctree.map(|l| l.available).unwrap_or(false);
+            // Loctree can report success while having scanned nothing. Zero
+            // counts from a zero-file scan are "not measured", not "clean" —
+            // the same rule build_heuristics_gate_check applies to the gate.
+            let measured = available && h.summary.total_files > 0;
             HeuristicsSection {
-                available: loctree.map(|l| l.available).unwrap_or(false),
-                dead_exports: loctree.map(|l| l.dead_exports.len()),
-                cycles: loctree.map(|l| l.cycles.len()),
-                twins: loctree.map(|l| l.twins.exact_twins.len()),
-                dead_parrots: loctree.map(|l| l.twins.dead_parrots.len()),
+                available,
+                status: if measured { "measured" } else { "skipped" },
+                skip_reason: if measured {
+                    None
+                } else if available {
+                    Some("loctree scanned no files")
+                } else {
+                    Some("loctree analysis unavailable")
+                },
+                total_files: Some(h.summary.total_files),
+                dead_exports: measured.then(|| loctree.map_or(0, |l| l.dead_exports.len())),
+                cycles: measured.then(|| loctree.map_or(0, |l| l.cycles.len())),
+                twins: measured.then(|| loctree.map_or(0, |l| l.twins.exact_twins.len())),
+                dead_parrots: measured.then(|| loctree.map_or(0, |l| l.twins.dead_parrots.len())),
                 log_path: Some("20_quality/heuristics_loctree.log"),
                 analysis_root: h.analysis_root.clone(),
                 regression: h.regression.clone(),
@@ -878,6 +929,9 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         }
         None => HeuristicsSection {
             available: false,
+            status: "skipped",
+            skip_reason: Some("heuristics not run"),
+            total_files: None,
             dead_exports: None,
             cycles: None,
             twins: None,
@@ -903,11 +957,13 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             new_env_vars_count: new_env_vars,
         },
         coverage: CoverageSection {
-            heuristic_ratio: if ctx.coverage.total_source > 0 {
-                ctx.coverage.covered_count as f64 / ctx.coverage.total_source as f64
-            } else {
-                1.0
-            },
+            // 0/0 must serialize as null + measured:false, never as a 1.0 that
+            // downstream renders as "100% coverage".
+            heuristic_ratio: (ctx.coverage.total_source > 0)
+                .then(|| ctx.coverage.covered_count as f64 / ctx.coverage.total_source as f64),
+            measured: ctx.coverage.total_source > 0,
+            not_measured_reason: (ctx.coverage.total_source == 0)
+                .then_some("no changed source files to evaluate"),
             matched: ctx.coverage.covered_count,
             total: ctx.coverage.total_source,
             txt_path: "20_quality/coverage-delta.txt",
@@ -1053,7 +1109,11 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         .collect();
 
     Report {
-        schema_version: "1.0",
+        // 2.0, not 1.1: `quality.coverage.heuristic_ratio` became nullable and
+        // the loctree counters became omittable, so a decoder written against
+        // 1.0 no longer parses every pack. Calling that additive would repeat,
+        // at the schema level, the "0/0 is 100%" lie the change removed.
+        schema_version: "2.0",
         meta,
         gate,
         checks: check_entries,
@@ -1260,7 +1320,7 @@ test result: FAILED. 0 passed; 1 failed
             coverage: CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,
@@ -1321,6 +1381,7 @@ test result: FAILED. 0 passed; 1 failed
         use crate::artifacts::signal::CoverageDelta;
         use crate::artifacts::{
             CheckGateEntry, DashboardContext, QualityFailureClass, QualityFailureDetail,
+            QualityFailureOrigin,
         };
         use crate::cli::ExecutionMode;
         use crate::config::test_config;
@@ -1349,6 +1410,7 @@ test result: FAILED. 0 passed; 1 failed
             quality_failure_details: vec![QualityFailureDetail {
                 name: "ESLint".to_string(),
                 classification: QualityFailureClass::Preexisting,
+                origin: QualityFailureOrigin::Failure,
             }],
             policy_mode: "warn",
             blocking_issues: vec![],
@@ -1363,7 +1425,7 @@ test result: FAILED. 0 passed; 1 failed
             coverage: CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,
@@ -1425,6 +1487,116 @@ test result: FAILED. 0 passed; 1 failed
                 .as_str()
                 .is_some_and(|summary| summary.contains("1 pre-existing"))
         );
+    }
+
+    #[test]
+    fn report_gate_names_the_origin_of_every_quality_failure_detail() {
+        // Without the origin, `introduced_quality_failures: ["Rustfmt"]` next to
+        // `quality_pass: true` reads as a contradiction: the array says the
+        // check failed, the flag says it never gated. `MERGE_GATE.json` has
+        // named the producing status since schema 2.2; `report.json` carried the
+        // same array without it, so the two artifacts of ONE run disagreed about
+        // what "failure" meant.
+        use crate::artifacts::signal::CoverageDelta;
+        use crate::artifacts::{
+            CheckGateEntry, DashboardContext, QualityFailureClass, QualityFailureDetail,
+            QualityFailureOrigin,
+        };
+        use crate::cli::ExecutionMode;
+        use crate::config::test_config;
+        use crate::git::ResolvedRef;
+
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Standard;
+
+        let ctx = DashboardContext {
+            verdict: "CONDITIONAL",
+            analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            merge_recommendation: crate::policy::engine::MergeRecommendation::ReviewRequired,
+            allow_merge: true,
+            // A warning-origin entry never fails the quality gate.
+            quality_pass: true,
+            policy_allow_merge: true,
+            recommended_merge: true,
+            review_caveats: vec![],
+            quality_failures: vec!["Rustfmt".to_string()],
+            introduced_quality_failures: vec!["Rustfmt".to_string()],
+            preexisting_quality_failures: vec![],
+            mixed_quality_failures: vec![],
+            unclassified_quality_failures: vec![],
+            quality_failure_details: vec![QualityFailureDetail {
+                name: "Rustfmt".to_string(),
+                classification: QualityFailureClass::Introduced,
+                origin: QualityFailureOrigin::Warning,
+            }],
+            policy_mode: "warn",
+            blocking_issues: vec![],
+            check_gates: vec![CheckGateEntry {
+                name: "Rustfmt".to_string(),
+                id: "rustfmt".to_string(),
+                blocking: false,
+                class: "WARN",
+                severity: "warn",
+            }],
+            breaking: vec![],
+            coverage: CoverageDelta {
+                total_source: 0,
+                covered_count: 0,
+                pct: None,
+                uncovered: vec![],
+                covered: vec![],
+                non_code_count: 0,
+                ghost_tests: vec![],
+            },
+            findings: vec![],
+            per_file_diff_files: vec![],
+            skipped_checks: vec![],
+            previous_run: None,
+            run_history: vec![],
+            flaky_scores: vec![],
+            lint_metrics: vec![],
+            ownership_map: vec![],
+            risk_scores: vec![],
+            i18n_delta: None,
+        };
+        let target = ResolvedRef {
+            name: "feature/report".to_string(),
+            commit_id: "deadbeef".to_string(),
+            is_remote: false,
+        };
+        let bases = vec![ResolvedRef {
+            name: "main".to_string(),
+            commit_id: "cafebabe".to_string(),
+            is_remote: false,
+        }];
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = ReportInput {
+            dir: tmp.path(),
+            config: &config,
+            diffs: &[],
+            checks: &[],
+            resolved_target: &target,
+            resolved_bases: &bases,
+            ctx: &ctx,
+            run_started_at: "2026-03-09T00:00:00Z",
+            heuristics: None,
+            regression: None,
+        };
+
+        let report = build_report(&input);
+        let json = serde_json::to_value(&report).expect("serialize report");
+
+        let detail = &json["gate"]["quality_failure_details"][0];
+        assert_eq!(detail["name"].as_str(), Some("Rustfmt"));
+        assert_eq!(detail["classification"].as_str(), Some("introduced"));
+        assert_eq!(
+            detail["origin"].as_str(),
+            Some("warning"),
+            "report.json must name the status that produced the entry, got: {}",
+            json["gate"]["quality_failure_details"]
+        );
+        assert_eq!(json["gate"]["quality_pass"].as_bool(), Some(true));
     }
 
     #[test]
@@ -1492,7 +1664,7 @@ test result: FAILED. 0 passed; 1 failed
             coverage: CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,
@@ -1559,6 +1731,9 @@ test result: FAILED. 0 passed; 1 failed
 
         let mut config = test_config();
         config.execution_mode = ExecutionMode::Standard;
+        // The fixture below is a loctree run that measured 10 files, so the
+        // config must be one that actually asked for heuristics.
+        config.run_heuristics = true;
 
         let ctx = DashboardContext {
             verdict: "PASS",
@@ -1588,7 +1763,7 @@ test result: FAILED. 0 passed; 1 failed
             coverage: crate::artifacts::signal::CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,
@@ -1675,6 +1850,234 @@ test result: FAILED. 0 passed; 1 failed
 
         assert_eq!(heuristics_json["unused_symbols"].as_u64(), Some(3));
         assert!(heuristics_json.get("dead_parrots").is_none());
+        assert_eq!(heuristics_json["status"].as_str(), Some("measured"));
+        assert_eq!(heuristics_json["total_files"].as_u64(), Some(10));
+        assert!(heuristics_json.get("skip_reason").is_none());
+    }
+
+    // ── SKIP-AS-ZERO regression guards (report.json) ─────────────────────
+
+    /// Minimal DashboardContext for report.json shape assertions.
+    fn skip_as_zero_ctx(
+        coverage: crate::artifacts::signal::CoverageDelta,
+    ) -> crate::artifacts::DashboardContext {
+        crate::artifacts::DashboardContext {
+            verdict: "PASS",
+            analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
+            allow_merge: true,
+            quality_pass: true,
+            policy_allow_merge: true,
+            recommended_merge: true,
+            review_caveats: vec![],
+            quality_failures: vec![],
+            introduced_quality_failures: vec![],
+            preexisting_quality_failures: vec![],
+            mixed_quality_failures: vec![],
+            unclassified_quality_failures: vec![],
+            quality_failure_details: vec![],
+            policy_mode: "warn",
+            blocking_issues: vec![],
+            check_gates: vec![],
+            breaking: vec![],
+            coverage,
+            findings: vec![],
+            per_file_diff_files: vec![],
+            skipped_checks: vec![],
+            previous_run: None,
+            run_history: vec![],
+            flaky_scores: vec![],
+            lint_metrics: vec![],
+            ownership_map: vec![],
+            risk_scores: vec![],
+            i18n_delta: None,
+        }
+    }
+
+    /// `run_heuristics` is the config flag, not a property of `heuristics`:
+    /// a disabled run still hands the report a default result, and telling the
+    /// two apart is the whole point of the heuristics section's skip reason.
+    fn skip_as_zero_report(
+        ctx: &crate::artifacts::DashboardContext,
+        heuristics: Option<&crate::heuristics::HeuristicsResult>,
+        run_heuristics: bool,
+    ) -> serde_json::Value {
+        use crate::cli::ExecutionMode;
+        use crate::config::test_config;
+        use crate::git::ResolvedRef;
+
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Standard;
+        config.run_heuristics = run_heuristics;
+        let target = ResolvedRef {
+            name: "feature/skip-as-zero".to_string(),
+            commit_id: "deadbeef".to_string(),
+            is_remote: false,
+        };
+        let bases = vec![ResolvedRef {
+            name: "main".to_string(),
+            commit_id: "cafebabe".to_string(),
+            is_remote: false,
+        }];
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = ReportInput {
+            dir: tmp.path(),
+            config: &config,
+            diffs: &[],
+            checks: &[],
+            resolved_target: &target,
+            resolved_bases: &bases,
+            ctx,
+            run_started_at: "2026-03-12T00:00:00Z",
+            heuristics,
+            regression: None,
+        };
+        serde_json::to_value(build_report(&input)).expect("serialize report")
+    }
+
+    fn coverage_delta(
+        total_source: usize,
+        covered_count: usize,
+        pct: Option<u32>,
+    ) -> crate::artifacts::signal::CoverageDelta {
+        crate::artifacts::signal::CoverageDelta {
+            total_source,
+            covered_count,
+            pct,
+            uncovered: vec![],
+            covered: vec![],
+            non_code_count: 0,
+            ghost_tests: vec![],
+        }
+    }
+
+    #[test]
+    fn report_coverage_zero_of_zero_is_null_not_full_ratio() {
+        let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        let json = skip_as_zero_report(&ctx, None, false);
+        let cov = &json["quality"]["coverage"];
+
+        assert!(
+            cov["heuristic_ratio"].is_null(),
+            "0/0 must serialize as null, got {:?}",
+            cov["heuristic_ratio"]
+        );
+        assert_eq!(cov["measured"].as_bool(), Some(false));
+        assert!(cov["not_measured_reason"].as_str().is_some());
+        // Schema compatibility: the counters stay present for existing readers.
+        assert_eq!(cov["matched"].as_u64(), Some(0));
+        assert_eq!(cov["total"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn report_schema_version_states_the_nullable_shape() {
+        // The unmeasured cut changed `heuristic_ratio` from a plain number to a
+        // nullable one, and made the loctree counters omittable. Both are shape
+        // changes a strict 1.0 decoder cannot survive, so leaving the stamp at
+        // "1.0" makes report.json misdescribe itself — the same class of lie the
+        // cut was fixing one level down. MINOR would promise old decoders keep
+        // working, which is exactly what stopped being true, so this is a MAJOR.
+        let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        let json = skip_as_zero_report(&ctx, None, false);
+
+        assert!(
+            json["quality"]["coverage"]["heuristic_ratio"].is_null(),
+            "precondition: the nullable shape is what the version must describe"
+        );
+        assert_eq!(
+            json["schema_version"].as_str(),
+            Some("2.0"),
+            "a nullable field and omittable counters are not an additive change"
+        );
+    }
+
+    #[test]
+    fn report_coverage_zero_of_n_stays_a_real_zero_ratio() {
+        // 0/3 IS a measurement — it must not be downgraded to "not measured".
+        let ctx = skip_as_zero_ctx(coverage_delta(3, 0, Some(0)));
+        let json = skip_as_zero_report(&ctx, None, false);
+        let cov = &json["quality"]["coverage"];
+
+        assert_eq!(cov["heuristic_ratio"].as_f64(), Some(0.0));
+        assert_eq!(cov["measured"].as_bool(), Some(true));
+        assert!(cov.get("not_measured_reason").is_none());
+        assert_eq!(cov["total"].as_u64(), Some(3));
+    }
+
+    #[test]
+    fn report_heuristics_zero_file_scan_is_marked_skipped_without_zero_counts() {
+        use crate::heuristics::{HeuristicsResult, HeuristicsSummary, LoctreeAnalysis};
+
+        // Loctree "succeeded" but scanned nothing: the gate already calls this
+        // SKIP, so report.json must not emit dead_exports/cycles/twins = 0.
+        let heuristics = HeuristicsResult {
+            loctree: Some(LoctreeAnalysis {
+                available: true,
+                ..Default::default()
+            }),
+            summary: HeuristicsSummary {
+                total_files: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        let json = skip_as_zero_report(&ctx, Some(&heuristics), true);
+        let h = &json["quality"]["heuristics"];
+
+        assert_eq!(h["status"].as_str(), Some("skipped"));
+        assert_eq!(h["skip_reason"].as_str(), Some("loctree scanned no files"));
+        assert_eq!(h["total_files"].as_u64(), Some(0));
+        for key in ["dead_exports", "cycles", "twins", "unused_symbols"] {
+            assert!(
+                h.get(key).is_none(),
+                "{key} must be absent for a zero-file scan, got {:?}",
+                h.get(key)
+            );
+        }
+    }
+
+    #[test]
+    fn report_heuristics_disabled_is_not_reported_as_an_unavailable_scanner() {
+        use crate::heuristics::HeuristicsResult;
+
+        // What a `--quick` / `--no-heuristics` run actually produces:
+        // `heuristics::run_all` short-circuits to a default result and `App::run`
+        // still passes it, so the report saw `Some(..)` with no loctree and
+        // called the scanner unavailable — a tool failure that never happened.
+        // A consumer cannot tell an intentional skip from a broken scanner, and
+        // the log path it was handed points at a zero-filled stub.
+        let heuristics = HeuristicsResult::default();
+        let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        let json = skip_as_zero_report(&ctx, Some(&heuristics), false);
+        let h = &json["quality"]["heuristics"];
+
+        assert_eq!(h["available"].as_bool(), Some(false));
+        assert_eq!(h["status"].as_str(), Some("skipped"));
+        assert_eq!(h["skip_reason"].as_str(), Some("heuristics not run"));
+        assert!(
+            h.get("log_path").is_none(),
+            "a run that never invoked loctree has no loctree log, got {:?}",
+            h.get("log_path")
+        );
+        assert!(
+            h.get("total_files").is_none(),
+            "a disabled scan measured nothing, got {:?}",
+            h.get("total_files")
+        );
+    }
+
+    #[test]
+    fn report_heuristics_not_run_is_marked_skipped() {
+        let ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        let json = skip_as_zero_report(&ctx, None, false);
+        let h = &json["quality"]["heuristics"];
+
+        assert_eq!(h["available"].as_bool(), Some(false));
+        assert_eq!(h["status"].as_str(), Some("skipped"));
+        assert_eq!(h["skip_reason"].as_str(), Some("heuristics not run"));
+        assert!(h.get("total_files").is_none());
+        assert!(h.get("dead_exports").is_none());
     }
 
     #[test]
@@ -1725,7 +2128,7 @@ test result: FAILED. 0 passed; 1 failed
             coverage: crate::artifacts::signal::CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
-                pct: 0,
+                pct: None,
                 uncovered: vec![],
                 covered: vec![],
                 non_code_count: 0,

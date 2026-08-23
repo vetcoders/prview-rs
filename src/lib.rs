@@ -19,6 +19,7 @@ pub mod paths;
 pub mod policy;
 pub mod proc;
 pub mod regression;
+pub(crate) mod rust_source;
 pub mod scope;
 pub mod state;
 pub mod storage;

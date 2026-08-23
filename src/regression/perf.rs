@@ -7,10 +7,25 @@
 //! Non-code files (docs, scripts, configs, assets) are skipped entirely.
 //! Test/e2e files are also skipped — a query-in-loop in a Playwright test
 //! is not a production performance regression signal.
+//!
+//! Inline Rust test context (`#[cfg(test)]` / `mod tests` / `#[test]`) is
+//! resolved **per hit line**, not per hunk: a production hot path that merely
+//! shares a hunk with a trailing test module still counts as a production
+//! signal. When the context of a hit is ambiguous it is classified as
+//! production — a false positive costs a reviewer a glance, a false negative
+//! hides a real regression. That rule governs the MARKERS too: only a gate that
+//! provably holds solely in a test build opens test context, so
+//! `#[cfg(not(test))]` and `#[cfg(any(test, …))]` are production. The context is read from the patch's **target
+//! state** only (added and context lines); removed lines describe what the
+//! patch replaces and never open or close a scope. A hit is paired only with a
+//! nearby loop in the *same* context, so a production statement cannot borrow a
+//! loop from an adjacent test module (or the reverse).
 
 use super::RegressionContext;
+use crate::rust_source::SourceScanner;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -52,12 +67,119 @@ static QUERY_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 static CLONE_COLLECT_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.(clone|collect)\s*\(\s*\)").unwrap());
 
+/// Markers that PROVE the item below them exists only in a test build.
+///
+/// The `cfg` alternatives are deliberately narrow. Matching the bare token
+/// `test` anywhere inside a predicate read `#[cfg(not(test))]` — code compiled
+/// into every build EXCEPT the test one — as test context and silently muted the
+/// production hits under it, and did the same for
+/// `#[cfg(any(test, feature = "bench"))]`, which compiles outside the test build
+/// whenever the feature is on, and for `#[cfg(feature = "__internal-test")]`,
+/// which is a feature that merely has `test` in its name. Only an exact
+/// `cfg(test)` and an `all(…)` with `test` among its operands — which cannot
+/// hold unless `test` does — are provable. Measured over the local registry
+/// (58,586 files), of the 11,030 attributes the previous pattern read as test
+/// context 83.62% are exactly `cfg(test)` and 6.76% are `all(…, test, …)`; the
+/// remaining 9.62% — `any(test, …)`, `not(…)` and `test`-named features — are
+/// the ones it was getting wrong.
+///
+/// `all` is commutative, so the operand's POSITION carries no meaning:
+/// `all(feature = "bench", test)` is as provably test-only as
+/// `all(test, feature = "bench")`, and reading only the first operand made the
+/// same predicate test context or production depending on how it was written.
+/// Accepting the operand anywhere adds 72 attributes over the same 58,614-file
+/// registry and removes none — `all(loom, test)`, `all(feature = "std", test)`,
+/// `all(windows, test)` and the degenerate `all(test)` — every one of them a
+/// direct `test` operand.
+/// The operand must be a DIRECT one, which is why nothing before it may open a
+/// nested predicate: `test` inside `all(not(test), …)` proves the opposite of
+/// itself, and `all(any(test, …), …)` proves nothing. That exclusion also drops
+/// `all(not(windows), test)`, where the `test` IS direct — an under-detection
+/// kept on purpose, per the asymmetry below, rather than a paren-matching
+/// parser this signal does not need.
+///
+/// Anything unproven is production, because the two errors are not
+/// symmetrical: failing to recognize test context costs one extra finding a
+/// reader can dismiss, while claiming it where it does not hold deletes a
+/// production finding nobody ever sees.
 static INLINE_RUST_TEST_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"#\[\s*(?:cfg\s*\([^]]*\btest\b[^]]*\)|(?:[\w:]+::)*test|rstest)\s*\]|\bmod\s+tests\b",
+        r"#\[\s*(?:cfg\s*\(\s*(?:test|all\s*\(\s*[^()]*\btest\s*(?:,[^]]*)?\))\s*\)|(?:[\w:]+::)*test|rstest)\s*\]|\bmod\s+tests\b",
     )
     .unwrap()
 });
+
+/// Runaway bound on how many physical lines one attribute may span.
+///
+/// rustfmt wraps a long `cfg` predicate over a handful of lines; nothing
+/// legitimate approaches this. The cap exists so a `#[` that never closes — a
+/// truncated hunk, a macro fragment — cannot keep swallowing lines and silence
+/// the rest of the file.
+const MAX_ATTRIBUTE_CONTINUATION_LINES: usize = 8;
+
+/// Joins the physical lines of one attribute so the marker pattern sees the
+/// whole predicate.
+///
+/// The pattern is written against a complete `#[…]`, but it was applied per
+/// physical line, so a wrapped
+/// `#[cfg(all(\n    feature = "bench",\n    test\n))]` matched on no line at
+/// all and its test-only item was read as production. Brackets are counted on
+/// the comment- and literal-resolved view, so a `]` inside a string or a
+/// trailing comment cannot close the attribute early.
+#[derive(Default)]
+struct AttributeAccumulator {
+    /// Joined code of the attribute so far, or `None` when none is open.
+    buffer: Option<String>,
+    /// Unclosed `[` of the open attribute.
+    depth: i32,
+    lines: usize,
+}
+
+impl AttributeAccumulator {
+    /// Feed one line of resolved code and return the text to match against, if
+    /// any: the line itself when no attribute is open and it needs none, the
+    /// joined attribute on the line that closes it, and nothing while one is
+    /// still accumulating.
+    fn feed<'a>(&mut self, code: &'a str) -> Option<Cow<'a, str>> {
+        let delta = bracket_delta(code);
+
+        if let Some(buffer) = self.buffer.as_mut() {
+            buffer.push(' ');
+            buffer.push_str(code);
+            self.depth += delta;
+            self.lines += 1;
+            if self.depth <= 0 {
+                return self.buffer.take().map(Cow::Owned);
+            }
+            if self.lines >= MAX_ATTRIBUTE_CONTINUATION_LINES {
+                // Unterminated: nothing was proven, so drop it rather than
+                // letting a half-read predicate decide the context.
+                self.buffer = None;
+                self.depth = 0;
+                self.lines = 0;
+            }
+            return None;
+        }
+
+        if delta > 0 && code.contains('#') {
+            self.buffer = Some(code.to_string());
+            self.depth = delta;
+            self.lines = 1;
+            return None;
+        }
+
+        Some(Cow::Borrowed(code))
+    }
+}
+
+/// Unclosed `[` in one line of resolved code.
+fn bracket_delta(code: &str) -> i32 {
+    code.chars().fold(0, |depth, ch| match ch {
+        '[' => depth + 1,
+        ']' => depth - 1,
+        _ => depth,
+    })
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PerfRegression {
@@ -171,56 +293,30 @@ pub fn analyze(ctx: &RegressionContext) -> PerfRegression {
             .map(|l| &l[1..]) // strip leading '+'
             .collect();
 
+        // Per-added-line inline test context, aligned index-by-index with
+        // `added_lines`, so each hit is classified by its own line.
+        let test_context = added_line_test_context(&file, &hunk);
+
         // Proximity-based detection: patterns must appear within PROXIMITY_WINDOW
         // added lines of each other, not just anywhere in the same hunk.
-        let (has_query_near_loop, has_clone_near_loop) = check_proximity(&added_lines);
-        let is_inline_test_context = is_inline_test_context(&file, &hunk);
+        let hits = check_proximity(&added_lines, &test_context);
 
-        if has_query_near_loop {
+        if hits.query_prod || hits.query_test || hits.clone_prod || hits.clone_test {
             let reasons = file_reasons.entry(file.clone()).or_default();
-            if is_inline_test_context {
-                if !reasons
-                    .test_reasons
-                    .iter()
-                    .any(|r| r.contains("query in loop"))
-                {
-                    reasons.test_reasons.push("query in loop".to_string());
-                }
-            } else {
+
+            if hits.query_prod {
                 query_in_loop += 1;
-                if !reasons
-                    .prod_reasons
-                    .iter()
-                    .any(|r| r.contains("query in loop"))
-                {
-                    reasons.prod_reasons.push("query in loop".to_string());
-                }
+                push_reason(&mut reasons.prod_reasons, "query in loop");
             }
-        }
-
-        if has_clone_near_loop {
-            let reasons = file_reasons.entry(file.clone()).or_default();
-            if is_inline_test_context {
-                if !reasons
-                    .test_reasons
-                    .iter()
-                    .any(|r| r.contains("clone/collect"))
-                {
-                    reasons
-                        .test_reasons
-                        .push("clone/collect in loop".to_string());
-                }
-            } else {
+            if hits.query_test {
+                push_reason(&mut reasons.test_reasons, "query in loop");
+            }
+            if hits.clone_prod {
                 clone_in_loop += 1;
-                if !reasons
-                    .prod_reasons
-                    .iter()
-                    .any(|r| r.contains("clone/collect"))
-                {
-                    reasons
-                        .prod_reasons
-                        .push("clone/collect in loop".to_string());
-                }
+                push_reason(&mut reasons.prod_reasons, "clone/collect in loop");
+            }
+            if hits.clone_test {
+                push_reason(&mut reasons.test_reasons, "clone/collect in loop");
             }
         }
     }
@@ -274,63 +370,401 @@ pub fn analyze(ctx: &RegressionContext) -> PerfRegression {
     }
 }
 
+/// Append `reason` unless it is already recorded.
+fn push_reason(reasons: &mut Vec<String>, reason: &str) {
+    if !reasons.iter().any(|r| r == reason) {
+        reasons.push(reason.to_string());
+    }
+}
+
+/// Proximity hits of one hunk, split by the context of the hit itself.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ProximityHits {
+    query_prod: bool,
+    query_test: bool,
+    clone_prod: bool,
+    clone_test: bool,
+}
+
+impl ProximityHits {
+    fn is_saturated(&self) -> bool {
+        self.query_prod && self.query_test && self.clone_prod && self.clone_test
+    }
+}
+
 /// Check if query/clone patterns appear within [`PROXIMITY_WINDOW`] added lines
-/// of a loop pattern. Returns `(query_near_loop, clone_near_loop)`.
-fn check_proximity(added_lines: &[&str]) -> (bool, bool) {
-    let loop_lines: Vec<usize> = added_lines
+/// of a loop pattern, classifying **each hit** as production or test context.
+///
+/// `test_context[i]` describes `added_lines[i]`. A hit counts as test context
+/// only when **its own line** sits in test context; anything else — including a
+/// missing or unknown classification — counts as production.
+///
+/// The nearby loop must share the hit's context. A production statement sitting
+/// just above a trailing `#[cfg(test)]` module is not "in" the loop of a test
+/// that happens to be within [`PROXIMITY_WINDOW`] lines of it — pairing across
+/// the boundary invents a loop that exists in neither context. Unknown context
+/// still resolves to production on both sides, so ambiguity keeps pairing.
+fn check_proximity(added_lines: &[&str], test_context: &[bool]) -> ProximityHits {
+    // Missing context data means "unknown" — treat it as production.
+    let context_of = |i: usize| test_context.get(i).copied().unwrap_or(false);
+
+    let loop_lines: Vec<(usize, bool)> = added_lines
         .iter()
         .enumerate()
         .filter(|(_, l)| is_loop_line(l))
-        .map(|(i, _)| i)
+        .map(|(i, _)| (i, context_of(i)))
         .collect();
 
+    let mut hits = ProximityHits::default();
     if loop_lines.is_empty() {
-        return (false, false);
+        return hits;
     }
 
-    let mut query_near_loop = false;
-    let mut clone_near_loop = false;
-
     for (i, line) in added_lines.iter().enumerate() {
+        let is_query = QUERY_PATTERN.is_match(line);
+        let is_clone = CLONE_COLLECT_PATTERN.is_match(line);
+        if !is_query && !is_clone {
+            continue;
+        }
+
+        let in_test = context_of(i);
+
         let near_loop = loop_lines
             .iter()
-            .any(|&l| i.abs_diff(l) <= PROXIMITY_WINDOW);
+            .any(|&(l, loop_in_test)| loop_in_test == in_test && i.abs_diff(l) <= PROXIMITY_WINDOW);
         if !near_loop {
             continue;
         }
-        if !query_near_loop && QUERY_PATTERN.is_match(line) {
-            query_near_loop = true;
+
+        if is_query {
+            hits.query_prod |= !in_test;
+            hits.query_test |= in_test;
         }
-        if !clone_near_loop && CLONE_COLLECT_PATTERN.is_match(line) {
-            clone_near_loop = true;
+        if is_clone {
+            hits.clone_prod |= !in_test;
+            hits.clone_test |= in_test;
         }
-        if query_near_loop && clone_near_loop {
+        if hits.is_saturated() {
             break;
         }
     }
 
-    (query_near_loop, clone_near_loop)
+    hits
 }
 
 fn is_loop_line(line: &str) -> bool {
     EXPLICIT_LOOP_PATTERN.is_match(line) || ITERATOR_LOOP_PATTERN.is_match(line)
 }
 
-fn is_inline_test_context(file: &str, hunk: &str) -> bool {
+/// Returns `true` for hunk lines that are diff bookkeeping rather than source.
+fn is_diff_metadata_line(line: &str) -> bool {
+    line.starts_with("@@")
+        || line.starts_with("diff --git")
+        || line.starts_with("+++")
+        || line.starts_with("--- a/")
+        || line == "---"
+        || line.starts_with("index ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("rename ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+}
+
+/// Map each added line of `hunk` to "is this line inside inline Rust test
+/// context?", in the same order as the added-line vector used for detection.
+///
+/// A test-context marker (`#[cfg(test)]`, `mod tests`, `#[test]`, `#[rstest]`)
+/// opens the context; it closes again once the braces opened after that marker
+/// balance out. Lines *before* the marker stay production — that is the whole
+/// point of per-hit classification: a hot path sharing a hunk with a trailing
+/// test module is still production code.
+///
+/// Ambiguity resolves toward production: non-Rust files, unrecognised braces
+/// and commented-out markers all leave the line classified as production.
+///
+/// Only the **target state** shapes the scope: added (`+`) and context (` `)
+/// lines. Removed (`-`) lines describe the state being replaced and are ignored
+/// wholesale — both for markers and for brace tracking. A `#[cfg(test)]` deleted
+/// by the patch does not exist afterwards, and a renamed declaration whose old
+/// and new lines both open a brace would otherwise leave the test scope
+/// permanently open and mute every production hit below it.
+fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
+    let added_lines = hunk
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"));
+
     if !file.ends_with(".rs") {
-        return false;
+        return added_lines.map(|_| false).collect();
     }
 
-    hunk.lines().any(|line| {
-        let trimmed = line
-            .strip_prefix('+')
-            .or_else(|| line.strip_prefix('-'))
-            .or_else(|| line.strip_prefix(' '))
-            .unwrap_or(line)
-            .trim();
+    let mut flags = Vec::new();
+    let mut in_test = false;
+    let mut depth: i32 = 0;
+    let mut seen_open = false;
+    // Bracket nesting of the annotated item's SIGNATURE, tracked only until its
+    // body opens. A brace inside `(…)`, `[…]` or `<…>` is not the body.
+    let mut sig_depth: i32 = 0;
+    // Braces open INSIDE those brackets — a const argument (`Buffer<{1<2}>`) or
+    // a destructured parameter (`Params(Req { field })`). Their contents are
+    // expression or pattern text, where `<` and `>` are operators, so signature
+    // tracking is frozen while one is open.
+    let mut sig_block: i32 = 0;
+    // Has the annotated item passed a top-level `=`? After one it states a
+    // VALUE, so `<` and `>` there are operators too.
+    let mut sig_initializes = false;
+    // Unclosed `[` of an attribute being scanned, and whether the previous
+    // character was the `#`/`#!` that opens one. Both persist across lines: an
+    // attribute may wrap, and its braces are never the item's body.
+    let mut attr_depth: i32 = 0;
+    let mut attr_sigil = false;
+    // Block comments and string literals span lines, so the reader is stateful
+    // for this hunk. Hunks are not contiguous, and this function is called per
+    // hunk, so the scanner starts clean here and is never carried past the
+    // hunk boundary.
+    let mut scanner = SourceScanner::default();
+    // Attributes wrap across lines; the marker pattern needs the whole one.
+    // Per hunk, like the scanner beside it.
+    let mut attributes = AttributeAccumulator::default();
 
-        INLINE_RUST_TEST_CONTEXT_PATTERN.is_match(trimmed)
-    })
+    for line in hunk.lines() {
+        if is_diff_metadata_line(line) {
+            continue;
+        }
+
+        // Removed lines are not part of the state this patch produces.
+        if line.starts_with('-') {
+            continue;
+        }
+
+        let is_added = line.starts_with('+');
+        let payload = line
+            .strip_prefix('+')
+            .or_else(|| line.strip_prefix(' '))
+            .unwrap_or(line);
+
+        // Comments (whole-line, doc, trailing, or a `/* … */` still open from
+        // an earlier line) are not code: neither their markers nor their braces
+        // may move the scope. A commented-out line reduces to an empty slice
+        // here, which is inert on both counts.
+        let code = scanner.code_only(payload);
+        let trimmed = code.trim();
+
+        // A wrapped attribute is matched once, on the line that closes it;
+        // while one is still open there is nothing complete to judge.
+        let marker_text = attributes.feed(trimmed);
+
+        // Only the outermost marker opens the context, so nested `#[test]`
+        // attributes do not reset the enclosing `mod tests` brace tracking.
+        if !in_test
+            && marker_text
+                .as_deref()
+                .is_some_and(|text| INLINE_RUST_TEST_CONTEXT_PATTERN.is_match(text))
+        {
+            in_test = true;
+            depth = 0;
+            seen_open = false;
+            sig_depth = 0;
+            sig_block = 0;
+            sig_initializes = false;
+            attr_depth = 0;
+            attr_sigil = false;
+        }
+
+        if is_added {
+            flags.push(in_test);
+        }
+
+        if in_test {
+            let mut prev = '\0';
+            let mut chars = code.chars().peekable();
+            while let Some(ch) = chars.next() {
+                // An attribute's brackets are its own: `#[case(Case { id: 1 })]`
+                // stacked under a test marker carries braces that belong to the
+                // attribute, never to the annotated item. Letting them through
+                // made the `{` a body opener and the `}` close the context on
+                // the same line, so the test function below read as production
+                // and its query-in-loop became a phantom regression. The depth
+                // persists across lines because attributes wrap.
+                if attr_depth > 0 {
+                    match ch {
+                        '[' => attr_depth += 1,
+                        ']' => attr_depth -= 1,
+                        _ => {}
+                    }
+                    prev = ch;
+                    continue;
+                }
+                if ch == '[' && attr_sigil {
+                    attr_depth = 1;
+                    prev = ch;
+                    continue;
+                }
+                // `#` opens an attribute sigil, `#!` an inner one; anything else
+                // clears it, so a plain index `a[0]` is not mistaken for one.
+                attr_sigil = ch == '#' || (attr_sigil && ch == '!');
+
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        // Only a brace OUTSIDE the signature's brackets opens
+                        // the body. `fn run() -> Buffer<{ LIMIT }>` and
+                        // `fn run(Params(Req { field }): Params<Req>)` both
+                        // balance a brace pair in type or pattern position,
+                        // before any body exists; reading one as the opener made
+                        // the very next line look like the item closing again,
+                        // so the context ended at the signature and the whole
+                        // test body was recorded as production.
+                        seen_open |= sig_depth == 0;
+                        // A brace that is NOT the body opener holds expression or
+                        // pattern text, where `<` and `>` are operators.
+                        if !seen_open {
+                            sig_block += 1;
+                        }
+                    }
+                    '}' => {
+                        depth -= 1;
+                        sig_block = (sig_block - 1).max(0);
+                    }
+                    // A top-level `=` ends the signature and starts a VALUE. The
+                    // `<` after it is a comparison or a shift, never a generic
+                    // opener, and counting one left `sig_depth` above zero — the
+                    // very thing the `;` close tests — so a body-less item like
+                    // `#[cfg(test)] const ENABLED: bool = 1<2;` could not end its
+                    // own context and muted every production hit below it. Only a
+                    // TOP-LEVEL `=` counts: inside brackets it states a default
+                    // (`fn f<const N: usize = 4>`) or an associated type
+                    // (`Iterator<Item = u8>`), and `==`, `=>` and the compound
+                    // assignments are not initializers at all.
+                    '=' if !seen_open
+                        && sig_depth == 0
+                        && sig_block == 0
+                        && !matches!(chars.peek(), Some(&('=' | '>')))
+                        && !"=!<>+-*/%&|^".contains(prev) =>
+                    {
+                        sig_initializes = true;
+                    }
+                    _ if !seen_open && sig_block == 0 => {
+                        track_signature_brackets(ch, prev, sig_initializes, &mut sig_depth);
+                    }
+                    _ => {}
+                }
+                prev = ch;
+            }
+            if seen_open && depth <= 0 {
+                in_test = false;
+                depth = 0;
+                seen_open = false;
+                sig_depth = 0;
+                sig_block = 0;
+                sig_initializes = false;
+            } else if !seen_open && sig_depth == 0 && ends_the_annotated_item(trimmed) {
+                // Not every test item has a body. `#[cfg(test)] mod tests;` and
+                // `#[cfg(test)] use crate::helper;` never open a brace, so the
+                // "balanced again" close above could not fire and the context
+                // stayed open over the rest of the hunk — every production loop
+                // and query below it was recorded as test-only and vanished from
+                // the signal. Such an item ends at its `;`, and so does the
+                // context it opened. A `;` still inside the signature's brackets
+                // (`fn f(x: [u8;\n N])`) is not that end.
+                in_test = false;
+                depth = 0;
+                sig_depth = 0;
+                sig_block = 0;
+                sig_initializes = false;
+            }
+        }
+    }
+
+    flags
+}
+
+/// Advance the signature's bracket nesting by one character.
+///
+/// Called only before the annotated item's body opens, which is the one region
+/// where `<` is reliably a generic opener rather than a comparison: signatures
+/// do not compare. `->` is spelled with the same `>`, so a return arrow must not
+/// be read as closing an angle bracket. The depth is clamped at zero because a
+/// hunk may start mid-signature and hand the tracker a closer whose opener it
+/// never saw; erring toward zero makes the next brace read as the body opener,
+/// which ENDS the test context — a phantom perf signal costs a reviewer a
+/// glance, while a context stuck open mutes real production code.
+///
+/// Braces in type or pattern position are rare but real: across the local
+/// crates.io registry (59,974 files, 1,697,077 `fn` signatures) 1,191 signatures
+/// carry one, 715 of them with the body opener on a later line — the shape that
+/// actually breaks the tracker — and 59 of those signatures are test-annotated.
+/// The dominant idiom is not the const generic `Buffer<{ LIMIT }>` but the
+/// destructured extractor parameter, `fn handler(Parameters(Req { field }):
+/// Parameters<Req>)`, as written by `rmcp`, `leptos` and `sqlx`.
+fn track_signature_brackets(ch: char, prev: char, initializes: bool, sig_depth: &mut i32) {
+    match ch {
+        '(' | '[' => *sig_depth += 1,
+        // A generic opener FOLLOWS the thing it parameterises — `Buffer<`,
+        // `Vec<`, `fn f<`, `::<`. A `<` after whitespace is a comparison. That
+        // spacing rule is a heuristic, not a boundary: it reads `Buffer<{ 1 < 2
+        // }>` correctly and `Buffer<{1<2}>` — the same type, formatted compactly
+        // — wrongly, because `<` after a digit looks exactly like `<` after an
+        // identifier. The boundary is the caller's, which freezes this tracker
+        // inside a const argument's braces. What survives here is the ordinary
+        // signature, where a comparison cannot appear at all. Closers stay
+        // unconditional (minus the `->` arrow) and the depth is clamped, so a
+        // `<` this rule still misjudges can only end the context early, never
+        // hold it open.
+        //
+        // The second boundary is the item's top-level `=`. After one the item
+        // states a VALUE, so both angle characters are operators there — and a
+        // counted comparison in a body-less initializer
+        // (`#[cfg(test)] const ENABLED: bool = 1<2;`) left the depth above zero,
+        // which is precisely what the `;` close tests, so the item could not end
+        // its own context and muted every production hit below it.
+        '<' if !initializes
+            && (prev.is_alphanumeric() || prev == '_' || prev == '>' || prev == ':') =>
+        {
+            *sig_depth += 1;
+        }
+        '>' if prev == '-' || initializes => {}
+        ')' | ']' | '>' => *sig_depth = (*sig_depth - 1).max(0),
+        _ => {}
+    }
+}
+
+/// Does this line finish a body-less item that a test marker annotated?
+///
+/// Only meaningful while the marker's item has not opened a brace: attributes
+/// stack above their item, so a line that is nothing but attributes is not it
+/// yet, and a line that opens a body is handled by the brace tracker instead.
+fn ends_the_annotated_item(trimmed: &str) -> bool {
+    let item = item_after_attributes(trimmed);
+    !item.is_empty() && item.ends_with(';')
+}
+
+/// The line with any leading `#[…]` attributes removed.
+///
+/// `#[cfg(test)] mod tests;` states the marker and the item it annotates on one
+/// line, so the item cannot be found by looking at how the line starts.
+fn item_after_attributes(trimmed: &str) -> &str {
+    let mut rest = trimmed;
+    while rest.starts_with("#[") {
+        let mut depth = 0usize;
+        let mut end = None;
+        for (index, ch) in rest.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index + ch.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // An attribute whose `]` is on a later line annotates nothing here.
+        let Some(end) = end else { return "" };
+        rest = rest[end..].trim_start();
+    }
+    rest
 }
 
 /// Split patch text into hunks (each starting with @@ or diff --git).
@@ -699,6 +1133,398 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
     }
 
     #[test]
+    fn a_not_test_cfg_is_production_context() {
+        // `#[cfg(not(test))]` is the exact OPPOSITE of test context: the item
+        // exists in every build EXCEPT the test one. Matching the bare token
+        // `test` anywhere inside the predicate read it as test context and muted
+        // a production query-in-loop entirely.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(not(test))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "code excluded from the test build is production code"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_cfg_that_only_may_be_test_is_production_context() {
+        // `#[cfg(any(test, feature = "bench"))]` compiles into a non-test build
+        // whenever the feature is on, so it is not PROVABLY test-only. The
+        // tolerated direction is a production finding for test code — one extra
+        // row a reader can dismiss — never a production hit silently dropped.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(any(test, feature = "bench"))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a cfg that may compile outside the test build is production"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_feature_named_after_test_is_production_context() {
+        // `#[cfg(feature = "__internal-test")]` states a FEATURE whose name
+        // happens to contain `test`. It compiles into an ordinary build.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(feature = "__internal-test")]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(result.perf_regression_suspected);
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn an_all_test_cfg_is_still_test_context() {
+        // The narrowing must not swallow the shape it is allowed to keep:
+        // `all(test, …)` cannot hold unless `test` does, so it is provably
+        // test-only and stays muted. 6.76% of the registry's cfg-test gates are
+        // written this way.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(all(test, feature = "std"))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.perf_regression_suspected);
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn an_all_cfg_proves_test_context_whatever_the_operand_order() {
+        // `all` is commutative, so `all(feature = "bench", test)` holds exactly
+        // when `all(test, feature = "bench")` does. Reading only the FIRST
+        // operand made the same predicate test context or production depending
+        // on how it happened to be written, and the second spelling produced a
+        // phantom production finding.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(all(feature = "bench", test))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.perf_regression_suspected);
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_nested_not_test_inside_all_is_production_context() {
+        // The operand has to be a DIRECT one. `all(feature = "x", not(test))`
+        // compiles in every build except the test one, so the bare token `test`
+        // inside it proves the opposite of test context — muting the hits under
+        // it would delete a production finding nobody ever sees.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(all(feature = "x", not(test)))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_feature_named_after_test_inside_all_is_production_context() {
+        // The widened alternative scans the whole operand list, so it must not
+        // start matching `test` inside a feature NAME. `all(unix, feature =
+        // "test-utils")` states no `test` operand at all.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(all(unix, feature = "test-utils"))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_multiline_cfg_attribute_still_opens_test_context() {
+        // rustfmt wraps a long predicate, and the marker regex runs per
+        // physical line, so no line ever carried the whole attribute: a
+        // test-only helper read as production and its query-in-loop surfaced as
+        // a phantom regression.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,12 @@
++#[cfg(all(
++    feature = "bench",
++    test
++))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.perf_regression_suspected);
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_multiline_not_test_cfg_is_still_production_context() {
+        // The accumulation must not turn the predicate into a bag of tokens:
+        // wrapped across lines, `not(test)` still proves the opposite of test
+        // context, and muting the hits under it would delete a production
+        // finding nobody ever sees.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,12 @@
++#[cfg(not(
++    test
++))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_multiline_any_test_cfg_is_still_production_context() {
+        // The other unproven shape, wrapped: `any(test, …)` compiles outside the
+        // test build whenever the other operand holds.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,12 @@
++#[cfg(any(
++    test,
++    feature = "bench"
++))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn an_unterminated_attribute_does_not_swallow_the_rest_of_the_hunk() {
+        // The accumulator is bounded. A `#[` that never closes — a truncated
+        // hunk, a macro fragment — must not keep eating lines and silence
+        // everything after it.
+        let mut patch = String::from(
+            "diff --git a/src/portal.rs b/src/portal.rs\n+++ b/src/portal.rs\n@@ -20,3 +20,40 @@\n+#[cfg(all(\n",
+        );
+        for _ in 0..MAX_ATTRIBUTE_CONTINUATION_LINES + 2 {
+            patch.push_str("+    feature = \"x\",\n");
+        }
+        patch.push_str("+fn refresh(users: &[User]) {\n");
+        patch.push_str("+    for user in users.iter() {\n");
+        patch.push_str("+        db.query(\"SELECT 1\");\n");
+        patch.push_str("+    }\n");
+        patch.push_str("+}\n");
+
+        let ctx = RegressionContext {
+            patch_text: Some(patch),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.suspected_files[0].test_context_only,
+            "an unterminated attribute proves nothing and must not mute the hit"
+        );
+    }
+
+    /// Build a patch that stacks `attr` under `#[rstest]` over a test function
+    /// whose body holds a query in a loop.
+    fn stacked_attribute_patch(attr: &str) -> String {
+        format!(
+            "diff --git a/src/portal.rs b/src/portal.rs\n+++ b/src/portal.rs\n@@ -20,3 +20,12 @@\n+#[rstest]\n+{attr}\n+fn checks(#[case] c: Case) {{\n+    for user in c.users.iter() {{\n+        db.query(\"SELECT 1\");\n+    }}\n+}}\n"
+        )
+    }
+
+    #[test]
+    fn braces_inside_a_stacked_attribute_do_not_open_the_item_body() {
+        // An attribute's braces belong to the attribute, never to the annotated
+        // item. `#[case(Case { id: 1 })]` alone is safe only because the `[` and
+        // `(` hold the signature depth above zero; two clamping `>` comparisons
+        // drive it back to zero first, and then the attribute's `{` was read as
+        // the body opener and its `}` closed the test context on the same line.
+        // The rstest function below was classified as production and its
+        // query-in-loop surfaced as a phantom regression.
+        for attr in [
+            "#[case(1 > 0, 2 > 1, Case { id: 1 })]",
+            "#[case(a > b, c > d, e > f, Case { id: 1 })]",
+        ] {
+            let ctx = RegressionContext {
+                patch_text: Some(stacked_attribute_patch(attr)),
+                ..Default::default()
+            };
+
+            let result = analyze(&ctx);
+            assert!(
+                result.suspected_files[0].test_context_only,
+                "the rstest function is test context: {attr}"
+            );
+            assert!(!result.perf_regression_suspected, "{attr}");
+            assert_eq!(result.query_in_loop_count, 0, "{attr}");
+        }
+    }
+
+    #[test]
+    fn ordinary_stacked_attributes_keep_their_test_context() {
+        // The shapes that already worked must keep working: the fix must not
+        // buy the case above by loosening the signature tracking.
+        for attr in [
+            "#[case(Case { id: 1 })]",
+            "#[case::first(Case { id: 1 })]",
+            "#[case(Case { id: 1 }, Other { id: 2 })]",
+            "#[case(Case::<u8> { id: 1 })]",
+            "#[should_panic(expected = \"Case { id: 1 }\")]",
+            "#[values(Cfg { a: 1 })]",
+        ] {
+            let ctx = RegressionContext {
+                patch_text: Some(stacked_attribute_patch(attr)),
+                ..Default::default()
+            };
+
+            let result = analyze(&ctx);
+            assert!(result.suspected_files[0].test_context_only, "{attr}");
+        }
+    }
+
+    #[test]
+    fn an_attribute_does_not_hide_the_real_body_brace() {
+        // The other direction: skipping an attribute's brackets must not also
+        // skip the item's own body. A production function carrying an attribute
+        // with braces still ends its (absent) test context exactly where it did,
+        // so the hit inside it stays visible.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,14 @@
++#[cfg(test)]
++fn helper() {
++    let _ = 1;
++}
++
++#[instrument(fields(ctx = Ctx { id: 1 }))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.suspected_files[0].test_context_only,
+            "the production function after the test helper is not test context"
+        );
+    }
+
+    #[test]
     fn test_inline_test_context_does_not_pollute_prod_perf_reasons() {
         let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
 +++ b/src/portal.rs
@@ -732,6 +1558,976 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         assert_eq!(
             result.suspected_files[0].reasons,
             vec!["query in loop".to_string()]
+        );
+    }
+
+    // ---- per-hit (not per-hunk) test-context classification ----
+
+    #[test]
+    fn test_prod_hit_in_mixed_hunk_is_not_muted_by_trailing_test_module() {
+        // Single hunk: production hot path first, test module afterwards.
+        // Per-hunk classification marked the whole hunk as test context and
+        // hid the production signal entirely.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -10,4 +10,18 @@
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT hash FROM users WHERE id = ?");
++    argon2.verify_password(password, &stored)?;
++}
+
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn verify_roundtrip() {
++        for candidate in candidates.iter() {
++            let ids: Vec<_> = candidate.ids.iter().collect();
++        }
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "production hot path sharing a hunk with a test module must stay a signal"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert_eq!(result.suspected_files[0].file, "src/auth.rs");
+        assert!(!result.suspected_files[0].test_context_only);
+        assert!(result.suspected_files[0].mixed_context);
+        assert_eq!(
+            result.suspected_files[0].reasons,
+            vec!["query in loop".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_prod_hit_after_closed_test_module_in_same_hunk_is_prod() {
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -10,4 +10,20 @@
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn roundtrip() {
++        for candidate in candidates.iter() {
++            let ids: Vec<_> = candidate.ids.iter().collect();
++        }
++    }
+ }
++
++pub fn verify_all(candidates: &[Candidate]) {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT hash FROM users WHERE id = ?");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "code after the test module closes is production again"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+        assert!(result.suspected_files[0].mixed_context);
+    }
+
+    #[test]
+    fn test_commented_test_marker_does_not_mute_prod_hit() {
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -10,4 +10,8 @@
++// covered by #[cfg(test)] mod tests below
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT hash FROM users WHERE id = ?");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a comment mentioning test attributes is not test context"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_same_reason_in_both_contexts_counts_once_as_prod() {
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -10,4 +10,18 @@
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT hash FROM users WHERE id = ?");
++}
+
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn roundtrip() {
++        for candidate in candidates.iter() {
++            let stored = db.query("SELECT 1");
++        }
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(result.perf_regression_suspected);
+        assert_eq!(
+            result.query_in_loop_count, 1,
+            "the test-context hit must not inflate the production counter"
+        );
+        assert!(!result.suspected_files[0].test_context_only);
+        assert!(
+            result.suspected_files[0].mixed_context,
+            "the same reason in both contexts is still a mixed-context file"
+        );
+        assert_eq!(
+            result.suspected_files[0].reasons,
+            vec!["query in loop".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_pure_test_hunk_stays_test_context_only() {
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -40,3 +40,10 @@
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn roundtrip() {
++        for candidate in candidates.iter() {
++            let stored = db.query("SELECT 1");
++        }
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.perf_regression_suspected);
+        assert_eq!(result.query_in_loop_count, 0);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert!(result.suspected_files[0].test_context_only);
+        assert!(!result.suspected_files[0].mixed_context);
+        assert_eq!(result.skipped_test_hits_count, 1);
+    }
+
+    #[test]
+    fn test_hit_in_rust_test_file_is_skipped_by_path() {
+        let patch = r#"diff --git a/src/auth_test.rs b/src/auth_test.rs
++++ b/src/auth_test.rs
+@@ -1,1 +1,5 @@
++pub fn helper(candidates: &[Candidate]) {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a hit in a test file is not a production signal, even outside #[cfg(test)]"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert_eq!(result.skipped_test_hits_count, 1);
+        assert!(result.suspected_files.is_empty());
+    }
+
+    // ---- target-state only: removed lines never shape the scope ----
+
+    #[test]
+    fn test_removed_test_marker_does_not_open_test_context() {
+        // The diff DELETES `#[cfg(test)]`, promoting the module to production.
+        // A marker that exists only on a removed line describes the *before*
+        // state and must not classify added lines as test context.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,6 +1,10 @@
+-#[cfg(test)]
+ pub mod helpers {
++    pub fn verify_all(candidates: &[Candidate]) {
++        for candidate in candidates.iter() {
++            let stored = db.query("SELECT hash FROM users WHERE id = ?");
++        }
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a removed #[cfg(test)] marker must not mute the added production hit"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_removed_declaration_does_not_unbalance_test_scope() {
+        // Renaming a fn inside `mod tests` emits `-fn old_name() {` and
+        // `+fn new_name() {`. Counting braces on BOTH sides leaves one extra
+        // opening brace, so the test scope never closes and every production
+        // hit later in the hunk was muted.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,10 +1,14 @@
+ #[cfg(test)]
+ mod tests {
+-    fn old_name() {
++    fn new_name() {
+         assert!(true);
+     }
+ }
++
++pub fn verify_all(candidates: &[Candidate]) {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT hash FROM users WHERE id = ?");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a renamed test fn must not leave the test scope open over prod code"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    // ---- proximity pairing respects the context of the loop ----
+
+    #[test]
+    fn test_prod_hit_is_not_paired_with_a_loop_inside_a_test_module() {
+        // The only loop in range lives in the trailing test module; pairing it
+        // with a production statement invented a query-in-loop that does not
+        // exist in either context.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
++let stored = db.query("SELECT hash FROM users WHERE id = ?");
++
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn roundtrip() {
++        for candidate in candidates.iter() {
++            assert!(candidate.ok);
++        }
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a production statement must not borrow a loop from the test module"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files.is_empty());
+    }
+
+    #[test]
+    fn test_test_hit_is_not_paired_with_a_production_loop() {
+        // Mirror direction: a `collect()` inside the test module has no test
+        // loop nearby, so the production loop above must not manufacture a
+        // test-context suspect either.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
++for candidate in candidates.iter() {
++    verify(candidate);
++}
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn roundtrip() {
++        let ids: Vec<_> = candidate.ids.iter().collect();
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.perf_regression_suspected);
+        assert_eq!(result.clone_collect_in_loop_count, 0);
+        assert!(
+            result.suspected_files.is_empty(),
+            "a test-context hit must not borrow a production loop, got: {:?}",
+            result.suspected_files
+        );
+        assert_eq!(result.skipped_test_hits_count, 0);
+    }
+
+    // ---- trailing `//` comments are not code ----
+
+    #[test]
+    fn test_inline_trailing_comment_marker_does_not_open_test_context() {
+        // Only FULL-LINE `//` comments were treated as non-code, and the marker
+        // pattern is unanchored — so a marker mentioned at the end of a real
+        // statement opened test context and muted the production hit below it.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,8 @@
++let verify_all = true; // mirrored by #[cfg(test)] mod tests below
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT hash FROM users WHERE id = ?");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a marker inside a trailing comment is not test context"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_braces_in_trailing_comment_do_not_close_test_context() {
+        // The brace tracker counted braces inside a trailing comment, so a
+        // comment mentioning `}}` closed the test scope early and reported a
+        // genuine test-only hit as production.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ mod tests {
++    let n = 1; // not real braces: }}
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "braces inside a comment must not leak a test hit into production"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_cfg_gated_external_module_closes_its_test_context() {
+        // `#[cfg(test)] mod tests;` annotates an item with no body, so no brace
+        // ever opened and the "balanced again" close could not fire. The test
+        // context stayed open for the rest of the hunk and recorded the
+        // production query-in-loop below it as test-only, dropping it from the
+        // performance signal entirely.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ mod tests;
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a body-less test item must not mute the production code below it"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_cfg_gated_import_closes_its_test_context() {
+        // The same shape with a `use`: the annotated item ends at its `;`, so
+        // the context it opened ends there too.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ use crate::helper;
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a cfg-gated import must not mute the production code below it"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_comparison_in_a_bodyless_initializer_closes_its_test_context() {
+        // A body-less item may state a VALUE, and after its top-level `=` the
+        // `<` is a comparison, not a generic opener. Counting it left the
+        // signature's bracket depth above zero, which is exactly what the `;`
+        // close checks, so the item's own semicolon could not end the context —
+        // and every production hit below the test was recorded as test-only.
+        // Over-detection of test context is the direction that HIDES work.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ const ENABLED: bool = 1<2;
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a body-less initializer must not mute the production code below it"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_generic_bodyless_initializer_still_closes_its_test_context() {
+        // The same item whose initializer genuinely names generics. A turbofish
+        // closes what it opens, so freezing the angle tracking after the `=`
+        // cannot leave this one stuck either.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ static NAMES: Vec<String> = Vec::<String>::new();
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a generic initializer must not mute the production code below it"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_generic_signature_is_still_tracked_before_any_equals() {
+        // The guard on the new rule: `=` only stops angle tracking AFTER it is
+        // seen at top level. A generic in an ordinary signature is untouched, so
+        // a const argument's brace still does not read as the body opener and
+        // the context still spans the whole test function.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{ LIMIT }>
+ {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a const-generic signature must still hold its test context open"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_cfg_gated_module_with_a_body_still_holds_its_context() {
+        // The other direction: an item that DOES open a body keeps the context
+        // until its brace balances, exactly as before. Closing at the first
+        // `;` inside it would report genuine test-only work as production.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[cfg(test)]
+ mod tests {
++    let n = 1;
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a statement inside a test module must not close its context"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_const_generic_braces_in_a_signature_do_not_open_the_body() {
+        // `Buffer<{ LIMIT }>` balances a brace pair in TYPE position, before the
+        // body exists. Counting it as the item's opener let the very next line
+        // look like the item closing again, so the test context ended at the
+        // signature and every loop in the body was recorded as production.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{ LIMIT }>
+ {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a const-generic brace in the signature must not close the test context"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_destructured_parameter_does_not_open_the_body() {
+        // The idiom the corpus actually shows: an extractor parameter matched by
+        // pattern, as `rmcp`, `leptos` and `sqlx` write their handlers. The brace
+        // pair sits inside the parameter list, lines before the body exists.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[tokio::test]
+ async fn slow_tool(
+     Parameters(SlowToolRequest { sleep_ms }): Parameters<SlowToolRequest>,
+ ) -> Result<(), Error> {
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a destructured parameter must not close the test context"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_comparison_inside_const_braces_does_not_hold_the_context_open() {
+        // A `<` inside a const argument is a comparison, not a generic opener.
+        // Counting it left the signature's bracket depth stuck above zero, the
+        // real body brace was then read as another type-level brace, and the
+        // context never closed — muting every production hit after the test,
+        // which is the error direction that HIDES work.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{ 1 < 2 }> {
+     let n = 1;
+ }
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "production code after the test must not be muted by a comparison in a const argument"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_compact_comparison_inside_const_braces_does_not_hold_the_context_open() {
+        // The same comparison written without spaces. `<` after a DIGIT passes
+        // the "follows an identifier" test that catches the spaced spelling, so
+        // the depth was still stuck above zero, the real body brace read as
+        // another type-level brace, and the context never closed. Whitespace is
+        // formatting, not meaning: both spellings must judge the same.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{1<2}> {
+     let n = 1;
+ }
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "production code after the test must not be muted by a compact comparison"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_turbofish_inside_const_braces_keeps_the_signature_balanced() {
+        // The shape the corpus actually carries in a const argument: a turbofish
+        // that opens and closes its own generic list. Freezing the signature's
+        // depth inside the braces must not break it — the pair is balanced
+        // against itself, so the item's real body opener is still found and the
+        // context still ends at the body's end.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{size_of::<u32>()}> {
+     let n = 1;
+ }
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a turbofish in a const argument must not mute production code below the test"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_qualified_path_inside_const_braces_keeps_the_signature_balanced() {
+        // The only shape the corpus actually carries here (crypto-bigint):
+        // `Uint<{ <Self>::LIMBS / 2 }>`. Its trace CHANGES under the freeze — the
+        // path's `>` used to decrement the outer list, leaving the depth at zero
+        // one closer early, and only clamping kept the verdict right. Frozen, the
+        // outer `>` does that job itself. Same verdict, different arithmetic, so
+        // it is worth holding.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn split(&self) -> Uint<{ <Self>::LIMBS / 2 }> {
+     let n = 1;
+ }
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a qualified path in a const argument must not mute production code below the test"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_const_generic_signature_still_closes_at_its_real_body_end() {
+        // The other direction, and the reason the fix cannot simply ignore
+        // braces in signatures: once the real body opener is found the context
+        // must still end where the body ends, or production code after the test
+        // is muted.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{ LIMIT }>
+ {
+     let n = 1;
+ }
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "production code after the test body must not stay muted"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_braces_in_string_literals_do_not_move_test_scope() {
+        // A brace typed inside a literal is data, not syntax. Counting it closed
+        // the test scope early and reported the test-only query-in-loop below it
+        // as a production perf suspect.
+        let patch = r##"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[cfg(test)]
+ mod tests {
++    const CLOSE: &str = "}";
++    const RAW: &str = r#"}"#;
++    const CH: char = '}';
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"##;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a brace inside a literal must not leak a test hit into production"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert_eq!(result.suspected_files.len(), 1);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_open_brace_in_string_literal_does_not_hold_test_scope_open() {
+        // The mirror failure: an unmatched `{` inside a literal kept the scope
+        // open past the end of the test module and muted the production hit
+        // that followed it.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[cfg(test)]
+ mod tests {
++    const OPEN: &str = "{";
++}
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a production query-in-loop after the test module must stay reported"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+    }
+
+    #[test]
+    fn test_braces_in_block_comments_do_not_move_test_scope() {
+        // Commenting out a block of code is what block comments are FOR, so a
+        // `}` inside one is ordinary. Counting it closed the test scope early
+        // and reported the test-only query-in-loop below it as production.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[cfg(test)]
+ mod tests {
++    /* removed the tail of the old case:
++    }
++    */
++    for candidate in candidates.iter() {
++        let stored = db.query("SELECT 1");
++    }
+ }
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a brace inside a block comment must not leak a test hit into production"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+    }
+
+    #[test]
+    fn test_open_brace_in_block_comment_does_not_hold_test_scope_open() {
+        // The mirror failure: a `{` inside a block comment kept the test scope
+        // open past the end of the module and muted the production hit below.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[cfg(test)]
+ mod tests {
++    /* old shape:
++    fn f() {
++    */
++}
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a production query-in-loop after the test module must stay reported"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+    }
+
+    #[test]
+    fn test_glob_pattern_is_not_a_block_comment() {
+        // `format!("{}/*.{}")` carries `/*` inside a string literal. Reading it
+        // as a comment opener would swallow the rest of the hunk and mute every
+        // production hit after it — a worse failure than the one block-comment
+        // tracking fixes, and a far more common line in real diffs.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
++let pattern = format!("{}/*.{}", dir, ext);
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a glob pattern must not open a block comment over the rest of the hunk"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+    }
+
+    #[test]
+    fn test_added_line_test_context_is_aligned_with_added_lines() {
+        let hunk = "@@ -1,4 +1,9 @@\n+let prod = 1;\n-let removed = 2;\n #[cfg(test)]\n mod tests {\n+    let inside = 3;\n }\n+let after = 4;\n";
+        assert_eq!(
+            added_line_test_context("src/auth.rs", hunk),
+            vec![false, true, false],
+            "flags must line up with added lines only, in order"
+        );
+        assert_eq!(
+            added_line_test_context("src/auth.ts", hunk),
+            vec![false, false, false],
+            "inline Rust test context does not apply to non-Rust files"
         );
     }
 }

@@ -1,4 +1,4 @@
-# MERGE_GATE Contract (schema 2.1)
+# MERGE_GATE Contract (schema 2.2)
 
 `MERGE_GATE.json` is the policy-aware merge decision emitted at
 `00_summary/MERGE_GATE.json`. It is the single machine-readable verdict surface
@@ -11,7 +11,7 @@ document disagree, the code is the contract and this document is the bug.
 
 | Field | Type | Notes |
 |---|---|---|
-| `schema_version` | string | `"2.1"` |
+| `schema_version` | string | `"2.2"` |
 | `generated_at` | string | RFC 3339 local datetime |
 | `bridge_stage` | integer | `0..4` |
 | `target` | string | Resolved target branch name (not raw CLI input) |
@@ -55,7 +55,7 @@ Every element of `checks` is one policy evaluation record:
 |---|---|---|
 | `id` | string | Policy check id (`check_id`) |
 | `name` | string | Human-readable check name |
-| `status` | string | Raw check status |
+| `status` | string | `passed` \| `failed` \| `warnings` \| `skipped` \| `error` — lowercase, exactly |
 | `execution_state` | string | `executed` \| `skipped` \| `unavailable` \| `unknown` |
 | `outcome` | string | `passed` \| `findings_failed` \| `findings_warning` \| `system_error` \| `skipped` \| `unavailable` \| `unknown` |
 | `class` | string | `PASS` \| `SKIP` \| `FAIL` \| `INFO` |
@@ -74,6 +74,29 @@ Skipped or unavailable checks carry no executed `CheckResult`, so `duration_secs
 is `0.0`, `cached` is `null`, `log` is `null`, and `evidence` degrades to a
 non-empty placeholder. These are contract-valid placeholders, never `null`
 evidence — the artifact must not fail its own gate on a runner that lacks a tool.
+
+`status` is a CLOSED, case-sensitive vocabulary: exactly the image of
+`CheckStatus::as_str`, pinned as `CheckStatus::EMITTED` in `src/checks/mod.rs`
+and mirrored as `VALID_CHECK_STATUSES` in `tools/validate_merge_gate.py`. The
+CLI tallies warnings by comparing against it, so a status outside it is
+UNREADABLE rather than clean: it counts toward the warning tally, raises an
+`unreadable_check_status:` caveat naming the offending checks, and
+`--ci --fail-on-warnings` fails on it. The validator rejects such a pack outright
+— it used to accept any non-empty string, which certified an artifact
+`--update` could reuse and the reader could not read. Case is deliberately NOT
+folded here, unlike `inline_findings.status`, whose writer has shipped legacy
+spellings: folding `WARNINGS` into a warning silently would hide that the pack
+is off-contract, and the resulting tally is the same either way.
+
+The same rule governs the CONTAINER. `checks` must be an array — the validator
+has required one since schema 1.0 — and a pack stating anything else is
+unreadable, not empty: it counts as at least one warning and raises an
+`unreadable_checks:` caveat. It used to fall back to "the checks this run
+executed", which on an unchanged `--update` run is none at all, so
+`--ci --fail-on-warnings` exited `0` on a pack whose warning list the reader
+could not read. An ABSENT `checks` is the one tolerant case and stays so: a pack
+that states no list may simply predate this build, and the CLI's own tally still
+applies. Absent and present-but-unreadable are different questions.
 
 ## `inline_findings`
 
@@ -112,7 +135,7 @@ authoritative axes — `analysis_status` (confidence) and `merge_recommendation`
 | `preexisting_quality_failures` | string[] | Pre-existing failures |
 | `mixed_quality_failures` | string[] | Mixed-provenance failures |
 | `unclassified_quality_failures` | string[] | Failures with unknown provenance |
-| `quality_failure_details` | object[] | `[{ name, classification }]` |
+| `quality_failure_details` | object[] | `[{ name, classification, origin }]` — `name` a non-empty check name, `classification` one of `introduced` \| `pre-existing` \| `mixed` \| `unclassified`, `origin` `"failure"` \| `"warning"` (schema 2.2) |
 | `decision_reason` | string | Human-readable reason for the verdict |
 | `review_caveats` | string[] | Non-blocking caveats requiring reviewer attention |
 | `blocking_issues` | string[] | Issues that block the merge |
@@ -138,7 +161,25 @@ by `derive_decision` (`src/artifacts/verdict.rs`), which calls
 - **`derive_decision` is the single source** of `verdict`, `allow_merge`, and
   `recommended_merge`. No caller sets these fields independently.
 - **`policy_allow_merge` is a distinct axis** ("policy did not hard-block") and
-  is not conflated with `allow_merge` or the recommendation.
+  is not conflated with `allow_merge` or the recommendation. It is derived from
+  one input and set nowhere else: `policy_allow_merge == blocking_issues.is_empty()`,
+  computed after the last entry is pushed and emitted beside that list. The
+  contract validator enforces the equivalence in both directions from 2.2.
+- **Only `origin: "failure"` entries may fail the quality gate.** Warning-level
+  checks enter `quality_failures` (and its classification arrays) so the
+  pre-existing downgrade can be computed for them, but they never flip
+  `quality_pass`. Reading `introduced_quality_failures` without `origin` is what
+  made `quality_pass: true` look like a contradiction; a consumer that wants
+  "what actually failed" filters `quality_failure_details` on
+  `origin == "failure"`. All three fields of the entry are validated, not just
+  the one that names the schema: `tools/validate_merge_gate.py` requires a
+  non-empty `name` and a `classification` from the emitted vocabulary, so
+  `{"origin": "failure"}` — a failure naming no check and stating no provenance
+  — is rejected rather than passed through as contract-clean. The
+  classification vocabulary is pinned to `QualityFailureClass::as_str`
+  (`src/artifacts/verdict.rs`); note that the value is `pre-existing` while the
+  sibling count field is `preexisting_quality_failures`, and an unvalidated
+  `classification` is exactly where that drift would hide.
 - **An executed check always carries its result artifact and log** (non-null
   `evidence` + `log`); a non-executed check carries non-null placeholders, never
   `null` evidence.
@@ -146,6 +187,339 @@ by `derive_decision` (`src/artifacts/verdict.rs`), which calls
 `HOLD` and `ALLOW` are retired pre-2.1 verdict synonyms. Current runs never emit
 them; the schema validator and the `prview mcp` adapter still tolerate them on
 read-back of older packs.
+
+## Reader contract
+
+`MERGE_GATE.json` is the ONLY derivation of the verdict. No reader re-derives one
+when the artifact cannot be read: `prview --json` / `--ci` exits `3` and the
+`prview mcp` adapter returns `storage_corrupt`. The removed CLI fallback
+(`fallback_merge_gate_summary`) re-derived `allow_merge = recommendation != block`
+and was the single place where `allow_merge: true` could coexist with a
+`CONDITIONAL` verdict, breaking the invariant above.
+
+Readers accept a pack by MAJOR version and say what they had to normalize:
+
+| `schema_version` on disk | Reader behavior |
+|---|---|
+| absent | Accepted silently — pre-2.1 packs predate the field, and their root object is read as the `decision` |
+| known MAJOR (`1`, `2`), same-or-older MINOR | Accepted silently |
+| known MAJOR, newer MINOR | Accepted with a `schema_forward_compat:` caveat; unknown fields ignored |
+| unknown MAJOR, unparsable version, a non-canonical spelling (`02.2`, `+2.2`), or a non-string value | Fail loud |
+
+A pack that STATES a `schema_version` must also carry the `decision` object that
+schema is built around. A missing or non-object `decision` there is a corrupt
+artifact, not a normalization: the CLI exits `3` and the MCP adapter returns
+`storage_corrupt`, matching `tools/validate_merge_gate.py`, which requires
+`decision` at every version. Only a pack with NO `schema_version` keeps the
+legacy tolerance of reading its root as the decision — and that tolerance is
+whole: a legacy pack shaped `{"verdict": "ALLOW", "allow_merge": true}` is read
+by BOTH readers, not accepted by one and called corrupt by the other. The rule
+lives in one place (`gate::select_decision_object`) so the two surfaces cannot
+answer it differently again.
+
+That tolerance is about WHERE the decision sits, not about what counts as one. A
+schema-less pack whose root parses to an array, a scalar or `null` has no fields
+to read at all: it is corrupt on both readers, not a decision with every signal
+missing. Reading one as a decision produced a "successful" summary carrying a
+normalized `BLOCK` for an artifact that never stated anything.
+
+A `decision` object that is present and states no decision falls under the same
+rule. It must carry at least one of `verdict`, `merge_recommendation` or
+`allow_merge`; a block carrying none of the three is corrupt on every surface —
+the CLI exits `3`, the MCP adapter returns `storage_corrupt`, `prview gate`
+cannot deserialize it, and `tools/validate_merge_gate.py` rejects it for the
+required fields it is missing. The test is PRESENCE, not recognizability: a
+stated `verdict: "PROBABLY"` is a decision this pack gave, and it collapses to
+`BLOCK` with an `unknown_verdict:` caveat as described below. Absence stays
+forgiven per FIELD — that is the shape of an older pack — but a decision block
+with no signal at all is not an older pack, it is a truncated one.
+
+For the same reason the tolerance is a fallback, not a precedence rule: a
+`decision` object, wherever it appears, is the decision. A schema-less pack that
+carries one is read from it rather than from its root, because reading a plainly
+stated decision as "every signal missing" would normalize to `BLOCK` and
+fabricate a block the artifact never stated. No writer has ever produced that
+shape — every generation back to the first public release emits `schema_version`
+and `decision` together — so a schema-less pack that ALSO carries root-level
+decision fields is undefined by this contract rather than resolved by it.
+
+One vocabulary answers "what verdict is this?" for every surface. The CLI
+`--json` summary, the MCP adapter and `prview gate` all fold a stored spelling
+through `gate::canonical_verdict`, which is case-insensitive and accepts the
+retired synonyms (`ALLOW`/`APPROVE` → `PASS`, `HOLD` → `CONDITIONAL`). Case is
+not meaning: a pack stating `verdict: "pass"` stated a pass, and reading it as a
+block would fabricate a verdict the artifact never gave. Each surface owning its
+own copy of this vocabulary is precisely how they came to read one file three
+ways — MCP ranking `"pass"` as a clean `PASS`, the CLI calling it an unknown
+verdict and normalizing to `BLOCK`, and `prview gate` refusing the pack as a
+verdict mismatch. `GateVerdict` stays a strict parser of the canonical spellings;
+it is fed the folded value, never the raw one.
+
+A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
+never read as-is and never silently dropped: BOTH readers collapse it to `BLOCK`
+with an `unknown_verdict:` caveat, and the MCP adapter additionally sets
+`normalized: true`. A verdict a reader substituted this way also governs
+everything derived beside it: `allow_merge` is forced `false` and
+`merge_recommendation` to `block`, whatever the same decision block claimed. A
+pack whose verdict could not be read is not a pack whose approval can be
+trusted, and the exit code follows the recommendation — so the invariant
+`allow_merge == (verdict == "PASS")` holds on the substituted verdict too. The
+same holds for a verdict that is simply absent while another signal is stated:
+the surviving `merge_recommendation: "approve"` does not buy a `PASS` on either
+surface, because a pack that names no verdict has not approved anything.
+
+That is what keeps "the artifact is corrupt" and "the artifact said something
+this reader cannot use" apart on every surface. `storage_corrupt` is reserved
+for a decision block stating none of the three signals. A signal that is present
+but unrankable — a verdict outside the vocabulary, a recommendation outside it,
+a lone `allow_merge` — is a decision the pack DID give, so it is normalized
+conservatively with a caveat instead of being called corrupt by one reader while
+the other publishes a summary from it. `allow_merge` is itself a rankable
+signal: `false` ranks as `CONDITIONAL` and `true` as `PASS`, and a pack stating
+nothing but `allow_merge: true` therefore still reads as `BLOCK` on both
+surfaces, because its missing verdict is substituted before its lone flag is
+ranked.
+
+The accepted version set is exactly the one `tools/validate_merge_gate.py`
+accepts, compared as written — a spelling that merely parses to a known tuple
+(`02.2`, `2.02`, `+2.2`) is rejected, so "readable by prview" cannot drift away
+from "valid per the contract validator". From schema 2.2 the validator also
+requires every `quality_failure_details` entry to carry an `origin` of exactly
+`failure` or `warning`: consumers are told to filter on it, which they cannot do
+if a pack may omit or mistype it.
+
+From 2.2 it also REQUIRES `quality_pass` and requires it to be a boolean. The
+2.2 writer emits the field unconditionally, from a single object literal, as a
+Rust `bool` — so a pack that claims 2.2 and omits it, or states it as `"false"`,
+is not an old pack but a broken one. Absence stays forgiven below 2.2, where the
+readers derive the flag instead, and that carve-out is deliberate: tightening it
+would reject every pack written before the field existed. Type-checking it here
+is what puts the validator back in step with the readers, which normalize a
+present-but-unreadable signal to BLOCK — without it the contract gate certified
+an artifact the CLI and MCP both refuse to trust.
+
+From the same version it also cross-checks `quality_pass` against those details,
+because the two are one fact written twice: the emitter sets the flag to
+`!QualityFailureSummary::has_new_failures()` and then serializes the very
+details that answer it. An entry gates the diff when its `origin` is `failure`
+AND its `classification` is anything but `pre-existing`, so
+
+> `quality_pass` is true if and only if no `quality_failure_details` entry
+> has `origin: "failure"` with a classification other than `pre-existing`.
+
+Both directions are checked. `quality_pass: true` beside
+`{"origin": "failure", "classification": "introduced"}` is the combination that
+matters: the emitter cannot produce it, both decision readers trust the
+permissive scalar, and a validator-clean pack could therefore approve a failure
+it also reports. `quality_pass: false` with nothing that could have failed it is
+equally unemittable, and rejected too. The `pre-existing` half of the rule is
+not a detail — a failure that predates the diff is published beside
+`quality_pass: true` deliberately, so the simpler rule "a failure-origin entry
+forces `quality_pass: false`" would reject a legitimate pack, and a validator
+that cries wolf on genuine output gates nothing. A pack that omits
+`quality_pass` entirely is left alone, per the absence rule below.
+
+The blocker axis is cross-checked the same way, and for the same reason. The
+emitter computes `policy_allow_merge = blocking_issues.is_empty()` after the
+last entry is pushed to that list and then writes both verbatim, so
+
+> `policy_allow_merge` is true if and only if `blocking_issues` is empty.
+
+Both directions are checked from 2.2, where both fields are required.
+`policy_allow_merge: true` beside a listed blocker is the shape that matters: it
+tells a reader trusting the flag that policy let the merge through while the list
+beside it names what blocked it. `false` with nothing in the list is equally
+unemittable and rejected too. This is not the same rule as the ranking below,
+which asks only how conservative the pack is and is satisfied by either half —
+ranking a pair does not check that the pair agrees. It is also not the
+pre-existing "no `allow_merge: true` beside a blocker" rule: that one is about
+the merge verdict, this one about the policy flag it is derived from. A test in
+`src/artifacts/merge_gate.rs` pins the flag to the list across the emitted packs,
+so the day the flag gains a second input the emitter fails rather than the
+validator rejecting output prview still writes.
+
+### The reconciliation is certified, not only read
+
+From 2.2 the validator requires the remaining decision axes on the same
+argument, and with the same vocabularies: `analysis_status` (`complete` /
+`degraded` / `incomplete`), `merge_recommendation` (`approve` /
+`review_required` / `block`) and a boolean `policy_allow_merge`. All three come
+out of the same object literal as `quality_pass`, from the typed enums in
+`src/policy/engine.rs`, so a 2.2 pack missing one is broken rather than old. The
+two enum vocabularies are case-sensitive and canonical-only — like
+`checks[].status`, and unlike the READERS, which fold case and still accept the
+retired `hold` spelling when reading an artifact off disk. That tolerance exists
+for packs already written; the validator certifies freshly emitted ones. A test
+in `src/policy/engine.rs` pins each variant's wire spelling to the word the
+validator lists, so a rename cannot silently drift the two apart.
+
+Requiring them is what makes the last certification rule possible: **the
+validator rejects a `verdict` milder than the axes stated beside it.** The rank
+table above is the readers' rule, and the emitter's `legacy_verdict` produces
+exactly the same number from the other direction, so a healthy `verdict` IS the
+maximum rank of its own axes. Until this was ported, the contract gate certified
+packs no reader would honour — `verdict: "PASS"` beside
+`analysis_status: "incomplete"`, `merge_recommendation: "block"` and
+`policy_allow_merge: false` validated OK, while every reader normalized the same
+artifact to `BLOCK`. Readers were already protected; the hole was in
+CERTIFICATION, which is a different claim: that the artifact is what it says it
+is.
+
+The rule is deliberately ONE-DIRECTIONAL. A verdict HARSHER than its other axes
+is legal and must stay so: a semgrep scan that passes with parse errors writes
+`merge_recommendation: "approve"` beside `analysis_status: "degraded"`, which the
+contract turns into `CONDITIONAL`, so "the verdict equals the maximum of the
+OTHER axes" would reject a pack the emitter really produces. A harsher verdict
+also misleads no one — every reader publishes it as stated. It is the permissive
+direction that certifies a permission the artifact never earned. (The readers
+still NAME the harsher case with a `core_inconsistency:` caveat; that is a report
+about a pack, not a rejection of it.)
+
+A decision signal present with the wrong JSON type (`merge_recommendation: 7`,
+`allow_merge: "false"`) is not the same as an absent one. Absence is the state a
+reader forgives, because it is the shape of an older pack; a field that is there
+and cannot be typed is a field the reader FAILED to read, and saying nothing
+about it publishes a confidence the read does not have. Both readers name it
+with an `unreadable_<field>:` caveat — every axis in the ranking table below.
+The MCP adapter additionally sets `normalized: true`; the CLI
+forces every decision axis conservative (`verdict: "BLOCK"`,
+`allow_merge: false`, `merge_recommendation: block`, and therefore `--ci`
+exit `1`), because a decision derived from a block this reader only partly read
+is not one it may publish as an approval.
+
+Correctly typed signals that CONTRADICT each other are reconciled the same way,
+by conservativeness rather than by field order. Each stated axis ranks
+`PASS`/`approve`/`allow_merge: true` as 1, `CONDITIONAL`/`review_required`/
+`allow_merge: false` as 2 and `BLOCK`/`block` as 3; the highest rank the pack
+states wins and every axis is published from it, with a `core_inconsistency:`
+caveat naming the originals. So `verdict: "BLOCK"` beside
+`merge_recommendation: "approve"` yields `block` on both surfaces — the CLI used
+to believe each field in turn and exit `0` on it — and `allow_merge: true`
+beside `review_required` never buys a `PASS`. Both readers rank through
+`gate::rank_from_verdict` / `gate::rank_from_merge_rec`. A recommendation
+outside the `approve` / `review_required` / `block` vocabulary cannot rank, so
+it is excluded from the reconciliation and named with an
+`unknown_merge_recommendation:` caveat rather than dropped in silence.
+
+`quality_pass` is one of those axes, because the contract permits `PASS` only
+when quality passes. A stated `quality_pass: false` therefore ranks 2 — it says
+"not a `PASS`", exactly as `allow_merge: false` does — so a pack shaped
+`verdict: "PASS"`, `merge_recommendation: "approve"`, `allow_merge: true`,
+`quality_pass: false` is published as `review_required` with
+`allow_merge: false` on both surfaces, with the `core_inconsistency:` caveat
+naming every original including this one. Leaving that axis out of the
+reconciliation published the approval verbatim, so automation reading the MCP
+surface approved a run whose own artifact said quality had failed. The
+asymmetry is deliberate in both directions: `quality_pass: true` states no rank
+at all, because a quality-clean run is still held at `CONDITIONAL` by a
+breaking-change escalation and one axis may not soften a verdict the others
+agree on; and an ABSENT `quality_pass` states nothing either, per the same
+per-field tolerance that governs the other signals — reading it as `false`
+would turn every pack written before the field into a `CONDITIONAL`. Those two
+states leave a third between them, and `quality_pass` is typed through the same
+`gate::readable_signal` as the other axes so it does not fall into it: a
+`quality_pass` that is PRESENT but not a boolean is neither a stated `false` nor
+an older pack. Read with a bare `as_bool()` it was indistinguishable from
+absent, so the string `"false"` bought a silent approval on both surfaces —
+the one shape that defeats the paragraph above. It now normalizes to `BLOCK`
+with an `unreadable_quality_pass:` caveat, like any other signal the reader
+could not type.
+
+### Which fields rank, and which deliberately do not
+
+One rule decides membership: **an axis states a rank only when its value RULES
+OUT a more permissive outcome.** A value that merely fails to forbid something
+states nothing — that is why `quality_pass: true` is silent, and it is the same
+reason `analysis_status: "complete"` is. Both are PRECONDITIONS of `PASS`, not
+grants of it: a quality-clean, fully-analysed run is still a `BLOCK` when policy
+blocks it, and letting either speak in the permissive direction would let one
+axis soften a verdict the others agree on.
+
+The decision object is closed, so every field it may carry is accounted for
+here. This table is the contract; a field added to `decision` without a row is
+an unfinished change.
+
+| Field | Rank | Rule |
+|---|---|---|
+| `verdict` | 1 / 2 / 3 | `PASS` \| `CONDITIONAL` \| `BLOCK`, via `gate::rank_from_verdict` |
+| `merge_recommendation` | 1 / 2 / 3 | `approve` \| `review_required` \| `block`, via `gate::rank_from_merge_rec` |
+| `allow_merge` | 1 / 2 | `false` rules out `PASS`; `true` ranks 1 and so never raises |
+| `quality_pass` | 2 | Only `false` ranks — `PASS` requires quality to pass |
+| `analysis_status` | 2 | Only `degraded` / `incomplete` rank — `PASS` requires `complete` |
+| `blocking_issues` | 3 | Non-empty ranks — see below |
+| `policy_allow_merge` | 3 | Only `false` ranks — the same fact as a non-empty `blocking_issues` |
+| `recommended_merge` | — | Legacy restatement of `merge_recommendation == approve`; ranking it counts one axis twice |
+| `recommended_label` | — | Human label with an open vocabulary (`e.g.` in its own row); nothing to rank against |
+| `quality_failures` and its four classification arrays | — | Non-empty ≠ failed: warning-origin entries populate them without flipping `quality_pass`, which is precisely the false positive `origin` was added to prevent |
+| `quality_failure_details` | — | The evidence BEHIND `quality_pass`, not an independent axis; ranking it would recompute that axis from parts and re-introduce the same warning/failure conflation |
+| `decision_reason` | — | Prose |
+| `review_caveats` | — | Non-blocking by definition |
+
+`blocking_issues` ranks 3 rather than 2 because a blocker is not a doubt: an
+entry appears there only when a check reached `PolicyConclusion::Blocked`, whose
+`merge_impact` is `Block`, so a pack listing one has already stated a `BLOCK`
+whether or not its `verdict` field agrees. `policy_allow_merge` is the same fact
+written twice — the emitter computes `policy_allow_merge =
+blocking_issues.is_empty()` — so both are read and both rank, which costs
+nothing when they agree and covers a pack that states only one. This does not
+conflate `policy_allow_merge` with `allow_merge`: the two remain distinct axes,
+and only the value that rules `PASS` out speaks. An empty `blocking_issues` and
+`policy_allow_merge: true` state nothing at all, because "policy did not
+hard-block" is not "merge is allowed".
+
+#### Ranking an absent field is not publishing one
+
+The table above says what an absent field contributes to the RANK: nothing. It
+does not say what the CLI summary should then report for that field, and
+conflating the two produced a reader split. A pre-`quality_pass` pack —
+`{"verdict": "PASS", "merge_recommendation": "approve", "allow_merge": true}` —
+is correctly reconciled to `PASS`, because absence adds no rank; but the summary
+published `quality_pass: false` from a bare default, derived
+`analysis_status: incomplete` from that, and exited `1` under `--ci`, while the
+MCP adapter returned a clean approval for the same artifact.
+
+An absent field is therefore PUBLISHED from the reconciled outcome rather than
+from a default. The contract permits `PASS` only when quality passes and the
+analysis is complete, so a reconciled `PASS` implies both; a decision held below
+`PASS` implies nothing about either axis specifically and both stay
+conservative. The direction is one-way — the reconciled verdict can only ever
+confirm what the contract already requires of a `PASS`, never soften a verdict.
+
+This does not reopen the absent/mistyped split. A field that is present but
+unreadable normalizes the whole decision to `BLOCK`, so by the time the summary
+is built the reconciled outcome is not a `PASS` and nothing can be inferred as
+passing from it. Absence is forgiven; an unreadable value is not.
+
+Every ranking axis is typed through `gate::readable_signal`, so present-but-
+unreadable is a third state distinct from both a stated value and an absent one:
+`blocking_issues: "Clippy"` (a string, not an array) or `analysis_status: 7`
+normalizes to `BLOCK` with an `unreadable_<field>:` caveat instead of being
+mistaken for a pack written before the field. A stated `analysis_status` outside
+`complete` / `degraded` / `incomplete` cannot rank, so it is excluded and named
+with an `unknown_analysis_status:` caveat — the rule already applied to
+`merge_recommendation`.
+
+The `core_inconsistency:` caveat reports a disagreement the pack actually
+states, so the comparison is made per axis rather than against the winning rank:
+the two textual axes are compared to the published verdict, and `allow_merge` to
+the `allow_merge` the readers publish. `allow_merge` has only two values and
+`false` ranks as `CONDITIONAL`, so measuring it against a rank it can never
+reach made every healthy `BLOCK` pack — `verdict: "BLOCK"`,
+`merge_recommendation: "block"`, `allow_merge: false` — report a contradiction
+it did not contain. `quality_pass` needs no comparison of its own: ranking 2
+when false, it makes any axis claiming 1 beside it disagree with the winning
+rank already, and a healthy `BLOCK` or `CONDITIONAL` pack states it in agreement
+with everything else. It is named in the caveat all the same, so a reader can
+see which axis forced the downgrade. The same holds for `analysis_status`,
+`blocking_issues` and `policy_allow_merge`: each ranks in one direction only, so
+a healthy pack states them in agreement with the winning rank — a `BLOCK` pack
+naming its blocker beside `policy_allow_merge: false` and a `complete` analysis
+is exactly what this tool writes and reports no contradiction — while a pack
+that states one of them AGAINST a permissive verdict is caught by the textual
+axes disagreeing with the rank it forced. All three are named in the caveat.
+A pack whose verdict was substituted
+reports the substitution (`unknown_verdict:`, `unreadable_<field>:`) and is not
+additionally accused of contradicting itself.
 
 ## Blocking rules
 
