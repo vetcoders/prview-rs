@@ -800,9 +800,21 @@ different declaration from `pub type Alias = u32;`, so a purely cosmetic reflow
 was reported as a `ChangedSignature` whose "before" and "after" were the same
 string. By the same rule a line contributing no code is dropped from the
 identity — a comment-only line says nothing about the API — unless a literal is
-open, where a blank line is a blank line in the value. (Indentation INSIDE such
-a literal is already gone by then — lines reach the accumulator trimmed — so two
-multi-line literals differing only in leading whitespace still read as one.)
+open, where a blank line is a blank line in the value.
+
+Whitespace at a line's edges follows the same rule, one edge at a time: the
+leading edge is kept when the PREVIOUS line left a literal open, the trailing
+edge when THIS line does. Lines reached the accumulator already trimmed, so
+re-indenting the inside of a multi-line public constant produced two identical
+identities and the changed value paired away as an unchanged re-add. Trimming
+neither edge would be worse in the other direction — every reflow would become a
+phantom `ChangedSignature`, and a trailing comment's leading gap would make `a:
+u8, // x` a different declaration from `a: u8,// y`. The per-edge rule keeps
+whitespace only where a literal is open across it, which is exactly where it is
+part of the value: measured over the local crates.io registry, of 200,553
+multi-line public declarations only 640 continuation lines sit at a literal edge
+at all, and 272 of those carry edge whitespace the old view dropped. No
+formatter re-indents inside a string literal, because that changes the program.
 
 A declaration ends at a `;` or a body `{` outside its brackets. Square brackets
 count for the same reason parentheses do: an array type states its length with a

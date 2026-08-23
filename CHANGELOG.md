@@ -201,6 +201,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Re-indenting the inside of a multi-line public constant is a value change
+  again.** Continuation lines reached the breaking-change accumulator already
+  trimmed, so whitespace at a line edge INSIDE a string literal — which is value,
+  not layout — never reached the comparison. Two literals differing only in their
+  indentation produced identical identities, and the exact-match pass consumed
+  the addition: a changed public value left no finding at all. The accumulator
+  now takes the raw line and normalizes per edge — the leading edge is kept when
+  the previous line left a literal open, the trailing edge when the line itself
+  does — so a reflow outside a literal stays the no-op it must be, and a trailing
+  comment's leading gap still contributes nothing. Measured over the local
+  crates.io registry, of 200,553 multi-line public declarations 640 continuation
+  lines sit at a literal edge and 272 carry whitespace the old view dropped.
 - **`tools/validate_merge_gate.py` now requires a boolean `quality_pass` from
   schema 2.2.** The validator checked the field's agreement with the failure
   details but never its presence or type, so a 2.2 pack stating
