@@ -1512,7 +1512,7 @@ pub(crate) fn validated_cargo_audit_vulnerability_list(
     }
 
     if let Some(found) = vulnerabilities.get("found")
-        && found.as_bool()? != !list.is_empty()
+        && found.as_bool()? == list.is_empty()
     {
         return None;
     }
