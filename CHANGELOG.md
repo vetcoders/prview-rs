@@ -568,7 +568,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from 2.2, requires it: an entry that omits `origin`, mistypes it, or spells it
   anything other than `failure` / `warning` now fails the contract validator,
   because a consumer told to filter on `origin == "failure"` cannot do that on a
-  pack where the field is optional.
+  pack where the field is optional. The validator checks the whole entry, not
+  only the field that names the schema: `name` must be a non-empty string and
+  `classification` one of `introduced` / `pre-existing` / `mixed` /
+  `unclassified`, the vocabulary `QualityFailureClass::as_str` emits. Validating
+  `origin` alone let `{"origin": "failure"}` — a failure naming no check and
+  stating no provenance — pass its own contract gate, and let `classification`
+  drift to any string at all, including the `preexisting` spelling used by the
+  sibling count field rather than the `pre-existing` the emitter writes.
 - Perf regression detection now resolves inline Rust test context (`#[cfg(test)]`,
   `mod tests`, `#[test]`) **per hit line** instead of per hunk. A production hot
   path that merely shared a hunk with a test module was classified as

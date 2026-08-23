@@ -112,7 +112,7 @@ authoritative axes — `analysis_status` (confidence) and `merge_recommendation`
 | `preexisting_quality_failures` | string[] | Pre-existing failures |
 | `mixed_quality_failures` | string[] | Mixed-provenance failures |
 | `unclassified_quality_failures` | string[] | Failures with unknown provenance |
-| `quality_failure_details` | object[] | `[{ name, classification, origin }]`; `origin` is `"failure"` or `"warning"` (schema 2.2) |
+| `quality_failure_details` | object[] | `[{ name, classification, origin }]` — `name` a non-empty check name, `classification` one of `introduced` \| `pre-existing` \| `mixed` \| `unclassified`, `origin` `"failure"` \| `"warning"` (schema 2.2) |
 | `decision_reason` | string | Human-readable reason for the verdict |
 | `review_caveats` | string[] | Non-blocking caveats requiring reviewer attention |
 | `blocking_issues` | string[] | Issues that block the merge |
@@ -145,7 +145,15 @@ by `derive_decision` (`src/artifacts/verdict.rs`), which calls
   `quality_pass`. Reading `introduced_quality_failures` without `origin` is what
   made `quality_pass: true` look like a contradiction; a consumer that wants
   "what actually failed" filters `quality_failure_details` on
-  `origin == "failure"`.
+  `origin == "failure"`. All three fields of the entry are validated, not just
+  the one that names the schema: `tools/validate_merge_gate.py` requires a
+  non-empty `name` and a `classification` from the emitted vocabulary, so
+  `{"origin": "failure"}` — a failure naming no check and stating no provenance
+  — is rejected rather than passed through as contract-clean. The
+  classification vocabulary is pinned to `QualityFailureClass::as_str`
+  (`src/artifacts/verdict.rs`); note that the value is `pre-existing` while the
+  sibling count field is `preexisting_quality_failures`, and an unvalidated
+  `classification` is exactly where that drift would hide.
 - **An executed check always carries its result artifact and log** (non-null
   `evidence` + `log`); a non-executed check carries non-null placeholders, never
   `null` evidence.
