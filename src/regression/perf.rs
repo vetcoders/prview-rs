@@ -75,12 +75,27 @@ static CLONE_COLLECT_PATTERN: LazyLock<Regex> =
 /// `#[cfg(any(test, feature = "bench"))]`, which compiles outside the test build
 /// whenever the feature is on, and for `#[cfg(feature = "__internal-test")]`,
 /// which is a feature that merely has `test` in its name. Only an exact
-/// `cfg(test)` and an `all(test, …)` — which cannot hold unless `test` does —
-/// are provable. Measured over the local registry (58,586 files), of the 11,030
-/// attributes the previous pattern read as test context 83.62% are exactly
-/// `cfg(test)` and 6.76% are `all(test, …)`; the remaining 9.62% —
-/// `any(test, …)`, `not(…)` and `test`-named features — are the ones it was
-/// getting wrong.
+/// `cfg(test)` and an `all(…)` with `test` among its operands — which cannot
+/// hold unless `test` does — are provable. Measured over the local registry
+/// (58,586 files), of the 11,030 attributes the previous pattern read as test
+/// context 83.62% are exactly `cfg(test)` and 6.76% are `all(…, test, …)`; the
+/// remaining 9.62% — `any(test, …)`, `not(…)` and `test`-named features — are
+/// the ones it was getting wrong.
+///
+/// `all` is commutative, so the operand's POSITION carries no meaning:
+/// `all(feature = "bench", test)` is as provably test-only as
+/// `all(test, feature = "bench")`, and reading only the first operand made the
+/// same predicate test context or production depending on how it was written.
+/// Accepting the operand anywhere adds 72 attributes over the same 58,614-file
+/// registry and removes none — `all(loom, test)`, `all(feature = "std", test)`,
+/// `all(windows, test)` and the degenerate `all(test)` — every one of them a
+/// direct `test` operand.
+/// The operand must be a DIRECT one, which is why nothing before it may open a
+/// nested predicate: `test` inside `all(not(test), …)` proves the opposite of
+/// itself, and `all(any(test, …), …)` proves nothing. That exclusion also drops
+/// `all(not(windows), test)`, where the `test` IS direct — an under-detection
+/// kept on purpose, per the asymmetry below, rather than a paren-matching
+/// parser this signal does not need.
 ///
 /// Anything unproven is production, because the two errors are not
 /// symmetrical: failing to recognize test context costs one extra finding a
@@ -88,7 +103,7 @@ static CLONE_COLLECT_PATTERN: LazyLock<Regex> =
 /// production finding nobody ever sees.
 static INLINE_RUST_TEST_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"#\[\s*(?:cfg\s*\(\s*(?:test|all\s*\(\s*test\s*[,)][^]]*\))\s*\)|(?:[\w:]+::)*test|rstest)\s*\]|\bmod\s+tests\b",
+        r"#\[\s*(?:cfg\s*\(\s*(?:test|all\s*\(\s*[^()]*\btest\s*(?:,[^]]*)?\))\s*\)|(?:[\w:]+::)*test|rstest)\s*\]|\bmod\s+tests\b",
     )
     .unwrap()
 });
@@ -1056,6 +1071,83 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         assert!(!result.perf_regression_suspected);
         assert_eq!(result.query_in_loop_count, 0);
         assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn an_all_cfg_proves_test_context_whatever_the_operand_order() {
+        // `all` is commutative, so `all(feature = "bench", test)` holds exactly
+        // when `all(test, feature = "bench")` does. Reading only the FIRST
+        // operand made the same predicate test context or production depending
+        // on how it happened to be written, and the second spelling produced a
+        // phantom production finding.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(all(feature = "bench", test))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.perf_regression_suspected);
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_nested_not_test_inside_all_is_production_context() {
+        // The operand has to be a DIRECT one. `all(feature = "x", not(test))`
+        // compiles in every build except the test one, so the bare token `test`
+        // inside it proves the opposite of test context — muting the hits under
+        // it would delete a production finding nobody ever sees.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(all(feature = "x", not(test)))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_feature_named_after_test_inside_all_is_production_context() {
+        // The widened alternative scans the whole operand list, so it must not
+        // start matching `test` inside a feature NAME. `all(unix, feature =
+        // "test-utils")` states no `test` operand at all.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,10 @@
++#[cfg(all(unix, feature = "test-utils"))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.suspected_files[0].test_context_only);
     }
 
     #[test]

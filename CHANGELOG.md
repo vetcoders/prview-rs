@@ -260,11 +260,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature that merely has `test` in its name. This inverted the module's own
   rule that ambiguity resolves toward production. Only a gate that provably
   holds solely in a test build now opens the context: an exact `#[cfg(test)]`,
-  an `#[cfg(all(test, …))]`, `#[test]` / `#[tokio::test]` / `#[rstest]`, and
-  `mod tests`. Measured over the local registry (58,586 files), of the 11,030
-  attributes the old pattern read as test context 83.62% are exactly
-  `cfg(test)` and 6.76% are `all(test, …)` — the remaining 9.62% are the ones it
-  was getting wrong.
+  an `#[cfg(all(…))]` naming `test` among its operands, `#[test]` /
+  `#[tokio::test]` / `#[rstest]`, and `mod tests`. Measured over the local
+  registry (58,586 files), of the 11,030 attributes the old pattern read as test
+  context 83.62% are exactly `cfg(test)` and 6.76% are `all(…, test, …)` — the
+  remaining 9.62% are the ones it was getting wrong. `all` is commutative, so
+  the operand's position carries no meaning: `all(feature = "bench", test)` is
+  read exactly like `all(test, feature = "bench")`, where matching only the
+  first operand made the same predicate production or test context depending on
+  how it was written (72 further attributes over that registry, none lost). The
+  operand must be a direct one, so `all(not(test), …)` — which proves the
+  opposite — and `all(any(test, …), …)` stay production.
 - **A block or struct-literal initializer no longer hides a changed public
   constant.** `pub const LIMIT: usize = {` and `pub const ZERO: Self = Self {`
   had their `{` read as the item's body opener, so both diff sides finalized at
