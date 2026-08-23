@@ -913,7 +913,23 @@ over the local crates.io registry, of 237,368 `cfg`-guarded attribute runs
 reaching a public declaration, 8,793 wrap across lines, 90 carry a literal
 spanning the break, 13 of those a raw string, and 9 balanced wrongly under the
 per-line state — all 9 of the line-continuation shape, in `rustix` and
-`wit-bindgen`. The guard is the WHOLE conjunction of
+`wit-bindgen`.
+
+Spacing follows the same split. Whitespace outside the literals is formatting —
+`#[cfg(feature="a")]`, `#[cfg(feature = "a")]` and the same predicate wrapped
+across four lines are ONE guard, and reading them as three would report removals
+that never happened. Whitespace inside a literal is value: `--cfg 'api="a b"'`
+and `--cfg 'api="ab"'` are different configurations, so the two attributes are
+different gates. The tracker stripped it from the whole attribute text, literals
+included, which made those two one guard and paired a struct that really left
+one configuration with its re-add under another. The strip is now the scanner's
+own dense view, so it cannot reach inside a value while normalizing layout.
+This one is a fix by construction rather than by frequency: of 524,530 gating
+attributes in the local registry only 3 carry whitespace inside a value literal,
+and none of them collide. Both directions still cost what they always did, and
+the hiding one is not worth leaving open for a one-line rule.
+
+The guard is the WHOLE conjunction of
 the attributes stacked above the declaration, sorted — `#[cfg(unix)]
 #[cfg(feature = "x")]` and `#[cfg(windows)] #[cfg(feature = "x")]` are different
 guards, while reordering the same two is not. An unseen scope or guard is

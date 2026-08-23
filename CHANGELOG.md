@@ -201,6 +201,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An unreadable `checks` list is not an empty one.** `checks` present but not
+  an array left the warning tally at zero and fell back to the checks the run
+  itself executed — which on an unchanged `--update` run is none — so
+  `--ci --fail-on-warnings --update` exited `0` on a reused pack whose warning
+  list the reader could not read. It now counts as at least one warning and says
+  so in the existing `unreadable_checks:` caveat. This is the r27 rule one level
+  up, on the container instead of an entry, and no legacy carve-out applies:
+  `checks` has been emitted since schema 1.0 and `validate_merge_gate.py` has
+  always required an array there, so a non-array was never a valid shape. An
+  ABSENT `checks` keeps its tolerance — a pack that states no list may simply
+  predate this build.
+- **Whitespace inside a `cfg` value is part of the gate.** The guard tracker
+  normalized an attribute by stripping whitespace from its whole text, literals
+  included, so `#[cfg(api = "a b")]` and `#[cfg(api = "ab")]` produced one guard:
+  a declaration that really left builds configured with `--cfg 'api="a b"'`
+  paired with its re-add under another value and produced no finding. The strip
+  is now `SourceScanner`'s own dense view, which removes spacing only where it
+  can see the spacing is outside every literal, so reformatting an attribute is
+  still not a different gate. A fix by construction rather than by frequency: of
+  524,530 gating attributes in the local crates.io registry only 3 carry
+  whitespace inside a value literal, and none of them collide.
 - **A check status outside the emitted vocabulary is unreadable, not clean.**
   `checks[].status` is a closed, case-sensitive set — `passed`, `failed`,
   `warnings`, `skipped`, `error` — but the CLI tallied warnings by comparing

@@ -88,6 +88,16 @@ folded here, unlike `inline_findings.status`, whose writer has shipped legacy
 spellings: folding `WARNINGS` into a warning silently would hide that the pack
 is off-contract, and the resulting tally is the same either way.
 
+The same rule governs the CONTAINER. `checks` must be an array — the validator
+has required one since schema 1.0 — and a pack stating anything else is
+unreadable, not empty: it counts as at least one warning and raises an
+`unreadable_checks:` caveat. It used to fall back to "the checks this run
+executed", which on an unchanged `--update` run is none at all, so
+`--ci --fail-on-warnings` exited `0` on a pack whose warning list the reader
+could not read. An ABSENT `checks` is the one tolerant case and stays so: a pack
+that states no list may simply predate this build, and the CLI's own tally still
+applies. Absent and present-but-unreadable are different questions.
+
 ## `inline_findings`
 
 | Field | Type | Notes |
