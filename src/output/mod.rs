@@ -9,8 +9,11 @@ use crate::heuristics::HeuristicsResult;
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const CLI_JSON_TOP_FAILURE_LIMIT: usize = 5;
 
@@ -876,28 +879,250 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
     format!("{truncated}…")
 }
 
-/// One row of the config box: a horizontal rule, or a content line carrying
-/// both its plain text (for width) and its coloured rendering (for display).
+/// One logical row of the config box. Styling is applied only after a row has
+/// been wrapped into physical terminal lines, so ANSI sequences never
+/// participate in width calculations.
 enum ConfigRow {
     Rule,
-    Line { plain: String, colored: String },
+    Line {
+        plain: String,
+        style: ConfigLineStyle,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ConfigLineStyle {
+    Label(&'static str),
+    Plain,
+    Note,
+    Base,
 }
 
 const CONFIG_BOX_TITLE: &str = "PRVIEW CONFIG";
 const CONFIG_BOX_MIN_INNER: usize = 64;
+const CONFIG_BOX_FALLBACK_COLUMNS: usize = 100;
+const CONFIG_BOX_NARROW_THRESHOLD: usize = 24;
 
-/// Inner width (columns between the two walls) for the config box: wide enough
-/// for the longest content line and the title, with a one-column right margin,
-/// never narrower than the historical minimum. All content is plain ASCII or
-/// single-width symbols, so `chars().count()` is the display width.
-fn config_box_inner_width(plain_lines: &[String], title: &str) -> usize {
+/// Inner width (columns between the two walls) for the config box. The desired
+/// width retains the historical 64-column minimum and a right margin, but is
+/// capped to the actual terminal width so the terminal never wraps a wall.
+fn config_box_inner_width(
+    plain_lines: &[String],
+    title: &str,
+    terminal_columns: usize,
+) -> Option<usize> {
+    if terminal_columns < CONFIG_BOX_NARROW_THRESHOLD {
+        return None;
+    }
+
     let widest = plain_lines
         .iter()
-        .map(|s| s.chars().count())
+        .map(|s| UnicodeWidthStr::width(s.as_str()))
         .max()
         .unwrap_or(0)
-        .max(title.chars().count());
-    widest.max(CONFIG_BOX_MIN_INNER - 1) + 1
+        .max(UnicodeWidthStr::width(title));
+    let desired = widest.max(CONFIG_BOX_MIN_INNER - 1) + 1;
+    Some(desired.min(terminal_columns.saturating_sub(2)))
+}
+
+fn config_output_columns() -> usize {
+    if io::stdout().is_terminal() {
+        crossterm::terminal::size()
+            .map(|(columns, _)| usize::from(columns))
+            .unwrap_or(CONFIG_BOX_FALLBACK_COLUMNS)
+    } else {
+        CONFIG_BOX_FALLBACK_COLUMNS
+    }
+}
+
+fn split_at_display_width(input: &str, max_width: usize) -> (&str, &str) {
+    let mut width = 0;
+    let mut split = 0;
+
+    for grapheme in input.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > max_width && split > 0 {
+            break;
+        }
+        width += grapheme_width;
+        split += grapheme.len();
+        if width >= max_width {
+            break;
+        }
+    }
+
+    input.split_at(split)
+}
+
+/// Word-wrap one logical row to display columns. Long unbroken refs are split
+/// on grapheme boundaries; continuation lines preserve the original indent.
+fn wrap_config_line(input: &str, max_width: usize) -> Vec<String> {
+    if UnicodeWidthStr::width(input) <= max_width {
+        return vec![input.to_string()];
+    }
+
+    let leading: String = input.chars().take_while(|ch| *ch == ' ').collect();
+    let indent = if UnicodeWidthStr::width(leading.as_str()) < max_width {
+        leading
+    } else {
+        " ".to_string()
+    };
+    let indent_width = UnicodeWidthStr::width(indent.as_str());
+    let content_width = max_width.saturating_sub(indent_width).max(1);
+    let mut lines = Vec::new();
+    let mut current = indent.clone();
+
+    for word in input.split_whitespace() {
+        let separator = if UnicodeWidthStr::width(current.as_str()) > indent_width {
+            1
+        } else {
+            0
+        };
+        if UnicodeWidthStr::width(current.as_str()) + separator + UnicodeWidthStr::width(word)
+            <= max_width
+        {
+            if separator == 1 {
+                current.push(' ');
+            }
+            current.push_str(word);
+            continue;
+        }
+
+        if UnicodeWidthStr::width(current.as_str()) > indent_width {
+            lines.push(current);
+            current = indent.clone();
+        }
+
+        let mut remainder = word;
+        while UnicodeWidthStr::width(remainder) > content_width {
+            let (chunk, rest) = split_at_display_width(remainder, content_width);
+            let mut line = indent.clone();
+            line.push_str(chunk);
+            lines.push(line);
+            remainder = rest;
+        }
+        current.push_str(remainder);
+    }
+
+    if UnicodeWidthStr::width(current.as_str()) > indent_width || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn style_config_line(line: &str, style: ConfigLineStyle, color: bool) -> String {
+    if !color {
+        return line.to_string();
+    }
+
+    match style {
+        ConfigLineStyle::Label(label) => {
+            let prefix = format!(" {label}:");
+            if let Some(rest) = line.strip_prefix(&prefix) {
+                format!(" {}:{}", label.bold(), rest)
+            } else {
+                line.to_string()
+            }
+        }
+        ConfigLineStyle::Plain => line.to_string(),
+        ConfigLineStyle::Note => {
+            if let Some(rest) = line.strip_prefix("    note: ") {
+                format!("    note: {}", rest.dimmed())
+            } else {
+                line.dimmed().to_string()
+            }
+        }
+        ConfigLineStyle::Base => {
+            let rendered = line.replacen('✓', &"✓".green().to_string(), 1);
+            ["[remote]", "[local]"]
+                .into_iter()
+                .fold(rendered, |text, source| {
+                    text.replace(source, &source.dimmed().to_string())
+                })
+        }
+    }
+}
+
+fn render_config(rows: &[ConfigRow], terminal_columns: usize, color: bool) -> String {
+    let plain_lines: Vec<String> = rows
+        .iter()
+        .filter_map(|row| match row {
+            ConfigRow::Line { plain, .. } => Some(plain.clone()),
+            ConfigRow::Rule => None,
+        })
+        .collect();
+
+    let Some(inner) = config_box_inner_width(&plain_lines, CONFIG_BOX_TITLE, terminal_columns)
+    else {
+        let mut output = String::new();
+        output.push_str(CONFIG_BOX_TITLE);
+        output.push('\n');
+        for row in rows {
+            match row {
+                ConfigRow::Rule => output.push('\n'),
+                ConfigRow::Line { plain, style } => {
+                    output.push_str(&style_config_line(plain, *style, color));
+                    output.push('\n');
+                }
+            }
+        }
+        return output;
+    };
+
+    let heavy = "═".repeat(inner);
+    let light = "─".repeat(inner);
+    let paint_border = |line: String| {
+        if color { line.cyan().to_string() } else { line }
+    };
+    let mut output = String::new();
+
+    output.push_str(&paint_border(format!("╔{heavy}╗")));
+    output.push('\n');
+
+    let title_width = UnicodeWidthStr::width(CONFIG_BOX_TITLE);
+    let left = (inner - title_width) / 2;
+    let right = inner - title_width - left;
+    let title_line = format!(
+        "║{}{}{}║",
+        " ".repeat(left),
+        CONFIG_BOX_TITLE,
+        " ".repeat(right)
+    );
+    output.push_str(&if color {
+        title_line.cyan().bold().to_string()
+    } else {
+        title_line
+    });
+    output.push('\n');
+    output.push_str(&paint_border(format!("╠{heavy}╣")));
+    output.push('\n');
+
+    let content_width = inner.saturating_sub(1).max(1);
+    for row in rows {
+        match row {
+            ConfigRow::Rule => {
+                output.push_str(&paint_border(format!("╟{light}╢")));
+                output.push('\n');
+            }
+            ConfigRow::Line { plain, style } => {
+                for line in wrap_config_line(plain, content_width) {
+                    let width = UnicodeWidthStr::width(line.as_str());
+                    let pad = " ".repeat(inner.saturating_sub(width));
+                    let left_wall = paint_border("║".to_string());
+                    let right_wall = paint_border("║".to_string());
+                    output.push_str(&left_wall);
+                    output.push_str(&style_config_line(&line, *style, color));
+                    output.push_str(&pad);
+                    output.push_str(&right_wall);
+                    output.push('\n');
+                }
+            }
+        }
+    }
+
+    output.push_str(&paint_border(format!("╚{heavy}╝")));
+    output.push('\n');
+    output
 }
 
 /// Print configuration block
@@ -906,100 +1131,53 @@ pub fn print_config(config: &Config, target: &ResolvedRef, bases: &[ResolvedRef]
 
     rows.push(ConfigRow::Line {
         plain: format!(" Target: {}", target.name),
-        colored: format!(" {}: {}", "Target".bold(), target.name),
+        style: ConfigLineStyle::Label("Target"),
     });
     let target_sha = crate::git::short_sha(&target.commit_id);
     rows.push(ConfigRow::Line {
         plain: format!("    commit: {}", target_sha),
-        colored: format!("    commit: {}", target_sha),
+        style: ConfigLineStyle::Plain,
     });
     let target_src = if target.is_remote { "remote" } else { "local" };
     rows.push(ConfigRow::Line {
         plain: format!("    source: {}", target_src),
-        colored: format!("    source: {}", target_src),
+        style: ConfigLineStyle::Plain,
     });
 
     rows.push(ConfigRow::Rule);
     let mode = describe_run_mode(config);
     rows.push(ConfigRow::Line {
         plain: format!(" Mode: {}", mode),
-        colored: format!(" {}: {}", "Mode".bold(), mode),
+        style: ConfigLineStyle::Label("Mode"),
     });
     let checks = describe_enabled_steps(config);
     rows.push(ConfigRow::Line {
         plain: format!(" Checks: {}", checks),
-        colored: format!(" {}: {}", "Checks".bold(), checks),
+        style: ConfigLineStyle::Label("Checks"),
     });
     if config.is_fast_remote_only_standard() {
         let note = "fast remote-only preset skips tests and heuristics; use --with-tests, --with-lint, or --deep for a heavier pass";
         rows.push(ConfigRow::Line {
             plain: format!("    note: {}", note),
-            colored: format!("    note: {}", note.dimmed()),
+            style: ConfigLineStyle::Note,
         });
     }
 
     rows.push(ConfigRow::Rule);
     rows.push(ConfigRow::Line {
         plain: " Bases:".to_string(),
-        colored: format!(" {}:", "Bases".bold()),
+        style: ConfigLineStyle::Label("Bases"),
     });
     for base in bases {
         let sha = crate::git::short_sha(&base.commit_id);
         let src = if base.is_remote { "remote" } else { "local" };
         rows.push(ConfigRow::Line {
             plain: format!("    ✓ {} → {} [{}]", base.name, sha, src),
-            colored: format!(
-                "    {} {} → {} [{}]",
-                "✓".green(),
-                base.name,
-                sha,
-                src.dimmed()
-            ),
+            style: ConfigLineStyle::Base,
         });
     }
 
-    let plain_lines: Vec<String> = rows
-        .iter()
-        .filter_map(|r| match r {
-            ConfigRow::Line { plain, .. } => Some(plain.clone()),
-            ConfigRow::Rule => None,
-        })
-        .collect();
-    let inner = config_box_inner_width(&plain_lines, CONFIG_BOX_TITLE);
-
-    let heavy = "═".repeat(inner);
-    let light = "─".repeat(inner);
-
-    println!("{}", format!("╔{heavy}╗").cyan());
-
-    let title_w = CONFIG_BOX_TITLE.chars().count();
-    let left = (inner - title_w) / 2;
-    let right = inner - title_w - left;
-    println!(
-        "{}",
-        format!(
-            "║{}{}{}║",
-            " ".repeat(left),
-            CONFIG_BOX_TITLE,
-            " ".repeat(right)
-        )
-        .cyan()
-        .bold()
-    );
-    println!("{}", format!("╠{heavy}╣").cyan());
-
-    for row in &rows {
-        match row {
-            ConfigRow::Rule => println!("{}", format!("╟{light}╢").cyan()),
-            ConfigRow::Line { plain, colored } => {
-                let pad = " ".repeat(inner.saturating_sub(plain.chars().count()));
-                println!("{}{}{}{}", "║".cyan(), colored, pad, "║".cyan());
-            }
-        }
-    }
-
-    println!("{}", format!("╚{heavy}╝").cyan());
-    println!();
+    println!("{}", render_config(&rows, config_output_columns(), true));
 }
 
 fn describe_run_mode(config: &Config) -> String {
@@ -1379,8 +1557,12 @@ mod tests {
                 .to_string(),
             " Bases:".to_string(),
         ];
-        let inner = config_box_inner_width(&rows, CONFIG_BOX_TITLE);
-        let widest = rows.iter().map(|r| r.chars().count()).max().unwrap();
+        let inner = config_box_inner_width(&rows, CONFIG_BOX_TITLE, 200).unwrap();
+        let widest = rows
+            .iter()
+            .map(|row| UnicodeWidthStr::width(row.as_str()))
+            .max()
+            .unwrap();
 
         // Every content line fits with a right margin, and the box never shrinks
         // below the historical minimum or the title width.
@@ -1391,11 +1573,12 @@ mod tests {
         // Padding makes every content row reach exactly `inner` columns, so the
         // right wall lines up with the borders (the bug in the screenshot).
         for r in &rows {
-            let pad = inner - r.chars().count();
-            assert_eq!(r.chars().count() + pad, inner);
+            let width = UnicodeWidthStr::width(r.as_str());
+            let pad = inner - width;
+            assert_eq!(width + pad, inner);
         }
         // Centered title also fills the row exactly.
-        let tw = CONFIG_BOX_TITLE.chars().count();
+        let tw = UnicodeWidthStr::width(CONFIG_BOX_TITLE);
         let left = (inner - tw) / 2;
         let right = inner - tw - left;
         assert_eq!(left + tw + right, inner);
@@ -1405,9 +1588,93 @@ mod tests {
     fn config_box_inner_width_floors_at_minimum() {
         let rows = vec![" Mode: standard".to_string()];
         assert_eq!(
-            config_box_inner_width(&rows, CONFIG_BOX_TITLE),
-            CONFIG_BOX_MIN_INNER
+            config_box_inner_width(&rows, CONFIG_BOX_TITLE, 200),
+            Some(CONFIG_BOX_MIN_INNER)
         );
+    }
+
+    fn config_box_test_rows() -> Vec<ConfigRow> {
+        vec![
+            ConfigRow::Line {
+                plain: " Target: feature/zażółć/e\u{301}/界/👩‍💻-and-a-very-long-unbroken-reference-name"
+                    .to_string(),
+                style: ConfigLineStyle::Label("Target"),
+            },
+            ConfigRow::Line {
+                plain: "    commit: 77d1f2a".to_string(),
+                style: ConfigLineStyle::Plain,
+            },
+            ConfigRow::Rule,
+            ConfigRow::Line {
+                plain: "    note: fast remote-only preset skips tests and heuristics; use --with-tests, --with-lint, or --deep for a heavier pass"
+                    .to_string(),
+                style: ConfigLineStyle::Note,
+            },
+            ConfigRow::Rule,
+            ConfigRow::Line {
+                plain: "    ✓ main → 2e11cc6 [remote]".to_string(),
+                style: ConfigLineStyle::Base,
+            },
+        ]
+    }
+
+    #[test]
+    fn config_box_never_exceeds_the_terminal_width() {
+        let rows = config_box_test_rows();
+
+        for columns in [40, 64, 80, 100, 116, 124, 160] {
+            let rendered = render_config(&rows, columns, false);
+            for line in rendered.lines() {
+                assert!(
+                    UnicodeWidthStr::width(line) <= columns,
+                    "{columns}-column terminal overflowed with: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_box_walls_align_after_wrapping() {
+        let rows = config_box_test_rows();
+
+        for columns in [40, 64, 80, 100, 116, 124] {
+            let rendered = render_config(&rows, columns, false);
+            let lines: Vec<&str> = rendered.lines().collect();
+            let expected_width = UnicodeWidthStr::width(lines[0]);
+            assert_eq!(expected_width, columns);
+            for line in lines {
+                assert_eq!(
+                    UnicodeWidthStr::width(line),
+                    expected_width,
+                    "misaligned line at {columns} columns: {line:?}"
+                );
+                assert!(
+                    (line.starts_with('║') && line.ends_with('║'))
+                        || (line.starts_with('╔') && line.ends_with('╗'))
+                        || (line.starts_with('╠') && line.ends_with('╣'))
+                        || (line.starts_with('╟') && line.ends_with('╢'))
+                        || (line.starts_with('╚') && line.ends_with('╝'))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_box_uses_unboxed_fallback_when_terminal_is_too_narrow() {
+        let rendered = render_config(&config_box_test_rows(), 20, false);
+
+        assert!(rendered.starts_with("PRVIEW CONFIG\n"));
+        assert!(rendered.contains("Target: feature/zażółć/e\u{301}/界/👩‍💻"));
+        assert!(!rendered.contains(['╔', '║', '╚']));
+    }
+
+    #[test]
+    fn config_box_splitter_keeps_grapheme_clusters_intact() {
+        let input = "a👩‍💻e\u{301}b";
+        let (first, rest) = split_at_display_width(input, 3);
+
+        assert_eq!(first, "a👩‍💻");
+        assert_eq!(rest, "e\u{301}b");
     }
 
     #[test]
