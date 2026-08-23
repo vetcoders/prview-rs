@@ -827,6 +827,22 @@ their own line must still terminate at their `;`. Measured over that registry
 tracking and the narrower `<{` sequence rule it replaced judge zero lines
 differently.
 
+INSIDE that const argument the same characters are operators, so the generic
+depth is frozen there. `pub fn run() -> Buffer<{ 1 < 2 }> {` counted the
+comparison as another opener, the argument list's own `>` closed only that
+phantom level, and the depth was still above zero at the item's real body brace
+— which therefore read as a further const argument and swallowed the body,
+turning a body-only rewrite into a phantom `ChangedSignature`. Freezing costs
+nothing, because whatever a const block states about generics is balanced
+against itself: a turbofish (`{ size_of::<u32>() }`) and a qualified path
+(`Uint<{ <Self>::LIMBS / 2 }>`, the shape crypto-bigint carries) close what they
+open. Those are also the only shapes the corpus holds — across 58,614 files,
+61 declaration or field lines put a const argument's braces around a `<` or `>`,
+43 of them a turbofish and 18 a qualified path or a shift, and none a bare
+comparison. The previous rule survived all of them by cancellation, the block's
+stray `>` closing the outer list and the outer list's `>` then finding nothing
+left; the freeze reaches the same verdict by construction instead.
+
 Nor is the `{` of an initializer that body brace. After a top-level `=` the item
 states a VALUE and runs to its `;`, so `pub const LIMIT: usize = {` and
 `pub const ZERO: Self = Self {` open an initializer, not an item body — and a
@@ -880,6 +896,23 @@ ordinary re-add into a phantom removal. The two families separate cleanly on the
 whitespace-stripped substring `,cfg(`: of the 44,562 `cfg_attr` attributes in the
 local crates.io registry, 189 apply a `cfg` (12 crates, the `portable-atomic`
 idiom) and none of them carry that substring inside a string literal.
+
+Reordering operands INSIDE one predicate is an accepted limit. Stacked
+attributes are sorted, so `#[cfg(unix)] #[cfg(feature = "x")]` pairs either way
+round, but `#[cfg(any(unix, windows))]` rewritten as `#[cfg(any(windows, unix))]`
+is compared as text, does not pair, and reports a phantom `RemovedSymbol` under
+an untouched declaration. Normalizing it means canonicalizing arbitrarily nested
+predicates — a `cfg` parser — and the measurement says the parser would not earn
+its risk. Across 708 consecutive-version pairs in the local registry, whole
+releases and so far wider than any diff this scanner reads, 32 `cfg` attributes
+were reordered at all, in 2 crates; across the 393 patch-level bumps among them,
+the closest available proxy for a PR-sized change, zero. Of the 32, only 6 are
+reachable by sorting an attribute's direct operands: the dominant real shape is
+`not(any(a, b, c))`, with the reorder one level down. A bounded sort would close
+a fifth of an already absent class while looking complete, which is worse than a
+limit written down — and the error direction here is the tolerable one, a
+phantom removal being visible in review rather than a real removal pairing away
+in silence.
 
 Both the module path and the perf tracker's test-context scope are counted over
 CODE only, via the shared scanner in `src/rust_source.rs`. It resolves comments
