@@ -201,6 +201,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tools/validate_merge_gate.py` now requires a boolean `quality_pass` from
+  schema 2.2.** The validator checked the field's agreement with the failure
+  details but never its presence or type, so a 2.2 pack stating
+  `quality_pass: "false"` — or omitting it — was certified clean while both
+  decision readers normalize a present-but-unreadable signal to BLOCK. The
+  contract gate was therefore passing artifacts the CLI and MCP refuse to trust.
+  The 2.2 writer emits the field unconditionally as a boolean, so requiring it
+  there is safe; absence stays forgiven below 2.2, where readers derive the flag
+  instead.
 - **A body-less test item can now end its own test context.** After a top-level
   `=` an item states a value, but the perf tracker kept reading `<` as a generic
   opener there, so `#[cfg(test)] const ENABLED: bool = 1<2;` left the signature's

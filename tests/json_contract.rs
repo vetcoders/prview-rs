@@ -488,6 +488,105 @@ fn validator_rejects_quality_pass_contradicting_its_own_details() {
         .success();
 }
 
+/// `quality_pass` is a documented decision axis, and from schema 2.2 the writer
+/// emits it unconditionally as a boolean. A 2.2 pack that omits it or states it
+/// as a string is therefore not an old pack but a broken one — and both decision
+/// readers normalize a present-but-unreadable signal to BLOCK, so a validator
+/// that accepted it certified an artifact the CLI and MCP both refuse to trust.
+///
+/// Absence stays forgiven BELOW 2.2, where readers derive the flag instead; that
+/// carve-out is asserted here too, because tightening it would break every pack
+/// written before the field existed.
+#[test]
+fn validator_requires_a_boolean_quality_pass_from_schema_two_two() {
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+
+    let payload = run_json_quiet(repo, &["feature/json-contract", "main"]);
+    let output_dir = Path::new(
+        payload["output_dir"]
+            .as_str()
+            .expect("output_dir should be a string"),
+    );
+    let merge_gate = output_dir.join("00_summary/MERGE_GATE.json");
+    let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
+
+    let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
+    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    assert_eq!(
+        original["schema_version"].as_str(),
+        Some("2.2"),
+        "this test pins the schema that requires the field"
+    );
+    assert!(
+        original["decision"]["quality_pass"].is_boolean(),
+        "the writer must emit a boolean for the requirement to be safe"
+    );
+
+    // Absent, and every non-boolean spelling of it.
+    let broken = [
+        None,
+        Some(serde_json::json!("false")),
+        Some(serde_json::json!("true")),
+        Some(serde_json::json!(0)),
+        Some(serde_json::json!(1)),
+        Some(serde_json::json!(null)),
+        Some(serde_json::json!([])),
+        Some(serde_json::json!({})),
+    ];
+
+    for value in broken {
+        let mut gate = original.clone();
+        match value {
+            Some(value) => gate["decision"]["quality_pass"] = value,
+            None => {
+                gate["decision"]
+                    .as_object_mut()
+                    .expect("decision object")
+                    .remove("quality_pass");
+            }
+        }
+        std::fs::write(
+            &merge_gate,
+            serde_json::to_string_pretty(&gate).expect("serialize gate"),
+        )
+        .expect("write gate");
+
+        Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert()
+            .failure();
+    }
+
+    // The legacy carve-out: below 2.2 an absent `quality_pass` is an old pack,
+    // not a broken one, and the readers derive the flag rather than refusing it.
+    let mut legacy = original.clone();
+    legacy["schema_version"] = serde_json::json!("2.1");
+    legacy["decision"]
+        .as_object_mut()
+        .expect("decision object")
+        .remove("quality_pass");
+    std::fs::write(
+        &merge_gate,
+        serde_json::to_string_pretty(&legacy).expect("serialize gate"),
+    )
+    .expect("write gate");
+    Command::new("python3")
+        .arg(&validator)
+        .arg(&merge_gate)
+        .assert()
+        .success();
+
+    // The shape the emitter actually writes still validates.
+    std::fs::write(&merge_gate, &raw).expect("restore gate");
+    Command::new("python3")
+        .arg(&validator)
+        .arg(&merge_gate)
+        .assert()
+        .success();
+}
+
 /// Resolve an executable by scanning `PATH` (test helper; no external crate).
 #[cfg(unix)]
 fn resolve_in_path(bin: &str) -> Option<std::path::PathBuf> {
