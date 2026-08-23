@@ -645,10 +645,25 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         _ => crate::policy::engine::MergeRecommendation::Block,
     };
 
-    let quality_pass = raw_quality_pass.unwrap_or(false);
+    // Ranking and PUBLISHING are different questions about the same absent
+    // field. Absence states no rank — that is what keeps a pre-`quality_pass`
+    // pack a PASS — but the summary still has to answer "did quality pass", and
+    // answering `false` asserted a failure the pack never claimed: it derived
+    // `analysis_status: Incomplete` from that, and `--ci` exited 1 on the same
+    // artifact the MCP adapter approved.
+    //
+    // So an absent axis is derived from the RECONCILED outcome instead. The
+    // contract permits `PASS` only when quality passes, so a reconciled `PASS`
+    // implies it; anything held below `PASS` implies nothing about quality
+    // specifically and stays conservative. This cannot launder a MISTYPED
+    // value: an unreadable signal normalizes the whole decision to `BLOCK`, so
+    // `allow_merge` is already false by the time it is read here.
+    let quality_pass = raw_quality_pass.unwrap_or(allow_merge);
 
     // Reuses the value typed above, so a mistyped `analysis_status` reaches this
     // fallback as absent rather than being read a second time by a laxer rule.
+    // Its absent case follows the same rule: a reconciled `PASS` requires a
+    // complete analysis, and nothing below `PASS` implies one.
     let analysis_status = match raw_analysis_status {
         Some("complete") => crate::policy::engine::AnalysisStatus::Complete,
         Some("degraded") => crate::policy::engine::AnalysisStatus::Degraded,
@@ -1273,6 +1288,27 @@ mod tests {
     /// Minimal artifact pack carrying one `MERGE_GATE.json` decision. The gate
     /// artifact is now the ONLY source of the verdict, so every summary test
     /// has to plant one instead of leaning on a re-derivation fallback.
+    /// Exit code the CLI would return for a pack, with no check of its own to
+    /// contribute — so the code reflects the gate artifact alone.
+    fn exit_code_for(pack: &tempfile::TempDir, strict: bool) -> i32 {
+        let mut config = test_config();
+        if strict {
+            config.execution_mode = ExecutionMode::Ci;
+        }
+        let report = Report {
+            target: "feature/legacy".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![],
+            heuristics: None,
+            artifacts_dir: pack.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: false,
+        };
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
+        compute_exit_code(&summary, strict, false)
+    }
+
     fn pack_with_gate(decision: &str) -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
@@ -3160,11 +3196,78 @@ api-router/app/core/cache.py
             "{:?}",
             cli.caveats
         );
+        // The reconciliation kept the PASS, but the SUMMARY has to agree with
+        // it. Defaulting the absent axis to `false` published a failed quality
+        // gate the pack never claimed, derived `analysis_status: Incomplete`
+        // from that, and made `--ci` exit 1 — on the same artifact the MCP
+        // adapter approved.
+        assert!(
+            cli.quality_pass,
+            "a reconciled PASS implies the quality axis passed"
+        );
+        assert_eq!(
+            cli.analysis_status,
+            crate::policy::engine::AnalysisStatus::Complete,
+            "a reconciled PASS implies a complete analysis"
+        );
+        assert_eq!(
+            exit_code_for(&pack, true),
+            0,
+            "a legacy PASS pack must not fail --ci"
+        );
 
         let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
         assert_eq!(mcp.verdict, "PASS");
         assert!(mcp.allow_merge);
         assert!(!mcp.normalized);
+        assert_eq!(
+            mcp.allow_merge, cli.allow_merge,
+            "the two readers must not disagree on the same artifact"
+        );
+    }
+
+    #[test]
+    fn an_absent_quality_axis_stays_conservative_when_the_pack_is_not_a_pass() {
+        // The derivation runs off the RECONCILED outcome, so it only ever says
+        // "passed" where the contract already implies it. A legacy pack that is
+        // held at CONDITIONAL or BLOCK states no quality axis either, and
+        // inferring a pass for it would soften a verdict on no evidence.
+        for decision in [
+            r#"{"verdict":"CONDITIONAL","merge_recommendation":"review_required","allow_merge":false}"#,
+            r#"{"verdict":"BLOCK","merge_recommendation":"block","allow_merge":false}"#,
+        ] {
+            let cli = read_merge_gate_summary(pack_with_gate(decision).path()).expect("readable");
+            assert!(!cli.quality_pass, "{decision}");
+            assert_eq!(
+                cli.analysis_status,
+                crate::policy::engine::AnalysisStatus::Incomplete,
+                "{decision}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mistyped_quality_axis_is_never_inferred_from_the_verdict() {
+        // The absent/mistyped split from round 20 is load-bearing here: a
+        // `quality_pass` that is PRESENT but unreadable normalizes the whole
+        // decision to BLOCK, so the derivation below can never read it back as
+        // a pass. Inferring from the verdict must not become a way around that.
+        let pack = pack_with_gate(
+            r#"{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":"true"}"#,
+        );
+
+        let cli = read_merge_gate_summary(pack.path()).expect("readable");
+        assert_eq!(cli.verdict, "BLOCK");
+        assert!(!cli.allow_merge);
+        assert!(
+            !cli.quality_pass,
+            "a signal that cannot be read is not a pass"
+        );
+        assert_eq!(
+            exit_code_for(&pack, true),
+            1,
+            "an unreadable quality axis still fails --ci"
+        );
     }
 
     #[test]

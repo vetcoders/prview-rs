@@ -933,6 +933,22 @@ unproven gate is production. The shape is rare: 10 occurrences over the same
 because its error direction is the mild one — a phantom finding a reader can
 dismiss, not a muted production hit.
 
+An attribute's brackets are its own, and the brace scan skips them by tracking
+attribute depth per character. `#[rstest]` stacked with
+`#[case(Case { id: 1 })]` carries braces that belong to the attribute, never to
+the annotated item, and letting them through made the `{` a body opener whose
+`}` closed the test context on the same line — the test function below then read
+as production. The plain shape survived by luck, because the attribute's `[` and
+`(` hold `sig_depth` above zero; two clamping `>` comparisons
+(`#[case(1 > 0, 2 > 1, Case { id: 1 })]`) drive it back to zero first and the
+brace lands where the opener is accepted. Skipping the attribute outright
+removes the class instead of the one shape that reaches it. This is separate
+from the line-level `AttributeAccumulator` above and deliberately so: that one
+answers "is this LINE part of an unterminated attribute" for the marker match,
+while the brace scan needs "is this CHARACTER inside one". The depth persists
+across lines, since attributes wrap; literals are already resolved away, so a
+`]` inside a string cannot close one early.
+
 The perf tracker's test context closes two ways, because not every test item has
 a body. One that opens a brace closes when that brace balances again; one that
 does not — `#[cfg(test)] mod tests;`, `#[cfg(test)] use crate::helper;` — closes
