@@ -925,13 +925,13 @@ fn config_box_inner_width(
     Some(desired.min(terminal_columns.saturating_sub(2)))
 }
 
-fn config_output_columns() -> usize {
+fn config_output_columns() -> Option<usize> {
     if io::stdout().is_terminal() {
         crossterm::terminal::size()
             .map(|(columns, _)| usize::from(columns))
-            .unwrap_or(CONFIG_BOX_FALLBACK_COLUMNS)
+            .ok()
     } else {
-        CONFIG_BOX_FALLBACK_COLUMNS
+        Some(CONFIG_BOX_FALLBACK_COLUMNS)
     }
 }
 
@@ -1043,7 +1043,38 @@ fn style_config_line(line: &str, style: ConfigLineStyle, color: bool) -> String 
     }
 }
 
-fn render_config(rows: &[ConfigRow], terminal_columns: usize, color: bool) -> String {
+fn render_unboxed_config(rows: &[ConfigRow], max_width: Option<usize>, color: bool) -> String {
+    let physical_lines = |input: &str| match max_width {
+        Some(width) => wrap_config_line(input, width.max(1)),
+        None => vec![input.to_string()],
+    };
+
+    let mut output = String::new();
+    for line in physical_lines(CONFIG_BOX_TITLE) {
+        output.push_str(&line);
+        output.push('\n');
+    }
+    for row in rows {
+        match row {
+            ConfigRow::Rule => output.push('\n'),
+            ConfigRow::Line { plain, style } => {
+                for line in physical_lines(plain) {
+                    output.push_str(&style_config_line(&line, *style, color));
+                    output.push('\n');
+                }
+            }
+        }
+    }
+    output
+}
+
+fn render_config(rows: &[ConfigRow], terminal_columns: Option<usize>, color: bool) -> String {
+    let Some(terminal_columns) = terminal_columns else {
+        // A TTY whose width cannot be queried must not receive a guessed frame:
+        // an oversized right wall is worse than the terminal's natural wrapping.
+        return render_unboxed_config(rows, None, color);
+    };
+
     let plain_lines: Vec<String> = rows
         .iter()
         .filter_map(|row| match row {
@@ -1054,24 +1085,7 @@ fn render_config(rows: &[ConfigRow], terminal_columns: usize, color: bool) -> St
 
     let Some(inner) = config_box_inner_width(&plain_lines, CONFIG_BOX_TITLE, terminal_columns)
     else {
-        let mut output = String::new();
-        let fallback_width = terminal_columns.max(1);
-        for line in wrap_config_line(CONFIG_BOX_TITLE, fallback_width) {
-            output.push_str(&line);
-            output.push('\n');
-        }
-        for row in rows {
-            match row {
-                ConfigRow::Rule => output.push('\n'),
-                ConfigRow::Line { plain, style } => {
-                    for line in wrap_config_line(plain, fallback_width) {
-                        output.push_str(&style_config_line(&line, *style, color));
-                        output.push('\n');
-                    }
-                }
-            }
-        }
-        return output;
+        return render_unboxed_config(rows, Some(terminal_columns), color);
     };
 
     let heavy = "═".repeat(inner);
@@ -1628,7 +1642,7 @@ mod tests {
         let rows = config_box_test_rows();
 
         for columns in [20, 23, 40, 64, 80, 100, 116, 124, 160] {
-            let rendered = render_config(&rows, columns, false);
+            let rendered = render_config(&rows, Some(columns), false);
             for line in rendered.lines() {
                 assert!(
                     UnicodeWidthStr::width(line) <= columns,
@@ -1643,7 +1657,7 @@ mod tests {
         let rows = config_box_test_rows();
 
         for columns in [40, 64, 80, 100, 116, 124] {
-            let rendered = render_config(&rows, columns, false);
+            let rendered = render_config(&rows, Some(columns), false);
             let lines: Vec<&str> = rendered.lines().collect();
             let expected_width = UnicodeWidthStr::width(lines[0]);
             assert_eq!(expected_width, columns);
@@ -1666,7 +1680,7 @@ mod tests {
 
     #[test]
     fn config_box_uses_unboxed_fallback_when_terminal_is_too_narrow() {
-        let rendered = render_config(&config_box_test_rows(), 20, false);
+        let rendered = render_config(&config_box_test_rows(), Some(20), false);
 
         assert!(rendered.starts_with("PRVIEW CONFIG\n"));
         assert!(rendered.contains(" Target:"));
@@ -1676,6 +1690,15 @@ mod tests {
                 .lines()
                 .all(|line| UnicodeWidthStr::width(line) <= 20)
         );
+        assert!(!rendered.contains(['╔', '║', '╚']));
+    }
+
+    #[test]
+    fn config_box_uses_unboxed_fallback_when_tty_width_is_unknown() {
+        let rendered = render_config(&config_box_test_rows(), None, false);
+
+        assert!(rendered.starts_with("PRVIEW CONFIG\n"));
+        assert!(rendered.contains("feature/zażółć/e\u{301}/界/👩‍💻"));
         assert!(!rendered.contains(['╔', '║', '╚']));
     }
 

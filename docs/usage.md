@@ -364,11 +364,12 @@ prview --update feature/x main
 prview --json --quiet feature/x main > summary.json
 ```
 
-Human-readable runs begin with a `PRVIEW CONFIG` panel. The panel follows the
-active terminal width, wraps long refs and notes within aligned walls, and
-falls back to an unboxed list only when the terminal is too narrow to draw a
-coherent frame. Redirected human output uses a deterministic 100-column layout;
-`--json --quiet` remains the machine-readable surface and emits no panel.
+After the initial banner, human-readable runs show a `PRVIEW CONFIG` panel. The
+panel follows the active terminal width, wraps long refs and notes within
+aligned walls, and falls back to an unboxed list when the terminal is too narrow
+to draw a coherent frame or its width cannot be queried safely. Redirected
+human output uses a deterministic 100-column layout; `--json --quiet` remains
+the machine-readable surface and emits no panel.
 
 In `--json --quiet` mode, stdout contains only the compact JSON summary
 (no banners or text summaries). This payload is meant for scripts and agents:
