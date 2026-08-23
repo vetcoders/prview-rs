@@ -221,7 +221,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   garbage exactly where the declaration mattered. Every cell carrying source
   text now escapes `|` as `\|`, which is what GitHub's table parser needs: it
   splits on unescaped pipes before any inline markup runs, so a code span was
-  never protection.
+  never protection. The span is also fenced by a backtick run longer than any
+  inside the cell, so a declaration stating a backtick of its own —
+  `pub const TEMPLATE: &str = r#"`value`"#;` — no longer closes its own code
+  span partway through and renders the remainder as prose.
 - **`#[cfg(not(test))]` no longer mutes a production performance finding.** The
   perf tracker opened inline test context on the bare token `test` appearing
   anywhere inside a `cfg` predicate, so a query-in-loop under

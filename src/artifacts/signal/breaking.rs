@@ -1249,6 +1249,26 @@ fn escape_table_cell(text: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Render one value as a markdown code span inside a table cell.
+///
+/// Pipe escaping alone is not enough: a declaration may hold a backtick of its
+/// own — `pub const TEMPLATE: &str = r#"`value`"#;` — and a single-backtick span
+/// ends at the first interior one, so the rest of the declaration rendered as
+/// prose. CommonMark's answer is a fence LONGER than any backtick run in the
+/// content, plus one space of padding when the content itself begins or ends
+/// with a backtick (the renderer strips exactly that pair back off).
+fn code_cell(text: &str) -> String {
+    let escaped = escape_table_cell(text);
+    let longest_run = escaped.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest_run + 1);
+    let pad = if escaped.starts_with('`') || escaped.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{escaped}{pad}{fence}")
+}
+
 fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
     let mut md = String::new();
 
@@ -1292,9 +1312,9 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
             if let BreakingKind::RemovedSymbol { symbol_type } = &f.kind {
                 let _ = writeln!(
                     md,
-                    "| {} | `{}` | {} |",
+                    "| {} | {} | {} |",
                     escape_table_cell(&f.file),
-                    escape_table_cell(&f.line),
+                    code_cell(&f.line),
                     symbol_type
                 );
             }
@@ -1310,9 +1330,9 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
             if let BreakingKind::RelocatedSymbol { symbol_type } = &f.kind {
                 let _ = writeln!(
                     md,
-                    "| {} | `{}` | {} |",
+                    "| {} | {} | {} |",
                     escape_table_cell(&f.file),
-                    escape_table_cell(&f.line),
+                    code_cell(&f.line),
                     symbol_type
                 );
             }
@@ -1356,20 +1376,20 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
             if variants.len() > 1 {
                 let _ = writeln!(
                     md,
-                    "| {} | `{}` | `{}` _(+{} feature-gated variant{})_ |",
+                    "| {} | {} | {} _(+{} feature-gated variant{})_ |",
                     escape_table_cell(&key.0),
-                    escape_table_cell(before),
-                    escape_table_cell(after),
+                    code_cell(before),
+                    code_cell(after),
                     variants.len() - 1,
                     if variants.len() - 1 == 1 { "" } else { "s" }
                 );
             } else {
                 let _ = writeln!(
                     md,
-                    "| {} | `{}` | `{}` |",
+                    "| {} | {} | {} |",
                     escape_table_cell(&key.0),
-                    escape_table_cell(before),
-                    escape_table_cell(after)
+                    code_cell(before),
+                    code_cell(after)
                 );
             }
         }
@@ -1384,9 +1404,9 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
             if let BreakingKind::NewEnvRequirement { variable } = &f.kind {
                 let _ = writeln!(
                     md,
-                    "| {} | `{}` |",
+                    "| {} | {} |",
                     escape_table_cell(&f.file),
-                    escape_table_cell(variable)
+                    code_cell(variable)
                 );
             }
         }
@@ -1428,6 +1448,42 @@ mod tests {
         // leaves the two empty ends plus one field per column.
         let cells = row.replace(r"\|", "\u{0}").split('|').count();
         assert_eq!(cells, 5, "three columns, two empty ends: {row}");
+    }
+
+    #[test]
+    fn a_backtick_in_a_declaration_does_not_end_its_code_span_early() {
+        // The other half of the escaping: a declaration whose literal states a
+        // backtick — a doc snippet, a shell template — wrapped in a
+        // single-backtick span closes that span at the first interior backtick,
+        // and the rest of the declaration renders as prose instead of code.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/limits.rs",
+            &["-pub const TEMPLATE: &str = r#\"`value`\"#;"],
+        )]);
+
+        let md = format_breaking_changes(&findings);
+        let row = md
+            .lines()
+            .find(|l| l.contains("TEMPLATE"))
+            .expect("the removed constant is reported");
+        let cell = row.split('|').nth(2).expect("the symbol column").trim();
+        // The fence must be longer than the longest backtick run inside it,
+        // which is CommonMark's rule for a span containing backticks.
+        assert_eq!(
+            cell, "``pub const TEMPLATE: &str = r#\"`value`\"#;``",
+            "the declaration must survive verbatim inside a longer fence: {row}"
+        );
+    }
+
+    #[test]
+    fn a_cell_that_begins_with_a_backtick_is_padded() {
+        // CommonMark strips exactly one leading and one trailing space from a
+        // code span, which is how a span whose CONTENT starts or ends with a
+        // backtick keeps that backtick instead of lengthening the fence.
+        assert_eq!(code_cell("`x`"), "`` `x` ``");
+        assert_eq!(code_cell("plain"), "`plain`");
+        assert_eq!(code_cell("a ``b`` c"), "```a ``b`` c```");
+        assert_eq!(code_cell("A | B"), r"`A \| B`");
     }
 
     #[test]

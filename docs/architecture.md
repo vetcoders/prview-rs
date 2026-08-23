@@ -757,7 +757,12 @@ patterns and closures with that character, and a declaration like
 `pub const MASK: u32 = READ | WRITE;` written verbatim opened new columns —
 the row rendered as garbage exactly where the declaration was interesting.
 GitHub's table parser splits on unescaped pipes before any inline markup runs,
-so a code span is no protection.
+so a code span is no protection. The span itself is fenced by a backtick run
+LONGER than any inside the cell, because a declaration may state a backtick of
+its own — `pub const TEMPLATE: &str = r#"`value`"#;` — and a single-backtick
+span ends at the first interior one, leaving the rest of the declaration to
+render as prose. When the content itself begins or ends with a backtick the
+fence carries one space of padding, which CommonMark strips back off.
 
 Display text and comparison identity are separate. `BREAKING_CHANGES.md` and a
 `ChangedSignature` show the declaration verbatim, comments included, because a
