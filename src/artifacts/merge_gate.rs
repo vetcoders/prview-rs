@@ -201,6 +201,8 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     all_review_caveats.extend(review_caveats);
     all_review_caveats.extend(rust_quality_review_caveats(config, checks));
     all_review_caveats.extend(cargo_audit_review_caveats(checks));
+    all_review_caveats.extend(cargo_audit_baseline_review_caveats(inline));
+    all_review_caveats.extend(semgrep_partial_parse_review_caveats(checks));
     all_review_caveats.extend(skipped_requested_security_review_caveats(
         config,
         checks,
@@ -236,11 +238,13 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     let introduced_inline = inline
         .dashboard_findings
         .iter()
+        .filter(|finding| is_operator_finding(finding))
         .filter(|f| f.in_diff == Some(true))
         .count();
     let preexisting_inline = inline
         .dashboard_findings
         .iter()
+        .filter(|finding| is_operator_finding(finding))
         .filter(|f| f.in_diff == Some(false))
         .count();
 
@@ -1025,7 +1029,7 @@ mod tests {
         // verdict is CONDITIONAL, not a clean PASS that hides the partial
         // coverage — an introduced finding could hide in the unparsed spans.
         let gate = run_gate_with_semgrep_output(
-            r#"{"results":[],"errors":[{"type":["PartialParsing",[]],"level":"warn"}]}"#,
+            r#"{"results":[],"errors":[{"type":["PartialParsing",[]],"level":"warn","path":"src/ffi.rs"}]}"#,
             false,
         );
 
@@ -1039,6 +1043,16 @@ mod tests {
         assert_eq!(
             gate["decision"]["preexisting_quality_failures"][0].as_str(),
             Some("Semgrep scan")
+        );
+        assert!(
+            gate["decision"]["review_caveats"]
+                .as_array()
+                .expect("review caveats")
+                .iter()
+                .any(|caveat| caveat
+                    .as_str()
+                    .is_some_and(|value| value.contains("src/ffi.rs"))),
+            "the operator-facing decision must name the incompletely parsed file"
         );
     }
 

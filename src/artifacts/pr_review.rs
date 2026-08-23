@@ -7,6 +7,7 @@ pub(crate) fn generate_pr_review(
     config: &Config,
     diffs: &[Diff],
     checks: &[CheckResult],
+    skipped_checks: &[crate::checks::SkippedCheck],
     coverage: &CoverageDelta,
     heuristics: Option<&HeuristicsResult>,
 ) -> Result<()> {
@@ -270,6 +271,10 @@ pub(crate) fn generate_pr_review(
 
     let ran: HashMap<String, &CheckResult> =
         checks.iter().map(|c| (c.name.to_lowercase(), c)).collect();
+    let skipped: HashMap<String, &crate::checks::SkippedCheck> = skipped_checks
+        .iter()
+        .map(|check| (check.name.to_lowercase(), check))
+        .collect();
     let all_profile_checks = crate::checks::get_checks_for_profile(config);
 
     for check in &all_profile_checks {
@@ -282,15 +287,27 @@ pub(crate) fn generate_pr_review(
                     ("\u{26a0}\u{fe0f}", "Warnings".to_string())
                 }
                 crate::checks::CheckStatus::Error => ("\u{274c}", "Error".to_string()),
-                crate::checks::CheckStatus::Skipped => ("\u{23ed}\u{fe0f}", "Skipped".to_string()),
+                crate::checks::CheckStatus::Skipped => (
+                    "\u{23ed}\u{fe0f}",
+                    format!(
+                        "Not executed by this PrView run. Reason: {}. External CI status not included.",
+                        result
+                            .output
+                            .lines()
+                            .find(|line| !line.trim().is_empty())
+                            .unwrap_or("reason unavailable")
+                            .replace('|', "\\|")
+                    ),
+                ),
             };
             writeln!(md, "| {} | {} {} |", name, icon, text)?;
-        } else {
-            let reason = match check.check_eligibility(config) {
-                crate::checks::CheckEligibility::Skip(r) => r,
-                crate::checks::CheckEligibility::Run => "unknown skip reason".to_string(),
-            };
-            writeln!(md, "| {} | \u{23ed}\u{fe0f} Skipped ({}) |", name, reason)?;
+        } else if let Some(skipped) = skipped.get(&name.to_lowercase()) {
+            writeln!(
+                md,
+                "| {} | \u{23ed}\u{fe0f} Not executed by this PrView run. Reason: {}. External CI status not included. |",
+                name,
+                skipped.reason.replace('|', "\\|")
+            )?;
         }
     }
     writeln!(md)?;

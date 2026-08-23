@@ -1568,6 +1568,45 @@ fn generated_pack_carries_pack_level_provenance() {
         );
     }
 
+    // Check projections share the policy evaluation produced for this run.
+    // RUN.json deliberately carries executed checks only, while MERGE_GATE and
+    // checks-status also expose pre-run skips; their overlapping rows must not
+    // invent a different status or gate class.
+    let merge_gate: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("00_summary/MERGE_GATE.json"))
+            .expect("read MERGE_GATE.json"),
+    )
+    .expect("parse MERGE_GATE.json");
+    let checks_status: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("checks-status.json"))
+            .expect("read checks-status.json"),
+    )
+    .expect("parse checks-status.json");
+    let gate_rows = merge_gate["checks"].as_array().expect("merge-gate checks");
+
+    for run_check in run_checks {
+        let gate_check = gate_rows
+            .iter()
+            .find(|row| row["id"] == run_check["gate"])
+            .expect("every RUN check has one MERGE_GATE projection");
+        assert_eq!(run_check["status"], gate_check["status"]);
+        assert_eq!(run_check["class"], gate_check["class"]);
+    }
+    for gate_check in gate_rows {
+        let id = gate_check["id"].as_str().expect("gate id");
+        let projected = checks_status[id]
+            .as_str()
+            .expect("every MERGE_GATE check has a checks-status projection");
+        if gate_check["status"] == "skipped" {
+            assert!(
+                projected.starts_with("skipped (") && projected.ends_with(')'),
+                "a skipped projection retains its reason: {id}={projected}"
+            );
+        } else {
+            assert_eq!(Some(projected), gate_check["status"].as_str());
+        }
+    }
+
     // Additive, but not invisible: the manifest hashes it and sanity requires it.
     let manifest: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(output_dir.join("00_summary/MANIFEST.json")).expect("read MANIFEST"),

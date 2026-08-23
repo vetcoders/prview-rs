@@ -133,6 +133,7 @@ macro_rules! generate_run_json_test {
             artifacts_root: $artifacts_root,
             config: $config,
             checks: $checks,
+            skipped_checks: &[],
             heuristics: $heuristics,
             resolved_target: $resolved_target,
             resolved_bases: $resolved_bases,
@@ -943,7 +944,21 @@ fn checks_status_lists_disabled_rust_quality_checks_as_skipped() {
     config.run_lint = false;
     let tmp = tempfile::tempdir().expect("tempdir");
 
-    generate_checks_status_json(tmp.path(), &config, &[], None).expect("checks status");
+    let checks = [build_heuristics_check(None, &config)];
+    let skipped = [
+        crate::checks::SkippedCheck {
+            id: "clippy".to_string(),
+            name: "Clippy".to_string(),
+            reason: "lint disabled".to_string(),
+        },
+        crate::checks::SkippedCheck {
+            id: "cargo_test".to_string(),
+            name: "Cargo Test".to_string(),
+            reason: "tests disabled".to_string(),
+        },
+    ];
+
+    generate_checks_status_json(tmp.path(), &config, &checks, &skipped).expect("checks status");
 
     let raw =
         std::fs::read_to_string(tmp.path().join("checks-status.json")).expect("read checks status");
@@ -969,7 +984,12 @@ fn checks_status_includes_geiger_when_security_full() {
     config.security_full = true;
     let tmp = tempfile::tempdir().expect("tempdir");
 
-    generate_checks_status_json(tmp.path(), &config, &[], None).expect("checks status");
+    let skipped = [crate::checks::SkippedCheck {
+        id: "cargo_geiger".to_string(),
+        name: "Cargo Geiger".to_string(),
+        reason: "tool not installed".to_string(),
+    }];
+    generate_checks_status_json(tmp.path(), &config, &[], &skipped).expect("checks status");
 
     let raw =
         std::fs::read_to_string(tmp.path().join("checks-status.json")).expect("read checks status");
@@ -987,7 +1007,14 @@ fn checks_status_explains_fast_remote_only_preset() {
     config.run_heuristics = false;
     let tmp = tempfile::tempdir().expect("tempdir");
 
-    generate_checks_status_json(tmp.path(), &config, &[], None).expect("checks status");
+    let checks = [build_heuristics_check(None, &config)];
+    let skipped = ["Cargo Test", "Clippy", "Rustfmt"].map(|name| crate::checks::SkippedCheck {
+        id: check_id_from_name(name),
+        name: name.to_string(),
+        reason: "fast remote-only preset".to_string(),
+    });
+
+    generate_checks_status_json(tmp.path(), &config, &checks, &skipped).expect("checks status");
 
     let raw =
         std::fs::read_to_string(tmp.path().join("checks-status.json")).expect("read checks status");
@@ -1016,11 +1043,15 @@ fn checks_status_includes_loctree_heuristics_when_available() {
     let mut config = create_test_config(PolicyConfig::default());
     config.run_heuristics = true;
     let mut heuristics = HeuristicsResult::default();
+    heuristics.loctree = Some(crate::heuristics::LoctreeAnalysis {
+        available: true,
+        ..Default::default()
+    });
     heuristics.summary.total_files = 10; // non-zero so it's not skipped
     let tmp = tempfile::tempdir().expect("tempdir");
+    let checks = [build_heuristics_check(Some(&heuristics), &config)];
 
-    generate_checks_status_json(tmp.path(), &config, &[], Some(&heuristics))
-        .expect("checks status");
+    generate_checks_status_json(tmp.path(), &config, &checks, &[]).expect("checks status");
 
     let raw =
         std::fs::read_to_string(tmp.path().join("checks-status.json")).expect("read checks status");
@@ -1174,6 +1205,19 @@ fn merge_gate_marks_heuristics_disabled_as_not_run() {
     assert_eq!(heuristics_check["status"].as_str(), Some("skipped"));
     assert_eq!(heuristics_check["class"].as_str(), Some("SKIP"));
     assert_eq!(heuristics_check["blocking"].as_bool(), Some(false));
+    for field in [
+        "execution_state",
+        "outcome",
+        "policy_conclusion",
+        "confidence_impact",
+        "merge_impact",
+        "reason",
+    ] {
+        assert!(
+            heuristics_check.get(field).is_some(),
+            "fallback heuristics row must preserve {field}"
+        );
+    }
 }
 
 #[test]
@@ -2563,7 +2607,14 @@ fn inline_findings_emits_one_sarif_result_per_cargo_audit_advisory() {
         generate_inline_findings(tmp.path(), &checks, &[], None, None).expect("inline findings");
     assert_eq!(summary.status, "failed");
     assert_eq!(summary.findings_count, 2);
-    assert_eq!(summary.dashboard_findings.len(), 2);
+    assert_eq!(summary.dashboard_findings.len(), 3);
+    assert!(summary.dashboard_findings.iter().any(|finding| {
+        finding.check_id == "cargo_audit_baseline"
+            && finding.message.contains("new=0")
+            && finding.message.contains("pre-existing=2")
+            && finding.message.contains("resolved=0")
+            && finding.message.contains("unknown-baseline=0")
+    }));
 
     let sarif_raw =
         std::fs::read_to_string(tmp.path().join("INLINE_FINDINGS.sarif")).expect("read");
@@ -2797,6 +2848,7 @@ fn pr_review_summarizes_cargo_audit_without_dumping_json() {
         &config,
         &diffs,
         &checks,
+        &[],
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
@@ -2886,6 +2938,7 @@ fn pr_review_surfaces_cargo_audit_informational_warnings_when_check_passes() {
         &config,
         &diffs,
         &checks,
+        &[],
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
@@ -3313,6 +3366,7 @@ fn pr_review_counts_code_test_and_non_code_separately() {
         &config,
         &diffs,
         &[],
+        &[],
         &CoverageDelta {
             total_source: 1,
             covered_count: 1,
@@ -3369,6 +3423,7 @@ fn pr_review_uses_coverage_delta_for_warning_summary() {
         tmp.path(),
         &config,
         &diffs,
+        &[],
         &[],
         &CoverageDelta {
             total_source: 4,
@@ -3429,11 +3484,24 @@ fn pr_review_surfaces_quick_wins_for_rust_signal_gaps_and_cargo_audit() {
     let mut config = create_test_config(PolicyConfig::default());
     config.run_tests = false;
     config.run_lint = false;
+    let skipped = [
+        crate::checks::SkippedCheck {
+            id: "cargo_test".to_string(),
+            name: "Cargo Test".to_string(),
+            reason: "tests disabled".to_string(),
+        },
+        crate::checks::SkippedCheck {
+            id: "clippy".to_string(),
+            name: "Clippy".to_string(),
+            reason: "lint disabled".to_string(),
+        },
+    ];
     generate_pr_review(
         tmp.path(),
         &config,
         &diffs,
         &checks,
+        &skipped,
         &CoverageDelta {
             total_source: 0,
             covered_count: 0,
@@ -3452,6 +3520,9 @@ fn pr_review_surfaces_quick_wins_for_rust_signal_gaps_and_cargo_audit() {
     assert!(content.contains("Enable `cargo test` for this run"));
     assert!(content.contains("Enable `cargo clippy` for this run"));
     assert!(content.contains("Bump `example-crate` to `>=0.3.2`"));
+    assert!(content.contains(
+        "Not executed by this PrView run. Reason: tests disabled. External CI status not included."
+    ));
 }
 
 #[test]
