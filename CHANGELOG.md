@@ -215,6 +215,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context line is unchanged by the patch. `MAX_DECL_CONTINUATION_LINES` (32)
   still bounds growth and a hunk header still finalizes both sides, so the
   reconstruction stays inside the hunk that emitted it.
+- **Braces in a stacked test attribute no longer end the test context.** An
+  attribute's brackets belong to the attribute, never to the item it annotates,
+  but the brace scan read them as the annotated item's: with `#[rstest]` stacked
+  over a brace-bearing `#[case(…)]`, the attribute's `{` was taken as the body
+  opener and its `}` closed the context on the same line, so the test function
+  below was classified as production and a query in its loop surfaced as a
+  phantom regression. The scan now tracks attribute depth per character and
+  skips what is inside one. The plain `#[case(Case { id: 1 })]` was safe only by
+  accident — its `[` and `(` hold the signature depth above zero — while
+  `#[case(1 > 0, 2 > 1, Case { id: 1 })]` clamps that depth back to zero first
+  and reaches the bug; skipping attributes removes the class rather than the one
+  shape.
 - **A legacy `PASS` pack no longer fails `--ci` on the CLI while the MCP adapter
   approves it.** A decision written before `quality_pass` existed —
   `{"verdict": "PASS", "merge_recommendation": "approve", "allow_merge": true}`

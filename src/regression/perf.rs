@@ -504,6 +504,11 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
     // Bracket nesting of the annotated item's SIGNATURE, tracked only until its
     // body opens. A brace inside `(…)`, `[…]` or `<…>` is not the body.
     let mut sig_depth: i32 = 0;
+    // Unclosed `[` of an attribute being scanned, and whether the previous
+    // character was the `#`/`#!` that opens one. Both persist across lines: an
+    // attribute may wrap, and its braces are never the item's body.
+    let mut attr_depth: i32 = 0;
+    let mut attr_sigil = false;
     // Block comments and string literals span lines, so the reader is stateful
     // for this hunk. Hunks are not contiguous, and this function is called per
     // hunk, so the scanner starts clean here and is never carried past the
@@ -551,6 +556,8 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
             depth = 0;
             seen_open = false;
             sig_depth = 0;
+            attr_depth = 0;
+            attr_sigil = false;
         }
 
         if is_added {
@@ -560,6 +567,31 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
         if in_test {
             let mut prev = '\0';
             for ch in code.chars() {
+                // An attribute's brackets are its own: `#[case(Case { id: 1 })]`
+                // stacked under a test marker carries braces that belong to the
+                // attribute, never to the annotated item. Letting them through
+                // made the `{` a body opener and the `}` close the context on
+                // the same line, so the test function below read as production
+                // and its query-in-loop became a phantom regression. The depth
+                // persists across lines because attributes wrap.
+                if attr_depth > 0 {
+                    match ch {
+                        '[' => attr_depth += 1,
+                        ']' => attr_depth -= 1,
+                        _ => {}
+                    }
+                    prev = ch;
+                    continue;
+                }
+                if ch == '[' && attr_sigil {
+                    attr_depth = 1;
+                    prev = ch;
+                    continue;
+                }
+                // `#` opens an attribute sigil, `#!` an inner one; anything else
+                // clears it, so a plain index `a[0]` is not mistaken for one.
+                attr_sigil = ch == '#' || (attr_sigil && ch == '!');
+
                 match ch {
                     '{' => {
                         depth += 1;
@@ -1343,6 +1375,97 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         assert!(
             !result.suspected_files[0].test_context_only,
             "an unterminated attribute proves nothing and must not mute the hit"
+        );
+    }
+
+    /// Build a patch that stacks `attr` under `#[rstest]` over a test function
+    /// whose body holds a query in a loop.
+    fn stacked_attribute_patch(attr: &str) -> String {
+        format!(
+            "diff --git a/src/portal.rs b/src/portal.rs\n+++ b/src/portal.rs\n@@ -20,3 +20,12 @@\n+#[rstest]\n+{attr}\n+fn checks(#[case] c: Case) {{\n+    for user in c.users.iter() {{\n+        db.query(\"SELECT 1\");\n+    }}\n+}}\n"
+        )
+    }
+
+    #[test]
+    fn braces_inside_a_stacked_attribute_do_not_open_the_item_body() {
+        // An attribute's braces belong to the attribute, never to the annotated
+        // item. `#[case(Case { id: 1 })]` alone is safe only because the `[` and
+        // `(` hold the signature depth above zero; two clamping `>` comparisons
+        // drive it back to zero first, and then the attribute's `{` was read as
+        // the body opener and its `}` closed the test context on the same line.
+        // The rstest function below was classified as production and its
+        // query-in-loop surfaced as a phantom regression.
+        for attr in [
+            "#[case(1 > 0, 2 > 1, Case { id: 1 })]",
+            "#[case(a > b, c > d, e > f, Case { id: 1 })]",
+        ] {
+            let ctx = RegressionContext {
+                patch_text: Some(stacked_attribute_patch(attr)),
+                ..Default::default()
+            };
+
+            let result = analyze(&ctx);
+            assert!(
+                result.suspected_files[0].test_context_only,
+                "the rstest function is test context: {attr}"
+            );
+            assert!(!result.perf_regression_suspected, "{attr}");
+            assert_eq!(result.query_in_loop_count, 0, "{attr}");
+        }
+    }
+
+    #[test]
+    fn ordinary_stacked_attributes_keep_their_test_context() {
+        // The shapes that already worked must keep working: the fix must not
+        // buy the case above by loosening the signature tracking.
+        for attr in [
+            "#[case(Case { id: 1 })]",
+            "#[case::first(Case { id: 1 })]",
+            "#[case(Case { id: 1 }, Other { id: 2 })]",
+            "#[case(Case::<u8> { id: 1 })]",
+            "#[should_panic(expected = \"Case { id: 1 }\")]",
+            "#[values(Cfg { a: 1 })]",
+        ] {
+            let ctx = RegressionContext {
+                patch_text: Some(stacked_attribute_patch(attr)),
+                ..Default::default()
+            };
+
+            let result = analyze(&ctx);
+            assert!(result.suspected_files[0].test_context_only, "{attr}");
+        }
+    }
+
+    #[test]
+    fn an_attribute_does_not_hide_the_real_body_brace() {
+        // The other direction: skipping an attribute's brackets must not also
+        // skip the item's own body. A production function carrying an attribute
+        // with braces still ends its (absent) test context exactly where it did,
+        // so the hit inside it stays visible.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,14 @@
++#[cfg(test)]
++fn helper() {
++    let _ = 1;
++}
++
++#[instrument(fields(ctx = Ctx { id: 1 }))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.suspected_files[0].test_context_only,
+            "the production function after the test helper is not test context"
         );
     }
 
