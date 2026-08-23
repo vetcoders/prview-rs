@@ -265,10 +265,13 @@ the caveat, followed by a remaining count when necessary.
 Cargo-audit advisories are baseline-classified as `new`, `pre-existing`,
 `resolved`, or `unknown-baseline`. If `Cargo.lock` did not change, every current
 advisory is safely pre-existing. If it changed, prview audits the base lockfile
-from the same Cargo root as the live check and compares advisory, package, and
-locked version. Inability to establish that base remains explicit as baseline
-`unavailable`; current findings stay unclassified, including for lock-only
-changes, instead of being inferred from manifest deltas.
+governing the same Cargo root as the live check (a member lock first, then the
+workspace lock) and compares advisory, package, and locked version. Inability to
+establish that base remains explicit as baseline `unavailable`; current
+findings stay unclassified, including for lock-only changes, instead of being
+inferred from manifest deltas. Invalid or truncated current tool output fails
+the check and uses a separate `current-unavailable` baseline state; it is never
+interpreted as a clean report.
 
 An intentionally omitted check is described as “Not executed by this PrView
 run. External CI status not included.” The reason from this run is retained;

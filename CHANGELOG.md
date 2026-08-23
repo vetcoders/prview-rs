@@ -27,12 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   example.
 - Cargo-audit caveats classify vulnerability and informational advisory keys as
   new, pre-existing, resolved, or unknown-baseline. A changed `Cargo.lock` uses
-  a valid base audit report from the same Cargo root as the live check; tool or
-  report failure remains explicitly unavailable and current findings remain
-  unclassified rather than being treated as pre-existing. Informational-only
-  reports no longer fall through to the generic SARIF scraper. Semgrep
-  partial-analysis caveats now name files reported under its JSON `errors[]`
-  payload.
+  a valid base audit report from the effective member or workspace lockfile used
+  by the live check; tool or report failure remains explicitly unavailable and
+  current findings remain unclassified rather than being treated as
+  pre-existing. Invalid current output now fails the check and is reported
+  separately as `current-unavailable` instead of clean or resolved.
+  Informational-only reports no longer fall through to the generic SARIF
+  scraper. Semgrep partial-analysis caveats now name files reported under its
+  JSON `errors[]` payload.
 
 ## [0.7.0] - 2026-08-23
 

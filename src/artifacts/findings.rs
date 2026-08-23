@@ -23,10 +23,20 @@ struct CargoAuditBaselineCounts {
 }
 
 fn cargo_audit_baseline_counts(
-    current: &std::collections::HashSet<(String, String, String)>,
+    current: Option<&std::collections::HashSet<(String, String, String)>>,
     cargo_lock_changed: bool,
     base: Option<&std::collections::HashSet<(String, String, String)>>,
 ) -> CargoAuditBaselineCounts {
+    let Some(current) = current else {
+        return CargoAuditBaselineCounts {
+            new: 0,
+            preexisting: 0,
+            resolved: 0,
+            unknown: 0,
+            status: "current-unavailable",
+        };
+    };
+
     if !cargo_lock_changed {
         CargoAuditBaselineCounts {
             new: 0,
@@ -359,16 +369,13 @@ pub(super) fn generate_inline_findings(
         // the generic file:line scraper.
         if check.name.eq_ignore_ascii_case("cargo audit") {
             let audit_findings = parse_cargo_audit_findings(&check.output);
-            let current_advisories = cargo_audit_all_advisory_keys(&check.output);
-            let cargo_lock_changed = diffs
-                .iter()
-                .flat_map(|diff| &diff.files)
-                .any(|file| file.path.ends_with("Cargo.lock"));
-            let base_audit_cache = cargo_lock_changed
+            let current_advisories = cargo_audit_report_advisory_keys(&check.output);
+            let cargo_lock_changed = cargo_audit_lock_changed(repo, diffs, cargo_root);
+            let base_audit_cache = (cargo_lock_changed && current_advisories.is_some())
                 .then(|| get_base_cargo_audit_findings(repo, diffs, cargo_root))
                 .flatten();
             let baseline = cargo_audit_baseline_counts(
-                &current_advisories,
+                current_advisories.as_ref(),
                 cargo_lock_changed,
                 base_audit_cache.as_ref(),
             );
@@ -942,7 +949,7 @@ mod tests {
         .collect();
 
         assert_eq!(
-            cargo_audit_baseline_counts(&current, true, Some(&base)),
+            cargo_audit_baseline_counts(Some(&current), true, Some(&base)),
             CargoAuditBaselineCounts {
                 new: 0,
                 preexisting: 0,
@@ -956,7 +963,7 @@ mod tests {
     #[test]
     fn cargo_audit_unknown_empty_baseline_remains_explicit() {
         assert_eq!(
-            cargo_audit_baseline_counts(&Default::default(), true, None),
+            cargo_audit_baseline_counts(Some(&Default::default()), true, None),
             CargoAuditBaselineCounts {
                 new: 0,
                 preexisting: 0,
@@ -965,6 +972,26 @@ mod tests {
                 status: "unavailable",
             }
         );
+    }
+
+    #[test]
+    fn cargo_audit_invalid_current_report_never_masquerades_as_clean() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = [cargo_audit_check(
+            crate::checks::CheckStatus::Warnings,
+            "cargo audit failed before producing JSON",
+        )];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &[], None, None).expect("findings");
+
+        assert_eq!(summary.findings_count, 0);
+        assert_eq!(summary.dashboard_findings.len(), 1);
+        assert!(
+            summary.dashboard_findings[0]
+                .message
+                .contains("status=current-unavailable")
+        );
+        assert!(!tmp.path().join("INLINE_FINDINGS.sarif").exists());
     }
 
     #[test]

@@ -218,11 +218,17 @@ informational warning families (`unmaintained`, `unsound`, `notice`, and future
 warning keys). Its identity is `(advisory id, package, locked version)`: an
 unchanged lock makes current advisories pre-existing without another tool run;
 a changed lock is compared against `cargo audit` over the base revision's
-lockfile from the same Cargo root as the live check. If that base audit is
-unavailable, current vulnerability findings remain unclassified rather than
-being inferred from manifest deltas. The decision caveat always enumerates
-counts for `new`, `pre-existing`, `resolved`, and `unknown-baseline`, plus an
-explicit baseline status (`not-required`, `available`, or `unavailable`).
+effective lockfile from the same Cargo root as the live check: a member lock if
+present, otherwise the workspace-root lock. If that base audit is unavailable,
+current vulnerability findings remain unclassified rather than being inferred
+from manifest deltas. A multi-base run with more than one changed effective
+lockfile is likewise left unavailable rather than choosing a favorable base. A
+malformed current report fails its check, has the distinct
+`current-unavailable` baseline status, and cannot manufacture a clean or
+resolved result.
+The decision caveat always enumerates counts for `new`, `pre-existing`,
+`resolved`, and `unknown-baseline`, plus an explicit baseline status
+(`not-required`, `available`, `unavailable`, or `current-unavailable`).
 
 Semgrep's `errors[]` remains a completeness signal independently of findings.
 Path-like `path`, `location.path`, and span `file` fields are collected into a

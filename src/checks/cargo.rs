@@ -1471,19 +1471,10 @@ fn classify_cargo_audit_status(
     stdout: &str,
     combined: &str,
 ) -> CheckStatus {
-    if let Some(vulnerability_count) = cargo_audit_vulnerability_count(stdout) {
-        if vulnerability_count > 0 {
-            return CheckStatus::Failed;
-        }
-
-        if cargo_audit_has_warnings(stdout, combined) {
-            return CheckStatus::Warnings;
-        }
-
-        if command_succeeded {
-            return CheckStatus::Passed;
-        }
-
+    let Some(vulnerability_count) = cargo_audit_vulnerability_count(stdout) else {
+        return CheckStatus::Failed;
+    };
+    if vulnerability_count > 0 {
         return CheckStatus::Failed;
     }
 
@@ -1492,35 +1483,24 @@ fn classify_cargo_audit_status(
     }
 
     if command_succeeded {
-        return CheckStatus::Passed;
+        CheckStatus::Passed
+    } else {
+        CheckStatus::Failed
     }
-
-    if combined.contains("RUSTSEC-") {
-        return CheckStatus::Failed;
-    }
-
-    CheckStatus::Failed
 }
 
 fn cargo_audit_vulnerability_count(stdout: &str) -> Option<usize> {
     let parsed = serde_json::from_str::<serde_json::Value>(stdout).ok()?;
     let vulnerabilities = parsed.get("vulnerabilities")?;
-
+    let list = vulnerabilities.get("list")?.as_array()?;
     if let Some(count) = vulnerabilities
         .get("count")
         .and_then(|value| value.as_u64())
+        && count as usize != list.len()
     {
-        return Some(count as usize);
+        return None;
     }
-
-    if let Some(list) = vulnerabilities
-        .get("list")
-        .and_then(|value| value.as_array())
-    {
-        return Some(list.len());
-    }
-
-    Some(0)
+    Some(list.len())
 }
 
 fn cargo_audit_has_warnings(stdout: &str, output: &str) -> bool {
@@ -2282,6 +2262,20 @@ mod tests {
     fn test_cargo_audit_non_json_failure_is_failed() {
         let combined = "error: failed to fetch advisory db";
         let status = classify_cargo_audit_status(false, "not-json", combined);
+        assert_eq!(status, CheckStatus::Failed);
+    }
+
+    #[test]
+    fn test_cargo_audit_malformed_success_is_failed() {
+        let malformed = r#"{"vulnerabilities":{"count":0}}"#;
+        let status = classify_cargo_audit_status(true, malformed, malformed);
+        assert_eq!(status, CheckStatus::Failed);
+    }
+
+    #[test]
+    fn test_cargo_audit_inconsistent_count_is_failed() {
+        let inconsistent = r#"{"vulnerabilities":{"count":1,"list":[]}}"#;
+        let status = classify_cargo_audit_status(true, inconsistent, inconsistent);
         assert_eq!(status, CheckStatus::Failed);
     }
 
