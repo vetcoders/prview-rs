@@ -998,16 +998,31 @@ item closing again: the context ended at the signature and the whole test body
 was classified as production. Inside a signature `<` is reliably a generic
 opener — but only where one can be: a `<` counts as opening a generic when it
 FOLLOWS what it parameterises (`Buffer<`, `Vec<`, `fn f<`, `::<`), and a `<`
-after whitespace is a comparison, which a const argument may hold
-(`Buffer<{ 1 < 2 }>`). Counting that comparison left the depth stuck above zero,
-the real body brace read as another type-level brace, and the context never
-closed — muting every production hit after the test. `->` is excluded so a return
-arrow is not read as a closing angle bracket; closers stay unconditional and the
-depth is clamped at zero, so a `<` this rule misjudges — like a hunk starting
-mid-signature — can only end the context early, never hold it open and mute
-production code. Measured over the local crates.io registry: of 1,697,077 `fn` signatures,
-1,191 carry a brace in that position and 715 place the body opener on a later
-line — the shape that actually breaks the tracker — 59 of them test-annotated.
+after whitespace is a comparison. `->` is excluded so a return arrow is not read
+as a closing angle bracket; closers stay unconditional and the depth is clamped
+at zero, so a `<` this rule misjudges — like a hunk starting mid-signature — can
+only end the context early, never hold it open and mute production code.
+Measured over the local crates.io registry: of 1,697,077 `fn` signatures, 1,191
+carry a brace in that position and 715 place the body opener on a later line —
+the shape that actually breaks the tracker — 59 of them test-annotated.
+
+Spacing is where that rule stops being a boundary, so the boundary is drawn
+around it: signature tracking is FROZEN inside a brace opened within those
+brackets. A const argument holds an expression (`Buffer<{ 1 < 2 }>`) and a
+destructured parameter holds a pattern, and in both `<` and `>` are operators.
+The spacing heuristic reads the spaced spelling correctly and the compact
+`Buffer<{1<2}>` — the same type, formatted without spaces — wrongly, because `<`
+after a digit is indistinguishable from `<` after an identifier. Counting that
+comparison left the depth stuck above zero, the real body brace read as another
+type-level brace, and the context never closed, muting every production hit
+after the test — the direction that HIDES work. Freezing costs nothing, because
+what such a brace states about generics closes what it opens. Measured over the
+same registry, of the 618 `fn` signatures whose brackets hold a brace, 6 put a
+`<` or `>` inside it, all of them the qualified path
+`Uint<{ <Self>::LIMBS / 2 }>` as crypto-bigint writes it, and none the compact
+comparison. Those 6 reached the right verdict before only through the clamp —
+the path's `>` closed the outer list, and the outer list's own `>` was then
+clamped away — and now reach it by construction.
 
 #### signal/coverage.rs — coverage delta computation
 

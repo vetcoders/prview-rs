@@ -201,6 +201,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A compactly written comparison in a const argument no longer mutes
+  production code.** The perf tracker judged `<` a generic opener whenever it
+  followed an identifier, which reads `Buffer<{ 1 < 2 }>` correctly and the same
+  type written `Buffer<{1<2}>` wrongly — `<` after a digit looks exactly like `<`
+  after an identifier. The signature's bracket depth then stayed above zero, the
+  real body brace read as another type-level brace, the test context never
+  closed, and every loop or query below the test was recorded as test-only and
+  dropped from the signal. Spacing is formatting, so it can no longer decide the
+  verdict: bracket tracking is now frozen inside a brace opened within the
+  signature, where a const argument holds an expression and a destructured
+  parameter holds a pattern and `<`/`>` are operators in both.
 - **A comparison inside a const argument no longer swallows the item body.**
   `pub fn run() -> Buffer<{ 1 < 2 }> {` counted the comparison as another
   generic opener, the argument list's own `>` closed only that phantom level,
