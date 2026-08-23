@@ -676,11 +676,48 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     // checks (`public_api_diff`, `unsafe_audit`, `ghost_refs`,
     // `heuristics_loctree`) to the list the gate is built from, and none of
     // them ever reaches the in-memory `Report` the CLI tallies.
+    //
+    // A status is matched against the vocabulary the writer emits, not against
+    // the single string `"warnings"`. Anything else is UNREADABLE, not clean:
+    // `"WARNINGS"` from another writer — or a stale pack `--update` reused
+    // unchanged — used to count as "not a warning", so `--ci
+    // --fail-on-warnings` exited 0 on an artifact whose warning signal this
+    // reader could not read. It is the same rule the decision axes follow: a
+    // present-but-untypeable signal normalizes conservatively and is reported,
+    // while an ABSENT one may legitimately mean a legacy pack. Case is not
+    // folded, deliberately — normalizing `"WARNINGS"` into a warning silently
+    // would hide that the pack is off-contract, and the tally is the same
+    // either way.
     let warned_checks = match value.get("checks") {
-        Some(Value::Array(entries)) => entries
-            .iter()
-            .filter(|entry| entry.get("status").and_then(Value::as_str) == Some("warnings"))
-            .count(),
+        Some(Value::Array(entries)) => {
+            let mut warned = 0usize;
+            let mut unreadable: Vec<String> = Vec::new();
+            for (index, entry) in entries.iter().enumerate() {
+                match entry.get("status").and_then(Value::as_str) {
+                    Some("warnings") => warned += 1,
+                    Some(status) if crate::checks::CheckStatus::EMITTED.contains(&status) => {}
+                    _ => {
+                        warned += 1;
+                        unreadable.push(
+                            entry
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("checks[{index}]")),
+                        );
+                    }
+                }
+            }
+            if !unreadable.is_empty() {
+                caveats.push(format!(
+                    "unreadable_check_status: MERGE_GATE.json states a status outside the emitted \
+                     vocabulary ({}) for {}; each one counts toward the warning tally",
+                    crate::checks::CheckStatus::EMITTED.join(", "),
+                    unreadable.join(", ")
+                ));
+            }
+            warned
+        }
         Some(other) => {
             caveats.push(format!(
                 "unreadable_checks: MERGE_GATE.json checks is {}, not an array; the warning tally \
@@ -2636,6 +2673,106 @@ api-router/app/core/cache.py
             cli.checks_summary
         );
         assert_eq!(compute_exit_code(&cli, true, true), 1);
+    }
+
+    #[test]
+    fn a_reused_pack_with_an_unreadable_check_status_still_fails_on_warnings() {
+        // The tally compared against the exact string `"warnings"`, so a status
+        // this build does not emit — `"WARNINGS"` from another writer, a stale
+        // pack `--update` reused unchanged — counted as NOT a warning. The run
+        // exited 0 under `--ci --fail-on-warnings` on an artifact whose warning
+        // signal the reader could not read. Present-but-unreadable is not zero:
+        // it joins the tally and says so.
+        let pack = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pack.path().join("00_summary")).unwrap();
+        std::fs::write(
+            pack.path().join("00_summary/MERGE_GATE.json"),
+            r#"{"schema_version":"2.2",
+                "checks":[{"id":"semgrep","status":"WARNINGS"}],
+                "decision":{"verdict":"CONDITIONAL",
+                            "merge_recommendation":"review_required",
+                            "allow_merge":false,"quality_pass":true,
+                            "analysis_status":"complete"}}"#,
+        )
+        .unwrap();
+
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Ci;
+        let report = Report {
+            target: "feature/reused-pack".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![],
+            heuristics: None,
+            artifacts_dir: pack.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: true,
+        };
+
+        let cli = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
+        assert_eq!(
+            cli.checks_summary.warned_in_pack, 1,
+            "an unreadable status is not a clean one: {:?}",
+            cli.checks_summary
+        );
+        assert_eq!(
+            compute_exit_code(&cli, true, true),
+            1,
+            "--ci --fail-on-warnings must not pass a pack it cannot read"
+        );
+        assert!(
+            cli.caveats
+                .iter()
+                .any(|caveat| caveat.starts_with("unreadable_check_status:")),
+            "the reader must say what it could not read, got: {:?}",
+            cli.caveats
+        );
+    }
+
+    #[test]
+    fn a_canonical_check_status_is_not_reported_as_unreadable() {
+        // The guard on that widening: every status this build emits must stay
+        // readable, or the caveat becomes noise on every clean run and a
+        // `passed` check inflates the warning tally.
+        let pack = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pack.path().join("00_summary")).unwrap();
+        std::fs::write(
+            pack.path().join("00_summary/MERGE_GATE.json"),
+            r#"{"schema_version":"2.2",
+                "checks":[{"id":"a","status":"passed"},{"id":"b","status":"failed"},
+                          {"id":"c","status":"skipped"},{"id":"d","status":"error"}],
+                "decision":{"verdict":"PASS","merge_recommendation":"approve",
+                            "allow_merge":true,"quality_pass":true,
+                            "analysis_status":"complete"}}"#,
+        )
+        .unwrap();
+
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Ci;
+        let report = Report {
+            target: "feature/clean-pack".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![],
+            heuristics: None,
+            artifacts_dir: pack.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: true,
+        };
+
+        let cli = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
+        assert_eq!(
+            cli.checks_summary.warned_in_pack, 0,
+            "no check in that pack warned: {:?}",
+            cli.checks_summary
+        );
+        assert!(
+            !cli.caveats
+                .iter()
+                .any(|caveat| caveat.starts_with("unreadable_check_status:")),
+            "the emitted vocabulary is readable, got: {:?}",
+            cli.caveats
+        );
     }
 
     #[test]

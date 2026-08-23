@@ -357,6 +357,14 @@ impl CheckStatus {
             Self::Error => "error",
         }
     }
+
+    /// Every spelling a check status can be written as in an artifact.
+    ///
+    /// `as_str` is total and this is its image, so a reader can tell "a status I
+    /// do not recognize" from "a status that is not a warning" — the difference
+    /// between counting an unreadable pack as clean and reporting it. Kept in
+    /// step with `as_str` by `every_emitted_status_is_in_the_vocabulary`.
+    pub const EMITTED: [&'static str; 5] = ["passed", "failed", "warnings", "skipped", "error"];
 }
 
 /// Trait for implementing checks
@@ -1381,6 +1389,39 @@ mod tests {
     use crate::cli::ExecutionMode;
     use crate::config::{Config, test_config, test_rust_profile};
     use std::time::Duration;
+
+    #[test]
+    fn every_emitted_status_is_in_the_vocabulary() {
+        // The vocabulary is what the CLI reader and the contract validator both
+        // measure a pack against, so it has to BE the writer's image. A variant
+        // added to the enum and forgotten here would be emitted into artifacts
+        // and then reported as unreadable by the very tool that wrote it.
+        let variants = [
+            CheckStatus::Passed,
+            CheckStatus::Failed,
+            CheckStatus::Warnings,
+            CheckStatus::Skipped,
+            CheckStatus::Error,
+        ];
+        for variant in variants {
+            assert!(
+                CheckStatus::EMITTED.contains(&variant.as_str()),
+                "{:?} is emitted but missing from the vocabulary",
+                variant
+            );
+        }
+        for spelling in CheckStatus::EMITTED {
+            assert!(
+                variants.iter().any(|v| v.as_str() == spelling),
+                "{spelling} is in the vocabulary but nothing emits it"
+            );
+        }
+        assert_eq!(
+            variants.len(),
+            CheckStatus::EMITTED.len(),
+            "one variant per spelling"
+        );
+    }
 
     fn rust_config(run_tests: bool, run_lint: bool, run_security: bool) -> Config {
         let mut config = test_config();

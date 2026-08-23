@@ -35,6 +35,16 @@ VALID_QUALITY_FAILURE_CLASSES = {
     "mixed",
     "unclassified",
 }
+# Every spelling a check status is emitted as. Mirrors `CheckStatus::EMITTED` in
+# src/checks/mod.rs, which a test there pins to `CheckStatus::as_str`.
+#
+# Case-SENSITIVE, unlike inline_findings.status below. The CLI counts warnings by
+# comparing this vocabulary exactly, so a pack spelling `WARNINGS` is one the
+# reader cannot read; accepting it here would certify an artifact that makes
+# `--ci --fail-on-warnings` report a warning it cannot attribute. The inline
+# field folds case because its writer has shipped legacy spellings; this one has
+# only ever emitted lowercase.
+VALID_CHECK_STATUSES = {"passed", "failed", "warnings", "skipped", "error"}
 
 
 def schema_at_least(raw: Any, minimum: tuple[int, int]) -> bool:
@@ -259,7 +269,10 @@ def validate(path: Path) -> list[str]:
             )
             require_non_empty_string(check.get("id"), f"{ctx}.id", issues)
             require_non_empty_string(check.get("name"), f"{ctx}.name", issues)
-            require_non_empty_string(check.get("status"), f"{ctx}.status", issues)
+            if check.get("status") not in VALID_CHECK_STATUSES:
+                issues.append(
+                    f"{ctx}.status must be one of {sorted(VALID_CHECK_STATUSES)}"
+                )
             if check.get("class") not in VALID_CLASSES:
                 issues.append(f"{ctx}.class must be one of {sorted(VALID_CLASSES)}")
             if check.get("severity") not in VALID_SEVERITIES:
