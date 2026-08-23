@@ -267,6 +267,10 @@ pub fn compute_risk_heatmap(diffs: &[Diff], file_scores: &[FileRiskScore]) -> Ri
         .flat_map(|d| &d.files)
         .filter(|f| seen_paths.insert(f.path.as_str()))
         .collect();
+    let risk_by_path: HashMap<&str, u32> = file_scores
+        .iter()
+        .map(|score| (score.source_path.as_str(), score.score))
+        .collect();
     let mut zone_data: HashMap<&'static str, (usize, usize, u32)> = HashMap::new();
 
     for file in &all_files {
@@ -275,10 +279,7 @@ pub fn compute_risk_heatmap(diffs: &[Diff], file_scores: &[FileRiskScore]) -> Ri
         }
         let lower = file.path.to_lowercase();
         let churn = file.additions + file.deletions;
-        let file_risk = file_scores
-            .iter()
-            .find(|s| s.source_path == file.path)
-            .map_or(0, |s| s.score);
+        let file_risk = risk_by_path.get(file.path.as_str()).copied().unwrap_or(0);
 
         for &(zone_name, keywords) in DOMAIN_ZONES {
             if keywords

@@ -218,14 +218,18 @@ informational warning families (`unmaintained`, `unsound`, `notice`, and future
 warning keys). Its identity is `(advisory id, package, locked version)`: an
 unchanged lock makes current advisories pre-existing without another tool run;
 a changed lock is compared against `cargo audit` over the base revision's
-lockfile. The decision caveat always enumerates counts for `new`,
-`pre-existing`, `resolved`, and `unknown-baseline`.
+lockfile from the same Cargo root as the live check. If that base audit is
+unavailable, current vulnerability findings remain unclassified rather than
+being inferred from manifest deltas. The decision caveat always enumerates
+counts for `new`, `pre-existing`, `resolved`, and `unknown-baseline`, plus an
+explicit baseline status (`not-required`, `available`, or `unavailable`).
 
 Semgrep's `errors[]` remains a completeness signal independently of findings.
 Path-like `path`, `location.path`, and span `file` fields are collected into a
 stable deduplicated list and emitted in decision caveats. A partial parser run
 therefore cannot look like a complete clean scan merely because `results[]` is
-empty.
+empty. The operator-facing caveat shows at most ten paths and reports the
+remaining count; this display bound does not truncate the underlying error set.
 
 In standard execution mode, tests and lint are enabled by default, unless a
 preset (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*` disables them.

@@ -259,13 +259,16 @@ artifact classifier still separates introduced from pre-existing findings.
 Semgrep parse/scan errors remain surfaced even when no rule findings are
 introduced. When Semgrep reports paths in `errors[]`, the merge decision caveats
 name the files that were only partially parsed, so the reviewer does not need to
-open the raw tool log to discover the analysis gap.
+open the raw tool log to discover the analysis gap. Up to ten paths are shown in
+the caveat, followed by a remaining count when necessary.
 
 Cargo-audit advisories are baseline-classified as `new`, `pre-existing`,
 `resolved`, or `unknown-baseline`. If `Cargo.lock` did not change, every current
 advisory is safely pre-existing. If it changed, prview audits the base lockfile
-and compares advisory, package, and locked version; inability to establish that
-base remains explicit as `unknown-baseline`.
+from the same Cargo root as the live check and compares advisory, package, and
+locked version. Inability to establish that base remains explicit as baseline
+`unavailable`; current findings stay unclassified, including for lock-only
+changes, instead of being inferred from manifest deltas.
 
 An intentionally omitted check is described as “Not executed by this PrView
 run. External CI status not included.” The reason from this run is retained;
