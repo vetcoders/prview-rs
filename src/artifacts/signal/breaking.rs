@@ -1234,6 +1234,21 @@ fn extract_fn_name(line: &str) -> Option<String> {
 type ChangedSignatureKey = (String, &'static str, String);
 
 /// Format breaking changes as markdown.
+/// Make one value safe to drop into a markdown table cell.
+///
+/// A table row is delimited by `|`, and Rust states bitwise or, patterns and
+/// closures with the same character: `pub const MASK: u32 = READ | WRITE;` in a
+/// cell opened two new columns and the row rendered as garbage. GitHub's table
+/// parser splits on UNESCAPED pipes before any inline markup runs, so `\|` is
+/// the escape even inside a code span.
+fn escape_table_cell(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('|') {
+        std::borrow::Cow::Owned(text.replace('|', r"\|"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
     let mut md = String::new();
 
@@ -1275,7 +1290,13 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
         md.push_str("|------|--------|------|\n");
         for f in &removed {
             if let BreakingKind::RemovedSymbol { symbol_type } = &f.kind {
-                let _ = writeln!(md, "| {} | `{}` | {} |", f.file, f.line, symbol_type);
+                let _ = writeln!(
+                    md,
+                    "| {} | `{}` | {} |",
+                    escape_table_cell(&f.file),
+                    escape_table_cell(&f.line),
+                    symbol_type
+                );
             }
         }
         md.push('\n');
@@ -1287,7 +1308,13 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
         md.push_str("|------|--------|------|\n");
         for f in &relocated {
             if let BreakingKind::RelocatedSymbol { symbol_type } = &f.kind {
-                let _ = writeln!(md, "| {} | `{}` | {} |", f.file, f.line, symbol_type);
+                let _ = writeln!(
+                    md,
+                    "| {} | `{}` | {} |",
+                    escape_table_cell(&f.file),
+                    escape_table_cell(&f.line),
+                    symbol_type
+                );
             }
         }
         md.push('\n');
@@ -1330,14 +1357,20 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
                 let _ = writeln!(
                     md,
                     "| {} | `{}` | `{}` _(+{} feature-gated variant{})_ |",
-                    key.0,
-                    before,
-                    after,
+                    escape_table_cell(&key.0),
+                    escape_table_cell(before),
+                    escape_table_cell(after),
                     variants.len() - 1,
                     if variants.len() - 1 == 1 { "" } else { "s" }
                 );
             } else {
-                let _ = writeln!(md, "| {} | `{}` | `{}` |", key.0, before, after);
+                let _ = writeln!(
+                    md,
+                    "| {} | `{}` | `{}` |",
+                    escape_table_cell(&key.0),
+                    escape_table_cell(before),
+                    escape_table_cell(after)
+                );
             }
         }
         md.push('\n');
@@ -1349,7 +1382,12 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
         md.push_str("|------|----------|\n");
         for f in &env_reqs {
             if let BreakingKind::NewEnvRequirement { variable } = &f.kind {
-                let _ = writeln!(md, "| {} | `{}` |", f.file, variable);
+                let _ = writeln!(
+                    md,
+                    "| {} | `{}` |",
+                    escape_table_cell(&f.file),
+                    escape_table_cell(variable)
+                );
             }
         }
         md.push('\n');
@@ -1362,6 +1400,35 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
 mod tests {
     use super::*;
     use crate::regression::tests::is_test_file;
+
+    #[test]
+    fn a_pipe_in_a_declaration_does_not_break_the_table_columns() {
+        // Declaration text goes into a markdown table, and Rust states bitwise
+        // or, patterns and closures with `|`. Written verbatim it opened new
+        // columns, so every row carrying one rendered as garbage — the report
+        // stopped being readable exactly where the declaration was interesting.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/limits.rs",
+            &[
+                "-pub const MASK: u32 = READ | WRITE;",
+                "+pub const MASK: u32 = READ | WRITE | EXEC;",
+            ],
+        )]);
+
+        let md = format_breaking_changes(&findings);
+        let row = md
+            .lines()
+            .find(|l| l.contains("MASK"))
+            .expect("the changed constant is reported");
+        assert!(
+            row.contains(r"\|"),
+            "the pipe must be escaped for the table: {row}"
+        );
+        // A GitHub table row is `| a | b | c |`: splitting on UNESCAPED pipes
+        // leaves the two empty ends plus one field per column.
+        let cells = row.replace(r"\|", "\u{0}").split('|').count();
+        assert_eq!(cells, 5, "three columns, two empty ends: {row}");
+    }
 
     #[test]
     fn breaking_changes_detects_removed_pub_fn() {

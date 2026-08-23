@@ -751,6 +751,14 @@ into the body, so a body-only rewrite came out as a phantom `ChangedSignature`.
 Feeding line by line ends a `//` where it really ends while the scanner still
 carries an open literal or `/* … */` across the continuation lines.
 
+`BREAKING_CHANGES.md` renders those declarations into markdown tables, so every
+cell carrying source text has its `|` escaped as `\|`. Rust states bitwise or,
+patterns and closures with that character, and a declaration like
+`pub const MASK: u32 = READ | WRITE;` written verbatim opened new columns —
+the row rendered as garbage exactly where the declaration was interesting.
+GitHub's table parser splits on unescaped pipes before any inline markup runs,
+so a code span is no protection.
+
 Display text and comparison identity are separate. `BREAKING_CHANGES.md` and a
 `ChangedSignature` show the declaration verbatim, comments included, because a
 reader shown a change should see the source as written; pairing COMPARES a

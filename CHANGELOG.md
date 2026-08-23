@@ -201,6 +201,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `|` in a declaration no longer breaks the `BREAKING_CHANGES.md` tables.**
+  Declaration text went into a markdown table verbatim, and Rust states bitwise
+  or, patterns and closures with the table's own delimiter — so a row reporting
+  `pub const MASK: u32 = READ | WRITE;` opened extra columns and rendered as
+  garbage exactly where the declaration mattered. Every cell carrying source
+  text now escapes `|` as `\|`, which is what GitHub's table parser needs: it
+  splits on unescaped pipes before any inline markup runs, so a code span was
+  never protection.
 - **`#[cfg(not(test))]` no longer mutes a production performance finding.** The
   perf tracker opened inline test context on the bare token `test` appearing
   anywhere inside a `cfg` predicate, so a query-in-loop under
