@@ -360,6 +360,26 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
             shape.describe(),
         )
     })?;
+    // A decision object that states NO decision is not a decision with every
+    // signal missing — it is the same corrupt pack the other two readers
+    // already refuse. `tools/validate_merge_gate.py` rejects it for its missing
+    // required fields, the MCP adapter returns `storage_corrupt`, and
+    // `prview gate` cannot deserialize it; only this reader used to normalize
+    // it to BLOCK and publish a summary, so a truncated artifact came back as a
+    // clean `--ci` exit 1 with a verdict the pack never gave. Presence is the
+    // test, not recognizability: a stated verdict outside the vocabulary IS a
+    // decision, and the contract has it collapse to BLOCK with a caveat.
+    if !["verdict", "merge_recommendation", "allow_merge"]
+        .iter()
+        .any(|field| decision.get(*field).is_some())
+    {
+        anyhow::bail!(
+            "merge gate artifact {} states no verdict, merge_recommendation or allow_merge — \
+             the pack is corrupt and no verdict can be read from it",
+            gate_path.display(),
+        );
+    }
+
     // A decision signal present with the WRONG JSON type is not an absent one.
     // Reading each through `as_str()` / `as_bool()` collapsed the two, and
     // "absent" is the state this reader forgives: `merge_recommendation: 7`
@@ -2590,6 +2610,63 @@ api-router/app/core/cache.py
                 "the error must name the missing object: {err:#} for {bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_decision_stating_no_signal_is_corrupt_on_both_readers() {
+        // The object is THERE and it is an object, so the structural check
+        // above passes — and it states nothing. Normalizing that to BLOCK
+        // published a verdict for an artifact that never gave one, and did it
+        // on the one surface that mattered: `tools/validate_merge_gate.py`
+        // rejects the same pack for its missing required fields, the MCP
+        // adapter returns `storage_corrupt`, and `prview gate` cannot even
+        // deserialize it. Absence is forgiven per FIELD, because that is the
+        // shape of an older pack; a decision block with no signal at all is not
+        // an older pack, it is a truncated one.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        for bad in [
+            r#"{"schema_version":"2.2","decision":{}}"#,
+            r#"{"schema_version":"2.2","decision":{"quality_pass":true,"analysis_status":"complete"}}"#,
+            r#"{}"#,
+        ] {
+            std::fs::write(temp.path().join("00_summary/MERGE_GATE.json"), bad).unwrap();
+
+            let err = read_merge_gate_summary(temp.path())
+                .expect_err("a decision that states nothing is not a BLOCK verdict");
+            assert!(
+                format!("{err:#}").contains("corrupt"),
+                "the CLI must call it corrupt: {err:#} for {bad}"
+            );
+
+            let mcp_err = crate::mcp::read::read_decision(temp.path())
+                .expect_err("the MCP adapter rejects the same pack");
+            assert_eq!(
+                mcp_err.class,
+                crate::mcp::types::error_class::STORAGE_CORRUPT,
+                "the two readers must agree on {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decision_stating_one_unreadable_signal_is_still_read() {
+        // The other direction, and the reason the rule counts PRESENCE rather
+        // than recognizability: a pack that states a verdict outside the
+        // vocabulary DID state a decision. The contract has it collapse to
+        // BLOCK with an `unknown_verdict:` caveat, and calling it corrupt
+        // instead would retire a documented read.
+        let pack = pack_with_gate(r#"{"verdict":"PROBABLY"}"#);
+        let summary = read_merge_gate_summary(pack.path()).expect("a stated verdict is a decision");
+        assert_eq!(summary.verdict, "BLOCK");
+        assert!(
+            summary
+                .caveats
+                .iter()
+                .any(|c| c.starts_with("unknown_verdict:")),
+            "{:?}",
+            summary.caveats
+        );
     }
 
     #[test]

@@ -189,6 +189,17 @@ to read at all: it is corrupt on both readers, not a decision with every signal
 missing. Reading one as a decision produced a "successful" summary carrying a
 normalized `BLOCK` for an artifact that never stated anything.
 
+A `decision` object that is present and states no decision falls under the same
+rule. It must carry at least one of `verdict`, `merge_recommendation` or
+`allow_merge`; a block carrying none of the three is corrupt on every surface —
+the CLI exits `3`, the MCP adapter returns `storage_corrupt`, `prview gate`
+cannot deserialize it, and `tools/validate_merge_gate.py` rejects it for the
+required fields it is missing. The test is PRESENCE, not recognizability: a
+stated `verdict: "PROBABLY"` is a decision this pack gave, and it collapses to
+`BLOCK` with an `unknown_verdict:` caveat as described below. Absence stays
+forgiven per FIELD — that is the shape of an older pack — but a decision block
+with no signal at all is not an older pack, it is a truncated one.
+
 For the same reason the tolerance is a fallback, not a precedence rule: a
 `decision` object, wherever it appears, is the decision. A schema-less pack that
 carries one is read from it rather than from its root, because reading a plainly

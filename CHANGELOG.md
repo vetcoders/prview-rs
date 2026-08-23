@@ -201,6 +201,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `MERGE_GATE.json` decision that states nothing is corrupt, not a BLOCK.**
+  A pack shaped `{"schema_version":"2.2","decision":{}}` passed the CLI's
+  structural check — the object is there and it is an object — and then
+  normalized to `BLOCK` and published a summary with `--ci` exit `1`, for an
+  artifact that never gave a verdict. The other three readers already refused
+  it: the MCP adapter with `storage_corrupt`, `prview gate` on deserialization,
+  and `tools/validate_merge_gate.py` on its required fields. The CLI now
+  requires at least one of `verdict`, `merge_recommendation` or `allow_merge`
+  and exits `3` without them, so the readers agree on the same pack. Presence is
+  the test, not recognizability: a stated `verdict: "PROBABLY"` is still read
+  and still collapses to `BLOCK` with its caveat.
 - **A block comment no longer takes a `cfg` guard down with it.** The guard
   tracker read `/** Configuration for the a build. */` standing between
   `#[cfg(feature = "a")]` and the item it guards as a new item, so both sides of
