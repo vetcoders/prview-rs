@@ -201,6 +201,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An `impl` owner is part of a declaration's site.** A `pub` associated item
+  moved between two impl blocks in one file — `pub const VALUE` leaving `impl A`
+  and appearing in `impl B` — matched on file, kind, name and text with an empty
+  scope on both sides, so the exact pairing consumed it and `A::VALUE` vanished
+  from the report entirely. Impl owners now ride the same stack as inline
+  modules, recorded as the header text with whitespace collapsed and nothing
+  parsed. The asymmetry is deliberate: two KNOWN and different owners never pair,
+  while an owner the hunk never showed stays unknown and pairs with anything, so
+  the accepted unseen-opener limit is untouched. Over 211 commits of this
+  repository the reports are identical before and after; over 708 crates.io
+  release pairs removals move 30,555 → 30,694 and signature changes 53,938 →
+  53,805, i.e. mostly a reclassification of a real owner change. Recorded limit,
+  mirroring the `cfg` operand-ordering one: the same owner written with a
+  different path qualifier reads as two owners (40 of 2,784 blocked pairings,
+  all in one crate) — closing it means parsing types.
 - **The contract validator now certifies the reconciliation, not just the
   shape.** `tools/validate_merge_gate.py` checked each decision field on its own,
   so a pack stating `verdict: "PASS"` beside `analysis_status: "incomplete"`, a

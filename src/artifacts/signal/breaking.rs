@@ -149,7 +149,8 @@ struct SymbolDecl {
     /// IS code: `pub const GREETING: &str = "hello";` and the same line ending
     /// `"bye";` are different declarations.
     identity: String,
-    /// Hunk-local inline-module path (`""` when the diff never showed one).
+    /// Hunk-local declaration site — inline modules and `impl` owners joined
+    /// into one path (`""` when the diff never showed the opener).
     scope: String,
     /// Every `#[cfg(…)]` predicate guarding this declaration, whitespace
     /// removed and sorted. `None` means the diff never showed one for this
@@ -180,16 +181,18 @@ struct SymbolDecl {
 /// trades that for smearing whole static bodies into one "declaration".
 const MAX_DECL_CONTINUATION_LINES: usize = 32;
 
-/// Inline-module nesting for ONE side of a unified diff.
+/// Declaration-site nesting for ONE side of a unified diff: inline modules and
+/// `impl` owners, tracked the same way because they are the same question —
+/// which namespace does the next declaration belong to?
 ///
 /// Context lines feed both sides, `-` lines only the "before" side and `+` lines
 /// only the "after" side, so a rename or a moved block cannot unbalance the
 /// tracker. State is hunk-local: it resets at every `@@` header because hunks
-/// are not contiguous, and an unseen module opener simply leaves the scope
-/// unknown (`""`) rather than inventing one.
+/// are not contiguous, and an unseen opener simply leaves the scope unknown
+/// (`""`) rather than inventing one.
 #[derive(Default)]
 struct ModScope {
-    /// `(module name, brace depth the module was opened at)`.
+    /// `(scope name, brace depth the scope was opened at)`.
     stack: Vec<(String, i32)>,
     depth: i32,
     /// Carries a `/* … */` or a string literal left open by an earlier line of
@@ -217,7 +220,8 @@ impl ModScope {
     /// hunk — see [`ModScope::reset`].
     fn feed(&mut self, payload: &str) {
         let code = self.scanner.code_only(payload);
-        let opened = mod_opening_name(code.trim());
+        let trimmed = code.trim();
+        let opened = mod_opening_name(trimmed).or_else(|| impl_opening_scope(trimmed));
         let start_depth = self.depth;
         for ch in code.chars() {
             match ch {
@@ -294,14 +298,86 @@ fn mod_opening_name(trimmed: &str) -> Option<String> {
     (!name.is_empty()).then(|| format!("{prefix}{name}"))
 }
 
+/// Scope name of the `impl` block this line opens, if it opens one.
+///
+/// An associated item belongs to its impl owner exactly as an item belongs to
+/// its module: `A::VALUE` disappearing while `B::VALUE` appears is a removal,
+/// not a no-op re-add, even though both sit in one file with byte-identical
+/// text. Without the owner in the scope both sides carried the empty path and
+/// the exact pairing consumed the removal silently.
+///
+/// The opener is recorded AS TEXT — everything before the body brace, whitespace
+/// runs collapsed — and nothing about it is parsed. Two sides that show the same
+/// header produce the same string, which is all the pairing asks; a header
+/// rewritten between the sides (`impl A` -> `impl A<T>`) reads as a different
+/// owner, which is the text-level answer this scanner is allowed to give. It is
+/// deliberately NOT a type parser: normalizing generics, lifetimes or paths here
+/// would be the same over-reach the `cfg` operand-ordering limit already refuses,
+/// and the identity comparison downstream is likewise textual.
+///
+/// The same-line brace rule is inherited from [`mod_opening_name`], and so is
+/// what happens without it: a header whose `{` sits on the next line records
+/// nothing, the declarations under it carry the unknown scope `""`, and unknown
+/// pairs with anything. That is the accepted limit for an opener the diff never
+/// showed, and this function does not narrow it — it only speaks when the opener
+/// IS visible.
+///
+/// MEASURED. Over 211 commits of this repository — PR-sized diffs, the shape
+/// this scanner actually reads — the reports are byte-identical with and without
+/// the owner in the scope: 3 removals and 6 signature changes either way. Over
+/// 708 consecutive-version pairs in the local crates.io registry (649 of them
+/// touching Rust; whole releases, far coarser than any diff this scanner sees)
+/// removals move 30,555 -> 30,694 and signature changes 53,938 -> 53,805, with
+/// the number of patches reporting anything unchanged at 277. The change is
+/// therefore mostly a RECLASSIFICATION: a declaration whose owner really changed
+/// now reads as the removal of `A::x` instead of a signature change of `x`.
+///
+/// ACCEPTED LIMIT — the owner is text, so the SAME owner written differently
+/// reads as two. Of the 2,784 pairings the rule blocks across that corpus, 40
+/// (1.4%, all in one crate) differ only in a path qualifier:
+/// `impl<T: ::windows_core::RuntimeType> IReference<T>` against the same header
+/// without the leading `::`. Normalizing that means resolving paths, which is a
+/// type parser — the same over-reach, and the same verdict, as the `cfg` operand
+/// ordering limit in [`cfgs_may_pair`]. The error direction is the tolerable
+/// one: a phantom removal is visible in review and rejected there, unlike a real
+/// removal that pairs away silently.
+fn impl_opening_scope(trimmed: &str) -> Option<String> {
+    let header = trimmed.split('{').next()?;
+    if header.len() == trimmed.len() {
+        // No body brace on this line.
+        return None;
+    }
+    // `unsafe impl Send for A {}` opens a scope too. Checking the following
+    // character keeps `unsafely_impl_something` out.
+    let candidate = match header.strip_prefix("unsafe") {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
+        _ => header,
+    };
+    let rest = candidate.strip_prefix("impl")?;
+    // `impl` must be the keyword, not the head of an identifier. A generic impl
+    // may open with `<` immediately (`impl<T> Trait for T`).
+    if !rest.starts_with(char::is_whitespace) && !rest.starts_with('<') {
+        return None;
+    }
+    let name = header.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!name.is_empty()).then_some(name)
+}
+
 /// May a removal in `removed_scope` and an addition in `added_scope` describe
 /// the same declaration site?
 ///
 /// Scopes are hunk-local and often unknown, so an unknown scope stays
 /// compatible with anything — that keeps today's pairing everywhere the diff
-/// does not show a module boundary. Two *known and different* module paths mean
-/// two different namespaces: `a::Config` disappearing while `b::Config` appears
-/// is a real removal, not a no-op re-add.
+/// does not show a boundary. Two *known and different* paths mean two different
+/// namespaces: `a::Config` disappearing while `b::Config` appears is a real
+/// removal, not a no-op re-add, and so is `A::VALUE` disappearing while
+/// `B::VALUE` appears (see [`impl_opening_scope`] — an `impl` owner is a
+/// namespace exactly as a module is).
+///
+/// The ASYMMETRY is the whole rule: known-vs-known blocks, but unknown on
+/// EITHER side still pairs. Only an opener the hunk actually showed can speak,
+/// so this never narrows the accepted unknown-scope limit below; it only fills
+/// in the case where the diff already told us the answer.
 ///
 /// The known gap — two empty scopes pair even when the file's real modules
 /// differ — is deliberate and measured, not overlooked. Over 173 commits of this
@@ -2783,6 +2859,145 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "an identical re-add in one module is not breaking, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_associated_item_moved_between_impl_blocks_is_a_removal() {
+        // `A::VALUE` disappearing while `B::VALUE` appears is the same defect
+        // `raw_identifier_modules_are_different_scopes` covers one namespace
+        // kind up: same file, same kind, same name, byte-identical text, and an
+        // empty module scope on both sides, so the exact pairing consumed the
+        // removal. Nothing named `A::VALUE` exists after this diff.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " impl A {",
+                "-    pub const VALUE: u32 = 1;",
+                " }",
+                " impl B {",
+                "+    pub const VALUE: u32 = 1;",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"constant".to_string()),
+            "a const moved from impl A to impl B must survive as a removal, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_same_impl_owner_still_pairs_a_moved_declaration() {
+        // The no-op direction of the same rule: an item shuffled WITHIN one impl
+        // block has the same owner on both sides, so it must stay unreported.
+        // A scope that made every impl-local move look breaking would be the
+        // phantom this analysis refuses to produce.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " impl A {",
+                "-    pub const VALUE: u32 = 1;",
+                "     pub fn keep(&self) {}",
+                "+    pub const VALUE: u32 = 1;",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a move inside one impl block is not breaking, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_impl_opener_the_hunk_never_showed_still_pairs() {
+        // The accepted unknown-scope limit, unchanged. When the diff does not
+        // show the owner, both sides carry the empty path and the re-add pairs —
+        // the same tolerance an unseen `mod` opener has always had. Narrowing
+        // this would turn ordinary re-adds into phantom removals wherever a hunk
+        // starts inside a block, which is most of them.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-    pub const VALUE: u32 = 1;",
+                "+    pub const VALUE: u32 = 1;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "an unseen impl opener must keep the scope unknown, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_impl_owner_composes_with_the_module_it_sits_in() {
+        // Owners and modules are one stack, so `a::impl A` and `b::impl A` are
+        // different sites even though the impl header is identical. Reading only
+        // the innermost opener would merge them.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " pub mod a {",
+                " impl A {",
+                "-    pub const VALUE: u32 = 1;",
+                " }",
+                " }",
+                " pub mod b {",
+                " impl A {",
+                "+    pub const VALUE: u32 = 1;",
+                " }",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"constant".to_string()),
+            "the same impl header in two modules is two sites, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_returned_impl_trait_does_not_open_a_scope() {
+        // `pub fn f() -> impl Iterator<Item = u8> {` contains the keyword but
+        // opens a function body, not an owner. Recording it would invent a scope
+        // for whatever follows and split a plain re-add into a phantom removal —
+        // the same "do not invent a scope" rule the literal-brace guard enforces.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                " pub fn rows() -> impl Iterator<Item = u8> {",
+                "-    pub const VALUE: u32 = 1;",
+                " }",
+                " pub fn cols() -> impl Iterator<Item = u8> {",
+                "+    pub const VALUE: u32 = 1;",
+                " }",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "`-> impl Trait` must not open an owner scope, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }
