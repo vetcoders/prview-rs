@@ -354,6 +354,29 @@ and only the value that rules `PASS` out speaks. An empty `blocking_issues` and
 `policy_allow_merge: true` state nothing at all, because "policy did not
 hard-block" is not "merge is allowed".
 
+#### Ranking an absent field is not publishing one
+
+The table above says what an absent field contributes to the RANK: nothing. It
+does not say what the CLI summary should then report for that field, and
+conflating the two produced a reader split. A pre-`quality_pass` pack —
+`{"verdict": "PASS", "merge_recommendation": "approve", "allow_merge": true}` —
+is correctly reconciled to `PASS`, because absence adds no rank; but the summary
+published `quality_pass: false` from a bare default, derived
+`analysis_status: incomplete` from that, and exited `1` under `--ci`, while the
+MCP adapter returned a clean approval for the same artifact.
+
+An absent field is therefore PUBLISHED from the reconciled outcome rather than
+from a default. The contract permits `PASS` only when quality passes and the
+analysis is complete, so a reconciled `PASS` implies both; a decision held below
+`PASS` implies nothing about either axis specifically and both stay
+conservative. The direction is one-way — the reconciled verdict can only ever
+confirm what the contract already requires of a `PASS`, never soften a verdict.
+
+This does not reopen the absent/mistyped split. A field that is present but
+unreadable normalizes the whole decision to `BLOCK`, so by the time the summary
+is built the reconciled outcome is not a `PASS` and nothing can be inferred as
+passing from it. Absence is forgiven; an unreadable value is not.
+
 Every ranking axis is typed through `gate::readable_signal`, so present-but-
 unreadable is a third state distinct from both a stated value and an absent one:
 `blocking_issues: "Clippy"` (a string, not an array) or `analysis_status: 7`

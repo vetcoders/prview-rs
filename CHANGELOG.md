@@ -215,6 +215,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context line is unchanged by the patch. `MAX_DECL_CONTINUATION_LINES` (32)
   still bounds growth and a hunk header still finalizes both sides, so the
   reconstruction stays inside the hunk that emitted it.
+- **A legacy `PASS` pack no longer fails `--ci` on the CLI while the MCP adapter
+  approves it.** A decision written before `quality_pass` existed —
+  `{"verdict": "PASS", "merge_recommendation": "approve", "allow_merge": true}`
+  — reconciled correctly to `PASS`, because an absent field adds no rank, but the
+  summary then published `quality_pass: false` from a bare default, derived
+  `analysis_status: incomplete` from that, and exited `1` under `--ci`. The two
+  readers answered the same artifact differently. Ranking an absent field and
+  publishing one are separate questions: an absent axis is now derived from the
+  reconciled outcome, so a reconciled `PASS` — which the contract permits only
+  when quality passes and the analysis is complete — publishes both, and a
+  decision held below `PASS` stays conservative on both. The absent/mistyped
+  split is untouched: an unreadable value normalizes the decision to `BLOCK`, so
+  nothing can be inferred as passing from it.
 - **An incomplete analysis or a stated blocker can no longer be published as an
   approval.** The conservative reconciliation ranked `verdict`,
   `merge_recommendation`, `allow_merge` and `quality_pass`, but read
