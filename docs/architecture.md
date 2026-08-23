@@ -778,18 +778,28 @@ produced no finding at all. Measured over the local crates.io registry, 719
 public `const`/`static` declarations in 126 crates open a multi-line initializer
 on a line whose type carries such a `;`.
 
+A `{` in type position is not that body brace. `pub type Alias = Buffer<{` opens
+a const argument, and finalizing there truncated both diff sides to the same
+prefix, so a changed const expression below — a different public type — paired
+away as an unchanged re-add. The rule is the exact `<{` sequence rather than
+generic-argument tracking: `<` is also the shift operator, and treating it as an
+opener would leave the 4,666 public `const`/`static` declarations in the local
+registry that state a shift on their own line accumulating past their `;`, to buy
+the 6 that carry a `<{`.
+
 Inline module names keep their raw-identifier prefix. `mod r#type` and
 `mod r#match` were both recorded as `r`, so two namespaces looked like one and a
 removal from the first was cancelled by an unrelated addition in the second.
 
 Pairing is scoped: two declarations pair only when their inline `mod` path and
-their `#[cfg(…)]` guard may be the same. **Accepted limit (measured):** the
-attribute's delimiter counter does not resolve block comments, so a `/* ) */`
-inside a multi-line predicate counts as syntax and could balance the attribute
-early. Resolving it needs a per-side scanner reset with the guard plus a second
-view (the guard's identity must keep literals a delimiter view drops); across the
-local crates.io registry a block comment opens inside a `cfg` predicate zero
-times, so the limit is recorded rather than paid for. The guard is the WHOLE conjunction of
+their `#[cfg(…)]` guard may be the same. The guard tracker resolves comments away
+before it reads anything, with one per-side scanner reset with the guard, so a
+block comment is not syntax on either count: `/** … */` standing between the
+`cfg` and the item it guards no longer reads as a new item and clears the guard,
+and `/* ))) */` inside a wrapped predicate no longer balances the attribute
+early. That view keeps literals, because `#[cfg(feature = "a")]` and
+`#[cfg(feature = "b")]` are different gates and a literal-dropping view would
+make them one. The guard is the WHOLE conjunction of
 the attributes stacked above the declaration, sorted — `#[cfg(unix)]
 #[cfg(feature = "x")]` and `#[cfg(windows)] #[cfg(feature = "x")]` are different
 guards, while reordering the same two is not. An unseen scope or guard is

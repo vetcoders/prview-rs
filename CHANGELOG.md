@@ -201,6 +201,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `MERGE_GATE.json` decision that states nothing is corrupt, not a BLOCK.**
+  A pack shaped `{"schema_version":"2.2","decision":{}}` passed the CLI's
+  structural check — the object is there and it is an object — and then
+  normalized to `BLOCK` and published a summary with `--ci` exit `1`, for an
+  artifact that never gave a verdict. The other three readers already refused
+  it: the MCP adapter with `storage_corrupt`, `prview gate` on deserialization,
+  and `tools/validate_merge_gate.py` on its required fields. The CLI now
+  requires at least one of `verdict`, `merge_recommendation` or `allow_merge`
+  and exits `3` without them, so the readers agree on the same pack. Presence is
+  the test, not recognizability: a stated `verdict: "PROBABLY"` is still read
+  and still collapses to `BLOCK` with its caveat.
+- **A block comment no longer takes a `cfg` guard down with it.** The guard
+  tracker read `/** Configuration for the a build. */` standing between
+  `#[cfg(feature = "a")]` and the item it guards as a new item, so both sides of
+  a diff came out unguarded, the identical declaration text paired as an
+  unchanged re-add, and a struct that really disappeared for the `a` build
+  produced no finding at all. Comments are now resolved away before the tracker
+  reads a line, by the same per-side scanner the declaration accumulator uses:
+  the comment reaches it as the blank line it is, wrapped over as many lines as
+  it likes. The same resolution retires the recorded limit on the attribute's
+  delimiter counter — `/* ))) */` inside a wrapped `#[cfg(any(` predicate no
+  longer balances the attribute early. Literals stay in that view, because
+  `#[cfg(feature = "a")]` and `#[cfg(feature = "b")]` are different gates.
+- **A const argument in a type no longer ends the declaration.** `pub type Alias
+  = Buffer<{` opens a const argument, but the accumulator read that `{` as the
+  item's body opener and finalized there. Both diff sides held the same
+  truncated prefix, paired as an unchanged re-add, and a changed const
+  expression on the lines below — a different public type — produced no finding.
+  A `{` directly after a `<` is now carried to its matching `}`. The rule is
+  that exact sequence rather than generic-argument tracking, because `<` is also
+  the shift operator: 4,666 public `const`/`static` declarations in the local
+  registry state a shift on their own line, against 6 that carry a `<{`.
 - **A changed multi-line array constant surfaces again.** An array type states
   its length with a `;` — `pub const TABLE: [u8; 2] = [` — and the declaration
   accumulator accepted that `;` as the terminator. Both sides of a diff

@@ -746,9 +746,11 @@ fn cfgs_may_pair(removed: &Option<Vec<String>>, added: &Option<Vec<String>>) -> 
 /// Does this line end the run of attributes standing above a declaration?
 ///
 /// Attributes, doc comments and blank lines sit between a `cfg` and the item it
-/// guards without breaking the link; anything else is a new item.
+/// guards without breaking the link; anything else is a new item. The line
+/// arrives with its comments already resolved away, so `/** … */` — the block
+/// form of `///`, wrapped or not — reaches this as the blank line it is.
 fn breaks_attribute_run(trimmed: &str) -> bool {
-    !trimmed.is_empty() && !trimmed.starts_with("#[") && !trimmed.starts_with("//")
+    !trimmed.is_empty() && !trimmed.starts_with("#[")
 }
 
 /// An attribute may wrap over this many lines before the tracker gives up on it.
@@ -783,11 +785,25 @@ struct OpenAttribute {
 /// the same predicate wrapped across four lines are ONE predicate: reformatting
 /// an attribute is not a different gate, and reading it as one would report a
 /// removal that never happened.
+///
+/// Comments are resolved away before any of that, by one
+/// [`SourceScanner`](crate::rust_source::SourceScanner) per side fed one
+/// physical line at a time. A block comment is not syntax on either count: a
+/// `/** … */` doc comment standing between the `cfg` and its item used to read
+/// as a new item and clear the guard, and a `/* ))) */` inside a wrapped
+/// predicate balanced the attribute early with the same result — both sides
+/// unguarded, the identical declaration text paired, and a struct that really
+/// left one configuration produced no finding. Literals are KEPT by that view,
+/// because `#[cfg(feature = "a")]` and `#[cfg(feature = "b")]` are different
+/// gates and a view that dropped literal bodies would make them one.
 #[derive(Default)]
 struct CfgGuard {
     /// The accumulated conjunction, or `None` for "not known on this side".
     guards: Option<Vec<String>>,
     open: Option<OpenAttribute>,
+    /// Resolves comments away, carrying an open `/* … */` or literal between
+    /// lines. Reset with the guard, because the diff has jumped elsewhere.
+    scanner: crate::rust_source::SourceScanner,
 }
 
 impl CfgGuard {
@@ -798,6 +814,16 @@ impl CfgGuard {
 
     /// Forget everything: the diff has jumped somewhere else.
     fn reset(&mut self) {
+        self.forget_attributes();
+        self.scanner.reset();
+    }
+
+    /// Drop the guard and any attribute in flight, keeping the scanner state.
+    ///
+    /// Used when an attribute overruns its continuation cap: the diff has NOT
+    /// jumped anywhere, so a literal or `/* … */` still open on this side is
+    /// still open on the next line.
+    fn forget_attributes(&mut self) {
         self.guards = None;
         self.open = None;
     }
@@ -808,6 +834,8 @@ impl CfgGuard {
     /// declaration is guarded by the attribute above it, not by one on its own
     /// line.
     fn feed(&mut self, trimmed: &str) {
+        let resolved = self.scanner.code_with_literals(trimmed);
+        let trimmed = resolved.trim();
         if let Some(open) = self.open.as_mut() {
             open.text
                 .extend(trimmed.chars().filter(|c| !c.is_whitespace()));
@@ -820,7 +848,7 @@ impl CfgGuard {
                 // Unknown pairs with anything, which is the tolerant direction:
                 // a guard invented from an unfinished attribute would fabricate
                 // removals out of ordinary re-adds.
-                self.reset();
+                self.forget_attributes();
             }
             return;
         }
@@ -891,19 +919,11 @@ fn gates_the_item(attribute: &str) -> bool {
 /// closes on its own line. Escapes are honoured so a `\"` does not end the
 /// string early.
 ///
-/// ACCEPTED LIMIT (measured, do not re-litigate). A block comment's contents are
-/// NOT resolved here, so `/* ) */` inside a multi-line `#[cfg(…)]` predicate
-/// counts as syntax. Enough stray closers in such a comment would balance the
-/// attribute early, the real continuation would then read as a new item and
-/// clear the pending guard, and differently guarded declarations could pair as
-/// if both were unguarded. Resolving it needs what the other trackers use — a
-/// [`SourceScanner`](crate::rust_source::SourceScanner) per side, reset with
-/// this guard, plus a SECOND view because the guard's identity must keep the
-/// literals a delimiter view drops. That machinery buys nothing measurable: over
-/// the local crates.io registry (59,974 files, 2,025 crates) a block comment
-/// opens inside a `cfg` predicate exactly ZERO times. The 12 nearby hits are the
-/// reverse shape — a whole `#[cfg(…)]` commented OUT, `/* #[cfg(test)]` — which
-/// never enters this counter because the line does not start with `#[`.
+/// Block comments never reach this counter at all: [`CfgGuard::feed`] resolves
+/// them away before the line gets here, so `/* ))) */` inside a wrapped
+/// `#[cfg(…)]` predicate can no longer balance the attribute early. The view it
+/// uses keeps literals, which is why the `in_string` handling below is still
+/// this function's own job.
 fn delimiter_depth(line: &str, depth: usize) -> usize {
     let mut depth = depth;
     let mut in_string = false;
@@ -1109,10 +1129,29 @@ fn should_scan_for_breaking_changes(path: &str) -> bool {
 /// removal was cancelled and the literal change the patch actually made went
 /// unreported. The scanner carries that literal across the continuation lines,
 /// and ends a `//` comment at the line that wrote it.
+///
+/// A `{` in TYPE position is not a body opener either. `pub type Alias =
+/// Buffer<{` states a const argument, and finalizing there truncated both diff
+/// sides to the same prefix: they paired as an unchanged re-add and a changed
+/// const expression — a different public type — produced no finding.
 fn declaration_complete(code: &str) -> bool {
     let mut depth: i32 = 0;
+    // How deep inside a const argument — `Buffer<{ LIMIT * 2 }>` — the scan is.
+    // Such a `{` is type-level syntax, not the item's body opener.
+    let mut const_block: i32 = 0;
+    let mut prev = '\0';
     for ch in code.chars() {
         match ch {
+            // A `{` directly after `<` opens a const argument, and everything
+            // up to its matching `}` is type-level syntax. The rule is the
+            // exact `<{` sequence rather than generic-argument tracking on
+            // purpose: `<` is also the shift and comparison operator, and 4,666
+            // public `const`/`static` declarations in the local registry state a
+            // shift on their own line — counting their `<` as an opener would
+            // leave every one of them accumulating past its `;`, to buy the 6
+            // declarations in that registry that carry a `<{`.
+            '{' if prev == '<' || const_block > 0 => const_block += 1,
+            '}' if const_block > 0 => const_block -= 1,
             // Square brackets are counted for the same reason parentheses are:
             // an array type states its length with a `;` — `pub const TABLE:
             // [u8; 2] = [` — and reading that as the terminator finalized the
@@ -1121,9 +1160,11 @@ fn declaration_complete(code: &str) -> bool {
             // initializer below produced no finding at all.
             '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
-            '{' if depth <= 0 => return true,
-            ';' if depth <= 0 => return true,
+            '{' | ';' if depth <= 0 => return true,
             _ => {}
+        }
+        if !ch.is_whitespace() {
+            prev = ch;
         }
     }
     false
@@ -1658,6 +1699,103 @@ mod tests {
         );
         assert_eq!(changes[0].0, "pub type Value = u32;");
         assert_eq!(changes[0].1, "pub type Value = u64;");
+    }
+
+    #[test]
+    fn a_const_block_in_a_generic_argument_is_not_the_body_opener() {
+        // `pub type Alias = Buffer<{` opens a const argument, not an item body.
+        // Finalizing there truncated BOTH sides to the same prefix, they paired
+        // as an unchanged re-add, and the changed const expression below —
+        // a different public type — produced no finding at all.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub type Alias = Buffer<{",
+                "-    LIMIT * 2",
+                "-}>;",
+                "+pub type Alias = Buffer<{",
+                "+    LIMIT * 3",
+                "+}>;",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "a changed const argument is a changed public type: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(changes[0].0.contains("LIMIT * 2"), "{}", changes[0].0);
+        assert!(changes[0].1.contains("LIMIT * 3"), "{}", changes[0].1);
+    }
+
+    #[test]
+    fn a_body_brace_after_a_const_argument_still_ends_the_declaration() {
+        // Guard against over-reach: the const block closes on the same line and
+        // the NEXT brace is the real body. Swallowing it would run the
+        // accumulator into the body and turn a body-only rewrite into a phantom
+        // signature change.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn to_hex(&self) -> ArrayString<{ 2 * OUT_LEN }> {",
+                "-    self.old_body()",
+                "-}",
+                "+pub fn to_hex(&self) -> ArrayString<{ 2 * OUT_LEN }> {",
+                "+    self.new_body()",
+                "+}",
+            ],
+        )]);
+
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a body-only rewrite is not a signature change: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_shifted_constant_still_terminates_at_its_semicolon() {
+        // `1 << 3` is the reason the fix above is spelled as the exact `<{`
+        // sequence rather than as generic-argument tracking: 4,666 public
+        // `const`/`static` declarations in the local registry state a shift on
+        // their own line, and a `<` counted as an opener there would leave
+        // every one of them accumulating past its `;`.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const MASK: u32 = 1 << 3;",
+                "-pub struct Keep;",
+                "+pub const MASK: u32 = 1 << 4;",
+                "+pub struct Keep;",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "the constant is one declaration, the struct below another: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(changes[0].0, "pub const MASK: u32 = 1 << 3;");
+        assert_eq!(changes[0].1, "pub const MASK: u32 = 1 << 4;");
     }
 
     #[test]
@@ -2322,6 +2460,89 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "an unchanged guard on a context line must not split the pair, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_block_comment_between_the_guard_and_its_item_does_not_drop_the_guard() {
+        // `/** … */` is the block form of `///`, and it sits between a `cfg`
+        // and the item it guards exactly as the line form does. Reading it as a
+        // new item cleared BOTH sides' guards, the identical declaration text
+        // then paired, and a struct that really left the `a` build produced no
+        // finding at all.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(feature = \"a\")]",
+                "-/** Configuration for the a build. */",
+                "-pub struct Config;",
+                "+#[cfg(feature = \"b\")]",
+                "+/** Configuration for the b build. */",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a block comment must not break the attribute run, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_multiline_block_comment_between_the_guard_and_its_item_does_not_drop_the_guard() {
+        // The close arrives on a later line, so tolerating the OPENER alone
+        // would leave the body and the `*/` line reading as new items — a fix
+        // that looks complete and still drops the guard.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(feature = \"a\")]",
+                "-/**",
+                "- * Configuration for the a build.",
+                "- */",
+                "-pub struct Config;",
+                "+#[cfg(feature = \"b\")]",
+                "+/**",
+                "+ * Configuration for the b build.",
+                "+ */",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a wrapped block comment must not break the attribute run, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_block_comment_inside_a_cfg_predicate_is_not_counted_as_syntax() {
+        // The delimiter counter used to read `/* ) */` as a real closer, so the
+        // attribute balanced early, its real continuation read as a new item,
+        // and the guard was gone by the time the declaration arrived.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(any(/* ))) */",
+                "-    feature = \"a\",",
+                "-    feature = \"c\"))]",
+                "-pub struct Config;",
+                "+#[cfg(any(/* ))) */",
+                "+    feature = \"b\",",
+                "+    feature = \"c\"))]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a comment inside the predicate must not balance it early, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }
