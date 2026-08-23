@@ -819,13 +819,30 @@ away as an unchanged re-add. The scanner tracks the generic argument list
 itself, so a const argument that is not the first one — `Buffer<u8, {`, where
 the brace follows a comma — is recognized as well; a const generic is rarely the
 leading argument, which made that the common half of the construct. `<` opens a
-list only directly after an identifier or a closing `>`, `->` never closes one,
-and `<<` is consumed whole, because `<` is also the shift operator and the 4,666
-public `const`/`static` declarations in the local registry that state a shift on
-their own line must still terminate at their `;`. Measured over that registry
-(59,946 files, 2,025 crates, 4,354,142 public declaration lines), argument-list
-tracking and the narrower `<{` sequence rule it replaced judge zero lines
-differently.
+list only directly after an identifier, a closing `>`, or a `:`, `->` never
+closes one, and `<<` is consumed whole, because `<` is also the shift operator
+and the 4,666 public `const`/`static` declarations in the local registry that
+state a shift on their own line must still terminate at their `;`. Measured over
+that registry (59,946 files, 2,025 crates, 4,354,142 public declaration lines),
+argument-list tracking and the narrower `<{` sequence rule it replaced judge zero
+lines differently.
+
+The `:` in that rule admits the TURBOFISH spelling of the same construct.
+`pub fn run() -> Buffer::<{` is a valid return type — rustc accepts `Type::<…>`
+in type position without a warning — but its `<` follows a `:`, so the list went
+uncounted, the const block's `{` read as the item's body opener, and both diff
+sides finalized at that identical prefix. They paired as an unchanged re-add and
+a changed const argument, which is a changed public return type, was reported
+nowhere: the direction that HIDES a break. Only `:` joins the openers, never
+whitespace, so a comparison is still not a list. The widening is verdict-neutral
+where it is not needed: `::<` appears on 557 public declaration lines in the
+registry and a `:` immediately before a `<` on exactly one — inside a string
+literal, which the code-only view never shows this scanner — and running both
+rules over all 4,334,018 public declaration lines produces zero disagreements,
+because a turbofish that closes on its own line (`size_of::<T>()`) nets to the
+same depth counted or ignored. What changes is the list left OPEN at end of line,
+which the accumulator carries into the next one; two public declarations in the
+registry wrap a turbofish that way today.
 
 INSIDE that const argument the same characters are operators, so the generic
 depth is frozen there. `pub fn run() -> Buffer<{ 1 < 2 }> {` counted the

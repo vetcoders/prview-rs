@@ -1220,9 +1220,16 @@ fn declaration_complete(code: &str) -> bool {
             continue;
         }
         match ch {
-            // `<` opens an argument list only directly after an identifier or a
-            // closing `>` — `Buffer<`, `Vec<u8>>` — which is where a type names
-            // its arguments and is not where a comparison puts it.
+            // `<` opens an argument list only directly after an identifier, a
+            // closing `>`, or a `:` — `Buffer<`, `Vec<u8>>`, `Buffer::<` — which
+            // is where a type names its arguments and is not where a comparison
+            // puts it. The `:` admits the turbofish spelling, which rustc accepts
+            // in type position without a warning: `pub fn run() -> Buffer::<{`
+            // left the list uncounted, so the const block's `{` read as the
+            // item's body opener and BOTH diff sides finalized at that identical
+            // prefix — they paired as an unchanged re-add and a changed const
+            // argument, a different public return type, was reported nowhere.
+            // Whitespace is still not an opener, so a comparison stays one.
             //
             // Inside a const block the same characters are OPERATORS, so the
             // depth is frozen there: `Buffer<{ 1 < 2 }>` counted the comparison
@@ -1232,7 +1239,9 @@ fn declaration_complete(code: &str) -> bool {
             // the whole body, turning a body-only rewrite into a phantom
             // `ChangedSignature`. A block's own generics (`size_of::<u32>()`)
             // are balanced against themselves, so freezing loses nothing.
-            '<' if block == 0 && (prev.is_alphanumeric() || prev == '_' || prev == '>') => {
+            '<' if block == 0
+                && (prev.is_alphanumeric() || prev == '_' || prev == '>' || prev == ':') =>
+            {
                 angle += 1
             }
             // `->` is a return arrow, not a closing bracket.
@@ -2246,6 +2255,111 @@ mod tests {
             "a body-only rewrite is not a signature change: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_turbofish_return_type_does_not_finalize_at_its_const_block() {
+        // `Buffer::<{` is a valid return type — the turbofish spelling of a
+        // const argument, which rustc accepts without a warning. Its `<` follows
+        // a `:`, so the argument list went uncounted, the const block's `{` read
+        // as the item's body opener, and BOTH sides finalized at that identical
+        // prefix. They paired as an unchanged re-add and the changed const
+        // expression below — a different public return type — was reported
+        // nowhere. This is the direction that HIDES a break.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn run() -> Buffer::<{",
+                "-    LIMIT * 2",
+                "-}> {",
+                "-    compute()",
+                "-}",
+                "+pub fn run() -> Buffer::<{",
+                "+    LIMIT * 3",
+                "+}> {",
+                "+    compute()",
+                "+}",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "a changed const argument is a changed return type: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            changes[0].0.contains("LIMIT * 2") && changes[0].1.contains("LIMIT * 3"),
+            "the finding must carry the const expression that changed: {:?}",
+            changes[0]
+        );
+    }
+
+    #[test]
+    fn a_turbofish_return_type_re_emitted_verbatim_is_a_no_op() {
+        // The other direction of the same rule: counting the turbofish list must
+        // not turn an untouched signature into a phantom change when only the
+        // body below it was rewritten.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn run() -> Buffer::<{",
+                "-    LIMIT * 2",
+                "-}> {",
+                "-    compute(2)",
+                "-}",
+                "+pub fn run() -> Buffer::<{",
+                "+    LIMIT * 2",
+                "+}> {",
+                "+    compute(3)",
+                "+}",
+            ],
+        )]);
+
+        assert!(
+            findings.is_empty(),
+            "a body-only rewrite is not a signature change: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_comparison_after_whitespace_still_does_not_open_an_argument_list() {
+        // The guard on widening the opener rule. `:` joins identifier and `>` as
+        // a predecessor that can open a list, but whitespace must not: a `<`
+        // after a space is a comparison, and counting it would leave every such
+        // constant accumulating past its `;`.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const OK: bool = 1 < 2;",
+                "-pub struct Keep;",
+                "+pub const OK: bool = 1 < 3;",
+                "+pub struct Keep;",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "the constant is one declaration, the struct below another: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(changes[0].0, "pub const OK: bool = 1 < 2;");
     }
 
     #[test]
