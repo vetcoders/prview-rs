@@ -704,6 +704,11 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     )
     .and_then(|v| v.as_bool());
 
+    // Whether any signal was present and could not be TYPED. Captured before
+    // the vocabulary caveats below join the same list, because the two are
+    // different failures with the same consequence.
+    let mistyped_signal = !unknown_signal_caveats.is_empty();
+
     let merge_rank = raw_merge.as_deref().and_then(rank_from_merge_rec);
     let verdict_rank = raw_verdict.as_deref().and_then(rank_from_verdict);
 
@@ -718,8 +723,16 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     {
         unknown_signal_caveats.push(format!(
             "unknown_verdict: MERGE_GATE.json verdict `{raw}` is not in the \
-             PASS/CONDITIONAL/BLOCK vocabulary; it was ignored when deriving this decision"
+             PASS/CONDITIONAL/BLOCK vocabulary; normalized to BLOCK"
         ));
+    }
+    // An absent verdict is named too, exactly as the CLI names it: the decision
+    // this adapter returns is then the reader's substitution, not the pack's.
+    if raw_verdict.is_none() && decision.get("verdict").is_none() {
+        unknown_signal_caveats.push(
+            "unknown_verdict: MERGE_GATE.json decision carries no `verdict`; normalized to BLOCK"
+                .to_string(),
+        );
     }
     if let Some(raw) = raw_merge.as_deref()
         && merge_rank.is_none()
@@ -731,11 +744,19 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
         ));
     }
 
-    // Need at least one decision signal to build a truthful surface.
-    if merge_rank.is_none() && verdict_rank.is_none() {
+    // Corrupt means the decision states NOTHING — not that what it states is
+    // unrankable. The presence test is the CLI's, field for field: a pack that
+    // named a verdict outside the vocabulary, or nothing but `allow_merge`, DID
+    // state a decision, and calling it corrupt here while the CLI published a
+    // summary for it left the same artifact readable on one surface and broken
+    // on the other.
+    if !["verdict", "merge_recommendation", "allow_merge"]
+        .iter()
+        .any(|field| decision.get(*field).is_some())
+    {
         return Err(ToolError::new(
             error_class::STORAGE_CORRUPT,
-            "MERGE_GATE.json decision has no recognizable merge_recommendation or verdict",
+            "MERGE_GATE.json decision states no verdict, merge_recommendation or allow_merge",
         ));
     }
 
@@ -743,19 +764,41 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // never lowers it (a permissive flag can't override a block/hold signal).
     let allow_rank = raw_allow.map(|allow| if allow { 1 } else { 2 });
 
-    let final_rank = [merge_rank, verdict_rank, allow_rank]
+    // A verdict this reader had to SUBSTITUTE — absent, outside the vocabulary,
+    // or present with the wrong JSON type — governs everything derived beside
+    // it, and so does any other signal that could not be typed. This is the
+    // CLI's `normalized_to_block` rule, mirrored: a decision derived from a
+    // block the reader only partly read is not one either surface may publish
+    // as permissive, and the two surfaces answering that differently is how one
+    // pack came to be a `PASS` for MCP automation and a `BLOCK` on the CLI.
+    let normalized_to_block = mistyped_signal || verdict_rank.is_none();
+
+    let stated_ranks: Vec<u8> = [merge_rank, verdict_rank, allow_rank]
         .into_iter()
         .flatten()
-        .max()
-        .unwrap_or(2);
+        .collect();
+    let final_rank = if normalized_to_block {
+        3
+    } else {
+        stated_ranks.iter().copied().max().unwrap_or(3)
+    };
 
     let allow_merge = final_rank == 1;
 
-    // Inconsistent iff the raw signals disagree on conservativeness, or the raw
-    // allow_merge flag contradicts the final (derived) recommendation.
-    let signal_ranks: Vec<u8> = [merge_rank, verdict_rank].into_iter().flatten().collect();
-    let signals_disagree = signal_ranks.iter().any(|&r| r != final_rank);
-    let allow_contradicts = raw_allow.map(|a| a != allow_merge).unwrap_or(false);
+    // Only the PACK's own axes can be inconsistent with each other; a verdict
+    // this reader substituted is already named by its own caveat, and calling
+    // the substitution an inconsistency would blame the artifact for the
+    // reader's normalization.
+    //
+    // `allow_merge` raises the rank but is not compared as one: `false` says
+    // "not a PASS" — `>= 2`, never 3 — so treating it as an exact rank would
+    // call every healthy BLOCK pack inconsistent with itself. It contradicts the
+    // decision only when the DERIVED flag disagrees with the stated one.
+    let textual_ranks: Vec<u8> = [merge_rank, verdict_rank].into_iter().flatten().collect();
+    let signals_disagree =
+        !normalized_to_block && textual_ranks.iter().any(|&rank| rank != final_rank);
+    let allow_contradicts =
+        !normalized_to_block && raw_allow.map(|a| a != allow_merge).unwrap_or(false);
     // An ignored signal is itself a normalization: the returned decision is not
     // a faithful passthrough of what the pack says. A forward schema is the same
     // situation one level up — the pack was written by a build this one does not
@@ -957,7 +1000,10 @@ mod tests {
         // An unrecognized verdict used to vanish into the rank `flatten()`: the
         // decision was derived from `merge_recommendation` alone and returned as
         // a clean passthrough, with nothing telling the caller a field had been
-        // dropped. It must now surface as an explicit `unknown_verdict` caveat.
+        // dropped. It must surface as an explicit `unknown_verdict` caveat — and
+        // it must also govern the decision published beside it. Deriving a PASS
+        // from the surviving `approve` was this adapter reading one pack as an
+        // approval while the CLI, on the same bytes, substituted BLOCK.
         let dir = tempfile::tempdir().unwrap();
         write_gate(
             dir.path(),
@@ -971,7 +1017,15 @@ mod tests {
             }),
         );
         let d = read_decision(dir.path()).unwrap();
-        assert_eq!(d.verdict, "PASS", "the recognizable signal still decides");
+        assert_eq!(
+            d.verdict, "BLOCK",
+            "a substituted verdict governs every axis derived beside it"
+        );
+        assert_eq!(d.merge_recommendation, "block");
+        assert!(
+            !d.allow_merge,
+            "the pack's `allow_merge: true` does not stand"
+        );
         assert!(d.normalized, "an ignored signal is a normalization");
         let caveat = d
             .caveats

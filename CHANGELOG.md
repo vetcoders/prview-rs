@@ -201,6 +201,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A const argument that is not the first one no longer hides a public type
+  change.** The breaking-change scanner recognized `Buffer<{ LIMIT }>` as
+  type-level syntax by the exact `<{` sequence, so `Buffer<u8, { LIMIT }>` —
+  where the brace follows a comma, which is where a const generic usually sits —
+  finalized the declaration at its opener. Both diff sides then held the same
+  prefix, paired as an unchanged re-add, and the changed const expression below
+  produced no finding. The scanner now tracks the generic argument list itself.
+  `<<` is consumed whole so a shifted public constant still terminates at its
+  `;`, and measured over the local registry (59,946 files, 2,025 crates,
+  4,354,142 public declaration lines) the new rule and the one it replaces judge
+  zero lines differently.
+- **The MCP adapter and the CLI now answer the same way about a decision they
+  cannot rank.** A pack that stated a signal outside the vocabulary — a
+  `verdict: "PROBABLY"`, or nothing but `allow_merge` — was read as a
+  conservative `BLOCK` summary by the CLI and refused as `storage_corrupt` by
+  `prview mcp`, one artifact with two answers. `storage_corrupt` is now reserved
+  for a decision block stating none of `verdict`, `merge_recommendation` and
+  `allow_merge`; a stated-but-unrankable signal is a decision the pack gave, and
+  the adapter normalizes it exactly as the CLI does, with a caveat and
+  `normalized: true`. The substitution governs the axes published beside it, so
+  an unreadable verdict beside `merge_recommendation: "approve"` no longer reads
+  as an approval on the MCP surface while the CLI blocks on the same bytes.
+- **A self-consistent `BLOCK` pack no longer reports contradicting itself.**
+  Both readers compared `allow_merge` to the numeric rank of the winning
+  verdict, but `allow_merge` has two values and `false` ranks as `CONDITIONAL` —
+  so `verdict: "BLOCK"` beside `merge_recommendation: "block"` and
+  `allow_merge: false`, the shape every blocking run writes, raised a
+  `core_inconsistency:` caveat naming a disagreement that was not there. The
+  check now compares the textual axes to the published verdict and `allow_merge`
+  to the flag actually published.
+- **`--ci` strictness no longer depends on which preset the run resolves to.**
+  `--update` outranks `--ci` when the execution preset is picked, so
+  `prview --ci --fail-on-warnings --update` published `execution_mode: "update"`
+  — and the exit code read its strictness off that label. Both `--ci` exits, the
+  `!quality_pass` one and the warning hardening clap insists on `--ci` for, were
+  therefore inert for exactly the combination CI jobs use. Strictness now follows
+  the flag the caller typed. On top of that, an `--update` run with no new
+  commits forced exit `0` outright: it reuses the previous pack and reports it,
+  so a second invocation turned a warning-carrying — or outright `BLOCK` — pack
+  green. Such a run now derives its exit from the pack it reused, like every
+  other run; `--soft-exit` stays the one deliberate way to ask for `0`.
+  (`output::compute_exit_code` takes the strictness explicitly as a result.)
 - **A `MERGE_GATE.json` decision that states nothing is corrupt, not a BLOCK.**
   A pack shaped `{"schema_version":"2.2","decision":{}}` passed the CLI's
   structural check — the object is there and it is an object — and then
