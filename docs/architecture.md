@@ -778,6 +778,15 @@ produced no finding at all. Measured over the local crates.io registry, 719
 public `const`/`static` declarations in 126 crates open a multi-line initializer
 on a line whose type carries such a `;`.
 
+A `{` in type position is not that body brace. `pub type Alias = Buffer<{` opens
+a const argument, and finalizing there truncated both diff sides to the same
+prefix, so a changed const expression below — a different public type — paired
+away as an unchanged re-add. The rule is the exact `<{` sequence rather than
+generic-argument tracking: `<` is also the shift operator, and treating it as an
+opener would leave the 4,666 public `const`/`static` declarations in the local
+registry that state a shift on their own line accumulating past their `;`, to buy
+the 6 that carry a `<{`.
+
 Inline module names keep their raw-identifier prefix. `mod r#type` and
 `mod r#match` were both recorded as `r`, so two namespaces looked like one and a
 removal from the first was cancelled by an unrelated addition in the second.

@@ -213,6 +213,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delimiter counter — `/* ))) */` inside a wrapped `#[cfg(any(` predicate no
   longer balances the attribute early. Literals stay in that view, because
   `#[cfg(feature = "a")]` and `#[cfg(feature = "b")]` are different gates.
+- **A const argument in a type no longer ends the declaration.** `pub type Alias
+  = Buffer<{` opens a const argument, but the accumulator read that `{` as the
+  item's body opener and finalized there. Both diff sides held the same
+  truncated prefix, paired as an unchanged re-add, and a changed const
+  expression on the lines below — a different public type — produced no finding.
+  A `{` directly after a `<` is now carried to its matching `}`. The rule is
+  that exact sequence rather than generic-argument tracking, because `<` is also
+  the shift operator: 4,666 public `const`/`static` declarations in the local
+  registry state a shift on their own line, against 6 that carry a `<{`.
 - **A changed multi-line array constant surfaces again.** An array type states
   its length with a `;` — `pub const TABLE: [u8; 2] = [` — and the declaration
   accumulator accepted that `;` as the terminator. Both sides of a diff

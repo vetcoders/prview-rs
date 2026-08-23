@@ -1129,10 +1129,29 @@ fn should_scan_for_breaking_changes(path: &str) -> bool {
 /// removal was cancelled and the literal change the patch actually made went
 /// unreported. The scanner carries that literal across the continuation lines,
 /// and ends a `//` comment at the line that wrote it.
+///
+/// A `{` in TYPE position is not a body opener either. `pub type Alias =
+/// Buffer<{` states a const argument, and finalizing there truncated both diff
+/// sides to the same prefix: they paired as an unchanged re-add and a changed
+/// const expression — a different public type — produced no finding.
 fn declaration_complete(code: &str) -> bool {
     let mut depth: i32 = 0;
+    // How deep inside a const argument — `Buffer<{ LIMIT * 2 }>` — the scan is.
+    // Such a `{` is type-level syntax, not the item's body opener.
+    let mut const_block: i32 = 0;
+    let mut prev = '\0';
     for ch in code.chars() {
         match ch {
+            // A `{` directly after `<` opens a const argument, and everything
+            // up to its matching `}` is type-level syntax. The rule is the
+            // exact `<{` sequence rather than generic-argument tracking on
+            // purpose: `<` is also the shift and comparison operator, and 4,666
+            // public `const`/`static` declarations in the local registry state a
+            // shift on their own line — counting their `<` as an opener would
+            // leave every one of them accumulating past its `;`, to buy the 6
+            // declarations in that registry that carry a `<{`.
+            '{' if prev == '<' || const_block > 0 => const_block += 1,
+            '}' if const_block > 0 => const_block -= 1,
             // Square brackets are counted for the same reason parentheses are:
             // an array type states its length with a `;` — `pub const TABLE:
             // [u8; 2] = [` — and reading that as the terminator finalized the
@@ -1141,9 +1160,11 @@ fn declaration_complete(code: &str) -> bool {
             // initializer below produced no finding at all.
             '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
-            '{' if depth <= 0 => return true,
-            ';' if depth <= 0 => return true,
+            '{' | ';' if depth <= 0 => return true,
             _ => {}
+        }
+        if !ch.is_whitespace() {
+            prev = ch;
         }
     }
     false
@@ -1678,6 +1699,103 @@ mod tests {
         );
         assert_eq!(changes[0].0, "pub type Value = u32;");
         assert_eq!(changes[0].1, "pub type Value = u64;");
+    }
+
+    #[test]
+    fn a_const_block_in_a_generic_argument_is_not_the_body_opener() {
+        // `pub type Alias = Buffer<{` opens a const argument, not an item body.
+        // Finalizing there truncated BOTH sides to the same prefix, they paired
+        // as an unchanged re-add, and the changed const expression below —
+        // a different public type — produced no finding at all.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub type Alias = Buffer<{",
+                "-    LIMIT * 2",
+                "-}>;",
+                "+pub type Alias = Buffer<{",
+                "+    LIMIT * 3",
+                "+}>;",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "a changed const argument is a changed public type: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(changes[0].0.contains("LIMIT * 2"), "{}", changes[0].0);
+        assert!(changes[0].1.contains("LIMIT * 3"), "{}", changes[0].1);
+    }
+
+    #[test]
+    fn a_body_brace_after_a_const_argument_still_ends_the_declaration() {
+        // Guard against over-reach: the const block closes on the same line and
+        // the NEXT brace is the real body. Swallowing it would run the
+        // accumulator into the body and turn a body-only rewrite into a phantom
+        // signature change.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn to_hex(&self) -> ArrayString<{ 2 * OUT_LEN }> {",
+                "-    self.old_body()",
+                "-}",
+                "+pub fn to_hex(&self) -> ArrayString<{ 2 * OUT_LEN }> {",
+                "+    self.new_body()",
+                "+}",
+            ],
+        )]);
+
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a body-only rewrite is not a signature change: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_shifted_constant_still_terminates_at_its_semicolon() {
+        // `1 << 3` is the reason the fix above is spelled as the exact `<{`
+        // sequence rather than as generic-argument tracking: 4,666 public
+        // `const`/`static` declarations in the local registry state a shift on
+        // their own line, and a `<` counted as an opener there would leave
+        // every one of them accumulating past its `;`.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const MASK: u32 = 1 << 3;",
+                "-pub struct Keep;",
+                "+pub const MASK: u32 = 1 << 4;",
+                "+pub struct Keep;",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "the constant is one declaration, the struct below another: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(changes[0].0, "pub const MASK: u32 = 1 << 3;");
+        assert_eq!(changes[0].1, "pub const MASK: u32 = 1 << 4;");
     }
 
     #[test]
