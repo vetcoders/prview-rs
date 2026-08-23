@@ -897,6 +897,23 @@ whitespace-stripped substring `,cfg(`: of the 44,562 `cfg_attr` attributes in th
 local crates.io registry, 189 apply a `cfg` (12 crates, the `portable-atomic`
 idiom) and none of them carry that substring inside a string literal.
 
+Reordering operands INSIDE one predicate is an accepted limit. Stacked
+attributes are sorted, so `#[cfg(unix)] #[cfg(feature = "x")]` pairs either way
+round, but `#[cfg(any(unix, windows))]` rewritten as `#[cfg(any(windows, unix))]`
+is compared as text, does not pair, and reports a phantom `RemovedSymbol` under
+an untouched declaration. Normalizing it means canonicalizing arbitrarily nested
+predicates — a `cfg` parser — and the measurement says the parser would not earn
+its risk. Across 708 consecutive-version pairs in the local registry, whole
+releases and so far wider than any diff this scanner reads, 32 `cfg` attributes
+were reordered at all, in 2 crates; across the 393 patch-level bumps among them,
+the closest available proxy for a PR-sized change, zero. Of the 32, only 6 are
+reachable by sorting an attribute's direct operands: the dominant real shape is
+`not(any(a, b, c))`, with the reorder one level down. A bounded sort would close
+a fifth of an already absent class while looking complete, which is worse than a
+limit written down — and the error direction here is the tolerable one, a
+phantom removal being visible in review rather than a real removal pairing away
+in silence.
+
 Both the module path and the perf tracker's test-context scope are counted over
 CODE only, via the shared scanner in `src/rust_source.rs`. It resolves comments
 and literals in ONE pass — `"http://x"` is a string and `format!("{}/*.{}")` is

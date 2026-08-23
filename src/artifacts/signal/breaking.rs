@@ -744,6 +744,25 @@ fn find_pairable_addition(
 /// [`scopes_may_pair`] gives an unseen module opener: the attribute may simply
 /// sit on a context line this hunk did not re-emit on that side, and treating
 /// "not shown" as "no cfg" would turn ordinary re-adds into phantom removals.
+///
+/// ACCEPTED LIMIT — predicates are compared as text, so reordering the operands
+/// INSIDE one attribute does not pair. `#[cfg(any(unix, windows))]` rewritten as
+/// `#[cfg(any(windows, unix))]` gates the item identically, but the two strings
+/// differ, and an untouched declaration under it reports a phantom
+/// `RemovedSymbol`. (Reordering whole STACKED attributes does pair — [`record`]
+/// sorts the conjunction.) Normalizing this properly means canonicalizing
+/// arbitrarily nested predicates, which is a `cfg` parser, and the measurements
+/// say the parser would not earn its risk. Across 708 consecutive-version pairs
+/// in the local crates.io registry — whole releases, far wider than any diff
+/// this scanner reads — 32 `cfg` attributes were reordered at all, in 2 crates;
+/// across the 393 of those pairs that are patch-level bumps, the closest
+/// available proxy for a PR-sized change, ZERO. And of the 32, only 6 are
+/// reachable by sorting an attribute's direct operands: the dominant real shape
+/// is `not(any(a, b, c))`, where the reorder sits one level down. A bounded sort
+/// would therefore close a fifth of an already absent class while LOOKING
+/// complete, which is worse than a limit written down. The error direction is
+/// the tolerable one — a phantom removal is visible in review and rejected
+/// there, unlike a real removal that pairs away silently.
 fn cfgs_may_pair(removed: &Option<Vec<String>>, added: &Option<Vec<String>>) -> bool {
     match (removed, added) {
         (Some(removed), Some(added)) => removed == added,
