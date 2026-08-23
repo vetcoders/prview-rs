@@ -714,6 +714,32 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
         &mut unknown_signal_caveats,
     )
     .and_then(|v| v.as_bool());
+    // The confidence and blocker axes, mirroring the CLI. All three are read
+    // here so a mistyped one reaches `mistyped_signal` below; `blocking_issues`
+    // was previously read only at the very end, for passthrough, so a stated
+    // blocker never touched the decision this adapter returned.
+    let raw_analysis_status = readable_signal(
+        "analysis_status",
+        decision.get("analysis_status"),
+        JsonKind::String,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_str().map(str::to_string));
+    let raw_policy_allow_merge = readable_signal(
+        "policy_allow_merge",
+        decision.get("policy_allow_merge"),
+        JsonKind::Boolean,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_bool());
+    let raw_blocking_issues = readable_signal(
+        "blocking_issues",
+        decision.get("blocking_issues"),
+        JsonKind::Array,
+        &mut unknown_signal_caveats,
+    )
+    .and_then(|v| v.as_array())
+    .map(|issues| issues.len());
 
     // Whether any signal was present and could not be TYPED. Captured before
     // the vocabulary caveats below join the same list, because the two are
@@ -754,6 +780,14 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
              decision"
         ));
     }
+    if let Some(raw) = raw_analysis_status.as_deref()
+        && !crate::gate::known_analysis_status(raw)
+    {
+        unknown_signal_caveats.push(format!(
+            "unknown_analysis_status: MERGE_GATE.json analysis_status `{raw}` is not in the \
+             complete/degraded/incomplete vocabulary; it was ignored when deriving this decision"
+        ));
+    }
 
     // Corrupt means the decision states NOTHING — not that what it states is
     // unrankable. The presence test is the CLI's, field for field: a pack that
@@ -786,6 +820,20 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
         Some(false) => Some(2),
         _ => None,
     };
+    // Same rule on the confidence axis: only `degraded`/`incomplete` rule `PASS`
+    // out and therefore rank. `complete` is a precondition of `PASS`, not a
+    // grant of it, so it stays silent like `quality_pass: true`.
+    let analysis_rank = raw_analysis_status
+        .as_deref()
+        .and_then(crate::gate::rank_from_analysis_status);
+    // A stated blocker is a stated BLOCK: `blocking_issues` is non-empty only
+    // when a check reached `PolicyConclusion::Blocked`, whose `merge_impact` is
+    // `Block`. `policy_allow_merge: false` is the same fact — the emitter writes
+    // `policy_allow_merge = blocking_issues.is_empty()`. Neither says anything
+    // permissive: "policy did not hard-block" is explicitly NOT `allow_merge`.
+    let blocker_rank = (raw_policy_allow_merge == Some(false)
+        || raw_blocking_issues.is_some_and(|len| len > 0))
+    .then_some(3);
 
     // A verdict this reader had to SUBSTITUTE — absent, outside the vocabulary,
     // or present with the wrong JSON type — governs everything derived beside
@@ -796,10 +844,17 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // pack came to be a `PASS` for MCP automation and a `BLOCK` on the CLI.
     let normalized_to_block = mistyped_signal || verdict_rank.is_none();
 
-    let stated_ranks: Vec<u8> = [merge_rank, verdict_rank, allow_rank, quality_rank]
-        .into_iter()
-        .flatten()
-        .collect();
+    let stated_ranks: Vec<u8> = [
+        merge_rank,
+        verdict_rank,
+        allow_rank,
+        quality_rank,
+        analysis_rank,
+        blocker_rank,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let final_rank = if normalized_to_block {
         3
     } else {
@@ -837,13 +892,20 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     if signals_disagree || allow_contradicts {
         caveats.push(format!(
             "core_inconsistency: original allow_merge={}, merge_recommendation={}, verdict={}, \
-             quality_pass={}",
+             quality_pass={}, analysis_status={}, blocking_issues={}, policy_allow_merge={}",
             raw_allow
                 .map(|b| b.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             raw_merge.as_deref().unwrap_or("null"),
             raw_verdict.as_deref().unwrap_or("null"),
             raw_quality_pass
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            raw_analysis_status.as_deref().unwrap_or("null"),
+            raw_blocking_issues
+                .map(|len| len.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            raw_policy_allow_merge
                 .map(|b| b.to_string())
                 .unwrap_or_else(|| "null".to_string()),
         ));

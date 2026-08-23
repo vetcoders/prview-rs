@@ -432,6 +432,35 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         &mut unreadable,
     )
     .and_then(Value::as_bool);
+    // The confidence axis. The contract permits `PASS` only when the analysis is
+    // `complete`, so this ranks beside the policy axes instead of being read
+    // afterwards for display — which is what let an `incomplete` run publish a
+    // clean approval.
+    let raw_analysis_status = crate::gate::readable_signal(
+        "analysis_status",
+        decision.get("analysis_status"),
+        crate::gate::JsonKind::String,
+        &mut unreadable,
+    )
+    .and_then(Value::as_str);
+    // The blocker axis, stated twice by the emitter:
+    // `policy_allow_merge = blocking_issues.is_empty()`. A pack may carry either
+    // or both, so both are read; agreeing on the same rank costs nothing and a
+    // pack that states only one is still covered.
+    let raw_policy_allow_merge = crate::gate::readable_signal(
+        "policy_allow_merge",
+        decision.get("policy_allow_merge"),
+        crate::gate::JsonKind::Boolean,
+        &mut unreadable,
+    )
+    .and_then(Value::as_bool);
+    let raw_blocking_issues = crate::gate::readable_signal(
+        "blocking_issues",
+        decision.get("blocking_issues"),
+        crate::gate::JsonKind::Array,
+        &mut unreadable,
+    )
+    .and_then(Value::as_array);
     // Whether the verdict below is what the pack said or what this reader had to
     // substitute for it. A substituted verdict cannot leave the OTHER decision
     // axes reading whatever the same unreliable decision block claimed: that
@@ -519,11 +548,36 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         Some(false) => Some(2),
         _ => None,
     };
+    // The confidence axis, ranked by the same rule: only the values that RULE
+    // OUT a more permissive outcome state a rank. `complete` rules nothing out
+    // — it is a precondition of `PASS`, not a grant of it — so like
+    // `quality_pass: true` it stays silent.
+    let analysis_rank = raw_analysis_status.and_then(crate::gate::rank_from_analysis_status);
+    if let Some(raw) = raw_analysis_status
+        && !crate::gate::known_analysis_status(raw)
+    {
+        caveats.push(format!(
+            "unknown_analysis_status: MERGE_GATE.json analysis_status `{raw}` is not in the \
+             complete/degraded/incomplete vocabulary; it was ignored when deriving this decision"
+        ));
+    }
+    // The blocker axis. `blocking_issues` is non-empty only when a check reached
+    // `PolicyConclusion::Blocked`, whose `merge_impact` is `Block`, so a stated
+    // blocker is a stated BLOCK — rank 3. `policy_allow_merge: false` is the
+    // same fact by its own definition. Neither states anything in the permissive
+    // direction: an empty list and `policy_allow_merge: true` mean only "policy
+    // did not hard-block", which the contract is explicit is NOT the same as
+    // `allow_merge`.
+    let blocker_rank = (raw_policy_allow_merge == Some(false)
+        || raw_blocking_issues.is_some_and(|issues| !issues.is_empty()))
+    .then_some(3);
     let stated_ranks: Vec<u8> = [
         crate::gate::rank_from_verdict(verdict),
         recommendation_rank,
         allow_rank,
         quality_rank,
+        analysis_rank,
+        blocker_rank,
     ]
     .into_iter()
     .flatten()
@@ -564,13 +618,20 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     if !normalized_to_block && axes_disagree {
         caveats.push(format!(
             "core_inconsistency: MERGE_GATE.json states verdict={verdict}, \
-             merge_recommendation={}, allow_merge={}, quality_pass={}; the most conservative \
-             signal wins",
+             merge_recommendation={}, allow_merge={}, quality_pass={}, analysis_status={}, \
+             blocking_issues={}, policy_allow_merge={}; the most conservative signal wins",
             raw_recommendation.unwrap_or("null"),
             raw_allow_merge
                 .map(|b| b.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             raw_quality_pass
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            raw_analysis_status.unwrap_or("null"),
+            raw_blocking_issues
+                .map(|issues| issues.len().to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            raw_policy_allow_merge
                 .map(|b| b.to_string())
                 .unwrap_or_else(|| "null".to_string()),
         ));
@@ -586,7 +647,9 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
 
     let quality_pass = raw_quality_pass.unwrap_or(false);
 
-    let analysis_status = match decision.get("analysis_status").and_then(Value::as_str) {
+    // Reuses the value typed above, so a mistyped `analysis_status` reaches this
+    // fallback as absent rather than being read a second time by a laxer rule.
+    let analysis_status = match raw_analysis_status {
         Some("complete") => crate::policy::engine::AnalysisStatus::Complete,
         Some("degraded") => crate::policy::engine::AnalysisStatus::Degraded,
         Some("incomplete") => crate::policy::engine::AnalysisStatus::Incomplete,
@@ -2751,6 +2814,245 @@ api-router/app/core/cache.py
                 "the two readers must agree on {bad}"
             );
         }
+    }
+
+    #[test]
+    fn an_incomplete_analysis_cannot_be_published_as_a_pass() {
+        // The contract permits `PASS` only when `analysis_status == "complete"`,
+        // so an `incomplete` analysis beside a clean approval contradicts
+        // itself. The axis was read only AFTER the reconciliation, for
+        // reporting, so it never raised the rank and the approval published
+        // verbatim — a run that says it did not finish looking.
+        for status in ["incomplete", "degraded"] {
+            let pack = pack_with_gate(&format!(
+                r#"{{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":true,"analysis_status":"{status}"}}"#
+            ));
+
+            let cli = read_merge_gate_summary(pack.path()).expect("readable");
+            assert_eq!(
+                cli.verdict, "CONDITIONAL",
+                "{status} analysis is not a PASS"
+            );
+            assert!(!cli.allow_merge);
+            assert!(
+                cli.caveats.iter().any(|c| {
+                    c.starts_with("core_inconsistency:")
+                        && c.contains(&format!("analysis_status={status}"))
+                }),
+                "the contradiction must be named: {:?}",
+                cli.caveats
+            );
+
+            let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+            assert_eq!(
+                mcp.verdict, cli.verdict,
+                "the two readers must not disagree"
+            );
+            assert_eq!(mcp.merge_recommendation, "review_required");
+            assert!(!mcp.allow_merge);
+            assert!(mcp.normalized);
+            assert!(
+                mcp.caveats.iter().any(|c| {
+                    c.contains("core_inconsistency")
+                        && c.contains(&format!("analysis_status={status}"))
+                }),
+                "the contradiction must be named: {:?}",
+                mcp.caveats
+            );
+        }
+    }
+
+    #[test]
+    fn a_stated_blocker_cannot_be_published_as_a_pass() {
+        // `blocking_issues` is non-empty only when a check reached
+        // `PolicyConclusion::Blocked`, which carries `merge_impact == Block`, so
+        // a pack that lists one beside a clean approval is stating a BLOCK it
+        // did not publish. `policy_allow_merge` is the same fact
+        // (`policy_allow_merge = blocking_issues.is_empty()`), so a pack may
+        // state either of them.
+        for decision in [
+            r#"{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":true,"blocking_issues":["Clippy (failed)"]}"#,
+            r#"{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":true,"policy_allow_merge":false}"#,
+        ] {
+            let pack = pack_with_gate(decision);
+
+            let cli = read_merge_gate_summary(pack.path()).expect("readable");
+            assert_eq!(cli.verdict, "BLOCK", "a stated blocker is a BLOCK");
+            assert!(!cli.allow_merge);
+            assert!(
+                cli.caveats
+                    .iter()
+                    .any(|c| c.starts_with("core_inconsistency:")),
+                "the contradiction must be named: {:?}",
+                cli.caveats
+            );
+
+            let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+            assert_eq!(
+                mcp.verdict, cli.verdict,
+                "the two readers must not disagree"
+            );
+            assert_eq!(mcp.merge_recommendation, "block");
+            assert!(!mcp.allow_merge);
+            assert!(mcp.normalized);
+        }
+    }
+
+    #[test]
+    fn a_healthy_block_pack_states_no_inconsistency() {
+        // The false positive the ranking must not create: a BLOCK pack states a
+        // blocker, `policy_allow_merge: false`, `quality_pass: false` and a
+        // COMPLETE analysis — every axis agreeing on rank 3 — and that is every
+        // BLOCK pack this tool writes.
+        let pack = pack_with_gate(
+            r#"{"verdict":"BLOCK","merge_recommendation":"block","allow_merge":false,"quality_pass":false,"analysis_status":"complete","policy_allow_merge":false,"blocking_issues":["Clippy (failed)"]}"#,
+        );
+
+        let cli = read_merge_gate_summary(pack.path()).expect("readable");
+        assert_eq!(cli.verdict, "BLOCK");
+        assert!(!cli.allow_merge);
+        assert!(
+            !cli.caveats
+                .iter()
+                .any(|c| c.starts_with("core_inconsistency:")),
+            "a pack whose axes all agree is not inconsistent: {:?}",
+            cli.caveats
+        );
+
+        let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+        assert_eq!(mcp.verdict, "BLOCK");
+        assert!(
+            !mcp.caveats.iter().any(|c| c.contains("core_inconsistency")),
+            "a pack whose axes all agree is not inconsistent: {:?}",
+            mcp.caveats
+        );
+        assert!(!mcp.normalized, "a healthy BLOCK pack is a faithful read");
+    }
+
+    #[test]
+    fn a_healthy_conditional_pack_states_no_inconsistency() {
+        // The other side of the same false positive: a CONDITIONAL pack states
+        // a degraded analysis and a failed quality axis with NO blocker, and
+        // every axis agrees on rank 2.
+        let pack = pack_with_gate(
+            r#"{"verdict":"CONDITIONAL","merge_recommendation":"review_required","allow_merge":false,"quality_pass":false,"analysis_status":"degraded","policy_allow_merge":true,"blocking_issues":[]}"#,
+        );
+
+        let cli = read_merge_gate_summary(pack.path()).expect("readable");
+        assert_eq!(cli.verdict, "CONDITIONAL");
+        assert!(
+            !cli.caveats
+                .iter()
+                .any(|c| c.starts_with("core_inconsistency:")),
+            "a pack whose axes all agree is not inconsistent: {:?}",
+            cli.caveats
+        );
+
+        let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+        assert_eq!(mcp.verdict, "CONDITIONAL");
+        assert!(
+            !mcp.normalized,
+            "a healthy CONDITIONAL pack is a faithful read"
+        );
+    }
+
+    #[test]
+    fn a_pack_stating_none_of_the_new_axes_is_read_exactly_as_before() {
+        // Absence states nothing, on every axis. A pack written before
+        // `analysis_status`, `policy_allow_merge` or `blocking_issues` existed
+        // must not be dragged to CONDITIONAL by their mere omission.
+        let pack = pack_with_gate(
+            r#"{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":true}"#,
+        );
+
+        let cli = read_merge_gate_summary(pack.path()).expect("readable");
+        assert_eq!(cli.verdict, "PASS");
+        assert!(cli.allow_merge);
+        assert!(
+            !cli.caveats
+                .iter()
+                .any(|c| c.starts_with("core_inconsistency:")),
+            "absence is not a contradiction: {:?}",
+            cli.caveats
+        );
+
+        let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+        assert_eq!(mcp.verdict, "PASS");
+        assert!(mcp.allow_merge);
+        assert!(!mcp.normalized);
+    }
+
+    #[test]
+    fn the_new_axes_are_conservative_when_they_cannot_be_typed() {
+        // Same rule as `quality_pass`: present-but-unreadable is neither a
+        // stated value nor an absent one, on every axis that now ranks.
+        for (field, decision) in [
+            (
+                "analysis_status",
+                r#"{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":true,"analysis_status":7}"#,
+            ),
+            (
+                "policy_allow_merge",
+                r#"{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":true,"policy_allow_merge":"false"}"#,
+            ),
+            (
+                "blocking_issues",
+                r#"{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":true,"blocking_issues":"Clippy"}"#,
+            ),
+        ] {
+            let pack = pack_with_gate(decision);
+
+            let cli = read_merge_gate_summary(pack.path()).expect("readable");
+            assert_eq!(cli.verdict, "BLOCK", "{field} cannot be typed");
+            assert!(!cli.allow_merge);
+            assert!(
+                cli.caveats
+                    .iter()
+                    .any(|c| c.starts_with(&format!("unreadable_{field}:"))),
+                "the unreadable axis must be named: {:?}",
+                cli.caveats
+            );
+
+            let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+            assert_eq!(mcp.verdict, "BLOCK", "{field} cannot be typed");
+            assert!(mcp.normalized);
+            assert!(
+                mcp.caveats
+                    .iter()
+                    .any(|c| c.starts_with(&format!("unreadable_{field}:"))),
+                "the unreadable axis must be named: {:?}",
+                mcp.caveats
+            );
+        }
+    }
+
+    #[test]
+    fn an_analysis_status_outside_the_vocabulary_is_named_not_ranked() {
+        // Mirrors `unknown_merge_recommendation`: a value that IS a string but
+        // is not one this contract defines cannot rank, so it drops out of the
+        // reconciliation — and is named rather than vanishing into a confident
+        // surface derived from the remaining axes.
+        let pack = pack_with_gate(
+            r#"{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":true,"analysis_status":"partial"}"#,
+        );
+
+        let cli = read_merge_gate_summary(pack.path()).expect("readable");
+        assert!(
+            cli.caveats
+                .iter()
+                .any(|c| c.starts_with("unknown_analysis_status:")),
+            "the unrecognized value must be named: {:?}",
+            cli.caveats
+        );
+
+        let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+        assert!(
+            mcp.caveats
+                .iter()
+                .any(|c| c.starts_with("unknown_analysis_status:")),
+            "the unrecognized value must be named: {:?}",
+            mcp.caveats
+        );
     }
 
     #[test]

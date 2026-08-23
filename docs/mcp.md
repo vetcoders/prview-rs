@@ -231,13 +231,17 @@ case sets `normalized: true`:
   of `verdict`, `merge_recommendation` and `allow_merge`; a signal that is
   present but unrankable — including a lone `allow_merge` — is a decision the
   pack gave, and it is normalized with a caveat rather than called corrupt.
-- `unreadable_verdict:` / `unreadable_merge_recommendation:` /
-  `unreadable_allow_merge:` / `unreadable_quality_pass:` — the field was present
-  with the wrong JSON type (`merge_recommendation: 7`, `allow_merge: "false"`,
-  `quality_pass: "false"`). A wrongly typed field is
+- `unreadable_<field>:` — the field was present with the wrong JSON type
+  (`merge_recommendation: 7`, `allow_merge: "false"`, `quality_pass: "false"`,
+  `analysis_status: 7`, `blocking_issues: "Clippy"`). Emitted for every axis in
+  the ranking table of `docs/contracts/merge_gate.md`. A wrongly typed field is
   not an absent one: it is ignored for ranking, but it is named, and the
   decision is normalized conservatively around it. The pack is
   `storage_corrupt` only when no signal was stated at all.
+- `unknown_analysis_status:` — the field is a string outside
+  `complete` / `degraded` / `incomplete`. Like `unknown_merge_recommendation:`,
+  it cannot rank, so it is excluded from the reconciliation and named rather
+  than dropped in silence.
 - `schema_forward_compat:` — the pack's `schema_version` is a newer MINOR of a
   known MAJOR; it is read, and fields this build does not know are ignored. An
   unknown MAJOR is `storage_corrupt`, and so is a `schema_version` that is
