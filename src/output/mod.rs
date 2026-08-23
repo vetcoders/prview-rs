@@ -417,6 +417,10 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         &mut unreadable,
     )
     .and_then(Value::as_str);
+    // Read as an OPTION, not through `unwrap_or(false)`: the reconciliation
+    // below has to tell a pack that states a failed quality axis from one
+    // written before the field existed.
+    let raw_quality_pass = decision.get("quality_pass").and_then(Value::as_bool);
     // Whether the verdict below is what the pack said or what this reader had to
     // substitute for it. A substituted verdict cannot leave the OTHER decision
     // axes reading whatever the same unreliable decision block claimed: that
@@ -491,10 +495,24 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     // `compute_exit_code` keys off the recommendation, exit 0 on a gate whose
     // own canonical artifact said BLOCK.
     let allow_rank = raw_allow_merge.map(|allow| if allow { 1 } else { 2 });
+    // `quality_pass` is a decision axis too, and only its FALSE is informative.
+    // `false` says "not a PASS" — the contract permits `PASS` only when quality
+    // passes — so it ranks 2, exactly like `allow_merge: false`. `true` states
+    // no rank: a quality-clean run is still held at CONDITIONAL by a
+    // breaking-change escalation, so reading it as an assertion that the gate
+    // passed would let one axis soften a verdict two others agree on. Absence
+    // states nothing either — that is the shape of a pack written before the
+    // field, and defaulting it to `false` would turn every one of them
+    // CONDITIONAL.
+    let quality_rank = match raw_quality_pass {
+        Some(false) => Some(2),
+        _ => None,
+    };
     let stated_ranks: Vec<u8> = [
         crate::gate::rank_from_verdict(verdict),
         recommendation_rank,
         allow_rank,
+        quality_rank,
     ]
     .into_iter()
     .flatten()
@@ -517,6 +535,15 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     // itself, which is every BLOCK pack this tool writes. It contradicts the
     // decision only when the derived `allow_merge` disagrees with the stated
     // one, which is the test the MCP adapter already used.
+    //
+    // `quality_pass` needs no test of its own. It ranks 2 when false, so any
+    // axis claiming 1 beside it already disagrees with the winning rank and
+    // fires above; and a healthy BLOCK or CONDITIONAL pack states
+    // `quality_pass: false` in agreement with everything else. A separate
+    // `quality_pass == Some(false) && final_rank == 1` guard would be
+    // unreachable — the rank it contributes is what makes `final_rank == 1`
+    // impossible. It is still NAMED in the caveat, so a reader can see which
+    // axis forced the downgrade.
     let textual_ranks = [crate::gate::rank_from_verdict(verdict), recommendation_rank];
     let axes_disagree = textual_ranks
         .iter()
@@ -526,9 +553,13 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     if !normalized_to_block && axes_disagree {
         caveats.push(format!(
             "core_inconsistency: MERGE_GATE.json states verdict={verdict}, \
-             merge_recommendation={}, allow_merge={}; the most conservative signal wins",
+             merge_recommendation={}, allow_merge={}, quality_pass={}; the most conservative \
+             signal wins",
             raw_recommendation.unwrap_or("null"),
             raw_allow_merge
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            raw_quality_pass
                 .map(|b| b.to_string())
                 .unwrap_or_else(|| "null".to_string()),
         ));
@@ -542,10 +573,7 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         _ => crate::policy::engine::MergeRecommendation::Block,
     };
 
-    let quality_pass = decision
-        .get("quality_pass")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let quality_pass = raw_quality_pass.unwrap_or(false);
 
     let analysis_status = match decision.get("analysis_status").and_then(Value::as_str) {
         Some("complete") => crate::policy::engine::AnalysisStatus::Complete,
@@ -2712,6 +2740,100 @@ api-router/app/core/cache.py
                 "the two readers must agree on {bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_failed_quality_axis_cannot_be_published_as_a_pass() {
+        // The contract permits `PASS` only when quality passes, so a pack that
+        // states `quality_pass: false` beside a clean approval contradicts
+        // itself. Leaving that axis out of the reconciliation published the
+        // approval verbatim — with `allow_merge: true`, and on BOTH surfaces, so
+        // automation approved it too.
+        let pack = pack_with_gate(
+            r#"{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":false}"#,
+        );
+
+        let cli = read_merge_gate_summary(pack.path()).expect("readable");
+        assert_eq!(
+            cli.verdict, "CONDITIONAL",
+            "a failed quality axis is not a PASS"
+        );
+        assert!(!cli.allow_merge);
+        assert!(
+            cli.caveats
+                .iter()
+                .any(|c| c.starts_with("core_inconsistency:") && c.contains("quality_pass=false")),
+            "the contradiction must be named: {:?}",
+            cli.caveats
+        );
+
+        let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+        assert_eq!(
+            mcp.verdict, cli.verdict,
+            "the two readers must not disagree"
+        );
+        assert_eq!(mcp.merge_recommendation, "review_required");
+        assert!(!mcp.allow_merge);
+        assert!(mcp.normalized);
+        assert!(
+            mcp.caveats
+                .iter()
+                .any(|c| c.contains("core_inconsistency") && c.contains("quality_pass=false")),
+            "the contradiction must be named: {:?}",
+            mcp.caveats
+        );
+    }
+
+    #[test]
+    fn a_pack_that_states_no_quality_axis_is_read_exactly_as_before() {
+        // Absence stays forgiven per FIELD — that is the shape of an older pack.
+        // Only a STATED `quality_pass: false` ranks; defaulting an absent one to
+        // `false` would have turned every pre-quality_pass pack into a
+        // CONDITIONAL.
+        let pack = pack_with_gate(
+            r#"{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true}"#,
+        );
+
+        let cli = read_merge_gate_summary(pack.path()).expect("readable");
+        assert_eq!(cli.verdict, "PASS");
+        assert!(cli.allow_merge);
+        assert!(
+            !cli.caveats
+                .iter()
+                .any(|c| c.starts_with("core_inconsistency:")),
+            "{:?}",
+            cli.caveats
+        );
+
+        let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+        assert_eq!(mcp.verdict, "PASS");
+        assert!(mcp.allow_merge);
+        assert!(!mcp.normalized);
+    }
+
+    #[test]
+    fn a_quality_axis_that_passes_does_not_soften_a_conservative_verdict() {
+        // The asymmetry that keeps the healthy packs quiet: `quality_pass: true`
+        // does not assert the gate passed — a breaking-change escalation holds a
+        // quality-clean run at CONDITIONAL — so it states no rank of its own and
+        // never contradicts the verdict beside it.
+        let pack = pack_with_gate(
+            r#"{"verdict":"CONDITIONAL","merge_recommendation":"review_required","allow_merge":false,"quality_pass":true}"#,
+        );
+
+        let cli = read_merge_gate_summary(pack.path()).expect("readable");
+        assert_eq!(cli.verdict, "CONDITIONAL");
+        assert!(
+            !cli.caveats
+                .iter()
+                .any(|c| c.starts_with("core_inconsistency:")),
+            "{:?}",
+            cli.caveats
+        );
+
+        let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+        assert_eq!(mcp.verdict, "CONDITIONAL");
+        assert!(!mcp.caveats.iter().any(|c| c.contains("core_inconsistency")));
     }
 
     #[test]

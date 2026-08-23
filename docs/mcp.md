@@ -200,8 +200,10 @@ The decision surface is normalized so callers read one vocabulary:
   clean `PASS`. A permissive flag on disk can never override a block/hold signal.
 
 If the stored gate emits contradictory signals (for example `allow_merge: true`
-alongside a block recommendation), the most conservative signal wins and a
-`core_inconsistency` note is appended to `caveats`. The note reports a
+alongside a block recommendation, or a clean approval alongside
+`quality_pass: false` — the contract permits `PASS` only when quality passes),
+the most conservative signal wins and a `core_inconsistency` note is appended to
+`caveats`. The note reports a
 disagreement the pack actually states — the textual axes against the published
 verdict, `allow_merge` against the flag published — so a self-consistent
 `BLOCK` pack (`verdict: "BLOCK"`, `merge_recommendation: "block"`,

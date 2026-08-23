@@ -129,7 +129,7 @@ pub fn check_merge_gate_schema_field(field: Option<&serde_json::Value>) -> Resul
 
 /// JSON type a decision signal is expected to carry.
 #[derive(Clone, Copy)]
-pub enum JsonKind {
+pub(crate) enum JsonKind {
     String,
     Boolean,
 }
@@ -174,7 +174,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 /// same contract question about the same artifact, and the one that had this
 /// rule while the other did not is how `merge_recommendation: 7` came back as
 /// `storage_corrupt` from one surface and as `approve` from the other.
-pub fn readable_signal<'v>(
+pub(crate) fn readable_signal<'v>(
     field: &str,
     value: Option<&'v serde_json::Value>,
     want: JsonKind,
