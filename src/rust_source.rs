@@ -44,6 +44,16 @@ impl SourceScanner {
         scan(line, &mut self.state, Literals::Keep)
     }
 
+    /// Is a string literal still open at the point the last line ended?
+    ///
+    /// The line break that follows is then literal CONTENT, not layout. A caller
+    /// comparing source needs the difference: a break inside a literal is part
+    /// of the value, while one between two halves of a reflowed declaration says
+    /// nothing about the API.
+    pub(crate) fn carries_literal(&self) -> bool {
+        self.state.open_literal.is_some()
+    }
+
     /// Forget a comment or literal left open: the next line is not contiguous
     /// with the last one (a new hunk, a new file).
     ///

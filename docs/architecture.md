@@ -751,6 +751,14 @@ into the body, so a body-only rewrite came out as a phantom `ChangedSignature`.
 Feeding line by line ends a `//` where it really ends while the scanner still
 carries an open literal or `/* … */` across the continuation lines.
 
+`BREAKING_CHANGES.md` renders those declarations into markdown tables, so every
+cell carrying source text has its `|` escaped as `\|`. Rust states bitwise or,
+patterns and closures with that character, and a declaration like
+`pub const MASK: u32 = READ | WRITE;` written verbatim opened new columns —
+the row rendered as garbage exactly where the declaration was interesting.
+GitHub's table parser splits on unescaped pipes before any inline markup runs,
+so a code span is no protection.
+
 Display text and comparison identity are separate. `BREAKING_CHANGES.md` and a
 `ChangedSignature` show the declaration verbatim, comments included, because a
 reader shown a change should see the source as written; pairing COMPARES a
@@ -763,12 +771,19 @@ and char literals verbatim: a literal is code, so `pub const GREETING: &str =
 delimiter trackers, which want a brace inside a string silenced, and
 `code_with_literals` for callers comparing source.
 
-The identity separates its lines with the character that separated them: a
-newline, not a space. A literal spanning two physical lines otherwise compared
-equal to the same literal rewritten with a space in it, and a changed public
-constant paired away as an unchanged re-add. (Indentation INSIDE such a literal
-is already gone by then — lines reach the accumulator trimmed — so two multi-line
-literals differing only in leading whitespace still read as one.)
+The identity keeps a physical line break only where the break is part of the
+value — that is, where the previous line left a string literal open. A literal
+spanning two physical lines otherwise compared equal to the same literal
+rewritten with a space in it, and a changed public constant paired away as an
+unchanged re-add. Everywhere else the break is layout and the lines are joined
+with a space: keeping it there made `pub type Alias =` followed by `u32;` a
+different declaration from `pub type Alias = u32;`, so a purely cosmetic reflow
+was reported as a `ChangedSignature` whose "before" and "after" were the same
+string. By the same rule a line contributing no code is dropped from the
+identity — a comment-only line says nothing about the API — unless a literal is
+open, where a blank line is a blank line in the value. (Indentation INSIDE such
+a literal is already gone by then — lines reach the accumulator trimmed — so two
+multi-line literals differing only in leading whitespace still read as one.)
 
 A declaration ends at a `;` or a body `{` outside its brackets. Square brackets
 count for the same reason parentheses do: an array type states its length with a
@@ -792,6 +807,22 @@ their own line must still terminate at their `;`. Measured over that registry
 (59,946 files, 2,025 crates, 4,354,142 public declaration lines), argument-list
 tracking and the narrower `<{` sequence rule it replaced judge zero lines
 differently.
+
+Nor is the `{` of an initializer that body brace. After a top-level `=` the item
+states a VALUE and runs to its `;`, so `pub const LIMIT: usize = {` and
+`pub const ZERO: Self = Self {` open an initializer, not an item body — and a
+`;` inside it terminates a statement, not the declaration. Finalizing at that
+brace truncated both diff sides to their identical first line, they paired as an
+unchanged re-add, and a changed expression inside the block produced no finding.
+Only a TOP-LEVEL `=` counts: inside a generic argument list one states a default
+(`struct Foo<const N: usize = 4>`) or an associated type
+(`impl Iterator<Item = u8>`), and both are followed by a body brace that must
+still end the declaration; `==`, `=>` and the compound assignments are excluded
+too. This is the widest of the brace rules by frequency — measured over the
+local registry (58,586 files, 1,960 crates, 4,334,320 public declaration lines),
+2,465 lines change verdict, every sampled one a public constant whose
+initializer is a struct literal or block spanning several lines. What such a
+declaration accumulates is still bounded by `MAX_DECL_CONTINUATION_LINES`.
 
 Inline module names keep their raw-identifier prefix. `mod r#type` and
 `mod r#match` were both recorded as `r`, so two namespaces looked like one and a
@@ -841,6 +872,22 @@ never reaches a delimiter tracker as syntax. Every raw form is recognized —
 worse than an unknown token: its body is then read as code, and the first
 interior `"` opens a phantom literal. That state is per side and per hunk: a
 hunk boundary is where contiguity ends, and every consumer resets there.
+
+What OPENS that context has to be provable, not merely suggestive. The marker
+set is an exact `#[cfg(test)]`, a `#[cfg(all(test, …))]` — which cannot hold
+unless `test` does — `#[test]` / `#[tokio::test]` / `#[rstest]`, and
+`mod tests`. Reading the bare token `test` anywhere inside a `cfg` predicate
+instead made `#[cfg(not(test))]` — code compiled into every build EXCEPT the
+test one — open test context and silently drop the production hits beneath it,
+and did the same for `#[cfg(any(test, feature = "bench"))]`, which compiles
+outside the test build whenever the feature is on, and for
+`#[cfg(feature = "__internal-test")]`, a feature that merely has `test` in its
+name. Measured over the local registry (58,586 files): of the 11,030 attributes
+the old pattern read as test context, 83.62% are exactly `cfg(test)` and 6.76%
+are `all(test, …)`; the remaining 9.62% are the ones it got wrong. Everything
+unproven is production, because the two errors are not symmetrical — an
+unrecognized test context costs one extra finding a reader can dismiss, while a
+claimed one that does not hold deletes a production finding nobody ever sees.
 
 The perf tracker's test context closes two ways, because not every test item has
 a body. One that opens a brace closes when that brace balances again; one that

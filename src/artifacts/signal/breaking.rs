@@ -1057,23 +1057,35 @@ impl PendingDecl {
         // block comment, never a line comment.
         self.code.push(' ');
 
+        // Read BEFORE this line is scanned: a literal the PREVIOUS line left
+        // open makes the break between the two part of the value rather than
+        // layout.
+        let continues_literal = self.identity.carries_literal();
+
         // A line that is nothing but a comment contributes nothing to the
         // identity, and a line whose code ends where its comment begins must not
         // contribute the whitespace between them either — otherwise `a: u8, //x`
-        // and `a: u8,// y` would read as different declarations.
+        // and `a: u8,// y` would read as different declarations. Inside a
+        // literal there is no comment to strip and a blank line is a blank line
+        // in the value, so it is kept.
         let line = self.identity.code_with_literals(trimmed);
         let line = line.trim();
-        if line.is_empty() {
+        if line.is_empty() && !continues_literal {
             return;
         }
         if !self.decl.identity.is_empty() {
-            // The lines are separated by the character that actually separated
-            // them. Joining with a space made a literal spanning two lines
-            // compare equal to the same literal rewritten with a space in it, so
-            // a changed public constant paired away as an unchanged re-add. The
-            // identity is only ever compared, never displayed, so the newline
-            // costs nothing and says what the source said.
-            self.decl.identity.push('\n');
+            // Physical boundaries are preserved only where they are part of the
+            // value. Joining a literal's lines with a space made a constant
+            // written across two lines compare equal to the same constant
+            // rewritten with a space in it, so a changed public value paired
+            // away as an unchanged re-add. Everywhere else the break is layout:
+            // preserving it there made `pub type Alias =` + `u32;` a different
+            // declaration from `pub type Alias = u32;`, and a purely cosmetic
+            // reflow was reported as a changed signature — with an identical
+            // "before" and "after", since those are joined with a space.
+            self.decl
+                .identity
+                .push(if continues_literal { '\n' } else { ' ' });
         }
         self.decl.identity.push_str(line);
     }
@@ -1140,7 +1152,13 @@ fn declaration_complete(code: &str) -> bool {
     // `Buffer<{ LIMIT * 2 }>`, `Buffer<u8, { LIMIT * 2 }>` — is type-level
     // syntax, not the item's body opener.
     let mut angle: i32 = 0;
-    let mut const_block: i32 = 0;
+    // How deep inside a brace that is NOT the item's body the scan is: a const
+    // argument, or an initializer block after a top-level `=`.
+    let mut block: i32 = 0;
+    // Has a top-level `=` been seen? After one, the item states a VALUE and
+    // runs to its `;` — every `{` from there on opens the initializer, never
+    // the body of a struct, enum, trait or function.
+    let mut initializes = false;
     let mut prev = '\0';
     let mut chars = code.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -1161,13 +1179,26 @@ fn declaration_complete(code: &str) -> bool {
             '<' if prev.is_alphanumeric() || prev == '_' || prev == '>' => angle += 1,
             // `->` is a return arrow, not a closing bracket.
             '>' if prev != '-' && angle > 0 => angle -= 1,
+            // Only a top-level `=` is an initializer. Inside a generic argument
+            // list it states a default (`struct Foo<const N: usize = 4>`) or an
+            // associated type (`impl Iterator<Item = u8>`), and both of those
+            // are followed by a body brace that must still end the declaration.
+            // `==`, `=>` and the compound assignments are not initializers either.
+            '=' if depth <= 0
+                && angle == 0
+                && block == 0
+                && !matches!(chars.peek(), Some(&('=' | '>')))
+                && !"=!<>+-*/%&|^".contains(prev) =>
+            {
+                initializes = true
+            }
             // Tracking the whole argument list rather than the exact `<{`
             // sequence is what catches a const argument that is not the FIRST
             // one, where the `{` follows a comma. Measured against the local
             // registry (59,946 files, 2,025 crates, 4,354,142 public
             // declaration lines), the two rules judge zero lines differently.
-            '{' if angle > 0 || const_block > 0 => const_block += 1,
-            '}' if const_block > 0 => const_block -= 1,
+            '{' if angle > 0 || block > 0 || initializes => block += 1,
+            '}' if block > 0 => block -= 1,
             // Square brackets are counted for the same reason parentheses are:
             // an array type states its length with a `;` — `pub const TABLE:
             // [u8; 2] = [` — and reading that as the terminator finalized the
@@ -1176,7 +1207,9 @@ fn declaration_complete(code: &str) -> bool {
             // initializer below produced no finding at all.
             '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
-            '{' | ';' if depth <= 0 => return true,
+            // A `;` inside an initializer block is a statement terminator, not
+            // the declaration's.
+            '{' | ';' if depth <= 0 && block == 0 => return true,
             _ => {}
         }
         if !ch.is_whitespace() {
@@ -1201,6 +1234,21 @@ fn extract_fn_name(line: &str) -> Option<String> {
 type ChangedSignatureKey = (String, &'static str, String);
 
 /// Format breaking changes as markdown.
+/// Make one value safe to drop into a markdown table cell.
+///
+/// A table row is delimited by `|`, and Rust states bitwise or, patterns and
+/// closures with the same character: `pub const MASK: u32 = READ | WRITE;` in a
+/// cell opened two new columns and the row rendered as garbage. GitHub's table
+/// parser splits on UNESCAPED pipes before any inline markup runs, so `\|` is
+/// the escape even inside a code span.
+fn escape_table_cell(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('|') {
+        std::borrow::Cow::Owned(text.replace('|', r"\|"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
     let mut md = String::new();
 
@@ -1242,7 +1290,13 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
         md.push_str("|------|--------|------|\n");
         for f in &removed {
             if let BreakingKind::RemovedSymbol { symbol_type } = &f.kind {
-                let _ = writeln!(md, "| {} | `{}` | {} |", f.file, f.line, symbol_type);
+                let _ = writeln!(
+                    md,
+                    "| {} | `{}` | {} |",
+                    escape_table_cell(&f.file),
+                    escape_table_cell(&f.line),
+                    symbol_type
+                );
             }
         }
         md.push('\n');
@@ -1254,7 +1308,13 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
         md.push_str("|------|--------|------|\n");
         for f in &relocated {
             if let BreakingKind::RelocatedSymbol { symbol_type } = &f.kind {
-                let _ = writeln!(md, "| {} | `{}` | {} |", f.file, f.line, symbol_type);
+                let _ = writeln!(
+                    md,
+                    "| {} | `{}` | {} |",
+                    escape_table_cell(&f.file),
+                    escape_table_cell(&f.line),
+                    symbol_type
+                );
             }
         }
         md.push('\n');
@@ -1297,14 +1357,20 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
                 let _ = writeln!(
                     md,
                     "| {} | `{}` | `{}` _(+{} feature-gated variant{})_ |",
-                    key.0,
-                    before,
-                    after,
+                    escape_table_cell(&key.0),
+                    escape_table_cell(before),
+                    escape_table_cell(after),
                     variants.len() - 1,
                     if variants.len() - 1 == 1 { "" } else { "s" }
                 );
             } else {
-                let _ = writeln!(md, "| {} | `{}` | `{}` |", key.0, before, after);
+                let _ = writeln!(
+                    md,
+                    "| {} | `{}` | `{}` |",
+                    escape_table_cell(&key.0),
+                    escape_table_cell(before),
+                    escape_table_cell(after)
+                );
             }
         }
         md.push('\n');
@@ -1316,7 +1382,12 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
         md.push_str("|------|----------|\n");
         for f in &env_reqs {
             if let BreakingKind::NewEnvRequirement { variable } = &f.kind {
-                let _ = writeln!(md, "| {} | `{}` |", f.file, variable);
+                let _ = writeln!(
+                    md,
+                    "| {} | `{}` |",
+                    escape_table_cell(&f.file),
+                    escape_table_cell(variable)
+                );
             }
         }
         md.push('\n');
@@ -1329,6 +1400,35 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
 mod tests {
     use super::*;
     use crate::regression::tests::is_test_file;
+
+    #[test]
+    fn a_pipe_in_a_declaration_does_not_break_the_table_columns() {
+        // Declaration text goes into a markdown table, and Rust states bitwise
+        // or, patterns and closures with `|`. Written verbatim it opened new
+        // columns, so every row carrying one rendered as garbage — the report
+        // stopped being readable exactly where the declaration was interesting.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/limits.rs",
+            &[
+                "-pub const MASK: u32 = READ | WRITE;",
+                "+pub const MASK: u32 = READ | WRITE | EXEC;",
+            ],
+        )]);
+
+        let md = format_breaking_changes(&findings);
+        let row = md
+            .lines()
+            .find(|l| l.contains("MASK"))
+            .expect("the changed constant is reported");
+        assert!(
+            row.contains(r"\|"),
+            "the pipe must be escaped for the table: {row}"
+        );
+        // A GitHub table row is `| a | b | c |`: splitting on UNESCAPED pipes
+        // leaves the two empty ends plus one field per column.
+        let cells = row.replace(r"\|", "\u{0}").split('|').count();
+        assert_eq!(cells, 5, "three columns, two empty ends: {row}");
+    }
 
     #[test]
     fn breaking_changes_detects_removed_pub_fn() {
@@ -1785,6 +1885,44 @@ mod tests {
         );
         assert!(changes[0].0.contains("LIMIT * 2"), "{}", changes[0].0);
         assert!(changes[0].1.contains("LIMIT * 3"), "{}", changes[0].1);
+    }
+
+    #[test]
+    fn a_block_initializer_is_not_the_body_opener() {
+        // `pub const LIMIT: usize = {` opens an initializer, not an item body:
+        // the declaration runs to the `;` after the block's `}`. Finalizing at
+        // the `{` truncated both diff sides to the same first line, they paired
+        // as an unchanged re-add, and the changed expression inside the block
+        // produced no finding at all.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/limits.rs",
+            &[
+                "-pub const LIMIT: usize = {",
+                "-    let base = 2;",
+                "-    base * 3",
+                "-};",
+                "+pub const LIMIT: usize = {",
+                "+    let base = 2;",
+                "+    base * 4",
+                "+};",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "a changed block-valued constant is a changed public value: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(changes[0].0.contains("base * 3"), "{}", changes[0].0);
+        assert!(changes[0].1.contains("base * 4"), "{}", changes[0].1);
     }
 
     #[test]
@@ -2895,6 +3033,76 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "collapsing a literal's newline into a space changes the value, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reflowing_a_declaration_across_lines_is_not_a_signature_change() {
+        // The line break is preserved because a literal may span it. Preserving
+        // it unconditionally made a purely cosmetic reflow — the same alias
+        // rewritten onto one line — read as two different declarations, and the
+        // pairing pass reported a signature change for an API that did not move.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &["-pub type Alias =", "-    u32;", "+pub type Alias = u32;"],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a reflow states the same API, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reflowing_a_declaration_onto_more_lines_is_not_a_signature_change_either() {
+        // The same no-op in the other direction, so the rule is not a one-way
+        // tolerance that merely happens to hold for the shape above.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &["-pub type Alias = u32;", "+pub type Alias =", "+    u32;"],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a reflow states the same API, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_literal_is_part_of_the_value() {
+        // The other half of the same rule: a line contributing no code is
+        // dropped from the identity, but inside a literal an empty line IS the
+        // value. Dropping it made a constant with a blank line compare equal to
+        // the same constant without one.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const BANNER: &str = \"a",
+                "-",
+                "-b\";",
+                "+pub const BANNER: &str = \"a",
+                "+b\";",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "dropping a literal's blank line changes the value, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

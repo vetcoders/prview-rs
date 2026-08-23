@@ -201,6 +201,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `|` in a declaration no longer breaks the `BREAKING_CHANGES.md` tables.**
+  Declaration text went into a markdown table verbatim, and Rust states bitwise
+  or, patterns and closures with the table's own delimiter — so a row reporting
+  `pub const MASK: u32 = READ | WRITE;` opened extra columns and rendered as
+  garbage exactly where the declaration mattered. Every cell carrying source
+  text now escapes `|` as `\|`, which is what GitHub's table parser needs: it
+  splits on unescaped pipes before any inline markup runs, so a code span was
+  never protection.
+- **`#[cfg(not(test))]` no longer mutes a production performance finding.** The
+  perf tracker opened inline test context on the bare token `test` appearing
+  anywhere inside a `cfg` predicate, so a query-in-loop under
+  `#[cfg(not(test))]` — code compiled into every build EXCEPT the test one — was
+  recorded as test-only and dropped, and so was one under
+  `#[cfg(any(test, feature = "bench"))]`, which compiles outside the test build
+  whenever the feature is on, or under `#[cfg(feature = "__internal-test")]`, a
+  feature that merely has `test` in its name. This inverted the module's own
+  rule that ambiguity resolves toward production. Only a gate that provably
+  holds solely in a test build now opens the context: an exact `#[cfg(test)]`,
+  an `#[cfg(all(test, …))]`, `#[test]` / `#[tokio::test]` / `#[rstest]`, and
+  `mod tests`. Measured over the local registry (58,586 files), of the 11,030
+  attributes the old pattern read as test context 83.62% are exactly
+  `cfg(test)` and 6.76% are `all(test, …)` — the remaining 9.62% are the ones it
+  was getting wrong.
+- **A block or struct-literal initializer no longer hides a changed public
+  constant.** `pub const LIMIT: usize = {` and `pub const ZERO: Self = Self {`
+  had their `{` read as the item's body opener, so both diff sides finalized at
+  their identical first line, paired as an unchanged re-add, and a changed
+  expression inside the block produced no finding at all. After a top-level `=`
+  the item states a value and runs to its `;`, and a `;` inside the initializer
+  terminates a statement rather than the declaration. Only a top-level `=`
+  counts — inside a generic argument list one states a default
+  (`struct Foo<const N: usize = 4>`) or an associated type
+  (`impl Iterator<Item = u8>`), both still followed by a real body brace.
+  Measured over the local registry (58,586 files, 1,960 crates, 4,334,320 public
+  declaration lines) this changes the verdict on 2,465 lines, every sampled one
+  a public constant with a multi-line struct-literal or block initializer.
+- **A reflowed declaration is no longer reported as a changed signature.** The
+  comparison identity preserved every physical line break, so
+  `pub type Alias =` followed by `u32;` was a different declaration from
+  `pub type Alias = u32;` — a purely cosmetic rewrap produced a
+  `ChangedSignature` whose "before" and "after" printed as the same string, and
+  could escalate the verdict. A break is now kept only where the previous line
+  left a string literal open, which is where it is part of the value; elsewhere
+  the lines are joined with a space. For the same reason a line contributing no
+  code is still dropped from the identity except inside a literal, where a blank
+  line is a blank line in the value.
 - **A const argument that is not the first one no longer hides a public type
   change.** The breaking-change scanner recognized `Buffer<{ LIMIT }>` as
   type-level syntax by the exact `<{` sequence, so `Buffer<u8, { LIMIT }>` —
