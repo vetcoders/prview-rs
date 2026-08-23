@@ -917,6 +917,22 @@ unproven is production, because the two errors are not symmetrical — an
 unrecognized test context costs one extra finding a reader can dismiss, while a
 claimed one that does not hold deletes a production finding nobody ever sees.
 
+The pattern describes a complete `#[…]`, so it is matched against a complete
+one. Attributes wrap — rustfmt breaks a long predicate over several lines — and
+running the pattern per physical line meant a wrapped
+`#[cfg(all(` / `feature = "bench",` / `test` / `))]` matched on no line at all,
+leaving a test-only item read as production. An `AttributeAccumulator` joins the
+lines of one attribute and matches once, on the line that closes it, counting
+brackets on the same comment- and literal-resolved view the rest of the scan
+uses so a `]` inside a string or a trailing comment cannot close it early. It
+only ever CONTINUES: a wrapped attribute is bounded by
+`MAX_ATTRIBUTE_CONTINUATION_LINES` (8), and one that never closes is dropped
+rather than allowed to swallow the rest of the hunk — nothing was proven, and an
+unproven gate is production. The shape is rare: 10 occurrences over the same
+58,614-file registry, all of them genuine `all(test, …)` gates. It is a P2
+because its error direction is the mild one — a phantom finding a reader can
+dismiss, not a muted production hit.
+
 The perf tracker's test context closes two ways, because not every test item has
 a body. One that opens a brace closes when that brace balances again; one that
 does not — `#[cfg(test)] mod tests;`, `#[cfg(test)] use crate::helper;` — closes

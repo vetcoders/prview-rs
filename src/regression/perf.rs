@@ -25,6 +25,7 @@ use super::RegressionContext;
 use crate::rust_source::SourceScanner;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -107,6 +108,78 @@ static INLINE_RUST_TEST_CONTEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+
+/// Runaway bound on how many physical lines one attribute may span.
+///
+/// rustfmt wraps a long `cfg` predicate over a handful of lines; nothing
+/// legitimate approaches this. The cap exists so a `#[` that never closes — a
+/// truncated hunk, a macro fragment — cannot keep swallowing lines and silence
+/// the rest of the file.
+const MAX_ATTRIBUTE_CONTINUATION_LINES: usize = 8;
+
+/// Joins the physical lines of one attribute so the marker pattern sees the
+/// whole predicate.
+///
+/// The pattern is written against a complete `#[…]`, but it was applied per
+/// physical line, so a wrapped
+/// `#[cfg(all(\n    feature = "bench",\n    test\n))]` matched on no line at
+/// all and its test-only item was read as production. Brackets are counted on
+/// the comment- and literal-resolved view, so a `]` inside a string or a
+/// trailing comment cannot close the attribute early.
+#[derive(Default)]
+struct AttributeAccumulator {
+    /// Joined code of the attribute so far, or `None` when none is open.
+    buffer: Option<String>,
+    /// Unclosed `[` of the open attribute.
+    depth: i32,
+    lines: usize,
+}
+
+impl AttributeAccumulator {
+    /// Feed one line of resolved code and return the text to match against, if
+    /// any: the line itself when no attribute is open and it needs none, the
+    /// joined attribute on the line that closes it, and nothing while one is
+    /// still accumulating.
+    fn feed<'a>(&mut self, code: &'a str) -> Option<Cow<'a, str>> {
+        let delta = bracket_delta(code);
+
+        if let Some(buffer) = self.buffer.as_mut() {
+            buffer.push(' ');
+            buffer.push_str(code);
+            self.depth += delta;
+            self.lines += 1;
+            if self.depth <= 0 {
+                return self.buffer.take().map(Cow::Owned);
+            }
+            if self.lines >= MAX_ATTRIBUTE_CONTINUATION_LINES {
+                // Unterminated: nothing was proven, so drop it rather than
+                // letting a half-read predicate decide the context.
+                self.buffer = None;
+                self.depth = 0;
+                self.lines = 0;
+            }
+            return None;
+        }
+
+        if delta > 0 && code.contains('#') {
+            self.buffer = Some(code.to_string());
+            self.depth = delta;
+            self.lines = 1;
+            return None;
+        }
+
+        Some(Cow::Borrowed(code))
+    }
+}
+
+/// Unclosed `[` in one line of resolved code.
+fn bracket_delta(code: &str) -> i32 {
+    code.chars().fold(0, |depth, ch| match ch {
+        '[' => depth + 1,
+        ']' => depth - 1,
+        _ => depth,
+    })
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PerfRegression {
@@ -436,6 +509,9 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
     // hunk, so the scanner starts clean here and is never carried past the
     // hunk boundary.
     let mut scanner = SourceScanner::default();
+    // Attributes wrap across lines; the marker pattern needs the whole one.
+    // Per hunk, like the scanner beside it.
+    let mut attributes = AttributeAccumulator::default();
 
     for line in hunk.lines() {
         if is_diff_metadata_line(line) {
@@ -460,9 +536,17 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
         let code = scanner.code_only(payload);
         let trimmed = code.trim();
 
+        // A wrapped attribute is matched once, on the line that closes it;
+        // while one is still open there is nothing complete to judge.
+        let marker_text = attributes.feed(trimmed);
+
         // Only the outermost marker opens the context, so nested `#[test]`
         // attributes do not reset the enclosing `mod tests` brace tracking.
-        if !in_test && INLINE_RUST_TEST_CONTEXT_PATTERN.is_match(trimmed) {
+        if !in_test
+            && marker_text
+                .as_deref()
+                .is_some_and(|text| INLINE_RUST_TEST_CONTEXT_PATTERN.is_match(text))
+        {
             in_test = true;
             depth = 0;
             seen_open = false;
@@ -1148,6 +1232,118 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
 
         let result = analyze(&ctx);
         assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_multiline_cfg_attribute_still_opens_test_context() {
+        // rustfmt wraps a long predicate, and the marker regex runs per
+        // physical line, so no line ever carried the whole attribute: a
+        // test-only helper read as production and its query-in-loop surfaced as
+        // a phantom regression.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,12 @@
++#[cfg(all(
++    feature = "bench",
++    test
++))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.perf_regression_suspected);
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_multiline_not_test_cfg_is_still_production_context() {
+        // The accumulation must not turn the predicate into a bag of tokens:
+        // wrapped across lines, `not(test)` still proves the opposite of test
+        // context, and muting the hits under it would delete a production
+        // finding nobody ever sees.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,12 @@
++#[cfg(not(
++    test
++))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn a_multiline_any_test_cfg_is_still_production_context() {
+        // The other unproven shape, wrapped: `any(test, …)` compiles outside the
+        // test build whenever the other operand holds.
+        let patch = r#"diff --git a/src/portal.rs b/src/portal.rs
++++ b/src/portal.rs
+@@ -20,3 +20,12 @@
++#[cfg(any(
++    test,
++    feature = "bench"
++))]
++fn refresh(users: &[User]) {
++    for user in users.iter() {
++        db.query("SELECT 1");
++    }
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn an_unterminated_attribute_does_not_swallow_the_rest_of_the_hunk() {
+        // The accumulator is bounded. A `#[` that never closes — a truncated
+        // hunk, a macro fragment — must not keep eating lines and silence
+        // everything after it.
+        let mut patch = String::from(
+            "diff --git a/src/portal.rs b/src/portal.rs\n+++ b/src/portal.rs\n@@ -20,3 +20,40 @@\n+#[cfg(all(\n",
+        );
+        for _ in 0..MAX_ATTRIBUTE_CONTINUATION_LINES + 2 {
+            patch.push_str("+    feature = \"x\",\n");
+        }
+        patch.push_str("+fn refresh(users: &[User]) {\n");
+        patch.push_str("+    for user in users.iter() {\n");
+        patch.push_str("+        db.query(\"SELECT 1\");\n");
+        patch.push_str("+    }\n");
+        patch.push_str("+}\n");
+
+        let ctx = RegressionContext {
+            patch_text: Some(patch),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.suspected_files[0].test_context_only,
+            "an unterminated attribute proves nothing and must not mute the hit"
+        );
     }
 
     #[test]

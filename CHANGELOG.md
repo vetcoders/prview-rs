@@ -297,7 +297,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first operand made the same predicate production or test context depending on
   how it was written (72 further attributes over that registry, none lost). The
   operand must be a direct one, so `all(not(test), …)` — which proves the
-  opposite — and `all(any(test, …), …)` stay production.
+  opposite — and `all(any(test, …), …)` stay production. The predicate is also
+  read as a whole attribute rather than per physical line: rustfmt wraps a long
+  one, and a `#[cfg(all(` / `feature = "bench",` / `test` / `))]` spread over
+  four lines matched on none of them, so its test-only item was read as
+  production and its query-in-loop surfaced as a phantom regression. The lines
+  of one attribute are now joined and matched once, on the line that closes it,
+  bounded to 8 lines so an attribute that never closes is dropped instead of
+  swallowing the rest of the hunk. The shape is rare — 10 occurrences over that
+  registry, every one a genuine `all(test, …)` gate.
 - **A block or struct-literal initializer no longer hides a changed public
   constant.** `pub const LIMIT: usize = {` and `pub const ZERO: Self = Self {`
   had their `{` read as the item's body opener, so both diff sides finalized at
