@@ -170,6 +170,50 @@ def check_quality_pass_agrees_with_details(
     return []
 
 
+def check_blocker_flag_agrees_with_blocking_issues(decision: dict[str, Any]) -> list[str]:
+    """Cross-check `policy_allow_merge` against the list it is computed from.
+
+    Like `quality_pass`, this flag is not an independent opinion: the writer sets
+    `policy_allow_merge = blocking_issues.is_empty()` (src/artifacts/merge_gate.rs)
+    AFTER the last push to that list, and then serializes both verbatim into the
+    same `json!` literal. Nothing else writes the field -- the other computation
+    of the same formula, in src/artifacts/context.rs, feeds the dashboard, not
+    this artifact. So the two are one fact written twice and the check is an
+    EQUIVALENCE, enforced in both directions:
+    `policy_allow_merge: true` beside real blockers, and `false` beside none,
+    are equally unemittable.
+
+    The reconciliation below already reads the pair -- but only in the harsher
+    direction, where either half raises the rank the verdict must clear. That
+    leaves the two halves free to contradict each other outright, which is the
+    hole this closes: a pack whose blockers say "blocked" and whose flag says
+    "policy let it through" certifies a state prview never produced, and readers
+    that trust one half read the opposite of readers that trust the other.
+
+    Reached only from schema 2.2, where both fields are required; below it,
+    absence is an old pack rather than a contradiction and no cross-field claim
+    exists to check.
+    """
+    policy_allow_merge = decision.get("policy_allow_merge")
+    blocking_issues = decision.get("blocking_issues")
+    if not isinstance(policy_allow_merge, bool) or not isinstance(blocking_issues, list):
+        # Type errors are reported once, by the shape checks that own them.
+        return []
+    if policy_allow_merge and blocking_issues:
+        return [
+            "decision.policy_allow_merge must be false when blocking_issues is "
+            "non-empty -- the writer derives the flag from that list: got "
+            f"policy_allow_merge=true with {len(blocking_issues)} blocking_issues"
+        ]
+    if not policy_allow_merge and not blocking_issues:
+        return [
+            "decision.policy_allow_merge must be true when blocking_issues is "
+            "empty -- the writer derives the flag from that list: got "
+            "policy_allow_merge=false with no blocking_issues"
+        ]
+    return []
+
+
 def check_decision_axes_agree_on_the_verdict(decision: dict[str, Any]) -> list[str]:
     """Reject a `verdict` milder than the axes stated beside it.
 
@@ -246,6 +290,9 @@ def check_decision_axes_agree_on_the_verdict(decision: dict[str, Any]) -> list[s
     # The blocker axis, stated twice by the emitter
     # (`policy_allow_merge = blocking_issues.is_empty()`). It is ONE axis: a pack
     # carrying both must not count it twice, and one carrying either is covered.
+    # That the two halves actually AGREE is not this rule's job -- ranking only
+    # asks how conservative the pack is -- it is enforced as an equivalence by
+    # `check_blocker_flag_agrees_with_blocking_issues`.
     blocking_issues = decision.get("blocking_issues")
     if decision.get("policy_allow_merge") is False:
         stated.append(("policy_allow_merge=False", 3))
@@ -518,6 +565,7 @@ def validate(path: Path) -> list[str]:
                 require_boolean(
                     decision.get("policy_allow_merge"), "decision.policy_allow_merge", issues
                 )
+            issues.extend(check_blocker_flag_agrees_with_blocking_issues(decision))
             issues.extend(check_decision_axes_agree_on_the_verdict(decision))
             details = decision.get("quality_failure_details")
             if not isinstance(details, list):

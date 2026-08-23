@@ -961,6 +961,46 @@ mod tests {
     }
 
     #[test]
+    fn the_blocker_flag_is_the_blocker_list_written_twice() {
+        // `tools/validate_merge_gate.py` certifies
+        // `policy_allow_merge == blocking_issues.is_empty()` as an equivalence,
+        // rejecting a pack that states one without the other. That is only sound
+        // while the flag is derived from the list and from nothing else, as it is
+        // above. Should the flag ever gain a second input, this pin fails here
+        // — in the emitter that changed — instead of the validator silently
+        // rejecting packs prview itself still writes.
+        let packs = [
+            run_gate_with_skipped_policy_check(
+                "cargo_audit",
+                "Cargo audit",
+                "security disabled",
+                crate::policy::PolicySeverity::Block,
+            ),
+            run_gate_with_skipped_policy_check(
+                "cargo_audit",
+                "Cargo audit",
+                "tool not installed (cargo-audit is missing)",
+                crate::policy::PolicySeverity::Block,
+            ),
+            run_gate_with_cargo_test_finding(false),
+            run_gate_with_semgrep_finding(false, false),
+        ];
+
+        for gate in packs {
+            let decision = &gate["decision"];
+            let no_blockers = decision["blocking_issues"]
+                .as_array()
+                .expect("blocking_issues array")
+                .is_empty();
+            assert_eq!(
+                decision["policy_allow_merge"].as_bool(),
+                Some(no_blockers),
+                "policy_allow_merge must mirror an empty blocking_issues: {decision}"
+            );
+        }
+    }
+
+    #[test]
     fn preexisting_semgrep_finding_outside_diff_does_not_degrade_verdict() {
         let gate = run_gate_with_semgrep_finding(false, false);
 
