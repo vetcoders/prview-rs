@@ -201,6 +201,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed quality axis can no longer be published as a `PASS`.** The
+  conservative reconciliation ranked `verdict`, `merge_recommendation` and
+  `allow_merge` but read `quality_pass` separately, afterwards — so a pack
+  shaped `verdict: "PASS"`, `merge_recommendation: "approve"`,
+  `allow_merge: true`, `quality_pass: false` published a clean approval with
+  `allow_merge: true`, on the CLI and on the MCP surface alike, where automation
+  could act on it. A stated `quality_pass: false` now ranks as `CONDITIONAL` on
+  both readers, exactly like `allow_merge: false`, and is named in the
+  `core_inconsistency:` caveat. `quality_pass: true` still states no rank — a
+  quality-clean run is held at `CONDITIONAL` by a breaking-change escalation, so
+  one axis may not soften a verdict the others agree on — and an ABSENT
+  `quality_pass` still states nothing, so packs written before the field are
+  read exactly as before.
 - **A `|` in a declaration no longer breaks the `BREAKING_CHANGES.md` tables.**
   Declaration text went into a markdown table verbatim, and Rust states bitwise
   or, patterns and closures with the table's own delimiter — so a row reporting

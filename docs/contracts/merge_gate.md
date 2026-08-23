@@ -280,6 +280,22 @@ outside the `approve` / `review_required` / `block` vocabulary cannot rank, so
 it is excluded from the reconciliation and named with an
 `unknown_merge_recommendation:` caveat rather than dropped in silence.
 
+`quality_pass` is one of those axes, because the contract permits `PASS` only
+when quality passes. A stated `quality_pass: false` therefore ranks 2 — it says
+"not a `PASS`", exactly as `allow_merge: false` does — so a pack shaped
+`verdict: "PASS"`, `merge_recommendation: "approve"`, `allow_merge: true`,
+`quality_pass: false` is published as `review_required` with
+`allow_merge: false` on both surfaces, with the `core_inconsistency:` caveat
+naming every original including this one. Leaving that axis out of the
+reconciliation published the approval verbatim, so automation reading the MCP
+surface approved a run whose own artifact said quality had failed. The
+asymmetry is deliberate in both directions: `quality_pass: true` states no rank
+at all, because a quality-clean run is still held at `CONDITIONAL` by a
+breaking-change escalation and one axis may not soften a verdict the others
+agree on; and an ABSENT `quality_pass` states nothing either, per the same
+per-field tolerance that governs the other signals — reading it as `false`
+would turn every pack written before the field into a `CONDITIONAL`.
+
 The `core_inconsistency:` caveat reports a disagreement the pack actually
 states, so the comparison is made per axis rather than against the winning rank:
 the two textual axes are compared to the published verdict, and `allow_merge` to
@@ -287,9 +303,13 @@ the `allow_merge` the readers publish. `allow_merge` has only two values and
 `false` ranks as `CONDITIONAL`, so measuring it against a rank it can never
 reach made every healthy `BLOCK` pack — `verdict: "BLOCK"`,
 `merge_recommendation: "block"`, `allow_merge: false` — report a contradiction
-it did not contain. A pack whose verdict was substituted reports the
-substitution (`unknown_verdict:`, `unreadable_<field>:`) and is not additionally
-accused of contradicting itself.
+it did not contain. `quality_pass` needs no comparison of its own: ranking 2
+when false, it makes any axis claiming 1 beside it disagree with the winning
+rank already, and a healthy `BLOCK` or `CONDITIONAL` pack states it in agreement
+with everything else. It is named in the caveat all the same, so a reader can
+see which axis forced the downgrade. A pack whose verdict was substituted
+reports the substitution (`unknown_verdict:`, `unreadable_<field>:`) and is not
+additionally accused of contradicting itself.
 
 ## Blocking rules
 

@@ -763,6 +763,18 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // allow_merge=false raises conservativeness to at least HOLD; allow=true
     // never lowers it (a permissive flag can't override a block/hold signal).
     let allow_rank = raw_allow.map(|allow| if allow { 1 } else { 2 });
+    // `quality_pass: false` says "not a PASS" — the contract permits `PASS` only
+    // when quality passes — so it ranks 2, like `allow_merge: false`. `true`
+    // states no rank of its own: a quality-clean run is still held at
+    // CONDITIONAL by a breaking-change escalation. Absence states nothing
+    // either, so a pack written before the field reads exactly as it always did.
+    // This is the CLI's rule, mirrored, because a pack this adapter approved
+    // while the CLI held it is the same split the reader parity work closed.
+    let raw_quality_pass = decision.get("quality_pass").and_then(|v| v.as_bool());
+    let quality_rank = match raw_quality_pass {
+        Some(false) => Some(2),
+        _ => None,
+    };
 
     // A verdict this reader had to SUBSTITUTE — absent, outside the vocabulary,
     // or present with the wrong JSON type — governs everything derived beside
@@ -773,7 +785,7 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // pack came to be a `PASS` for MCP automation and a `BLOCK` on the CLI.
     let normalized_to_block = mistyped_signal || verdict_rank.is_none();
 
-    let stated_ranks: Vec<u8> = [merge_rank, verdict_rank, allow_rank]
+    let stated_ranks: Vec<u8> = [merge_rank, verdict_rank, allow_rank, quality_rank]
         .into_iter()
         .flatten()
         .collect();
@@ -813,12 +825,16 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     caveats.append(&mut unknown_signal_caveats);
     if signals_disagree || allow_contradicts {
         caveats.push(format!(
-            "core_inconsistency: original allow_merge={}, merge_recommendation={}, verdict={}",
+            "core_inconsistency: original allow_merge={}, merge_recommendation={}, verdict={}, \
+             quality_pass={}",
             raw_allow
                 .map(|b| b.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             raw_merge.as_deref().unwrap_or("null"),
             raw_verdict.as_deref().unwrap_or("null"),
+            raw_quality_pass
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "null".to_string()),
         ));
     }
     caveats.extend(string_array(decision.get("review_caveats")));
