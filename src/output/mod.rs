@@ -957,15 +957,40 @@ fn split_at_display_width(input: &str, max_width: usize) -> (&str, &str) {
 /// Word-wrap one logical row to display columns. Long unbroken refs are split
 /// on grapheme boundaries; continuation lines preserve the original indent.
 fn wrap_config_line(input: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
+    // No renderer can place a width-2 grapheme in a one-column terminal.
+    // Preserve every grapheme that can fit and make the impossible remainder
+    // explicit with one printable replacement column instead of overflowing.
+    let normalized = input
+        .graphemes(true)
+        .map(|grapheme| {
+            if UnicodeWidthStr::width(grapheme) > max_width {
+                "?"
+            } else {
+                grapheme
+            }
+        })
+        .collect::<String>();
+    let input = normalized.as_str();
+
     if UnicodeWidthStr::width(input) <= max_width {
         return vec![input.to_string()];
     }
 
     let leading: String = input.chars().take_while(|ch| *ch == ' ').collect();
-    let indent = if UnicodeWidthStr::width(leading.as_str()) < max_width {
+    let widest_grapheme = input
+        .graphemes(true)
+        .filter(|grapheme| !grapheme.chars().all(char::is_whitespace))
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(1);
+    let leading_width = UnicodeWidthStr::width(leading.as_str());
+    let indent = if leading_width + widest_grapheme <= max_width {
         leading
-    } else {
+    } else if widest_grapheme < max_width {
         " ".to_string()
+    } else {
+        String::new()
     };
     let indent_width = UnicodeWidthStr::width(indent.as_str());
     let content_width = max_width.saturating_sub(indent_width).max(1);
@@ -1641,7 +1666,7 @@ mod tests {
     fn config_box_never_exceeds_the_terminal_width() {
         let rows = config_box_test_rows();
 
-        for columns in [20, 23, 40, 64, 80, 100, 116, 124, 160] {
+        for columns in (1..=23).chain([40, 64, 80, 100, 116, 124, 160]) {
             let rendered = render_config(&rows, Some(columns), false);
             for line in rendered.lines() {
                 assert!(
@@ -1691,6 +1716,18 @@ mod tests {
                 .all(|line| UnicodeWidthStr::width(line) <= 20)
         );
         assert!(!rendered.contains(['╔', '║', '╚']));
+    }
+
+    #[test]
+    fn config_box_replaces_only_graphemes_that_cannot_fit_the_terminal() {
+        let rendered = render_config(&config_box_test_rows(), Some(1), false);
+
+        assert!(rendered.contains('?'));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| UnicodeWidthStr::width(line) <= 1)
+        );
     }
 
     #[test]
