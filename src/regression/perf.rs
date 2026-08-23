@@ -504,6 +504,11 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
     // Bracket nesting of the annotated item's SIGNATURE, tracked only until its
     // body opens. A brace inside `(…)`, `[…]` or `<…>` is not the body.
     let mut sig_depth: i32 = 0;
+    // Braces open INSIDE those brackets — a const argument (`Buffer<{1<2}>`) or
+    // a destructured parameter (`Params(Req { field })`). Their contents are
+    // expression or pattern text, where `<` and `>` are operators, so signature
+    // tracking is frozen while one is open.
+    let mut sig_block: i32 = 0;
     // Unclosed `[` of an attribute being scanned, and whether the previous
     // character was the `#`/`#!` that opens one. Both persist across lines: an
     // attribute may wrap, and its braces are never the item's body.
@@ -556,6 +561,7 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
             depth = 0;
             seen_open = false;
             sig_depth = 0;
+            sig_block = 0;
             attr_depth = 0;
             attr_sigil = false;
         }
@@ -604,9 +610,19 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
                         // so the context ended at the signature and the whole
                         // test body was recorded as production.
                         seen_open |= sig_depth == 0;
+                        // A brace that is NOT the body opener holds expression or
+                        // pattern text, where `<` and `>` are operators.
+                        if !seen_open {
+                            sig_block += 1;
+                        }
                     }
-                    '}' => depth -= 1,
-                    _ if !seen_open => track_signature_brackets(ch, prev, &mut sig_depth),
+                    '}' => {
+                        depth -= 1;
+                        sig_block = (sig_block - 1).max(0);
+                    }
+                    _ if !seen_open && sig_block == 0 => {
+                        track_signature_brackets(ch, prev, &mut sig_depth);
+                    }
                     _ => {}
                 }
                 prev = ch;
@@ -616,6 +632,7 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
                 depth = 0;
                 seen_open = false;
                 sig_depth = 0;
+                sig_block = 0;
             } else if !seen_open && sig_depth == 0 && ends_the_annotated_item(trimmed) {
                 // Not every test item has a body. `#[cfg(test)] mod tests;` and
                 // `#[cfg(test)] use crate::helper;` never open a brace, so the
@@ -628,6 +645,7 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
                 in_test = false;
                 depth = 0;
                 sig_depth = 0;
+                sig_block = 0;
             }
         }
     }
@@ -657,13 +675,16 @@ fn track_signature_brackets(ch: char, prev: char, sig_depth: &mut i32) {
     match ch {
         '(' | '[' => *sig_depth += 1,
         // A generic opener FOLLOWS the thing it parameterises — `Buffer<`,
-        // `Vec<`, `fn f<`, `::<`. A `<` after whitespace is a comparison, and a
-        // const argument may hold one: `Buffer<{ 1 < 2 }>`. Counting that
-        // comparison left the depth stuck above zero, so the real body brace
-        // read as another type-level brace and the context never closed —
-        // muting every production hit after the test. Closers stay unconditional
-        // (minus the `->` arrow) and the depth is clamped, so a `<` this rule
-        // misjudges can only end the context early, never hold it open.
+        // `Vec<`, `fn f<`, `::<`. A `<` after whitespace is a comparison. That
+        // spacing rule is a heuristic, not a boundary: it reads `Buffer<{ 1 < 2
+        // }>` correctly and `Buffer<{1<2}>` — the same type, formatted compactly
+        // — wrongly, because `<` after a digit looks exactly like `<` after an
+        // identifier. The boundary is the caller's, which freezes this tracker
+        // inside a const argument's braces. What survives here is the ordinary
+        // signature, where a comparison cannot appear at all. Closers stay
+        // unconditional (minus the `->` arrow) and the depth is clamped, so a
+        // `<` this rule still misjudges can only end the context early, never
+        // hold it open.
         '<' if prev.is_alphanumeric() || prev == '_' || prev == '>' || prev == ':' => {
             *sig_depth += 1;
         }
@@ -2087,6 +2108,103 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         assert!(
             result.perf_regression_suspected,
             "production code after the test must not be muted by a comparison in a const argument"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_compact_comparison_inside_const_braces_does_not_hold_the_context_open() {
+        // The same comparison written without spaces. `<` after a DIGIT passes
+        // the "follows an identifier" test that catches the spaced spelling, so
+        // the depth was still stuck above zero, the real body brace read as
+        // another type-level brace, and the context never closed. Whitespace is
+        // formatting, not meaning: both spellings must judge the same.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{1<2}> {
+     let n = 1;
+ }
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "production code after the test must not be muted by a compact comparison"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_turbofish_inside_const_braces_keeps_the_signature_balanced() {
+        // The shape the corpus actually carries in a const argument: a turbofish
+        // that opens and closes its own generic list. Freezing the signature's
+        // depth inside the braces must not break it — the pair is balanced
+        // against itself, so the item's real body opener is still found and the
+        // context still ends at the body's end.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn run() -> Buffer<{size_of::<u32>()}> {
+     let n = 1;
+ }
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a turbofish in a const argument must not mute production code below the test"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn test_a_qualified_path_inside_const_braces_keeps_the_signature_balanced() {
+        // The only shape the corpus actually carries here (crypto-bigint):
+        // `Uint<{ <Self>::LIMBS / 2 }>`. Its trace CHANGES under the freeze — the
+        // path's `>` used to decrement the outer list, leaving the depth at zero
+        // one closer early, and only clamping kept the verdict right. Frozen, the
+        // outer `>` does that job itself. Same verdict, different arithmetic, so
+        // it is worth holding.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,12 @@
+ #[test]
+ fn split(&self) -> Uint<{ <Self>::LIMBS / 2 }> {
+     let n = 1;
+ }
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a qualified path in a const argument must not mute production code below the test"
         );
         assert_eq!(result.query_in_loop_count, 1);
         assert!(!result.suspected_files[0].test_context_only);

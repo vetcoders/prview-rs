@@ -80,6 +80,57 @@ def require_non_negative_integer(value: Any, ctx: str, issues: list[str]) -> Non
         issues.append(f"{ctx} must be a non-negative integer")
 
 
+def check_quality_pass_agrees_with_details(
+    decision: dict[str, Any], details: list[Any]
+) -> list[str]:
+    """Cross-check `quality_pass` against the details it is computed from.
+
+    `quality_pass` is not an independent opinion. The writer sets it to
+    `!QualityFailureSummary::has_new_failures()` and serializes the very same
+    details 1:1 into `quality_failure_details`, so the two are one fact written
+    twice and the check is an EQUIVALENCE, enforced in both directions.
+
+    An entry gates the diff when its origin is `failure` AND its classification
+    is anything but `pre-existing`. Both halves matter, and the second is the
+    reason the obvious rule -- "a failure-origin entry forces quality_pass
+    false" -- is WRONG: a purely pre-existing failure is emitted next to
+    `quality_pass: true` on purpose, because it predates the diff and must not
+    block the merge. `security_full_preexisting_semgrep_finding_is_advisory_only`
+    in src/artifacts/merge_gate.rs produces exactly that pack, and rejecting it
+    would make the validator cry wolf on a genuine one -- which costs more than
+    the hole it closes, because a validator nobody trusts gates nothing.
+
+    Only entries whose own shape already validated are counted, so a malformed
+    detail is reported once as a shape error rather than twice.
+    """
+    quality_pass = decision.get("quality_pass")
+    if not isinstance(quality_pass, bool):
+        # Absent is legal on packs written before the field existed, and a
+        # mistyped one is the readers' problem, not a cross-field contradiction.
+        return []
+    gating = [
+        detail.get("name")
+        for detail in details
+        if isinstance(detail, dict)
+        and detail.get("origin") == "failure"
+        and detail.get("classification") in VALID_QUALITY_FAILURE_CLASSES
+        and detail.get("classification") != "pre-existing"
+    ]
+    if quality_pass and gating:
+        return [
+            "decision.quality_pass must be false when a quality_failure_details "
+            "entry has origin 'failure' and a classification other than "
+            f"'pre-existing': got quality_pass=true with {sorted(map(str, gating))}"
+        ]
+    if not quality_pass and not gating:
+        return [
+            "decision.quality_pass must be true when no quality_failure_details "
+            "entry has origin 'failure' with a classification other than "
+            "'pre-existing': got quality_pass=false with no such entry"
+        ]
+    return []
+
+
 def require_iso_datetime(value: Any, ctx: str, issues: list[str]) -> None:
     if not isinstance(value, str) or not value.strip():
         issues.append(f"{ctx} must be an ISO datetime string")
@@ -308,6 +359,7 @@ def validate(path: Path) -> list[str]:
                             f"{ctx}.origin must be one of "
                             f"{sorted(VALID_QUALITY_FAILURE_ORIGINS)} (schema 2.2)"
                         )
+                issues.extend(check_quality_pass_agrees_with_details(decision, details))
 
         if not isinstance(decision.get("blocking_issues"), list):
             issues.append("decision.blocking_issues must be an array")

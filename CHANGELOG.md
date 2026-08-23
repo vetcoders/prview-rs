@@ -201,6 +201,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tools/validate_merge_gate.py` now rejects a `quality_pass` that
+  contradicts its own evidence.** The flag and `quality_failure_details` are one
+  fact written twice — the emitter sets `quality_pass` to
+  `!QualityFailureSummary::has_new_failures()` and serializes the very details
+  that answer it — but the validator checked each side's shape and never
+  compared them. `quality_pass: true` beside
+  `{"origin": "failure", "classification": "introduced"}` therefore certified
+  clean, and both decision readers trust the permissive scalar, so a
+  validator-clean pack could approve an explicitly introduced failure. The check
+  is an equivalence: `quality_pass` is true if and only if no detail has
+  `origin: "failure"` with a classification other than `pre-existing`. The
+  `pre-existing` carve-out is load-bearing — a failure that predates the diff is
+  emitted beside `quality_pass: true` on purpose, so the simpler one-way rule
+  would have rejected packs prview itself writes. Packs without the field are
+  untouched.
+- **A compactly written comparison in a const argument no longer mutes
+  production code.** The perf tracker judged `<` a generic opener whenever it
+  followed an identifier, which reads `Buffer<{ 1 < 2 }>` correctly and the same
+  type written `Buffer<{1<2}>` wrongly — `<` after a digit looks exactly like `<`
+  after an identifier. The signature's bracket depth then stayed above zero, the
+  real body brace read as another type-level brace, the test context never
+  closed, and every loop or query below the test was recorded as test-only and
+  dropped from the signal. Spacing is formatting, so it can no longer decide the
+  verdict: bracket tracking is now frozen inside a brace opened within the
+  signature, where a const argument holds an expression and a destructured
+  parameter holds a pattern and `<`/`>` are operators in both.
 - **A comparison inside a const argument no longer swallows the item body.**
   `pub fn run() -> Buffer<{ 1 < 2 }> {` counted the comparison as another
   generic opener, the argument list's own `>` closed only that phantom level,

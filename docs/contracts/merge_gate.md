@@ -262,6 +262,27 @@ requires every `quality_failure_details` entry to carry an `origin` of exactly
 `failure` or `warning`: consumers are told to filter on it, which they cannot do
 if a pack may omit or mistype it.
 
+From the same version it also cross-checks `quality_pass` against those details,
+because the two are one fact written twice: the emitter sets the flag to
+`!QualityFailureSummary::has_new_failures()` and then serializes the very
+details that answer it. An entry gates the diff when its `origin` is `failure`
+AND its `classification` is anything but `pre-existing`, so
+
+> `quality_pass` is true if and only if no `quality_failure_details` entry
+> has `origin: "failure"` with a classification other than `pre-existing`.
+
+Both directions are checked. `quality_pass: true` beside
+`{"origin": "failure", "classification": "introduced"}` is the combination that
+matters: the emitter cannot produce it, both decision readers trust the
+permissive scalar, and a validator-clean pack could therefore approve a failure
+it also reports. `quality_pass: false` with nothing that could have failed it is
+equally unemittable, and rejected too. The `pre-existing` half of the rule is
+not a detail — a failure that predates the diff is published beside
+`quality_pass: true` deliberately, so the simpler rule "a failure-origin entry
+forces `quality_pass: false`" would reject a legitimate pack, and a validator
+that cries wolf on genuine output gates nothing. A pack that omits
+`quality_pass` entirely is left alone, per the absence rule below.
+
 A decision signal present with the wrong JSON type (`merge_recommendation: 7`,
 `allow_merge: "false"`) is not the same as an absent one. Absence is the state a
 reader forgives, because it is the shape of an older pack; a field that is there
