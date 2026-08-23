@@ -201,6 +201,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The MCP adapter and the CLI now answer the same way about a decision they
+  cannot rank.** A pack that stated a signal outside the vocabulary — a
+  `verdict: "PROBABLY"`, or nothing but `allow_merge` — was read as a
+  conservative `BLOCK` summary by the CLI and refused as `storage_corrupt` by
+  `prview mcp`, one artifact with two answers. `storage_corrupt` is now reserved
+  for a decision block stating none of `verdict`, `merge_recommendation` and
+  `allow_merge`; a stated-but-unrankable signal is a decision the pack gave, and
+  the adapter normalizes it exactly as the CLI does, with a caveat and
+  `normalized: true`. The substitution governs the axes published beside it, so
+  an unreadable verdict beside `merge_recommendation: "approve"` no longer reads
+  as an approval on the MCP surface while the CLI blocks on the same bytes.
+- **A self-consistent `BLOCK` pack no longer reports contradicting itself.**
+  Both readers compared `allow_merge` to the numeric rank of the winning
+  verdict, but `allow_merge` has two values and `false` ranks as `CONDITIONAL` —
+  so `verdict: "BLOCK"` beside `merge_recommendation: "block"` and
+  `allow_merge: false`, the shape every blocking run writes, raised a
+  `core_inconsistency:` caveat naming a disagreement that was not there. The
+  check now compares the textual axes to the published verdict and `allow_merge`
+  to the flag actually published.
 - **`--ci` strictness no longer depends on which preset the run resolves to.**
   `--update` outranks `--ci` when the execution preset is picked, so
   `prview --ci --fail-on-warnings --update` published `execution_mode: "update"`

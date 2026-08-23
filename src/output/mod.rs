@@ -508,7 +508,22 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     // this reader had to substitute is already named by its own caveat, and
     // calling the substitution an inconsistency would blame the artifact for
     // the reader's normalization.
-    if !normalized_to_block && stated_ranks.iter().any(|rank| *rank != final_rank) {
+    //
+    // `allow_merge` is deliberately NOT one of the axes compared here, though it
+    // still raises the rank above. `false` says "not a PASS" — it is `>= 2`, not
+    // `== 2`, and cannot reach 3 at all — so comparing it as an exact rank
+    // called every healthy BLOCK pack (`verdict: "BLOCK"`,
+    // `merge_recommendation: "block"`, `allow_merge: false`) inconsistent with
+    // itself, which is every BLOCK pack this tool writes. It contradicts the
+    // decision only when the derived `allow_merge` disagrees with the stated
+    // one, which is the test the MCP adapter already used.
+    let textual_ranks = [crate::gate::rank_from_verdict(verdict), recommendation_rank];
+    let axes_disagree = textual_ranks
+        .iter()
+        .flatten()
+        .any(|rank| *rank != final_rank)
+        || raw_allow_merge.is_some_and(|allow| allow != (final_rank == 1));
+    if !normalized_to_block && axes_disagree {
         caveats.push(format!(
             "core_inconsistency: MERGE_GATE.json states verdict={verdict}, \
              merge_recommendation={}, allow_merge={}; the most conservative signal wins",
@@ -2696,6 +2711,98 @@ api-router/app/core/cache.py
                 crate::mcp::types::error_class::STORAGE_CORRUPT,
                 "the two readers must agree on {bad}"
             );
+        }
+    }
+
+    #[test]
+    fn a_self_consistent_pack_raises_no_inconsistency_on_either_surface() {
+        // `allow_merge` is a two-valued axis: `false` can never rank as high as
+        // BLOCK, so comparing it to the numeric rank of the winning verdict made
+        // every healthy BLOCK pack look self-contradictory. The consistency
+        // check compares the textual axes to each other and `allow_merge` to the
+        // flag actually published — nothing else.
+        for decision in [
+            r#"{"merge_recommendation":"block","verdict":"BLOCK","allow_merge":false,"quality_pass":false}"#,
+            r#"{"merge_recommendation":"review_required","verdict":"CONDITIONAL","allow_merge":false,"quality_pass":true}"#,
+            r#"{"merge_recommendation":"approve","verdict":"PASS","allow_merge":true,"quality_pass":true}"#,
+        ] {
+            let pack = pack_with_gate(decision);
+
+            let cli = read_merge_gate_summary(pack.path()).expect("readable");
+            assert!(
+                !cli.caveats
+                    .iter()
+                    .any(|c| c.starts_with("core_inconsistency:")),
+                "the CLI invented a disagreement in {decision}: {:?}",
+                cli.caveats
+            );
+
+            let mcp = crate::mcp::read::read_decision(pack.path()).expect("readable");
+            assert!(
+                !mcp.caveats.iter().any(|c| c.contains("core_inconsistency")),
+                "the MCP adapter invented a disagreement in {decision}: {:?}",
+                mcp.caveats
+            );
+            assert!(
+                !mcp.normalized,
+                "a self-consistent pack is published as stated: {decision}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_present_but_unrankable_decision_reads_the_same_on_both_surfaces() {
+        // The residual of the previous round: `storage_corrupt` is reserved for
+        // a decision that states NOTHING. A signal that is present but cannot
+        // rank — a verdict outside the vocabulary, a lone `allow_merge` — is a
+        // decision the pack gave, and both readers must normalize it the same
+        // conservative way instead of one publishing a summary while the other
+        // calls the identical artifact corrupt.
+        for decision in [
+            r#"{"verdict":"PROBABLY","allow_merge":false}"#,
+            r#"{"allow_merge":false}"#,
+            r#"{"allow_merge":true}"#,
+            r#"{"merge_recommendation":"approve","verdict":"MAYBE","allow_merge":true}"#,
+        ] {
+            let pack = pack_with_gate(decision);
+
+            let cli = read_merge_gate_summary(pack.path()).expect("the CLI reads a stated signal");
+            let mcp = crate::mcp::read::read_decision(pack.path())
+                .expect("the MCP adapter reads the same signal");
+
+            assert_eq!(
+                cli.verdict, "BLOCK",
+                "a decision this reader had to substitute is not an approval: {decision}"
+            );
+            assert_eq!(
+                mcp.verdict, cli.verdict,
+                "the two readers must not disagree about {decision}"
+            );
+            assert_eq!(
+                mcp.merge_recommendation, "block",
+                "every axis follows the substituted verdict: {decision}"
+            );
+            assert!(!mcp.allow_merge, "{decision}");
+            assert!(mcp.normalized, "a substituted verdict is a normalization");
+        }
+    }
+
+    #[test]
+    fn an_unversioned_allow_merge_only_pack_reads_the_same_on_both_surfaces() {
+        // The legacy root shape of the same case: a pre-2.1 pack whose root IS
+        // the decision and whose only correctly typed field is `allow_merge`.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        for root in [r#"{"allow_merge":false}"#, r#"{"allow_merge":true}"#] {
+            std::fs::write(temp.path().join("00_summary/MERGE_GATE.json"), root).unwrap();
+
+            let cli = read_merge_gate_summary(temp.path()).expect("legacy pack stays readable");
+            let mcp = crate::mcp::read::read_decision(temp.path())
+                .expect("the MCP adapter reads the same legacy pack");
+
+            assert_eq!(cli.verdict, "BLOCK", "{root}");
+            assert_eq!(mcp.verdict, cli.verdict, "the readers must agree on {root}");
+            assert!(!mcp.allow_merge, "{root}");
         }
     }
 

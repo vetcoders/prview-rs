@@ -201,7 +201,11 @@ The decision surface is normalized so callers read one vocabulary:
 
 If the stored gate emits contradictory signals (for example `allow_merge: true`
 alongside a block recommendation), the most conservative signal wins and a
-`core_inconsistency` note is appended to `caveats`. The CLI `--json` surface
+`core_inconsistency` note is appended to `caveats`. The note reports a
+disagreement the pack actually states — the textual axes against the published
+verdict, `allow_merge` against the flag published — so a self-consistent
+`BLOCK` pack (`verdict: "BLOCK"`, `merge_recommendation: "block"`,
+`allow_merge: false`) raises no caveat at all. The CLI `--json` surface
 reconciles the same way through the same ranking
 (`gate::rank_from_verdict` / `gate::rank_from_merge_rec`), so the two surfaces
 cannot disagree about a contradictory pack. Legacy gate tokens (`ALLOW`,
@@ -216,14 +220,21 @@ case sets `normalized: true`:
 
 - `unknown_verdict:` / `unknown_merge_recommendation:` — the field was present
   but outside the known vocabulary, so it was ignored when deriving the decision.
-  A gate whose decision has NO recognizable signal at all is still a fail-loud
-  `storage_corrupt`.
+  A verdict that could not be ranked — outside the vocabulary, or simply absent
+  while another signal is stated — is substituted with `BLOCK`, and that
+  substitution governs the axes published beside it: `merge_recommendation`
+  reads `block` and `allow_merge` `false`, whatever the pack claimed. This is
+  the CLI's rule, applied here so the two readers cannot answer the same bytes
+  differently. `storage_corrupt` is reserved for a decision block stating NONE
+  of `verdict`, `merge_recommendation` and `allow_merge`; a signal that is
+  present but unrankable — including a lone `allow_merge` — is a decision the
+  pack gave, and it is normalized with a caveat rather than called corrupt.
 - `unreadable_verdict:` / `unreadable_merge_recommendation:` /
   `unreadable_allow_merge:` — the field was present with the wrong JSON type
   (`merge_recommendation: 7`, `allow_merge: "false"`). A wrongly typed field is
   not an absent one: it is ignored for ranking, but it is named, and the
-  remaining signals still have to yield a decision or the pack is
-  `storage_corrupt`.
+  decision is normalized conservatively around it. The pack is
+  `storage_corrupt` only when no signal was stated at all.
 - `schema_forward_compat:` — the pack's `schema_version` is a newer MINOR of a
   known MAJOR; it is read, and fields this build does not know are ignored. An
   unknown MAJOR is `storage_corrupt`, and so is a `schema_version` that is
@@ -361,7 +372,7 @@ fields (e.g. `retry_after_ms`, `active_run_id`, `run_id`).
 | `artifact_missing` | The requested artifact does not exist within the run, is not UTF-8 text, or would escape the run directory. |
 | `tool_missing` | A required external tool is unavailable. |
 | `storage_locked` | Another review is already running for this repo branch. Carries `active_run_id` and `retry_after_ms`. |
-| `storage_corrupt` | `MERGE_GATE.json` is missing, invalid, carries a `schema_version` with an unknown MAJOR, has no recognizable decision, or an explicit `run_id` is ambiguous in storage. |
+| `storage_corrupt` | `MERGE_GATE.json` is missing, invalid, carries a `schema_version` with an unknown MAJOR, states no decision signal at all, or an explicit `run_id` is ambiguous in storage. |
 | `stale_run` | The run is still in progress or its process died before completing. Carries `retry_after_ms` while running. |
 
 ### Retrying

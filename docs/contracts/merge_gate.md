@@ -222,14 +222,29 @@ verdict mismatch. `GateVerdict` stays a strict parser of the canonical spellings
 it is fed the folded value, never the raw one.
 
 A verdict outside `PASS` / `CONDITIONAL` / `BLOCK` (and the legacy synonyms) is
-never read as-is and never silently dropped: the CLI collapses it to `BLOCK` with
-an `unknown_verdict:` caveat, and the MCP adapter ignores it for ranking, emits
-the same caveat, and sets `normalized: true`. A verdict the CLI substituted this
-way also governs everything derived beside it: `allow_merge` is forced `false`
-and `merge_recommendation` to `block`, whatever the same decision block claimed.
-A pack whose verdict could not be read is not a pack whose approval can be
+never read as-is and never silently dropped: BOTH readers collapse it to `BLOCK`
+with an `unknown_verdict:` caveat, and the MCP adapter additionally sets
+`normalized: true`. A verdict a reader substituted this way also governs
+everything derived beside it: `allow_merge` is forced `false` and
+`merge_recommendation` to `block`, whatever the same decision block claimed. A
+pack whose verdict could not be read is not a pack whose approval can be
 trusted, and the exit code follows the recommendation — so the invariant
-`allow_merge == (verdict == "PASS")` holds on the substituted verdict too.
+`allow_merge == (verdict == "PASS")` holds on the substituted verdict too. The
+same holds for a verdict that is simply absent while another signal is stated:
+the surviving `merge_recommendation: "approve"` does not buy a `PASS` on either
+surface, because a pack that names no verdict has not approved anything.
+
+That is what keeps "the artifact is corrupt" and "the artifact said something
+this reader cannot use" apart on every surface. `storage_corrupt` is reserved
+for a decision block stating none of the three signals. A signal that is present
+but unrankable — a verdict outside the vocabulary, a recommendation outside it,
+a lone `allow_merge` — is a decision the pack DID give, so it is normalized
+conservatively with a caveat instead of being called corrupt by one reader while
+the other publishes a summary from it. `allow_merge` is itself a rankable
+signal: `false` ranks as `CONDITIONAL` and `true` as `PASS`, and a pack stating
+nothing but `allow_merge: true` therefore still reads as `BLOCK` on both
+surfaces, because its missing verdict is substituted before its lone flag is
+ranked.
 
 The accepted version set is exactly the one `tools/validate_merge_gate.py`
 accepts, compared as written — a spelling that merely parses to a known tuple
@@ -264,6 +279,17 @@ beside `review_required` never buys a `PASS`. Both readers rank through
 outside the `approve` / `review_required` / `block` vocabulary cannot rank, so
 it is excluded from the reconciliation and named with an
 `unknown_merge_recommendation:` caveat rather than dropped in silence.
+
+The `core_inconsistency:` caveat reports a disagreement the pack actually
+states, so the comparison is made per axis rather than against the winning rank:
+the two textual axes are compared to the published verdict, and `allow_merge` to
+the `allow_merge` the readers publish. `allow_merge` has only two values and
+`false` ranks as `CONDITIONAL`, so measuring it against a rank it can never
+reach made every healthy `BLOCK` pack — `verdict: "BLOCK"`,
+`merge_recommendation: "block"`, `allow_merge: false` — report a contradiction
+it did not contain. A pack whose verdict was substituted reports the
+substitution (`unknown_verdict:`, `unreadable_<field>:`) and is not additionally
+accused of contradicting itself.
 
 ## Blocking rules
 
