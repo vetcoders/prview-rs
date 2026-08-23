@@ -814,3 +814,102 @@ fn init_command_creates_policy_and_updates_gitignore() {
             "prview-artifacts already in .gitignore",
         ));
 }
+
+/// Recursively find the one `00_summary/MERGE_GATE.json` under `root`.
+fn find_merge_gate(root: &Path) -> Option<std::path::PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_merge_gate(&path) {
+                return Some(found);
+            }
+        } else if path.ends_with("00_summary/MERGE_GATE.json") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[test]
+fn an_unchanged_update_run_still_honors_fail_on_warnings() {
+    // `--update` with no new commits reuses the previous pack, and that pack is
+    // what the run reports. Forcing exit 0 there made a warnings-clean CI job
+    // turn green on its second invocation while the reused pack still carried
+    // warnings — the flag promises exit 1 whenever any pack check warns.
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+    let home = tempfile::tempdir().expect("prview home");
+
+    // A first run produces the pack the update run will reuse.
+    Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(repo)
+        .env("PRVIEW_HOME", home.path())
+        .args([
+            "--quick",
+            "--quiet",
+            "--no-zip",
+            "--no-heuristics",
+            "--no-fetch",
+            "--local-only",
+        ])
+        .output()
+        .expect("first run");
+
+    // Plant a decision that is clean on every axis EXCEPT one warning check, so
+    // the exit code can only come from the warning-hardening flag.
+    let gate = find_merge_gate(home.path()).expect("the first run wrote a pack");
+    fs::write(
+        &gate,
+        r#"{
+  "schema_version": "2.2",
+  "decision": {
+    "verdict": "PASS",
+    "merge_recommendation": "approve",
+    "allow_merge": true,
+    "quality_pass": true,
+    "analysis_status": "complete"
+  },
+  "checks": [{"id": "rustfmt", "status": "warnings"}]
+}"#,
+    )
+    .expect("plant gate");
+
+    let update_args = [
+        "--ci",
+        "--update",
+        "--quiet",
+        "--no-zip",
+        "--no-heuristics",
+        "--no-fetch",
+        "--local-only",
+    ];
+
+    // Without the flag the reused pack is advisory: warnings do not fail CI.
+    let lenient = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(repo)
+        .env("PRVIEW_HOME", home.path())
+        .args(update_args)
+        .output()
+        .expect("lenient update run");
+    assert_eq!(
+        lenient.status.code(),
+        Some(0),
+        "an unchanged run over a non-blocking pack still exits 0: {}",
+        String::from_utf8_lossy(&lenient.stderr)
+    );
+
+    let strict = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(repo)
+        .env("PRVIEW_HOME", home.path())
+        .args(update_args)
+        .arg("--fail-on-warnings")
+        .output()
+        .expect("strict update run");
+    assert_eq!(
+        strict.status.code(),
+        Some(1),
+        "the reused pack warns, so --fail-on-warnings must exit 1: {}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+}

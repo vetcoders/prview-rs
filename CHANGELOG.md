@@ -201,6 +201,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--ci` strictness no longer depends on which preset the run resolves to.**
+  `--update` outranks `--ci` when the execution preset is picked, so
+  `prview --ci --fail-on-warnings --update` published `execution_mode: "update"`
+  — and the exit code read its strictness off that label. Both `--ci` exits, the
+  `!quality_pass` one and the warning hardening clap insists on `--ci` for, were
+  therefore inert for exactly the combination CI jobs use. Strictness now follows
+  the flag the caller typed. On top of that, an `--update` run with no new
+  commits forced exit `0` outright: it reuses the previous pack and reports it,
+  so a second invocation turned a warning-carrying — or outright `BLOCK` — pack
+  green. Such a run now derives its exit from the pack it reused, like every
+  other run; `--soft-exit` stays the one deliberate way to ask for `0`.
+  (`output::compute_exit_code` takes the strictness explicitly as a result.)
 - **A `MERGE_GATE.json` decision that states nothing is corrupt, not a BLOCK.**
   A pack shaped `{"schema_version":"2.2","decision":{}}` passed the CLI's
   structural check — the object is there and it is an object — and then

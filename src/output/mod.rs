@@ -259,13 +259,20 @@ pub fn build_cli_json_summary(config: &Config, report: &Report) -> anyhow::Resul
 ///   generates (`public_api_diff`, `unsafe_audit`, `ghost_refs`,
 ///   `heuristics_loctree`) warn like any other check, and a flag that promises
 ///   to fail on any warning cannot be blind to four of them.
-pub fn compute_exit_code(summary: &CliJsonSummary, fail_on_warnings: bool) -> i32 {
+///
+/// `strict` is the INVOCATION's answer to "did the caller ask for `--ci`?", not
+/// a property read back off the published summary. It used to be derived from
+/// `mode.execution_mode == "ci"`, and that label is a preset name, not a
+/// strictness flag: `--update` outranks `--ci` when the preset is resolved, so
+/// `--ci --fail-on-warnings --update` published `execution_mode: "update"` and
+/// silently ran lenient — the flag clap had just insisted on `--ci` for could
+/// not fire, and neither could the `!quality_pass` exit `--ci` promises.
+pub fn compute_exit_code(summary: &CliJsonSummary, strict: bool, fail_on_warnings: bool) -> i32 {
     use crate::policy::engine::MergeRecommendation;
 
     if summary.merge_recommendation == MergeRecommendation::Block {
         return 1;
     }
-    let strict = summary.mode.execution_mode == "ci";
     if strict && !summary.quality_pass {
         return 1;
     }
@@ -1638,7 +1645,7 @@ mod tests {
 
         let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_eq!(summary.status, "ok");
-        assert_eq!(compute_exit_code(&summary, false), 0);
+        assert_eq!(compute_exit_code(&summary, false, false), 0);
     }
 
     #[test]
@@ -1676,7 +1683,7 @@ mod tests {
             summary.merge_recommendation,
             crate::policy::engine::MergeRecommendation::ReviewRequired
         );
-        assert_eq!(compute_exit_code(&summary, false), 0);
+        assert_eq!(compute_exit_code(&summary, false, false), 0);
     }
 
     #[test]
@@ -1710,7 +1717,7 @@ mod tests {
 
         let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_eq!(summary.mode.execution_mode, "ci");
-        assert_eq!(compute_exit_code(&summary, false), 1);
+        assert_eq!(compute_exit_code(&summary, true, false), 1);
     }
 
     #[test]
@@ -1750,8 +1757,8 @@ mod tests {
         assert_eq!(summary.mode.execution_mode, "ci");
         assert_eq!(summary.checks_summary.warned, 1);
         assert!(summary.quality_pass);
-        assert_eq!(compute_exit_code(&summary, false), 0);
-        assert_eq!(compute_exit_code(&summary, true), 1);
+        assert_eq!(compute_exit_code(&summary, true, false), 0);
+        assert_eq!(compute_exit_code(&summary, true, true), 1);
     }
 
     #[test]
@@ -1786,7 +1793,50 @@ mod tests {
 
         let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_ne!(summary.mode.execution_mode, "ci");
-        assert_eq!(compute_exit_code(&summary, true), 0);
+        assert_eq!(compute_exit_code(&summary, false, true), 0);
+    }
+
+    #[test]
+    fn the_preset_label_does_not_decide_ci_strictness() {
+        // `--update` outranks `--ci` when the preset is resolved, so a
+        // `--ci --fail-on-warnings --update` run publishes
+        // `execution_mode: "update"`. Deriving strictness from that label made
+        // the flag clap had just insisted on `--ci` for silently inert, and took
+        // the `!quality_pass` exit `--ci` promises down with it.
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Update;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        std::fs::write(
+            temp.path().join("00_summary/MERGE_GATE.json"),
+            r#"{"decision":{"verdict":"CONDITIONAL","merge_recommendation":"review_required","allow_merge":false,"quality_pass":true},
+                "checks":[{"id":"rustfmt","status":"warnings"}]}"#,
+        )
+        .unwrap();
+        let report = Report {
+            target: "feature/update-strictness".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![],
+            heuristics: None,
+            artifacts_dir: temp.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: true,
+        };
+
+        let summary = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
+        assert_eq!(summary.mode.execution_mode, "update");
+        assert_eq!(summary.checks_summary.warned_in_pack, 1);
+        assert_eq!(
+            compute_exit_code(&summary, true, true),
+            1,
+            "the caller asked for --ci, so the pack's warning fails the run"
+        );
+        assert_eq!(
+            compute_exit_code(&summary, false, true),
+            0,
+            "without --ci the escape hatch stays inert, preset or not"
+        );
     }
 
     #[test]
@@ -1817,7 +1867,7 @@ mod tests {
             summary.merge_recommendation,
             crate::policy::engine::MergeRecommendation::Block
         );
-        assert_eq!(compute_exit_code(&summary, false), 1);
+        assert_eq!(compute_exit_code(&summary, false, false), 1);
     }
 
     #[test]
@@ -2208,7 +2258,7 @@ api-router/app/core/cache.py
         };
         let cli = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_eq!(
-            compute_exit_code(&cli, false),
+            compute_exit_code(&cli, false, false),
             1,
             "a BLOCK verdict must not exit 0"
         );
@@ -2281,7 +2331,7 @@ api-router/app/core/cache.py
         };
         let cli = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_eq!(
-            compute_exit_code(&cli, false),
+            compute_exit_code(&cli, false, false),
             1,
             "a BLOCK gate must fail the process even outside CI"
         );
@@ -2385,12 +2435,12 @@ api-router/app/core/cache.py
             cli.checks_summary
         );
         assert_eq!(
-            compute_exit_code(&cli, true),
+            compute_exit_code(&cli, true, true),
             1,
             "--ci --fail-on-warnings must fail on a warning only the pack knows about"
         );
         assert_eq!(
-            compute_exit_code(&cli, false),
+            compute_exit_code(&cli, true, false),
             0,
             "without the flag a warning still does not fail the run"
         );
@@ -2432,7 +2482,7 @@ api-router/app/core/cache.py
             "{:?}",
             cli.checks_summary
         );
-        assert_eq!(compute_exit_code(&cli, true), 1);
+        assert_eq!(compute_exit_code(&cli, true, true), 1);
     }
 
     #[test]
@@ -2481,7 +2531,7 @@ api-router/app/core/cache.py
         };
         let cli = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
         assert_eq!(
-            compute_exit_code(&cli, false),
+            compute_exit_code(&cli, false, false),
             1,
             "a pack with an unreadable decision signal must not exit 0"
         );

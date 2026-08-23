@@ -311,6 +311,19 @@ tally is built from. The `--json` summary states both numbers:
 `checks_summary.warned` is what the CLI ran, `checks_summary.warned_in_pack` is
 the complete count the flag keys off, and it is always the larger of the two.
 
+Strictness follows the `--ci` you typed, not the preset label the run reports.
+`--update` outranks `--ci` when the execution preset is resolved, so
+`prview --ci --fail-on-warnings --update` publishes `mode.execution_mode:
+"update"` — and reading strictness off that label made both `--ci` exits
+(`!quality_pass` and the warning hardening) silently inert for exactly the
+combination CI jobs use.
+
+An `--update` run that finds no new commits reuses the previous pack, and its
+exit code is derived from that pack like any other run's: a reused `BLOCK` or a
+reused warning under `--fail-on-warnings` exits non-zero rather than reporting a
+green second invocation over an artifact nothing re-checked. `--soft-exit`
+remains the one way to ask for `0` regardless.
+
 ## Examples
 
 ### Rust project

@@ -127,14 +127,30 @@ async fn run() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&cli_summary)?);
     }
 
-    // Exit with appropriate code. An unchanged --update run re-checked nothing,
-    // so it exits 0 regardless of --json — previously the human path exited 0
-    // while the JSON path derived its code from an empty gate.
-    let exit_code = if report.unchanged || cli.soft_exit {
+    // An unchanged `--update` run re-checked nothing, but it REPORTS the pack it
+    // reused, and the exit code follows the summary it just published — the same
+    // rule every other run obeys. Forcing 0 here made a second `--ci
+    // --fail-on-warnings` invocation turn green over a pack that still warned,
+    // and it swallowed a reused BLOCK just as quietly. The original reason for
+    // the shortcut is gone: the code was derived from an EMPTY gate back when a
+    // missing pack was re-derived, and an unreadable pack now exits 3 above.
+    // `--soft-exit` stays the one deliberate way to ask for 0.
+    let exit_code = if cli.soft_exit {
         0
     } else {
-        prview::output::compute_exit_code(&cli_summary, cli.fail_on_warnings)
+        prview::output::compute_exit_code(&cli_summary, cli.ci, cli.fail_on_warnings)
     };
+
+    // A human unchanged run prints "Nothing to update." and no verdict, so say
+    // which verdict the exit code came from instead of failing wordlessly.
+    if report.unchanged && !cli.json && !cli.quiet && exit_code != 0 {
+        println!(
+            "{} Reused verdict: {} (exit {})",
+            "ℹ".blue(),
+            cli_summary.verdict,
+            exit_code
+        );
+    }
 
     std::process::exit(exit_code);
 }
