@@ -149,14 +149,21 @@ a valid completed review). Response:
   "gates": [
     {
       "id": "cargo_test",
+      "name": "Cargo test",
       "status": "passed",
       "execution_state": "executed",
       "outcome": "passed",
+      "class": "PASS",
+      "severity": "block",
+      "policy_conclusion": "satisfied",
       "blocking": false,
       "merge_impact": "approve",
       "confidence_impact": "complete",
+      "duration_secs": 12.4,
+      "cached": false,
       "reason": null,
-      "evidence": "20_quality/cargo_test.result.json"
+      "evidence": "20_quality/cargo_test.result.json",
+      "log": "20_quality/cargo_test.log"
     }
   ],
   "artifact_paths": {
@@ -281,14 +288,21 @@ Completed response:
   "gates": [
     {
       "id": "clippy",
+      "name": "Clippy",
       "status": "passed",
       "execution_state": "executed",
       "outcome": "passed",
+      "class": "PASS",
+      "severity": "block",
+      "policy_conclusion": "satisfied",
       "blocking": false,
       "merge_impact": "approve",
       "confidence_impact": "complete",
+      "duration_secs": 4.2,
+      "cached": false,
       "reason": null,
-      "evidence": "20_quality/clippy.result.json"
+      "evidence": "20_quality/clippy.result.json",
+      "log": "20_quality/clippy.log"
     }
   ],
   "generated_at": "2026-07-01T12:00:03+02:00",

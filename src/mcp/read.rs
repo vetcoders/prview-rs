@@ -949,23 +949,7 @@ pub fn read_gates(run_dir: &Path) -> Vec<serde_json::Value> {
     value
         .get("checks")
         .and_then(|c| c.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|g| {
-                    serde_json::json!({
-                        "id": g.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                        "status": g.get("status").cloned().unwrap_or(serde_json::Value::Null),
-                        "execution_state": g.get("execution_state").cloned().unwrap_or(serde_json::Value::Null),
-                        "outcome": g.get("outcome").cloned().unwrap_or(serde_json::Value::Null),
-                        "blocking": g.get("blocking").cloned().unwrap_or(serde_json::Value::Null),
-                        "merge_impact": g.get("merge_impact").cloned().unwrap_or(serde_json::Value::Null),
-                        "confidence_impact": g.get("confidence_impact").cloned().unwrap_or(serde_json::Value::Null),
-                        "reason": g.get("reason").cloned().unwrap_or(serde_json::Value::Null),
-                        "evidence": g.get("evidence").cloned().unwrap_or(serde_json::Value::Null),
-                    })
-                })
-                .collect()
-        })
+        .cloned()
         .unwrap_or_default()
 }
 
@@ -988,31 +972,33 @@ mod tests {
     #[test]
     fn read_gates_preserves_policy_axes() {
         let dir = tempfile::tempdir().unwrap();
+        let row = serde_json::json!({
+            "id": "semgrep_scan",
+            "name": "Semgrep scan",
+            "status": "warnings",
+            "execution_state": "executed",
+            "outcome": "findings_warning",
+            "class": "INFO",
+            "severity": "warn",
+            "policy_conclusion": "advisory",
+            "blocking": false,
+            "merge_impact": "review_required",
+            "confidence_impact": "degraded",
+            "duration_secs": 1.25,
+            "cached": false,
+            "reason": "partial parse",
+            "evidence": "20_quality/semgrep_scan.result.json",
+            "log": "20_quality/semgrep_scan.log"
+        });
         write_gate(
             dir.path(),
             &serde_json::json!({
-                "checks": [{
-                    "id": "semgrep_scan",
-                    "status": "warnings",
-                    "execution_state": "executed",
-                    "outcome": "findings_warning",
-                    "blocking": false,
-                    "merge_impact": "review_required",
-                    "confidence_impact": "degraded",
-                    "reason": "partial parse",
-                    "evidence": "20_quality/semgrep_scan.result.json"
-                }]
+                "checks": [row.clone()]
             }),
         );
 
         let gates = read_gates(dir.path());
-        assert_eq!(gates.len(), 1);
-        let gate = &gates[0];
-        assert_eq!(gate["execution_state"], "executed");
-        assert_eq!(gate["outcome"], "findings_warning");
-        assert_eq!(gate["blocking"], false);
-        assert_eq!(gate["merge_impact"], "review_required");
-        assert_eq!(gate["confidence_impact"], "degraded");
+        assert_eq!(gates, vec![row]);
     }
 
     #[test]

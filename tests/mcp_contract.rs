@@ -844,15 +844,26 @@ fn verdict_on_completed_run_reports_decision() {
     let gates = body["gates"].as_array().expect("gates array");
     assert!(!gates.is_empty());
     for field in [
+        "id",
+        "name",
+        "status",
         "execution_state",
         "outcome",
+        "class",
+        "severity",
+        "policy_conclusion",
         "blocking",
         "merge_impact",
         "confidence_impact",
+        "duration_secs",
+        "cached",
+        "reason",
+        "evidence",
+        "log",
     ] {
         assert!(
-            gates[0].get(field).is_some_and(|value| !value.is_null()),
-            "MCP gate row must preserve {field}"
+            gates[0].get(field).is_some(),
+            "MCP gate row must preserve the complete MERGE_GATE field {field}"
         );
     }
 }

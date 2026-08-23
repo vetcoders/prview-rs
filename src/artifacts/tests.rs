@@ -1205,6 +1205,19 @@ fn merge_gate_marks_heuristics_disabled_as_not_run() {
     assert_eq!(heuristics_check["status"].as_str(), Some("skipped"));
     assert_eq!(heuristics_check["class"].as_str(), Some("SKIP"));
     assert_eq!(heuristics_check["blocking"].as_bool(), Some(false));
+    for field in [
+        "execution_state",
+        "outcome",
+        "policy_conclusion",
+        "confidence_impact",
+        "merge_impact",
+        "reason",
+    ] {
+        assert!(
+            heuristics_check.get(field).is_some(),
+            "fallback heuristics row must preserve {field}"
+        );
+    }
 }
 
 #[test]

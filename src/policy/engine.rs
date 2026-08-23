@@ -366,7 +366,11 @@ impl<'a> PolicyEngine<'a> {
 fn is_mode_skip_reason(reason: &str) -> bool {
     matches!(
         reason,
-        "security disabled" | "lint disabled" | "tests disabled" | "requires --security-full"
+        "security disabled"
+            | "lint disabled"
+            | "tests disabled"
+            | "heuristics disabled"
+            | "requires --security-full"
     )
 }
 
@@ -530,5 +534,10 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn explicitly_disabled_heuristics_is_a_mode_skip() {
+        assert!(is_mode_skip_reason("heuristics disabled"));
     }
 }
