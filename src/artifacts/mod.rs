@@ -449,13 +449,18 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     // 30_context/
     let t = Instant::now();
     generate_changed_tests(diffs, &context_dir)?;
-    let deps_delta = signal::generate_deps_delta(&context_dir, diffs, &repo).ok();
+    let _deps_delta = signal::generate_deps_delta(&context_dir, diffs, &repo).ok();
+    let cargo_root = config
+        .profile
+        .cargo_root
+        .as_deref()
+        .unwrap_or(config.repo_root.as_path());
     let inline_summary = generate_inline_findings(
         &context_dir,
         &all_checks,
         diffs,
-        deps_delta.as_ref(),
         Some(&repo),
+        Some(cargo_root),
     )?;
     signal::generate_pattern_scan(&context_dir, diffs, &repo)?;
 
