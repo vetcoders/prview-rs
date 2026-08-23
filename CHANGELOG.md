@@ -201,6 +201,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A body-less test item can now end its own test context.** After a top-level
+  `=` an item states a value, but the perf tracker kept reading `<` as a generic
+  opener there, so `#[cfg(test)] const ENABLED: bool = 1<2;` left the signature's
+  bracket depth above zero — the very thing the `;` close tests. The item could
+  not end the context it opened, and every loop or query below it was recorded as
+  test-only and dropped from the signal. Angle tracking now stops at the item's
+  top-level `=`, the same rule the declaration scanner already applies. The
+  reported shape is a comparison, but the corpus idiom is the compact shift
+  (`const Reverse = 1<<8;`, as objc2 generates its bitflags): of 2,206,540
+  single-line `const`/`static`/`type` declarations in the local crates.io
+  registry that end at their own `;`, 1,069 left the depth stuck open before this
+  change and 64 still do — and those 64 are an array type wrapping to the next
+  line, where holding the depth open is exactly right.
 - **A turbofish return type no longer hides a changed public signature.**
   `pub fn run() -> Buffer::<{` is a valid return type — rustc accepts
   `Type::<…>` in type position — but its `<` follows a `:`, which the scanner did

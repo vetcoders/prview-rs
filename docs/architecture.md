@@ -1041,6 +1041,24 @@ comparison. Those 6 reached the right verdict before only through the clamp —
 the path's `>` closed the outer list, and the outer list's own `>` was then
 clamped away — and now reach it by construction.
 
+The item's own top-level `=` is the second such boundary, and by frequency the
+larger one. After it the item states a VALUE, so both angle characters are
+operators, and tracking is frozen for the rest of the item. A body-less item ends
+at its `;` — the close that tests whether the signature's brackets are balanced —
+so a counted comparison there could not be undone by anything: the context stayed
+open and every production hit below the test was recorded as test-only, which
+over-detects test context and HIDES work. `#[cfg(test)] const ENABLED: bool =
+1<2;` is the reported shape, but the corpus idiom is the compact SHIFT, because
+this tracker (unlike the declaration scanner) has no rule consuming `<<` whole.
+Measured over the local registry on the same code-only view the tracker reads,
+excluding lines with lifetimes, which this model cannot lex: of 2,206,540
+single-line `const`/`static`/`type` declarations ending at their own `;`, 1,069
+left the bracket depth stuck open under the old rule — dominated by
+`const Reverse = 1<<8;` as objc2 generates its bitflags — and 64 still do. Those
+64 are not a residual bug but the protection working: an array type wrapping to
+the next line (`pub static X: [[u16; N];`) must hold its depth open so that `;`
+is not mistaken for the end of the item.
+
 #### signal/coverage.rs — coverage delta computation
 
 Cross-references changed source files with test files to estimate test coverage:
