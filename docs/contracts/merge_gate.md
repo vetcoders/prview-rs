@@ -161,7 +161,10 @@ by `derive_decision` (`src/artifacts/verdict.rs`), which calls
 - **`derive_decision` is the single source** of `verdict`, `allow_merge`, and
   `recommended_merge`. No caller sets these fields independently.
 - **`policy_allow_merge` is a distinct axis** ("policy did not hard-block") and
-  is not conflated with `allow_merge` or the recommendation.
+  is not conflated with `allow_merge` or the recommendation. It is derived from
+  one input and set nowhere else: `policy_allow_merge == blocking_issues.is_empty()`,
+  computed after the last entry is pushed and emitted beside that list. The
+  contract validator enforces the equivalence in both directions from 2.2.
 - **Only `origin: "failure"` entries may fail the quality gate.** Warning-level
   checks enter `quality_failures` (and its classification arrays) so the
   pre-existing downgrade can be computed for them, but they never flip
@@ -315,6 +318,25 @@ not a detail — a failure that predates the diff is published beside
 forces `quality_pass: false`" would reject a legitimate pack, and a validator
 that cries wolf on genuine output gates nothing. A pack that omits
 `quality_pass` entirely is left alone, per the absence rule below.
+
+The blocker axis is cross-checked the same way, and for the same reason. The
+emitter computes `policy_allow_merge = blocking_issues.is_empty()` after the
+last entry is pushed to that list and then writes both verbatim, so
+
+> `policy_allow_merge` is true if and only if `blocking_issues` is empty.
+
+Both directions are checked from 2.2, where both fields are required.
+`policy_allow_merge: true` beside a listed blocker is the shape that matters: it
+tells a reader trusting the flag that policy let the merge through while the list
+beside it names what blocked it. `false` with nothing in the list is equally
+unemittable and rejected too. This is not the same rule as the ranking below,
+which asks only how conservative the pack is and is satisfied by either half —
+ranking a pair does not check that the pair agrees. It is also not the
+pre-existing "no `allow_merge: true` beside a blocker" rule: that one is about
+the merge verdict, this one about the policy flag it is derived from. A test in
+`src/artifacts/merge_gate.rs` pins the flag to the list across the emitted packs,
+so the day the flag gains a second input the emitter fails rather than the
+validator rejecting output prview still writes.
 
 ### The reconciliation is certified, not only read
 

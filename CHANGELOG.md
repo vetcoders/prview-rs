@@ -201,6 +201,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The blocker flag and the blocker list are certified as one fact.** The
+  emitter computes `policy_allow_merge = blocking_issues.is_empty()` after the
+  last entry is pushed and writes both verbatim, but the contract validator used
+  that relation only in the harsher direction — a listed blocker raises the
+  verdict a pack must clear — which left the two halves free to contradict each
+  other outright. `policy_allow_merge: true` beside a listed blocker certified
+  clean, telling a reader that trusts the flag that policy let the merge through
+  while the list beside it named what blocked it. From schema 2.2, where both
+  fields are required, `tools/validate_merge_gate.py` enforces the equivalence in
+  both directions: `true` with blockers and `false` without them are both
+  rejected. This completes the reconciliation port rather than adding a rule to
+  it — same shape as the `quality_pass` / `quality_failure_details` equivalence,
+  and distinct from the older "no `allow_merge: true` beside a blocker" check,
+  which is about the merge verdict rather than the policy flag it derives from. A
+  test in `src/artifacts/merge_gate.rs` pins the flag to the list across the
+  emitted packs, so a second input to the flag fails the emitter instead of
+  making the validator reject prview's own output. Probed against every pack on
+  disk: no pack from a real run is rejected.
 - **An `impl` owner is part of a declaration's site.** A `pub` associated item
   moved between two impl blocks in one file — `pub const VALUE` leaving `impl A`
   and appearing in `impl B` — matched on file, kind, name and text with an empty

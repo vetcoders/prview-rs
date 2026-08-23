@@ -1056,13 +1056,155 @@ fn validator_rejects_a_verdict_its_own_axes_contradict() {
             }),
             true,
         ),
-        // A BLOCK whose blocker is stated only as a policy flag.
+        // A BLOCK whose blocker is stated ONLY as a policy flag. This case was
+        // asserted legal when the reconciliation rule landed, on the assumption
+        // that a pack may state either half of the blocker axis. The source says
+        // otherwise: the emitter computes
+        // `policy_allow_merge = blocking_issues.is_empty()` after the last push
+        // to that list, so the flag and the list are one fact written twice and
+        // `false` beside an empty list is unemittable. The correction is not a
+        // relaxation — this shape is now rejected, by the equivalence the test
+        // below pins.
         (
             serde_json::json!({
                 "verdict": "BLOCK",
                 "allow_merge": false,
                 "merge_recommendation": "block",
                 "policy_allow_merge": false,
+            }),
+            false,
+        ),
+    ];
+
+    for (patch, must_validate) in cases {
+        let mut gate = original.clone();
+        gate["decision"] = with(&clean, patch.clone());
+        std::fs::write(
+            &merge_gate,
+            serde_json::to_string_pretty(&gate).expect("serialize gate"),
+        )
+        .expect("write gate");
+
+        let assertion = Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert();
+        if must_validate {
+            assertion.success();
+        } else {
+            assertion.failure();
+        }
+    }
+
+    // The shape the emitter actually writes still validates.
+    std::fs::write(&merge_gate, &raw).expect("restore gate");
+    Command::new("python3")
+        .arg(&validator)
+        .arg(&merge_gate)
+        .assert()
+        .success();
+}
+
+/// The blocker axis is one fact written twice, and the gate certifies it as one.
+///
+/// The emitter computes `policy_allow_merge = blocking_issues.is_empty()` after
+/// the last push to that list, and then emits both verbatim, so the flag has no
+/// input the list does not have. The reconciliation rule only used that in the
+/// harsher direction — a non-empty list raises the required verdict — which left
+/// the two fields free to contradict each other outright: a pack claiming
+/// `policy_allow_merge: true` beside real blockers, or `false` beside none,
+/// certified clean while every reader treats the pair as a single signal.
+///
+/// Both illegal shapes below carry a `BLOCK` verdict, the most conservative one
+/// there is, so the reconciliation cannot be what rejects them. Only the
+/// equivalence can.
+#[test]
+fn validator_rejects_a_blocker_flag_its_blocking_issues_contradict() {
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+
+    let payload = run_json_quiet(repo, &["feature/json-contract", "main"]);
+    let output_dir = Path::new(
+        payload["output_dir"]
+            .as_str()
+            .expect("output_dir should be a string"),
+    );
+    let merge_gate = output_dir.join("00_summary/MERGE_GATE.json");
+    let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
+
+    let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
+    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+
+    let with = |base: &serde_json::Value, patch: serde_json::Value| {
+        let mut decision = base.clone();
+        for (key, value) in patch.as_object().expect("patch object") {
+            decision[key] = value.clone();
+        }
+        decision
+    };
+    let clean = with(
+        &original["decision"],
+        serde_json::json!({
+            "verdict": "PASS",
+            "allow_merge": true,
+            "merge_recommendation": "approve",
+            "analysis_status": "complete",
+            "quality_pass": true,
+            "policy_allow_merge": true,
+            "blocking_issues": [],
+            "quality_failure_details": [],
+        }),
+    );
+
+    // (decision patch over `clean`, must_validate)
+    let cases: [(serde_json::Value, bool); 5] = [
+        // The reported hole: blockers listed, yet the flag says policy let the
+        // merge through.
+        (
+            serde_json::json!({
+                "verdict": "BLOCK",
+                "allow_merge": false,
+                "merge_recommendation": "block",
+                "policy_allow_merge": true,
+                "blocking_issues": ["Semgrep (failed)"],
+            }),
+            false,
+        ),
+        // The other direction, unemittable for the same reason: policy is said to
+        // have blocked, but the list it is computed from is empty.
+        (
+            serde_json::json!({
+                "verdict": "BLOCK",
+                "allow_merge": false,
+                "merge_recommendation": "block",
+                "policy_allow_merge": false,
+                "blocking_issues": [],
+            }),
+            false,
+        ),
+        // Legal shapes. The clean pass itself: no blockers, flag agrees.
+        (serde_json::json!({}), true),
+        // A healthy BLOCK: blockers listed, flag agrees.
+        (
+            serde_json::json!({
+                "verdict": "BLOCK",
+                "allow_merge": false,
+                "merge_recommendation": "block",
+                "analysis_status": "incomplete",
+                "policy_allow_merge": false,
+                "blocking_issues": ["Semgrep (failed)"],
+            }),
+            true,
+        ),
+        // A CONDITIONAL nobody blocked: the equivalence says nothing about the
+        // axes that made it conditional.
+        (
+            serde_json::json!({
+                "verdict": "CONDITIONAL",
+                "allow_merge": false,
+                "analysis_status": "degraded",
+                "policy_allow_merge": true,
+                "blocking_issues": [],
             }),
             true,
         ),
