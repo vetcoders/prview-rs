@@ -808,10 +808,14 @@ struct OpenAttribute {
 /// therefore accumulated until its delimiters balance, and only the finished
 /// text becomes a guard.
 ///
-/// Whitespace is dropped so `#[cfg(feature="a")]`, `#[cfg(feature = "a")]` and
-/// the same predicate wrapped across four lines are ONE predicate: reformatting
-/// an attribute is not a different gate, and reading it as one would report a
-/// removal that never happened.
+/// Whitespace OUTSIDE the literals is dropped so `#[cfg(feature="a")]`,
+/// `#[cfg(feature = "a")]` and the same predicate wrapped across four lines are
+/// ONE predicate: reformatting an attribute is not a different gate, and reading
+/// it as one would report a removal that never happened. Whitespace INSIDE a
+/// literal is kept, because it is part of the value the compiler matches on:
+/// dropping it too made `#[cfg(api = "a b")]` and `#[cfg(api = "ab")]` one
+/// guard, and a struct that really left builds configured with
+/// `--cfg 'api="a b"'` paired with its re-add under another value.
 ///
 /// Comments are resolved away before any of that, by one
 /// [`SourceScanner`](crate::rust_source::SourceScanner) per side fed one
@@ -878,11 +882,16 @@ impl CfgGuard {
         // constructs and differ only in what they emit.
         let counted = self.depth_scanner.code_only(trimmed);
         let counted = counted.trim().to_string();
-        let resolved = self.text_scanner.code_with_literals(trimmed);
+        // Already whitespace-free outside its literals, which is why nothing
+        // here filters the text a second time: a blanket filter reached INSIDE
+        // the literals too, and `#[cfg(api = "a b")]` normalized to the same
+        // guard as `#[cfg(api = "ab")]`. The space is part of the value the
+        // compiler matches on, so a struct that really left builds configured
+        // with `--cfg 'api="a b"'` paired with its re-add under another value.
+        let resolved = self.text_scanner.code_with_literals_dense(trimmed);
         let trimmed = resolved.trim();
         if let Some(open) = self.open.as_mut() {
-            open.text
-                .extend(trimmed.chars().filter(|c| !c.is_whitespace()));
+            open.text.push_str(trimmed);
             open.depth = delimiter_depth(&counted, open.depth);
             open.lines += 1;
             if open.depth == 0 {
@@ -898,7 +907,7 @@ impl CfgGuard {
         }
 
         if trimmed.starts_with("#[") {
-            let text: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+            let text = trimmed.to_string();
             let depth = delimiter_depth(&counted, 0);
             if depth == 0 {
                 self.record(text);
@@ -2982,6 +2991,59 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "rewrapping a cfg predicate is not breaking, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn whitespace_inside_a_cfg_value_is_part_of_the_gate() {
+        // Whitespace was stripped from the WHOLE attribute text, literals
+        // included, so `#[cfg(api = "a b")]` and `#[cfg(api = "ab")]` normalized
+        // to one guard. A struct that really left builds configured with
+        // `--cfg 'api="a b"'` paired with its re-add under a different value and
+        // produced no finding: the space is part of the value the compiler
+        // matches on, not layout.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(api = \"a b\")]",
+                "-pub struct Config;",
+                "+#[cfg(api = \"ab\")]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "two cfg values are two gates, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn spacing_outside_a_cfg_value_is_still_only_layout() {
+        // The guard on that: whitespace OUTSIDE the literal stays formatting.
+        // Keeping it would make reformatting an attribute a different gate and
+        // split an ordinary re-add into a phantom removal — the error direction
+        // that costs trust.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(api = \"a b\")]",
+                "-pub struct Config;",
+                "+#[cfg( api=\"a b\" )]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "respacing an attribute is not a different gate, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

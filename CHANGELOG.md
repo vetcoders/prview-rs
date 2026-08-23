@@ -201,6 +201,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Whitespace inside a `cfg` value is part of the gate.** The guard tracker
+  normalized an attribute by stripping whitespace from its whole text, literals
+  included, so `#[cfg(api = "a b")]` and `#[cfg(api = "ab")]` produced one guard:
+  a declaration that really left builds configured with `--cfg 'api="a b"'`
+  paired with its re-add under another value and produced no finding. The strip
+  is now `SourceScanner`'s own dense view, which removes spacing only where it
+  can see the spacing is outside every literal, so reformatting an attribute is
+  still not a different gate. A fix by construction rather than by frequency: of
+  524,530 gating attributes in the local crates.io registry only 3 carry
+  whitespace inside a value literal, and none of them collide.
 - **A check status outside the emitted vocabulary is unreadable, not clean.**
   `checks[].status` is a closed, case-sensitive set — `passed`, `failed`,
   `warnings`, `skipped`, `error` — but the CLI tallied warnings by comparing

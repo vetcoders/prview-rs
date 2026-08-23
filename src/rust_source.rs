@@ -44,6 +44,17 @@ impl SourceScanner {
         scan(line, &mut self.state, Literals::Keep)
     }
 
+    /// The same again, with whitespace OUTSIDE the literals removed.
+    ///
+    /// For callers that treat spacing as formatting but a literal's contents as
+    /// a value: `#[cfg(api = "a b")]` and `#[cfg( api="a b" )]` are one gate,
+    /// while `#[cfg(api = "ab")]` is another. Stripping whitespace from the
+    /// whole line instead made those last two equal and paired a
+    /// configuration-specific removal away.
+    pub(crate) fn code_with_literals_dense<'a>(&mut self, line: &'a str) -> Cow<'a, str> {
+        scan(line, &mut self.state, Literals::KeepDense)
+    }
+
     /// Is a string literal still open at the point the last line ended?
     ///
     /// The line break that follows is then literal CONTENT, not layout. A caller
@@ -69,7 +80,7 @@ impl SourceScanner {
 
 /// What a scan does with the literals it resolves.
 ///
-/// Both views resolve comments and literals identically — only the output
+/// Every view resolves comments and literals identically — only the output
 /// differs, so a scanner's carried state advances the same way whichever one a
 /// caller asks for.
 #[derive(Clone, Copy)]
@@ -78,13 +89,24 @@ enum Literals {
     Drop,
     /// Emit the literal verbatim, opening and closing delimiters included.
     Keep,
+    /// The same, and drop whitespace everywhere else.
+    ///
+    /// The only mode that changes what is emitted for NON-literal code, and it
+    /// changes only spacing. It exists so a caller normalizing formatting cannot
+    /// reach inside a value while doing it.
+    KeepDense,
 }
 
 impl Literals {
     fn emit(self, out: &mut String, literal: &str) {
-        if matches!(self, Literals::Keep) {
+        if matches!(self, Literals::Keep | Literals::KeepDense) {
             out.push_str(literal);
         }
+    }
+
+    /// Does whitespace outside a literal survive into the output?
+    fn keeps_spacing(self) -> bool {
+        !matches!(self, Literals::KeepDense)
     }
 }
 
@@ -109,8 +131,8 @@ enum OpenLiteral {
 /// One pass over `line`, dropping comments and treating literals per `literals`.
 ///
 /// `state` is what earlier lines left open — a nested block comment, a string
-/// literal — and is updated in place. It advances identically for both
-/// `literals` modes: the mode decides what is written out, never what is read.
+/// literal — and is updated in place. It advances identically for every
+/// `literals` mode: the mode decides what is written out, never what is read.
 ///
 /// Comments and literals are resolved in the SAME pass, which is what keeps a
 /// delimiter from being read in the wrong language: `"http://x"` is a string,
@@ -122,7 +144,8 @@ enum OpenLiteral {
 /// so only strings are carried.
 fn scan<'a>(line: &'a str, state: &mut ScanState, literals: Literals) -> Cow<'a, str> {
     let bytes = line.as_bytes();
-    if state.block_comment_depth == 0
+    if literals.keeps_spacing()
+        && state.block_comment_depth == 0
         && state.open_literal.is_none()
         && !bytes.iter().any(|b| matches!(b, b'"' | b'\''))
         && !line.contains("//")
@@ -210,7 +233,12 @@ fn scan<'a>(line: &'a str, state: &mut ScanState, literals: Literals) -> Cow<'a,
                     .chars()
                     .next()
                     .expect("index sits on a char boundary");
-                out.push(ch);
+                // The one place a mode may drop non-literal code, and it drops
+                // only spacing: this arm is reached exactly when `ch` is outside
+                // every literal and comment.
+                if literals.keeps_spacing() || !ch.is_whitespace() {
+                    out.push(ch);
+                }
                 i += ch.len_utf8();
             }
         }
@@ -497,6 +525,57 @@ mod tests {
         assert_eq!(scanner.code_only("let j = br##\"{"), "let j = ");
         assert_eq!(scanner.code_only("  \"a\": \"x\"#,"), "");
         assert_eq!(scanner.code_only("}\"##; {"), "; {");
+    }
+
+    #[test]
+    fn the_dense_view_normalizes_spacing_without_reaching_into_a_literal() {
+        // Two questions, one line: spacing outside a literal is formatting, and
+        // spacing inside one is value. A caller that answered the first with a
+        // blanket whitespace filter answered the second wrongly.
+        let mut scanner = SourceScanner::default();
+        assert_eq!(
+            scanner.code_with_literals_dense("#[cfg( api = \"a b\" )]"),
+            "#[cfg(api=\"a b\")]"
+        );
+        assert_eq!(
+            scanner.code_with_literals_dense("#[cfg(api=\"ab\")]"),
+            "#[cfg(api=\"ab\")]"
+        );
+        // A comment is still resolved away, and the spacing it leaves behind
+        // with it.
+        assert_eq!(
+            scanner.code_with_literals_dense("#[cfg(unix)] // why"),
+            "#[cfg(unix)]"
+        );
+    }
+
+    #[test]
+    fn the_dense_view_keeps_a_carried_literal_verbatim() {
+        // The line break inside a multi-line literal is not this view's to
+        // normalize either: it only ever removes spacing it can see is outside
+        // every literal.
+        let mut scanner = SourceScanner::default();
+        assert_eq!(
+            scanner.code_with_literals_dense("const T: &str = \"a b"),
+            "constT:&str=\"a b"
+        );
+        assert_eq!(scanner.code_with_literals_dense("  c d\";"), "  c d\";");
+    }
+
+    #[test]
+    fn the_other_views_still_keep_their_spacing() {
+        // Guard on the widening: only the dense mode drops non-literal
+        // whitespace, and the two established views are untouched by it.
+        let mut scanner = SourceScanner::default();
+        assert_eq!(
+            scanner.code_with_literals("#[cfg( api = \"a b\" )]"),
+            "#[cfg( api = \"a b\" )]"
+        );
+        let mut scanner = SourceScanner::default();
+        assert_eq!(
+            scanner.code_only("#[cfg( api = \"a b\" )]"),
+            "#[cfg( api =  )]"
+        );
     }
 
     #[test]
