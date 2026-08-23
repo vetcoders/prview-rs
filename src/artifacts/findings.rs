@@ -66,10 +66,13 @@ fn cargo_audit_baseline_counts(
 
 fn cargo_audit_finding_in_diff(
     key: &(String, String, String),
+    current_report_valid: bool,
     cargo_lock_changed: bool,
     base: Option<&std::collections::HashSet<(String, String, String)>>,
 ) -> Option<bool> {
-    if !cargo_lock_changed {
+    if !current_report_valid {
+        None
+    } else if !cargo_lock_changed {
         Some(false)
     } else {
         base.map(|known| !known.contains(key))
@@ -422,6 +425,7 @@ pub(super) fn generate_inline_findings(
 
                 let current_audit_in_diff = cargo_audit_finding_in_diff(
                     &cargo_audit_finding_key(finding),
+                    current_advisories.is_some(),
                     cargo_lock_changed,
                     base_audit_cache.as_ref(),
                 );
@@ -972,6 +976,16 @@ mod tests {
                 status: "unavailable",
             }
         );
+    }
+
+    #[test]
+    fn cargo_audit_invalid_current_report_cannot_mark_a_finding_preexisting() {
+        let key = (
+            "RUSTSEC-2024-0001".to_string(),
+            "demo".to_string(),
+            "1.2.3".to_string(),
+        );
+        assert_eq!(cargo_audit_finding_in_diff(&key, false, false, None), None);
     }
 
     #[test]

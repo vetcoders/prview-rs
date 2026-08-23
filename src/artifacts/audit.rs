@@ -218,9 +218,7 @@ pub(crate) fn cargo_audit_report_advisory_keys(
     output: &str,
 ) -> Option<std::collections::HashSet<(String, String, String)>> {
     let parsed = extract_embedded_json(output)?;
-    parsed
-        .pointer("/vulnerabilities/list")
-        .and_then(|value| value.as_array())?;
+    crate::checks::validated_cargo_audit_vulnerability_list(&parsed)?;
 
     let mut keys: std::collections::HashSet<_> = parse_cargo_audit_findings(output)
         .iter()
@@ -419,10 +417,7 @@ pub(crate) fn parse_cargo_audit_findings(output: &str) -> Vec<CargoAuditFinding>
     let Some(parsed) = extract_embedded_json(output) else {
         return Vec::new();
     };
-    let Some(entries) = parsed
-        .pointer("/vulnerabilities/list")
-        .and_then(|value| value.as_array())
-    else {
+    let Some(entries) = crate::checks::validated_cargo_audit_vulnerability_list(&parsed) else {
         return Vec::new();
     };
 
@@ -869,5 +864,21 @@ mod tests {
             cargo_audit_report_advisory_keys(clean),
             Some(Default::default())
         );
+    }
+
+    #[test]
+    fn report_keys_and_findings_reject_inconsistent_structural_fields() {
+        let finding = r#"{
+          "advisory":{"id":"RUSTSEC-2024-0001","title":"demo"},
+          "package":{"name":"demo","version":"1.2.3"},
+          "versions":{}
+        }"#;
+        for report in [
+            format!(r#"{{"vulnerabilities":{{"count":99,"list":[{finding}]}}}}"#),
+            format!(r#"{{"vulnerabilities":{{"found":false,"count":1,"list":[{finding}]}}}}"#),
+        ] {
+            assert!(cargo_audit_report_advisory_keys(&report).is_none());
+            assert!(parse_cargo_audit_findings(&report).is_empty());
+        }
     }
 }

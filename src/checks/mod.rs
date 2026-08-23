@@ -25,6 +25,7 @@ mod python;
 mod semgrep;
 mod typescript;
 
+pub(crate) use cargo::validated_cargo_audit_vulnerability_list;
 pub use cargo::{
     CargoAuditCheck, CargoCheck, CargoGeigerCheck, CargoTestCheck, ClippyCheck, RustfmtCheck,
 };

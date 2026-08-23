@@ -1491,16 +1491,33 @@ fn classify_cargo_audit_status(
 
 fn cargo_audit_vulnerability_count(stdout: &str) -> Option<usize> {
     let parsed = serde_json::from_str::<serde_json::Value>(stdout).ok()?;
-    let vulnerabilities = parsed.get("vulnerabilities")?;
+    Some(validated_cargo_audit_vulnerability_list(&parsed)?.len())
+}
+
+/// Return the advisory list only when cargo-audit's redundant structural
+/// fields agree. Both the check classifier and artifact parsers use this gate,
+/// so malformed output cannot fail at execution time and then be laundered as
+/// a clean or pre-existing baseline downstream.
+pub(crate) fn validated_cargo_audit_vulnerability_list(
+    report: &serde_json::Value,
+) -> Option<&[serde_json::Value]> {
+    let vulnerabilities = report.get("vulnerabilities")?;
     let list = vulnerabilities.get("list")?.as_array()?;
-    if let Some(count) = vulnerabilities
-        .get("count")
-        .and_then(|value| value.as_u64())
-        && count as usize != list.len()
+
+    if let Some(count) = vulnerabilities.get("count") {
+        let count = usize::try_from(count.as_u64()?).ok()?;
+        if count != list.len() {
+            return None;
+        }
+    }
+
+    if let Some(found) = vulnerabilities.get("found")
+        && found.as_bool()? != !list.is_empty()
     {
         return None;
     }
-    Some(list.len())
+
+    Some(list.as_slice())
 }
 
 fn cargo_audit_has_warnings(stdout: &str, output: &str) -> bool {
@@ -2277,6 +2294,20 @@ mod tests {
         let inconsistent = r#"{"vulnerabilities":{"count":1,"list":[]}}"#;
         let status = classify_cargo_audit_status(true, inconsistent, inconsistent);
         assert_eq!(status, CheckStatus::Failed);
+    }
+
+    #[test]
+    fn test_cargo_audit_inconsistent_found_is_failed() {
+        let inconsistent = r#"{"vulnerabilities":{"found":true,"count":0,"list":[]}}"#;
+        let status = classify_cargo_audit_status(true, inconsistent, inconsistent);
+        assert_eq!(status, CheckStatus::Failed);
+    }
+
+    #[test]
+    fn test_cargo_audit_optional_found_preserves_older_valid_reports() {
+        let valid = r#"{"vulnerabilities":{"count":0,"list":[]}}"#;
+        let status = classify_cargo_audit_status(true, valid, valid);
+        assert_eq!(status, CheckStatus::Passed);
     }
 
     #[test]
