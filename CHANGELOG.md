@@ -201,6 +201,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An attribute's delimiters are counted with its literals removed.** The
+  `cfg`-guard tracker resolved comments away with a carried scanner but counted
+  brackets with a literal state of its own, reset at every line — so a literal
+  opened on an earlier line was invisible to it. A `)` typed inside a multi-line
+  `#[doc = r#"…"#]` balanced the attribute early and the literal's remaining
+  lines then cleared the pending `cfg`; a `#[must_use = "… \` continued onto the
+  next line had its own closing quote read as an opener, swallowing the `]`, so
+  the attribute never closed and absorbed the real `#[cfg(…)]` below it. Either
+  way both diff sides came out unguarded, the identical declaration text paired,
+  and a configuration-specific removal produced no finding. The counter now runs
+  on a literal-free view from a second scanner walking the same lines, while the
+  guard text keeps its literals so `feature = "a"` and `feature = "b"` stay two
+  gates. Measured over the local crates.io registry: of 237,368 `cfg`-guarded
+  attribute runs reaching a public declaration, 8,793 wrap, 90 carry a literal
+  spanning the break, 13 a raw string, and 9 balanced wrongly.
 - **Re-indenting the inside of a multi-line public constant is a value change
   again.** Continuation lines reached the breaking-change accumulator already
   trimmed, so whitespace at a line edge INSIDE a string literal — which is value,
