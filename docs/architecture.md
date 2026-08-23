@@ -827,6 +827,22 @@ their own line must still terminate at their `;`. Measured over that registry
 tracking and the narrower `<{` sequence rule it replaced judge zero lines
 differently.
 
+INSIDE that const argument the same characters are operators, so the generic
+depth is frozen there. `pub fn run() -> Buffer<{ 1 < 2 }> {` counted the
+comparison as another opener, the argument list's own `>` closed only that
+phantom level, and the depth was still above zero at the item's real body brace
+— which therefore read as a further const argument and swallowed the body,
+turning a body-only rewrite into a phantom `ChangedSignature`. Freezing costs
+nothing, because whatever a const block states about generics is balanced
+against itself: a turbofish (`{ size_of::<u32>() }`) and a qualified path
+(`Uint<{ <Self>::LIMBS / 2 }>`, the shape crypto-bigint carries) close what they
+open. Those are also the only shapes the corpus holds — across 58,614 files,
+61 declaration or field lines put a const argument's braces around a `<` or `>`,
+43 of them a turbofish and 18 a qualified path or a shift, and none a bare
+comparison. The previous rule survived all of them by cancellation, the block's
+stray `>` closing the outer list and the outer list's `>` then finding nothing
+left; the freeze reaches the same verdict by construction instead.
+
 Nor is the `{` of an initializer that body brace. After a top-level `=` the item
 states a VALUE and runs to its `;`, so `pub const LIMIT: usize = {` and
 `pub const ZERO: Self = Self {` open an initializer, not an item body — and a

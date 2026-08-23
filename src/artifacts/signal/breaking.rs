@@ -1204,9 +1204,20 @@ fn declaration_complete(code: &str) -> bool {
             // `<` opens an argument list only directly after an identifier or a
             // closing `>` — `Buffer<`, `Vec<u8>>` — which is where a type names
             // its arguments and is not where a comparison puts it.
-            '<' if prev.is_alphanumeric() || prev == '_' || prev == '>' => angle += 1,
+            //
+            // Inside a const block the same characters are OPERATORS, so the
+            // depth is frozen there: `Buffer<{ 1 < 2 }>` counted the comparison
+            // as an opener, the argument list's `>` then closed only that phantom
+            // level, and `angle` was still above zero at the item's real body
+            // brace — which therefore read as another const block and swallowed
+            // the whole body, turning a body-only rewrite into a phantom
+            // `ChangedSignature`. A block's own generics (`size_of::<u32>()`)
+            // are balanced against themselves, so freezing loses nothing.
+            '<' if block == 0 && (prev.is_alphanumeric() || prev == '_' || prev == '>') => {
+                angle += 1
+            }
             // `->` is a return arrow, not a closing bracket.
-            '>' if prev != '-' && angle > 0 => angle -= 1,
+            '>' if block == 0 && prev != '-' && angle > 0 => angle -= 1,
             // Only a top-level `=` is an initializer. Inside a generic argument
             // list it states a default (`struct Foo<const N: usize = 4>`) or an
             // associated type (`impl Iterator<Item = u8>`), and both of those
@@ -1934,6 +1945,113 @@ mod tests {
         );
         assert!(changes[0].0.contains("LIMIT * 2"), "{}", changes[0].0);
         assert!(changes[0].1.contains("LIMIT * 3"), "{}", changes[0].1);
+    }
+
+    #[test]
+    fn a_comparison_inside_a_const_block_does_not_swallow_the_item_body() {
+        // Inside a const argument the `<` and `>` are OPERATORS, not delimiters.
+        // Counting one as a generic opener left `angle` above zero when the
+        // argument list closed, so the item's real body brace read as another
+        // const block and the whole body was absorbed into the declaration —
+        // making this body-only rewrite a phantom `ChangedSignature`.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn run() -> Buffer<{ 1 < 2 }> {",
+                "-    compute(2)",
+                "-}",
+                "+pub fn run() -> Buffer<{ 1 < 2 }> {",
+                "+    compute(3)",
+                "+}",
+            ],
+        )]);
+
+        assert!(
+            findings.is_empty(),
+            "a body-only rewrite is not a signature change: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_changed_const_comparison_is_still_a_signature_change() {
+        // The other direction: the const expression is part of the public type,
+        // so changing it must still be reported. Freezing the angle depth
+        // inside the block must not make the declaration end early.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn run() -> Buffer<{ 1 < 2 }> {",
+                "+pub fn run() -> Buffer<{ 1 < 3 }> {",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "a changed const argument is a changed signature: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(changes[0].0.contains("1 < 2"), "{}", changes[0].0);
+        assert!(changes[0].1.contains("1 < 3"), "{}", changes[0].1);
+    }
+
+    #[test]
+    fn a_turbofish_inside_a_const_block_keeps_its_own_balance() {
+        // A const block may legitimately state generics of its own —
+        // `size_of::<u32>()`. Freezing the outer depth inside the block leaves
+        // that pair balanced against itself, so the declaration still ends at
+        // its real body brace.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn run() -> Buffer<{ size_of::<u32>() }> {",
+                "-    compute(2)",
+                "-}",
+                "+pub fn run() -> Buffer<{ size_of::<u32>() }> {",
+                "+    compute(3)",
+                "+}",
+            ],
+        )]);
+
+        assert!(
+            findings.is_empty(),
+            "a body-only rewrite is not a signature change: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_qualified_path_inside_a_const_block_stays_balanced() {
+        // The shape the corpus actually carries (crypto-bigint):
+        // `Uint<{ <Self>::LIMBS / 2 }>`. Its `<`/`>` pair is a qualified path,
+        // not an argument list, and the previous rule only survived it by
+        // cancellation — the path's `>` decremented the OUTER list, whose own
+        // `>` then found nothing left to close. Freezing keeps both honest.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub fn split(&self) -> Uint<{ <Self>::LIMBS / 2 }> {",
+                "-    compute(2)",
+                "-}",
+                "+pub fn split(&self) -> Uint<{ <Self>::LIMBS / 2 }> {",
+                "+    compute(3)",
+                "+}",
+            ],
+        )]);
+
+        assert!(
+            findings.is_empty(),
+            "a body-only rewrite is not a signature change: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
     }
 
     #[test]

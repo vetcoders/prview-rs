@@ -201,6 +201,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A comparison inside a const argument no longer swallows the item body.**
+  `pub fn run() -> Buffer<{ 1 < 2 }> {` counted the comparison as another
+  generic opener, the argument list's own `>` closed only that phantom level,
+  and the depth was still above zero at the real body brace — which read as a
+  further const argument, absorbed the body, and turned a body-only rewrite into
+  a phantom `ChangedSignature`. Inside a const block `<` and `>` are operators,
+  so the generic depth is now frozen there. Nothing is lost: whatever such a
+  block states about generics closes what it opens — a turbofish
+  (`{ size_of::<u32>() }`) or a qualified path (`Uint<{ <Self>::LIMBS / 2 }>`),
+  which are also the only shapes the local crates.io corpus carries. Those
+  survived the previous rule by cancellation, the block's stray `>` closing the
+  outer list; they now reach the same verdict by construction.
 - **A signature edited in place is no longer swallowed by the context lines
   around it.** A hunk interleaves two texts, and the scanner reconstructs both:
   the before side is context ∪ removed lines, the after side is context ∪ added
