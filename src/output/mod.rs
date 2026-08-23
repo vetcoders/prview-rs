@@ -718,10 +718,18 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
             }
             warned
         }
+        // The same rule one level up, on the container instead of an entry. This
+        // used to fall back to "the checks this run executed", which on an
+        // unchanged `--update` run is none at all: `--ci --fail-on-warnings`
+        // exited 0 on a pack whose warning list the reader could not read. An
+        // unreadable list is not an empty one, so it counts as at least one
+        // warning. No legacy carve-out applies — `checks` has been emitted since
+        // schema 1.0 and the contract validator has always required an array
+        // there, so a non-array was never a valid shape.
         Some(other) => {
             caveats.push(format!(
                 "unreadable_checks: MERGE_GATE.json checks is {}, not an array; the warning tally \
-                 falls back to the checks this run executed",
+                 cannot be read and counts as at least one warning",
                 match other {
                     Value::Null => "null",
                     Value::Bool(_) => "a boolean",
@@ -731,8 +739,12 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
                     Value::Array(_) => unreachable!("matched above"),
                 }
             ));
-            0
+            1
         }
+        // ABSENT is the one tolerant case, and stays so: a pack that states no
+        // list may simply predate this build, and the CLI's own tally still
+        // applies through the `max` at the call site. Absent is not the same
+        // question as present-but-unreadable.
         None => 0,
     };
 
@@ -2727,6 +2739,74 @@ api-router/app/core/cache.py
             "the reader must say what it could not read, got: {:?}",
             cli.caveats
         );
+    }
+
+    #[test]
+    fn a_reused_pack_with_an_unreadable_checks_container_still_fails_on_warnings() {
+        // The same rule as the per-entry status, one level up: `checks` present
+        // but not an array left the tally at zero and fell back to the checks
+        // this run executed — which on an unchanged `--update` run is none at
+        // all. `--ci --fail-on-warnings` then exited 0 on a pack whose warning
+        // list the reader could not read.
+        //
+        // ABSENT `checks` keeps its tolerance and is covered by
+        // `a_pack_without_a_checks_list_keeps_the_cli_warning_tally`: a pack that
+        // states no list may simply be an old one. A pack that states something
+        // unreadable is not, and no legacy carve-out applies — `checks` has been
+        // emitted since 1.0, so a non-array there was never a valid shape.
+        for container in [
+            r#"{"semgrep":"warnings"}"#,
+            r#""warnings""#,
+            "7",
+            "null",
+            "true",
+        ] {
+            let pack = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(pack.path().join("00_summary")).unwrap();
+            std::fs::write(
+                pack.path().join("00_summary/MERGE_GATE.json"),
+                format!(
+                    r#"{{"schema_version":"2.2",
+                        "checks":{container},
+                        "decision":{{"verdict":"PASS","merge_recommendation":"approve",
+                                     "allow_merge":true,"quality_pass":true,
+                                     "analysis_status":"complete"}}}}"#
+                ),
+            )
+            .unwrap();
+
+            let mut config = test_config();
+            config.execution_mode = ExecutionMode::Ci;
+            let report = Report {
+                target: "feature/reused-pack".to_string(),
+                bases: vec!["main".to_string()],
+                diffs: vec![],
+                checks: vec![],
+                heuristics: None,
+                artifacts_dir: pack.path().to_path_buf(),
+                duration: Duration::from_secs(1),
+                unchanged: true,
+            };
+
+            let cli = build_cli_json_summary(&config, &report).expect("gate artifact is readable");
+            assert!(
+                cli.checks_summary.warned_in_pack >= 1,
+                "an unreadable checks list is not an empty one ({container}): {:?}",
+                cli.checks_summary
+            );
+            assert_eq!(
+                compute_exit_code(&cli, true, true),
+                1,
+                "--ci --fail-on-warnings must not pass a pack it cannot read ({container})"
+            );
+            assert!(
+                cli.caveats
+                    .iter()
+                    .any(|caveat| caveat.starts_with("unreadable_checks:")),
+                "the reader must say what it could not read ({container}), got: {:?}",
+                cli.caveats
+            );
+        }
     }
 
     #[test]

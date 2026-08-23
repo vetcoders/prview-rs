@@ -679,6 +679,86 @@ fn validator_rejects_a_check_status_outside_the_emitted_vocabulary() {
         .success();
 }
 
+/// The container half of the same contract. The validator already required
+/// `checks` to be an array — this pins that, because the CLI now treats a
+/// present-but-unreadable list as at least one warning and the two surfaces have
+/// to agree on which packs are valid at all. Absence is a separate question and
+/// is rejected here too: `checks` has been emitted since schema 1.0.
+#[test]
+fn validator_rejects_a_checks_list_that_is_not_an_array() {
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+
+    let payload = run_json_quiet(repo, &["feature/json-contract", "main"]);
+    let output_dir = Path::new(
+        payload["output_dir"]
+            .as_str()
+            .expect("output_dir should be a string"),
+    );
+    let merge_gate = output_dir.join("00_summary/MERGE_GATE.json");
+    let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
+
+    let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
+    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    assert!(
+        original["checks"].is_array(),
+        "the emitter writes an array here"
+    );
+
+    let broken = [
+        Some(serde_json::json!({"semgrep": "warnings"})),
+        Some(serde_json::json!("warnings")),
+        Some(serde_json::json!(7)),
+        Some(serde_json::json!(null)),
+        Some(serde_json::json!(true)),
+        None,
+    ];
+
+    for value in broken {
+        let mut gate = original.clone();
+        match value {
+            Some(value) => gate["checks"] = value,
+            None => {
+                gate.as_object_mut().expect("gate object").remove("checks");
+            }
+        }
+        std::fs::write(
+            &merge_gate,
+            serde_json::to_string_pretty(&gate).expect("serialize gate"),
+        )
+        .expect("write gate");
+
+        Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert()
+            .failure();
+    }
+
+    // An empty list is a legitimate shape — a run in which nothing gated — and
+    // must not be swept up by the same rule.
+    let mut empty = original.clone();
+    empty["checks"] = serde_json::json!([]);
+    std::fs::write(
+        &merge_gate,
+        serde_json::to_string_pretty(&empty).expect("serialize gate"),
+    )
+    .expect("write gate");
+    Command::new("python3")
+        .arg(&validator)
+        .arg(&merge_gate)
+        .assert()
+        .success();
+
+    // The shape the emitter actually writes still validates.
+    std::fs::write(&merge_gate, &raw).expect("restore gate");
+    Command::new("python3")
+        .arg(&validator)
+        .arg(&merge_gate)
+        .assert()
+        .success();
+}
+
 /// Resolve an executable by scanning `PATH` (test helper; no external crate).
 #[cfg(unix)]
 fn resolve_in_path(bin: &str) -> Option<std::path::PathBuf> {
