@@ -820,17 +820,29 @@ struct OpenAttribute {
 /// as a new item and clear the guard, and a `/* ))) */` inside a wrapped
 /// predicate balanced the attribute early with the same result — both sides
 /// unguarded, the identical declaration text paired, and a struct that really
-/// left one configuration produced no finding. Literals are KEPT by that view,
-/// because `#[cfg(feature = "a")]` and `#[cfg(feature = "b")]` are different
-/// gates and a view that dropped literal bodies would make them one.
+/// left one configuration produced no finding.
+///
+/// The two questions asked of a line want opposite treatments of its literals,
+/// so each gets its own scanner, fed in step. The guard TEXT keeps them, because
+/// `#[cfg(feature = "a")]` and `#[cfg(feature = "b")]` are different gates and a
+/// view that dropped literal bodies would make them one. The DELIMITER COUNT
+/// must not see them: a `)` typed inside a multi-line `#[doc = r#"…"#]` is text,
+/// and reading it as syntax balanced the attribute early, after which the
+/// remaining literal lines looked like ordinary items and cleared the pending
+/// `cfg` — both sides unguarded again.
 #[derive(Default)]
 struct CfgGuard {
     /// The accumulated conjunction, or `None` for "not known on this side".
     guards: Option<Vec<String>>,
     open: Option<OpenAttribute>,
-    /// Resolves comments away, carrying an open `/* … */` or literal between
-    /// lines. Reset with the guard, because the diff has jumped elsewhere.
-    scanner: crate::rust_source::SourceScanner,
+    /// Resolves comments away and keeps literals: the view the guard text is
+    /// built from. Carries an open `/* … */` or literal between lines, and is
+    /// reset with the guard, because the diff has jumped elsewhere.
+    text_scanner: crate::rust_source::SourceScanner,
+    /// The same walk with literal bodies dropped: the view the delimiters are
+    /// counted on. A separate scanner rather than a second call, because one
+    /// scanner reads each line exactly once.
+    depth_scanner: crate::rust_source::SourceScanner,
 }
 
 impl CfgGuard {
@@ -842,7 +854,8 @@ impl CfgGuard {
     /// Forget everything: the diff has jumped somewhere else.
     fn reset(&mut self) {
         self.forget_attributes();
-        self.scanner.reset();
+        self.text_scanner.reset();
+        self.depth_scanner.reset();
     }
 
     /// Drop the guard and any attribute in flight, keeping the scanner state.
@@ -861,12 +874,16 @@ impl CfgGuard {
     /// declaration is guarded by the attribute above it, not by one on its own
     /// line.
     fn feed(&mut self, trimmed: &str) {
-        let resolved = self.scanner.code_with_literals(trimmed);
+        // Both scanners read every line, in step: they carry the same open
+        // constructs and differ only in what they emit.
+        let counted = self.depth_scanner.code_only(trimmed);
+        let counted = counted.trim().to_string();
+        let resolved = self.text_scanner.code_with_literals(trimmed);
         let trimmed = resolved.trim();
         if let Some(open) = self.open.as_mut() {
             open.text
                 .extend(trimmed.chars().filter(|c| !c.is_whitespace()));
-            open.depth = delimiter_depth(trimmed, open.depth);
+            open.depth = delimiter_depth(&counted, open.depth);
             open.lines += 1;
             if open.depth == 0 {
                 let finished = self.open.take().expect("open attribute").text;
@@ -882,7 +899,7 @@ impl CfgGuard {
 
         if trimmed.starts_with("#[") {
             let text: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
-            let depth = delimiter_depth(trimmed, 0);
+            let depth = delimiter_depth(&counted, 0);
             if depth == 0 {
                 self.record(text);
             } else {
@@ -942,32 +959,20 @@ fn gates_the_item(attribute: &str) -> bool {
 
 /// How many delimiters `line` leaves open, starting from `depth`.
 ///
-/// Delimiters inside a string literal are text, not structure: `#[doc = "a ("]`
-/// closes on its own line. Escapes are honoured so a `\"` does not end the
-/// string early.
+/// Takes a line neither comments nor literals have survived: [`CfgGuard::feed`]
+/// resolves both away before the line gets here. Counting either as syntax
+/// balanced an attribute early — `/* ))) */` inside a wrapped `#[cfg(…)]`
+/// predicate, a `)` inside a multi-line `#[doc = r#"…"#]` — and the lines below
+/// it then read as ordinary items and cleared the pending guard.
 ///
-/// Block comments never reach this counter at all: [`CfgGuard::feed`] resolves
-/// them away before the line gets here, so `/* ))) */` inside a wrapped
-/// `#[cfg(…)]` predicate can no longer balance the attribute early. The view it
-/// uses keeps literals, which is why the `in_string` handling below is still
-/// this function's own job.
+/// A per-line literal state of its own is what this function used to carry, and
+/// it could not see a raw string opened on an EARLIER line: `r#"` has no
+/// closing delimiter until `"#`, so the bare `"` starting the last line read as
+/// an opener and the `]` after it was swallowed as text.
 fn delimiter_depth(line: &str, depth: usize) -> usize {
     let mut depth = depth;
-    let mut in_string = false;
-    let mut escaped = false;
     for c in line.chars() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
         match c {
-            '"' => in_string = true,
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth = depth.saturating_sub(1),
             _ => {}
@@ -3006,6 +3011,126 @@ mod tests {
         assert!(
             removed_symbol_types(&findings).contains(&"struct".to_string()),
             "a wrapped attribute must not drop the cfg above it, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_delimiter_inside_a_multiline_raw_string_attribute_does_not_end_it() {
+        // The delimiter counter carried its own per-LINE literal state, so a raw
+        // string opened on one line was forgotten on the next: a `)` typed inside
+        // a multi-line `#[doc = r#"…"#]` read as syntax and balanced the
+        // attribute early. The remaining literal lines then looked like ordinary
+        // items and cleared the pending `cfg`, so both sides came out unguarded,
+        // the identical struct text paired, and a struct that really left one
+        // configuration produced no finding.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(unix)]",
+                "-#[doc = r#\"a",
+                "-) more",
+                "-\"#]",
+                "-pub struct Config;",
+                "+#[cfg(windows)]",
+                "+#[doc = r#\"a",
+                "+) more",
+                "+\"#]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "a raw string's contents are not attribute syntax, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_multiline_raw_string_attribute_ends_at_its_own_delimiter() {
+        // The other half: the attribute must still CLOSE once the raw string
+        // does. Counting a literal's delimiters as syntax leaves the attribute
+        // permanently open, and a stale guard standing over the rest of the hunk
+        // fabricates removals out of ordinary re-adds — the error direction that
+        // costs trust. Here the two sides carry the SAME guard, so the re-add
+        // must cancel the removal.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(unix)]",
+                "-#[doc = r#\"a",
+                "-) more",
+                "-\"#]",
+                "-pub struct Config;",
+                "+#[cfg(unix)]",
+                "+#[doc = r#\"a",
+                "+) more",
+                "+\"#]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "an unchanged re-add under the same guard is not a removal, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_line_continued_string_attribute_does_not_swallow_the_cfg_below_it() {
+        // The shape the registry actually holds: `#[must_use = "… \` continues
+        // its literal onto the next line, and the per-line counter read the
+        // literal's own closing quote as an OPENER — so the `]` after it was
+        // swallowed as text and the attribute never closed. Everything below it,
+        // the real `#[cfg(…)]` included, was absorbed as continuation, both sides
+        // came out unguarded, and the struct that left one configuration paired
+        // with its re-add under another.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[must_use = \"a \\",
+                "-             b\"]",
+                "-#[cfg(unix)]",
+                "-pub struct Config;",
+                "+#[must_use = \"a \\",
+                "+             b\"]",
+                "+#[cfg(windows)]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "an attribute must end at its own bracket, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_literal_still_tells_two_cfg_predicates_apart() {
+        // The guard TEXT keeps literals even though the delimiter counter no
+        // longer sees them: `feature = "a"` and `feature = "b"` are different
+        // gates, and a view that dropped literal bodies would make them one and
+        // pair a configuration-specific removal away.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-#[cfg(feature = \"a\")]",
+                "-pub struct Config;",
+                "+#[cfg(feature = \"b\")]",
+                "+pub struct Config;",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            removed_symbol_types(&findings).contains(&"struct".to_string()),
+            "two feature gates are two gates, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }

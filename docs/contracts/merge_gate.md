@@ -55,7 +55,7 @@ Every element of `checks` is one policy evaluation record:
 |---|---|---|
 | `id` | string | Policy check id (`check_id`) |
 | `name` | string | Human-readable check name |
-| `status` | string | Raw check status |
+| `status` | string | `passed` \| `failed` \| `warnings` \| `skipped` \| `error` — lowercase, exactly |
 | `execution_state` | string | `executed` \| `skipped` \| `unavailable` \| `unknown` |
 | `outcome` | string | `passed` \| `findings_failed` \| `findings_warning` \| `system_error` \| `skipped` \| `unavailable` \| `unknown` |
 | `class` | string | `PASS` \| `SKIP` \| `FAIL` \| `INFO` |
@@ -74,6 +74,19 @@ Skipped or unavailable checks carry no executed `CheckResult`, so `duration_secs
 is `0.0`, `cached` is `null`, `log` is `null`, and `evidence` degrades to a
 non-empty placeholder. These are contract-valid placeholders, never `null`
 evidence — the artifact must not fail its own gate on a runner that lacks a tool.
+
+`status` is a CLOSED, case-sensitive vocabulary: exactly the image of
+`CheckStatus::as_str`, pinned as `CheckStatus::EMITTED` in `src/checks/mod.rs`
+and mirrored as `VALID_CHECK_STATUSES` in `tools/validate_merge_gate.py`. The
+CLI tallies warnings by comparing against it, so a status outside it is
+UNREADABLE rather than clean: it counts toward the warning tally, raises an
+`unreadable_check_status:` caveat naming the offending checks, and
+`--ci --fail-on-warnings` fails on it. The validator rejects such a pack outright
+— it used to accept any non-empty string, which certified an artifact
+`--update` could reuse and the reader could not read. Case is deliberately NOT
+folded here, unlike `inline_findings.status`, whose writer has shipped legacy
+spellings: folding `WARNINGS` into a warning silently would hide that the pack
+is off-contract, and the resulting tally is the same either way.
 
 ## `inline_findings`
 

@@ -201,6 +201,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A check status outside the emitted vocabulary is unreadable, not clean.**
+  `checks[].status` is a closed, case-sensitive set — `passed`, `failed`,
+  `warnings`, `skipped`, `error` — but the CLI tallied warnings by comparing
+  against the single string `"warnings"`, so any other spelling counted as "not a
+  warning" and `--ci --fail-on-warnings --update` exited `0` on a reused pack
+  whose warning signal it could not read. `tools/validate_merge_gate.py` accepted
+  any non-empty string there, so such an artifact even passed the repository
+  gate. Both sides now name the vocabulary: the reader counts an unrecognized
+  status toward the tally and raises an `unreadable_check_status:` caveat naming
+  the checks, and the validator rejects the pack. Case is deliberately not
+  folded — normalizing `"WARNINGS"` silently would hide that the pack is
+  off-contract, and the tally is the same either way. The vocabulary lives as
+  `CheckStatus::EMITTED` next to `CheckStatus::as_str`, with a test pinning the
+  two together.
+- **An attribute's delimiters are counted with its literals removed.** The
+  `cfg`-guard tracker resolved comments away with a carried scanner but counted
+  brackets with a literal state of its own, reset at every line — so a literal
+  opened on an earlier line was invisible to it. A `)` typed inside a multi-line
+  `#[doc = r#"…"#]` balanced the attribute early and the literal's remaining
+  lines then cleared the pending `cfg`; a `#[must_use = "… \` continued onto the
+  next line had its own closing quote read as an opener, swallowing the `]`, so
+  the attribute never closed and absorbed the real `#[cfg(…)]` below it. Either
+  way both diff sides came out unguarded, the identical declaration text paired,
+  and a configuration-specific removal produced no finding. The counter now runs
+  on a literal-free view from a second scanner walking the same lines, while the
+  guard text keeps its literals so `feature = "a"` and `feature = "b"` stay two
+  gates. Measured over the local crates.io registry: of 237,368 `cfg`-guarded
+  attribute runs reaching a public declaration, 8,793 wrap, 90 carry a literal
+  spanning the break, 13 a raw string, and 9 balanced wrongly.
 - **Re-indenting the inside of a multi-line public constant is a value change
   again.** Continuation lines reached the breaking-change accumulator already
   trimmed, so whitespace at a line edge INSIDE a string literal — which is value,

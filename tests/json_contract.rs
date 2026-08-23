@@ -587,6 +587,98 @@ fn validator_requires_a_boolean_quality_pass_from_schema_two_two() {
         .success();
 }
 
+/// Regression: the validator accepted any non-empty `checks[].status`, so a pack
+/// spelling a status the emitter never writes — `WARNINGS` from another writer,
+/// a stale artifact `--update` reused unchanged — passed the repository gate
+/// while the CLI, which counts warnings against the emitted vocabulary, could not
+/// read it. The contract now names that vocabulary, case included.
+#[test]
+fn validator_rejects_a_check_status_outside_the_emitted_vocabulary() {
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+
+    let payload = run_json_quiet(repo, &["feature/json-contract", "main"]);
+    let output_dir = Path::new(
+        payload["output_dir"]
+            .as_str()
+            .expect("output_dir should be a string"),
+    );
+    let merge_gate = output_dir.join("00_summary/MERGE_GATE.json");
+    let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
+
+    let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
+    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    assert!(
+        original["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .all(|check| matches!(
+                check["status"].as_str(),
+                Some("passed" | "failed" | "warnings" | "skipped" | "error")
+            )),
+        "the emitter writes only the vocabulary this test pins: {:?}",
+        original["checks"]
+    );
+
+    // Recognizable-but-uncanonical spellings, plus the non-strings a bare
+    // "non-empty" rule never caught either.
+    let broken = [
+        serde_json::json!("WARNINGS"),
+        serde_json::json!("Warnings"),
+        serde_json::json!("warning"),
+        serde_json::json!("warn"),
+        serde_json::json!("PASSED"),
+        serde_json::json!("ok"),
+        serde_json::json!(" warnings"),
+        serde_json::json!(true),
+        serde_json::json!(0),
+        serde_json::json!(null),
+    ];
+
+    for value in broken {
+        let mut gate = original.clone();
+        gate["checks"][0]["status"] = value.clone();
+        std::fs::write(
+            &merge_gate,
+            serde_json::to_string_pretty(&gate).expect("serialize gate"),
+        )
+        .expect("write gate");
+
+        Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert()
+            .failure();
+    }
+
+    // Every canonical spelling stays accepted, so the vocabulary is a contract
+    // and not a single-value pin.
+    for spelling in ["passed", "failed", "warnings", "skipped", "error"] {
+        let mut gate = original.clone();
+        gate["checks"][0]["status"] = serde_json::json!(spelling);
+        std::fs::write(
+            &merge_gate,
+            serde_json::to_string_pretty(&gate).expect("serialize gate"),
+        )
+        .expect("write gate");
+
+        Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert()
+            .success();
+    }
+
+    // The shape the emitter actually writes still validates.
+    std::fs::write(&merge_gate, &raw).expect("restore gate");
+    Command::new("python3")
+        .arg(&validator)
+        .arg(&merge_gate)
+        .assert()
+        .success();
+}
+
 /// Resolve an executable by scanning `PATH` (test helper; no external crate).
 #[cfg(unix)]
 fn resolve_in_path(bin: &str) -> Option<std::path::PathBuf> {

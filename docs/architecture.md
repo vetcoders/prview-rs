@@ -898,9 +898,22 @@ before it reads anything, with one per-side scanner reset with the guard, so a
 block comment is not syntax on either count: `/** … */` standing between the
 `cfg` and the item it guards no longer reads as a new item and clears the guard,
 and `/* ))) */` inside a wrapped predicate no longer balances the attribute
-early. That view keeps literals, because `#[cfg(feature = "a")]` and
+early. The guard TEXT keeps literals, because `#[cfg(feature = "a")]` and
 `#[cfg(feature = "b")]` are different gates and a literal-dropping view would
-make them one. The guard is the WHOLE conjunction of
+make them one; the DELIMITER COUNT drops them, from a second scanner walking the
+same lines in step. Counting a literal's brackets as syntax broke the tracker
+both ways. A `)` typed inside a multi-line `#[doc = r#"…"#]` balanced the
+attribute early, and the literal's remaining lines then read as ordinary items
+and cleared the pending `cfg`. The reverse cost more: the counter carried its
+literal state per LINE, so a literal opened earlier was forgotten and its own
+closing quote read as an opener — `#[must_use = "… \` continued onto the next
+line swallowed the `]` after `…"`, the attribute never closed, and everything
+below it, the real `#[cfg(…)]` included, was absorbed as continuation. Measured
+over the local crates.io registry, of 237,368 `cfg`-guarded attribute runs
+reaching a public declaration, 8,793 wrap across lines, 90 carry a literal
+spanning the break, 13 of those a raw string, and 9 balanced wrongly under the
+per-line state — all 9 of the line-continuation shape, in `rustix` and
+`wit-bindgen`. The guard is the WHOLE conjunction of
 the attributes stacked above the declaration, sorted — `#[cfg(unix)]
 #[cfg(feature = "x")]` and `#[cfg(windows)] #[cfg(feature = "x")]` are different
 guards, while reordering the same two is not. An unseen scope or guard is
