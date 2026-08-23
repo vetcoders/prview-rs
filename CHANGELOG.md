@@ -214,6 +214,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Measured over the local registry (58,586 files, 1,960 crates, 4,334,320 public
   declaration lines) this changes the verdict on 2,465 lines, every sampled one
   a public constant with a multi-line struct-literal or block initializer.
+- **A reflowed declaration is no longer reported as a changed signature.** The
+  comparison identity preserved every physical line break, so
+  `pub type Alias =` followed by `u32;` was a different declaration from
+  `pub type Alias = u32;` — a purely cosmetic rewrap produced a
+  `ChangedSignature` whose "before" and "after" printed as the same string, and
+  could escalate the verdict. A break is now kept only where the previous line
+  left a string literal open, which is where it is part of the value; elsewhere
+  the lines are joined with a space. For the same reason a line contributing no
+  code is still dropped from the identity except inside a literal, where a blank
+  line is a blank line in the value.
 - **A const argument that is not the first one no longer hides a public type
   change.** The breaking-change scanner recognized `Buffer<{ LIMIT }>` as
   type-level syntax by the exact `<{` sequence, so `Buffer<u8, { LIMIT }>` —

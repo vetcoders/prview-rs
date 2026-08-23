@@ -763,12 +763,19 @@ and char literals verbatim: a literal is code, so `pub const GREETING: &str =
 delimiter trackers, which want a brace inside a string silenced, and
 `code_with_literals` for callers comparing source.
 
-The identity separates its lines with the character that separated them: a
-newline, not a space. A literal spanning two physical lines otherwise compared
-equal to the same literal rewritten with a space in it, and a changed public
-constant paired away as an unchanged re-add. (Indentation INSIDE such a literal
-is already gone by then — lines reach the accumulator trimmed — so two multi-line
-literals differing only in leading whitespace still read as one.)
+The identity keeps a physical line break only where the break is part of the
+value — that is, where the previous line left a string literal open. A literal
+spanning two physical lines otherwise compared equal to the same literal
+rewritten with a space in it, and a changed public constant paired away as an
+unchanged re-add. Everywhere else the break is layout and the lines are joined
+with a space: keeping it there made `pub type Alias =` followed by `u32;` a
+different declaration from `pub type Alias = u32;`, so a purely cosmetic reflow
+was reported as a `ChangedSignature` whose "before" and "after" were the same
+string. By the same rule a line contributing no code is dropped from the
+identity — a comment-only line says nothing about the API — unless a literal is
+open, where a blank line is a blank line in the value. (Indentation INSIDE such
+a literal is already gone by then — lines reach the accumulator trimmed — so two
+multi-line literals differing only in leading whitespace still read as one.)
 
 A declaration ends at a `;` or a body `{` outside its brackets. Square brackets
 count for the same reason parentheses do: an array type states its length with a

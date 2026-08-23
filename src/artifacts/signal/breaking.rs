@@ -1057,23 +1057,35 @@ impl PendingDecl {
         // block comment, never a line comment.
         self.code.push(' ');
 
+        // Read BEFORE this line is scanned: a literal the PREVIOUS line left
+        // open makes the break between the two part of the value rather than
+        // layout.
+        let continues_literal = self.identity.carries_literal();
+
         // A line that is nothing but a comment contributes nothing to the
         // identity, and a line whose code ends where its comment begins must not
         // contribute the whitespace between them either — otherwise `a: u8, //x`
-        // and `a: u8,// y` would read as different declarations.
+        // and `a: u8,// y` would read as different declarations. Inside a
+        // literal there is no comment to strip and a blank line is a blank line
+        // in the value, so it is kept.
         let line = self.identity.code_with_literals(trimmed);
         let line = line.trim();
-        if line.is_empty() {
+        if line.is_empty() && !continues_literal {
             return;
         }
         if !self.decl.identity.is_empty() {
-            // The lines are separated by the character that actually separated
-            // them. Joining with a space made a literal spanning two lines
-            // compare equal to the same literal rewritten with a space in it, so
-            // a changed public constant paired away as an unchanged re-add. The
-            // identity is only ever compared, never displayed, so the newline
-            // costs nothing and says what the source said.
-            self.decl.identity.push('\n');
+            // Physical boundaries are preserved only where they are part of the
+            // value. Joining a literal's lines with a space made a constant
+            // written across two lines compare equal to the same constant
+            // rewritten with a space in it, so a changed public value paired
+            // away as an unchanged re-add. Everywhere else the break is layout:
+            // preserving it there made `pub type Alias =` + `u32;` a different
+            // declaration from `pub type Alias = u32;`, and a purely cosmetic
+            // reflow was reported as a changed signature — with an identical
+            // "before" and "after", since those are joined with a space.
+            self.decl
+                .identity
+                .push(if continues_literal { '\n' } else { ' ' });
         }
         self.decl.identity.push_str(line);
     }
@@ -2954,6 +2966,76 @@ mod tests {
                 BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
             )),
             "collapsing a literal's newline into a space changes the value, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reflowing_a_declaration_across_lines_is_not_a_signature_change() {
+        // The line break is preserved because a literal may span it. Preserving
+        // it unconditionally made a purely cosmetic reflow — the same alias
+        // rewritten onto one line — read as two different declarations, and the
+        // pairing pass reported a signature change for an API that did not move.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &["-pub type Alias =", "-    u32;", "+pub type Alias = u32;"],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a reflow states the same API, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reflowing_a_declaration_onto_more_lines_is_not_a_signature_change_either() {
+        // The same no-op in the other direction, so the rule is not a one-way
+        // tolerance that merely happens to hold for the shape above.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &["-pub type Alias = u32;", "+pub type Alias =", "+    u32;"],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "a reflow states the same API, got: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_literal_is_part_of_the_value() {
+        // The other half of the same rule: a line contributing no code is
+        // dropped from the identity, but inside a literal an empty line IS the
+        // value. Dropping it made a constant with a blank line compare equal to
+        // the same constant without one.
+        let patch = one_file_patch(
+            "src/model.rs",
+            &[
+                "-pub const BANNER: &str = \"a",
+                "-",
+                "-b\";",
+                "+pub const BANNER: &str = \"a",
+                "+b\";",
+            ],
+        );
+
+        let findings = analyze_all_breaking_changes(&[patch]);
+        assert!(
+            findings.iter().any(|f| matches!(
+                &f.kind,
+                BreakingKind::RemovedSymbol { .. } | BreakingKind::ChangedSignature { .. }
+            )),
+            "dropping a literal's blank line changes the value, got: {:?}",
             findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
         );
     }
