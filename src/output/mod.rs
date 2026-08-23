@@ -1055,14 +1055,19 @@ fn render_config(rows: &[ConfigRow], terminal_columns: usize, color: bool) -> St
     let Some(inner) = config_box_inner_width(&plain_lines, CONFIG_BOX_TITLE, terminal_columns)
     else {
         let mut output = String::new();
-        output.push_str(CONFIG_BOX_TITLE);
-        output.push('\n');
+        let fallback_width = terminal_columns.max(1);
+        for line in wrap_config_line(CONFIG_BOX_TITLE, fallback_width) {
+            output.push_str(&line);
+            output.push('\n');
+        }
         for row in rows {
             match row {
                 ConfigRow::Rule => output.push('\n'),
                 ConfigRow::Line { plain, style } => {
-                    output.push_str(&style_config_line(plain, *style, color));
-                    output.push('\n');
+                    for line in wrap_config_line(plain, fallback_width) {
+                        output.push_str(&style_config_line(&line, *style, color));
+                        output.push('\n');
+                    }
                 }
             }
         }
@@ -1622,7 +1627,7 @@ mod tests {
     fn config_box_never_exceeds_the_terminal_width() {
         let rows = config_box_test_rows();
 
-        for columns in [40, 64, 80, 100, 116, 124, 160] {
+        for columns in [20, 23, 40, 64, 80, 100, 116, 124, 160] {
             let rendered = render_config(&rows, columns, false);
             for line in rendered.lines() {
                 assert!(
@@ -1664,7 +1669,13 @@ mod tests {
         let rendered = render_config(&config_box_test_rows(), 20, false);
 
         assert!(rendered.starts_with("PRVIEW CONFIG\n"));
-        assert!(rendered.contains("Target: feature/zażółć/e\u{301}/界/👩‍💻"));
+        assert!(rendered.contains(" Target:"));
+        assert!(rendered.contains("zażółć"));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| UnicodeWidthStr::width(line) <= 20)
+        );
         assert!(!rendered.contains(['╔', '║', '╚']));
     }
 
