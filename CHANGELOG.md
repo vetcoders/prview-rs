@@ -201,6 +201,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A turbofish return type no longer hides a changed public signature.**
+  `pub fn run() -> Buffer::<{` is a valid return type — rustc accepts
+  `Type::<…>` in type position — but its `<` follows a `:`, which the scanner did
+  not accept as opening a generic argument list. The list went uncounted, the
+  const block's `{` read as the item's body opener, and both diff sides
+  finalized at that identical prefix: they paired as an unchanged re-add and a
+  changed const argument, which is a changed public return type, produced no
+  finding at all. `:` now joins an identifier and a closing `>` as a predecessor
+  that opens a list; whitespace still does not, so a comparison is still not a
+  list. Verdict-neutral where it is not needed — over all 4,334,018 public
+  declaration lines in the local crates.io registry the old and new rules
+  disagree on none, because a turbofish that closes on its own line nets out
+  either way. What changes is a list left open at end of line.
 - **`tools/validate_merge_gate.py` now rejects a `quality_pass` that
   contradicts its own evidence.** The flag and `quality_failure_details` are one
   fact written twice — the emitter sets `quality_pass` to
