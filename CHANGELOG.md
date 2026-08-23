@@ -201,6 +201,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A block or struct-literal initializer no longer hides a changed public
+  constant.** `pub const LIMIT: usize = {` and `pub const ZERO: Self = Self {`
+  had their `{` read as the item's body opener, so both diff sides finalized at
+  their identical first line, paired as an unchanged re-add, and a changed
+  expression inside the block produced no finding at all. After a top-level `=`
+  the item states a value and runs to its `;`, and a `;` inside the initializer
+  terminates a statement rather than the declaration. Only a top-level `=`
+  counts — inside a generic argument list one states a default
+  (`struct Foo<const N: usize = 4>`) or an associated type
+  (`impl Iterator<Item = u8>`), both still followed by a real body brace.
+  Measured over the local registry (58,586 files, 1,960 crates, 4,334,320 public
+  declaration lines) this changes the verdict on 2,465 lines, every sampled one
+  a public constant with a multi-line struct-literal or block initializer.
 - **A const argument that is not the first one no longer hides a public type
   change.** The breaking-change scanner recognized `Buffer<{ LIMIT }>` as
   type-level syntax by the exact `<{` sequence, so `Buffer<u8, { LIMIT }>` —

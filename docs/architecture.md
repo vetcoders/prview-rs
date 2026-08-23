@@ -793,6 +793,22 @@ their own line must still terminate at their `;`. Measured over that registry
 tracking and the narrower `<{` sequence rule it replaced judge zero lines
 differently.
 
+Nor is the `{` of an initializer that body brace. After a top-level `=` the item
+states a VALUE and runs to its `;`, so `pub const LIMIT: usize = {` and
+`pub const ZERO: Self = Self {` open an initializer, not an item body — and a
+`;` inside it terminates a statement, not the declaration. Finalizing at that
+brace truncated both diff sides to their identical first line, they paired as an
+unchanged re-add, and a changed expression inside the block produced no finding.
+Only a TOP-LEVEL `=` counts: inside a generic argument list one states a default
+(`struct Foo<const N: usize = 4>`) or an associated type
+(`impl Iterator<Item = u8>`), and both are followed by a body brace that must
+still end the declaration; `==`, `=>` and the compound assignments are excluded
+too. This is the widest of the brace rules by frequency — measured over the
+local registry (58,586 files, 1,960 crates, 4,334,320 public declaration lines),
+2,465 lines change verdict, every sampled one a public constant whose
+initializer is a struct literal or block spanning several lines. What such a
+declaration accumulates is still bounded by `MAX_DECL_CONTINUATION_LINES`.
+
 Inline module names keep their raw-identifier prefix. `mod r#type` and
 `mod r#match` were both recorded as `r`, so two namespaces looked like one and a
 removal from the first was cancelled by an unrelated addition in the second.

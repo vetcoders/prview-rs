@@ -1140,7 +1140,13 @@ fn declaration_complete(code: &str) -> bool {
     // `Buffer<{ LIMIT * 2 }>`, `Buffer<u8, { LIMIT * 2 }>` — is type-level
     // syntax, not the item's body opener.
     let mut angle: i32 = 0;
-    let mut const_block: i32 = 0;
+    // How deep inside a brace that is NOT the item's body the scan is: a const
+    // argument, or an initializer block after a top-level `=`.
+    let mut block: i32 = 0;
+    // Has a top-level `=` been seen? After one, the item states a VALUE and
+    // runs to its `;` — every `{` from there on opens the initializer, never
+    // the body of a struct, enum, trait or function.
+    let mut initializes = false;
     let mut prev = '\0';
     let mut chars = code.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -1161,13 +1167,26 @@ fn declaration_complete(code: &str) -> bool {
             '<' if prev.is_alphanumeric() || prev == '_' || prev == '>' => angle += 1,
             // `->` is a return arrow, not a closing bracket.
             '>' if prev != '-' && angle > 0 => angle -= 1,
+            // Only a top-level `=` is an initializer. Inside a generic argument
+            // list it states a default (`struct Foo<const N: usize = 4>`) or an
+            // associated type (`impl Iterator<Item = u8>`), and both of those
+            // are followed by a body brace that must still end the declaration.
+            // `==`, `=>` and the compound assignments are not initializers either.
+            '=' if depth <= 0
+                && angle == 0
+                && block == 0
+                && !matches!(chars.peek(), Some(&('=' | '>')))
+                && !"=!<>+-*/%&|^".contains(prev) =>
+            {
+                initializes = true
+            }
             // Tracking the whole argument list rather than the exact `<{`
             // sequence is what catches a const argument that is not the FIRST
             // one, where the `{` follows a comma. Measured against the local
             // registry (59,946 files, 2,025 crates, 4,354,142 public
             // declaration lines), the two rules judge zero lines differently.
-            '{' if angle > 0 || const_block > 0 => const_block += 1,
-            '}' if const_block > 0 => const_block -= 1,
+            '{' if angle > 0 || block > 0 || initializes => block += 1,
+            '}' if block > 0 => block -= 1,
             // Square brackets are counted for the same reason parentheses are:
             // an array type states its length with a `;` — `pub const TABLE:
             // [u8; 2] = [` — and reading that as the terminator finalized the
@@ -1176,7 +1195,9 @@ fn declaration_complete(code: &str) -> bool {
             // initializer below produced no finding at all.
             '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
-            '{' | ';' if depth <= 0 => return true,
+            // A `;` inside an initializer block is a statement terminator, not
+            // the declaration's.
+            '{' | ';' if depth <= 0 && block == 0 => return true,
             _ => {}
         }
         if !ch.is_whitespace() {
@@ -1785,6 +1806,44 @@ mod tests {
         );
         assert!(changes[0].0.contains("LIMIT * 2"), "{}", changes[0].0);
         assert!(changes[0].1.contains("LIMIT * 3"), "{}", changes[0].1);
+    }
+
+    #[test]
+    fn a_block_initializer_is_not_the_body_opener() {
+        // `pub const LIMIT: usize = {` opens an initializer, not an item body:
+        // the declaration runs to the `;` after the block's `}`. Finalizing at
+        // the `{` truncated both diff sides to the same first line, they paired
+        // as an unchanged re-add, and the changed expression inside the block
+        // produced no finding at all.
+        let findings = analyze_all_breaking_changes(&[one_file_patch(
+            "src/limits.rs",
+            &[
+                "-pub const LIMIT: usize = {",
+                "-    let base = 2;",
+                "-    base * 3",
+                "-};",
+                "+pub const LIMIT: usize = {",
+                "+    let base = 2;",
+                "+    base * 4",
+                "+};",
+            ],
+        )]);
+
+        let changes: Vec<(&String, &String)> = findings
+            .iter()
+            .filter_map(|f| match &f.kind {
+                BreakingKind::ChangedSignature { before, after } => Some((before, after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "a changed block-valued constant is a changed public value: {:?}",
+            findings.iter().map(|f| &f.kind).collect::<Vec<_>>()
+        );
+        assert!(changes[0].0.contains("base * 3"), "{}", changes[0].0);
+        assert!(changes[0].1.contains("base * 4"), "{}", changes[0].1);
     }
 
     #[test]
