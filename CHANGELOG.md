@@ -201,6 +201,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A signature edited in place is no longer swallowed by the context lines
+  around it.** A hunk interleaves two texts, and the scanner reconstructs both:
+  the before side is context ∪ removed lines, the after side is context ∪ added
+  lines. It used to end BOTH pending declarations at the first line from the
+  other side, so the everyday shape of an edited signature — `pub fn f(`
+  retouched on both sides, a shared `x: u8,`, then `-old: u16,` / `+new: u32,`
+  and a shared `) {` — finalized to two identical openers, paired as an
+  unchanged re-add, and reported the parameter change nowhere. A `-` line now
+  extends only the removed side, a `+` line only the added side, and a context
+  line extends whichever side still has a declaration open. Context lines only
+  CONTINUE a declaration and never start one: a `pub` item first seen on a
+  context line is unchanged by the patch. `MAX_DECL_CONTINUATION_LINES` (32)
+  still bounds growth and a hunk header still finalizes both sides, so the
+  reconstruction stays inside the hunk that emitted it.
 - **A failed quality axis can no longer be published as a `PASS`.** The
   conservative reconciliation ranked `verdict`, `merge_recommendation` and
   `allow_merge` but read `quality_pass` separately, afterwards — so a pack

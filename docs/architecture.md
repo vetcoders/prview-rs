@@ -742,6 +742,20 @@ declarations agreeing on their opener and first eight lines finalized to the
 same truncated text and paired as an unchanged re-add, so a parameter, bound or
 return type changed below the cut produced no finding at all.
 
+A hunk interleaves two texts, and the accumulators reconstruct both: the before
+side is context ∪ removed lines, the after side is context ∪ added lines. So a
+`-` line never touches the added accumulator, a `+` line never touches the
+removed one, and a context line EXTENDS whichever side still has a declaration
+open. Ending both accumulators at the first line from the other side truncated
+every declaration a patch edits in place — `pub fn f(` and a shared `x: u8,`
+followed by `-old: u16,` / `+new: u32,` finalized to two identical openers,
+paired as an unchanged re-add, and the parameter change was reported nowhere.
+Context lines only ever CONTINUE a declaration; a `pub` item that first appears
+on one is unchanged by the patch and must not open an accumulator, which keeps
+the reconstruction inside the hunk that emitted it. The bound is unchanged:
+`MAX_DECL_CONTINUATION_LINES` still caps growth, and a hunk header or a new file
+still finalizes both sides.
+
 Where a declaration ENDS is decided on a separate, comment-resolved view of the
 same lines, fed through the pending declaration's own `SourceScanner` one
 physical line at a time. The joined text has no line breaks, so scanning it as a
