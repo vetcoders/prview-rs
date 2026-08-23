@@ -371,7 +371,11 @@ fn validator_rejects_schema_two_two_without_a_usable_origin() {
 
     // Every classification the emitter can write must validate — the vocabulary
     // is pinned to `QualityFailureClass::as_str`, so a validator that spelled
-    // one of them differently would reject a pack prview itself produced.
+    // one of them differently would reject a pack prview itself produced. The
+    // flag moves with the row because `quality_pass` is derived from these very
+    // details: only `pre-existing` leaves the gate passing, so pinning one flag
+    // across all four would test a pack the emitter cannot write. What this loop
+    // asserts is unchanged — all four spellings validate.
     for classification in ["introduced", "pre-existing", "mixed", "unclassified"] {
         let mut gate = original.clone();
         gate["decision"]["quality_failure_details"] = serde_json::json!([{
@@ -379,6 +383,7 @@ fn validator_rejects_schema_two_two_without_a_usable_origin() {
             "classification": classification,
             "origin": "failure",
         }]);
+        gate["decision"]["quality_pass"] = serde_json::json!(classification == "pre-existing");
         std::fs::write(
             &merge_gate,
             serde_json::to_string_pretty(&gate).expect("serialize gate"),
@@ -390,6 +395,88 @@ fn validator_rejects_schema_two_two_without_a_usable_origin() {
             .arg(&merge_gate)
             .assert()
             .success();
+    }
+
+    // The shape the emitter actually writes still validates.
+    std::fs::write(&merge_gate, &raw).expect("restore gate");
+    Command::new("python3")
+        .arg(&validator)
+        .arg(&merge_gate)
+        .assert()
+        .success();
+}
+
+/// `quality_pass` and `quality_failure_details` are ONE fact written twice: the
+/// emitter sets the flag to `!QualityFailureSummary::has_new_failures()` and
+/// serializes the very details that answer it. Validating each side's shape
+/// while never comparing them let a pack claim `quality_pass: true` beside an
+/// explicitly introduced failure, and both decision readers trust the permissive
+/// scalar — so a validator-clean pack could approve a failure it also reports.
+///
+/// The check is an equivalence, and the `pre-existing` row is why the obvious
+/// one-way rule would be wrong: a failure that predates the diff is emitted
+/// beside `quality_pass: true` on purpose.
+#[test]
+fn validator_rejects_quality_pass_contradicting_its_own_details() {
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+
+    let payload = run_json_quiet(repo, &["feature/json-contract", "main"]);
+    let output_dir = Path::new(
+        payload["output_dir"]
+            .as_str()
+            .expect("output_dir should be a string"),
+    );
+    let merge_gate = output_dir.join("00_summary/MERGE_GATE.json");
+    let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
+
+    let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
+    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+
+    let detail = |classification: &str, origin: &str| serde_json::json!([{ "name": "Clippy", "classification": classification, "origin": origin }]);
+
+    // (details, quality_pass, must_validate)
+    let cases: [(serde_json::Value, bool, bool); 10] = [
+        // A gating failure beside a passing flag — the combination the emitter
+        // cannot produce, and the one that lets a clean-looking pack approve an
+        // introduced failure.
+        (detail("introduced", "failure"), true, false),
+        (detail("mixed", "failure"), true, false),
+        (detail("unclassified", "failure"), true, false),
+        // The same rows with the flag the emitter would actually write.
+        (detail("introduced", "failure"), false, true),
+        (detail("mixed", "failure"), false, true),
+        (detail("unclassified", "failure"), false, true),
+        // Pre-existing failures do NOT gate: this pack is legal and must not be
+        // rejected by a rule that keys on origin alone.
+        (detail("pre-existing", "failure"), true, true),
+        // Warnings never gate either, whatever they classify as.
+        (detail("introduced", "warning"), true, true),
+        // The other direction: a failing flag with nothing that could have
+        // failed it is equally unemittable.
+        (detail("pre-existing", "failure"), false, false),
+        (serde_json::json!([]), false, false),
+    ];
+
+    for (details, quality_pass, must_validate) in cases {
+        let mut gate = original.clone();
+        gate["decision"]["quality_failure_details"] = details.clone();
+        gate["decision"]["quality_pass"] = serde_json::json!(quality_pass);
+        std::fs::write(
+            &merge_gate,
+            serde_json::to_string_pretty(&gate).expect("serialize gate"),
+        )
+        .expect("write gate");
+
+        let assertion = Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert();
+        if must_validate {
+            assertion.success();
+        } else {
+            assertion.failure();
+        }
     }
 
     // The shape the emitter actually writes still validates.
