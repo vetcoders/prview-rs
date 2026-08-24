@@ -1,0 +1,37 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "combining_mark_distinct",
+  "family": "combining_mark",
+  "legacy_expectation": "positive",
+  "legacy_positive_sibling": null,
+  "repo_backed_records": [
+    {
+      "kind": "removed",
+      "symbol": "café",
+      "namespace": "crate",
+      "before": "pub fn café()",
+      "after": null,
+      "provenance": {
+        "base_revision": "fixture://combining_mark_distinct/base",
+        "target_revision": "fixture://combining_mark_distinct/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    },
+    {
+      "kind": "added",
+      "symbol": "cafè",
+      "namespace": "crate",
+      "before": null,
+      "after": "pub fn cafè()",
+      "provenance": {
+        "base_revision": "fixture://combining_mark_distinct/base",
+        "target_revision": "fixture://combining_mark_distinct/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

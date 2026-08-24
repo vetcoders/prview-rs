@@ -1,0 +1,831 @@
+{
+  "schema": "prview.api_surface_corpus.v1",
+  "required_families": [
+    "abi",
+    "cfg",
+    "literal",
+    "module_scope",
+    "combining_mark",
+    "line_limit",
+    "move",
+    "reexport"
+  ],
+  "cells": [
+    {
+      "id": "abi_changed",
+      "family": "abi",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "abi_unchanged",
+      "family": "abi",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "cfg_guard_changed",
+      "family": "cfg",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "cfg_operand_reordered",
+      "family": "cfg",
+      "legacy_expectation": "accepted_zero",
+      "legacy_positive_sibling": "cfg_guard_changed",
+      "legacy_delta_rationale": "the legacy detector accepted reordered commutative cfg operands"
+    },
+    {
+      "id": "cfg_unchanged",
+      "family": "cfg",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "literal_changed",
+      "family": "literal",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "literal_layout_only",
+      "family": "literal",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "module_scope_changed",
+      "family": "module_scope",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "module_scope_unseen_opener",
+      "family": "module_scope",
+      "legacy_expectation": "accepted_zero",
+      "legacy_positive_sibling": "module_scope_changed",
+      "legacy_delta_rationale": "the legacy hunk scanner could not recover an Allman module opener outside its visible context"
+    },
+    {
+      "id": "module_scope_unchanged",
+      "family": "module_scope",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "module_scope_private_unreachable",
+      "family": "module_scope",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "combining_mark_changed",
+      "family": "combining_mark",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "combining_mark_distinct",
+      "family": "combining_mark",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "combining_mark_unchanged",
+      "family": "combining_mark",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "long_within_cap_changed",
+      "family": "line_limit",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "long_below_32_line_cut",
+      "family": "line_limit",
+      "legacy_expectation": "accepted_zero",
+      "legacy_positive_sibling": "long_within_cap_changed",
+      "legacy_delta_rationale": "the legacy declaration accumulator stopped before the changed value below its 32-line cap"
+    },
+    {
+      "id": "long_unchanged",
+      "family": "line_limit",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "move_relocated",
+      "family": "move",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "move_same_path",
+      "family": "move",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "reexport_removed",
+      "family": "reexport",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "reexport_preserved",
+      "family": "reexport",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "reexport_changed",
+      "family": "reexport",
+      "legacy_expectation": "accepted_zero",
+      "legacy_positive_sibling": "reexport_removed",
+      "legacy_delta_rationale": "the legacy breaking detector deliberately ignored changed pub-use edges"
+    },
+    {
+      "id": "item_opener_removed",
+      "family": "item_body",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "item_body_removed",
+      "family": "item_body",
+      "legacy_expectation": "accepted_zero",
+      "legacy_positive_sibling": "item_opener_removed",
+      "legacy_delta_rationale": "the diff-only detector missed a public field removal when the item opener was unchanged"
+    },
+    {
+      "id": "item_body_changed",
+      "family": "item_body",
+      "legacy_expectation": "accepted_zero",
+      "legacy_positive_sibling": "item_opener_removed",
+      "legacy_delta_rationale": "the diff-only detector paired identical item openers and missed a public field type change"
+    },
+    {
+      "id": "backslash_literal_changed",
+      "family": "backslash_continuation",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "backslash_reindent",
+      "family": "backslash_continuation",
+      "legacy_expectation": "accepted_zero",
+      "legacy_positive_sibling": "backslash_literal_changed",
+      "legacy_delta_rationale": "the diff-only detector accepted indentation-only churn around a continued literal"
+    },
+    {
+      "id": "declaration_pairing_changed",
+      "family": "declaration_pairing",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "declaration_pairing_noop",
+      "family": "declaration_pairing",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "legacy_non_api_control",
+      "family": "legacy_control",
+      "legacy_expectation": "negative",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "function_removed",
+      "family": "removal",
+      "legacy_expectation": "positive",
+      "legacy_positive_sibling": null
+    },
+    {
+      "id": "function_added",
+      "family": "removal",
+      "legacy_expectation": "accepted_zero",
+      "legacy_positive_sibling": "function_removed",
+      "legacy_delta_rationale": "the legacy breaking detector deliberately ignored additive public functions"
+    }
+  ],
+  "historical_regressions": {
+    "a_pipe_in_a_declaration_does_not_break_the_table_columns": {
+      "cell": "literal_layout_only",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_backtick_in_a_declaration_does_not_end_its_code_span_early": {
+      "cell": "literal_layout_only",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_cell_that_begins_with_a_backtick_is_padded": {
+      "cell": "literal_layout_only",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "breaking_changes_detects_removed_pub_fn": {
+      "cell": "function_removed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "removed"
+      ]
+    },
+    "breaking_changes_skips_non_code_markdown": {
+      "cell": "legacy_non_api_control",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "breaking_changes_clean_diff": {
+      "cell": "function_added",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "added"
+      ]
+    },
+    "breaking_changes_detects_signature_change": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "new_env_requirement_detected_despite_adjacent_punctuation": {
+      "cell": "legacy_non_api_control",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "relocated_symbols_are_not_reported_as_removed": {
+      "cell": "move_relocated",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "relocated"
+      ]
+    },
+    "genuine_removal_in_single_file_stays_removed": {
+      "cell": "function_removed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "removed"
+      ]
+    },
+    "identical_remove_readd_in_same_file_is_not_breaking": {
+      "cell": "declaration_pairing_noop",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "identical_remove_readd_non_fn_symbols_are_not_breaking": {
+      "cell": "declaration_pairing_noop",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "changed_non_fn_declaration_is_signature_change_not_removal": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "genuine_non_fn_removal_stays_removed": {
+      "cell": "item_body_removed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "removed"
+      ]
+    },
+    "duplicate_declarations_pair_one_to_one": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_const_block_in_a_generic_argument_is_not_the_body_opener": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_comparison_inside_a_const_block_does_not_swallow_the_item_body": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_changed_const_comparison_is_still_a_signature_change": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_turbofish_inside_a_const_block_keeps_its_own_balance": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_qualified_path_inside_a_const_block_stays_balanced": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_const_block_in_a_later_generic_argument_is_not_the_body_opener_either": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_shared_context_line_does_not_truncate_both_sides_of_a_declaration": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "an_opposite_side_line_does_not_truncate_a_pending_declaration": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_block_initializer_is_not_the_body_opener": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_body_brace_after_a_const_argument_still_ends_the_declaration": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_turbofish_return_type_does_not_finalize_at_its_const_block": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_turbofish_return_type_re_emitted_verbatim_is_a_no_op": {
+      "cell": "declaration_pairing_noop",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_comparison_after_whitespace_still_does_not_open_an_argument_list": {
+      "cell": "literal_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_shifted_constant_still_terminates_at_its_semicolon": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "unpaired_duplicate_removal_stays_a_removal": {
+      "cell": "item_body_removed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "removed"
+      ]
+    },
+    "pub_use_reexport_is_not_a_tracked_public_symbol": {
+      "cell": "reexport_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "added",
+        "removed"
+      ]
+    },
+    "changed_signature_reconstructs_multiline_after": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "changed_signature_dedups_feature_gated_variants": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "changed_signatures_of_different_kinds_do_not_collapse": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "same_name_in_different_inline_modules_is_not_a_no_op_pair": {
+      "cell": "module_scope_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "relocated"
+      ]
+    },
+    "raw_identifier_modules_are_different_scopes": {
+      "cell": "module_scope_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "relocated"
+      ]
+    },
+    "literal_and_comment_braces_do_not_pop_the_module_scope": {
+      "cell": "module_scope_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "relocated"
+      ]
+    },
+    "a_literal_spanning_lines_does_not_pop_the_module_scope": {
+      "cell": "module_scope_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "relocated"
+      ]
+    },
+    "literal_brace_does_not_invent_a_module_scope": {
+      "cell": "module_scope_private_unreachable",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "an_associated_item_moved_between_impl_blocks_is_a_removal": {
+      "cell": "item_body_removed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "removed"
+      ]
+    },
+    "the_same_impl_owner_still_pairs_a_moved_declaration": {
+      "cell": "module_scope_private_unreachable",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "an_impl_opener_the_hunk_never_showed_still_pairs": {
+      "cell": "module_scope_private_unreachable",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "an_impl_owner_composes_with_the_module_it_sits_in": {
+      "cell": "module_scope_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "relocated"
+      ]
+    },
+    "a_returned_impl_trait_does_not_open_a_scope": {
+      "cell": "module_scope_private_unreachable",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_literal_delimiter_does_not_end_a_declaration_early": {
+      "cell": "literal_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_declaration_ending_inside_a_literal_still_completes_at_the_real_end": {
+      "cell": "literal_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_removal_is_not_cancelled_by_a_re_add_under_a_different_cfg": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_re_add_under_the_same_cfg_still_cancels": {
+      "cell": "cfg_unchanged",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_stack_of_cfg_attributes_is_one_guard": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_reordered_cfg_stack_is_the_same_guard": {
+      "cell": "cfg_operand_reordered",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_multiline_cfg_predicate_still_guards_its_declaration": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_rewrapped_cfg_predicate_is_the_same_guard": {
+      "cell": "cfg_operand_reordered",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "whitespace_inside_a_cfg_value_is_part_of_the_gate": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_line_break_inside_a_cfg_value_is_part_of_the_gate": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_line_break_inside_a_raw_cfg_value_is_part_of_the_gate_too": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "indentation_inside_a_cfg_value_is_part_of_the_gate": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_multiline_cfg_value_reemitted_unchanged_is_still_a_no_op": {
+      "cell": "cfg_operand_reordered",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "re_indenting_a_wrapped_predicate_is_still_only_layout": {
+      "cell": "cfg_operand_reordered",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "spacing_outside_a_cfg_value_is_still_only_layout": {
+      "cell": "cfg_operand_reordered",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_multiline_attribute_does_not_drop_the_cfg_above_it": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_delimiter_inside_a_multiline_raw_string_attribute_does_not_end_it": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_multiline_raw_string_attribute_ends_at_its_own_delimiter": {
+      "cell": "cfg_unchanged",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_line_continued_string_attribute_does_not_swallow_the_cfg_below_it": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_literal_still_tells_two_cfg_predicates_apart": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_cfg_attr_that_applies_a_cfg_is_part_of_the_guard": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_cfg_attr_that_applies_no_cfg_is_not_a_guard": {
+      "cell": "cfg_unchanged",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "an_unseen_cfg_guard_pairs_as_before": {
+      "cell": "cfg_unchanged",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_block_comment_between_the_guard_and_its_item_does_not_drop_the_guard": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_multiline_block_comment_between_the_guard_and_its_item_does_not_drop_the_guard": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_block_comment_inside_a_cfg_predicate_is_not_counted_as_syntax": {
+      "cell": "cfg_guard_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "same_name_in_the_same_inline_module_still_pairs": {
+      "cell": "item_body_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "multiline_non_fn_declaration_change_is_not_swallowed": {
+      "cell": "declaration_pairing_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "multiline_non_fn_declaration_reemitted_unchanged_is_not_breaking": {
+      "cell": "declaration_pairing_noop",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_long_signature_change_below_the_old_cap_is_not_swallowed": {
+      "cell": "long_within_cap_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_trailing_comment_does_not_swallow_the_rest_of_a_declaration": {
+      "cell": "literal_layout_only",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_real_change_below_a_trailing_comment_still_surfaces": {
+      "cell": "literal_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "rewording_a_comment_inside_a_declaration_is_not_a_signature_change": {
+      "cell": "literal_layout_only",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_changed_multiline_array_constant_surfaces": {
+      "cell": "literal_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_reemitted_multiline_array_constant_is_still_a_no_op": {
+      "cell": "literal_layout_only",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_newline_inside_a_literal_is_not_the_same_value_as_a_space": {
+      "cell": "literal_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "reflowing_a_declaration_across_lines_is_not_a_signature_change": {
+      "cell": "literal_layout_only",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "reflowing_a_declaration_onto_more_lines_is_not_a_signature_change_either": {
+      "cell": "literal_layout_only",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_blank_line_inside_a_literal_is_part_of_the_value": {
+      "cell": "literal_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_multiline_literal_reemitted_unchanged_is_still_a_no_op": {
+      "cell": "literal_layout_only",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "re_indenting_a_literal_s_continuation_line_changes_the_value": {
+      "cell": "literal_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "trailing_whitespace_inside_a_literal_changes_the_value_too": {
+      "cell": "literal_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "re_indenting_a_continuation_line_outside_a_literal_is_still_a_no_op": {
+      "cell": "literal_layout_only",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "the_gap_before_a_trailing_comment_is_still_not_part_of_the_identity": {
+      "cell": "literal_layout_only",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "a_changed_string_literal_is_still_a_signature_change": {
+      "cell": "literal_changed",
+      "expected_polarity": "positive",
+      "expected_delta_kinds": [
+        "changed"
+      ]
+    },
+    "a_long_declaration_reemitted_unchanged_is_still_a_no_op": {
+      "cell": "long_unchanged",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "test_breaking_risk_barrel_files_are_high": {
+      "cell": "legacy_non_api_control",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "test_breaking_risk_crate_roots_are_high": {
+      "cell": "legacy_non_api_control",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "test_breaking_risk_workspace_crate_root_high": {
+      "cell": "legacy_non_api_control",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "test_breaking_risk_shallow_path_is_medium": {
+      "cell": "legacy_non_api_control",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "test_breaking_risk_deep_barrel_is_high": {
+      "cell": "legacy_non_api_control",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "test_breaking_risk_deep_non_barrel_is_low": {
+      "cell": "legacy_non_api_control",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "test_breaking_risk_empty_path_is_medium": {
+      "cell": "legacy_non_api_control",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "test_should_scan_for_breaking_changes_matches_code_only": {
+      "cell": "legacy_non_api_control",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    },
+    "is_test_file_patterns": {
+      "cell": "legacy_non_api_control",
+      "expected_polarity": "negative",
+      "expected_delta_kinds": []
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "abi_changed",
+  "family": "abi",
+  "legacy_expectation": "positive",
+  "legacy_positive_sibling": null,
+  "repo_backed_records": [
+    {
+      "kind": "changed",
+      "symbol": "call",
+      "namespace": "crate",
+      "before": "pub extern \"C\" fn call(x: u32) -> u32",
+      "after": "pub extern \"system\" fn call(x: u32) -> u32",
+      "provenance": {
+        "base_revision": "fixture://abi_changed/base",
+        "target_revision": "fixture://abi_changed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

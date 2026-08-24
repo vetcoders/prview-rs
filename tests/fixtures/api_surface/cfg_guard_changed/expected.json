@@ -1,0 +1,23 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "cfg_guard_changed",
+  "family": "cfg",
+  "legacy_expectation": "positive",
+  "legacy_positive_sibling": null,
+  "repo_backed_records": [
+    {
+      "kind": "changed",
+      "symbol": "gated",
+      "namespace": "crate",
+      "before": "#[cfg(feature = \"a\")] pub fn gated()",
+      "after": "#[cfg(feature = \"b\")] pub fn gated()",
+      "provenance": {
+        "base_revision": "fixture://cfg_guard_changed/base",
+        "target_revision": "fixture://cfg_guard_changed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

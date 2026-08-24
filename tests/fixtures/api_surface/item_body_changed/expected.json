@@ -1,0 +1,24 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "item_body_changed",
+  "family": "item_body",
+  "legacy_expectation": "accepted_zero",
+  "legacy_positive_sibling": "item_opener_removed",
+  "legacy_delta_rationale": "the diff-only detector paired identical item openers and missed a public field type change",
+  "repo_backed_records": [
+    {
+      "kind": "changed",
+      "symbol": "field",
+      "namespace": "crate::Public",
+      "before": "pub field: u8",
+      "after": "pub field: u16",
+      "provenance": {
+        "base_revision": "fixture://item_body_changed/base",
+        "target_revision": "fixture://item_body_changed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

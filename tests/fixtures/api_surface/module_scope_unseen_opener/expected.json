@@ -1,0 +1,24 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "module_scope_unseen_opener",
+  "family": "module_scope",
+  "legacy_expectation": "accepted_zero",
+  "legacy_positive_sibling": "module_scope_changed",
+  "legacy_delta_rationale": "the legacy hunk scanner could not recover an Allman module opener outside its visible context",
+  "repo_backed_records": [
+    {
+      "kind": "relocated",
+      "symbol": "value",
+      "namespace": "crate",
+      "before": "a::value",
+      "after": "b::value",
+      "provenance": {
+        "base_revision": "fixture://module_scope_unseen_opener/base",
+        "target_revision": "fixture://module_scope_unseen_opener/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

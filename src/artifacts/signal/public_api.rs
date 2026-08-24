@@ -16,6 +16,102 @@ pub struct PublicApiDiff {
     pub changed: Vec<ApiSignatureChange>,
 }
 
+#[cfg(test)]
+pub(crate) mod api_surface_corpus_contract {
+    use serde::Deserialize;
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum CorpusExpectation {
+        Positive,
+        Negative,
+        AcceptedZero,
+    }
+
+    #[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum ApiDeltaKind {
+        Added,
+        Removed,
+        Changed,
+        Relocated,
+        VisibilityChanged,
+        Unknown,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum ApiConfidence {
+        Confirmed,
+        Probable,
+        Unknown,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct ApiSourceProvenance {
+        pub(crate) base_revision: String,
+        pub(crate) target_revision: String,
+        pub(crate) source_kind: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct ExpectedApiDelta {
+        pub(crate) kind: ApiDeltaKind,
+        pub(crate) symbol: String,
+        pub(crate) namespace: String,
+        pub(crate) before: Option<String>,
+        pub(crate) after: Option<String>,
+        pub(crate) provenance: ApiSourceProvenance,
+        pub(crate) confidence: ApiConfidence,
+        pub(crate) unknown_reason: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct CorpusExpected {
+        pub(crate) schema: String,
+        pub(crate) cell: String,
+        pub(crate) family: String,
+        pub(crate) legacy_expectation: CorpusExpectation,
+        pub(crate) legacy_positive_sibling: Option<String>,
+        #[serde(default)]
+        pub(crate) legacy_delta_rationale: Option<String>,
+        pub(crate) repo_backed_records: Vec<ExpectedApiDelta>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct CorpusManifestCell {
+        pub(crate) id: String,
+        pub(crate) family: String,
+        pub(crate) legacy_expectation: CorpusExpectation,
+        pub(crate) legacy_positive_sibling: Option<String>,
+        #[serde(default)]
+        pub(crate) legacy_delta_rationale: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum CorpusPolarity {
+        Positive,
+        Negative,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct HistoricalRegressionMapping {
+        pub(crate) cell: String,
+        pub(crate) expected_polarity: CorpusPolarity,
+        pub(crate) expected_delta_kinds: Vec<ApiDeltaKind>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct CorpusManifest {
+        pub(crate) schema: String,
+        pub(crate) required_families: Vec<String>,
+        pub(crate) cells: Vec<CorpusManifestCell>,
+        pub(crate) historical_regressions: BTreeMap<String, HistoricalRegressionMapping>,
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ApiFinding {
     pub file: String,

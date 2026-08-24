@@ -4385,3 +4385,279 @@ mod tests {
         assert!(!is_test_file("src/config/mod.rs"));
     }
 }
+// API_SURFACE_CORPUS_HARNESS
+#[cfg(test)]
+mod api_surface_corpus_tests {
+    use super::super::public_api::api_surface_corpus_contract::{
+        ApiConfidence, ApiDeltaKind, CorpusExpectation, CorpusExpected, CorpusManifest,
+        CorpusPolarity,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
+    use std::path::Path;
+
+    const CORPUS_SCHEMA: &str = "prview.api_surface_corpus.v1";
+    const EXPECTED_SCHEMA: &str = "prview.api_surface_expected.v1";
+
+    fn legacy_breaking_tests() -> BTreeSet<String> {
+        let source = include_str!("breaking.rs")
+            .split("// API_SURFACE_CORPUS_HARNESS")
+            .next()
+            .expect("harness marker exists");
+        let mut names = BTreeSet::new();
+        let mut test_attribute_seen = false;
+
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed == "#[test]" {
+                test_attribute_seen = true;
+                continue;
+            }
+            if test_attribute_seen {
+                if let Some(rest) = trimmed.strip_prefix("fn ")
+                    && let Some((name, _)) = rest.split_once('(')
+                {
+                    names.insert(name.to_string());
+                }
+                test_attribute_seen = false;
+            }
+        }
+
+        names
+    }
+
+    fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> T {
+        let bytes = fs::read(path).unwrap_or_else(|error| {
+            panic!("failed to read corpus file {}: {error}", path.display())
+        });
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!("failed to parse corpus file {}: {error}", path.display())
+        })
+    }
+
+    #[test]
+    fn api_surface_corpus() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/api_surface");
+        let manifest: CorpusManifest = read_json(&root.join("manifest.json"));
+        assert_eq!(manifest.schema, CORPUS_SCHEMA);
+
+        let registered: BTreeSet<_> = manifest.cells.iter().map(|cell| cell.id.as_str()).collect();
+        assert_eq!(
+            registered.len(),
+            manifest.cells.len(),
+            "corpus cell ids must be unique"
+        );
+
+        let fixture_dirs: BTreeSet<String> = fs::read_dir(&root)
+            .expect("api-surface fixture root exists")
+            .filter_map(|entry| {
+                let entry = entry.expect("fixture directory entry is readable");
+                entry
+                    .file_type()
+                    .expect("fixture entry type is readable")
+                    .is_dir()
+                    .then(|| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+        let registered_owned: BTreeSet<String> =
+            registered.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            fixture_dirs, registered_owned,
+            "every fixture directory must be registered, and every registration must exist"
+        );
+
+        let by_id: BTreeMap<_, _> = manifest
+            .cells
+            .iter()
+            .map(|cell| (cell.id.as_str(), cell))
+            .collect();
+        let mut expected_by_id = BTreeMap::new();
+
+        for cell in &manifest.cells {
+            let dir = root.join(&cell.id);
+            for revision in ["base", "head"] {
+                let manifest = dir.join(revision).join("Cargo.toml");
+                let source = dir.join(revision).join("src/lib.rs");
+                assert!(
+                    manifest.is_file(),
+                    "missing repo-shaped manifest {}",
+                    manifest.display()
+                );
+                assert!(
+                    source.is_file(),
+                    "missing repo-shaped source {}",
+                    source.display()
+                );
+                assert!(
+                    !fs::read(&source)
+                        .expect("fixture source is readable")
+                        .is_empty(),
+                    "fixture source must not be empty: {}",
+                    source.display()
+                );
+            }
+
+            let expected: CorpusExpected = read_json(&dir.join("expected.json"));
+            assert_eq!(expected.schema, EXPECTED_SCHEMA, "cell {}", cell.id);
+            assert_eq!(expected.cell, cell.id);
+            assert_eq!(expected.family, cell.family);
+            assert_eq!(expected.legacy_expectation, cell.legacy_expectation);
+            assert_eq!(
+                expected.legacy_positive_sibling,
+                cell.legacy_positive_sibling
+            );
+            assert_eq!(expected.legacy_delta_rationale, cell.legacy_delta_rationale);
+
+            for delta in &expected.repo_backed_records {
+                assert!(
+                    !delta.symbol.trim().is_empty(),
+                    "cell {} has an empty symbol",
+                    cell.id
+                );
+                assert!(
+                    !delta.namespace.trim().is_empty(),
+                    "cell {} has an empty namespace",
+                    cell.id
+                );
+                assert_eq!(
+                    delta.provenance.base_revision,
+                    format!("fixture://{}/base", cell.id)
+                );
+                assert_eq!(
+                    delta.provenance.target_revision,
+                    format!("fixture://{}/head", cell.id)
+                );
+                assert_eq!(delta.provenance.source_kind, "repo_revision_pair");
+
+                let is_unknown = delta.kind == ApiDeltaKind::Unknown
+                    || delta.confidence == ApiConfidence::Unknown;
+                assert_eq!(
+                    delta
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| !reason.trim().is_empty()),
+                    is_unknown,
+                    "cell {} must explain unknowns and only unknowns",
+                    cell.id
+                );
+
+                match delta.kind {
+                    ApiDeltaKind::Added => assert!(delta.after.is_some()),
+                    ApiDeltaKind::Removed => assert!(delta.before.is_some()),
+                    ApiDeltaKind::Changed
+                    | ApiDeltaKind::Relocated
+                    | ApiDeltaKind::VisibilityChanged => {
+                        assert!(delta.before.is_some() && delta.after.is_some())
+                    }
+                    ApiDeltaKind::Unknown => {}
+                }
+            }
+
+            if expected.legacy_expectation == CorpusExpectation::AcceptedZero {
+                assert!(
+                    expected
+                        .legacy_delta_rationale
+                        .as_deref()
+                        .is_some_and(|rationale| !rationale.trim().is_empty()),
+                    "legacy accepted-zero cell {} needs a delta rationale",
+                    cell.id
+                );
+                assert!(
+                    expected.repo_backed_records.iter().all(|delta| {
+                        delta.kind != ApiDeltaKind::Unknown
+                            && delta.confidence == ApiConfidence::Confirmed
+                    }),
+                    "legacy accepted-zero cell {} must encode confirmed repo-backed truth, not invented unknowns",
+                    cell.id
+                );
+            }
+
+            expected_by_id.insert(cell.id.as_str(), expected);
+        }
+
+        for cell in &manifest.cells {
+            if cell.legacy_expectation != CorpusExpectation::AcceptedZero {
+                continue;
+            }
+            let sibling_id = cell.legacy_positive_sibling.as_deref().unwrap_or_else(|| {
+                panic!("accepted zero cell {} lacks a positive sibling", cell.id)
+            });
+            let sibling = by_id.get(sibling_id).unwrap_or_else(|| {
+                panic!(
+                    "accepted zero cell {} names missing sibling {sibling_id}",
+                    cell.id
+                )
+            });
+            assert_eq!(sibling.family, cell.family);
+            assert_eq!(sibling.legacy_expectation, CorpusExpectation::Positive);
+        }
+
+        for family in &manifest.required_families {
+            let family_cells: Vec<_> = manifest
+                .cells
+                .iter()
+                .filter(|cell| cell.family == *family)
+                .collect();
+            assert!(
+                family_cells
+                    .iter()
+                    .any(|cell| !expected_by_id[cell.id.as_str()]
+                        .repo_backed_records
+                        .is_empty()),
+                "required family {family} lacks a repo-backed positive cell"
+            );
+            assert!(
+                family_cells
+                    .iter()
+                    .any(|cell| expected_by_id[cell.id.as_str()]
+                        .repo_backed_records
+                        .is_empty()),
+                "required family {family} lacks a repo-backed negative cell"
+            );
+        }
+
+        let legacy = legacy_breaking_tests();
+        let mapped: BTreeSet<_> = manifest.historical_regressions.keys().cloned().collect();
+        assert_eq!(
+            mapped, legacy,
+            "every legacy breaking regression must be mapped"
+        );
+        for (test, mapping) in &manifest.historical_regressions {
+            let expected = expected_by_id
+                .get(mapping.cell.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "historical regression {test} maps to unknown cell {}",
+                        mapping.cell
+                    )
+                });
+            let actual_polarity = if expected.repo_backed_records.is_empty() {
+                CorpusPolarity::Negative
+            } else {
+                CorpusPolarity::Positive
+            };
+            assert_eq!(
+                mapping.expected_polarity, actual_polarity,
+                "historical regression {test} declares the wrong semantic polarity for {}",
+                mapping.cell
+            );
+            let actual_kinds: BTreeSet<_> = expected
+                .repo_backed_records
+                .iter()
+                .map(|delta| delta.kind.clone())
+                .collect();
+            let declared_kinds: BTreeSet<_> =
+                mapping.expected_delta_kinds.iter().cloned().collect();
+            assert_eq!(
+                mapping.expected_delta_kinds.len(),
+                declared_kinds.len(),
+                "historical regression {test} repeats a declared delta kind"
+            );
+            assert_eq!(
+                declared_kinds, actual_kinds,
+                "historical regression {test} declares delta kinds that disagree with {}",
+                mapping.cell
+            );
+        }
+    }
+}
