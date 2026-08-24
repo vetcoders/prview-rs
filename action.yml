@@ -3,16 +3,20 @@ description: Install prview and run the contractual prview gate automation check
 
 inputs:
   strict:
-    description: Treat CONDITIONAL as a failing gate exit code.
+    description: Reject typed review-required decisions; typed warnings-only remains accepted.
+    required: false
+    default: "false"
+  fail-on-warnings:
+    description: With strict=true, also reject the canonical warnings-only lane (requires prview 0.8.0+).
     required: false
     default: "false"
   version:
     description: >-
       prview crate version to install (for example "0.6.0"), or "latest" for the
       newest published release. `prview gate` shipped starting with the 0.6.0
-      release; pin to "0.6.0" or newer. "latest" is a resilient default: it
-      never fails to resolve a pinned version that does not yet exist on
-      crates.io.
+      release; typed warnings-only policy and fail-on-warnings require 0.8.0+.
+      "latest" is a resilient default: it never fails to resolve a pinned
+      version that does not yet exist on crates.io.
     required: false
     default: "latest"
   args:
@@ -89,6 +93,7 @@ runs:
       shell: bash
       env:
         PRVIEW_STRICT: ${{ inputs.strict }}
+        PRVIEW_FAIL_ON_WARNINGS: ${{ inputs['fail-on-warnings'] }}
         PRVIEW_ARGS: ${{ inputs.args }}
         INSTALL_METHOD: ${{ steps.install.outputs.method }}
       run: |
@@ -101,12 +106,31 @@ runs:
             exit 3
             ;;
         esac
+        case "$PRVIEW_FAIL_ON_WARNINGS" in
+          true|false) ;;
+          *)
+            echo "fail-on-warnings must be 'true' or 'false', got '${PRVIEW_FAIL_ON_WARNINGS}'" >&2
+            exit 3
+            ;;
+        esac
+        if [ "$PRVIEW_FAIL_ON_WARNINGS" = "true" ] && [ "$PRVIEW_STRICT" != "true" ]; then
+          echo "fail-on-warnings=true requires strict=true" >&2
+          exit 3
+        fi
+        if [ "$PRVIEW_FAIL_ON_WARNINGS" = "true" ] && \
+           ! prview gate --help 2>/dev/null | grep -q -- '--fail-on-warnings'; then
+          echo "fail-on-warnings=true requires prview 0.8.0 or newer; update the version input" >&2
+          exit 3
+        fi
 
         JSON_PATH="${RUNNER_TEMP:-/tmp}/prview-gate-${GITHUB_RUN_ID:-local}.json"
         cmd=(prview gate --json)
 
         if [ "$PRVIEW_STRICT" = "true" ]; then
           cmd+=(--strict)
+        fi
+        if [ "$PRVIEW_FAIL_ON_WARNINGS" = "true" ]; then
+          cmd+=(--fail-on-warnings)
         fi
 
         if [ -n "$PRVIEW_ARGS" ]; then
@@ -120,12 +144,14 @@ runs:
         set -e
 
         verdict=""
+        enforcement_disposition=""
         output_dir=""
         merge_gate_json=""
         sarif_path=""
 
         if command -v jq >/dev/null 2>&1 && [ -s "$JSON_PATH" ]; then
           verdict="$(jq -r '.verdict // empty' "$JSON_PATH" 2>/dev/null || true)"
+          enforcement_disposition="$(jq -r '.enforcement_disposition // empty' "$JSON_PATH" 2>/dev/null || true)"
           output_dir="$(jq -r '.output_dir // empty' "$JSON_PATH" 2>/dev/null || true)"
           merge_gate_json="$(jq -r '.merge_gate_json // empty' "$JSON_PATH" 2>/dev/null || true)"
         fi
@@ -136,7 +162,7 @@ runs:
 
         case "$status" in
           0)
-            result="PASS or CONDITIONAL accepted by non-strict mode"
+            result="PASS, advisory CONDITIONAL, or typed warnings-only accepted"
             action_exit=0
             ;;
           1)
@@ -144,15 +170,15 @@ runs:
             action_exit=1
             ;;
           2)
-            # Exit 2 is ambiguous: the gate contract uses it for CONDITIONAL
-            # under --strict, but clap ALSO exits 2 on a CLI usage error (e.g.
+            # Exit 2 is ambiguous: the gate contract uses it for strict
+            # review-required or warning-clean rejection, but clap ALSO exits 2 on a CLI usage error (e.g.
             # a typo or unknown flag in the `args` input). A real verdict always
             # emits its gate JSON to stdout (captured in JSON_PATH); a usage
             # error writes nothing to stdout (clap prints to stderr). Use that
             # sentinel so an argument typo surfaces as a usage error, not a
-            # phantom "CONDITIONAL rejected" verdict.
+            # phantom gate rejection.
             if [ -s "$JSON_PATH" ]; then
-              result="CONDITIONAL rejected by strict mode"
+              result="typed review-required or warnings-only rejected by the selected strict lane"
               action_exit=2
             else
               echo "prview gate exited 2 without emitting a gate verdict; treating as a CLI usage error (check the 'args' input), not a CONDITIONAL verdict" >&2
@@ -186,9 +212,13 @@ runs:
             echo "| Exit code | \`${status}\` |"
             echo "| Result | ${result} |"
             echo "| Strict | \`${PRVIEW_STRICT}\` |"
+            echo "| Fail on warnings | \`${PRVIEW_FAIL_ON_WARNINGS}\` |"
             echo "| Install method | \`${INSTALL_METHOD:-unknown}\` |"
             if [ -n "$verdict" ]; then
               echo "| JSON verdict | \`${verdict}\` |"
+            fi
+            if [ -n "$enforcement_disposition" ]; then
+              echo "| Enforcement disposition | \`${enforcement_disposition}\` |"
             fi
             if [ -n "$merge_gate_json" ]; then
               echo "| MERGE_GATE.json | \`${merge_gate_json}\` |"

@@ -52,7 +52,7 @@ Generates Artifact Pack v1 with structured, verifiable PR review artifacts:\n\n\
   prview gate                         Quality gate with contractual exit codes
   prview gate --strict --json         Machine-readable gate verdict
   prview --json --quiet               Compact JSON summary for CI and agents
-  prview --ci                         CI mode: all checks, strict exit codes
+  prview --ci                         CI mode: exit 1 on BLOCK or failed quality
   prview runs                         List previous runs for the current repository
   prview runs --all                   List runs across all repositories
   prview open                         Open dashboard for the latest run
@@ -80,7 +80,7 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["quick", "ci", "ai_only"])]
     pub deep: bool,
 
-    /// CI mode: all checks, no colors, strict non-zero exit on failure
+    /// CI mode: all checks; exit 1 on BLOCK or failed quality
     #[arg(long, conflicts_with_all = ["quick", "deep", "ai_only"])]
     pub ci: bool,
 
@@ -215,16 +215,15 @@ pub struct Cli {
     #[arg(long = "soft-exit")]
     pub soft_exit: bool,
 
-    /// In --ci mode, also exit 1 when any check reports warnings
+    /// In --ci mode, also exit 1 when the canonical pack warning tally is non-zero
     #[arg(
         long = "fail-on-warnings",
         requires = "ci",
         conflicts_with = "soft_exit",
-        long_help = "Make --ci exit 1 when any check reports warnings, not only on a hard \
-                     failure. Warning-level signals (rustfmt deltas, an unmaintained-crate \
-                     advisory, lint warnings) are advisory by default and exit 0. This flag \
-                     restores the stricter pre-0.7 CI behaviour for teams that want a \
-                     warnings-clean trunk."
+        long_help = "Top-level --ci exits 1 for BLOCK or failed quality. With \
+                     --fail-on-warnings it also exits 1 when the canonical pack warning tally \
+                     is non-zero. Quality-clean review-required decisions remain advisory in \
+                     top-level CI; use prview gate --strict for gate-strict enforcement."
     )]
     pub fail_on_warnings: bool,
 
@@ -294,14 +293,18 @@ pub enum CliCommand {
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 #[command(after_help = "Exit codes:
-  0 = PASS, or CONDITIONAL without --strict
+  0 = PASS, advisory CONDITIONAL, or warnings-only under --strict
   1 = BLOCK
-  2 = CONDITIONAL with --strict
+  2 = strict review-required, or warnings-only with --fail-on-warnings
   3 = gate could not execute (internal/tooling error)")]
 pub struct GateArgs {
-    /// Treat CONDITIONAL as exit code 2 instead of advisory exit 0
+    /// Enforce breaking/degraded/quality failures; warnings-only remains advisory
     #[arg(long)]
     pub strict: bool,
+
+    /// With --strict, also exit 2 when the canonical pack reports warnings
+    #[arg(long, requires = "strict")]
+    pub fail_on_warnings: bool,
 
     /// Emit machine-readable gate JSON to stdout
     #[arg(long)]
@@ -1043,10 +1046,30 @@ mod tests {
             cli.command,
             Some(CliCommand::Gate(GateArgs {
                 strict: true,
+                fail_on_warnings: false,
                 json: true,
             }))
         );
         assert_eq!(cli.target, None);
+    }
+
+    #[test]
+    fn operator_policy_gate_fail_on_warnings_requires_strict() {
+        let cli =
+            Cli::try_parse_from(["prview", "gate", "--strict", "--fail-on-warnings", "--json"])
+                .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(CliCommand::Gate(GateArgs {
+                strict: true,
+                fail_on_warnings: true,
+                json: true,
+            }))
+        );
+        assert!(
+            Cli::try_parse_from(["prview", "gate", "--fail-on-warnings"]).is_err(),
+            "warnings-clean gate lane is meaningful only with --strict"
+        );
     }
 
     #[test]

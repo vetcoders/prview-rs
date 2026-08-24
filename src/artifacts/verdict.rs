@@ -354,11 +354,11 @@ pub(crate) fn apply_rust_api_delta_outcome(
     view: Option<&api_delta::ApiArtifactView>,
     worst_confidence: &mut crate::policy::engine::AnalysisStatus,
     worst_merge: &mut crate::policy::engine::MergeRecommendation,
-) {
-    use crate::policy::engine::{AnalysisStatus, MergeRecommendation};
+) -> crate::policy::engine::EnforcementDisposition {
+    use crate::policy::engine::{AnalysisStatus, EnforcementDisposition, MergeRecommendation};
 
     let Some(view) = view else {
-        return;
+        return EnforcementDisposition::Clean;
     };
     let confirmed_breaking = view.findings.iter().any(|finding| {
         finding.confidence == api_delta::ApiDeltaConfidence::Confirmed
@@ -381,6 +381,12 @@ pub(crate) fn apply_rust_api_delta_outcome(
         if *worst_merge == MergeRecommendation::Approve {
             *worst_merge = MergeRecommendation::ReviewRequired;
         }
+    }
+
+    if (enabled && confirmed_breaking) || view.counts.unknown > 0 {
+        EnforcementDisposition::ReviewRequired
+    } else {
+        EnforcementDisposition::Clean
     }
 }
 

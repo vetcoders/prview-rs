@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `prview gate --strict` now consumes a schema 2.3 typed enforcement
+  disposition instead of collapsing every `CONDITIONAL` cause into one exit.
+  Clean and proven warnings-only packs exit `0`; confirmed/potential breaking,
+  degraded/unknown analysis, quality failures, and other review requirements
+  exit `2`; hard blocks remain `1`. `prview gate --strict --fail-on-warnings`
+  adds the explicit warning-clean exit `2`. Top-level `prview --ci` deliberately
+  keeps its historical Block/quality-failure exit `1`, while
+  `--ci --fail-on-warnings` still rejects the canonical pack warning tally.
+  `MERGE_GATE.json` now requires the disposition plus typed check and effective
+  inline proof, with CLI/MCP/gate sharing one fail-honest reader; packs through
+  schema 2.2 remain readable but cannot inject the new warnings-only exception.
+
 - Rust `PUBLIC_API_DIFF` and `BREAKING_CHANGES` now share one repo-backed
   `ApiDelta` computed from the exact base/target Git trees. Existing public-API
   JSON rows and artifact filenames remain compatible, while additive structured

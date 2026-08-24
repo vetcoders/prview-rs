@@ -2309,8 +2309,8 @@ fn merge_gate_names_the_origin_of_every_quality_failure_entry() {
     );
     assert_eq!(
         crate::gate::MERGE_GATE_SCHEMA_VERSION,
-        "2.2",
-        "adding `origin` to quality_failure_details bumps the MINOR"
+        "2.3",
+        "typed enforcement disposition and its proof bump the MINOR after origin"
     );
 }
 

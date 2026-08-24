@@ -503,10 +503,11 @@ fn completed_body(
     commit: &str,
 ) -> Result<serde_json::Value, ToolError> {
     let d = read::read_decision(run_dir)?;
-    let (verdict, merge_rec, allow_merge, base_used, blocking, caveats) = (
+    let (verdict, merge_rec, allow_merge, enforcement_disposition, base_used, blocking, caveats) = (
         d.verdict.clone(),
         d.merge_recommendation.clone(),
         d.allow_merge,
+        d.enforcement_disposition,
         d.base_used.clone(),
         d.blocking_issues.clone(),
         d.caveats.clone(),
@@ -540,6 +541,7 @@ fn completed_body(
         "verdict": verdict,
         "merge_recommendation": merge_rec,
         "allow_merge": allow_merge,
+        "enforcement_disposition": enforcement_disposition,
         "blocking_issues": blocking,
         "caveats": caveats,
         "gates": read::read_gates(run_dir),

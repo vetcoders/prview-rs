@@ -668,6 +668,35 @@ are being written; doing so could report a different reason from the run that
 actually happened. Pre-run skip provenance remains in `PROVENANCE.json` as
 described above.
 
+`MERGE_GATE.json` schema 2.3 adds a typed enforcement layer beside those stable
+decision axes. `decision.enforcement_disposition` is emitted from effective
+policy evaluations, legacy breaking ratchets, and the repo-backed Rust
+`ApiDelta`; it never re-ranks canonical `PASS` / `CONDITIONAL` / `BLOCK` or
+`allow_merge`. Consequently a pack with only warnings can remain a canonical
+`PASS` while carrying `warnings_only`. Pure Rust API additions are neutral;
+confirmed/potential breaking facts (when the existing escalation knob is on)
+and unknown/degraded analysis raise `review_required`. The Rust backend keeps
+using the language-neutral `RevisionFileSource` substrate described below, and
+the legacy JS/TS analyzer remains unchanged.
+
+The 2.3 proof is deliberately complete at the artifact boundary. Each check row
+states execution, outcome, class, policy conclusion, confidence, merge impact,
+severity, and blocking; `inline_findings` additionally states its effective
+class and per-source enforcement disposition. Typed quality-failure details
+prove the one legal pre-existing downgrade of a raw failure. The validator and
+one shared CLI/MCP reader cross-check those relations, so a missing or
+contradictory additive field becomes review-required uncertainty rather than a
+warning-only permission. Older packs remain readable, but a schema through 2.2
+cannot opt into the new warning exception.
+
+Exit policy is an adapter after that read boundary. `prview gate --strict`
+accepts `clean` and `warnings_only`, rejects `review_required` with exit 2, and
+keeps `block` at exit 1; its explicit `--fail-on-warnings` lane rejects the
+canonical warning tally as exit 2. Top-level `prview --ci` intentionally keeps
+the historical quality/block contract (exit 1 for Block or failed quality),
+with its own `--fail-on-warnings` opt-in. The two commands therefore share typed
+facts and parsing, but not an accidentally conflated enforcement mode.
+
 The worktree state is frozen **per run**, and a `--watch` iteration is a run:
 each iteration re-reads the working tree before its checks, so the pack it emits
 describes the tree that iteration analysed rather than the tree as it looked

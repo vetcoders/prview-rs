@@ -66,6 +66,7 @@ prview --pr 23 --quick
 ```bash
 prview gate
 prview gate --strict
+prview gate --strict --fail-on-warnings
 prview gate --json
 ```
 
@@ -75,13 +76,15 @@ not compute a second verdict path.
 
 | Exit code | Meaning |
 |-----------|---------|
-| `0` | `PASS`, or `CONDITIONAL` without `--strict` |
+| `0` | `PASS`, advisory `CONDITIONAL`, or typed warnings-only under `--strict` |
 | `1` | `BLOCK` |
-| `2` | `CONDITIONAL` with `--strict` |
+| `2` | Review-required under `--strict`, or warnings-only with `--strict --fail-on-warnings` |
 | `3` | Gate execution failed before a trustworthy verdict was available |
 
 `--json` makes stdout machine-readable (`schema_version: "gate-json/v1"`) with
-the verdict, caveats, blocking issues, and artifact paths.
+the verdict, `enforcement_disposition`, caveats, blocking issues, and artifact
+paths. Only a schema 2.3 pack with typed warning proof can use the warnings-only
+strict exception; older or malformed packs remain strict-rejected.
 
 Local pre-push hook recipes and the recommended Shadow -> Warn -> Block rollout
 are in [`docs/gate-playbook.md`](gate-playbook.md).
@@ -118,9 +121,9 @@ from the gate exit-code contract:
 
 | Exit code | Action result |
 |-----------|---------------|
-| `0` | success (`PASS`, or `CONDITIONAL` without strict mode) |
+| `0` | success (`PASS`, advisory `CONDITIONAL`, or typed warnings-only in strict mode) |
 | `1` | failure (`BLOCK`) |
-| `2` | failure (`CONDITIONAL` with strict mode) |
+| `2` | failure (strict review-required, or warnings-only with `fail-on-warnings`) |
 | `3` | failure (gate execution error) |
 
 Minimal blocking gate:
@@ -137,10 +140,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: vetcoders/prview-rs@v0.6.0 # pin to a released tag
+      - uses: vetcoders/prview-rs@v0.8.0 # fail-on-warnings requires 0.8+
         id: prview
         with:
           strict: "true"
+          fail-on-warnings: "false"
           version: "latest"
       - uses: github/codeql-action/upload-sarif@v3
         if: ${{ steps.prview.outputs['sarif-path'] != '' }}
@@ -150,12 +154,15 @@ jobs:
 
 Use `strict: "false"` for advisory rollout: `CONDITIONAL` remains exit `0`,
 while `BLOCK` still exits `1`. Extra CLI flags can be passed as whitespace-
-separated `args`.
+separated `args`. With `strict: "true"`, typed warnings-only remains successful;
+set `fail-on-warnings: "true"` to require a warning-clean pack as well.
 
 The Action prefers `cargo-binstall` when that binary is already available on the
-runner and falls back to `cargo install prview --locked --force`. Set `version`
-to a published release that contains `prview gate` (`0.6.0` or newer), or
-`latest` for the newest release.
+runner and falls back to `cargo install prview --locked --force`. The base gate
+exists from `0.6.0`; typed warnings-only enforcement and the
+`fail-on-warnings` Action input require Action/runtime `0.8.0` or newer.
+`latest` resolves that lane after 0.8 is published. Older pins must omit that
+input and retain their historical gate semantics.
 
 SARIF upload requires `permissions: security-events: write`. prview writes
 `30_context/INLINE_FINDINGS.sarif` only when there are inline findings or
@@ -177,7 +184,7 @@ prview feature/x main
 | standard (default) | Full review with tests and lint enabled by default |
 | `--quick` | Light pass: skip tests/lint/bundle/heuristics |
 | `--deep` | All heavier checks enabled (including security and heuristics) |
-| `--ci` | Like deep, tuned for automation: no colors, strict non-zero exit |
+| `--ci` | Like deep, tuned for automation: no colors; non-zero on Block/quality failure |
 | `--update` | Incremental rerun after new commits, skipping heavy checks unless forced |
 | `--ai-only` | Minimal artifact pack for AI/review flows |
 
@@ -234,7 +241,7 @@ prview --help
 |------|--------|
 | `--quick` | Skip tests/lint/bundle/heuristics |
 | `--deep` | Enable all checks (including security and heuristics) |
-| `--ci` | CI mode: all checks, no colors, strict exit |
+| `--ci` | CI mode: all checks, no colors; Block/quality failure exit |
 | `--ai-only` | Minimal checks, AI context pack only |
 
 ### Step control
@@ -314,19 +321,23 @@ job passed or failed.
 
 ### `--ci` exit codes
 
-`--ci` is the strict variant of the plain review run: it exits `1` on a `BLOCK`
+`--ci` is the automation variant of the plain review run: it exits `1` on a `BLOCK`
 verdict or a broken quality gate, and `0` otherwise. Warning-level signals — a
 formatter delta, an unmaintained-crate advisory, lint warnings — are advisory:
-they keep the verdict at `CONDITIONAL` and surface as review caveats, but they
-do not fail the process. Add `--fail-on-warnings` to opt into exit `1` for them;
-the flag requires `--ci` and does not affect `prview gate`, whose exit codes come
-from the gate contract (see `docs/gate-playbook.md`).
+they can keep the verdict at `PASS` or `CONDITIONAL` and surface as review
+caveats, but they do not fail the process. Add `--fail-on-warnings` to opt into
+exit `1` for `--ci`; that top-level flag still requires `--ci`. The gate
+subcommand exposes its own equivalent lane as
+`prview gate --strict --fail-on-warnings`, which exits `2` for typed
+warnings-only (see `docs/gate-playbook.md`).
 
-`--fail-on-warnings` counts the artifact pack's check list, not the CLI's own.
-The artifact run generates further checks — `public_api_diff`, `unsafe_audit`,
-`ghost_refs` and the synthetic `heuristics_loctree` — which reach
-`MERGE_GATE.json` and the dashboard but never the in-memory report the plain
-tally is built from. The `--json` summary states both numbers:
+`--fail-on-warnings` counts the artifact pack's canonical typed warning tally,
+not only the CLI's in-memory check list. That tally includes `checks[]` plus the
+validated inline-findings warning source. The artifact run also generates
+further checks — `public_api_diff`, `unsafe_audit`, `ghost_refs` and the
+synthetic `heuristics_loctree` — which reach `MERGE_GATE.json` and the dashboard
+but never the in-memory report the plain tally is built from. The `--json`
+summary states both numbers:
 `checks_summary.warned` is what the CLI ran, `checks_summary.warned_in_pack` is
 the complete count the flag keys off, and it is always the larger of the two.
 

@@ -1,7 +1,8 @@
 //! End-to-end contract test for the `prview gate` process exit codes.
 //!
-//! The exit-code mapping (0 = PASS/non-strict CONDITIONAL, 1 = BLOCK,
-//! 2 = strict CONDITIONAL, 3 = gate could not execute) is unit-tested at the
+//! The exit-code mapping (0 = PASS/advisory CONDITIONAL/strict warnings-only,
+//! 1 = BLOCK, 2 = strict review-required or warning-clean rejection, 3 = gate
+//! could not execute) is unit-tested at the
 //! pure-function level in `src/gate.rs`. That does not prove the *binary*
 //! actually exits with those codes — the composite GitHub Action decides
 //! pass/fail solely from the process exit code, so the contract has to hold at
@@ -87,6 +88,47 @@ fn create_breaking_gate_fixture() -> TempDir {
     temp
 }
 
+/// A deterministic warnings-only pack: missing semgrep is explicitly ignored,
+/// while an added unsafe block produces the artifact-only `unsafe_audit`
+/// warning in the canonical checks list.
+fn create_warning_only_gate_fixture() -> TempDir {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test User"]);
+    run_git(repo, &["config", "user.email", "test@example.com"]);
+    fs::create_dir_all(repo.join("src")).expect("create src");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname='operator-policy-fixture'\nversion='0.0.0'\nedition='2024'\n",
+    )
+    .expect("write Cargo.toml");
+    fs::write(repo.join("src/lib.rs"), "pub fn stable() {}\n").expect("write lib.rs");
+    fs::write(
+        repo.join(".prview-policy.yml"),
+        "version: 1\nmode: warn\ndefault_severity: ignore\nchecks:\n  semgrep_scan: ignore\n  cargo_audit: ignore\n",
+    )
+    .expect("write policy");
+    run_git(
+        repo,
+        &["add", "Cargo.toml", "src/lib.rs", ".prview-policy.yml"],
+    );
+    run_git(repo, &["commit", "-m", "initial"]);
+    run_git(repo, &["branch", "-M", "main"]);
+
+    run_git(repo, &["checkout", "-b", "feature/warnings-only"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn stable() {}\n\npub unsafe fn raw(ptr: *const u8) -> u8 {\n    unsafe { *ptr }\n}\n",
+    )
+    .expect("add unsafe API");
+    run_git(repo, &["add", "src/lib.rs"]);
+    run_git(repo, &["commit", "-m", "add unsafe api"]);
+
+    temp
+}
+
 fn path_without_semgrep(repo: &Path) -> OsString {
     let bin_dir = repo.join(".test-bin");
     fs::create_dir_all(&bin_dir).expect("create fixture bin dir");
@@ -144,6 +186,44 @@ fn gate_exits_two_for_strict_conditional_with_breaking_change() {
         .args(["gate", "--strict"])
         .assert()
         .code(2);
+}
+
+#[test]
+fn operator_policy_real_gate_warning_lane() {
+    let temp = create_warning_only_gate_fixture();
+    let home = tempfile::tempdir().expect("prview home");
+    let path = path_without_semgrep(temp.path());
+
+    let strict = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(temp.path())
+        .env("PATH", &path)
+        .env("PRVIEW_HOME", home.path())
+        .args(["gate", "--strict", "--json"])
+        .output()
+        .expect("run strict warning gate");
+    assert_eq!(
+        strict.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&strict.stdout),
+        String::from_utf8_lossy(&strict.stderr)
+    );
+    let strict_json: serde_json::Value = serde_json::from_slice(&strict.stdout).unwrap();
+    assert_eq!(strict_json["enforcement_disposition"], "warnings_only");
+    assert_eq!(strict_json["exit_code"], 0);
+
+    let hardened = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(temp.path())
+        .env("PATH", &path)
+        .env("PRVIEW_HOME", home.path())
+        .args(["gate", "--strict", "--fail-on-warnings", "--json"])
+        .output()
+        .expect("run warnings-clean gate");
+    assert_eq!(hardened.status.code(), Some(2));
+    let hardened_json: serde_json::Value = serde_json::from_slice(&hardened.stdout).unwrap();
+    assert_eq!(hardened_json["enforcement_disposition"], "warnings_only");
+    assert_eq!(hardened_json["exit_code"], 2);
+    assert_eq!(hardened_json["fail_on_warnings"], true);
 }
 
 #[test]

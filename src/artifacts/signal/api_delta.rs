@@ -1808,6 +1808,104 @@ mod tests {
     }
 
     #[test]
+    fn operator_policy_api_matrix() {
+        use crate::policy::engine::{AnalysisStatus, EnforcementDisposition, MergeRecommendation};
+
+        let added = public_api_diff_view(&fixture_delta("function_added"));
+        let confirmed = public_api_diff_view(&fixture_delta("function_removed"));
+        let base = snapshot_rust_api(&MemorySource::source("pub fn item() {}", "base"));
+        let target = snapshot_rust_api(&MemorySource::source(
+            "mod donor { pub fn item() {} }\npub use donor::*;",
+            "target",
+        ));
+        let unknown = public_api_diff_view(&compare_rust_api(&base, &target));
+
+        let rows = [
+            (
+                "addition",
+                &added,
+                EnforcementDisposition::Clean,
+                AnalysisStatus::Complete,
+                MergeRecommendation::Approve,
+            ),
+            (
+                "confirmed breaking",
+                &confirmed,
+                EnforcementDisposition::ReviewRequired,
+                AnalysisStatus::Complete,
+                MergeRecommendation::ReviewRequired,
+            ),
+            (
+                "unknown",
+                &unknown,
+                EnforcementDisposition::ReviewRequired,
+                AnalysisStatus::Degraded,
+                MergeRecommendation::ReviewRequired,
+            ),
+        ];
+
+        for (name, view, expected_disposition, expected_analysis, expected_merge) in rows {
+            let mut analysis = AnalysisStatus::Complete;
+            let mut merge = MergeRecommendation::Approve;
+            let disposition = crate::artifacts::apply_rust_api_delta_outcome(
+                true,
+                Some(view),
+                &mut analysis,
+                &mut merge,
+            );
+            assert_eq!(disposition, expected_disposition, "{name}");
+            assert_eq!(analysis, expected_analysis, "{name}");
+            assert_eq!(merge, expected_merge, "{name}");
+        }
+
+        // The public breaking-escalation opt-out remains effective: facts stay
+        // serialized, but a confirmed break does not create a hidden exit-only
+        // failure when policy explicitly leaves the verdict informational.
+        let mut analysis = AnalysisStatus::Complete;
+        let mut merge = MergeRecommendation::Approve;
+        let disposition = crate::artifacts::apply_rust_api_delta_outcome(
+            false,
+            Some(&confirmed),
+            &mut analysis,
+            &mut merge,
+        );
+        assert_eq!(disposition, EnforcementDisposition::Clean);
+        assert_eq!(analysis, AnalysisStatus::Complete);
+        assert_eq!(merge, MergeRecommendation::Approve);
+    }
+
+    #[test]
+    fn operator_policy_language_boundary() {
+        // Rust reads revision snapshots through the existing language-neutral
+        // source contract; no patch-only backend is introduced for the 0.8
+        // Rust-first slice.
+        let base = MemorySource::source("pub fn old_api() {}", "base");
+        let target = MemorySource::source("pub fn new_api() {}", "target");
+        let delta = compare_rust_api(&snapshot_rust_api(&base), &snapshot_rust_api(&target));
+        assert_eq!(base.entries().len(), target.entries().len());
+        assert!(
+            delta
+                .removed
+                .iter()
+                .any(|finding| finding.identity.name == "old_api")
+        );
+        assert!(
+            delta
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "new_api")
+        );
+
+        // The unchanged JS/TS compatibility path still consumes patch sections
+        // and never observes Rust lines in the same patch.
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +0,0 @@\n-pub fn rust_only() {}\ndiff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1 +0,0 @@\n-export function js_only() {}\n";
+        let legacy = analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+        assert_eq!(legacy.removed.len(), 1);
+        assert_eq!(legacy.removed[0].file, "src/api.ts");
+        assert!(legacy.removed[0].signature.contains("js_only"));
+    }
+
+    #[test]
     fn multi_base_merge_preserves_each_comparison_provenance_without_dedup() {
         let target = snapshot_rust_api(&MemorySource::source(
             "pub fn added_for_each_base() {}",

@@ -42,6 +42,7 @@ fn run_json_quiet(repo: &Path, extra_args: &[&str]) -> serde_json::Value {
 
     let assert = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
         .current_dir(repo)
+        .env("PRVIEW_HOME", repo.join(".prview-test-home"))
         .args(args)
         .assert()
         .success();
@@ -64,7 +65,9 @@ fn gate_help_documents_exit_code_contract() {
         .stdout(predicate::str::contains("Exit codes:"))
         .stdout(predicate::str::contains("0 = PASS"))
         .stdout(predicate::str::contains("1 = BLOCK"))
-        .stdout(predicate::str::contains("2 = CONDITIONAL with --strict"))
+        .stdout(predicate::str::contains("warnings-only under --strict"))
+        .stdout(predicate::str::contains("--fail-on-warnings"))
+        .stdout(predicate::str::contains("2 = strict review-required"))
         .stdout(predicate::str::contains("3 = gate could not execute"));
 }
 
@@ -77,7 +80,13 @@ fn fail_on_warnings_is_documented_and_scoped_to_ci() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("--fail-on-warnings"));
+        .stdout(predicate::str::contains(
+            "CI mode: exit 1 on BLOCK or failed quality",
+        ))
+        .stdout(predicate::str::contains("--fail-on-warnings"))
+        .stdout(predicate::str::contains(
+            "canonical pack warning tally is non-zero",
+        ));
 
     Command::new(assert_cmd::cargo::cargo_bin!("prview"))
         .arg("--fail-on-warnings")
@@ -282,7 +291,7 @@ fn json_quiet_stdout_omits_full_report_payload_fields() {
 }
 
 #[test]
-fn generated_merge_gate_passes_repo_validator() {
+fn operator_policy_rank_invariants_validator_contract() {
     let temp = create_fixture_repo();
     let repo = temp.path();
 
@@ -300,6 +309,486 @@ fn generated_merge_gate_passes_repo_validator() {
         .arg(&merge_gate)
         .assert()
         .success();
+
+    let raw = fs::read_to_string(&merge_gate).expect("read generated merge gate");
+    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse merge gate");
+    assert_eq!(original["schema_version"], "2.3");
+    assert!(
+        original["decision"]["enforcement_disposition"]
+            .as_str()
+            .is_some(),
+        "the 2.3 writer must emit its typed enforcement disposition"
+    );
+
+    let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
+    let validate = |gate: &serde_json::Value, must_validate: bool| {
+        fs::write(
+            &merge_gate,
+            serde_json::to_vec_pretty(gate).expect("serialize gate"),
+        )
+        .expect("write merge gate vector");
+        let assertion = Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert()
+            .stderr(predicate::str::contains("Traceback").not());
+        if must_validate {
+            assertion.success();
+        } else {
+            assertion.failure();
+        }
+    };
+
+    let clean_decision = {
+        let mut decision = original["decision"].clone();
+        for (key, value) in serde_json::json!({
+            "verdict": "PASS",
+            "allow_merge": true,
+            "analysis_status": "complete",
+            "merge_recommendation": "approve",
+            "policy_allow_merge": true,
+            "quality_pass": true,
+            "quality_failure_details": [],
+            "blocking_issues": [],
+            "enforcement_disposition": "clean"
+        })
+        .as_object()
+        .expect("decision patch")
+        {
+            decision[key] = value.clone();
+        }
+        decision
+    };
+    let healthy_inline = serde_json::json!({
+        "file": null,
+        "status": "passed",
+        "severity": "warn",
+        "blocking": false,
+        "effective_class": "PASS",
+        "enforcement_disposition": "clean",
+        "findings_count": 0,
+        "introduced_count": 0,
+        "preexisting_count": 0
+    });
+    let warning_check = serde_json::json!({
+        "id": "rustfmt",
+        "name": "Rustfmt",
+        "status": "warnings",
+        "execution_state": "executed",
+        "outcome": "findings_warning",
+        "class": "INFO",
+        "severity": "warn",
+        "policy_conclusion": "advisory",
+        "confidence_impact": "complete",
+        "merge_impact": "review_required",
+        "blocking": false,
+        "duration_secs": 0.0,
+        "evidence": "20_quality/RUSTFMT.md"
+    });
+    let clean_pack = {
+        let mut gate = original.clone();
+        gate["checks"] = serde_json::json!([]);
+        gate["inline_findings"] = healthy_inline.clone();
+        gate["decision"] = clean_decision.clone();
+        gate
+    };
+    validate(&clean_pack, true);
+
+    let mut warnings_pack = clean_pack.clone();
+    warnings_pack["checks"] = serde_json::json!([warning_check.clone()]);
+    warnings_pack["decision"]["enforcement_disposition"] = serde_json::json!("warnings_only");
+    validate(&warnings_pack, true);
+
+    let mut preexisting_warning = warnings_pack.clone();
+    preexisting_warning["checks"][0]["merge_impact"] = serde_json::json!("approve");
+    preexisting_warning["decision"]["quality_failure_details"] = serde_json::json!([{
+        "name":"Rustfmt", "classification":"pre-existing", "origin":"warning"
+    }]);
+    validate(&preexisting_warning, true);
+
+    for classification in ["introduced", "mixed", "unclassified"] {
+        let mut matched_warning = warnings_pack.clone();
+        matched_warning["decision"]["quality_failure_details"] = serde_json::json!([{
+            "name":"Rustfmt", "classification":classification, "origin":"warning"
+        }]);
+        validate(&matched_warning, true);
+    }
+
+    for classification in ["introduced", "pre-existing", "mixed", "unclassified"] {
+        let mut orphan_warning_detail = clean_pack.clone();
+        orphan_warning_detail["decision"]["quality_failure_details"] = serde_json::json!([{
+            "name":"Rustfmt", "classification":classification, "origin":"warning"
+        }]);
+        validate(&orphan_warning_detail, false);
+    }
+
+    let mut duplicate_warning_detail = preexisting_warning.clone();
+    duplicate_warning_detail["decision"]["quality_failure_details"] = serde_json::json!([
+        {"name":"Rustfmt", "classification":"pre-existing", "origin":"warning"},
+        {"name":"Rustfmt", "classification":"pre-existing", "origin":"warning"}
+    ]);
+    validate(&duplicate_warning_detail, false);
+
+    // The additive field is required and closed in 2.3. It never becomes a
+    // prose-derived or best-effort permission.
+    for disposition in [
+        None,
+        Some(serde_json::json!("mystery")),
+        Some(serde_json::json!(7)),
+    ] {
+        let mut gate = clean_pack.clone();
+        match disposition {
+            Some(value) => gate["decision"]["enforcement_disposition"] = value,
+            None => {
+                gate["decision"]
+                    .as_object_mut()
+                    .expect("decision object")
+                    .remove("enforcement_disposition");
+            }
+        }
+        validate(&gate, false);
+    }
+
+    let mut unproven = warnings_pack.clone();
+    unproven["checks"] = serde_json::json!([]);
+    validate(&unproven, false);
+
+    let mut hidden_warning = warnings_pack.clone();
+    hidden_warning["decision"]["enforcement_disposition"] = serde_json::json!("clean");
+    validate(&hidden_warning, false);
+
+    let mut hidden_degraded_check = warnings_pack.clone();
+    hidden_degraded_check["checks"]
+        .as_array_mut()
+        .expect("checks array")
+        .push(serde_json::json!({
+            "id":"cargo_check", "name":"Cargo check", "status":"skipped",
+            "execution_state":"unavailable", "outcome":"unavailable", "class":"SKIP",
+            "severity":"warn", "policy_conclusion":"advisory",
+            "confidence_impact":"degraded", "merge_impact":"review_required",
+            "blocking":false, "duration_secs":0.0,
+            "evidence":"tool unavailable"
+        }));
+    validate(&hidden_degraded_check, false);
+
+    let mut preexisting_failure = clean_pack.clone();
+    preexisting_failure["checks"] = serde_json::json!([{
+        "id":"cargo", "name":"Cargo check", "status":"failed",
+        "execution_state":"executed", "outcome":"findings_failed", "class":"FAIL",
+        "severity":"block", "policy_conclusion":"advisory",
+        "confidence_impact":"complete", "merge_impact":"approve", "blocking":false,
+        "duration_secs":0.0, "evidence":"20_quality/cargo.result.json"
+    }]);
+    preexisting_failure["decision"]["quality_failure_details"] = serde_json::json!([{
+        "name":"Cargo check", "classification":"pre-existing", "origin":"failure"
+    }]);
+    validate(&preexisting_failure, true);
+
+    let mut amputated_failure = preexisting_failure.clone();
+    amputated_failure["decision"]["quality_failure_details"] = serde_json::json!([]);
+    validate(&amputated_failure, false);
+
+    let mut impossible_advisory = clean_pack.clone();
+    impossible_advisory["checks"] = serde_json::json!([{
+        "id":"cargo", "name":"Cargo check", "status":"passed",
+        "execution_state":"executed", "outcome":"passed", "class":"PASS",
+        "severity":"warn", "policy_conclusion":"advisory",
+        "confidence_impact":"complete", "merge_impact":"approve", "blocking":false,
+        "duration_secs":0.0, "evidence":"20_quality/cargo.result.json"
+    }]);
+    validate(&impossible_advisory, false);
+
+    let mut forged_inline = clean_pack.clone();
+    forged_inline["inline_findings"] = serde_json::json!({
+        "file":"30_context/INLINE_FINDINGS.sarif", "status":"failed",
+        "severity":"warn", "blocking":false, "effective_class":"PASS",
+        "enforcement_disposition":"clean", "findings_count":2,
+        "introduced_count":1, "preexisting_count":1
+    });
+    validate(&forged_inline, false);
+
+    let mut unclassified_inline = clean_pack.clone();
+    unclassified_inline["inline_findings"] = serde_json::json!({
+        "file":"30_context/INLINE_FINDINGS.sarif", "status":"failed",
+        "severity":"warn", "blocking":false, "effective_class":"PASS",
+        "enforcement_disposition":"clean", "findings_count":1,
+        "introduced_count":0, "preexisting_count":0
+    });
+    validate(&unclassified_inline, false);
+
+    let mut failed_info_without_preexisting = clean_pack.clone();
+    failed_info_without_preexisting["decision"]["enforcement_disposition"] =
+        serde_json::json!("warnings_only");
+    failed_info_without_preexisting["inline_findings"] = serde_json::json!({
+        "file":"30_context/INLINE_FINDINGS.sarif", "status":"failed",
+        "severity":"warn", "blocking":false, "effective_class":"INFO",
+        "enforcement_disposition":"warnings_only", "findings_count":2,
+        "introduced_count":1, "preexisting_count":0
+    });
+    validate(&failed_info_without_preexisting, false);
+
+    for broken_root in [
+        ("checks", serde_json::Value::Null),
+        ("inline_findings", serde_json::json!([])),
+    ] {
+        let mut gate = clean_pack.clone();
+        gate[broken_root.0] = broken_root.1;
+        validate(&gate, false);
+    }
+
+    // Any typed lower-level blocker requires the complete canonical Block
+    // tuple, whether its status is a warning or a passing observation.
+    for (checks, inline) in [
+        (
+            serde_json::json!([{
+                "id":"rustfmt", "name":"Rustfmt", "status":"passed", "class":"PASS",
+                "execution_state":"executed", "outcome":"passed",
+                "severity":"warn", "blocking":true, "duration_secs":0.0,
+                "policy_conclusion":"blocked", "confidence_impact":"incomplete",
+                "merge_impact":"block",
+                "evidence":"20_quality/RUSTFMT.md"
+            }]),
+            healthy_inline.clone(),
+        ),
+        (
+            serde_json::json!([]),
+            serde_json::json!({
+                "file": null, "status":"passed", "severity":"warn",
+                "blocking":true, "effective_class":"PASS",
+                "enforcement_disposition":"block", "findings_count":0,
+                "introduced_count":0, "preexisting_count":0
+            }),
+        ),
+        (
+            serde_json::json!([{
+                "id":"rustfmt", "name":"Rustfmt", "status":"warnings", "class":"PASS",
+                "execution_state":"executed", "outcome":"findings_warning",
+                "severity":"warn", "blocking":true, "duration_secs":0.0,
+                "policy_conclusion":"blocked", "confidence_impact":"incomplete",
+                "merge_impact":"block",
+                "evidence":"20_quality/RUSTFMT.md"
+            }]),
+            healthy_inline.clone(),
+        ),
+    ] {
+        let mut gate = clean_pack.clone();
+        gate["checks"] = checks;
+        gate["inline_findings"] = inline;
+        validate(&gate, false);
+    }
+
+    let mut canonical_block = clean_pack.clone();
+    canonical_block["checks"] = serde_json::json!([{
+        "id":"rustfmt", "name":"Rustfmt", "status":"failed", "class":"FAIL",
+        "execution_state":"executed", "outcome":"findings_failed",
+        "severity":"block", "blocking":true, "duration_secs":0.0,
+        "policy_conclusion":"blocked", "confidence_impact":"incomplete",
+        "merge_impact":"block",
+        "evidence":"20_quality/RUSTFMT.md"
+    }]);
+    for (key, value) in serde_json::json!({
+        "verdict":"BLOCK",
+        "allow_merge":false,
+        "analysis_status":"incomplete",
+        "merge_recommendation":"block",
+        "policy_allow_merge":false,
+        "quality_pass":false,
+        "quality_failure_details":[{
+            "name":"Rustfmt", "classification":"introduced", "origin":"failure"
+        }],
+        "blocking_issues":["Rustfmt (failed)"],
+        "enforcement_disposition":"block"
+    })
+    .as_object()
+    .expect("block patch")
+    {
+        canonical_block["decision"][key] = value.clone();
+    }
+    validate(&canonical_block, true);
+
+    for (verdict, allow_merge, disposition) in [
+        ("CONDITIONAL", false, "clean"),
+        ("PASS", true, "review_required"),
+        ("PASS", true, "block"),
+    ] {
+        let mut gate = clean_pack.clone();
+        gate["decision"]["verdict"] = serde_json::json!(verdict);
+        gate["decision"]["allow_merge"] = serde_json::json!(allow_merge);
+        gate["decision"]["enforcement_disposition"] = serde_json::json!(disposition);
+        validate(&gate, false);
+    }
+
+    fs::write(&merge_gate, raw).expect("restore generated merge gate");
+}
+
+#[test]
+fn operator_policy_rank_invariants_validator_inline_count_truth_table() {
+    fn realizable(
+        status: &str,
+        class: &str,
+        findings: u64,
+        introduced: u64,
+        preexisting: u64,
+    ) -> bool {
+        if introduced
+            .checked_add(preexisting)
+            .is_none_or(|classified| classified > findings)
+        {
+            return false;
+        }
+        match status {
+            "passed" | "not_run" => findings == 0 && class == "PASS",
+            "warnings" if findings > 0 => match class {
+                "INFO" => true,
+                "PASS" => introduced == 0 && findings == preexisting,
+                _ => false,
+            },
+            "failed" if findings > 0 => match class {
+                "FAIL" => true,
+                "INFO" => findings >= 2 && preexisting >= 1,
+                "PASS" => introduced == 0 && findings == preexisting,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    let temp = create_fixture_repo();
+    let payload = run_json_quiet(temp.path(), &["feature/json-contract", "main"]);
+    let output_dir = Path::new(payload["output_dir"].as_str().expect("output_dir string"));
+    let original: serde_json::Value = serde_json::from_slice(
+        &fs::read(output_dir.join("00_summary/MERGE_GATE.json")).expect("read merge gate"),
+    )
+    .expect("parse merge gate");
+
+    let mut count_cases = Vec::new();
+    for findings in 0..=3_u64 {
+        for introduced in 0..=findings {
+            for preexisting in 0..=(findings - introduced) {
+                count_cases.push((findings, introduced, preexisting));
+            }
+        }
+    }
+    count_cases.extend([(u64::MAX, u64::MAX, 0), (u64::MAX, u64::MAX, 1)]);
+
+    let mut vectors = Vec::new();
+    for status in ["passed", "not_run", "warnings", "failed"] {
+        for class in ["PASS", "INFO", "FAIL"] {
+            for &(findings, introduced, preexisting) in &count_cases {
+                let expected = realizable(status, class, findings, introduced, preexisting);
+                let source_disposition = if class == "FAIL" {
+                    "review_required"
+                } else if class == "INFO" || status == "warnings" {
+                    "warnings_only"
+                } else {
+                    "clean"
+                };
+                let (verdict, recommendation, allow_merge) =
+                    if source_disposition == "review_required" {
+                        ("CONDITIONAL", "review_required", false)
+                    } else {
+                        ("PASS", "approve", true)
+                    };
+                let mut gate = original.clone();
+                gate["policy"]["mode"] = serde_json::json!("shadow");
+                gate["checks"] = serde_json::json!([]);
+                for (key, value) in serde_json::json!({
+                    "verdict":verdict,
+                    "enforcement_disposition":source_disposition,
+                    "analysis_status":"complete",
+                    "merge_recommendation":recommendation,
+                    "allow_merge":allow_merge,
+                    "policy_allow_merge":true,
+                    "quality_pass":true,
+                    "decision_reason":"bounded inline truth table",
+                    "review_caveats":[],
+                    "blocking_issues":[],
+                    "quality_failure_details":[]
+                })
+                .as_object()
+                .expect("decision patch")
+                {
+                    gate["decision"][key] = value.clone();
+                }
+                gate["inline_findings"] = serde_json::json!({
+                    "file":if findings == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!("30_context/INLINE_FINDINGS.sarif")
+                    },
+                    "file_exists":findings > 0,
+                    "status":status,
+                    "severity":"warn",
+                    "blocking":false,
+                    "effective_class":class,
+                    "enforcement_disposition":source_disposition,
+                    "findings_count":findings,
+                    "introduced_count":introduced,
+                    "preexisting_count":preexisting
+                });
+                gate["files"]["inline_findings"] = if findings == 0 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!("30_context/INLINE_FINDINGS.sarif")
+                };
+                vectors.push(serde_json::json!({
+                    "expected":expected,
+                    "label":format!(
+                        "status={status} class={class} F={findings} I={introduced} P={preexisting}"
+                    ),
+                    "gate":gate
+                }));
+            }
+        }
+    }
+    assert_eq!(vectors.len(), 264);
+
+    let vectors_path = temp.path().join("inline-count-vectors.json");
+    fs::write(
+        &vectors_path,
+        serde_json::to_vec(&vectors).expect("serialize vectors"),
+    )
+    .expect("write vectors");
+    let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
+    let batch_validator = r#"
+import importlib.util
+import json
+import pathlib
+import sys
+import tempfile
+
+validator_path = pathlib.Path(sys.argv[1])
+vectors_path = pathlib.Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location("validate_merge_gate", validator_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+vectors = json.loads(vectors_path.read_text(encoding="utf-8"))
+failures = []
+with tempfile.TemporaryDirectory() as tmp:
+    gate_path = pathlib.Path(tmp) / "MERGE_GATE.json"
+    for vector in vectors:
+        gate_path.write_text(json.dumps(vector["gate"]), encoding="utf-8")
+        issues = module.validate(gate_path)
+        actual = not issues
+        if actual != vector["expected"]:
+            failures.append({"label": vector["label"], "issues": issues})
+if failures:
+    print(json.dumps(failures, indent=2), file=sys.stderr)
+    raise SystemExit(1)
+print(f"validator-inline-count-truth-table-ok vectors={len(vectors)}")
+"#;
+    Command::new("python3")
+        .args([
+            "-c",
+            batch_validator,
+            validator.to_str().expect("validator utf8"),
+            vectors_path.to_str().expect("vectors utf8"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "validator-inline-count-truth-table-ok vectors=264",
+        ));
 }
 
 /// Accepting schema `2.2` without checking the fields that define it lets a pack
@@ -324,12 +813,13 @@ fn validator_rejects_schema_two_two_without_a_usable_origin() {
     let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
 
     let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
-    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    let mut original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
     assert_eq!(
         original["schema_version"].as_str(),
-        Some("2.2"),
-        "this test pins the schema that introduced `origin`"
+        Some("2.3"),
+        "the current writer retains the 2.2 `origin` requirement"
     );
+    original["schema_version"] = serde_json::json!("2.2");
 
     let broken_details = [
         serde_json::json!([{ "name": "Clippy", "classification": "introduced" }]),
@@ -431,7 +921,8 @@ fn validator_rejects_quality_pass_contradicting_its_own_details() {
     let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
 
     let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
-    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    let mut original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    original["schema_version"] = serde_json::json!("2.2");
 
     let detail = |classification: &str, origin: &str| serde_json::json!([{ "name": "Clippy", "classification": classification, "origin": origin }]);
 
@@ -515,8 +1006,8 @@ fn validator_requires_a_boolean_quality_pass_from_schema_two_two() {
     let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
     assert_eq!(
         original["schema_version"].as_str(),
-        Some("2.2"),
-        "this test pins the schema that requires the field"
+        Some("2.3"),
+        "the current writer retains the 2.2 quality_pass requirement"
     );
     assert!(
         original["decision"]["quality_pass"].is_boolean(),
@@ -607,7 +1098,7 @@ fn validator_rejects_a_check_status_outside_the_emitted_vocabulary() {
     let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
 
     let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
-    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    let mut original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
     assert!(
         original["checks"]
             .as_array()
@@ -620,6 +1111,7 @@ fn validator_rejects_a_check_status_outside_the_emitted_vocabulary() {
         "the emitter writes only the vocabulary this test pins: {:?}",
         original["checks"]
     );
+    original["schema_version"] = serde_json::json!("2.2");
 
     // Recognizable-but-uncanonical spellings, plus the non-strings a bare
     // "non-empty" rule never caught either.
@@ -778,12 +1270,13 @@ fn validator_requires_the_decision_axes_schema_two_two_emits() {
     let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
 
     let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
-    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    let mut original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
     assert_eq!(
         original["schema_version"].as_str(),
-        Some("2.2"),
-        "these requirements are scoped to 2.2"
+        Some("2.3"),
+        "the current writer retains the decision axes introduced in 2.2"
     );
+    original["schema_version"] = serde_json::json!("2.2");
     for axis in [
         "analysis_status",
         "merge_recommendation",
@@ -924,7 +1417,8 @@ fn validator_rejects_a_verdict_its_own_axes_contradict() {
     let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
 
     let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
-    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    let mut original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    original["schema_version"] = serde_json::json!("2.2");
 
     let gating_detail = serde_json::json!([
         { "name": "Clippy", "classification": "introduced", "origin": "failure" }
@@ -952,6 +1446,7 @@ fn validator_rejects_a_verdict_its_own_axes_contradict() {
             "policy_allow_merge": true,
             "blocking_issues": [],
             "quality_failure_details": [],
+            "enforcement_disposition": "clean",
         }),
     );
 
@@ -997,6 +1492,7 @@ fn validator_rejects_a_verdict_its_own_axes_contradict() {
                 "verdict": "CONDITIONAL",
                 "allow_merge": false,
                 "merge_recommendation": "review_required",
+                "enforcement_disposition": "review_required",
                 "blocking_issues": ["Semgrep (failed)"],
             }),
             false,
@@ -1020,6 +1516,7 @@ fn validator_rejects_a_verdict_its_own_axes_contradict() {
                 "verdict": "CONDITIONAL",
                 "allow_merge": false,
                 "merge_recommendation": "review_required",
+                "enforcement_disposition": "review_required",
             }),
             true,
         ),
@@ -1031,6 +1528,7 @@ fn validator_rejects_a_verdict_its_own_axes_contradict() {
                 "verdict": "CONDITIONAL",
                 "allow_merge": false,
                 "analysis_status": "degraded",
+                "enforcement_disposition": "review_required",
             }),
             true,
         ),
@@ -1041,6 +1539,7 @@ fn validator_rejects_a_verdict_its_own_axes_contradict() {
                 "allow_merge": false,
                 "quality_pass": false,
                 "quality_failure_details": gating_detail,
+                "enforcement_disposition": "review_required",
             }),
             true,
         ),
@@ -1053,6 +1552,7 @@ fn validator_rejects_a_verdict_its_own_axes_contradict() {
                 "analysis_status": "incomplete",
                 "policy_allow_merge": false,
                 "blocking_issues": ["Semgrep (failed)"],
+                "enforcement_disposition": "block",
             }),
             true,
         ),
@@ -1071,6 +1571,7 @@ fn validator_rejects_a_verdict_its_own_axes_contradict() {
                 "allow_merge": false,
                 "merge_recommendation": "block",
                 "policy_allow_merge": false,
+                "enforcement_disposition": "block",
             }),
             false,
         ),
@@ -1133,7 +1634,8 @@ fn validator_rejects_a_blocker_flag_its_blocking_issues_contradict() {
     let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
 
     let raw = std::fs::read_to_string(&merge_gate).expect("read gate");
-    let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    let mut original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
+    original["schema_version"] = serde_json::json!("2.2");
 
     let with = |base: &serde_json::Value, patch: serde_json::Value| {
         let mut decision = base.clone();
@@ -1153,6 +1655,7 @@ fn validator_rejects_a_blocker_flag_its_blocking_issues_contradict() {
             "policy_allow_merge": true,
             "blocking_issues": [],
             "quality_failure_details": [],
+            "enforcement_disposition": "clean",
         }),
     );
 
@@ -1167,6 +1670,7 @@ fn validator_rejects_a_blocker_flag_its_blocking_issues_contradict() {
                 "merge_recommendation": "block",
                 "policy_allow_merge": true,
                 "blocking_issues": ["Semgrep (failed)"],
+                "enforcement_disposition": "block",
             }),
             false,
         ),
@@ -1179,6 +1683,7 @@ fn validator_rejects_a_blocker_flag_its_blocking_issues_contradict() {
                 "merge_recommendation": "block",
                 "policy_allow_merge": false,
                 "blocking_issues": [],
+                "enforcement_disposition": "block",
             }),
             false,
         ),
@@ -1193,6 +1698,7 @@ fn validator_rejects_a_blocker_flag_its_blocking_issues_contradict() {
                 "analysis_status": "incomplete",
                 "policy_allow_merge": false,
                 "blocking_issues": ["Semgrep (failed)"],
+                "enforcement_disposition": "block",
             }),
             true,
         ),
@@ -1205,6 +1711,7 @@ fn validator_rejects_a_blocker_flag_its_blocking_issues_contradict() {
                 "analysis_status": "degraded",
                 "policy_allow_merge": true,
                 "blocking_issues": [],
+                "enforcement_disposition": "review_required",
             }),
             true,
         ),
@@ -1828,4 +2335,102 @@ fn an_unchanged_update_run_still_honors_fail_on_warnings() {
         "the reused pack warns, so --fail-on-warnings must exit 1: {}",
         String::from_utf8_lossy(&strict.stderr)
     );
+
+    // A historical CONDITIONAL cannot acquire the new gate-strict exception by
+    // injecting a field its 2.2 schema never defined. The unchanged update
+    // path must read this stored pack (not reconstruct policy from an empty
+    // Report), while top-level CI keeps its historical quality/block-only rule.
+    fs::write(
+        &gate,
+        r#"{
+  "schema_version": "2.2",
+  "decision": {
+    "verdict": "CONDITIONAL",
+    "merge_recommendation": "review_required",
+    "allow_merge": false,
+    "policy_allow_merge": true,
+    "quality_pass": true,
+    "analysis_status": "complete",
+    "enforcement_disposition": "warnings_only",
+    "blocking_issues": [],
+    "quality_failure_details": []
+  },
+  "checks": [],
+  "inline_findings": {"status": "passed", "blocking": false}
+}"#,
+    )
+    .expect("plant legacy conditional gate");
+
+    for fail_on_warnings in [false, true] {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("prview"));
+        command
+            .current_dir(repo)
+            .env("PRVIEW_HOME", home.path())
+            .args(update_args);
+        if fail_on_warnings {
+            command.arg("--fail-on-warnings");
+        }
+        let output = command.output().expect("legacy update run");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "legacy CONDITIONAL with quality=true and no warning stays CI-advisory \
+             (fail_on_warnings={fail_on_warnings}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // A fresh typed pack can carry an enforcement-level review ratchet and a
+    // separate warning fact. Historical CI remains advisory for the review,
+    // while its explicit warnings-clean lane must still fail the reused pack.
+    fs::write(
+        &gate,
+        r#"{
+  "schema_version": "2.3",
+  "policy": {"mode": "warn"},
+  "decision": {
+    "verdict": "CONDITIONAL",
+    "merge_recommendation": "review_required",
+    "allow_merge": false,
+    "policy_allow_merge": true,
+    "quality_pass": true,
+    "analysis_status": "complete",
+    "enforcement_disposition": "review_required",
+    "blocking_issues": [],
+    "quality_failure_details": []
+  },
+  "checks": [{
+    "id": "rustfmt", "name": "Rustfmt", "status": "warnings",
+    "execution_state": "executed", "outcome": "findings_warning",
+    "class": "INFO", "severity": "warn", "policy_conclusion": "advisory",
+    "confidence_impact": "complete", "merge_impact": "review_required",
+    "blocking": false
+  }],
+  "inline_findings": {
+    "status": "passed", "severity": "warn", "blocking": false,
+    "effective_class": "PASS", "enforcement_disposition": "clean",
+    "findings_count": 0, "introduced_count": 0, "preexisting_count": 0
+  }
+}"#,
+    )
+    .expect("plant fresh mixed gate");
+
+    for (fail_on_warnings, expected) in [(false, 0), (true, 1)] {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("prview"));
+        command
+            .current_dir(repo)
+            .env("PRVIEW_HOME", home.path())
+            .args(update_args);
+        if fail_on_warnings {
+            command.arg("--fail-on-warnings");
+        }
+        let output = command.output().expect("fresh mixed update run");
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "stored mixed warning/review pack must preserve CI warning lane \
+             (fail_on_warnings={fail_on_warnings}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

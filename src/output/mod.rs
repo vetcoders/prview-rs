@@ -41,6 +41,7 @@ pub struct CliJsonSummary {
     pub schema_version: &'static str,
     pub status: &'static str,
     pub verdict: String,
+    pub enforcement_disposition: crate::policy::engine::EnforcementDisposition,
     pub analysis_status: crate::policy::engine::AnalysisStatus,
     pub merge_recommendation: crate::policy::engine::MergeRecommendation,
     pub allow_merge: bool,
@@ -133,6 +134,7 @@ pub struct CliJsonArtifacts {
 #[derive(Debug, Clone)]
 struct MergeGateSummary {
     verdict: String,
+    enforcement_disposition: crate::policy::engine::EnforcementDisposition,
     analysis_status: crate::policy::engine::AnalysisStatus,
     merge_recommendation: crate::policy::engine::MergeRecommendation,
     allow_merge: bool,
@@ -214,6 +216,7 @@ pub fn build_cli_json_summary(config: &Config, report: &Report) -> anyhow::Resul
             .merge_recommendation
             .machine_status(gate.analysis_status, gate.quality_pass),
         verdict: gate.verdict.clone(),
+        enforcement_disposition: gate.enforcement_disposition,
         analysis_status: gate.analysis_status,
         merge_recommendation: gate.merge_recommendation,
         allow_merge: gate.allow_merge,
@@ -271,18 +274,41 @@ pub fn build_cli_json_summary(config: &Config, report: &Report) -> anyhow::Resul
 /// silently ran lenient — the flag clap had just insisted on `--ci` for could
 /// not fire, and neither could the `!quality_pass` exit `--ci` promises.
 pub fn compute_exit_code(summary: &CliJsonSummary, strict: bool, fail_on_warnings: bool) -> i32 {
-    use crate::policy::engine::MergeRecommendation;
+    use crate::policy::engine::EnforcementMode;
 
-    if summary.merge_recommendation == MergeRecommendation::Block {
+    let mode = EnforcementMode::from_ci_flags(strict, fail_on_warnings);
+    cli_exit_code_for_disposition(
+        summary.enforcement_disposition,
+        mode,
+        summary.checks_summary.warned_in_pack,
+        summary.quality_pass,
+    )
+}
+
+pub fn cli_exit_code_for_disposition(
+    disposition: crate::policy::engine::EnforcementDisposition,
+    mode: crate::policy::engine::EnforcementMode,
+    warned_in_pack: usize,
+    quality_pass: bool,
+) -> i32 {
+    use crate::policy::engine::EnforcementAction;
+
+    // Preserve the public 0.7 CI contract: a quality failure is fatal, while a
+    // breaking/degraded review requirement with passing quality remains
+    // advisory. The gate modes enforce the full typed disposition separately.
+    if mode.is_ci() && !quality_pass {
         return 1;
     }
-    if strict && !summary.quality_pass {
+    if mode.fails_on_warnings() && warned_in_pack > 0 {
+        // The canonical warning tally is orthogonal to disposition ordering:
+        // ReviewRequired + a warning is still warning-dirty. Raising the enum
+        // would keep ReviewRequired and accidentally bypass the CI opt-in.
         return 1;
     }
-    if strict && fail_on_warnings && summary.checks_summary.warned_in_pack > 0 {
-        return 1;
+    match disposition.action(mode) {
+        EnforcementAction::Accept => 0,
+        EnforcementAction::Reject | EnforcementAction::Block => 1,
     }
-    0
 }
 
 impl CliJsonChecksSummary {
@@ -358,6 +384,8 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     {
         caveats.push(caveat);
     }
+    let enforcement_required =
+        crate::gate::schema_requires_enforcement_disposition(value.get("schema_version"));
 
     // Legacy root-as-decision vs. mandatory `decision` object: one rule, shared
     // with the MCP adapter, because the two readers answering it differently is
@@ -464,6 +492,20 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         &mut unreadable,
     )
     .and_then(Value::as_array);
+    let mut enforcement_caveats = Vec::new();
+    let stated_enforcement_disposition = crate::gate::read_enforcement_disposition(
+        decision.get("enforcement_disposition"),
+        enforcement_required,
+        &mut enforcement_caveats,
+    );
+    let warning_tally = crate::gate::read_pack_warning_tally(
+        value.get("checks"),
+        value.get("inline_findings"),
+        value.get("policy"),
+        decision.get("quality_failure_details"),
+        enforcement_required,
+        &mut caveats,
+    );
     // Whether the verdict below is what the pack said or what this reader had to
     // substitute for it. A substituted verdict cannot leave the OTHER decision
     // axes reading whatever the same unreliable decision block claimed: that
@@ -476,6 +518,7 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     let mut normalized_to_block = !unreadable.is_empty();
     let verdict_is_mistyped = decision.get("verdict").is_some() && raw_verdict.is_none();
     caveats.append(&mut unreadable);
+    caveats.append(&mut enforcement_caveats);
     // The vocabulary itself lives in `gate::canonical_verdict`, shared with the
     // MCP adapter. This reader owning a second copy of it is exactly how the
     // two surfaces came to read one pack two ways.
@@ -547,10 +590,16 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     // states nothing either — that is the shape of a pack written before the
     // field, and defaulting it to `false` would turn every one of them
     // CONDITIONAL.
-    let quality_rank = match raw_quality_pass {
-        Some(false) => Some(2),
-        _ => None,
-    };
+    let quality_rank = (raw_quality_pass == Some(false)
+        || warning_tally.has_new_quality_failure_signal)
+        .then_some(2);
+    if warning_tally.has_new_quality_failure_signal && raw_quality_pass != Some(false) {
+        caveats.push(
+            "quality_failure_inconsistency: typed introduced/mixed/unclassified failure details \
+             contradict quality_pass; normalized to false"
+                .to_string(),
+        );
+    }
     // The confidence axis, ranked by the same rule: only the values that RULE
     // OUT a more permissive outcome state a rank. `complete` rules nothing out
     // — it is a precondition of `PASS`, not a grant of it — so like
@@ -572,14 +621,17 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     // did not hard-block", which the contract is explicit is NOT the same as
     // `allow_merge`.
     let blocker_rank = (raw_policy_allow_merge == Some(false)
-        || raw_blocking_issues.is_some_and(|issues| !issues.is_empty()))
-    .then_some(3);
+        || raw_blocking_issues.is_some_and(|issues| !issues.is_empty())
+        || warning_tally.has_blocking_signal)
+        .then_some(3);
+    let check_review_rank = warning_tally.has_review_signal.then_some(2);
     let stated_ranks: Vec<u8> = [
         crate::gate::rank_from_verdict(verdict),
         recommendation_rank,
         allow_rank,
         quality_rank,
         analysis_rank,
+        check_review_rank,
         blocker_rank,
     ]
     .into_iter()
@@ -647,6 +699,33 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         "review_required" => crate::policy::engine::MergeRecommendation::ReviewRequired,
         _ => crate::policy::engine::MergeRecommendation::Block,
     };
+    let mut enforcement_disposition = stated_enforcement_disposition.unwrap_or(match final_rank {
+        1 => crate::policy::engine::EnforcementDisposition::Clean,
+        2 => crate::policy::engine::EnforcementDisposition::ReviewRequired,
+        _ => crate::policy::engine::EnforcementDisposition::Block,
+    });
+    if final_rank == 3 {
+        enforcement_disposition.raise_to(crate::policy::engine::EnforcementDisposition::Block);
+    } else if raw_quality_pass == Some(false)
+        || analysis_rank.is_some()
+        || check_review_rank.is_some()
+        || blocker_rank.is_some()
+        || (final_rank == 2
+            && enforcement_disposition == crate::policy::engine::EnforcementDisposition::Clean)
+    {
+        if check_review_rank.is_some()
+            && enforcement_disposition
+                < crate::policy::engine::EnforcementDisposition::ReviewRequired
+        {
+            caveats.push(
+                "check_enforcement_inconsistency: a typed check requires review but the stored \
+                 enforcement_disposition was more permissive; normalized to review_required"
+                    .to_string(),
+            );
+        }
+        enforcement_disposition
+            .raise_to(crate::policy::engine::EnforcementDisposition::ReviewRequired);
+    }
 
     // Ranking and PUBLISHING are different questions about the same absent
     // field. Absence states no rank — that is what keeps a pre-`quality_pass`
@@ -661,7 +740,11 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     // specifically and stays conservative. This cannot launder a MISTYPED
     // value: an unreadable signal normalizes the whole decision to `BLOCK`, so
     // `allow_merge` is already false by the time it is read here.
-    let quality_pass = raw_quality_pass.unwrap_or(allow_merge);
+    let quality_pass = if warning_tally.has_new_quality_failure_signal {
+        false
+    } else {
+        raw_quality_pass.unwrap_or(allow_merge)
+    };
 
     // Reuses the value typed above, so a mistyped `analysis_status` reaches this
     // fallback as absent rather than being read a second time by a laxer rule.
@@ -674,85 +757,44 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
         _ if allow_merge && quality_pass => crate::policy::engine::AnalysisStatus::Complete,
         _ => crate::policy::engine::AnalysisStatus::Incomplete,
     };
-    // `checks[]` sits at the pack ROOT, beside `decision`, and it is the only
-    // complete list of what ran: the artifact stage appends its own signal
-    // checks (`public_api_diff`, `unsafe_audit`, `ghost_refs`,
-    // `heuristics_loctree`) to the list the gate is built from, and none of
-    // them ever reaches the in-memory `Report` the CLI tallies.
-    //
-    // A status is matched against the vocabulary the writer emits, not against
-    // the single string `"warnings"`. Anything else is UNREADABLE, not clean:
-    // `"WARNINGS"` from another writer — or a stale pack `--update` reused
-    // unchanged — used to count as "not a warning", so `--ci
-    // --fail-on-warnings` exited 0 on an artifact whose warning signal this
-    // reader could not read. It is the same rule the decision axes follow: a
-    // present-but-untypeable signal normalizes conservatively and is reported,
-    // while an ABSENT one may legitimately mean a legacy pack. Case is not
-    // folded, deliberately — normalizing `"WARNINGS"` into a warning silently
-    // would hide that the pack is off-contract, and the tally is the same
-    // either way.
-    let warned_checks = match value.get("checks") {
-        Some(Value::Array(entries)) => {
-            let mut warned = 0usize;
-            let mut unreadable: Vec<String> = Vec::new();
-            for (index, entry) in entries.iter().enumerate() {
-                match entry.get("status").and_then(Value::as_str) {
-                    Some("warnings") => warned += 1,
-                    Some(status) if crate::checks::CheckStatus::EMITTED.contains(&status) => {}
-                    _ => {
-                        warned += 1;
-                        unreadable.push(
-                            entry
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| format!("checks[{index}]")),
-                        );
-                    }
-                }
-            }
-            if !unreadable.is_empty() {
-                caveats.push(format!(
-                    "unreadable_check_status: MERGE_GATE.json states a status outside the emitted \
-                     vocabulary ({}) for {}; each one counts toward the warning tally",
-                    crate::checks::CheckStatus::EMITTED.join(", "),
-                    unreadable.join(", ")
-                ));
-            }
-            warned
+    // The shared parser keeps CLI and MCP on one distinction: literal warning
+    // facts may be warnings-only, while unreadable check state is enforceable
+    // uncertainty even though it also counts for the warnings-clean tally.
+    let warned_checks = warning_tally.warned;
+
+    if warning_tally.has_unreadable_signal {
+        enforcement_disposition
+            .raise_to(crate::policy::engine::EnforcementDisposition::ReviewRequired);
+    } else if enforcement_required
+        && enforcement_disposition == crate::policy::engine::EnforcementDisposition::WarningsOnly
+        && !warning_tally.has_explicit_warnings
+    {
+        caveats.push(
+            "unproven_warnings_only: MERGE_GATE.json schema 2.3+ states warnings_only without a \
+             typed warning fact; normalized to review_required"
+                .to_string(),
+        );
+        enforcement_disposition
+            .raise_to(crate::policy::engine::EnforcementDisposition::ReviewRequired);
+    } else if warning_tally.has_explicit_warnings
+        && enforcement_disposition == crate::policy::engine::EnforcementDisposition::Clean
+    {
+        if stated_enforcement_disposition
+            == Some(crate::policy::engine::EnforcementDisposition::Clean)
+        {
+            caveats.push(
+                "enforcement_inconsistency: MERGE_GATE.json has typed warning facts beside a clean \
+                 enforcement_disposition; warnings-clean enforcement uses the canonical tally"
+                    .to_string(),
+            );
         }
-        // The same rule one level up, on the container instead of an entry. This
-        // used to fall back to "the checks this run executed", which on an
-        // unchanged `--update` run is none at all: `--ci --fail-on-warnings`
-        // exited 0 on a pack whose warning list the reader could not read. An
-        // unreadable list is not an empty one, so it counts as at least one
-        // warning. No legacy carve-out applies — `checks` has been emitted since
-        // schema 1.0 and the contract validator has always required an array
-        // there, so a non-array was never a valid shape.
-        Some(other) => {
-            caveats.push(format!(
-                "unreadable_checks: MERGE_GATE.json checks is {}, not an array; the warning tally \
-                 cannot be read and counts as at least one warning",
-                match other {
-                    Value::Null => "null",
-                    Value::Bool(_) => "a boolean",
-                    Value::Number(_) => "a number",
-                    Value::String(_) => "a string",
-                    Value::Object(_) => "an object",
-                    Value::Array(_) => unreachable!("matched above"),
-                }
-            ));
-            1
-        }
-        // ABSENT is the one tolerant case, and stays so: a pack that states no
-        // list may simply predate this build, and the CLI's own tally still
-        // applies through the `max` at the call site. Absent is not the same
-        // question as present-but-unreadable.
-        None => 0,
-    };
+        enforcement_disposition
+            .raise_to(crate::policy::engine::EnforcementDisposition::WarningsOnly);
+    }
 
     Ok(MergeGateSummary {
         verdict: verdict.to_string(),
+        enforcement_disposition,
         analysis_status,
         merge_recommendation,
         allow_merge,
@@ -1599,6 +1641,826 @@ mod tests {
         )
         .unwrap();
         temp
+    }
+
+    fn pack_with_value(value: serde_json::Value) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("00_summary")).unwrap();
+        std::fs::write(
+            temp.path().join("00_summary/MERGE_GATE.json"),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        temp
+    }
+
+    fn summary_for_pack(pack: &tempfile::TempDir) -> CliJsonSummary {
+        let report = Report {
+            target: "feature/operator-policy".to_string(),
+            bases: vec!["main".to_string()],
+            diffs: vec![],
+            checks: vec![],
+            heuristics: None,
+            artifacts_dir: pack.path().to_path_buf(),
+            duration: Duration::from_secs(1),
+            unchanged: true,
+        };
+        build_cli_json_summary(&test_config(), &report).expect("pack is readable")
+    }
+
+    #[test]
+    fn operator_policy_rank_invariants() {
+        use crate::gate::build_gate_json_output;
+        use crate::policy::engine::{EnforcementDisposition as D, EnforcementMode as M};
+
+        let decision =
+            |verdict: &str, recommendation: &str, allow: bool, disposition: serde_json::Value| {
+                serde_json::json!({
+                    "verdict": verdict,
+                    "enforcement_disposition": disposition,
+                    "analysis_status": "complete",
+                    "merge_recommendation": recommendation,
+                    "allow_merge": allow,
+                    "policy_allow_merge": true,
+                    "quality_pass": true,
+                    "decision_reason": "operator policy fixture",
+                    "review_caveats": [],
+                    "blocking_issues": [],
+                    "quality_failure_details": []
+                })
+            };
+        let pack = |decision: serde_json::Value, checks: Option<serde_json::Value>| {
+            let mut value = serde_json::json!({
+                "schema_version": "2.3",
+                "policy": {"mode":"warn"},
+                "decision": decision,
+                "inline_findings": {
+                    "status":"passed", "severity":"warn", "blocking":false,
+                    "effective_class":"PASS", "enforcement_disposition":"clean",
+                    "findings_count":0, "introduced_count":0, "preexisting_count":0
+                },
+            });
+            if let Some(checks) = checks {
+                value["checks"] = checks;
+            }
+            pack_with_value(value)
+        };
+
+        let clean = pack(
+            decision("PASS", "approve", true, serde_json::json!("clean")),
+            Some(serde_json::json!([])),
+        );
+        let cli = summary_for_pack(&clean);
+        let mcp = crate::mcp::read::read_decision(clean.path()).unwrap();
+        assert_eq!(cli.verdict, "PASS");
+        assert!(cli.allow_merge);
+        assert_eq!(cli.enforcement_disposition, D::Clean);
+        assert_eq!(mcp.verdict, "PASS");
+        assert!(mcp.allow_merge);
+        assert_eq!(mcp.enforcement_disposition, D::Clean);
+
+        let warnings = pack(
+            decision("PASS", "approve", true, serde_json::json!("warnings_only")),
+            Some(serde_json::json!([{
+                "id":"rustfmt",
+                "status":"warnings",
+                "execution_state":"executed",
+                "outcome":"findings_warning",
+                "class":"INFO",
+                "severity":"warn",
+                "policy_conclusion":"advisory",
+                "confidence_impact":"complete",
+                "merge_impact":"review_required",
+                "blocking":false
+            }])),
+        );
+        let cli = summary_for_pack(&warnings);
+        let mcp = crate::mcp::read::read_decision(warnings.path()).unwrap();
+        assert_eq!((cli.verdict.as_str(), cli.allow_merge), ("PASS", true));
+        assert_eq!(cli.enforcement_disposition, D::WarningsOnly);
+        assert_eq!((mcp.verdict.as_str(), mcp.allow_merge), ("PASS", true));
+        assert_eq!(mcp.enforcement_disposition, D::WarningsOnly);
+        assert_eq!(compute_exit_code(&cli, true, false), 0);
+        assert_eq!(compute_exit_code(&cli, true, true), 1);
+        let gate_path = warnings.path().join("00_summary/MERGE_GATE.json");
+        assert_eq!(
+            build_gate_json_output(&cli, &gate_path, M::GateStrict)
+                .unwrap()
+                .exit_code,
+            0
+        );
+        assert_eq!(
+            build_gate_json_output(&cli, &gate_path, M::GateFailOnWarnings)
+                .unwrap()
+                .exit_code,
+            2
+        );
+
+        // A warning detail is typed provenance for an emitted warning row, not
+        // an independent way to smuggle or duplicate a warning fact. Only the
+        // pre-existing classification can justify advisory+approve, but every
+        // classification participates in the reverse one-to-one proof.
+        let mut preexisting_warning_decision =
+            decision("PASS", "approve", true, serde_json::json!("warnings_only"));
+        preexisting_warning_decision["quality_failure_details"] = serde_json::json!([{
+            "name":"Rustfmt", "classification":"pre-existing", "origin":"warning"
+        }]);
+        let preexisting_warning = pack(
+            preexisting_warning_decision,
+            Some(serde_json::json!([{
+                "id":"rustfmt", "name":"Rustfmt", "status":"warnings",
+                "execution_state":"executed", "outcome":"findings_warning",
+                "class":"INFO", "severity":"warn", "policy_conclusion":"advisory",
+                "confidence_impact":"complete", "merge_impact":"approve", "blocking":false
+            }])),
+        );
+        let cli = summary_for_pack(&preexisting_warning);
+        let mcp = crate::mcp::read::read_decision(preexisting_warning.path()).unwrap();
+        assert_eq!(cli.enforcement_disposition, D::WarningsOnly);
+        assert_eq!(mcp.enforcement_disposition, D::WarningsOnly);
+        assert_eq!(compute_exit_code(&cli, true, false), 0);
+        assert_eq!(compute_exit_code(&cli, true, true), 1);
+
+        for classification in ["introduced", "mixed", "unclassified"] {
+            let mut warning_decision =
+                decision("PASS", "approve", true, serde_json::json!("warnings_only"));
+            warning_decision["quality_failure_details"] = serde_json::json!([{
+                "name":"Rustfmt", "classification":classification, "origin":"warning"
+            }]);
+            let matched_warning = pack(
+                warning_decision,
+                Some(serde_json::json!([{
+                    "id":"rustfmt", "name":"Rustfmt", "status":"warnings",
+                    "execution_state":"executed", "outcome":"findings_warning",
+                    "class":"INFO", "severity":"warn", "policy_conclusion":"advisory",
+                    "confidence_impact":"complete", "merge_impact":"review_required",
+                    "blocking":false
+                }])),
+            );
+            let cli = summary_for_pack(&matched_warning);
+            let mcp = crate::mcp::read::read_decision(matched_warning.path()).unwrap();
+            assert_eq!(cli.enforcement_disposition, D::WarningsOnly);
+            assert_eq!(mcp.enforcement_disposition, D::WarningsOnly);
+            assert_eq!(compute_exit_code(&cli, true, false), 0);
+            assert_eq!(compute_exit_code(&cli, true, true), 1);
+        }
+
+        let orphan_warning_details =
+            ["introduced", "pre-existing", "mixed", "unclassified"].map(|classification| {
+                pack_with_value(serde_json::json!({
+                    "schema_version":"2.3", "policy":{"mode":"warn"},
+                    "decision":{
+                        "verdict":"PASS", "enforcement_disposition":"clean",
+                        "analysis_status":"complete", "merge_recommendation":"approve",
+                        "allow_merge":true, "policy_allow_merge":true, "quality_pass":true,
+                        "decision_reason":"orphan warning detail", "review_caveats":[],
+                        "blocking_issues":[], "quality_failure_details":[{
+                            "name":"Rustfmt", "classification":classification, "origin":"warning"
+                        }]
+                    },
+                    "checks":[],
+                    "inline_findings":{
+                        "status":"passed", "severity":"warn", "blocking":false,
+                        "effective_class":"PASS", "enforcement_disposition":"clean",
+                        "findings_count":0, "introduced_count":0, "preexisting_count":0
+                    }
+                }))
+            });
+        let mut duplicate_warning_value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                preexisting_warning
+                    .path()
+                    .join("00_summary/MERGE_GATE.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        duplicate_warning_value["decision"]["quality_failure_details"] = serde_json::json!([
+            {"name":"Rustfmt", "classification":"pre-existing", "origin":"warning"},
+            {"name":"Rustfmt", "classification":"pre-existing", "origin":"warning"}
+        ]);
+        let duplicate_warning_detail = pack_with_value(duplicate_warning_value);
+        for candidate in orphan_warning_details
+            .iter()
+            .chain(std::iter::once(&duplicate_warning_detail))
+        {
+            let cli = summary_for_pack(candidate);
+            let mcp = crate::mcp::read::read_decision(candidate.path()).unwrap();
+            assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+            assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+            assert!(cli.checks_summary.warned_in_pack > 0);
+            assert_eq!(compute_exit_code(&cli, true, false), 0);
+            assert_eq!(compute_exit_code(&cli, true, true), 1);
+            assert_eq!(
+                build_gate_json_output(
+                    &cli,
+                    &candidate.path().join("00_summary/MERGE_GATE.json"),
+                    M::GateStrict,
+                )
+                .unwrap()
+                .exit_code,
+                2
+            );
+        }
+
+        let hidden_degraded = pack(
+            decision("PASS", "approve", true, serde_json::json!("warnings_only")),
+            Some(serde_json::json!([
+                {
+                    "id":"rustfmt", "status":"warnings", "execution_state":"executed",
+                    "outcome":"findings_warning", "class":"INFO", "severity":"warn",
+                    "policy_conclusion":"advisory",
+                    "confidence_impact":"complete", "merge_impact":"review_required",
+                    "blocking":false
+                },
+                {
+                    "id":"cargo_check", "status":"skipped", "execution_state":"unavailable",
+                    "outcome":"unavailable", "class":"SKIP", "severity":"warn",
+                    "policy_conclusion":"advisory",
+                    "confidence_impact":"degraded", "merge_impact":"review_required",
+                    "blocking":false
+                }
+            ])),
+        );
+        let cli = summary_for_pack(&hidden_degraded);
+        let mcp = crate::mcp::read::read_decision(hidden_degraded.path()).unwrap();
+        assert_eq!(
+            (cli.verdict.as_str(), cli.allow_merge),
+            ("CONDITIONAL", false)
+        );
+        assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(
+            (mcp.verdict.as_str(), mcp.allow_merge),
+            ("CONDITIONAL", false)
+        );
+        assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(compute_exit_code(&cli, true, false), 0);
+        assert_eq!(compute_exit_code(&cli, true, true), 1);
+        let gate_path = hidden_degraded.path().join("00_summary/MERGE_GATE.json");
+        assert_eq!(
+            build_gate_json_output(&cli, &gate_path, M::GateStrict)
+                .unwrap()
+                .exit_code,
+            2
+        );
+
+        // A raw failed/error check may be downgraded to approve only when its
+        // same-name quality detail proves pre-existing debt. That typed
+        // provenance keeps a valid emitted pack clean without trusting prose.
+        let mut preexisting_decision =
+            decision("PASS", "approve", true, serde_json::json!("clean"));
+        preexisting_decision["quality_failure_details"] = serde_json::json!([{
+            "name":"Cargo check", "classification":"pre-existing", "origin":"failure"
+        }]);
+        let preexisting_failure = pack(
+            preexisting_decision,
+            Some(serde_json::json!([{
+                "id":"cargo", "name":"Cargo check", "status":"failed",
+                "execution_state":"executed", "outcome":"findings_failed",
+                "class":"FAIL", "severity":"block", "policy_conclusion":"advisory",
+                "confidence_impact":"complete", "merge_impact":"approve", "blocking":false
+            }])),
+        );
+        let cli = summary_for_pack(&preexisting_failure);
+        let mcp = crate::mcp::read::read_decision(preexisting_failure.path()).unwrap();
+        assert_eq!((cli.verdict.as_str(), cli.allow_merge), ("PASS", true));
+        assert!(cli.quality_pass);
+        assert_eq!(cli.enforcement_disposition, D::Clean);
+        assert_eq!((mcp.verdict.as_str(), mcp.allow_merge), ("PASS", true));
+        assert_eq!(mcp.enforcement_disposition, D::Clean);
+
+        // Amputating that detail cannot launder a raw failure into quality=true.
+        // The shared reader derives a new quality failure, so historical CI
+        // still fails for its historical reason while gate strict rejects review.
+        let amputated_failure = pack_with_value(serde_json::json!({
+            "schema_version":"2.3",
+            "policy":{"mode":"shadow"},
+            "decision": decision("PASS", "approve", true, serde_json::json!("clean")),
+            "checks":[{
+                "id":"cargo", "name":"Cargo check", "status":"failed",
+                "execution_state":"executed", "outcome":"findings_failed",
+                "class":"FAIL", "severity":"block", "policy_conclusion":"advisory",
+                "confidence_impact":"complete", "merge_impact":"approve", "blocking":false
+            }],
+            "inline_findings":{
+                "status":"passed", "severity":"warn", "blocking":false,
+                "effective_class":"PASS", "enforcement_disposition":"clean",
+                "findings_count":0, "introduced_count":0, "preexisting_count":0
+            }
+        }));
+        let cli = summary_for_pack(&amputated_failure);
+        let mcp = crate::mcp::read::read_decision(amputated_failure.path()).unwrap();
+        assert_eq!(
+            (cli.verdict.as_str(), cli.allow_merge),
+            ("CONDITIONAL", false)
+        );
+        assert!(!cli.quality_pass);
+        assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(
+            (mcp.verdict.as_str(), mcp.allow_merge),
+            ("CONDITIONAL", false)
+        );
+        assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(compute_exit_code(&cli, true, false), 1);
+        assert_eq!(
+            build_gate_json_output(
+                &cli,
+                &amputated_failure.path().join("00_summary/MERGE_GATE.json"),
+                M::GateStrict,
+            )
+            .unwrap()
+            .exit_code,
+            2
+        );
+
+        // Inline INFO can coexist with a raw failed aggregate (a pre-existing
+        // error plus an introduced warning). The typed inline warning must
+        // still participate in the warnings-clean tally when another source
+        // raises the overall disposition to ReviewRequired.
+        let mixed_inline_warning = pack_with_value(serde_json::json!({
+            "schema_version":"2.3",
+            "policy":{"mode":"warn"},
+            "decision": decision(
+                "CONDITIONAL", "review_required", false,
+                serde_json::json!("review_required")
+            ),
+            "checks":[{
+                "id":"cargo", "name":"Cargo check", "status":"skipped",
+                "execution_state":"unavailable", "outcome":"unavailable",
+                "class":"SKIP", "severity":"warn", "policy_conclusion":"advisory",
+                "confidence_impact":"degraded", "merge_impact":"review_required",
+                "blocking":false
+            }],
+            "inline_findings":{
+                "status":"failed", "severity":"warn", "blocking":false,
+                "effective_class":"INFO", "enforcement_disposition":"warnings_only",
+                "findings_count":2, "introduced_count":1, "preexisting_count":1
+            }
+        }));
+        let cli = summary_for_pack(&mixed_inline_warning);
+        let mcp = crate::mcp::read::read_decision(mixed_inline_warning.path()).unwrap();
+        assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+        assert!(cli.checks_summary.warned_in_pack > 0);
+        assert_eq!(compute_exit_code(&cli, true, false), 0);
+        assert_eq!(compute_exit_code(&cli, true, true), 1);
+        assert_eq!(
+            build_gate_json_output(
+                &cli,
+                &mixed_inline_warning
+                    .path()
+                    .join("00_summary/MERGE_GATE.json"),
+                M::GateStrict,
+            )
+            .unwrap()
+            .exit_code,
+            2
+        );
+
+        // Vocabulary-valid but emitter-impossible tuples cannot remain clean:
+        // advisory+approve needs exact typed pre-existing provenance, and any
+        // introduced inline finding rules out effective PASS.
+        let impossible_advisory = pack(
+            decision("PASS", "approve", true, serde_json::json!("clean")),
+            Some(serde_json::json!([{
+                "id":"cargo", "name":"Cargo check", "status":"passed",
+                "execution_state":"executed", "outcome":"passed", "class":"PASS",
+                "severity":"warn", "policy_conclusion":"advisory",
+                "confidence_impact":"complete", "merge_impact":"approve", "blocking":false
+            }])),
+        );
+        let forged_inline = pack_with_value(serde_json::json!({
+            "schema_version":"2.3", "policy":{"mode":"warn"},
+            "decision": decision("PASS", "approve", true, serde_json::json!("clean")),
+            "checks":[],
+            "inline_findings":{
+                "status":"failed", "severity":"warn", "blocking":false,
+                "effective_class":"PASS", "enforcement_disposition":"clean",
+                "findings_count":2, "introduced_count":1, "preexisting_count":1
+            }
+        }));
+        let unclassified_inline = pack_with_value(serde_json::json!({
+            "schema_version":"2.3", "policy":{"mode":"warn"},
+            "decision": decision("PASS", "approve", true, serde_json::json!("clean")),
+            "checks":[],
+            "inline_findings":{
+                "status":"failed", "severity":"warn", "blocking":false,
+                "effective_class":"PASS", "enforcement_disposition":"clean",
+                "findings_count":1, "introduced_count":0, "preexisting_count":0
+            }
+        }));
+        for candidate in [&impossible_advisory, &forged_inline, &unclassified_inline] {
+            let cli = summary_for_pack(candidate);
+            let mcp = crate::mcp::read::read_decision(candidate.path()).unwrap();
+            assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+            assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+            assert_eq!(compute_exit_code(&cli, true, false), 0);
+            assert_eq!(
+                build_gate_json_output(
+                    &cli,
+                    &candidate.path().join("00_summary/MERGE_GATE.json"),
+                    M::GateStrict,
+                )
+                .unwrap()
+                .exit_code,
+                2
+            );
+        }
+
+        let unproven = pack(
+            decision("PASS", "approve", true, serde_json::json!("warnings_only")),
+            Some(serde_json::json!([])),
+        );
+        let cli = summary_for_pack(&unproven);
+        let mcp = crate::mcp::read::read_decision(unproven.path()).unwrap();
+        assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+        assert!(
+            cli.caveats
+                .iter()
+                .any(|c| c.starts_with("unproven_warnings_only:"))
+        );
+        assert!(
+            mcp.caveats
+                .iter()
+                .any(|c| c.starts_with("unproven_warnings_only:"))
+        );
+        let gate_path = unproven.path().join("00_summary/MERGE_GATE.json");
+        let gate = build_gate_json_output(&cli, &gate_path, M::GateStrict).unwrap();
+        assert_eq!(gate.exit_code, 2);
+        assert!(
+            gate.caveats
+                .iter()
+                .any(|c| c.starts_with("unproven_warnings_only:"))
+        );
+
+        // A 2.2 CONDITIONAL cannot prove it is warning-only. Both readers keep
+        // its canonical decision and conservatively enforce strict mode.
+        let legacy = pack_with_value(serde_json::json!({
+            "schema_version": "2.2",
+            "decision": {
+                "verdict": "CONDITIONAL",
+                "analysis_status": "complete",
+                "merge_recommendation": "review_required",
+                "allow_merge": false,
+                "quality_pass": true
+            },
+            "checks": [{"id":"rustfmt","status":"warnings"}]
+        }));
+        let cli = summary_for_pack(&legacy);
+        let mcp = crate::mcp::read::read_decision(legacy.path()).unwrap();
+        assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(compute_exit_code(&cli, true, false), 0);
+        assert_eq!(
+            build_gate_json_output(
+                &cli,
+                &legacy.path().join("00_summary/MERGE_GATE.json"),
+                M::GateStrict,
+            )
+            .unwrap()
+            .exit_code,
+            2
+        );
+
+        let legacy_smuggle = pack_with_value(serde_json::json!({
+            "schema_version": "2.2",
+            "decision": {
+                "verdict": "CONDITIONAL",
+                "analysis_status": "complete",
+                "merge_recommendation": "review_required",
+                "allow_merge": false,
+                "quality_pass": true,
+                "enforcement_disposition": "warnings_only"
+            },
+            "checks": [],
+            "inline_findings": {"status":"passed"}
+        }));
+        let cli = summary_for_pack(&legacy_smuggle);
+        let mcp = crate::mcp::read::read_decision(legacy_smuggle.path()).unwrap();
+        assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(compute_exit_code(&cli, true, false), 0);
+        assert_eq!(
+            build_gate_json_output(
+                &cli,
+                &legacy_smuggle.path().join("00_summary/MERGE_GATE.json"),
+                M::GateStrict,
+            )
+            .unwrap()
+            .exit_code,
+            2
+        );
+
+        // Missing/unknown/mistyped additive metadata cannot rewrite canonical
+        // PASS evidence, but none may unlock warnings-only strict acceptance.
+        for field in [
+            None,
+            Some(serde_json::json!("mystery")),
+            Some(serde_json::json!(7)),
+        ] {
+            let mut d = decision("PASS", "approve", true, serde_json::json!("clean"));
+            match field {
+                Some(value) => d["enforcement_disposition"] = value,
+                None => {
+                    d.as_object_mut().unwrap().remove("enforcement_disposition");
+                }
+            }
+            let candidate = pack(d, Some(serde_json::json!([])));
+            let cli = summary_for_pack(&candidate);
+            let mcp = crate::mcp::read::read_decision(candidate.path()).unwrap();
+            assert_eq!((cli.verdict.as_str(), cli.allow_merge), ("PASS", true));
+            assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+            assert_eq!((mcp.verdict.as_str(), mcp.allow_merge), ("PASS", true));
+            assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+            assert_eq!(compute_exit_code(&cli, false, false), 0);
+            assert_eq!(compute_exit_code(&cli, true, false), 0);
+            assert_eq!(
+                build_gate_json_output(
+                    &cli,
+                    &candidate.path().join("00_summary/MERGE_GATE.json"),
+                    M::GateStrict,
+                )
+                .unwrap()
+                .exit_code,
+                2
+            );
+        }
+
+        // Unreadable or amputated 2.3 check truth is enforceable uncertainty,
+        // not proof of a harmless warning, on both reader surfaces.
+        for checks in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!([{"id":"x","status":"mystery"}])),
+        ] {
+            let candidate = pack(
+                decision("PASS", "approve", true, serde_json::json!("clean")),
+                checks,
+            );
+            let cli = summary_for_pack(&candidate);
+            let mcp = crate::mcp::read::read_decision(candidate.path()).unwrap();
+            assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+            assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+            assert_eq!(compute_exit_code(&cli, false, false), 0);
+            assert_eq!(compute_exit_code(&cli, true, false), 0);
+            assert_eq!(compute_exit_code(&cli, true, true), 1);
+            assert_eq!(
+                build_gate_json_output(
+                    &cli,
+                    &candidate.path().join("00_summary/MERGE_GATE.json"),
+                    M::GateStrict,
+                )
+                .unwrap()
+                .exit_code,
+                2
+            );
+        }
+
+        let missing_warning_proof = pack(
+            decision("PASS", "approve", true, serde_json::json!("warnings_only")),
+            None,
+        );
+        let cli = summary_for_pack(&missing_warning_proof);
+        let mcp = crate::mcp::read::read_decision(missing_warning_proof.path()).unwrap();
+        assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+        assert_eq!(compute_exit_code(&cli, true, false), 0);
+        assert_eq!(
+            build_gate_json_output(
+                &cli,
+                &missing_warning_proof
+                    .path()
+                    .join("00_summary/MERGE_GATE.json"),
+                M::GateStrict,
+            )
+            .unwrap()
+            .exit_code,
+            2
+        );
+
+        for inline in [serde_json::json!({}), serde_json::json!({"status":7})] {
+            let candidate = pack_with_value(serde_json::json!({
+                "schema_version":"2.3",
+                "policy":{"mode":"warn"},
+                "decision": decision("PASS", "approve", true, serde_json::json!("clean")),
+                "checks": [],
+                "inline_findings": inline
+            }));
+            let cli = summary_for_pack(&candidate);
+            let mcp = crate::mcp::read::read_decision(candidate.path()).unwrap();
+            assert_eq!(cli.enforcement_disposition, D::ReviewRequired);
+            assert_eq!(mcp.enforcement_disposition, D::ReviewRequired);
+            assert_eq!(compute_exit_code(&cli, true, false), 0);
+            assert_eq!(
+                build_gate_json_output(
+                    &cli,
+                    &candidate.path().join("00_summary/MERGE_GATE.json"),
+                    M::GateStrict,
+                )
+                .unwrap()
+                .exit_code,
+                2
+            );
+        }
+
+        let legacy_absent_inline = pack_with_value(serde_json::json!({
+            "schema_version":"2.2",
+            "decision":{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":true},
+            "checks": []
+        }));
+        assert_eq!(
+            summary_for_pack(&legacy_absent_inline).enforcement_disposition,
+            D::Clean
+        );
+        for inline in [serde_json::json!({"status":7}), serde_json::json!([])] {
+            let malformed = pack_with_value(serde_json::json!({
+                "schema_version":"2.2",
+                "decision":{"verdict":"PASS","merge_recommendation":"approve","allow_merge":true,"quality_pass":true},
+                "checks": [],
+                "inline_findings": inline
+            }));
+            assert_eq!(
+                summary_for_pack(&malformed).enforcement_disposition,
+                D::ReviewRequired
+            );
+            assert_eq!(
+                crate::mcp::read::read_decision(malformed.path())
+                    .unwrap()
+                    .enforcement_disposition,
+                D::ReviewRequired
+            );
+        }
+
+        // A lower typed blocker cannot coexist with a permissive canonical
+        // decision or the warnings-only exception. The shared parser raises
+        // both CLI and MCP to the same fail-honest Block outcome.
+        for (disposition, checks, inline_findings) in [
+            (
+                "warnings_only",
+                serde_json::json!([{"id":"rustfmt","status":"warnings","blocking":true}]),
+                serde_json::json!({"status":"passed","blocking":false}),
+            ),
+            (
+                "warnings_only",
+                serde_json::json!([]),
+                serde_json::json!({"status":"warnings","blocking":true}),
+            ),
+            (
+                "clean",
+                serde_json::json!([{"id":"rustfmt","status":"passed","blocking":true}]),
+                serde_json::json!({"status":"passed","blocking":false}),
+            ),
+            (
+                "clean",
+                serde_json::json!([]),
+                serde_json::json!({"status":"passed","blocking":true}),
+            ),
+        ] {
+            let contradictory = pack_with_value(serde_json::json!({
+                "schema_version":"2.3",
+                "decision": decision("PASS", "approve", true, serde_json::json!(disposition)),
+                "checks": checks,
+                "inline_findings": inline_findings
+            }));
+            let cli = summary_for_pack(&contradictory);
+            let mcp = crate::mcp::read::read_decision(contradictory.path()).unwrap();
+            assert_eq!((cli.verdict.as_str(), cli.allow_merge), ("BLOCK", false));
+            assert_eq!(cli.enforcement_disposition, D::Block);
+            assert_eq!((mcp.verdict.as_str(), mcp.allow_merge), ("BLOCK", false));
+            assert_eq!(mcp.enforcement_disposition, D::Block);
+            assert_eq!(compute_exit_code(&cli, false, false), 1);
+            assert_eq!(compute_exit_code(&cli, true, false), 1);
+        }
+    }
+
+    #[test]
+    fn operator_policy_rank_invariants_inline_count_truth_table() {
+        use crate::policy::engine::EnforcementDisposition as D;
+
+        fn realizable(
+            status: &str,
+            class: &str,
+            findings: u64,
+            introduced: u64,
+            preexisting: u64,
+        ) -> bool {
+            if introduced
+                .checked_add(preexisting)
+                .is_none_or(|classified| classified > findings)
+            {
+                return false;
+            }
+            match status {
+                "passed" | "not_run" => findings == 0 && class == "PASS",
+                "warnings" if findings > 0 => match class {
+                    "INFO" => true,
+                    "PASS" => introduced == 0 && findings == preexisting,
+                    _ => false,
+                },
+                "failed" if findings > 0 => match class {
+                    "FAIL" => true,
+                    "INFO" => findings >= 2 && preexisting >= 1,
+                    "PASS" => introduced == 0 && findings == preexisting,
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+
+        let mut count_cases = Vec::new();
+        for findings in 0..=3_u64 {
+            for introduced in 0..=findings {
+                for preexisting in 0..=(findings - introduced) {
+                    count_cases.push((findings, introduced, preexisting));
+                }
+            }
+        }
+        count_cases.extend([(u64::MAX, u64::MAX, 0), (u64::MAX, u64::MAX, 1)]);
+
+        for status in ["passed", "not_run", "warnings", "failed"] {
+            for class in ["PASS", "INFO", "FAIL"] {
+                for &(findings, introduced, preexisting) in &count_cases {
+                    let expected = realizable(status, class, findings, introduced, preexisting);
+                    let source_disposition = if class == "FAIL" {
+                        "review_required"
+                    } else if class == "INFO" || status == "warnings" {
+                        "warnings_only"
+                    } else {
+                        "clean"
+                    };
+                    let (verdict, recommendation, allow_merge) =
+                        if source_disposition == "review_required" {
+                            ("CONDITIONAL", "review_required", false)
+                        } else {
+                            ("PASS", "approve", true)
+                        };
+                    let candidate = pack_with_value(serde_json::json!({
+                        "schema_version":"2.3",
+                        "policy":{"mode":"shadow"},
+                        "decision":{
+                            "verdict":verdict,
+                            "enforcement_disposition":source_disposition,
+                            "analysis_status":"complete",
+                            "merge_recommendation":recommendation,
+                            "allow_merge":allow_merge,
+                            "policy_allow_merge":true,
+                            "quality_pass":true,
+                            "decision_reason":"bounded inline truth table",
+                            "review_caveats":[],
+                            "blocking_issues":[],
+                            "quality_failure_details":[]
+                        },
+                        "checks":[],
+                        "inline_findings":{
+                            "file":if findings == 0 {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::json!("30_context/INLINE_FINDINGS.sarif")
+                            },
+                            "status":status,
+                            "severity":"warn",
+                            "blocking":false,
+                            "effective_class":class,
+                            "enforcement_disposition":source_disposition,
+                            "findings_count":findings,
+                            "introduced_count":introduced,
+                            "preexisting_count":preexisting
+                        }
+                    }));
+                    let cli = summary_for_pack(&candidate);
+                    let mcp = crate::mcp::read::read_decision(candidate.path()).unwrap();
+                    let cli_accepted = !cli
+                        .caveats
+                        .iter()
+                        .any(|c| c.starts_with("inconsistent_inline_class:"));
+                    let mcp_accepted = !mcp
+                        .caveats
+                        .iter()
+                        .any(|c| c.starts_with("inconsistent_inline_class:"));
+                    assert_eq!(
+                        cli_accepted, expected,
+                        "CLI tuple status={status} class={class} F={findings} I={introduced} P={preexisting}"
+                    );
+                    assert_eq!(
+                        mcp_accepted, expected,
+                        "MCP tuple status={status} class={class} F={findings} I={introduced} P={preexisting}"
+                    );
+                    if expected {
+                        let expected_disposition = match source_disposition {
+                            "clean" => D::Clean,
+                            "warnings_only" => D::WarningsOnly,
+                            _ => D::ReviewRequired,
+                        };
+                        assert_eq!(cli.enforcement_disposition, expected_disposition);
+                        assert_eq!(mcp.enforcement_disposition, expected_disposition);
+                    } else {
+                        assert!(cli.enforcement_disposition >= D::ReviewRequired);
+                        assert!(mcp.enforcement_disposition >= D::ReviewRequired);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3200,8 +4062,10 @@ api-router/app/core/cache.py
         std::fs::write(
             pack.path().join("00_summary/MERGE_GATE.json"),
             r#"{"schema_version":"2.2",
-                "checks":[{"id":"a","status":"passed"},{"id":"b","status":"failed"},
-                          {"id":"c","status":"skipped"},{"id":"d","status":"error"}],
+                "checks":[{"id":"a","name":"A","status":"passed"},
+                          {"id":"b","name":"B","status":"failed"},
+                          {"id":"c","name":"C","status":"skipped"},
+                          {"id":"d","name":"D","status":"error"}],
                 "decision":{"verdict":"PASS","merge_recommendation":"approve",
                             "allow_merge":true,"quality_pass":true,
                             "analysis_status":"complete"}}"#,
@@ -4059,6 +4923,7 @@ api-router/app/core/cache.py
         };
         let gate = MergeGateSummary {
             verdict: "PASS".to_string(),
+            enforcement_disposition: crate::policy::engine::EnforcementDisposition::Clean,
             analysis_status: crate::policy::engine::AnalysisStatus::Complete,
             merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
             allow_merge: true,

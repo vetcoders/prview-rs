@@ -120,13 +120,17 @@ generated merge-gate artifact, and exits with the automation contract:
 
 | Exit code | Meaning |
 |-----------|---------|
-| `0` | `PASS`, or `CONDITIONAL` without `--strict` |
+| `0` | `PASS`, advisory `CONDITIONAL`, or a typed warnings-only decision under `--strict` |
 | `1` | `BLOCK` |
-| `2` | `CONDITIONAL` with `--strict` |
+| `2` | Review-required under `--strict`, or warnings-only with `--strict --fail-on-warnings` |
 | `3` | Gate execution failed before a trustworthy verdict was available |
 
 Use `prview gate --json` for schema-friendly stdout with the verdict, caveats,
-blocking issues, and artifact paths.
+blocking issues, typed `enforcement_disposition`, and artifact paths. A strict
+gate accepts `clean` and `warnings_only`; confirmed/potential breaking
+changes, degraded or unknown analysis, quality failures, and hard blocks remain
+non-zero. Add `--fail-on-warnings` when a Required check must also enforce a
+warnings-clean pack.
 
 For local pre-push recipes and the recommended Shadow -> Warn -> Block rollout,
 see [`docs/gate-playbook.md`](docs/gate-playbook.md).
@@ -147,10 +151,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: vetcoders/prview-rs@v0.6.0 # pin to a released tag
+      - uses: vetcoders/prview-rs@v0.8.0 # fail-on-warnings requires 0.8+
         id: prview
         with:
           strict: "true"
+          fail-on-warnings: "false"
           version: "latest"
       - uses: github/codeql-action/upload-sarif@v3
         if: ${{ steps.prview.outputs['sarif-path'] != '' }}
@@ -161,9 +166,11 @@ jobs:
 The Action maps pass/fail only from the `prview gate` exit-code contract. JSON
 stdout is used for step-summary details and artifact paths, not for deciding
 whether the check passed. `cargo-binstall` is used when available, with
-`cargo install prview` as the fallback. Set `version` to a published release
-that contains `prview gate` (`0.6.0` or newer), or `latest` for the newest
-release.
+`cargo install prview` as the fallback. The base gate exists from `0.6.0`, but
+the typed warnings-only contract and the Action's `fail-on-warnings` input
+require Action/runtime `0.8.0` or newer. `latest` resolves that lane after 0.8
+is published; older pins must omit the input and retain their historical gate
+semantics.
 
 GitHub code scanning accepts SARIF uploads through
 `github/codeql-action/upload-sarif`. Keep SARIF under GitHub's ingestion limits:

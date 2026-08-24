@@ -1,4 +1,4 @@
-# MERGE_GATE Contract (schema 2.2)
+# MERGE_GATE Contract (schema 2.3)
 
 `MERGE_GATE.json` is the policy-aware merge decision emitted at
 `00_summary/MERGE_GATE.json`. It is the single machine-readable verdict surface
@@ -11,7 +11,7 @@ document disagree, the code is the contract and this document is the bug.
 
 | Field | Type | Notes |
 |---|---|---|
-| `schema_version` | string | `"2.2"` |
+| `schema_version` | string | `"2.3"` |
 | `generated_at` | string | RFC 3339 local datetime |
 | `bridge_stage` | integer | `0..4` |
 | `target` | string | Resolved target branch name (not raw CLI input) |
@@ -94,9 +94,12 @@ unreadable, not empty: it counts as at least one warning and raises an
 `unreadable_checks:` caveat. It used to fall back to "the checks this run
 executed", which on an unchanged `--update` run is none at all, so
 `--ci --fail-on-warnings` exited `0` on a pack whose warning list the reader
-could not read. An ABSENT `checks` is the one tolerant case and stays so: a pack
-that states no list may simply predate this build, and the CLI's own tally still
-applies. Absent and present-but-unreadable are different questions.
+could not read. Actual absence is tolerated only for a schema at or below 2.2,
+where the pack may predate typed enforcement. Schema 2.3 requires `checks` and
+`inline_findings`; absent, non-container, unknown-status, or mistyped states
+raise a reader caveat and the `review_required` disposition. They still count as
+at least one warning for the explicit warnings-clean lane, but can never prove
+the harmless warnings-only exception.
 
 ## `inline_findings`
 
@@ -107,12 +110,45 @@ applies. Absent and present-but-unreadable are different questions.
 | `status` | string | Inline analysis status |
 | `severity` | string | `block` \| `warn` \| `ignore` |
 | `blocking` | boolean | Whether inline findings block the merge |
+| `effective_class` | string | `PASS` \| `INFO` \| `FAIL` — the emitter-side class after trusted pre-existing policy |
+| `enforcement_disposition` | string | Per-source `clean` \| `warnings_only` \| `review_required` \| `block` proof (required from schema 2.3) |
 | `findings_count` | integer | Total inline findings |
 | `introduced_count` | integer | Findings this diff introduced (`in_diff == true`) |
 | `preexisting_count` | integer | Pre-existing whole-repo findings (`in_diff == false`) |
 
 `introduced_count + preexisting_count` may be less than `findings_count`: the
-split counts only tool-finding rows and excludes cargo-audit / check SARIF rows.
+split counts only operator findings with a known `in_diff` value, so the
+remainder has no trusted pre-existing proof. Schema 2.3 therefore does not
+reconstruct `effective_class` from those counts; it only checks whether the
+stored class is possible. With `F = findings_count`, `I = introduced_count`,
+and `P = preexisting_count`, the complete count model is:
+
+| Raw status | Required count shape | Possible effective classes |
+|---|---|---|
+| `passed` / `not_run` | `F = 0` | `PASS` |
+| `warnings` | `F > 0` | `INFO`; also `PASS` only when `I = 0` and `F = P` |
+| `failed` | `F > 0` | `FAIL`; also `INFO` only when `F >= 2` and `P >= 1`; also `PASS` only when `I = 0` and `F = P` |
+
+Every row additionally requires `I + P <= F`. The `failed`/`INFO` condition is
+necessary because the raw error must be pre-existing while a distinct warning
+remains effective. An all-pre-existing count does **not** prove `PASS`, because
+the effective downgrade also depends on baseline/trust provenance that the
+aggregate does not carry.
+
+The emitter and validator share this per-source disposition table:
+
+| Effective inline fact | Per-source disposition |
+|---|---|
+| `blocking: true` | `block` |
+| `effective_class: FAIL`, non-blocking | `review_required` |
+| `effective_class: INFO`, or a raw `warnings` status with effective `PASS` | `warnings_only` |
+| effective `PASS` with raw `passed`, `failed`, or `not_run` | `clean` |
+
+`blocking` itself is checked against `policy.mode`, inline severity, and
+effective class exactly like `PolicyConfig::is_blocking`: shadow never blocks;
+warn blocks `FAIL` at block severity; block mode blocks `FAIL` at block or warn
+severity. This preserves legal pre-existing errors while preventing a forged
+non-blocking inline failure from hiding a policy block.
 
 ## `rust_api_delta`
 
@@ -145,6 +181,7 @@ authoritative axes — `analysis_status` (confidence) and `merge_recommendation`
 | `analysis_status` | string | `complete` \| `degraded` \| `incomplete` |
 | `merge_recommendation` | string | `approve` \| `review_required` \| `block` |
 | `verdict` | string | `PASS` \| `CONDITIONAL` \| `BLOCK` — the single-field gate for AI consumers |
+| `enforcement_disposition` | string | `clean` \| `warnings_only` \| `review_required` \| `block` (required from schema 2.3) |
 | `allow_merge` | boolean | Derived: `true` **iff** `verdict == "PASS"` |
 | `policy_allow_merge` | boolean | Whether policy hard-blocked (no blocking issues); NOT the same as `allow_merge` |
 | `quality_pass` | boolean | No new quality failures from this diff |
@@ -172,6 +209,63 @@ by `derive_decision` (`src/artifacts/verdict.rs`), which calls
 | `CONDITIONAL` | `merge_recommendation == review_required`, OR `approve` with degraded/incomplete analysis or failing quality |
 | `PASS` | `merge_recommendation == approve` AND `analysis_status == complete` AND `quality_pass == true` |
 
+## Enforcement disposition (schema 2.3)
+
+`enforcement_disposition` answers a different question from `verdict`: whether
+an operator-selected process lane accepts the already-derived decision. It does
+not rank or rewrite `verdict`, `allow_merge`, or `merge_recommendation`. In
+particular, a pre-existing warning may legitimately serialize
+`verdict: "PASS"`, `allow_merge: true`, and
+`enforcement_disposition: "warnings_only"`; readers preserve all three.
+
+| disposition | Typed cause | `prview gate` advisory | `prview gate --strict` | `prview gate --strict --fail-on-warnings` |
+|---|---|---:|---:|---:|
+| `clean` | No effective warning, review ratchet, or blocker | accept | accept | accept |
+| `warnings_only` | One or more effective typed warnings, with complete analysis and no review/block ratchet | accept | accept | reject (`2`) |
+| `review_required` | Confirmed/potential breaking under effective escalation, unknown/degraded analysis, or quality failure | accept | reject (`2`) | reject (`2`) |
+| `block` | Canonical hard block | block (`1`) | block (`1`) | block (`1`) |
+
+The emitter computes this value while it still holds typed policy evaluations,
+legacy breaking findings, and the repo-backed Rust `ApiDelta`. No reader parses
+`review_caveats` or other prose to reconstruct a cause. Pure Rust API additions
+stay `clean`; confirmed/potential breaking raises only when the existing
+`[gate] breaking_escalation` policy is effective. With that operator knob off,
+the breaking fact remains informational and does not create a hidden strict
+failure. Unknown Rust facts still degrade confidence and require review.
+
+`warnings_only` requires literal typed proof: an exact
+`checks[].status=warnings`/`outcome=findings_warning` row, or the validated
+inline per-source `warnings_only` disposition. The latter may accompany raw
+inline `failed` when a trusted pre-existing error and an introduced warning
+produce effective `INFO`; readers never infer it from prose. Every such source
+is non-blocking.
+Schema 2.3's validator rejects a missing proof, a `clean` disposition beside an
+explicit warning, and any lower typed `blocking: true` beside a decision that is
+not the full canonical Block tuple. CLI, MCP, and `prview gate` consume the same
+schema-aware proof parser and disposition table.
+
+Check-row proof is also relational, not vocabulary-only. Schema 2.3 validates
+status/outcome/execution/class tuples, confidence loss, the
+conclusion/merge/blocking triad, and policy-mode blocking. `advisory` normally
+requires `review_required`; its only `approve` exception is an exact same-name
+typed pre-existing failure/warning downgrade. A raw failed/error
+check must map one-to-one by name to an `origin: failure`
+`quality_failure_details` row. The only legal failed-check `approve` downgrade
+is a typed `classification: pre-existing` detail beside the exact
+advisory/approve/non-blocking tuple; amputating that detail is an unreadable new
+quality failure, not a clean pass. Every `origin: warning` detail, across all
+four classifications, likewise maps one-to-one by name to a literal warning
+check row. Only the `pre-existing` warning classification can justify the
+advisory/approve downgrade; an orphaned or duplicated warning detail is
+unreadable review evidence and still counts in warning-clean lanes.
+
+This table governs `prview gate`. Top-level `prview --ci` intentionally retains
+the historical adapter: Block or `quality_pass: false` exits `1`, while a typed
+review requirement with passing quality remains advisory. Its explicit
+`--fail-on-warnings` lane additionally exits `1` whenever the canonical pack
+warning tally is non-zero, including a warning mixed with a higher review
+disposition.
+
 ## Invariants
 
 - **`allow_merge == (verdict == "PASS")`.** `allow_merge` is derived in
@@ -180,6 +274,9 @@ by `derive_decision` (`src/artifacts/verdict.rs`), which calls
   unrepresentable (PV-03).
 - **`derive_decision` is the single source** of `verdict`, `allow_merge`, and
   `recommended_merge`. No caller sets these fields independently.
+- **`enforcement_disposition` is orthogonal to verdict rank.** It selects an
+  exit adapter action after the canonical axes are reconciled; it cannot turn a
+  `PASS` into `CONDITIONAL` or change `allow_merge`.
 - **`policy_allow_merge` is a distinct axis** ("policy did not hard-block") and
   is not conflated with `allow_merge` or the recommendation. It is derived from
   one input and set nowhere else: `policy_allow_merge == blocking_issues.is_empty()`,
@@ -222,9 +319,23 @@ Readers accept a pack by MAJOR version and say what they had to normalize:
 | `schema_version` on disk | Reader behavior |
 |---|---|
 | absent | Accepted silently — pre-2.1 packs predate the field, and their root object is read as the `decision` |
-| known MAJOR (`1`, `2`), same-or-older MINOR | Accepted silently |
-| known MAJOR, newer MINOR | Accepted with a `schema_forward_compat:` caveat; unknown fields ignored |
+| known schema through `2.2` | Canonical verdict stays readable, but any injected `enforcement_disposition` is ignored; a legacy `CONDITIONAL` is conservatively `review_required` for strict enforcement |
+| `2.3` | `enforcement_disposition`, `checks`, `inline_findings`, policy mode, and typed quality-failure provenance are required and cross-checked as enforcement proof |
+| known MAJOR, newer MINOR | Accepted with a `schema_forward_compat:` caveat; the 2.3 typed-enforcement requirements still apply |
 | unknown MAJOR, unparsable version, a non-canonical spelling (`02.2`, `+2.2`), or a non-string value | Fail loud |
+
+Errors in the additive disposition axis are deliberately separate from errors
+in the canonical evidence axes. A missing, unknown, or wrongly typed 2.3
+`enforcement_disposition` preserves the stored `PASS` / `CONDITIONAL` / `BLOCK`
+and its `allow_merge`, adds a precise caveat, and normalizes only enforcement to
+`review_required`. Advisory mode therefore still reports the pack's canonical
+decision, while strict mode rejects it; malformed additive metadata never
+manufactures a canonical `BLOCK`, and never unlocks `warnings_only`.
+
+The same shared readback boundary feeds CLI JSON, MCP `run_review`/`verdict`, and
+the gate exit adapter. `prview gate` does not deserialize a second enum path or
+drop reader caveats: it consumes the normalized `CliJsonSummary`, merges its
+caveats with stored review caveats, and applies the one enforcement table.
 
 A pack that STATES a `schema_version` must also carry the `decision` object that
 schema is built around. A missing or non-object `decision` there is a corrupt
@@ -243,12 +354,12 @@ to read at all: it is corrupt on both readers, not a decision with every signal
 missing. Reading one as a decision produced a "successful" summary carrying a
 normalized `BLOCK` for an artifact that never stated anything.
 
-A `decision` object that is present and states no decision falls under the same
+A `decision` object that is present and states no canonical decision falls under the same
 rule. It must carry at least one of `verdict`, `merge_recommendation` or
 `allow_merge`; a block carrying none of the three is corrupt on every surface —
-the CLI exits `3`, the MCP adapter returns `storage_corrupt`, `prview gate`
-cannot deserialize it, and `tools/validate_merge_gate.py` rejects it for the
-required fields it is missing. The test is PRESENCE, not recognizability: a
+the CLI and `prview gate` exit `3`, the MCP adapter returns `storage_corrupt`,
+and `tools/validate_merge_gate.py` rejects it for the required fields it is
+missing. The test is PRESENCE, not recognizability: a
 stated `verdict: "PROBABLY"` is a decision this pack gave, and it collapses to
 `BLOCK` with an `unknown_verdict:` caveat as described below. Absence stays
 forgiven per FIELD — that is the shape of an older pack — but a decision block
@@ -301,7 +412,7 @@ surfaces, because its missing verdict is substituted before its lone flag is
 ranked.
 
 The accepted version set is exactly the one `tools/validate_merge_gate.py`
-accepts, compared as written — a spelling that merely parses to a known tuple
+accepts (`1.0`, `2.0`, `2.1`, `2.2`, `2.3`), compared as written — a spelling that merely parses to a known tuple
 (`02.2`, `2.02`, `+2.2`) is rejected, so "readable by prview" cannot drift away
 from "valid per the contract validator". From schema 2.2 the validator also
 requires every `quality_failure_details` entry to carry an `origin` of exactly
@@ -468,6 +579,7 @@ an unfinished change.
 | `analysis_status` | 2 | Only `degraded` / `incomplete` rank — `PASS` requires `complete` |
 | `blocking_issues` | 3 | Non-empty ranks — see below |
 | `policy_allow_merge` | 3 | Only `false` ranks — the same fact as a non-empty `blocking_issues` |
+| `enforcement_disposition` | — | Orthogonal exit-policy axis; applied only after canonical rank reconciliation |
 | `recommended_merge` | — | Legacy restatement of `merge_recommendation == approve`; ranking it counts one axis twice |
 | `recommended_label` | — | Human label with an open vocabulary (`e.g.` in its own row); nothing to rank against |
 | `quality_failures` and its four classification arrays | — | Non-empty ≠ failed: warning-origin entries populate them without flipping `quality_pass`, which is precisely the false positive `origin` was added to prevent |

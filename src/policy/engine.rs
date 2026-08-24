@@ -41,6 +41,141 @@ pub enum MergeRecommendation {
     Block,
 }
 
+/// Typed reason class used by every process-exit adapter.
+///
+/// The merge verdict deliberately stays on the stable
+/// `PASS`/`CONDITIONAL`/`BLOCK` vocabulary. A `CONDITIONAL` alone cannot say
+/// whether the run only warned or whether a breaking/degraded fact requires
+/// strict enforcement, so the artifact emitter records that distinction once
+/// from typed facts and readers consume it without parsing prose caveats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementDisposition {
+    Clean,
+    WarningsOnly,
+    ReviewRequired,
+    Block,
+}
+
+/// Invocation lane for the shared enforcement table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnforcementMode {
+    /// Only a policy block is process-fatal.
+    Advisory,
+    /// Historical top-level `--ci`: block/quality failures are fatal, while a
+    /// review-only conditional remains advisory.
+    Ci,
+    /// Historical CI plus the warnings-clean opt-in.
+    CiFailOnWarnings,
+    /// `prview gate --strict`: typed review requirements are fatal;
+    /// warnings-only is accepted.
+    GateStrict,
+    /// Strict gate plus the warnings-clean opt-in.
+    GateFailOnWarnings,
+}
+
+/// Result of looking up a disposition in the enforcement table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnforcementAction {
+    Accept,
+    Reject,
+    Block,
+}
+
+impl EnforcementMode {
+    pub const fn from_ci_flags(ci: bool, fail_on_warnings: bool) -> Self {
+        if ci && fail_on_warnings {
+            Self::CiFailOnWarnings
+        } else if ci {
+            Self::Ci
+        } else {
+            Self::Advisory
+        }
+    }
+
+    pub const fn from_gate_flags(strict: bool, fail_on_warnings: bool) -> Self {
+        if strict && fail_on_warnings {
+            Self::GateFailOnWarnings
+        } else if strict {
+            Self::GateStrict
+        } else {
+            Self::Advisory
+        }
+    }
+
+    pub const fn is_strict(self) -> bool {
+        !matches!(self, Self::Advisory)
+    }
+
+    pub const fn fails_on_warnings(self) -> bool {
+        matches!(self, Self::CiFailOnWarnings | Self::GateFailOnWarnings)
+    }
+
+    pub const fn is_ci(self) -> bool {
+        matches!(self, Self::Ci | Self::CiFailOnWarnings)
+    }
+}
+
+impl EnforcementDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::WarningsOnly => "warnings_only",
+            Self::ReviewRequired => "review_required",
+            Self::Block => "block",
+        }
+    }
+
+    /// One monotonic enforcement table shared by gate and CI exit adapters.
+    pub const fn action(self, mode: EnforcementMode) -> EnforcementAction {
+        match (self, mode) {
+            (Self::Block, _) => EnforcementAction::Block,
+            (
+                Self::ReviewRequired,
+                EnforcementMode::GateStrict | EnforcementMode::GateFailOnWarnings,
+            )
+            | (
+                Self::WarningsOnly,
+                EnforcementMode::CiFailOnWarnings | EnforcementMode::GateFailOnWarnings,
+            ) => EnforcementAction::Reject,
+            _ => EnforcementAction::Accept,
+        }
+    }
+
+    /// Ratchet to the more conservative typed disposition.
+    pub fn raise_to(&mut self, other: Self) {
+        *self = (*self).max(other);
+    }
+
+    /// Classify effective policy evaluations before artifact-only signals add
+    /// their own typed ratchets. A plain warning is the only review-required
+    /// evaluation that strict mode may accept; loss of confidence, an executed
+    /// failure/error/skip, and a hard block remain enforceable.
+    pub fn from_evaluations(evaluations: &[CheckEvaluation]) -> Self {
+        evaluations
+            .iter()
+            .fold(Self::Clean, |mut disposition, eval| {
+                let current = if eval.merge_impact == MergeRecommendation::Block {
+                    Self::Block
+                } else if eval.confidence_impact != AnalysisStatus::Complete {
+                    Self::ReviewRequired
+                } else if eval.outcome == ToolOutcome::FindingsWarning {
+                    // The warning remains a real pack fact even when baseline or
+                    // policy downgrading makes its effective merge impact Approve.
+                    // This is what lets PASS-with-warnings stay PASS while the
+                    // explicit warnings-clean lane still sees the warning.
+                    Self::WarningsOnly
+                } else if eval.merge_impact == MergeRecommendation::ReviewRequired {
+                    Self::ReviewRequired
+                } else {
+                    Self::Clean
+                };
+                disposition.raise_to(current);
+                disposition
+            })
+    }
+}
+
 impl MergeRecommendation {
     /// Legacy single-field verdict, unified to the machine vocabulary
     /// `PASS`/`CONDITIONAL`/`BLOCK` (PV-03/04). `CONDITIONAL` replaces the former
@@ -398,7 +533,7 @@ fn classify_skip_execution_state(reason: &str) -> CheckExecutionState {
         return CheckExecutionState::Unknown;
     }
     if reason.starts_with("profile")
-        || reason.contains("disabled")
+        || is_mode_skip_reason(reason)
         || reason.contains("fast remote-only preset")
     {
         return CheckExecutionState::Skipped;
@@ -539,5 +674,10 @@ mod tests {
     #[test]
     fn explicitly_disabled_heuristics_is_a_mode_skip() {
         assert!(is_mode_skip_reason("heuristics disabled"));
+        assert_eq!(
+            classify_skip_execution_state("requires --security-full"),
+            CheckExecutionState::Skipped,
+            "declared mode skips must not masquerade as unknown tool loss"
+        );
     }
 }

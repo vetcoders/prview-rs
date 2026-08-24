@@ -46,10 +46,12 @@ jobs:
           echo "json_path=${json_path}" >> "$GITHUB_OUTPUT"
 
           verdict=""
+          enforcement_disposition=""
           output_dir=""
           sarif_path=""
           if command -v jq >/dev/null 2>&1 && [ -s "$json_path" ]; then
             verdict="$(jq -r '.verdict // empty' "$json_path" 2>/dev/null || true)"
+            enforcement_disposition="$(jq -r '.enforcement_disposition // empty' "$json_path" 2>/dev/null || true)"
             output_dir="$(jq -r '.output_dir // empty' "$json_path" 2>/dev/null || true)"
           fi
 
@@ -59,9 +61,9 @@ jobs:
           echo "sarif_path=${sarif_path}" >> "$GITHUB_OUTPUT"
 
           case "$status" in
-            0) result="PASS or non-strict CONDITIONAL" ;;
+            0) result="PASS, advisory CONDITIONAL, or accepted typed warnings-only" ;;
             1) result="BLOCK" ;;
-            2) result="strict CONDITIONAL" ;;
+            2) result="strict review-required or warning-clean rejection" ;;
             3) result="internal gate execution error" ;;
             *) result="unexpected exit code" ;;
           esac
@@ -77,6 +79,9 @@ jobs:
             echo "| Result | ${result} |"
             if [ -n "$verdict" ]; then
               echo "| JSON verdict | \`${verdict}\` |"
+            fi
+            if [ -n "$enforcement_disposition" ]; then
+              echo "| Enforcement disposition | \`${enforcement_disposition}\` |"
             fi
             if [ -n "$sarif_path" ]; then
               echo "| SARIF | \`${sarif_path}\` |"
