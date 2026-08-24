@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scraper. Semgrep partial-analysis caveats now name files reported under its
   JSON `errors[]` payload.
 
+### Fixed
+
+- The human-readable `PRVIEW CONFIG` panel now caps itself to the active
+  terminal width and wraps long refs and preset notes before drawing its right
+  wall. Narrow panes no longer let the terminal wrap border glyphs onto stray
+  lines; display-width accounting also handles Unicode refs, and terminals too
+  narrow for a coherent box (or whose width cannot be queried) receive an
+  unboxed fallback.
+
 ## [0.7.0] - 2026-08-23
 
 ### Added

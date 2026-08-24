@@ -3243,6 +3243,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "unicode-segmentation",
+ "unicode-width",
  "walkdir",
  "which",
  "zip",

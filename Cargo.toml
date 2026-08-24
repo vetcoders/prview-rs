@@ -47,6 +47,8 @@ semver = "1"
 
 # Terminal UI
 colored = "3"
+unicode-segmentation = "1"
+unicode-width = "0.2"
 
 # Ratatui TUI
 ratatui = "0.30"
