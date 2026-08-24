@@ -997,7 +997,14 @@ fn wrap_config_line(input: &str, max_width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = indent.clone();
 
-    for word in input.split_whitespace() {
+    // Only ASCII spaces belong to the renderer's formatting. Git refnames may
+    // contain other Unicode whitespace, which must remain byte-for-byte
+    // recognizable instead of being normalized by `split_whitespace()`.
+    for word in input
+        .trim_start_matches(' ')
+        .split(' ')
+        .filter(|word| !word.is_empty())
+    {
         let separator = if UnicodeWidthStr::width(current.as_str()) > indent_width {
             1
         } else {
@@ -1746,6 +1753,20 @@ mod tests {
 
         assert_eq!(first, "a👩‍💻");
         assert_eq!(rest, "e\u{301}b");
+    }
+
+    #[test]
+    fn config_box_wrapper_preserves_unicode_whitespace_in_refs() {
+        let input = " Target: feature/with\u{a0}nbsp/and\u{2003}em-space";
+        let lines = wrap_config_line(input, 16);
+        let reconstructed = lines
+            .iter()
+            .map(|line| line.trim_start_matches(' '))
+            .collect::<String>();
+
+        assert_eq!(reconstructed, input.replace(' ', ""));
+        assert!(reconstructed.contains('\u{a0}'));
+        assert!(reconstructed.contains('\u{2003}'));
     }
 
     #[test]
