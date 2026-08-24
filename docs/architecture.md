@@ -717,6 +717,14 @@ has meaningful data. Originally a single 3400+ LOC `signal.rs` file, now split
 into 16 focused modules under `src/artifacts/signal/`. The facade (`mod.rs`)
 re-exports everything public, so callers continue to use `signal::*` unchanged.
 
+The language-neutral revision substrate is the one intentionally public seam:
+`prview::artifacts::revision_source`. It binds every exact-tree or tracked
+working-tree-overlay entry/read to explicit provenance. Overlay inventory is the
+path-sorted union of the target tree and overlay-only paths reported by tracked
+Git status; unrelated untracked paths are neither inventoried nor readable.
+Only this module is re-exported through `artifacts`; the internal signal facade
+remains crate-private.
+
 #### signal/mod.rs — re-export facade
 
 Declares all submodules and re-exports their public API via `pub use`. Adding a

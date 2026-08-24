@@ -14,6 +14,7 @@ pub mod ghost_refs;
 mod i18n;
 mod patterns;
 pub mod public_api;
+pub mod revision_source;
 mod risk;
 pub mod semantic;
 pub mod tauri_commands;

@@ -6,6 +6,7 @@ mod dashboard;
 pub mod parsers;
 pub(crate) mod report;
 pub(crate) mod signal;
+pub use signal::revision_source;
 
 mod context_artifacts;
 mod findings;
