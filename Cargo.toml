@@ -41,6 +41,11 @@ serde_json = "1"
 serde_yaml = "0.9"
 toml = "1"
 
+# Whole-file Rust API snapshots (dark 0.8 backend).
+syn = { version = "2", features = ["full", "fold"] }
+quote = "1"
+unicode-normalization = "0.1"
+
 # Cargo.lock freshness: does a locked version still satisfy the manifest?
 # Cargo's own version parser, already in the dependency graph.
 semver = "1"

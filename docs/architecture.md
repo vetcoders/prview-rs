@@ -722,8 +722,148 @@ The language-neutral revision substrate is the one intentionally public seam:
 working-tree-overlay entry/read to explicit provenance. Overlay inventory is the
 path-sorted union of the target tree and overlay-only paths reported by tracked
 Git status; unrelated untracked paths are neither inventoried nor readable.
-Only this module is re-exported through `artifacts`; the internal signal facade
-remains crate-private.
+The adjacent dark 0.8 language backend is exposed narrowly as
+`prview::artifacts::api_surface`; the rest of the signal facade remains
+crate-private. `snapshot_rust_api(&dyn RevisionFileSource)` creates one
+`RustApiSnapshot` only. It does not compare revisions, write artifacts, affect
+policy, or replace the production diff scanner.
+
+`RustApiSnapshot` carries the source provenance and path-sorted records for
+library crates, parsed module variants, reachable module aliases, externally
+reachable items, explicit reexports, and guarded typed unknowns. A crate or
+module receives `RustSourceCertainty::Confirmed` only after its exact live
+regular UTF-8 source has been read through `RevisionFileSource` and the complete
+file has parsed successfully. Active recursion and completed source outcomes are
+separate state: successful variants may be reused, while failed reads, UTF-8
+decodes, and parses stay failed on every later lookup and can never manufacture
+a crate or module. `Added` and `RenamedFrom` roots/modules consume the exact
+revision bytes like other live entries; there is no checkout or HEAD fallback.
+Evidence paths, source states, private origins, and provenance remain traceable
+but are separate from external semantic identity.
+
+Library discovery matches the exact `Cargo.toml` basename. It validates every
+consumed Cargo field (`package.name`, `[lib]`, `lib.name`, `lib.path`,
+`lib.proc-macro`, and `package.autolib`) instead of inventing defaults for an
+invalid schema. Package and explicit library names must also be non-empty valid
+Cargo/crate identifiers; a TOML string alone is not semantic validation. A
+valid virtual workspace is non-crate; an implicit library is
+admitted only when `autolib != false` and its live default `src/lib.rs` can be
+read and parsed. Repository-relative paths are normalized fallibly: absolute,
+prefixed, non-UTF-8, and escaping paths become manifest/source unknowns rather
+than being remapped. Missing, renamed-away, deleted, non-regular, non-UTF-8,
+unreadable, or parse-failed manifests and roots remain typed unknowns.
+
+Reachability starts at each library root. Ordinary inline modules and
+`mod foo;` files (`foo.rs` or `foo/mod.rs`) are walked as whole syntax trees.
+Candidate selection distinguishes live (`Present`, `Added`, `RenamedFrom`)
+sources from unavailable old-side states, and a recursion stack is distinct
+from stable `(crate, source, module path, cfg guard)` variant identity. Safe,
+single-literal `#[path = "..."]` modules are source-backed. The walker keeps
+the physical declaring-file directory separate from the logical module
+directory: a direct `#[path]` in `a.rs` uses the file's directory, ordinary
+`mod child;` uses `a/`, and an inline module's own `#[path]` becomes the base for
+its children. Conditional `cfg_attr(..., path = ...)` cannot be selected without
+a feature/target matrix, so it emits a guarded path unknown and suppresses an
+arbitrary default candidate. Malformed, multiple, escaping, or unavailable
+paths are likewise unknowns. Both ordinary module
+candidates, neither candidate, non-regular/read-failed sources, parse failures,
+and actual active cycles are likewise explicit unknowns. Rust compiler behavior
+for `#[path]` on non-`mod.rs` external modules may evolve; the backend records
+the currently tested declaring-file rule and does not speculate beyond an
+executable current-rustc result.
+
+A textual `pub` item is external only when every enclosing module is reachable.
+An explicit public reexport can expose an item or the public-edge descendants of
+a public child below a private implementation parent. Every module declaration
+retains its parent-relative visibility separately from absolute reachability;
+therefore a private module cannot be reexported illegally and a private child
+cannot leak through a legal alias. Positive admission and private veto are
+separate proofs. A public declaration contributes only when its guards are
+contained in the symbol's effective guard lineage. Any private proof for the
+same module segment vetoes that positive unless `guards_proven_disjoint` proves
+the regions disjoint; a different feature predicate is potentially overlapping,
+not a disjointness proof. An overlap whose residual public region cannot be
+represented emits guarded `AmbiguousReexport` and no broad `Confirmed` record.
+A public Unix declaration may therefore remain visible beside a private Windows
+variant, while public `feature = "a"` and private `feature = "b"` do not produce
+an overbroad positive when both features can be active. Item aliases, internal
+resolver-only module aliases, externally reachable module aliases (including
+nested `self as alias`), constructors, and chains through `crate`, `self`, and
+`super` resolve in one finite stable-set closure. Internal aliases never enter
+the semantic snapshot.
+Declaration and every intermediate reexport guard are merged before an alias
+enters the graph. Relative/root candidates that source-level resolution cannot
+select uniquely become `AmbiguousReexport`, not two positives. Module/type,
+Value, and Macro candidates for one `use` leaf are resolved independently, so
+success or ambiguity in one namespace cannot erase a valid sibling namespace.
+Ambiguous module and symbolic alias identities become monotonic tombstones. The
+resolver retains the complete set of normalized origins for each module-alias
+identity and for each symbolic identity in Type, Value, and Macro independently.
+It records every overlapping conflicting pair in deterministic order; each
+pair's guards describe that pair's overlap, rather than combining unrelated
+alternative origins into one false conjunction. A tombstoned identity remains
+eligible for origin collection but cannot contribute a positive, so later
+declarations complete the conflict component without resurrecting the alias.
+
+Each new tombstone restarts projection from separately retained, source-backed
+items and use edges, clearing all derived module aliases, symbolic aliases,
+projected items, and reexports first. Consequently invalidation follows the
+causal proof graph rather than the output path: a result renamed to `Other` or
+through multiple aliases disappears when its ambiguous root disappears. The
+old shared 128-pass constant is not part of the contract. Completion is bounded
+by a measure derived from the finite non-glob use-leaf graph: a leaf can own one
+module-alias identity and one identity in each of the three Rust namespaces,
+and a continuing pass must add a monotonic tombstone or a previously absent
+leaf-to-leaf derived relation. If implementation drift ever exhausts that
+graph-derived budget without the explicit no-rebuild/no-progress postcondition,
+the resolver clears every derived positive and emits typed `ResolutionLimit`
+instead of returning a partial or silently truncated API.
+
+Guard regions are assumed to overlap unless the backend has an explicit proof
+of disjointness. The currently proved family is the tested Unix/Windows target
+family split; different feature strings and composite `all`/`any` expressions
+are not disjointness proof. Conflicting overlapping origins suppress all
+positives for that external key and emit deterministic pairwise guarded
+ambiguities for the complete conflict component. Malformed or
+unsupported cfg syntax inherits all already-proved outer guards, emits
+`CfgPredicate`, and suppresses the affected item/module/reexport. Documentation
+and lint-only `cfg_attr` branches are semantic no-ops; conditional cfg, shape,
+ABI, path, and transforming branches retain their distinct meaning. Globs, true
+cycles, external/prelude paths, `include!`, and unexpanded macro-generated items
+remain typed unknowns. A reachable `pub extern crate` is likewise retained as
+guarded `UnsupportedExternResolution` until external/prelude resolution exists;
+private or unreachable declarations do not create external semantic surface.
+Semantic proof comparison includes the public unknown's kind, crate/module
+location, exact evidence, and guards, while continuing to exclude source paths,
+provenance, and private reexport target/origin spelling.
+
+Item identity is `crate + external module path + Rust namespace + NFC external
+name`. Value, type, and macro namespaces are separate. Tuple and unit struct
+constructors also occupy Value; named-field structs remain Type-only.
+`macro_export` is projected to the crate-root Macro namespace, with docs,
+rustfmt, and lint attributes normalized away. Proc-macro crate exports use their
+external macro/derive names only for public functions declared at crate root;
+private or nested declarations become precise unknowns. Unresolved transforming
+attributes are checked on modules, impls and associated items, foreign
+blocks/items, macro declarations, and ordinary public projections. They
+suppress every dependent positive claim and emit exact `MacroGeneratedItems`
+evidence. Foreign functions/statics inherit the parent ABI, safety, and relevant
+attributes.
+
+Contracts are emitted from normalized `syn` ASTs. Function/default bodies and
+private member types are excluded, while ABI, qualifiers,
+generics/bounds/where clauses, return types, public fields with structural tuple
+indices, enum variants/discriminants, trait headers and associated items, type
+aliases, public constants/statics, and relevant attributes remain. Inherent
+impls are collected independently of module reachability, resolve owners through
+same-crate `self`/`super`/`crate` paths, and retain self type, specialization,
+impl generics/bounds/where clauses, and impl/item attributes before projection
+through every reachable type alias. Unprovable owners are typed unknowns.
+Documentation, rustfmt, and lint-control attributes are recursively discarded;
+shape/ABI attributes remain. Raw identifiers and NFC-equivalent identifiers
+share semantic names. Nested `cfg`/`cfg_attr` use the same recursive sorted and
+deduplicated `all(...)`/`any(...)` canonicalization as top-level guards, without
+evaluating host configuration.
 
 #### signal/mod.rs — re-export facade
 
