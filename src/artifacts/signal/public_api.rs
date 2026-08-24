@@ -1,6 +1,12 @@
 //! Public API Diff — heuristic scan for public API surface changes.
 
-use super::common::{ReviewFileCategory, RustLexState, classify_review_file, strip_rust_non_code};
+use super::api_delta::{
+    ApiArtifactView, ApiDeltaConfidence, ApiDeltaFinding, ApiDeltaKind, REPO_BACKED_RUST_API_SOURCE,
+};
+use super::common::{
+    ReviewFileCategory, RustLexState, classify_review_file, js_ts_patch_sections,
+    strip_rust_non_code,
+};
 use crate::checks::{CheckResult, CheckStatus};
 use anyhow::Result;
 use std::collections::HashSet;
@@ -14,10 +20,17 @@ pub struct PublicApiDiff {
     pub added: Vec<ApiFinding>,
     pub removed: Vec<ApiFinding>,
     pub changed: Vec<ApiSignatureChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rust_api_delta: Option<ApiArtifactView>,
 }
 
 #[cfg(test)]
 pub(crate) mod api_surface_corpus_contract {
+    use crate::artifacts::signal::breaking::historical_scenarios::{
+        HistoricalFactKind, HistoricalTestId,
+    };
     use serde::Deserialize;
     use std::collections::BTreeMap;
 
@@ -87,6 +100,14 @@ pub(crate) mod api_surface_corpus_contract {
         pub(crate) legacy_positive_sibling: Option<String>,
         #[serde(default)]
         pub(crate) legacy_delta_rationale: Option<String>,
+        #[serde(default)]
+        pub(crate) historical_test_id: Option<HistoricalTestId>,
+        #[serde(default)]
+        pub(crate) historical_expected_breaking_kinds: Vec<HistoricalFactKind>,
+        #[serde(default)]
+        pub(crate) recommended_disposition: Option<String>,
+        #[serde(default)]
+        pub(crate) phase_b_operator_effect: Option<String>,
     }
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -128,7 +149,24 @@ pub struct ApiSignatureChange {
 }
 
 /// Analyze patch texts and compute a diff of public symbols.
+#[cfg(test)]
 pub fn generate_public_api_diff(dir: &Path, patch_texts: &[String]) -> Result<Option<CheckResult>> {
+    let diff = analyze_public_api_diff(patch_texts);
+    write_public_api_diff(dir, diff, None)
+}
+
+/// Analyze only JS/TS diff sections with the legacy backend. Rust patch lines
+/// are structurally absent from this input after the Phase B takeover.
+pub fn analyze_js_ts_public_api_diff(patch_texts: &[String]) -> PublicApiDiff {
+    let patches = patch_texts
+        .iter()
+        .map(|patch| js_ts_patch_sections(patch))
+        .filter(|patch| !patch.is_empty())
+        .collect::<Vec<_>>();
+    analyze_public_api_diff(&patches)
+}
+
+fn analyze_public_api_diff(patch_texts: &[String]) -> PublicApiDiff {
     let mut added_findings = Vec::new();
     let mut removed_findings = Vec::new();
     let mut changed_findings = Vec::new();
@@ -138,10 +176,6 @@ pub fn generate_public_api_diff(dir: &Path, patch_texts: &[String]) -> Result<Op
         added_findings.extend(add);
         removed_findings.extend(rm);
         changed_findings.extend(ch);
-    }
-
-    if added_findings.is_empty() && removed_findings.is_empty() && changed_findings.is_empty() {
-        return Ok(None);
     }
 
     // Sort for determinism, then drop exact duplicates (the same symbol can be
@@ -160,11 +194,58 @@ pub fn generate_public_api_diff(dir: &Path, patch_texts: &[String]) -> Result<Op
     dedupe_api_findings(&mut removed_findings);
     dedupe_signature_changes(&mut changed_findings);
 
-    let diff = PublicApiDiff {
+    PublicApiDiff {
         added: added_findings,
         removed: removed_findings,
         changed: changed_findings,
-    };
+        analysis_source: None,
+        rust_api_delta: None,
+    }
+}
+
+/// Write the compatibility projection plus the full canonical Rust view.
+/// Existing readers retain `added`/`removed`/`changed`; additive readers use
+/// `rust_api_delta` for stable IDs, confidence, evidence, and provenance.
+pub fn write_public_api_diff(
+    dir: &Path,
+    mut diff: PublicApiDiff,
+    rust_view: Option<&ApiArtifactView>,
+) -> Result<Option<CheckResult>> {
+    let had_legacy_js_ts_facts =
+        !diff.added.is_empty() || !diff.removed.is_empty() || !diff.changed.is_empty();
+    let legacy_js_breaking = !diff.removed.is_empty() || !diff.changed.is_empty();
+    if let Some(view) = rust_view {
+        for finding in &view.findings {
+            project_rust_finding_for_legacy_fields(&mut diff, finding);
+        }
+        diff.analysis_source = Some(if had_legacy_js_ts_facts {
+            "repo_backed_rust_api+legacy_js_ts_diff".to_owned()
+        } else {
+            REPO_BACKED_RUST_API_SOURCE.to_owned()
+        });
+        diff.rust_api_delta = Some(view.clone());
+    }
+
+    if diff.added.is_empty()
+        && diff.removed.is_empty()
+        && diff.changed.is_empty()
+        && diff
+            .rust_api_delta
+            .as_ref()
+            .is_none_or(|view| view.findings.is_empty())
+    {
+        return Ok(None);
+    }
+
+    diff.added
+        .sort_by(|a, b| a.file.cmp(&b.file).then(a.signature.cmp(&b.signature)));
+    diff.removed
+        .sort_by(|a, b| a.file.cmp(&b.file).then(a.signature.cmp(&b.signature)));
+    diff.changed
+        .sort_by(|a, b| a.file.cmp(&b.file).then(a.before.cmp(&b.before)));
+    dedupe_api_findings(&mut diff.added);
+    dedupe_api_findings(&mut diff.removed);
+    dedupe_signature_changes(&mut diff.changed);
 
     fs::create_dir_all(dir)?;
     fs::write(
@@ -175,8 +256,20 @@ pub fn generate_public_api_diff(dir: &Path, patch_texts: &[String]) -> Result<Op
     let md = format_public_api_diff(&diff);
     fs::write(dir.join("PUBLIC_API_DIFF.md"), md)?;
 
+    let rust_breaking_or_unknown = diff.rust_api_delta.as_ref().is_some_and(|view| {
+        view.findings.iter().any(|finding| {
+            finding.confidence == ApiDeltaConfidence::Unknown
+                || matches!(
+                    finding.kind,
+                    ApiDeltaKind::Removed
+                        | ApiDeltaKind::Changed
+                        | ApiDeltaKind::Relocated
+                        | ApiDeltaKind::VisibilityChanged
+                )
+        })
+    });
     let msg = format!(
-        "[Heuristic] Public API changed: {} new, {} removed, {} modified",
+        "Public API changed: {} new, {} removed, {} modified",
         diff.added.len(),
         diff.removed.len(),
         diff.changed.len()
@@ -184,12 +277,65 @@ pub fn generate_public_api_diff(dir: &Path, patch_texts: &[String]) -> Result<Op
 
     Ok(Some(CheckResult {
         name: "public_api_diff".to_string(),
-        status: CheckStatus::Warnings,
+        status: if rust_breaking_or_unknown || legacy_js_breaking {
+            CheckStatus::Warnings
+        } else {
+            CheckStatus::Passed
+        },
         duration: std::time::Duration::ZERO,
         output: msg,
         cached: false,
         provenance: None,
     }))
+}
+
+fn project_rust_finding_for_legacy_fields(diff: &mut PublicApiDiff, finding: &ApiDeltaFinding) {
+    match finding.kind {
+        ApiDeltaKind::Added => {
+            if let Some(after) = &finding.after {
+                diff.added.push(ApiFinding {
+                    file: after.source_path.clone(),
+                    symbol_type: finding.identity.namespace.clone(),
+                    signature: after.contract.clone(),
+                });
+            }
+        }
+        ApiDeltaKind::Removed => {
+            if let Some(before) = &finding.before {
+                diff.removed.push(ApiFinding {
+                    file: before.source_path.clone(),
+                    symbol_type: finding.identity.namespace.clone(),
+                    signature: before.contract.clone(),
+                });
+            }
+        }
+        ApiDeltaKind::Changed | ApiDeltaKind::Relocated => {
+            if let (Some(before), Some(after)) = (&finding.before, &finding.after) {
+                diff.changed.push(ApiSignatureChange {
+                    file: after.source_path.clone(),
+                    symbol_type: finding.identity.namespace.clone(),
+                    before: before.contract.clone(),
+                    after: after.contract.clone(),
+                });
+            }
+        }
+        ApiDeltaKind::VisibilityChanged => match (&finding.before, &finding.after) {
+            (Some(before), Some(after)) if before.declared_public && !after.declared_public => {
+                diff.removed.push(ApiFinding {
+                    file: before.source_path.clone(),
+                    symbol_type: finding.identity.namespace.clone(),
+                    signature: before.contract.clone(),
+                });
+            }
+            (Some(_), Some(after)) => diff.added.push(ApiFinding {
+                file: after.source_path.clone(),
+                symbol_type: finding.identity.namespace.clone(),
+                signature: after.contract.clone(),
+            }),
+            _ => {}
+        },
+        ApiDeltaKind::Unknown => {}
+    }
 }
 
 fn analyze_patch_for_api_diff(
@@ -428,10 +574,31 @@ fn dedupe_signature_changes(findings: &mut Vec<ApiSignatureChange>) {
 fn format_public_api_diff(diff: &PublicApiDiff) -> String {
     let mut md = String::new();
     let _ = writeln!(md, "# Public API Diff\n");
-    let _ = writeln!(
-        md,
-        "> ⚠️ **NEEDS VERIFICATION**: *Generated by a fast text heuristic. It may miss AST details or raise false positives (e.g. macros). `export ...` is only scanned in JS/TS files; `pub use` is labelled as a re-export.* \n"
-    );
+    if diff.rust_api_delta.is_some() {
+        let _ = writeln!(
+            md,
+            "> Rust facts are derived from exact revision-backed repository trees. JavaScript/TypeScript exports remain a bounded diff heuristic. Unknown Rust regions are preserved explicitly rather than inferred as removals.\n"
+        );
+    } else {
+        let _ = writeln!(
+            md,
+            "> ⚠️ **NEEDS VERIFICATION**: *Generated by a fast text heuristic. It may miss AST details or raise false positives (e.g. macros). `export ...` is only scanned in JS/TS files; `pub use` is labelled as a re-export.* \n"
+        );
+    }
+
+    if let Some(view) = &diff.rust_api_delta {
+        let _ = writeln!(
+            md,
+            "- Rust analysis source: `{}`\n- Rust counts: added={}, removed={}, changed={}, relocated={}, visibility_changed={}, unknown={}\n",
+            view.analysis_source,
+            view.counts.added,
+            view.counts.removed,
+            view.counts.changed,
+            view.counts.relocated,
+            view.counts.visibility_changed,
+            view.counts.unknown,
+        );
+    }
 
     if !diff.added.is_empty() {
         let _ = writeln!(md, "## Added ({} elements)", diff.added.len());
@@ -559,6 +726,20 @@ mod tests {
         assert!(ch.is_empty());
         assert!(rm.iter().any(|r| r.signature.contains("helperA")));
         assert!(rm.iter().any(|r| r.signature.contains("MY_CONSTANT")));
+    }
+
+    #[test]
+    fn js_ts_legacy_public_api_path_never_observes_rust_patch_lines() {
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +0,0 @@\n-pub fn rust_only() {}\ndiff --git a/src/utils.ts b/src/utils.ts\n--- a/src/utils.ts\n+++ b/src/utils.ts\n@@ -1 +0,0 @@\n-export function js_only() {}\n";
+        let diff = analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+        assert_eq!(diff.removed.len(), 1);
+        assert_eq!(diff.removed[0].file, "src/utils.ts");
+        assert!(diff.removed[0].signature.contains("js_only"));
+        assert!(
+            diff.removed
+                .iter()
+                .all(|finding| !finding.signature.contains("rust_only"))
+        );
     }
 
     #[test]

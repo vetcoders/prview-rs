@@ -114,6 +114,26 @@ applies. Absent and present-but-unreadable are different questions.
 `introduced_count + preexisting_count` may be less than `findings_count`: the
 split counts only tool-finding rows and excludes cargo-audit / check SARIF rows.
 
+## `rust_api_delta`
+
+For Rust projects, `rust_api_delta` is an additive lossless copy of the exact
+revision-backed view used by `PUBLIC_API_DIFF.json`, `BREAKING_CHANGES.json`,
+`report.json`, and decision caveats. Non-Rust runs emit `null`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `view` | string | `breaking_changes` in MERGE_GATE |
+| `analysis_source` | string | `repo_backed_rust_api` |
+| `base_revision` / `target_revision` | string | Exact Git-tree provenance; multi-base values explicitly name all revisions |
+| `counts` | object | `added`, `removed`, `changed`, `relocated`, `visibility_changed`, `unknown` |
+| `findings` | object[] | Stable `id`, kind, semantic identity, before/after, confidence, evidence, provenance, optional unknown reason/source |
+
+Added-only Rust facts do not change the decision axes. Confirmed removed,
+changed, relocated, and visibility-changed facts raise the merge axis to review
+when `breaking_escalation` is enabled. Unknown facts degrade analysis confidence
+and require review; they never masquerade as confirmed removals. Review caveats
+carry the same IDs, so consumers can join directly to this structure.
+
 ## `decision`
 
 The decision object is the merge verdict. Its scalar fields are derived from two

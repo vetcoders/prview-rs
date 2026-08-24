@@ -706,7 +706,7 @@ The core artifact generator. Builds the numbered directory layout
 - Root: `PR_REVIEW.md`, `dashboard.html`, `artifacts.zip`
 - `00_summary/`: `RUN.json`, `PROVENANCE.json`, `FAILURES_SUMMARY.md`, `MANIFEST.json`, `SANITY.json`, `MERGE_GATE.json/md`, metadata
 - `10_diff/`: `full.patch`, `per-commit-diffs/` (batching + thematic labels), `per-file-diffs/` (hotspots)
-- `20_quality/`: per-check `*.result.json` + `*.log`, `full-checks.log`, `checks-errors.log`, `coverage-delta.txt`, `BREAKING_CHANGES.md`
+- `20_quality/`: per-check `*.result.json` + `*.log`, `full-checks.log`, `checks-errors.log`, `coverage-delta.txt`, `PUBLIC_API_DIFF.json/md`, `BREAKING_CHANGES.json/md`
 - `30_context/`: optional `INLINE_FINDINGS.sarif`, `changed-tests.txt`, profile-specific (`cargo-tree`, `tsc-trace`, `eslint`, `vitest`)
 - `latest` symlink in the parent dir
 
@@ -722,8 +722,9 @@ The language-neutral revision substrate is the one intentionally public seam:
 working-tree-overlay entry/read to explicit provenance. Overlay inventory is the
 path-sorted union of the target tree and overlay-only paths reported by tracked
 Git status; unrelated untracked paths are neither inventoried nor readable.
-The adjacent dark 0.8 language backend is exposed narrowly as
-`prview::artifacts::api_surface`; the rest of the signal facade remains
+The 0.8 Rust language backend is exposed narrowly as
+`prview::artifacts::api_surface`; its production comparison seam is exposed as
+`prview::artifacts::api_delta`, while the rest of the signal facade remains
 crate-private. `snapshot_rust_api(&dyn RevisionFileSource)` creates one
 `RustApiSnapshot` only. It does not compare revisions, write artifacts, affect
 policy, or replace the production diff scanner.
@@ -865,6 +866,78 @@ share semantic names. Nested `cfg`/`cfg_attr` use the same recursive sorted and
 deduplicated `all(...)`/`any(...)` canonicalization as top-level guards, without
 evaluating host configuration.
 
+#### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
+
+The W2-01 backend compares each exact base and target
+`RustApiSnapshot` exactly once. `ApiDelta` is the single typed owner of added,
+removed, changed, relocated, visibility-changed, and unknown facts. Identity is
+crate + external module path + Rust namespace + normalized name + compatible
+cfg region. Pairing is one-to-one and conservative: ambiguous identities or
+relocations become typed unknowns, an unknown snapshot region suppresses a
+confirmed removal/change, and a proven relocation cannot also appear as an
+addition/removal. Parsed ordinary declarations include private counterparts
+only as evidence for a proven public/non-public transition; externally
+reachable `items` remain the API surface.
+
+Exact identity is grouped on both sides before any fact is consumed: only a
+`1 ↔ 1` component may become a confirmed change, while wider components are
+consumed as deterministic typed ambiguity, including one-sided duplicate
+components before the final add/remove pass. Cfg-region changes are paired only
+when the guards may overlap. The comparison reuses the snapshot resolver's
+single conservative disjointness proof (currently Unix versus Windows), so
+different feature guards remain potentially co-active. One shared pair-certainty
+check tests both identities and both source paths against the unknown regions
+from both revisions before any exact, cfg, relocation, or visibility fact can
+be confirmed. A glob, include, source-parse, or other relevant unknown therefore
+blocks a contradictory confirmed fact at either the source or destination.
+Standalone unknown findings retain their source side, source path, and revision
+provenance. Finding IDs preserve Rust identifier case and serialize the complete
+semantic identity, including both sides' cfg regions, contracts, and typed
+unknown provenance; legal ambiguous input is data, never an assertion failure.
+
+`compare_rust_api_revisions` constructs snapshots only from the exact
+`Diff.base_commit_id` and `Diff.target_commit_id` Git trees. It never reads a
+checkout, working-tree overlay, or patch fallback. Duplicate exact base/target
+OID pairs are coalesced in stable first-seen order before either snapshot is
+built; distinct multi-base comparisons each retain their own revision evidence
+and comparison-qualified finding ID.
+`breaking_changes_view` and `public_api_diff_view` are pure deterministic
+projections over the same delta. Their shared counts, IDs, confidence, evidence,
+unknown reasons, and provenance therefore cannot drift through independent
+re-pairing.
+
+Production keeps the existing artifact filenames and old
+`PUBLIC_API_DIFF.json` added/removed/changed rows, then adds the complete Rust
+view under `rust_api_delta`. `BREAKING_CHANGES.json` is the lossless Rust view;
+both Markdown files are presentations of that same data. MERGE_GATE and
+`report.json` serialize the same view directly. Confirmed Removed, Changed,
+Relocated, and VisibilityChanged facts use the existing `breaking_escalation`
+knob; Added-only is informational. Unknown facts degrade confidence and require
+review without changing policy defaults or becoming a confirmed break.
+
+`tests/fixtures/api_surface/phase_a_parity.json` is the deterministic,
+byte-locked v3 machine ledger for all 32 W0 positive/mutant cells. Its test
+executes both legacy Rust analyzers on the same normalized repo-shaped patch,
+executes the repo-backed delta on the exact base/head fixture trees, and keeps
+the complete structured facts rather than polarity labels: multiplicity,
+namespace, cfg, contracts, before/after sides, provenance, evidence,
+confidence, and unknown reasons survive serialization. Five controlled cases
+byte-lock include-macro, glob-reexport, source-parse, namespace/cfg
+multiplicity, and zero-fact revision provenance.
+
+Operator-row relationships are derived from executed structured observations:
+3 genuine legacy blind spots, 6 inaccurate historical-fixture transfers, and
+23 current W0 fixtures that match their declared mapping. The exact six
+transferred mappings use stable typed scenario IDs and one patch helper shared
+by the original legacy regression test and the parity harness. Each ledger row
+stores the historical scenario's expected fact kinds separately from its full
+actual legacy facts, as well as the distinct current W0 legacy and repo-backed
+facts. This is the deliberately bounded historical proof surface; the remaining
+23 matches are derived from current W0 actual-versus-declared data. Recommended
+disposition and the actual Phase B product effect remain separate operator
+decision fields. Historical regressions are executed, not silently re-baselined
+by the W0 ledger.
+
 #### signal/mod.rs — re-export facade
 
 Declares all submodules and re-exports their public API via `pub use`. Adding a
@@ -890,16 +963,27 @@ Types and functions used across multiple signal modules:
 
 #### signal/breaking.rs — breaking changes detection
 
-Heuristic scan of diffs for API-breaking changes:
+Legacy diff scan retained only for JavaScript/TypeScript API changes and the
+separate non-API Rust environment-requirement signal:
 
 - `BreakingRisk` enum (`High`, `Medium`, `Low`) — publicness heuristic based on file path depth and barrel/re-export file detection
 - `BreakingFinding` struct with `BreakingKind` (`RemovedSymbol`, `RelocatedSymbol`, `ChangedSignature`, `NewEnvRequirement`)
-- `analyze_all_breaking_changes(patches)` — returns all findings from multiple patch texts
-- `write_breaking_changes(dir, findings)` — writes `BREAKING_CHANGES.md` if findings are non-empty
+- `analyze_js_ts_breaking_changes(patches)` — legacy API facts after structural JS/TS-only filtering
+- `analyze_rust_env_requirements(patches)` — added-line env markers only; cannot emit Rust API facts
+- `write_breaking_changes_with_api(...)` — writes lossless Rust JSON and the compatible Markdown view
 
-Scans for removed `pub` symbols (fn, struct, enum, trait, type, const, static),
-JS/TS `export` removals, signature changes, and new environment variable
-requirements. Only scans code files (not tests, config, docs).
+Production Rust public symbols no longer enter this diff-only API analyzer.
+JS/TS `export` removals/signature changes remain here. Rust env requirements are
+preserved by a dedicated parser because they are not API surface facts. Only
+code files are scanned (not tests, config, docs). The shared patch boundary is
+side-aware for renames: JS/TS→JS/TS keeps both sides, Rust→JS/TS keeps only the
+added JS/TS side, JS/TS→Rust keeps only the removed JS/TS side, and a non-JS
+pair is discarded. Quoted Git paths are decoded structurally before the
+normalized legacy header is emitted. The decoded `diff --git` paths own section
+identity: `---`/`+++` markers must match them exactly, `/dev/null` requires the
+corresponding new/deleted-file mode, and a hunk without both markers is
+discarded fail-closed. Marker-free metadata-only rename/copy and mode-only
+add/delete sections remain valid.
 
 Remove + re-add pairing (applies to every `pub` symbol kind above, not just
 functions): when a declaration is removed and re-added for the same name and
@@ -909,14 +993,12 @@ silent re-addition. A re-add in a *different* file is a module move and becomes
 `RelocatedSymbol`, which is reported but deliberately excluded from breaking
 escalation.
 
-**Accepted limit (deferred to 0.8).** The scan sees only the declaration LINES a
-diff emitted. An enum variant, a trait method or a struct field removed below an
-unchanged `pub enum` / `pub trait` / `pub struct` opener is a breaking change
-prview does not report: the opener was never emitted as `-`/`+`, so nothing
-enters pairing to begin with. Reporting it needs the item's body from BOTH
-commits, which a diff-only scanner does not have — the fix is the repo-backed
-breaking analysis planned for 0.8, and this limit was reviewed and accepted
-deliberately rather than papered over with a deeper heuristic.
+The old Rust limitation below is historical only: a diff-only scanner could not
+see an enum variant, trait method, or public struct field removed beneath an
+unchanged item opener. Production Rust now reads both exact repository trees,
+so those contracts participate in `ApiDelta`. The bounded declaration-line
+logic that follows remains relevant only to the retained JS/TS legacy backend
+and test-only historical compatibility fixtures.
 
 Declarations are compared on their FULL text, continuation lines joined, up to
 `MAX_DECL_CONTINUATION_LINES` (32) — a runaway bound for static bodies and
@@ -1441,9 +1523,12 @@ target commit and builds a set of line numbers inside test blocks, using string/
 brace counting. This correctly classifies additions inside pre-existing test modules
 even when the `#[cfg(test)]` annotation is outside the patch hunk.
 
-#### signal/public_api.rs — heuristic public API surface diff
+#### signal/public_api.rs — hybrid public API artifact writer
 
-Heuristic diff of the public API surface exposed by changed files:
+The writer preserves the legacy top-level JSON fields while embedding the full
+repo-backed Rust `ApiArtifactView` additively. Rust findings are projected only
+for old-reader compatibility; the embedded view is authoritative. Legacy
+analysis receives JS/TS patch sections only.
 
 - `PublicSymbol` struct — name, kind (`Fn`, `Struct`, `Enum`, `Trait`, `Type`, `Const`, `Static`),
   file path, and whether it was added or removed
@@ -1451,8 +1536,9 @@ Heuristic diff of the public API surface exposed by changed files:
   `pub` symbol declarations, then pairs added/removed names to identify renames and
   signature changes. Produces `PUBLIC_API_DIFF.json`.
 
-Only considers Rust `pub` symbols at this time. Non-code files (tests, config, assets)
-are excluded. Results are aggregated per file and sorted by kind for readability.
+Confirmed Rust facts include namespace, cfg, before/after contracts, source
+paths, provenance, confidence, evidence, and stable IDs. JS/TS remains a bounded
+text heuristic. Non-code files (tests, config, assets) are excluded.
 
 #### signal/deps.rs — dependency manifest diffing
 

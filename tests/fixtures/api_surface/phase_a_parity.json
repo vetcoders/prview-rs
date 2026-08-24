@@ -1,0 +1,2366 @@
+{
+  "schema": "prview.api_delta_phase_a_parity.v3",
+  "rows": [
+    {
+      "corpus_cell": "abi_changed",
+      "base_revision": "git_tree:fixture://abi_changed/base",
+      "target_revision": "git_tree:fixture://abi_changed/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"before_contract\":\"pub extern \\\"C\\\" fn __prview_name (x : u32) -> u32 { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"after_contract\":\"pub extern \\\"system\\\" fn __prview_name (x : u32) -> u32 { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "changed",
+          "identity": {
+            "crate_name": "fixture_abi_changed",
+            "module_path": [],
+            "namespace": "value",
+            "name": "call",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_abi_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "call",
+              "cfg_region": []
+            },
+            "contract": "pub extern \"C\" fn __prview_name (x : u32) -> u32 { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub extern \"C\" fn __prview_name (x : u32) -> u32 { }",
+            "provenance": "git_tree:fixture://abi_changed/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_abi_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "call",
+              "cfg_region": []
+            },
+            "contract": "pub extern \"system\" fn __prview_name (x : u32) -> u32 { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub extern \"system\" fn __prview_name (x : u32) -> u32 { }",
+            "provenance": "git_tree:fixture://abi_changed/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub extern \"C\" fn __prview_name (x : u32) -> u32 { }",
+            "pub extern \"system\" fn __prview_name (x : u32) -> u32 { }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "genuine_legacy_blind_spot",
+      "classification": "genuine_legacy_blind_spot",
+      "rationale": "current W0 legacy breaking polarity is false, declared polarity is true, and no historical mapping substitute is involved",
+      "recommended_disposition": "approve repo-backed ABI change as canonical truth",
+      "status": "operator_decision_required",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "Rust artifacts will begin reporting ABI-only signature changes that the legacy analyzer misses"
+    },
+    {
+      "corpus_cell": "abi_unchanged",
+      "base_revision": "git_tree:fixture://abi_unchanged/base",
+      "target_revision": "git_tree:fixture://abi_unchanged/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "cfg_guard_changed",
+      "base_revision": "git_tree:fixture://cfg_guard_changed/base",
+      "target_revision": "git_tree:fixture://cfg_guard_changed/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_cfg_guard_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"gated\",\"cfg_region\":[\"feature = \\\"a\\\"\"]},\"before_identity\":{\"crate_name\":\"fixture_cfg_guard_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"gated\",\"cfg_region\":[\"feature = \\\"a\\\"\"]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_cfg_guard_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"gated\",\"cfg_region\":[\"feature = \\\"b\\\"\"]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "changed",
+          "identity": {
+            "crate_name": "fixture_cfg_guard_changed",
+            "module_path": [],
+            "namespace": "value",
+            "name": "gated",
+            "cfg_region": [
+              "feature = \"a\""
+            ]
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_cfg_guard_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "gated",
+              "cfg_region": [
+                "feature = \"a\""
+              ]
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://cfg_guard_changed/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_cfg_guard_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "gated",
+              "cfg_region": [
+                "feature = \"b\""
+              ]
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://cfg_guard_changed/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name () { }",
+            "pub fn __prview_name () { }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": {
+        "test_id": "feature_gated_signature_dedup",
+        "expected_breaking_kinds": [
+          "changed",
+          "changed",
+          "changed",
+          "changed"
+        ],
+        "actual_breaking_facts": [
+          {
+            "file": "src/vector_index.rs",
+            "kind": {
+              "kind": "changed_signature",
+              "before": "pub fn query_index(_project: Option<&str>) -> Result<Vec<QueryHit>> {",
+              "after": "pub fn query_index(_project: Option<&str>) -> Result<QueryHit> {"
+            },
+            "line": "",
+            "risk_level": "medium"
+          },
+          {
+            "file": "src/vector_index.rs",
+            "kind": {
+              "kind": "changed_signature",
+              "before": "pub fn query_index(_project: Option<&str>) -> Result<Vec<QueryHit>> {",
+              "after": "pub fn query_index(_project: Option<&str>) -> Result<QueryHit> {"
+            },
+            "line": "",
+            "risk_level": "medium"
+          },
+          {
+            "file": "src/vector_index.rs",
+            "kind": {
+              "kind": "changed_signature",
+              "before": "pub fn query_index(project: Option<&str>) -> Result<Vec<QueryHit>> {",
+              "after": "pub fn query_index(project: Option<&str>) -> Result<QueryHit> {"
+            },
+            "line": "",
+            "risk_level": "medium"
+          },
+          {
+            "file": "src/vector_index.rs",
+            "kind": {
+              "kind": "changed_signature",
+              "before": "pub fn query_index(project: Option<&str>) -> Result<Vec<QueryHit>> {",
+              "after": "pub fn query_index(project: Option<&str>) -> Result<QueryHit> {"
+            },
+            "line": "",
+            "risk_level": "medium"
+          }
+        ]
+      },
+      "legacy_relationship": "fixture_mapping_mismatch",
+      "classification": "fixture_mapping_mismatch",
+      "rationale": "the shared historical scenario matches its typed expectation, while current execution of the distinct W0 fixture does not match the transferred legacy polarity",
+      "recommended_disposition": "keep the historical tests and approve this separate repo-backed cfg semantic record",
+      "status": "operator_decision_required",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "the W0 guard-only fixture becomes a reported Rust change without changing the distinct historical cfg regression contracts"
+    },
+    {
+      "corpus_cell": "cfg_operand_reordered",
+      "base_revision": "git_tree:fixture://cfg_operand_reordered/base",
+      "target_revision": "git_tree:fixture://cfg_operand_reordered/head",
+      "declared_legacy_expectation": "accepted_zero",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "cfg_unchanged",
+      "base_revision": "git_tree:fixture://cfg_unchanged/base",
+      "target_revision": "git_tree:fixture://cfg_unchanged/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "literal_changed",
+      "base_revision": "git_tree:fixture://literal_changed/base",
+      "target_revision": "git_tree:fixture://literal_changed/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "changed_signature",
+            "before": "pub const GREETING: &str = \"hello\";",
+            "after": "pub const GREETING: &str = \"goodbye\";"
+          },
+          "line": "",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub const GREETING: &str = ;",
+            "symbol_type": "constant"
+          }
+        ],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub const GREETING: &str = ;",
+            "symbol_type": "constant"
+          }
+        ]
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"GREETING\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"GREETING\",\"cfg_region\":[]},\"before_contract\":\"pub const __prview_name : & str = \\\"hello\\\" ;\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"GREETING\",\"cfg_region\":[]},\"after_contract\":\"pub const __prview_name : & str = \\\"goodbye\\\" ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "changed",
+          "identity": {
+            "crate_name": "fixture_literal_changed",
+            "module_path": [],
+            "namespace": "value",
+            "name": "GREETING",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_literal_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "GREETING",
+              "cfg_region": []
+            },
+            "contract": "pub const __prview_name : & str = \"hello\" ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub const __prview_name : & str = \"hello\" ;",
+            "provenance": "git_tree:fixture://literal_changed/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_literal_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "GREETING",
+              "cfg_region": []
+            },
+            "contract": "pub const __prview_name : & str = \"goodbye\" ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub const __prview_name : & str = \"goodbye\" ;",
+            "provenance": "git_tree:fixture://literal_changed/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub const __prview_name : & str = \"hello\" ;",
+            "pub const __prview_name : & str = \"goodbye\" ;"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": true,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "literal_layout_only",
+      "base_revision": "git_tree:fixture://literal_layout_only/base",
+      "target_revision": "git_tree:fixture://literal_layout_only/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub const GREETING: &str =",
+            "symbol_type": "constant"
+          }
+        ],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub const GREETING: &str = ;",
+            "symbol_type": "constant"
+          }
+        ]
+      },
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "proven_truth_improvement",
+      "rationale": "repo-backed semantic polarity matches the frozen W0 record and removes a legacy public-API heuristic false positive/negative",
+      "recommended_disposition": "already accepted by W0/D2",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "canonical Rust artifacts replace the legacy public-API heuristic polarity"
+    },
+    {
+      "corpus_cell": "module_scope_changed",
+      "base_revision": "git_tree:fixture://module_scope_changed/base",
+      "target_revision": "git_tree:fixture://module_scope_changed/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"relocated\",\"identity\":{\"crate_name\":\"fixture_module_scope_changed\",\"module_path\":[\"a\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_module_scope_changed\",\"module_path\":[\"a\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_module_scope_changed\",\"module_path\":[\"b\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "relocated",
+          "identity": {
+            "crate_name": "fixture_module_scope_changed",
+            "module_path": [
+              "a"
+            ],
+            "namespace": "value",
+            "name": "value",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_module_scope_changed",
+              "module_path": [
+                "a"
+              ],
+              "namespace": "value",
+              "name": "value",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://module_scope_changed/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_module_scope_changed",
+              "module_path": [
+                "b"
+              ],
+              "namespace": "value",
+              "name": "value",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://module_scope_changed/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name () { }",
+            "pub fn __prview_name () { }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": {
+        "test_id": "different_inline_module_removal",
+        "expected_breaking_kinds": [
+          "removed"
+        ],
+        "actual_breaking_facts": [
+          {
+            "file": "src/model.rs",
+            "kind": {
+              "kind": "removed_symbol",
+              "symbol_type": "struct"
+            },
+            "line": "pub struct Config {",
+            "risk_level": "medium"
+          }
+        ]
+      },
+      "legacy_relationship": "fixture_mapping_mismatch",
+      "classification": "fixture_mapping_mismatch",
+      "rationale": "the shared historical scenario matches its typed expectation, while current execution of the distinct W0 fixture does not match the transferred legacy polarity",
+      "recommended_disposition": "keep the historical scope tests and approve the repo-backed relocation record for this distinct fixture",
+      "status": "operator_decision_required",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "same-file module relocation becomes visible in Rust artifacts while historical hunk-scope behavior stays independently guarded"
+    },
+    {
+      "corpus_cell": "module_scope_unseen_opener",
+      "base_revision": "git_tree:fixture://module_scope_unseen_opener/base",
+      "target_revision": "git_tree:fixture://module_scope_unseen_opener/head",
+      "declared_legacy_expectation": "accepted_zero",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"relocated\",\"identity\":{\"crate_name\":\"fixture_module_scope_unseen_opener\",\"module_path\":[\"a\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_module_scope_unseen_opener\",\"module_path\":[\"a\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_module_scope_unseen_opener\",\"module_path\":[\"b\"],\"namespace\":\"value\",\"name\":\"value\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "relocated",
+          "identity": {
+            "crate_name": "fixture_module_scope_unseen_opener",
+            "module_path": [
+              "a"
+            ],
+            "namespace": "value",
+            "name": "value",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_module_scope_unseen_opener",
+              "module_path": [
+                "a"
+              ],
+              "namespace": "value",
+              "name": "value",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://module_scope_unseen_opener/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_module_scope_unseen_opener",
+              "module_path": [
+                "b"
+              ],
+              "namespace": "value",
+              "name": "value",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://module_scope_unseen_opener/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name () { }",
+            "pub fn __prview_name () { }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "proven_truth_improvement",
+      "rationale": "the legacy hunk scanner could not recover an Allman module opener outside its visible context",
+      "recommended_disposition": "already accepted by W0/D2",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "canonical Rust artifacts gain the W0-proven semantic fact"
+    },
+    {
+      "corpus_cell": "module_scope_unchanged",
+      "base_revision": "git_tree:fixture://module_scope_unchanged/base",
+      "target_revision": "git_tree:fixture://module_scope_unchanged/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "module_scope_private_unreachable",
+      "base_revision": "git_tree:fixture://module_scope_private_unreachable/base",
+      "target_revision": "git_tree:fixture://module_scope_private_unreachable/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "combining_mark_changed",
+      "base_revision": "git_tree:fixture://combining_mark_changed/base",
+      "target_revision": "git_tree:fixture://combining_mark_changed/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "removed_symbol",
+            "symbol_type": "function"
+          },
+          "line": "pub fn café() {}",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn café() {}",
+            "symbol_type": "function"
+          }
+        ],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn café() {}",
+            "symbol_type": "function"
+          }
+        ]
+      },
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": true,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "genuine_legacy_blind_spot",
+      "classification": "genuine_legacy_blind_spot",
+      "rationale": "current W0 legacy breaking polarity is true, declared polarity is false, and no historical mapping substitute is involved",
+      "recommended_disposition": "approve the repo-backed no-change result as canonical Rust identity truth",
+      "status": "operator_decision_required",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "Rust artifacts stop emitting a false breaking change for canonically equivalent combining-mark spelling"
+    },
+    {
+      "corpus_cell": "combining_mark_distinct",
+      "base_revision": "git_tree:fixture://combining_mark_distinct/base",
+      "target_revision": "git_tree:fixture://combining_mark_distinct/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "changed_signature",
+            "before": "pub fn café() {}",
+            "after": "pub fn cafè() {}"
+          },
+          "line": "",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn cafè() {}",
+            "symbol_type": "function"
+          }
+        ],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn café() {}",
+            "symbol_type": "function"
+          }
+        ]
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture_combining_mark_distinct\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"cafè\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture_combining_mark_distinct\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"cafè\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "added",
+          "identity": {
+            "crate_name": "fixture_combining_mark_distinct",
+            "module_path": [],
+            "namespace": "value",
+            "name": "cafè",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": {
+            "identity": {
+              "crate_name": "fixture_combining_mark_distinct",
+              "module_path": [],
+              "namespace": "value",
+              "name": "cafè",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://combining_mark_distinct/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name () { }"
+          ]
+        },
+        {
+          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_combining_mark_distinct\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"café\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_combining_mark_distinct\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"café\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "removed",
+          "identity": {
+            "crate_name": "fixture_combining_mark_distinct",
+            "module_path": [],
+            "namespace": "value",
+            "name": "café",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_combining_mark_distinct",
+              "module_path": [],
+              "namespace": "value",
+              "name": "café",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://combining_mark_distinct/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name () { }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": true,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "combining_mark_unchanged",
+      "base_revision": "git_tree:fixture://combining_mark_unchanged/base",
+      "target_revision": "git_tree:fixture://combining_mark_unchanged/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "long_within_cap_changed",
+      "base_revision": "git_tree:fixture://long_within_cap_changed/base",
+      "target_revision": "git_tree:fixture://long_within_cap_changed/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name (a00 : u8 , a01 : u8 , a02 : u8) { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name (a00 : u8 , a01 : u16 , a02 : u8) { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "changed",
+          "identity": {
+            "crate_name": "fixture_long_within_cap_changed",
+            "module_path": [],
+            "namespace": "value",
+            "name": "long",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_long_within_cap_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "long",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name (a00 : u8 , a01 : u8 , a02 : u8) { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name (a00 : u8 , a01 : u8 , a02 : u8) { }",
+            "provenance": "git_tree:fixture://long_within_cap_changed/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_long_within_cap_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "long",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name (a00 : u8 , a01 : u16 , a02 : u8) { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name (a00 : u8 , a01 : u16 , a02 : u8) { }",
+            "provenance": "git_tree:fixture://long_within_cap_changed/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name (a00 : u8 , a01 : u8 , a02 : u8) { }",
+            "pub fn __prview_name (a00 : u8 , a01 : u16 , a02 : u8) { }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": {
+        "test_id": "long_signature_below_old_cap",
+        "expected_breaking_kinds": [
+          "changed"
+        ],
+        "actual_breaking_facts": [
+          {
+            "file": "src/model.rs",
+            "kind": {
+              "kind": "changed_signature",
+              "before": "pub fn build(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8, ) -> u8 {",
+              "after": "pub fn build(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8, ) -> u16 {"
+            },
+            "line": "",
+            "risk_level": "medium"
+          }
+        ]
+      },
+      "legacy_relationship": "fixture_mapping_mismatch",
+      "classification": "fixture_mapping_mismatch",
+      "rationale": "the shared historical scenario matches its typed expectation, while current execution of the distinct W0 fixture does not match the transferred legacy polarity",
+      "recommended_disposition": "retain the historical long-signature regression and approve the independently modeled W0 contract change",
+      "status": "operator_decision_required",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "the W0 long declaration change becomes visible through repository parsing; the historical cap regression remains green"
+    },
+    {
+      "corpus_cell": "long_below_32_line_cut",
+      "base_revision": "git_tree:fixture://long_below_32_line_cut/base",
+      "target_revision": "git_tree:fixture://long_below_32_line_cut/head",
+      "declared_legacy_expectation": "accepted_zero",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_long_below_32_line_cut\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"TABLE\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_long_below_32_line_cut\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"TABLE\",\"cfg_region\":[]},\"before_contract\":\"pub const __prview_name : & [u8] = & [0 , 1 , 2 , 3 , 4 , 5 , 6 , 7 , 8 , 9 , 10 , 11 , 12 , 13 , 14 , 15 , 16 , 17 , 18 , 19 , 20 , 21 , 22 , 23 , 24 , 25 , 26 , 27 , 28 , 29 , 30 , 31 , 32 , 33 , 250 ,] ;\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_long_below_32_line_cut\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"TABLE\",\"cfg_region\":[]},\"after_contract\":\"pub const __prview_name : & [u8] = & [0 , 1 , 2 , 3 , 4 , 5 , 6 , 7 , 8 , 9 , 10 , 11 , 12 , 13 , 14 , 15 , 16 , 17 , 18 , 19 , 20 , 21 , 22 , 23 , 24 , 25 , 26 , 27 , 28 , 29 , 30 , 31 , 32 , 33 , 251 ,] ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "changed",
+          "identity": {
+            "crate_name": "fixture_long_below_32_line_cut",
+            "module_path": [],
+            "namespace": "value",
+            "name": "TABLE",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_long_below_32_line_cut",
+              "module_path": [],
+              "namespace": "value",
+              "name": "TABLE",
+              "cfg_region": []
+            },
+            "contract": "pub const __prview_name : & [u8] = & [0 , 1 , 2 , 3 , 4 , 5 , 6 , 7 , 8 , 9 , 10 , 11 , 12 , 13 , 14 , 15 , 16 , 17 , 18 , 19 , 20 , 21 , 22 , 23 , 24 , 25 , 26 , 27 , 28 , 29 , 30 , 31 , 32 , 33 , 250 ,] ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub const __prview_name : & [u8] = & [0 , 1 , 2 , 3 , 4 , 5 , 6 , 7 , 8 , 9 , 10 , 11 , 12 , 13 , 14 , 15 , 16 , 17 , 18 , 19 , 20 , 21 , 22 , 23 , 24 , 25 , 26 , 27 , 28 , 29 , 30 , 31 , 32 , 33 , 250 ,] ;",
+            "provenance": "git_tree:fixture://long_below_32_line_cut/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_long_below_32_line_cut",
+              "module_path": [],
+              "namespace": "value",
+              "name": "TABLE",
+              "cfg_region": []
+            },
+            "contract": "pub const __prview_name : & [u8] = & [0 , 1 , 2 , 3 , 4 , 5 , 6 , 7 , 8 , 9 , 10 , 11 , 12 , 13 , 14 , 15 , 16 , 17 , 18 , 19 , 20 , 21 , 22 , 23 , 24 , 25 , 26 , 27 , 28 , 29 , 30 , 31 , 32 , 33 , 251 ,] ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub const __prview_name : & [u8] = & [0 , 1 , 2 , 3 , 4 , 5 , 6 , 7 , 8 , 9 , 10 , 11 , 12 , 13 , 14 , 15 , 16 , 17 , 18 , 19 , 20 , 21 , 22 , 23 , 24 , 25 , 26 , 27 , 28 , 29 , 30 , 31 , 32 , 33 , 251 ,] ;",
+            "provenance": "git_tree:fixture://long_below_32_line_cut/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub const __prview_name : & [u8] = & [0 , 1 , 2 , 3 , 4 , 5 , 6 , 7 , 8 , 9 , 10 , 11 , 12 , 13 , 14 , 15 , 16 , 17 , 18 , 19 , 20 , 21 , 22 , 23 , 24 , 25 , 26 , 27 , 28 , 29 , 30 , 31 , 32 , 33 , 250 ,] ;",
+            "pub const __prview_name : & [u8] = & [0 , 1 , 2 , 3 , 4 , 5 , 6 , 7 , 8 , 9 , 10 , 11 , 12 , 13 , 14 , 15 , 16 , 17 , 18 , 19 , 20 , 21 , 22 , 23 , 24 , 25 , 26 , 27 , 28 , 29 , 30 , 31 , 32 , 33 , 251 ,] ;"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "proven_truth_improvement",
+      "rationale": "the legacy declaration accumulator stopped before the changed value below its 32-line cap",
+      "recommended_disposition": "already accepted by W0/D2",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "canonical Rust artifacts gain the W0-proven semantic fact"
+    },
+    {
+      "corpus_cell": "long_unchanged",
+      "base_revision": "git_tree:fixture://long_unchanged/base",
+      "target_revision": "git_tree:fixture://long_unchanged/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "move_relocated",
+      "base_revision": "git_tree:fixture://move_relocated/base",
+      "target_revision": "git_tree:fixture://move_relocated/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"relocated\",\"identity\":{\"crate_name\":\"fixture_move_relocated\",\"module_path\":[\"old\"],\"namespace\":\"value\",\"name\":\"moved\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_move_relocated\",\"module_path\":[\"old\"],\"namespace\":\"value\",\"name\":\"moved\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_move_relocated\",\"module_path\":[\"new\"],\"namespace\":\"value\",\"name\":\"moved\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "relocated",
+          "identity": {
+            "crate_name": "fixture_move_relocated",
+            "module_path": [
+              "old"
+            ],
+            "namespace": "value",
+            "name": "moved",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_move_relocated",
+              "module_path": [
+                "old"
+              ],
+              "namespace": "value",
+              "name": "moved",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://move_relocated/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_move_relocated",
+              "module_path": [
+                "new"
+              ],
+              "namespace": "value",
+              "name": "moved",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://move_relocated/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name () { }",
+            "pub fn __prview_name () { }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": {
+        "test_id": "cross_file_relocation",
+        "expected_breaking_kinds": [
+          "relocated"
+        ],
+        "actual_breaking_facts": [
+          {
+            "file": "src/artifacts/signal.rs",
+            "kind": {
+              "kind": "relocated_symbol",
+              "symbol_type": "function"
+            },
+            "line": "pub fn compute_coverage_signal(diffs: &[Diff]) -> CoverageSignal {",
+            "risk_level": "low"
+          }
+        ]
+      },
+      "legacy_relationship": "fixture_mapping_mismatch",
+      "classification": "fixture_mapping_mismatch",
+      "rationale": "the shared historical scenario matches its typed expectation, while current execution of the distinct W0 fixture does not match the transferred legacy polarity",
+      "recommended_disposition": "retain the cross-file historical test and approve the distinct repo-backed same-file relocation record",
+      "status": "operator_decision_required",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "same-file module moves become explicit relocations without changing cross-file legacy relocation coverage"
+    },
+    {
+      "corpus_cell": "move_same_path",
+      "base_revision": "git_tree:fixture://move_same_path/base",
+      "target_revision": "git_tree:fixture://move_same_path/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn stable() {}",
+            "symbol_type": "function"
+          }
+        ],
+        "changed": [],
+        "removed": []
+      },
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "proven_truth_improvement",
+      "rationale": "repo-backed semantic polarity matches the frozen W0 record and removes a legacy public-API heuristic false positive/negative",
+      "recommended_disposition": "already accepted by W0/D2",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "canonical Rust artifacts replace the legacy public-API heuristic polarity"
+    },
+    {
+      "corpus_cell": "reexport_removed",
+      "base_revision": "git_tree:fixture://reexport_removed/base",
+      "target_revision": "git_tree:fixture://reexport_removed/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": {
+        "added": [],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub use inner::api;",
+            "symbol_type": "re-export"
+          }
+        ]
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_reexport_removed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"api\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_reexport_removed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"api\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "removed",
+          "identity": {
+            "crate_name": "fixture_reexport_removed",
+            "module_path": [],
+            "namespace": "value",
+            "name": "api",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_reexport_removed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "api",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://reexport_removed/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name () { }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "genuine_legacy_blind_spot",
+      "classification": "genuine_legacy_blind_spot",
+      "rationale": "current W0 legacy breaking polarity is false, declared polarity is true, and no historical mapping substitute is involved",
+      "recommended_disposition": "approve repo-backed re-export removal as canonical breaking truth",
+      "status": "operator_decision_required",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "Rust breaking artifacts will report removed public re-exports instead of relying on the secondary public-API heuristic"
+    },
+    {
+      "corpus_cell": "reexport_preserved",
+      "base_revision": "git_tree:fixture://reexport_preserved/base",
+      "target_revision": "git_tree:fixture://reexport_preserved/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn api() {}",
+            "symbol_type": "function"
+          }
+        ],
+        "changed": [],
+        "removed": []
+      },
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "proven_truth_improvement",
+      "rationale": "repo-backed semantic polarity matches the frozen W0 record and removes a legacy public-API heuristic false positive/negative",
+      "recommended_disposition": "already accepted by W0/D2",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "canonical Rust artifacts replace the legacy public-API heuristic polarity"
+    },
+    {
+      "corpus_cell": "reexport_changed",
+      "base_revision": "git_tree:fixture://reexport_changed/base",
+      "target_revision": "git_tree:fixture://reexport_changed/head",
+      "declared_legacy_expectation": "accepted_zero",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub use inner::Settings;",
+            "symbol_type": "re-export"
+          }
+        ],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub use inner::Config;",
+            "symbol_type": "re-export"
+          }
+        ]
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Settings\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Settings\",\"cfg_region\":[]},\"after_contract\":\"pub struct __prview_name ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "added",
+          "identity": {
+            "crate_name": "fixture_reexport_changed",
+            "module_path": [],
+            "namespace": "type",
+            "name": "Settings",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": {
+            "identity": {
+              "crate_name": "fixture_reexport_changed",
+              "module_path": [],
+              "namespace": "type",
+              "name": "Settings",
+              "cfg_region": []
+            },
+            "contract": "pub struct __prview_name ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub struct __prview_name ;",
+            "provenance": "git_tree:fixture://reexport_changed/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub struct __prview_name ;"
+          ]
+        },
+        {
+          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Settings\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Settings\",\"cfg_region\":[]},\"after_contract\":\"pub struct __prview_name ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "added",
+          "identity": {
+            "crate_name": "fixture_reexport_changed",
+            "module_path": [],
+            "namespace": "value",
+            "name": "Settings",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": {
+            "identity": {
+              "crate_name": "fixture_reexport_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "Settings",
+              "cfg_region": []
+            },
+            "contract": "pub struct __prview_name ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub struct __prview_name ;",
+            "provenance": "git_tree:fixture://reexport_changed/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub struct __prview_name ;"
+          ]
+        },
+        {
+          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Config\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Config\",\"cfg_region\":[]},\"before_contract\":\"pub struct __prview_name ;\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "removed",
+          "identity": {
+            "crate_name": "fixture_reexport_changed",
+            "module_path": [],
+            "namespace": "type",
+            "name": "Config",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_reexport_changed",
+              "module_path": [],
+              "namespace": "type",
+              "name": "Config",
+              "cfg_region": []
+            },
+            "contract": "pub struct __prview_name ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub struct __prview_name ;",
+            "provenance": "git_tree:fixture://reexport_changed/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub struct __prview_name ;"
+          ]
+        },
+        {
+          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Config\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_reexport_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Config\",\"cfg_region\":[]},\"before_contract\":\"pub struct __prview_name ;\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "removed",
+          "identity": {
+            "crate_name": "fixture_reexport_changed",
+            "module_path": [],
+            "namespace": "value",
+            "name": "Config",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_reexport_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "Config",
+              "cfg_region": []
+            },
+            "contract": "pub struct __prview_name ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub struct __prview_name ;",
+            "provenance": "git_tree:fixture://reexport_changed/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub struct __prview_name ;"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "proven_truth_improvement",
+      "rationale": "the legacy breaking detector deliberately ignored changed pub-use edges",
+      "recommended_disposition": "already accepted by W0/D2",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "canonical Rust artifacts gain the W0-proven semantic fact"
+    },
+    {
+      "corpus_cell": "item_opener_removed",
+      "base_revision": "git_tree:fixture://item_opener_removed/base",
+      "target_revision": "git_tree:fixture://item_opener_removed/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "removed_symbol",
+            "symbol_type": "struct"
+          },
+          "line": "pub struct Public { pub field: u8 }",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub struct Public { pub field: u8 }",
+            "symbol_type": "struct"
+          }
+        ]
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"visibility_changed\",\"identity\":{\"crate_name\":\"fixture_item_opener_removed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Public\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_item_opener_removed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Public\",\"cfg_region\":[]},\"before_contract\":\"pub struct __prview_name { pub field : u8 }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_item_opener_removed\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Public\",\"cfg_region\":[]},\"after_contract\":\"struct __prview_name { pub field : u8 }\",\"after_declared_public\":false,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "visibility_changed",
+          "identity": {
+            "crate_name": "fixture_item_opener_removed",
+            "module_path": [],
+            "namespace": "type",
+            "name": "Public",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_item_opener_removed",
+              "module_path": [],
+              "namespace": "type",
+              "name": "Public",
+              "cfg_region": []
+            },
+            "contract": "pub struct __prview_name { pub field : u8 }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub struct __prview_name { pub field : u8 }",
+            "provenance": "git_tree:fixture://item_opener_removed/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_item_opener_removed",
+              "module_path": [],
+              "namespace": "type",
+              "name": "Public",
+              "cfg_region": []
+            },
+            "contract": "struct __prview_name { pub field : u8 }",
+            "source_path": "src/lib.rs",
+            "evidence": "struct __prview_name { pub field : u8 }",
+            "provenance": "git_tree:fixture://item_opener_removed/head",
+            "declared_public": false
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub struct __prview_name { pub field : u8 }",
+            "struct __prview_name { pub field : u8 }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": true,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "item_body_removed",
+      "base_revision": "git_tree:fixture://item_body_removed/base",
+      "target_revision": "git_tree:fixture://item_body_removed/head",
+      "declared_legacy_expectation": "accepted_zero",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_item_body_removed\",\"module_path\":[\"Public\"],\"namespace\":\"value\",\"name\":\"field\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_item_body_removed\",\"module_path\":[\"Public\"],\"namespace\":\"value\",\"name\":\"field\",\"cfg_region\":[]},\"before_contract\":\"pub field : u8\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "removed",
+          "identity": {
+            "crate_name": "fixture_item_body_removed",
+            "module_path": [
+              "Public"
+            ],
+            "namespace": "value",
+            "name": "field",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_item_body_removed",
+              "module_path": [
+                "Public"
+              ],
+              "namespace": "value",
+              "name": "field",
+              "cfg_region": []
+            },
+            "contract": "pub field : u8",
+            "source_path": "src/lib.rs",
+            "evidence": "pub field : u8",
+            "provenance": "git_tree:fixture://item_body_removed/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub field : u8"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "proven_truth_improvement",
+      "rationale": "the diff-only detector missed a public field removal when the item opener was unchanged",
+      "recommended_disposition": "already accepted by W0/D2",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "canonical Rust artifacts gain the W0-proven semantic fact"
+    },
+    {
+      "corpus_cell": "item_body_changed",
+      "base_revision": "git_tree:fixture://item_body_changed/base",
+      "target_revision": "git_tree:fixture://item_body_changed/head",
+      "declared_legacy_expectation": "accepted_zero",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "changed_signature",
+            "before": "pub struct Public { pub field: u8 }",
+            "after": "pub struct Public { pub field: u16 }"
+          },
+          "line": "",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [],
+        "changed": [
+          {
+            "after": "pub struct Public { pub field: u16 }",
+            "before": "pub struct Public { pub field: u8 }",
+            "file": "src/lib.rs",
+            "symbol_type": "struct"
+          }
+        ],
+        "removed": []
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_item_body_changed\",\"module_path\":[\"Public\"],\"namespace\":\"value\",\"name\":\"field\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_item_body_changed\",\"module_path\":[\"Public\"],\"namespace\":\"value\",\"name\":\"field\",\"cfg_region\":[]},\"before_contract\":\"pub field : u8\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_item_body_changed\",\"module_path\":[\"Public\"],\"namespace\":\"value\",\"name\":\"field\",\"cfg_region\":[]},\"after_contract\":\"pub field : u16\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "changed",
+          "identity": {
+            "crate_name": "fixture_item_body_changed",
+            "module_path": [
+              "Public"
+            ],
+            "namespace": "value",
+            "name": "field",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_item_body_changed",
+              "module_path": [
+                "Public"
+              ],
+              "namespace": "value",
+              "name": "field",
+              "cfg_region": []
+            },
+            "contract": "pub field : u8",
+            "source_path": "src/lib.rs",
+            "evidence": "pub field : u8",
+            "provenance": "git_tree:fixture://item_body_changed/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_item_body_changed",
+              "module_path": [
+                "Public"
+              ],
+              "namespace": "value",
+              "name": "field",
+              "cfg_region": []
+            },
+            "contract": "pub field : u16",
+            "source_path": "src/lib.rs",
+            "evidence": "pub field : u16",
+            "provenance": "git_tree:fixture://item_body_changed/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub field : u8",
+            "pub field : u16"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": true,
+      "current_legacy_public_positive": true,
+      "historical_binding": {
+        "test_id": "same_inline_module_pairing_noop",
+        "expected_breaking_kinds": [],
+        "actual_breaking_facts": []
+      },
+      "legacy_relationship": "fixture_mapping_mismatch",
+      "classification": "fixture_mapping_mismatch",
+      "rationale": "the shared historical scenario matches its typed expectation, while current execution of the distinct W0 fixture does not match the transferred legacy polarity",
+      "recommended_disposition": "retain the historical declaration-pairing test and correct the W0 legacy observation without changing its repo-backed field record",
+      "status": "operator_decision_required",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "the field change remains reported, but via a granular canonical field fact rather than the legacy whole-declaration presentation"
+    },
+    {
+      "corpus_cell": "backslash_literal_changed",
+      "base_revision": "git_tree:fixture://backslash_literal_changed/base",
+      "target_revision": "git_tree:fixture://backslash_literal_changed/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "changed_signature",
+            "before": "pub const VALUE: &str = \"left\";",
+            "after": "pub const VALUE: &str = \"right\";"
+          },
+          "line": "",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub const VALUE: &str = ;",
+            "symbol_type": "constant"
+          }
+        ],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub const VALUE: &str = ;",
+            "symbol_type": "constant"
+          }
+        ]
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_backslash_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"VALUE\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_backslash_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"VALUE\",\"cfg_region\":[]},\"before_contract\":\"pub const __prview_name : & str = \\\"left\\\" ;\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_backslash_literal_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"VALUE\",\"cfg_region\":[]},\"after_contract\":\"pub const __prview_name : & str = \\\"right\\\" ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "changed",
+          "identity": {
+            "crate_name": "fixture_backslash_literal_changed",
+            "module_path": [],
+            "namespace": "value",
+            "name": "VALUE",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_backslash_literal_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "VALUE",
+              "cfg_region": []
+            },
+            "contract": "pub const __prview_name : & str = \"left\" ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub const __prview_name : & str = \"left\" ;",
+            "provenance": "git_tree:fixture://backslash_literal_changed/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_backslash_literal_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "VALUE",
+              "cfg_region": []
+            },
+            "contract": "pub const __prview_name : & str = \"right\" ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub const __prview_name : & str = \"right\" ;",
+            "provenance": "git_tree:fixture://backslash_literal_changed/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub const __prview_name : & str = \"left\" ;",
+            "pub const __prview_name : & str = \"right\" ;"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": true,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "backslash_reindent",
+      "base_revision": "git_tree:fixture://backslash_reindent/base",
+      "target_revision": "git_tree:fixture://backslash_reindent/head",
+      "declared_legacy_expectation": "accepted_zero",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "declaration_pairing_changed",
+      "base_revision": "git_tree:fixture://declaration_pairing_changed/base",
+      "target_revision": "git_tree:fixture://declaration_pairing_changed/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "changed_signature",
+            "before": "pub fn paired(x: u8) {}",
+            "after": "pub fn paired(x: u16) {}"
+          },
+          "line": "",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [],
+        "changed": [
+          {
+            "after": "pub fn paired(x: u16) {}",
+            "before": "pub fn paired(x: u8) {}",
+            "file": "src/lib.rs",
+            "symbol_type": "function"
+          }
+        ],
+        "removed": []
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name (x : u8) { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name (x : u16) { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "changed",
+          "identity": {
+            "crate_name": "fixture_declaration_pairing_changed",
+            "module_path": [],
+            "namespace": "value",
+            "name": "paired",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_declaration_pairing_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "paired",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name (x : u8) { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name (x : u8) { }",
+            "provenance": "git_tree:fixture://declaration_pairing_changed/base",
+            "declared_public": true
+          },
+          "after": {
+            "identity": {
+              "crate_name": "fixture_declaration_pairing_changed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "paired",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name (x : u16) { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name (x : u16) { }",
+            "provenance": "git_tree:fixture://declaration_pairing_changed/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name (x : u8) { }",
+            "pub fn __prview_name (x : u16) { }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": true,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "declaration_pairing_noop",
+      "base_revision": "git_tree:fixture://declaration_pairing_noop/base",
+      "target_revision": "git_tree:fixture://declaration_pairing_noop/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "changed_signature",
+            "before": "pub fn paired(x: u8) {}",
+            "after": "pub fn paired(x: u8, ) {}"
+          },
+          "line": "",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [],
+        "changed": [
+          {
+            "after": "pub fn paired(",
+            "before": "pub fn paired(x: u8) {}",
+            "file": "src/lib.rs",
+            "symbol_type": "function"
+          }
+        ],
+        "removed": []
+      },
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": true,
+      "current_legacy_public_positive": true,
+      "historical_binding": {
+        "test_id": "identical_remove_readd_noop",
+        "expected_breaking_kinds": [],
+        "actual_breaking_facts": []
+      },
+      "legacy_relationship": "fixture_mapping_mismatch",
+      "classification": "fixture_mapping_mismatch",
+      "rationale": "the shared historical scenario matches its typed expectation, while current execution of the distinct W0 fixture does not match the transferred legacy polarity",
+      "recommended_disposition": "retain the historical no-op tests and record this fixture's current legacy observation separately from the canonical repo-backed no-op",
+      "status": "operator_decision_required",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "the W0 no-op stops producing a legacy false positive while faithful historical no-op scenarios remain independently guarded"
+    },
+    {
+      "corpus_cell": "legacy_non_api_control",
+      "base_revision": "git_tree:fixture://legacy_non_api_control/base",
+      "target_revision": "git_tree:fixture://legacy_non_api_control/head",
+      "declared_legacy_expectation": "negative",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": [],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": false,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "function_removed",
+      "base_revision": "git_tree:fixture://function_removed/base",
+      "target_revision": "git_tree:fixture://function_removed/head",
+      "declared_legacy_expectation": "positive",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "removed_symbol",
+            "symbol_type": "function"
+          },
+          "line": "pub fn removed() {}",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn removed() {}",
+            "symbol_type": "function"
+          }
+        ]
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"removed\",\"identity\":{\"crate_name\":\"fixture_function_removed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"removed\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_function_removed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"removed\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "removed",
+          "identity": {
+            "crate_name": "fixture_function_removed",
+            "module_path": [],
+            "namespace": "value",
+            "name": "removed",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture_function_removed",
+              "module_path": [],
+              "namespace": "value",
+              "name": "removed",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://function_removed/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name () { }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": true,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "compatibility_preserving_presentation",
+      "rationale": "legacy polarity and repo-backed semantic polarity agree",
+      "recommended_disposition": "preserve semantic polarity",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "only the structured presentation changes"
+    },
+    {
+      "corpus_cell": "function_added",
+      "base_revision": "git_tree:fixture://function_added/base",
+      "target_revision": "git_tree:fixture://function_added/head",
+      "declared_legacy_expectation": "accepted_zero",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn added() {}",
+            "symbol_type": "function"
+          }
+        ],
+        "changed": [],
+        "removed": []
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture_function_added\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"added\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture_function_added\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"added\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "added",
+          "identity": {
+            "crate_name": "fixture_function_added",
+            "module_path": [],
+            "namespace": "value",
+            "name": "added",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": {
+            "identity": {
+              "crate_name": "fixture_function_added",
+              "module_path": [],
+              "namespace": "value",
+              "name": "added",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:fixture://function_added/head",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name () { }"
+          ]
+        }
+      ],
+      "current_legacy_breaking_positive": false,
+      "current_legacy_public_positive": true,
+      "historical_binding": null,
+      "legacy_relationship": "current_fixture_matches_mapping",
+      "classification": "proven_truth_improvement",
+      "rationale": "the legacy breaking detector deliberately ignored additive public functions",
+      "recommended_disposition": "already accepted by W0/D2",
+      "status": "accepted_by_w0_d2",
+      "phase_a_operator_effect": "none: shadow-only, no verdict or policy change",
+      "phase_b_operator_effect": "canonical Rust artifacts gain the W0-proven semantic fact"
+    }
+  ],
+  "controlled_cases": [
+    {
+      "id": "multiplicity_namespace_cfg",
+      "base_revision": "git_tree:multiplicity_namespace_cfg/base",
+      "target_revision": "git_tree:multiplicity_namespace_cfg/target",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub struct Same;",
+            "symbol_type": "struct"
+          }
+        ],
+        "changed": [],
+        "removed": []
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"macro\",\"name\":\"Exported\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"macro\",\"name\":\"Exported\",\"cfg_region\":[]},\"after_contract\":\"# [macro_export] macro_rules ! __prview_name { () => { } }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "added",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "macro",
+            "name": "Exported",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": {
+            "identity": {
+              "crate_name": "fixture",
+              "module_path": [],
+              "namespace": "macro",
+              "name": "Exported",
+              "cfg_region": []
+            },
+            "contract": "# [macro_export] macro_rules ! __prview_name { () => { } }",
+            "source_path": "src/lib.rs",
+            "evidence": "# [macro_export] macro_rules ! __prview_name { () => { } }",
+            "provenance": "git_tree:multiplicity_namespace_cfg/target",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "# [macro_export] macro_rules ! __prview_name { () => { } }"
+          ]
+        },
+        {
+          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Same\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"type\",\"name\":\"Same\",\"cfg_region\":[]},\"after_contract\":\"pub struct __prview_name ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "added",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "type",
+            "name": "Same",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": {
+            "identity": {
+              "crate_name": "fixture",
+              "module_path": [],
+              "namespace": "type",
+              "name": "Same",
+              "cfg_region": []
+            },
+            "contract": "pub struct __prview_name ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub struct __prview_name ;",
+            "provenance": "git_tree:multiplicity_namespace_cfg/target",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub struct __prview_name ;"
+          ]
+        },
+        {
+          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Same\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Same\",\"cfg_region\":[]},\"after_contract\":\"pub struct __prview_name ;\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "added",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "value",
+            "name": "Same",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": {
+            "identity": {
+              "crate_name": "fixture",
+              "module_path": [],
+              "namespace": "value",
+              "name": "Same",
+              "cfg_region": []
+            },
+            "contract": "pub struct __prview_name ;",
+            "source_path": "src/lib.rs",
+            "evidence": "pub struct __prview_name ;",
+            "provenance": "git_tree:multiplicity_namespace_cfg/target",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub struct __prview_name ;"
+          ]
+        },
+        {
+          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Variant\",\"cfg_region\":[\"unix\"]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Variant\",\"cfg_region\":[\"unix\"]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "added",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "value",
+            "name": "Variant",
+            "cfg_region": [
+              "unix"
+            ]
+          },
+          "before": null,
+          "after": {
+            "identity": {
+              "crate_name": "fixture",
+              "module_path": [],
+              "namespace": "value",
+              "name": "Variant",
+              "cfg_region": [
+                "unix"
+              ]
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:multiplicity_namespace_cfg/target",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name () { }"
+          ]
+        },
+        {
+          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Variant\",\"cfg_region\":[\"windows\"]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"Variant\",\"cfg_region\":[\"windows\"]},\"after_contract\":\"pub fn __prview_name () { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "kind": "added",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "value",
+            "name": "Variant",
+            "cfg_region": [
+              "windows"
+            ]
+          },
+          "before": null,
+          "after": {
+            "identity": {
+              "crate_name": "fixture",
+              "module_path": [],
+              "namespace": "value",
+              "name": "Variant",
+              "cfg_region": [
+                "windows"
+              ]
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:multiplicity_namespace_cfg/target",
+            "declared_public": true
+          },
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "confirmed",
+          "evidence": [
+            "pub fn __prview_name () { }"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "include_macro_unknown",
+      "base_revision": "git_tree:include_macro_unknown/base",
+      "target_revision": "git_tree:include_macro_unknown/target",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "removed_symbol",
+            "symbol_type": "function"
+          },
+          "line": "pub fn item() {}",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn item() {}",
+            "symbol_type": "function"
+          }
+        ]
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"unknown\",\"name\":\"IncludeMacro\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target snapshot IncludeMacro: include ! (\\\"generated.rs\\\") ;\",\"unknown_source\":{\"side\":\"target\",\"source_path\":\"src/lib.rs\",\"provenance\":\"git_tree:include_macro_unknown/target\"}}",
+          "kind": "unknown",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "unknown",
+            "name": "IncludeMacro",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "unknown",
+          "evidence": [
+            "include ! (\"generated.rs\") ;"
+          ],
+          "unknown_reason": "target snapshot IncludeMacro: include ! (\"generated.rs\") ;",
+          "unknown_source": {
+            "side": "target",
+            "source_path": "src/lib.rs",
+            "provenance": "git_tree:include_macro_unknown/target"
+          }
+        },
+        {
+          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target counterpart is unprovable in an unknown snapshot region\",\"unknown_source\":null}",
+          "kind": "unknown",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "value",
+            "name": "item",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture",
+              "module_path": [],
+              "namespace": "value",
+              "name": "item",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:include_macro_unknown/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "unknown",
+          "evidence": [
+            "target counterpart is unprovable in an unknown snapshot region"
+          ],
+          "unknown_reason": "target counterpart is unprovable in an unknown snapshot region"
+        }
+      ]
+    },
+    {
+      "id": "glob_reexport_unknown",
+      "base_revision": "git_tree:glob_reexport_unknown/base",
+      "target_revision": "git_tree:glob_reexport_unknown/target",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "removed_symbol",
+            "symbol_type": "function"
+          },
+          "line": "pub fn item() {}",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub use donor::*;",
+            "symbol_type": "re-export"
+          }
+        ],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn item() {}",
+            "symbol_type": "function"
+          }
+        ]
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"unknown\",\"name\":\"GlobReexport\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target snapshot GlobReexport: donor\",\"unknown_source\":{\"side\":\"target\",\"source_path\":\"src/lib.rs\",\"provenance\":\"git_tree:glob_reexport_unknown/target\"}}",
+          "kind": "unknown",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "unknown",
+            "name": "GlobReexport",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "unknown",
+          "evidence": [
+            "donor"
+          ],
+          "unknown_reason": "target snapshot GlobReexport: donor",
+          "unknown_source": {
+            "side": "target",
+            "source_path": "src/lib.rs",
+            "provenance": "git_tree:glob_reexport_unknown/target"
+          }
+        },
+        {
+          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target counterpart is unprovable in an unknown snapshot region\",\"unknown_source\":null}",
+          "kind": "unknown",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "value",
+            "name": "item",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture",
+              "module_path": [],
+              "namespace": "value",
+              "name": "item",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:glob_reexport_unknown/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "unknown",
+          "evidence": [
+            "target counterpart is unprovable in an unknown snapshot region"
+          ],
+          "unknown_reason": "target counterpart is unprovable in an unknown snapshot region"
+        }
+      ]
+    },
+    {
+      "id": "source_parse_unknown",
+      "base_revision": "git_tree:source_parse_unknown/base",
+      "target_revision": "git_tree:source_parse_unknown/target",
+      "legacy_breaking_facts": [
+        {
+          "file": "src/lib.rs",
+          "kind": {
+            "kind": "removed_symbol",
+            "symbol_type": "function"
+          },
+          "line": "pub fn item() {}",
+          "risk_level": "high"
+        }
+      ],
+      "legacy_public_api_artifact": {
+        "added": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn broken(",
+            "symbol_type": "function"
+          }
+        ],
+        "changed": [],
+        "removed": [
+          {
+            "file": "src/lib.rs",
+            "signature": "pub fn item() {}",
+            "symbol_type": "function"
+          }
+        ]
+      },
+      "repo_backed_facts": [
+        {
+          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"unknown\",\"name\":\"SourceParse\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target snapshot SourceParse: cannot parse string into token stream\",\"unknown_source\":{\"side\":\"target\",\"source_path\":\"src/lib.rs\",\"provenance\":\"git_tree:source_parse_unknown/target\"}}",
+          "kind": "unknown",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "unknown",
+            "name": "SourceParse",
+            "cfg_region": []
+          },
+          "before": null,
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "unknown",
+          "evidence": [
+            "cannot parse string into token stream"
+          ],
+          "unknown_reason": "target snapshot SourceParse: cannot parse string into token stream",
+          "unknown_source": {
+            "side": "target",
+            "source_path": "src/lib.rs",
+            "provenance": "git_tree:source_parse_unknown/target"
+          }
+        },
+        {
+          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"item\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name () { }\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target counterpart is unprovable in an unknown snapshot region\",\"unknown_source\":null}",
+          "kind": "unknown",
+          "identity": {
+            "crate_name": "fixture",
+            "module_path": [],
+            "namespace": "value",
+            "name": "item",
+            "cfg_region": []
+          },
+          "before": {
+            "identity": {
+              "crate_name": "fixture",
+              "module_path": [],
+              "namespace": "value",
+              "name": "item",
+              "cfg_region": []
+            },
+            "contract": "pub fn __prview_name () { }",
+            "source_path": "src/lib.rs",
+            "evidence": "pub fn __prview_name () { }",
+            "provenance": "git_tree:source_parse_unknown/base",
+            "declared_public": true
+          },
+          "after": null,
+          "analysis_source": "repo_backed_rust_api",
+          "confidence": "unknown",
+          "evidence": [
+            "target counterpart is unprovable in an unknown snapshot region"
+          ],
+          "unknown_reason": "target counterpart is unprovable in an unknown snapshot region"
+        }
+      ]
+    },
+    {
+      "id": "no_op_provenance",
+      "base_revision": "git_tree:no_op_provenance/base",
+      "target_revision": "git_tree:no_op_provenance/target",
+      "legacy_breaking_facts": [],
+      "legacy_public_api_artifact": null,
+      "repo_backed_facts": []
+    }
+  ]
+}

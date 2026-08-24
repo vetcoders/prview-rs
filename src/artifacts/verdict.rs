@@ -345,6 +345,101 @@ pub(crate) fn apply_breaking_escalation(
     ))
 }
 
+/// Apply the existing breaking-escalation policy to the canonical Rust API
+/// delta. Added-only deltas are informational. Unknown facts always degrade
+/// confidence and require review because absence cannot be proven; this does
+/// not change any policy default or create a blocking outcome.
+pub(crate) fn apply_rust_api_delta_outcome(
+    enabled: bool,
+    view: Option<&api_delta::ApiArtifactView>,
+    worst_confidence: &mut crate::policy::engine::AnalysisStatus,
+    worst_merge: &mut crate::policy::engine::MergeRecommendation,
+) {
+    use crate::policy::engine::{AnalysisStatus, MergeRecommendation};
+
+    let Some(view) = view else {
+        return;
+    };
+    let confirmed_breaking = view.findings.iter().any(|finding| {
+        finding.confidence == api_delta::ApiDeltaConfidence::Confirmed
+            && matches!(
+                finding.kind,
+                api_delta::ApiDeltaKind::Removed
+                    | api_delta::ApiDeltaKind::Changed
+                    | api_delta::ApiDeltaKind::Relocated
+                    | api_delta::ApiDeltaKind::VisibilityChanged
+            )
+    });
+    if enabled && confirmed_breaking && *worst_merge == MergeRecommendation::Approve {
+        *worst_merge = MergeRecommendation::ReviewRequired;
+    }
+
+    if view.counts.unknown > 0 {
+        if *worst_confidence == AnalysisStatus::Complete {
+            *worst_confidence = AnalysisStatus::Degraded;
+        }
+        if *worst_merge == MergeRecommendation::Approve {
+            *worst_merge = MergeRecommendation::ReviewRequired;
+        }
+    }
+}
+
+/// Exact operator caveats derived from the same serialized view used by both
+/// API artifacts. IDs are included so consumers can join caveats to evidence
+/// without recounting or reparsing Markdown.
+pub(crate) fn rust_api_delta_review_caveats(
+    view: Option<&api_delta::ApiArtifactView>,
+) -> Vec<String> {
+    let Some(view) = view else {
+        return Vec::new();
+    };
+    let breaking = view
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.confidence == api_delta::ApiDeltaConfidence::Confirmed
+                && matches!(
+                    finding.kind,
+                    api_delta::ApiDeltaKind::Removed
+                        | api_delta::ApiDeltaKind::Changed
+                        | api_delta::ApiDeltaKind::Relocated
+                        | api_delta::ApiDeltaKind::VisibilityChanged
+                )
+        })
+        .collect::<Vec<_>>();
+    let unknown = view
+        .findings
+        .iter()
+        .filter(|finding| finding.confidence == api_delta::ApiDeltaConfidence::Unknown)
+        .collect::<Vec<_>>();
+    let mut caveats = Vec::new();
+    if !breaking.is_empty() {
+        caveats.push(format!(
+            "Rust API delta: {} confirmed breaking finding{} [{}]",
+            breaking.len(),
+            if breaking.len() == 1 { "" } else { "s" },
+            breaking
+                .iter()
+                .map(|finding| finding.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !unknown.is_empty() {
+        caveats.push(format!(
+            "Rust API delta: {} unknown finding{} [{}]",
+            unknown.len(),
+            if unknown.len() == 1 { "" } else { "s" },
+            unknown
+                .iter()
+                .map(|finding| finding.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    caveats
+}
+
 pub(crate) fn build_review_caveats(
     breaking: &[BreakingFinding],
     coverage: &CoverageDelta,

@@ -13,6 +13,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         heuristics,
         inline,
         breaking,
+        rust_api_delta,
         coverage,
         diffs,
         skipped_checks,
@@ -133,10 +134,11 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     }
 
     if !diffs.is_empty() {
-        let risk_scores = signal::compute_file_risk_scores_with_root(
+        let risk_scores = signal::compute_file_risk_scores_with_api(
             diffs,
             coverage,
             breaking,
+            rust_api_delta,
             Some(&config.repo_root),
         );
         let risk_heatmap = signal::compute_risk_heatmap(diffs, &risk_scores);
@@ -188,6 +190,12 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     {
         review_caveats.push(reason);
     }
+    apply_rust_api_delta_outcome(
+        config.breaking_escalation,
+        rust_api_delta,
+        &mut worst_confidence,
+        &mut worst_merge,
+    );
 
     // Derive the scalar decision fields from the FINAL axes (after every
     // review/risk bump above) through the single coherent source. `allow_merge`
@@ -198,6 +206,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     let legacy_recommended_merge = decision_fields.recommended_merge;
 
     let mut all_review_caveats = build_review_caveats(breaking, coverage, inline.findings_count);
+    all_review_caveats.extend(rust_api_delta_review_caveats(rust_api_delta));
     all_review_caveats.extend(review_caveats);
     all_review_caveats.extend(rust_quality_review_caveats(config, checks));
     all_review_caveats.extend(cargo_audit_review_caveats(checks));
@@ -272,6 +281,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             "introduced_count": introduced_inline,
             "preexisting_count": preexisting_inline
         },
+        "rust_api_delta": rust_api_delta,
         "decision": {
             "analysis_status": worst_confidence,
             "merge_recommendation": worst_merge,
@@ -528,6 +538,54 @@ mod tests {
         )
     }
 
+    #[test]
+    fn merge_gate_serializes_the_exact_shared_rust_api_view() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config();
+        let inline = InlineFindingsSummary {
+            status: "passed".to_owned(),
+            findings_count: 0,
+            dashboard_findings: Vec::new(),
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+        let view = api_delta::ApiArtifactView {
+            view: api_delta::ApiArtifactViewKind::BreakingChanges,
+            analysis_source: api_delta::REPO_BACKED_RUST_API_SOURCE,
+            base_revision: "git_tree:base".to_owned(),
+            target_revision: "git_tree:target".to_owned(),
+            counts: api_delta::ApiDeltaCounts {
+                added: 0,
+                removed: 0,
+                changed: 0,
+                relocated: 0,
+                visibility_changed: 0,
+                unknown: 0,
+            },
+            findings: Vec::new(),
+        };
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            checks: &[],
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            rust_api_delta: Some(&view),
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+        })
+        .expect("merge gate");
+        let gate: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("MERGE_GATE.json")).unwrap())
+                .unwrap();
+        assert_eq!(gate["rust_api_delta"], serde_json::to_value(view).unwrap());
+    }
+
     fn run_gate_with_semgrep_finding(in_diff: bool, security_full: bool) -> serde_json::Value {
         run_gate_with_semgrep_finding_scan(in_diff, security_full, true)
     }
@@ -562,6 +620,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -605,6 +664,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -655,6 +715,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -698,6 +759,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &skipped_checks,
@@ -752,6 +814,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -770,6 +833,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: Vec::new(),
+            rust_api_delta: None,
             coverage,
             diff_dir: tmp.path(),
             skipped_checks: Vec::new(),
@@ -813,6 +877,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &breaking,
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -831,6 +896,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: breaking.clone(),
+            rust_api_delta: None,
             coverage,
             diff_dir: tmp.path(),
             skipped_checks: Vec::new(),
@@ -1157,6 +1223,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -1272,6 +1339,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &breaking,
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],

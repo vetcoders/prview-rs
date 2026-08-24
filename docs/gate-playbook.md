@@ -25,8 +25,9 @@ re-derives a verdict when the gate artifact cannot be read.
 
 ## Breaking-change escalation
 
-A genuine breaking API change in the diff — a removed public symbol, a changed
-public signature, or a newly required environment variable — escalates the
+A genuine breaking API change — a confirmed removed, changed, relocated, or
+visibility-changed public Rust fact; a legacy JS/TS break; or a newly required
+environment variable — escalates the
 verdict to at least `CONDITIONAL` (never `BLOCK` on its own, and never lowering a
 verdict already raised for another reason). Under `--strict` a `CONDITIONAL`
 verdict exits `2`, so a breaking change fails a Required gate until an owner
@@ -39,6 +40,11 @@ effect on the verdict — useful for repositories that intentionally ship breaki
 changes on a cadence. Whether on or off, the reason
 (`breaking API change detected: <n> finding(s)`) is reported identically on the
 console, in `report.json`, and in `MERGE_GATE.json`.
+
+Added-only Rust API touch is informational. A typed Rust unknown is not called a
+break; it degrades analysis confidence and requires review because the exact
+repository trees could not prove the counterpart. MERGE_GATE embeds the same
+structured `rust_api_delta` IDs/counts/evidence as both API artifacts.
 
 ### Which command enforces it
 

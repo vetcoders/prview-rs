@@ -180,6 +180,9 @@ step.
 | `dashboard.html` | Visual summary of the analysis |
 | `00_summary/MERGE_GATE.json` | Pass/fail gate for automation |
 | `00_summary/PROVENANCE.json` | Commits, working-tree state, and the tree each check scanned |
+| `20_quality/PUBLIC_API_DIFF.json` | Additive API contract: compatibility rows plus lossless repo-backed Rust delta |
+| `20_quality/BREAKING_CHANGES.json` | Lossless repo-backed Rust breaking/API delta (optional) |
+| `20_quality/BREAKING_CHANGES.md` | Human Rust API truth plus bounded JS/TS and env signals (optional) |
 | `INLINE_FINDINGS.sarif` | Per-finding annotations (optional) |
 
 The merge decision is a single enum — `PASS`, `CONDITIONAL`, or `BLOCK` — so both humans and automation read one truth. See [`docs/contracts/merge_gate.md`](docs/contracts/merge_gate.md).

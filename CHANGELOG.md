@@ -13,6 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Rust `PUBLIC_API_DIFF` and `BREAKING_CHANGES` now share one repo-backed
+  `ApiDelta` computed from the exact base/target Git trees. Existing public-API
+  JSON rows and artifact filenames remain compatible, while additive structured
+  fields expose stable IDs, counts, confidence, evidence, unknown reasons, and
+  provenance in both artifacts, `MERGE_GATE.json`, and `report.json`. Added-only
+  API touch is informational; confirmed removals, changes, relocations, and
+  visibility changes use the existing breaking-escalation policy, while unknown
+  regions degrade confidence without claiming a break. JS/TS keeps the legacy
+  diff analyzer behind a side-aware language filter: cross-language renames
+  retain only the JS/TS side, including quoted Git paths, without leaking Rust
+  lines or losing removed exports. Git headers own section identity: non-null
+  file markers must match both decoded header paths, and add/delete null sides
+  require coherent mode metadata; malformed or incomplete sections fail closed.
+  Exact duplicate base/target OID pairs are
+  coalesced before snapshotting, while distinct comparisons keep separate
+  provenance. Rust env-requirement detection is preserved as a separate
+  non-API signal.
+
 - The three check inventories now project the policy evaluation captured by the
   run instead of re-running eligibility while artifacts are written.
   `RUN.json.checks[]` remains executed-only, while `MERGE_GATE.json` and

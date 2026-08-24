@@ -25,8 +25,27 @@ pub struct RustApiSnapshot {
     pub modules: Vec<RustModuleSnapshot>,
     pub module_aliases: Vec<RustModuleAlias>,
     pub items: Vec<RustApiItem>,
+    /// Parsed ordinary declarations, including non-public counterparts in an
+    /// externally reachable parent module. Delta analysis uses this evidence
+    /// only to prove public/non-public transitions; artifact views continue to
+    /// use `items` as the externally reachable API surface.
+    pub declarations: Vec<RustApiDeclaration>,
     pub reexports: Vec<RustApiReexport>,
     pub unknowns: Vec<RustApiUnknown>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustApiDeclaration {
+    pub key: RustApiItemKey,
+    pub kind: RustApiItemKind,
+    pub contract: String,
+    pub cfg_guard: Vec<String>,
+    pub source_path: String,
+    pub evidence: String,
+    pub provenance: RevisionProvenance,
+    pub certainty: RustSourceCertainty,
+    pub declared_public: bool,
+    pub parent_externally_reachable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,6 +287,7 @@ struct SnapshotBuilder<'a> {
     modules: Vec<RustModuleSnapshot>,
     module_aliases: Vec<RustModuleAlias>,
     items: Vec<RustApiItem>,
+    declarations: Vec<RustApiDeclaration>,
     reexports: Vec<RustApiReexport>,
     unknowns: Vec<RustApiUnknown>,
     symbols: BTreeMap<SymbolKey, Vec<RawSymbol>>,
@@ -295,6 +315,7 @@ impl<'a> SnapshotBuilder<'a> {
             modules: Vec::new(),
             module_aliases: Vec::new(),
             items: Vec::new(),
+            declarations: Vec::new(),
             reexports: Vec::new(),
             unknowns: Vec::new(),
             symbols: BTreeMap::new(),
@@ -361,6 +382,25 @@ impl<'a> SnapshotBuilder<'a> {
                 ))
         });
         self.items.dedup();
+        self.declarations.sort_by(|left, right| {
+            (
+                &left.key,
+                left.kind,
+                &left.cfg_guard,
+                &left.contract,
+                left.declared_public,
+                &left.source_path,
+            )
+                .cmp(&(
+                    &right.key,
+                    right.kind,
+                    &right.cfg_guard,
+                    &right.contract,
+                    right.declared_public,
+                    &right.source_path,
+                ))
+        });
+        self.declarations.dedup();
         self.module_aliases.sort_by(|left, right| {
             (
                 &left.crate_name,
@@ -422,6 +462,7 @@ impl<'a> SnapshotBuilder<'a> {
             modules: self.modules,
             module_aliases: self.module_aliases,
             items: self.items,
+            declarations: self.declarations,
             reexports: self.reexports,
             unknowns: self.unknowns,
         }
@@ -1136,6 +1177,30 @@ impl<'a> SnapshotBuilder<'a> {
                     }
                 }
                 _ => {
+                    if transforming_attrs(item_attrs(item)).next().is_none()
+                        && transforming_cfg_attrs(item_attrs(item)).is_empty()
+                        && let Some((name, namespace, kind, contract, declared_public)) =
+                            ordinary_item_contract(item)
+                    {
+                        let evidence = contract.clone();
+                        self.declarations.push(RustApiDeclaration {
+                            key: RustApiItemKey {
+                                crate_name: crate_name.to_owned(),
+                                module_path: module_path.to_vec(),
+                                namespace,
+                                external_name: name,
+                            },
+                            kind,
+                            contract,
+                            cfg_guard: cfg_guard.clone(),
+                            source_path: source_path.to_owned(),
+                            evidence,
+                            provenance: self.provenance.clone(),
+                            certainty: RustSourceCertainty::Confirmed,
+                            declared_public,
+                            parent_externally_reachable: module_reachable,
+                        });
+                    }
                     if let Some((name, namespace, kind, contract)) = public_item_contract(item) {
                         self.record_symbol(
                             crate_name,
@@ -2372,6 +2437,13 @@ impl<'a> SnapshotBuilder<'a> {
 }
 
 fn public_item_contract(item: &Item) -> Option<(String, RustNamespace, RustApiItemKind, String)> {
+    let (name, namespace, kind, contract, public) = ordinary_item_contract(item)?;
+    public.then_some((name, namespace, kind, contract))
+}
+
+fn ordinary_item_contract(
+    item: &Item,
+) -> Option<(String, RustNamespace, RustApiItemKind, String, bool)> {
     let (name, namespace, kind, public) = match item {
         Item::Fn(value) => (
             value.sig.ident.to_string(),
@@ -2423,14 +2495,12 @@ fn public_item_contract(item: &Item) -> Option<(String, RustNamespace, RustApiIt
         ),
         _ => return None,
     };
-    if !public {
-        return None;
-    }
     Some((
         normalize_identifier(name),
         namespace,
         kind,
         normalized_contract_without_item_name(item.clone()),
+        public,
     ))
 }
 
@@ -3242,7 +3312,7 @@ fn has_ambiguous_module_prefix(
     })
 }
 
-fn guards_proven_disjoint(left: &[String], right: &[String]) -> bool {
+pub(super) fn guards_proven_disjoint(left: &[String], right: &[String]) -> bool {
     matches!(
         (proven_target_family(left), proven_target_family(right)),
         (

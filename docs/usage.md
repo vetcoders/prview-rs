@@ -446,7 +446,10 @@ $HOME/.prview/runs/my-repo/feature-x/20260225-185357/
 │   ├── full-checks.log       # Full output from all checks
 │   ├── checks-errors.log     # Filtered: errors/warnings only, with +/-2 lines of context
 │   ├── coverage-delta.txt    # Source<->test mapping with change status
-│   └── BREAKING_CHANGES.md   # Removed pub symbols, changed signatures
+│   ├── PUBLIC_API_DIFF.json  # Compatibility rows + lossless Rust ApiDelta
+│   ├── PUBLIC_API_DIFF.md    # Human API summary
+│   ├── BREAKING_CHANGES.json # Lossless Rust ApiDelta breaking view
+│   └── BREAKING_CHANGES.md   # Human Rust + bounded JS/TS/env summary
 ├── 30_context/
 │   ├── INLINE_FINDINGS.sarif # Optional: only when the run has findings/advisories
 │   ├── changed-tests.txt     # Test files changed in this PR
@@ -468,11 +471,26 @@ it has something worth showing:
 | Artifact | Description | When generated |
 |----------|-------------|----------------|
 | `checks-errors.log` | Errors and warnings from checks with +/-2 lines of context | When checks found errors |
-| `BREAKING_CHANGES.md` | Removed `pub` symbols, changed signatures, new env requirements | When breaking changes are detected |
+| `PUBLIC_API_DIFF.json/.md` | Exact-tree Rust API delta plus legacy JS/TS export compatibility rows | When an API fact or typed unknown exists |
+| `BREAKING_CHANGES.json/.md` | Same Rust delta IDs/counts/evidence used by the gate, plus bounded JS/TS and env presentation | When a Rust API fact/unknown or legacy JS/TS/env signal exists |
 | `coverage-delta.txt` | Source-file-to-test mapping (multi-strategy matching) | When the diff contains source files |
 | `per-file-diffs/` | Individual patches for files with `>=80` lines changed | When such hotspots exist |
 
 When a generator produces no file, the CLI prints an `i` note explaining why.
+
+Rust API facts are computed from the exact `Diff.base_commit_id` and
+`Diff.target_commit_id` Git trees; the working tree and patch text are not
+fallbacks. Duplicate exact OID pairs are compared once; distinct base/target
+comparisons retain separate provenance. JS/TS exports remain on the legacy diff
+analyzer behind a side-aware boundary: a cross-language rename retains only its
+JS/TS side, including standard quoted Git paths, so Rust lines cannot leak and
+removed JS exports cannot disappear. File markers must agree exactly with the
+decoded Git header identity; incoherent, truncated, or markerless hunk sections
+are discarded fail-closed, while coherent mode-only add/delete metadata remains
+valid. Confirmed removed, changed, relocated, and
+visibility-changed Rust facts are breaking; added-only facts are informational.
+Typed unknowns degrade confidence and require review without claiming a
+confirmed removal.
 
 #### How to read an artifact pack
 

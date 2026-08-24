@@ -71,6 +71,7 @@ pub(crate) struct DashboardContext {
     pub blocking_issues: Vec<String>,
     pub check_gates: Vec<CheckGateEntry>,
     pub breaking: Vec<BreakingFinding>,
+    pub rust_api_delta: Option<api_delta::ApiArtifactView>,
     pub coverage: CoverageDelta,
     pub findings: Vec<DashboardFinding>,
     pub per_file_diff_files: Vec<String>,
@@ -91,6 +92,7 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         heuristics,
         inline,
         breaking,
+        rust_api_delta,
         coverage,
         diff_dir,
         skipped_checks,
@@ -283,10 +285,11 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
     let lint_metrics = compute_lint_metrics(checks, diffs);
 
     // B4: Compute file risk scores
-    let risk_scores = signal::compute_file_risk_scores_with_root(
+    let risk_scores = signal::compute_file_risk_scores_with_api(
         diffs,
         &coverage,
         &breaking,
+        rust_api_delta.as_ref(),
         Some(&config.repo_root),
     );
     let risk_heatmap = signal::compute_risk_heatmap(diffs, &risk_scores);
@@ -338,6 +341,13 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
     {
         review_caveats.push(reason);
     }
+    apply_rust_api_delta_outcome(
+        config.breaking_escalation,
+        rust_api_delta.as_ref(),
+        &mut worst_confidence,
+        &mut worst_merge,
+    );
+    review_caveats.extend(rust_api_delta_review_caveats(rust_api_delta.as_ref()));
 
     // B2: Compute i18n parity delta
     let i18n_delta = signal::compute_i18n_delta(diffs, &config.repo_root);
@@ -366,6 +376,7 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         blocking_issues,
         check_gates,
         breaking,
+        rust_api_delta,
         coverage,
         findings,
         per_file_diff_files,

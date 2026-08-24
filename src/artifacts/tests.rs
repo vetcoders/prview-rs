@@ -107,6 +107,193 @@ use crate::git::{CommitInfo, DiffStats, FileChange, FileStatus, Repository, Reso
 use crate::policy::{PolicyConfig, PolicyMode, PolicySeverity};
 use std::time::Duration;
 
+#[test]
+fn api_delta_no_diff_only_runtime() {
+    let production = include_str!("mod.rs");
+    assert!(production.contains("compare_rust_api_revisions(&repo, diffs)"));
+    assert!(production.contains("analyze_js_ts_public_api_diff(&patch_texts)"));
+    assert!(production.contains("analyze_js_ts_breaking_changes(&patch_texts)"));
+    assert!(production.contains("analyze_rust_env_requirements(&patch_texts)"));
+    assert!(
+        !production.contains("generate_public_api_diff(&quality_dir, &patch_texts)"),
+        "Rust production must never return to the diff-only PUBLIC_API backend"
+    );
+    assert!(
+        !production.contains("analyze_all_breaking_changes(&patch_texts)"),
+        "Rust production must never return to the diff-only BREAKING backend"
+    );
+}
+
+#[test]
+fn js_ts_legacy_breaking_path_never_observes_rust_patch_lines() {
+    let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +0,0 @@\n-pub fn rust_only() {}\ndiff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1 +0,0 @@\n-export function js_only() {}\n";
+    let findings = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].file, "src/api.ts");
+    assert!(findings[0].line.contains("js_only"));
+    assert!(
+        findings
+            .iter()
+            .all(|finding| !finding.line.contains("rust_only"))
+    );
+}
+
+#[test]
+fn malformed_marker_identity_never_reclassifies_rust_for_either_legacy_adapter() {
+    for patch in [
+        "diff --git a/src/lib.rs b/src/api.ts\n--- a/src/fake.ts\n+++ b/src/api.ts\n@@ -1 +1 @@\n-pub fn rust_secret() {}\n+export function js_added() {}\n",
+        "diff --git a/src/api.ts b/src/lib.rs\n--- a/src/api.ts\n+++ b/src/fake.ts\n@@ -1 +1 @@\n-export function js_secret() {}\n+pub fn rust_added() {}\n",
+        "diff --git \"a/src/lib.rs\" \"b/src/quoted\\040api.ts\"\n--- \"a/src/fake\\040api.ts\"\n+++ \"b/src/quoted\\040api.ts\"\n@@ -1 +1 @@\n-pub fn quoted_rust_secret() {}\n+export function quoted_js_added() {}\n",
+        "diff --git a/src/lib.rs b/src/api.ts\nsimilarity index 61%\nrename from src/lib.rs\nrename to src/api.ts\n@@ -1 +1 @@\n-pub fn markerless_rust_secret() {}\n+export function markerless_js_added() {}\n",
+    ] {
+        let filtered = signal::js_ts_patch_sections(patch);
+        assert_eq!(filtered, "", "{patch}");
+
+        let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+        assert!(public.added.is_empty(), "{patch}");
+        assert!(public.removed.is_empty(), "{patch}");
+
+        let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
+        assert!(breaking.is_empty(), "{patch}");
+    }
+}
+
+#[test]
+fn cross_language_rust_to_ts_keeps_only_the_js_added_side() {
+    let patch = "diff --git a/src/lib.rs b/src/api.ts\nsimilarity index 61%\nrename from src/lib.rs\nrename to src/api.ts\n--- a/src/lib.rs\n+++ b/src/api.ts\n@@ -1 +1 @@\n-pub fn rust_removed() {}\n+export function js_added() {}\n";
+    let filtered = signal::js_ts_patch_sections(patch);
+    assert!(filtered.contains("js_added"));
+    assert!(!filtered.contains("rust_removed"));
+    assert!(!filtered.contains("src/lib.rs"));
+
+    let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+    assert!(
+        public
+            .added
+            .iter()
+            .any(|finding| finding.signature.contains("js_added"))
+    );
+    assert!(public.removed.is_empty());
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
+    assert!(breaking.iter().all(|finding| {
+        !finding.line.contains("rust_removed") && !finding.file.ends_with(".rs")
+    }));
+}
+
+#[test]
+fn cross_language_ts_to_rust_keeps_only_the_js_removed_side() {
+    let patch = "diff --git a/src/api.ts b/src/lib.rs\nsimilarity index 61%\nrename from src/api.ts\nrename to src/lib.rs\n--- a/src/api.ts\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-export function js_removed() {}\n+pub fn rust_added() {}\n";
+    let filtered = signal::js_ts_patch_sections(patch);
+    assert!(filtered.contains("js_removed"));
+    assert!(!filtered.contains("rust_added"));
+    assert!(!filtered.contains("src/lib.rs"));
+
+    let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+    assert!(
+        public
+            .removed
+            .iter()
+            .any(|finding| finding.signature.contains("js_removed"))
+    );
+    assert!(public.added.is_empty());
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
+    assert!(breaking.iter().any(|finding| {
+        finding.file == "src/api.ts"
+            && finding.line.contains("js_removed")
+            && matches!(finding.kind, BreakingKind::RemovedSymbol { .. })
+    }));
+    assert!(
+        breaking.iter().all(|finding| {
+            !finding.line.contains("rust_added") && !finding.file.ends_with(".rs")
+        })
+    );
+}
+
+#[test]
+fn quoted_and_unquoted_space_js_paths_survive_both_legacy_adapters() {
+    for patch in [
+        "diff --git \"a/src/quoted\\040api.ts\" \"b/src/quoted\\040api.ts\"\n--- \"a/src/quoted\\040api.ts\"\n+++ \"b/src/quoted\\040api.ts\"\n@@ -1 +1 @@\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n",
+        "diff --git a/src/plain old.ts b/src/plain new.ts\n--- a/src/plain old.ts\n+++ b/src/plain new.ts\n@@ -1 +1 @@\n-export function api(value: number): number { return value; }\n+export function api(value: string): string { return value; }\n",
+    ] {
+        let filtered = signal::js_ts_patch_sections(patch);
+        assert!(filtered.contains("export function api"));
+
+        let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+        assert!(
+            public
+                .removed
+                .iter()
+                .any(|finding| finding.signature.contains("value: number")),
+            "{filtered}"
+        );
+        assert!(
+            public
+                .added
+                .iter()
+                .any(|finding| finding.signature.contains("value: string")),
+            "{filtered}"
+        );
+
+        let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
+        assert!(breaking.iter().any(|finding| {
+            finding.file.ends_with(".ts")
+                && finding.line.contains("value: number")
+                && matches!(finding.kind, BreakingKind::RemovedSymbol { .. })
+        }));
+    }
+}
+
+#[test]
+fn js_add_delete_sections_keep_the_correct_legacy_side() {
+    let added = "diff --git a/src/new.ts b/src/new.ts\nnew file mode 100644\n--- /dev/null\n+++ b/src/new.ts\n@@ -0,0 +1 @@\n+export function added_js() {}\n";
+    let deleted = "diff --git a/src/old.ts b/src/old.ts\ndeleted file mode 100644\n--- a/src/old.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-export function removed_js() {}\n";
+
+    let public = signal::analyze_js_ts_public_api_diff(&[added.to_owned(), deleted.to_owned()]);
+    assert!(
+        public
+            .added
+            .iter()
+            .any(|finding| finding.signature.contains("added_js"))
+    );
+    assert!(
+        public
+            .removed
+            .iter()
+            .any(|finding| finding.signature.contains("removed_js"))
+    );
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[added.to_owned(), deleted.to_owned()]);
+    assert!(breaking.iter().any(|finding| {
+        finding.file == "src/old.ts"
+            && finding.line.contains("removed_js")
+            && matches!(finding.kind, BreakingKind::RemovedSymbol { .. })
+    }));
+    assert!(
+        breaking
+            .iter()
+            .all(|finding| !finding.line.contains("added_js"))
+    );
+}
+
+#[test]
+fn rust_env_signal_is_preserved_without_emitting_rust_api_facts() {
+    let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n-pub fn old() {}\n+pub fn new() {}\n+// REQUIRED_ENV MY_DATABASE_URL=postgres://localhost\n";
+    let findings = signal::analyze_rust_env_requirements(&[patch.to_owned()]);
+    assert_eq!(findings.len(), 1);
+    assert!(matches!(
+        &findings[0].kind,
+        BreakingKind::NewEnvRequirement { variable } if variable == "MY_DATABASE_URL"
+    ));
+    assert!(findings.iter().all(|finding| !matches!(
+        finding.kind,
+        BreakingKind::RemovedSymbol { .. }
+            | BreakingKind::ChangedSignature { .. }
+            | BreakingKind::RelocatedSymbol { .. }
+    )));
+}
+
 macro_rules! generate_merge_gate_test {
     ($dir:expr, $config:expr, $checks:expr, $heuristics:expr, $inline:expr, $breaking:expr, $coverage:expr, $skipped_checks:expr, $resolved_target:expr, $resolved_bases:expr $(,)?) => {
         generate_merge_gate(MergeGateInput {
@@ -116,6 +303,7 @@ macro_rules! generate_merge_gate_test {
             heuristics: $heuristics,
             inline: $inline,
             breaking: $breaking,
+            rust_api_delta: None,
             coverage: $coverage,
             diffs: &[],
             skipped_checks: $skipped_checks,

@@ -15,7 +15,9 @@
       "id": "abi_changed",
       "family": "abi",
       "legacy_expectation": "positive",
-      "legacy_positive_sibling": null
+      "legacy_positive_sibling": null,
+      "recommended_disposition": "approve repo-backed ABI change as canonical truth",
+      "phase_b_operator_effect": "Rust artifacts will begin reporting ABI-only signature changes that the legacy analyzer misses"
     },
     {
       "id": "abi_unchanged",
@@ -27,7 +29,11 @@
       "id": "cfg_guard_changed",
       "family": "cfg",
       "legacy_expectation": "positive",
-      "legacy_positive_sibling": null
+      "legacy_positive_sibling": null,
+      "historical_test_id": "feature_gated_signature_dedup",
+      "historical_expected_breaking_kinds": ["changed", "changed", "changed", "changed"],
+      "recommended_disposition": "keep the historical tests and approve this separate repo-backed cfg semantic record",
+      "phase_b_operator_effect": "the W0 guard-only fixture becomes a reported Rust change without changing the distinct historical cfg regression contracts"
     },
     {
       "id": "cfg_operand_reordered",
@@ -58,7 +64,11 @@
       "id": "module_scope_changed",
       "family": "module_scope",
       "legacy_expectation": "positive",
-      "legacy_positive_sibling": null
+      "legacy_positive_sibling": null,
+      "historical_test_id": "different_inline_module_removal",
+      "historical_expected_breaking_kinds": ["removed"],
+      "recommended_disposition": "keep the historical scope tests and approve the repo-backed relocation record for this distinct fixture",
+      "phase_b_operator_effect": "same-file module relocation becomes visible in Rust artifacts while historical hunk-scope behavior stays independently guarded"
     },
     {
       "id": "module_scope_unseen_opener",
@@ -83,7 +93,9 @@
       "id": "combining_mark_changed",
       "family": "combining_mark",
       "legacy_expectation": "negative",
-      "legacy_positive_sibling": null
+      "legacy_positive_sibling": null,
+      "recommended_disposition": "approve the repo-backed no-change result as canonical Rust identity truth",
+      "phase_b_operator_effect": "Rust artifacts stop emitting a false breaking change for canonically equivalent combining-mark spelling"
     },
     {
       "id": "combining_mark_distinct",
@@ -101,7 +113,11 @@
       "id": "long_within_cap_changed",
       "family": "line_limit",
       "legacy_expectation": "positive",
-      "legacy_positive_sibling": null
+      "legacy_positive_sibling": null,
+      "historical_test_id": "long_signature_below_old_cap",
+      "historical_expected_breaking_kinds": ["changed"],
+      "recommended_disposition": "retain the historical long-signature regression and approve the independently modeled W0 contract change",
+      "phase_b_operator_effect": "the W0 long declaration change becomes visible through repository parsing; the historical cap regression remains green"
     },
     {
       "id": "long_below_32_line_cut",
@@ -120,7 +136,11 @@
       "id": "move_relocated",
       "family": "move",
       "legacy_expectation": "positive",
-      "legacy_positive_sibling": null
+      "legacy_positive_sibling": null,
+      "historical_test_id": "cross_file_relocation",
+      "historical_expected_breaking_kinds": ["relocated"],
+      "recommended_disposition": "retain the cross-file historical test and approve the distinct repo-backed same-file relocation record",
+      "phase_b_operator_effect": "same-file module moves become explicit relocations without changing cross-file legacy relocation coverage"
     },
     {
       "id": "move_same_path",
@@ -132,7 +152,9 @@
       "id": "reexport_removed",
       "family": "reexport",
       "legacy_expectation": "positive",
-      "legacy_positive_sibling": null
+      "legacy_positive_sibling": null,
+      "recommended_disposition": "approve repo-backed re-export removal as canonical breaking truth",
+      "phase_b_operator_effect": "Rust breaking artifacts will report removed public re-exports instead of relying on the secondary public-API heuristic"
     },
     {
       "id": "reexport_preserved",
@@ -165,7 +187,11 @@
       "family": "item_body",
       "legacy_expectation": "accepted_zero",
       "legacy_positive_sibling": "item_opener_removed",
-      "legacy_delta_rationale": "the diff-only detector paired identical item openers and missed a public field type change"
+      "legacy_delta_rationale": "the diff-only detector paired identical item openers and missed a public field type change",
+      "historical_test_id": "same_inline_module_pairing_noop",
+      "historical_expected_breaking_kinds": [],
+      "recommended_disposition": "retain the historical declaration-pairing test and correct the W0 legacy observation without changing its repo-backed field record",
+      "phase_b_operator_effect": "the field change remains reported, but via a granular canonical field fact rather than the legacy whole-declaration presentation"
     },
     {
       "id": "backslash_literal_changed",
@@ -190,7 +216,11 @@
       "id": "declaration_pairing_noop",
       "family": "declaration_pairing",
       "legacy_expectation": "negative",
-      "legacy_positive_sibling": null
+      "legacy_positive_sibling": null,
+      "historical_test_id": "identical_remove_readd_noop",
+      "historical_expected_breaking_kinds": [],
+      "recommended_disposition": "retain the historical no-op tests and record this fixture's current legacy observation separately from the canonical repo-backed no-op",
+      "phase_b_operator_effect": "the W0 no-op stops producing a legacy false positive while faithful historical no-op scenarios remain independently guarded"
     },
     {
       "id": "legacy_non_api_control",

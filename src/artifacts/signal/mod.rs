@@ -3,6 +3,7 @@
 //! Split from monolithic signal.rs for maintainability.
 //! Each submodule owns one signal domain.
 
+pub mod api_delta;
 pub mod api_surface;
 mod breaking;
 mod checks_log;
