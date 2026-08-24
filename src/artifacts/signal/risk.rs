@@ -13,6 +13,9 @@ use std::path::Path;
 #[derive(Debug, Clone)]
 pub struct FileRiskScore {
     pub path: String,
+    /// Original diff path used for joins. `path` is display-normalized and may
+    /// therefore differ for absolute/off-root inputs.
+    source_path: String,
     pub score: u32,
     pub factors: Vec<&'static str>,
     // Never read on the runtime path: zone aggregation recomputes membership in
@@ -119,7 +122,8 @@ const DOMAIN_ZONES: &[(&str, &[&str])] = &[
 ];
 
 /// Compute risk scores for changed files based on multiple signals (B4).
-/// Returns top 10 files sorted by score descending.
+/// Returns all risky files sorted by score descending. Presentation layers may
+/// take the first 10, but verdict-level aggregation must see the full set.
 ///
 /// Test-only convenience wrapper: every runtime caller goes through
 /// `compute_file_risk_scores_with_root` (context_artifacts.rs, merge_gate.rs)
@@ -243,6 +247,7 @@ pub fn compute_file_risk_scores_with_root(
             };
             scores.push(FileRiskScore {
                 path: normalized,
+                source_path: file.path.clone(),
                 score,
                 factors,
                 zones,
@@ -251,7 +256,6 @@ pub fn compute_file_risk_scores_with_root(
     }
 
     scores.sort_by_key(|entry| std::cmp::Reverse(entry.score));
-    scores.truncate(10);
     scores
 }
 
@@ -263,6 +267,10 @@ pub fn compute_risk_heatmap(diffs: &[Diff], file_scores: &[FileRiskScore]) -> Ri
         .flat_map(|d| &d.files)
         .filter(|f| seen_paths.insert(f.path.as_str()))
         .collect();
+    let risk_by_path: HashMap<&str, u32> = file_scores
+        .iter()
+        .map(|score| (score.source_path.as_str(), score.score))
+        .collect();
     let mut zone_data: HashMap<&'static str, (usize, usize, u32)> = HashMap::new();
 
     for file in &all_files {
@@ -271,11 +279,7 @@ pub fn compute_risk_heatmap(diffs: &[Diff], file_scores: &[FileRiskScore]) -> Ri
         }
         let lower = file.path.to_lowercase();
         let churn = file.additions + file.deletions;
-        let file_risk = file_scores
-            .iter()
-            .find(|s| s.path == file.path)
-            .map(|s| s.score)
-            .unwrap_or(0);
+        let file_risk = risk_by_path.get(file.path.as_str()).copied().unwrap_or(0);
 
         for &(zone_name, keywords) in DOMAIN_ZONES {
             if keywords
@@ -436,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn test_risk_scores_max_10_sorted_descending() {
+    fn test_risk_scores_keep_full_sorted_set_for_aggregation() {
         // Create 15 files, all with hotspot churn and varying deletions
         let files: Vec<FileChange> = (0..15)
             .map(|i| {
@@ -454,7 +458,7 @@ mod tests {
             .collect();
         let diff = mock_diff(files);
         let scores = compute_file_risk_scores(&[diff], &empty_coverage(), &[]);
-        assert!(scores.len() <= 10, "Should return at most 10 results");
+        assert_eq!(scores.len(), 15, "aggregation must retain every risky file");
         // Verify descending order
         for w in scores.windows(2) {
             assert!(
@@ -464,6 +468,35 @@ mod tests {
                 w[1].score
             );
         }
+    }
+
+    #[test]
+    fn risk_heatmap_has_no_top_ten_ceiling() {
+        let files = (0..300)
+            .map(|i| {
+                mock_file_change(
+                    &format!("src/api/handler_{i}.rs"),
+                    FileStatus::Modified,
+                    40,
+                    40,
+                )
+            })
+            .collect();
+        let diff = mock_diff(files);
+        let scores = compute_file_risk_scores(std::slice::from_ref(&diff), &empty_coverage(), &[]);
+        let heatmap = compute_risk_heatmap(&[diff], &scores);
+
+        assert_eq!(scores.len(), 300);
+        assert_eq!(heatmap.total_risk_score, 3_000);
+        assert_eq!(heatmap.risk_level, "high");
+        assert_eq!(
+            heatmap
+                .zones
+                .iter()
+                .find(|zone| zone.name == "api/public")
+                .map(|zone| zone.files_touched),
+            Some(300)
+        );
     }
 
     #[test]

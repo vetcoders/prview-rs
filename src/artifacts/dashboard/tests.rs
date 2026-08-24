@@ -280,6 +280,18 @@ fn test_skipped_checks_rendered() {
 }
 
 #[test]
+fn runtime_skipped_check_renders_operator_disclaimer() {
+    let mut checks = mock_checks();
+    checks[0].status = CheckStatus::Skipped;
+    checks[0].output = "virtual manifest — configure -p demo".to_string();
+    let html = build_checks_section(&checks, &mock_ctx());
+
+    assert!(html.contains("Not executed by this PrView run."));
+    assert!(html.contains("Reason: virtual manifest — configure -p demo."));
+    assert!(html.contains("External CI status not included."));
+}
+
+#[test]
 fn test_file_rows_have_ids() {
     let diff = mock_diff();
     let ctx = mock_ctx();

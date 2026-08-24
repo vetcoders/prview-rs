@@ -841,7 +841,31 @@ fn verdict_on_completed_run_reports_decision() {
     assert!(body["merge_recommendation"].as_str().is_some());
     assert!(body["allow_merge"].is_boolean());
     assert!(body["base_used"].is_array());
-    assert!(body["gates"].is_array());
+    let gates = body["gates"].as_array().expect("gates array");
+    assert!(!gates.is_empty());
+    for field in [
+        "id",
+        "name",
+        "status",
+        "execution_state",
+        "outcome",
+        "class",
+        "severity",
+        "policy_conclusion",
+        "blocking",
+        "merge_impact",
+        "confidence_impact",
+        "duration_secs",
+        "cached",
+        "reason",
+        "evidence",
+        "log",
+    ] {
+        assert!(
+            gates[0].get(field).is_some(),
+            "MCP gate row must preserve the complete MERGE_GATE field {field}"
+        );
+    }
 }
 
 #[test]

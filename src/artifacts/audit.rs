@@ -207,27 +207,197 @@ pub(crate) fn cargo_audit_finding_key(finding: &CargoAuditFinding) -> (String, S
     )
 }
 
+/// Parse a complete cargo-audit report into every advisory-like item, including
+/// informational `warnings` categories. The key includes the locked version so
+/// dependency changes cannot launder a finding as pre-existing.
+///
+/// The outer `Option` distinguishes a valid clean report from truncated output
+/// or a tool error. Treating both as an empty set would manufacture resolved
+/// advisories and a false clean baseline.
+pub(crate) fn cargo_audit_report_advisory_keys(
+    output: &str,
+) -> Option<std::collections::HashSet<(String, String, String)>> {
+    let parsed = extract_embedded_json(output)?;
+    crate::checks::validated_cargo_audit_vulnerability_list(&parsed)?;
+
+    let mut keys: std::collections::HashSet<_> = parse_cargo_audit_findings(output)
+        .iter()
+        .map(cargo_audit_finding_key)
+        .collect();
+    let Some(warnings) = parsed.get("warnings").and_then(|value| value.as_object()) else {
+        return Some(keys);
+    };
+    for entries in warnings.values().filter_map(|value| value.as_array()) {
+        for entry in entries {
+            let Some(advisory_id) = entry
+                .pointer("/advisory/id")
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            let Some(package_name) = entry
+                .pointer("/package/name")
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            let Some(package_version) = entry
+                .pointer("/package/version")
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            keys.insert((
+                advisory_id.to_string(),
+                package_name.to_string(),
+                package_version.to_string(),
+            ));
+        }
+    }
+    Some(keys)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoAuditComparisonContext {
+    base_commit_id: String,
+    base_lock_path: Option<String>,
+    target_lock_path: Option<String>,
+    cargo_cwd: std::path::PathBuf,
+    lock_changed: bool,
+}
+
+fn effective_cargo_lock_path_at_commit(
+    repo: &crate::git::Repository,
+    commit_id: &str,
+    relative_root: &std::path::Path,
+) -> Option<Option<String>> {
+    let member_lock = if relative_root == std::path::Path::new(".") {
+        "Cargo.lock".to_string()
+    } else {
+        relative_root
+            .join("Cargo.lock")
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    match repo.regular_file_at_commit(commit_id, &member_lock) {
+        Ok(true) => return Some(Some(member_lock)),
+        Ok(false) => {}
+        Err(_) => return None,
+    }
+
+    if member_lock == "Cargo.lock" {
+        return Some(None);
+    }
+    match repo.regular_file_at_commit(commit_id, "Cargo.lock") {
+        Ok(true) => Some(Some("Cargo.lock".to_string())),
+        Ok(false) => Some(None),
+        Err(_) => None,
+    }
+}
+
+fn cargo_audit_comparison_context_for_diff(
+    repo: &crate::git::Repository,
+    diff: &crate::git::Diff,
+    cargo_root: Option<&std::path::Path>,
+) -> Option<CargoAuditComparisonContext> {
+    let configured_root = cargo_root.unwrap_or_else(|| repo.path());
+    let normalized = crate::paths::normalize_to_repo_relative(
+        &configured_root.display().to_string(),
+        repo.path(),
+    );
+    if normalized.is_external {
+        return None;
+    }
+    let relative_root = std::path::Path::new(&normalized.display);
+    let cargo_cwd = if relative_root == std::path::Path::new(".") {
+        repo.path().to_path_buf()
+    } else {
+        repo.path().join(relative_root)
+    };
+    let base_lock_path =
+        effective_cargo_lock_path_at_commit(repo, &diff.base_commit_id, relative_root)?;
+    let target_lock_path =
+        effective_cargo_lock_path_at_commit(repo, &diff.target_commit_id, relative_root)?;
+    let lock_changed = base_lock_path != target_lock_path
+        || diff.files.iter().any(|file| {
+            base_lock_path.as_deref() == Some(file.path.as_str())
+                || target_lock_path.as_deref() == Some(file.path.as_str())
+        });
+
+    Some(CargoAuditComparisonContext {
+        base_commit_id: diff.base_commit_id.clone(),
+        base_lock_path,
+        target_lock_path,
+        cargo_cwd,
+        lock_changed,
+    })
+}
+
+fn cargo_audit_comparison_context(
+    repo: &crate::git::Repository,
+    diffs: &[crate::git::Diff],
+    cargo_root: Option<&std::path::Path>,
+) -> Option<CargoAuditComparisonContext> {
+    let mut first_resolved = None;
+    let mut changed = None;
+    for diff in diffs {
+        let Some(context) = cargo_audit_comparison_context_for_diff(repo, diff, cargo_root) else {
+            continue;
+        };
+        if context.lock_changed {
+            if changed.is_some() {
+                // One cargo-audit invocation cannot truthfully classify against
+                // two different historical lockfiles. The caller will preserve
+                // the changed-lock signal but report the baseline unavailable.
+                return None;
+            }
+            changed = Some(context);
+            continue;
+        }
+        first_resolved.get_or_insert(context);
+    }
+    changed.or(first_resolved)
+}
+
+pub(crate) fn cargo_audit_lock_changed(
+    repo: Option<&crate::git::Repository>,
+    diffs: &[crate::git::Diff],
+    cargo_root: Option<&std::path::Path>,
+) -> bool {
+    repo.and_then(|repo| cargo_audit_comparison_context(repo, diffs, cargo_root))
+        .map(|context| context.lock_changed)
+        .unwrap_or_else(|| {
+            diffs
+                .iter()
+                .flat_map(|diff| &diff.files)
+                .any(|file| file.path.ends_with("Cargo.lock"))
+        })
+}
+
 pub(crate) fn get_base_cargo_audit_findings(
     repo: Option<&crate::git::Repository>,
     diffs: &[crate::git::Diff],
+    cargo_root: Option<&std::path::Path>,
 ) -> Option<std::collections::HashSet<(String, String, String)>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
     let repo = repo?;
-
-    let cargo_lock_diff = diffs
-        .iter()
-        .flat_map(|d| &d.files)
-        .find(|f| f.path.ends_with("Cargo.lock"))?;
-
-    let base_commit_id = diffs.first()?.base_commit_id.clone();
+    let context = cargo_audit_comparison_context(repo, diffs, cargo_root)?;
+    if !context.lock_changed {
+        return None;
+    }
+    let cargo_lock_path = context.base_lock_path?;
     let base_content = repo
-        .file_at_commit(&base_commit_id, &cargo_lock_diff.path)
+        .file_at_commit(&context.base_commit_id, &cargo_lock_path)
         .ok()?;
 
+    // cargo-audit explicitly documents `-` as the stdin sentinel for --file.
+    // Keeping the historical lock out of the target worktree avoids making the
+    // baseline comparison mutate or materialise a second checkout.
     let mut child = Command::new("cargo")
         .args(["audit", "--json", "-n", "-q", "-f", "-"])
+        .current_dir(context.cargo_cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -239,22 +409,15 @@ pub(crate) fn get_base_cargo_audit_findings(
     }
 
     let output = child.wait_with_output().ok()?;
-    if let Ok(out_str) = String::from_utf8(output.stdout) {
-        let findings = parse_cargo_audit_findings(&out_str);
-        Some(findings.iter().map(cargo_audit_finding_key).collect())
-    } else {
-        None
-    }
+    let out_str = String::from_utf8(output.stdout).ok()?;
+    cargo_audit_report_advisory_keys(&out_str)
 }
 
 pub(crate) fn parse_cargo_audit_findings(output: &str) -> Vec<CargoAuditFinding> {
     let Some(parsed) = extract_embedded_json(output) else {
         return Vec::new();
     };
-    let Some(entries) = parsed
-        .pointer("/vulnerabilities/list")
-        .and_then(|value| value.as_array())
-    else {
+    let Some(entries) = crate::checks::validated_cargo_audit_vulnerability_list(&parsed) else {
         return Vec::new();
     };
 
@@ -469,6 +632,64 @@ pub(crate) fn append_cargo_audit_findings(
 mod tests {
     use super::*;
 
+    fn commit_fixture(root: &std::path::Path, files: &[(&str, &str)]) -> String {
+        let raw = if root.join(".git").exists() {
+            git2::Repository::open(root).expect("git open")
+        } else {
+            git2::Repository::init(root).expect("git init")
+        };
+        let parent = raw.head().ok().and_then(|head| head.peel_to_commit().ok());
+        for (path, content) in files {
+            let path = root.join(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("fixture parent");
+            }
+            std::fs::write(path, content).expect("fixture write");
+        }
+        let mut index = raw.index().expect("index");
+        for (path, _) in files {
+            index
+                .add_path(std::path::Path::new(path))
+                .expect("index add");
+        }
+        index.write().expect("index write");
+        let tree_id = index.write_tree().expect("tree id");
+        let tree = raw.find_tree(tree_id).expect("tree");
+        let signature =
+            git2::Signature::now("PrView Test", "prview@example.test").expect("signature");
+        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+        raw.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "fixture",
+            &tree,
+            &parents,
+        )
+        .expect("commit")
+        .to_string()
+    }
+
+    fn lock_diff(base: &str, target: &str, paths: &[&str]) -> crate::git::Diff {
+        crate::git::Diff {
+            base: "main".to_string(),
+            target: "feature".to_string(),
+            base_commit_id: base.to_string(),
+            target_commit_id: target.to_string(),
+            files: paths
+                .iter()
+                .map(|path| crate::git::FileChange {
+                    path: (*path).to_string(),
+                    status: crate::git::FileStatus::Modified,
+                    additions: 1,
+                    deletions: 1,
+                })
+                .collect(),
+            stats: Default::default(),
+            commits: vec![],
+        }
+    }
+
     fn finding(advisory_id: &str, package_name: &str, package_version: &str) -> CargoAuditFinding {
         CargoAuditFinding {
             advisory_id: advisory_id.to_string(),
@@ -503,5 +724,161 @@ mod tests {
             base_set.contains(&cargo_audit_finding_key(&unchanged)),
             "an identical (advisory, package, version) stays pre-existing"
         );
+    }
+
+    #[test]
+    fn all_advisory_keys_include_informational_warnings() {
+        let output = r#"{
+          "vulnerabilities":{"list":[]},
+          "warnings":{"unmaintained":[{
+            "advisory":{"id":"RUSTSEC-2024-0001"},
+            "package":{"name":"demo","version":"1.2.3"}
+          }]}
+        }"#;
+        let keys = cargo_audit_report_advisory_keys(output).expect("valid report");
+        assert!(keys.contains(&(
+            "RUSTSEC-2024-0001".to_string(),
+            "demo".to_string(),
+            "1.2.3".to_string()
+        )));
+    }
+
+    #[test]
+    fn malformed_informational_entries_do_not_collapse_into_sentinel_keys() {
+        let output = r#"{
+          "vulnerabilities":{"list":[]},
+          "warnings":{"unmaintained":[
+            {"advisory":{"id":"RUSTSEC-2024-0001"},"package":{"name":"demo"}},
+            {"package":{"name":"demo","version":"1.2.3"}}
+          ]}
+        }"#;
+
+        assert!(
+            cargo_audit_report_advisory_keys(output)
+                .expect("valid report")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn baseline_context_selects_the_configured_cargo_root_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let commit = commit_fixture(
+            tmp.path(),
+            &[
+                ("Cargo.lock", "root"),
+                ("crates/member/Cargo.lock", "member"),
+            ],
+        );
+        let repo = crate::git::Repository::open(tmp.path()).expect("repository");
+        let diff = lock_diff(
+            &commit,
+            &commit,
+            &["Cargo.lock", "crates/member/Cargo.lock"],
+        );
+        let member = tmp.path().join("crates/member");
+
+        let context =
+            cargo_audit_comparison_context(&repo, &[diff], Some(&member)).expect("context");
+        assert_eq!(context.base_commit_id, commit);
+        assert_eq!(
+            context.base_lock_path.as_deref(),
+            Some("crates/member/Cargo.lock")
+        );
+        assert_eq!(
+            context.target_lock_path.as_deref(),
+            Some("crates/member/Cargo.lock")
+        );
+        assert_eq!(context.cargo_cwd, member);
+        assert!(context.lock_changed);
+    }
+
+    #[test]
+    fn baseline_context_falls_back_to_workspace_lock_for_member() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let commit = commit_fixture(
+            tmp.path(),
+            &[
+                ("Cargo.lock", "workspace"),
+                ("crates/member/Cargo.toml", "[package]\nname='member'\n"),
+            ],
+        );
+        let repo = crate::git::Repository::open(tmp.path()).expect("repository");
+        let diff = lock_diff(&commit, &commit, &["Cargo.lock"]);
+        let member = tmp.path().join("crates/member");
+
+        let context =
+            cargo_audit_comparison_context(&repo, &[diff], Some(&member)).expect("context");
+        assert_eq!(context.base_lock_path.as_deref(), Some("Cargo.lock"));
+        assert_eq!(context.target_lock_path.as_deref(), Some("Cargo.lock"));
+        assert_eq!(context.cargo_cwd, member);
+        assert!(context.lock_changed);
+    }
+
+    #[test]
+    fn baseline_context_keeps_the_lock_change_and_base_in_the_same_diff() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first_base = commit_fixture(tmp.path(), &[("Cargo.lock", "shared")]);
+        let second_base = commit_fixture(tmp.path(), &[("Cargo.lock", "other")]);
+        let target = commit_fixture(tmp.path(), &[("Cargo.lock", "shared")]);
+        let repo = crate::git::Repository::open(tmp.path()).expect("repository");
+        let unchanged = lock_diff(&first_base, &target, &["Cargo.toml"]);
+        let changed = lock_diff(&second_base, &target, &["Cargo.lock"]);
+
+        let context = cargo_audit_comparison_context(&repo, &[unchanged, changed], None)
+            .expect("comparison context");
+        assert_eq!(context.base_commit_id, second_base);
+        assert_eq!(context.base_lock_path.as_deref(), Some("Cargo.lock"));
+        assert!(context.lock_changed);
+    }
+
+    #[test]
+    fn baseline_context_rejects_two_changed_multi_base_locks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first_base = commit_fixture(tmp.path(), &[("Cargo.lock", "first")]);
+        let second_base = commit_fixture(tmp.path(), &[("Cargo.lock", "second")]);
+        let target = commit_fixture(tmp.path(), &[("Cargo.lock", "target")]);
+        let repo = crate::git::Repository::open(tmp.path()).expect("repository");
+        let first = lock_diff(&first_base, &target, &["Cargo.lock"]);
+        let second = lock_diff(&second_base, &target, &["Cargo.lock"]);
+
+        assert!(
+            cargo_audit_comparison_context(&repo, &[first.clone(), second.clone()], None).is_none(),
+            "one baseline must not be selected from two changed lock comparisons"
+        );
+        assert!(cargo_audit_lock_changed(
+            Some(&repo),
+            &[first, second],
+            None
+        ));
+    }
+
+    #[test]
+    fn report_keys_reject_failed_or_incomplete_tool_output() {
+        assert!(cargo_audit_report_advisory_keys("").is_none());
+        assert!(cargo_audit_report_advisory_keys("cargo audit failed").is_none());
+        assert!(cargo_audit_report_advisory_keys(r#"{"error":"database unavailable"}"#).is_none());
+
+        let clean = r#"{"vulnerabilities":{"list":[]},"warnings":{}}"#;
+        assert_eq!(
+            cargo_audit_report_advisory_keys(clean),
+            Some(Default::default())
+        );
+    }
+
+    #[test]
+    fn report_keys_and_findings_reject_inconsistent_structural_fields() {
+        let finding = r#"{
+          "advisory":{"id":"RUSTSEC-2024-0001","title":"demo"},
+          "package":{"name":"demo","version":"1.2.3"},
+          "versions":{}
+        }"#;
+        for report in [
+            format!(r#"{{"vulnerabilities":{{"count":99,"list":[{finding}]}}}}"#),
+            format!(r#"{{"vulnerabilities":{{"found":false,"count":1,"list":[{finding}]}}}}"#),
+        ] {
+            assert!(cargo_audit_report_advisory_keys(&report).is_none());
+            assert!(parse_cargo_audit_findings(&report).is_empty());
+        }
     }
 }

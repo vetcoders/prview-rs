@@ -1471,19 +1471,10 @@ fn classify_cargo_audit_status(
     stdout: &str,
     combined: &str,
 ) -> CheckStatus {
-    if let Some(vulnerability_count) = cargo_audit_vulnerability_count(stdout) {
-        if vulnerability_count > 0 {
-            return CheckStatus::Failed;
-        }
-
-        if cargo_audit_has_warnings(stdout, combined) {
-            return CheckStatus::Warnings;
-        }
-
-        if command_succeeded {
-            return CheckStatus::Passed;
-        }
-
+    let Some(vulnerability_count) = cargo_audit_vulnerability_count(stdout) else {
+        return CheckStatus::Failed;
+    };
+    if vulnerability_count > 0 {
         return CheckStatus::Failed;
     }
 
@@ -1492,35 +1483,41 @@ fn classify_cargo_audit_status(
     }
 
     if command_succeeded {
-        return CheckStatus::Passed;
+        CheckStatus::Passed
+    } else {
+        CheckStatus::Failed
     }
-
-    if combined.contains("RUSTSEC-") {
-        return CheckStatus::Failed;
-    }
-
-    CheckStatus::Failed
 }
 
 fn cargo_audit_vulnerability_count(stdout: &str) -> Option<usize> {
     let parsed = serde_json::from_str::<serde_json::Value>(stdout).ok()?;
-    let vulnerabilities = parsed.get("vulnerabilities")?;
+    Some(validated_cargo_audit_vulnerability_list(&parsed)?.len())
+}
 
-    if let Some(count) = vulnerabilities
-        .get("count")
-        .and_then(|value| value.as_u64())
-    {
-        return Some(count as usize);
+/// Return the advisory list only when cargo-audit's redundant structural
+/// fields agree. Both the check classifier and artifact parsers use this gate,
+/// so malformed output cannot fail at execution time and then be laundered as
+/// a clean or pre-existing baseline downstream.
+pub(crate) fn validated_cargo_audit_vulnerability_list(
+    report: &serde_json::Value,
+) -> Option<&[serde_json::Value]> {
+    let vulnerabilities = report.get("vulnerabilities")?;
+    let list = vulnerabilities.get("list")?.as_array()?;
+
+    if let Some(count) = vulnerabilities.get("count") {
+        let count = usize::try_from(count.as_u64()?).ok()?;
+        if count != list.len() {
+            return None;
+        }
     }
 
-    if let Some(list) = vulnerabilities
-        .get("list")
-        .and_then(|value| value.as_array())
+    if let Some(found) = vulnerabilities.get("found")
+        && found.as_bool()? == list.is_empty()
     {
-        return Some(list.len());
+        return None;
     }
 
-    Some(0)
+    Some(list.as_slice())
 }
 
 fn cargo_audit_has_warnings(stdout: &str, output: &str) -> bool {
@@ -2283,6 +2280,34 @@ mod tests {
         let combined = "error: failed to fetch advisory db";
         let status = classify_cargo_audit_status(false, "not-json", combined);
         assert_eq!(status, CheckStatus::Failed);
+    }
+
+    #[test]
+    fn test_cargo_audit_malformed_success_is_failed() {
+        let malformed = r#"{"vulnerabilities":{"count":0}}"#;
+        let status = classify_cargo_audit_status(true, malformed, malformed);
+        assert_eq!(status, CheckStatus::Failed);
+    }
+
+    #[test]
+    fn test_cargo_audit_inconsistent_count_is_failed() {
+        let inconsistent = r#"{"vulnerabilities":{"count":1,"list":[]}}"#;
+        let status = classify_cargo_audit_status(true, inconsistent, inconsistent);
+        assert_eq!(status, CheckStatus::Failed);
+    }
+
+    #[test]
+    fn test_cargo_audit_inconsistent_found_is_failed() {
+        let inconsistent = r#"{"vulnerabilities":{"found":true,"count":0,"list":[]}}"#;
+        let status = classify_cargo_audit_status(true, inconsistent, inconsistent);
+        assert_eq!(status, CheckStatus::Failed);
+    }
+
+    #[test]
+    fn test_cargo_audit_optional_found_preserves_older_valid_reports() {
+        let valid = r#"{"vulnerabilities":{"count":0,"list":[]}}"#;
+        let status = classify_cargo_audit_status(true, valid, valid);
+        assert_eq!(status, CheckStatus::Passed);
     }
 
     #[test]

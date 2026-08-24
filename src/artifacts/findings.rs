@@ -9,6 +9,76 @@ pub(super) struct InlineFindingsSummary {
     pub(super) dashboard_findings: Vec<DashboardFinding>,
 }
 
+pub(super) fn is_operator_finding(finding: &DashboardFinding) -> bool {
+    matches!(finding.level, "error" | "warning")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CargoAuditBaselineCounts {
+    new: usize,
+    preexisting: usize,
+    resolved: usize,
+    unknown: usize,
+    status: &'static str,
+}
+
+fn cargo_audit_baseline_counts(
+    current: Option<&std::collections::HashSet<(String, String, String)>>,
+    cargo_lock_changed: bool,
+    base: Option<&std::collections::HashSet<(String, String, String)>>,
+) -> CargoAuditBaselineCounts {
+    let Some(current) = current else {
+        return CargoAuditBaselineCounts {
+            new: 0,
+            preexisting: 0,
+            resolved: 0,
+            unknown: 0,
+            status: "current-unavailable",
+        };
+    };
+
+    if !cargo_lock_changed {
+        CargoAuditBaselineCounts {
+            new: 0,
+            preexisting: current.len(),
+            resolved: 0,
+            unknown: 0,
+            status: "not-required",
+        }
+    } else if let Some(base) = base {
+        CargoAuditBaselineCounts {
+            new: current.difference(base).count(),
+            preexisting: current.intersection(base).count(),
+            resolved: base.difference(current).count(),
+            unknown: 0,
+            status: "available",
+        }
+    } else {
+        CargoAuditBaselineCounts {
+            new: 0,
+            preexisting: 0,
+            resolved: 0,
+            unknown: current.len(),
+            status: "unavailable",
+        }
+    }
+}
+
+fn cargo_audit_finding_in_diff(
+    key: &(String, String, String),
+    current_report_valid: bool,
+    cargo_lock_changed: bool,
+    base: Option<&std::collections::HashSet<(String, String, String)>>,
+) -> Option<bool> {
+    if !current_report_valid {
+        None
+    } else if !cargo_lock_changed {
+        Some(false)
+    } else {
+        base.map(|known| !known.contains(key))
+    }
+}
+
 /// Effective gate class for the aggregate INLINE_FINDINGS gate.
 ///
 /// The raw `status` field counts *every* SARIF row, so a scan whose findings
@@ -207,44 +277,33 @@ pub(super) fn build_heuristics_gate_check(
     heuristics: Option<&HeuristicsResult>,
 ) -> (serde_json::Value, Option<String>) {
     use serde_json::json;
-
-    let severity = config.policy.severity_for("heuristics_loctree");
-    let (status, class, dead, cycles) = if !config.run_heuristics {
-        ("skipped", GateClass::Skip, 0usize, 0usize)
-    } else if let Some(h) = heuristics {
-        let dead = h.summary.dead_exports;
-        let cycles = h.summary.circular_imports;
-        if h.summary.total_files == 0 {
-            // Loctree ran but scanned no files — treat as SKIP, not PASS
-            ("skipped", GateClass::Skip, dead, cycles)
-        } else if dead > 0 || cycles > 0 {
-            ("warnings", GateClass::Info, dead, cycles)
-        } else {
-            ("passed", GateClass::Pass, dead, cycles)
-        }
-    } else {
-        ("skipped", GateClass::Skip, 0usize, 0usize)
-    };
-
-    let blocking = config.policy.is_blocking(severity, class);
+    let result = super::build_heuristics_check(heuristics, config);
+    let evaluation = crate::policy::engine::PolicyEngine::new(config).evaluate_run(&result);
+    let blocking = matches!(
+        evaluation.merge_impact,
+        crate::policy::engine::MergeRecommendation::Block
+    );
     let blocking_issue = if blocking {
-        Some(format!(
-            "Loctree heuristics (dead_exports={}, cycles={})",
-            dead, cycles
-        ))
+        Some(format!("Loctree heuristics ({})", result.output))
     } else {
         None
     };
 
     let check = json!({
-        "id": "heuristics_loctree",
+        "id": evaluation.check_id,
         "name": "Loctree Heuristics",
-        "status": status,
-        "class": gate_class_to_str(class),
-        "severity": policy_severity_to_str(severity),
+        "status": evaluation.raw_status,
+        "execution_state": evaluation.execution_state,
+        "outcome": evaluation.outcome,
+        "class": gate_class_to_str(evaluation.gate_class),
+        "severity": policy_severity_to_str(evaluation.severity),
+        "policy_conclusion": evaluation.conclusion,
+        "confidence_impact": evaluation.confidence_impact,
+        "merge_impact": evaluation.merge_impact,
         "blocking": blocking,
         "duration_secs": 0.0,
         "cached": false,
+        "reason": evaluation.reason,
         "evidence": "20_quality/heuristics_loctree.result.json",
         "log": "20_quality/heuristics_loctree.log",
     });
@@ -256,8 +315,8 @@ pub(super) fn generate_inline_findings(
     dir: &Path,
     checks: &[CheckResult],
     diffs: &[crate::git::Diff],
-    deps_delta: Option<&signal::DepsDelta>,
     repo: Option<&crate::git::Repository>,
+    cargo_root: Option<&Path>,
 ) -> Result<InlineFindingsSummary> {
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -305,12 +364,112 @@ pub(super) fn generate_inline_findings(
     let mut tool_findings_sets: Vec<ToolFindings> = Vec::new();
 
     for check in checks {
+        let check_id = check_id_from_name(&check.name);
+
+        // Cargo audit has its own structured contract. Process it independently
+        // of the raw check status so a passing head can still report advisories
+        // resolved relative to the base, and never let its JSON fall through to
+        // the generic file:line scraper.
+        if check.name.eq_ignore_ascii_case("cargo audit") {
+            let audit_findings = parse_cargo_audit_findings(&check.output);
+            let current_advisories = cargo_audit_report_advisory_keys(&check.output);
+            let cargo_lock_changed = cargo_audit_lock_changed(repo, diffs, cargo_root);
+            let base_audit_cache = (cargo_lock_changed && current_advisories.is_some())
+                .then(|| get_base_cargo_audit_findings(repo, diffs, cargo_root))
+                .flatten();
+            let baseline = cargo_audit_baseline_counts(
+                current_advisories.as_ref(),
+                cargo_lock_changed,
+                base_audit_cache.as_ref(),
+            );
+
+            dashboard_findings.push(DashboardFinding {
+                level: "note",
+                check_name: "Cargo audit baseline".to_string(),
+                check_id: "cargo_audit_baseline".to_string(),
+                message: format!(
+                    "Cargo audit baseline: status={}, new={}, pre-existing={}, resolved={}, unknown-baseline={}",
+                    baseline.status,
+                    baseline.new,
+                    baseline.preexisting,
+                    baseline.resolved,
+                    baseline.unknown,
+                ),
+                in_diff: Some(false),
+            });
+
+            let location = cargo_audit_location_for_check(check);
+            for finding in &audit_findings {
+                match finding.sarif_level {
+                    "error" => error_count += 1,
+                    "warning" => warning_count += 1,
+                    _ => {}
+                }
+
+                if known_sarif_rules.insert(finding.advisory_id.clone()) {
+                    sarif_rules.push(json!({
+                        "id": finding.advisory_id,
+                        "name": "cargo audit advisory",
+                        "shortDescription": { "text": finding.title },
+                        "helpUri": finding.help_url,
+                        "defaultConfiguration": {
+                            "level": finding.sarif_level
+                        },
+                        "properties": {
+                            "package": finding.package_display(),
+                            "severity": finding.severity,
+                            "patched_versions": finding.patched_versions,
+                        }
+                    }));
+                }
+
+                let current_audit_in_diff = cargo_audit_finding_in_diff(
+                    &cargo_audit_finding_key(finding),
+                    current_advisories.is_some(),
+                    cargo_lock_changed,
+                    base_audit_cache.as_ref(),
+                );
+
+                dashboard_findings.push(DashboardFinding {
+                    level: finding.sarif_level,
+                    check_name: check.name.clone(),
+                    check_id: check_id.clone(),
+                    message: finding.sarif_message(),
+                    in_diff: current_audit_in_diff,
+                });
+
+                sarif_results.push(json!({
+                    "ruleId": finding.advisory_id,
+                    "level": finding.sarif_level,
+                    "message": { "text": finding.sarif_message() },
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": { "uri": &location },
+                            "region": { "startLine": 1 }
+                        }
+                    }],
+                    "partialFingerprints": {
+                        "primaryLocationLineHash": fingerprint(
+                            &finding.advisory_id,
+                            &location,
+                            1,
+                        )
+                    },
+                    "properties": {
+                        "check": "cargo_audit",
+                        "in_diff": current_audit_in_diff,
+                        "package": finding.package_display(),
+                        "severity": finding.severity,
+                    }
+                }));
+            }
+            continue;
+        }
+
         let class = gate_class_for_check(check.status);
         if !matches!(class, GateClass::Fail | GateClass::Info) {
             continue;
         }
-
-        let check_id = check_id_from_name(&check.name);
 
         // Dispatch to structured parsers first.
         match check_id.as_str() {
@@ -382,87 +541,6 @@ pub(super) fn generate_inline_findings(
                 continue;
             }
             _ => {}
-        }
-
-        // Cargo audit: keep existing structured parsing in its own run.
-        if check.name.eq_ignore_ascii_case("cargo audit") {
-            let audit_findings = parse_cargo_audit_findings(&check.output);
-            if !audit_findings.is_empty() {
-                let location = cargo_audit_location_for_check(check);
-                let _audit_in_diff_fallback = is_in_diff("Cargo.lock");
-                let base_audit_cache = get_base_cargo_audit_findings(repo, diffs);
-
-                for finding in &audit_findings {
-                    match finding.sarif_level {
-                        "error" => error_count += 1,
-                        "warning" => warning_count += 1,
-                        _ => {}
-                    }
-
-                    if known_sarif_rules.insert(finding.advisory_id.clone()) {
-                        sarif_rules.push(json!({
-                            "id": finding.advisory_id,
-                            "name": "cargo audit advisory",
-                            "shortDescription": { "text": finding.title },
-                            "helpUri": finding.help_url,
-                            "defaultConfiguration": {
-                                "level": finding.sarif_level
-                            },
-                            "properties": {
-                                "package": finding.package_display(),
-                                "severity": finding.severity,
-                                "patched_versions": finding.patched_versions,
-                            }
-                        }));
-                    }
-
-                    let current_audit_in_diff = if let Some(cache) = &base_audit_cache {
-                        // Version is part of the key (R5-22): a swap between two
-                        // vulnerable versions under the same advisory is NEW, not
-                        // a base finding, so it stays in_diff and keeps gating.
-                        !cache.contains(&cargo_audit_finding_key(finding))
-                    } else if let Some(deps) = deps_delta {
-                        deps.added.contains(&finding.package_name)
-                            || deps.changed.contains(&finding.package_name)
-                    } else {
-                        _audit_in_diff_fallback
-                    };
-
-                    dashboard_findings.push(DashboardFinding {
-                        level: finding.sarif_level,
-                        check_name: check.name.clone(),
-                        check_id: check_id.clone(),
-                        message: finding.sarif_message(),
-                        in_diff: Some(current_audit_in_diff),
-                    });
-
-                    sarif_results.push(json!({
-                        "ruleId": finding.advisory_id,
-                        "level": finding.sarif_level,
-                        "message": { "text": finding.sarif_message() },
-                        "locations": [{
-                            "physicalLocation": {
-                                "artifactLocation": { "uri": &location },
-                                "region": { "startLine": 1 }
-                            }
-                        }],
-                        "partialFingerprints": {
-                            "primaryLocationLineHash": fingerprint(
-                                &finding.advisory_id,
-                                &location,
-                                1,
-                            )
-                        },
-                        "properties": {
-                            "check": "cargo_audit",
-                            "in_diff": current_audit_in_diff,
-                            "package": finding.package_display(),
-                            "severity": finding.severity,
-                        }
-                    }));
-                }
-                continue;
-            }
         }
 
         // Fallback: generic single-result for checks without a parser.
@@ -852,6 +930,85 @@ mod tests {
     }
 
     #[test]
+    fn baseline_metadata_is_not_an_operator_finding() {
+        let metadata = DashboardFinding {
+            level: "note",
+            check_name: "Cargo audit baseline".to_string(),
+            check_id: "cargo_audit_baseline".to_string(),
+            message: "Cargo audit baseline: new=0, pre-existing=1".to_string(),
+            in_diff: Some(false),
+        };
+        assert!(!is_operator_finding(&metadata));
+        assert!(is_operator_finding(&err(Some(true))));
+    }
+
+    #[test]
+    fn cargo_audit_baseline_counts_all_resolved_when_head_is_clean() {
+        let current = std::collections::HashSet::new();
+        let base = std::iter::once((
+            "RUSTSEC-2024-0001".to_string(),
+            "demo".to_string(),
+            "1.2.3".to_string(),
+        ))
+        .collect();
+
+        assert_eq!(
+            cargo_audit_baseline_counts(Some(&current), true, Some(&base)),
+            CargoAuditBaselineCounts {
+                new: 0,
+                preexisting: 0,
+                resolved: 1,
+                unknown: 0,
+                status: "available",
+            }
+        );
+    }
+
+    #[test]
+    fn cargo_audit_unknown_empty_baseline_remains_explicit() {
+        assert_eq!(
+            cargo_audit_baseline_counts(Some(&Default::default()), true, None),
+            CargoAuditBaselineCounts {
+                new: 0,
+                preexisting: 0,
+                resolved: 0,
+                unknown: 0,
+                status: "unavailable",
+            }
+        );
+    }
+
+    #[test]
+    fn cargo_audit_invalid_current_report_cannot_mark_a_finding_preexisting() {
+        let key = (
+            "RUSTSEC-2024-0001".to_string(),
+            "demo".to_string(),
+            "1.2.3".to_string(),
+        );
+        assert_eq!(cargo_audit_finding_in_diff(&key, false, false, None), None);
+    }
+
+    #[test]
+    fn cargo_audit_invalid_current_report_never_masquerades_as_clean() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = [cargo_audit_check(
+            crate::checks::CheckStatus::Warnings,
+            "cargo audit failed before producing JSON",
+        )];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &[], None, None).expect("findings");
+
+        assert_eq!(summary.findings_count, 0);
+        assert_eq!(summary.dashboard_findings.len(), 1);
+        assert!(
+            summary.dashboard_findings[0]
+                .message
+                .contains("status=current-unavailable")
+        );
+        assert!(!tmp.path().join("INLINE_FINDINGS.sarif").exists());
+    }
+
+    #[test]
     fn inline_gate_ignores_preexisting_only_errors() {
         // THREAD 7: raw status is "failed" but every error is pre-existing, so
         // the aggregate gate must not fire (it would block under policy-mode
@@ -973,6 +1130,41 @@ mod tests {
         }
     }
 
+    fn cargo_audit_check(status: crate::checks::CheckStatus, output: &str) -> CheckResult {
+        CheckResult {
+            name: "Cargo audit".to_string(),
+            status,
+            duration: std::time::Duration::from_millis(1),
+            output: output.to_string(),
+            cached: false,
+            provenance: None,
+        }
+    }
+
+    const CLEAN_CARGO_AUDIT: &str =
+        r#"{"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{}}"#;
+    const VULNERABLE_CARGO_AUDIT: &str = r#"{
+        "vulnerabilities": {
+            "found": true,
+            "count": 1,
+            "list": [{
+                "advisory": {"id": "RUSTSEC-2024-0001", "title": "demo advisory"},
+                "package": {"name": "demo", "version": "1.2.3"},
+                "versions": {"patched": [">=1.2.4"]}
+            }]
+        },
+        "warnings": {}
+    }"#;
+    const INFORMATIONAL_CARGO_AUDIT: &str = r#"{
+        "vulnerabilities": {"found": false, "count": 0, "list": []},
+        "warnings": {
+            "unmaintained": [{
+                "advisory": {"id": "RUSTSEC-2024-9999"},
+                "package": {"name": "demo", "version": "1.2.3"}
+            }]
+        }
+    }"#;
+
     fn one_file_diff(path: &str) -> crate::git::Diff {
         crate::git::Diff {
             base: "main".to_string(),
@@ -1025,6 +1217,103 @@ mod tests {
             Some(false),
             "rustfmt header must parse so an out-of-diff file can be downgraded"
         );
+    }
+
+    #[test]
+    fn cargo_audit_informational_only_never_falls_through_to_generic_sarif() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = [cargo_audit_check(
+            crate::checks::CheckStatus::Warnings,
+            INFORMATIONAL_CARGO_AUDIT,
+        )];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &[], None, None).expect("findings");
+
+        assert_eq!(summary.findings_count, 0);
+        assert_eq!(summary.dashboard_findings.len(), 1);
+        assert_eq!(
+            summary.dashboard_findings[0].check_id,
+            "cargo_audit_baseline"
+        );
+        assert!(
+            summary.dashboard_findings[0]
+                .message
+                .contains("pre-existing=1")
+        );
+        assert!(!tmp.path().join("INLINE_FINDINGS.sarif").exists());
+    }
+
+    #[test]
+    fn cargo_audit_passed_still_emits_a_clean_baseline_summary() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = [cargo_audit_check(
+            crate::checks::CheckStatus::Passed,
+            CLEAN_CARGO_AUDIT,
+        )];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &[], None, None).expect("findings");
+
+        assert_eq!(summary.findings_count, 0);
+        assert_eq!(summary.dashboard_findings.len(), 1);
+        assert!(
+            summary.dashboard_findings[0]
+                .message
+                .contains("status=not-required")
+        );
+    }
+
+    #[test]
+    fn cargo_audit_lock_only_unknown_baseline_stays_unclassified() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = [cargo_audit_check(
+            crate::checks::CheckStatus::Failed,
+            VULNERABLE_CARGO_AUDIT,
+        )];
+        let diffs = [one_file_diff("Cargo.lock")];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &diffs, None, None).expect("findings");
+
+        assert!(
+            summary.dashboard_findings[0]
+                .message
+                .contains("status=unavailable")
+        );
+        let advisory = summary
+            .dashboard_findings
+            .iter()
+            .find(|finding| finding.check_id == "cargo_audit")
+            .expect("cargo-audit advisory");
+        assert_eq!(advisory.in_diff, None);
+
+        let sarif: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("INLINE_FINDINGS.sarif")).expect("sarif"),
+        )
+        .expect("parse sarif");
+        assert!(sarif["runs"][0]["results"][0]["properties"]["in_diff"].is_null());
+    }
+
+    #[test]
+    fn cargo_audit_manifest_only_change_keeps_locked_advisory_preexisting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = [cargo_audit_check(
+            crate::checks::CheckStatus::Failed,
+            VULNERABLE_CARGO_AUDIT,
+        )];
+        let diffs = [one_file_diff("Cargo.toml")];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &diffs, None, None).expect("findings");
+
+        assert!(
+            summary.dashboard_findings[0]
+                .message
+                .contains("pre-existing=1")
+        );
+        let advisory = summary
+            .dashboard_findings
+            .iter()
+            .find(|finding| finding.check_id == "cargo_audit")
+            .expect("cargo-audit advisory");
+        assert_eq!(advisory.in_diff, Some(false));
     }
 
     #[test]

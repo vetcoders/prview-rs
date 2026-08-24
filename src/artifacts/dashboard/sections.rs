@@ -1328,11 +1328,24 @@ pub(super) fn build_checks_section(checks: &[CheckResult], ctx: &DashboardContex
         };
 
         let check_anchor = gate.map(|g| g.id.as_str()).unwrap_or("");
+        let runtime_skip_html = if check.status == CheckStatus::Skipped {
+            let reason = check
+                .output
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("reason unavailable");
+            format!(
+                r#"<div class="check-meta" style="margin-top:4px;font-size:11px;color:var(--faint)">Not executed by this PrView run. Reason: {}. External CI status not included.</div>"#,
+                escape_html(reason),
+            )
+        } else {
+            String::new()
+        };
 
         let _ = write!(
             rows,
             r#"<tr class="check-row{ec}" data-check-id="{idx}" id="check-{anchor}">
-    <td><div class="check-name-cell">{arrow}<span class="check-icon {skey}">{icon}</span> {name}{blocking}</div>{prov}</td>
+    <td><div class="check-name-cell">{arrow}<span class="check-icon {skey}">{icon}</span> {name}{blocking}</div>{prov}{skip_note}</td>
     <td><span class="badge {bc}">{status}</span></td>
     <td style="text-align:right; font-family:var(--mono); font-size:12px; color:var(--muted)">{dur}</td>
 </tr>"#,
@@ -1345,6 +1358,7 @@ pub(super) fn build_checks_section(checks: &[CheckResult], ctx: &DashboardContex
             name = escape_html(&check.name),
             blocking = blocking_html,
             prov = prov_html,
+            skip_note = runtime_skip_html,
             bc = check_badge_class(check.status),
             status = escape_html(status_str),
             dur = escape_html(&duration),
@@ -1407,7 +1421,7 @@ pub(super) fn build_checks_section(checks: &[CheckResult], ctx: &DashboardContex
             let _ = write!(
                 items,
                 "<span style=\"display:inline-flex;align-items:center;gap:4px;padding:2px 8px;background:var(--surface-2);border-radius:var(--radius-sm);font-size:11px;font-family:var(--mono)\">\
-                <span class=\"badge badge-muted\" style=\"font-size:9px\">SKIP</span> {} <span style=\"color:var(--faint)\">— {}</span></span>",
+                <span class=\"badge badge-muted\" style=\"font-size:9px\">SKIP</span> {} <span style=\"color:var(--faint)\">— Not executed by this PrView run. Reason: {}. External CI status not included.</span></span>",
                 escape_html(&sc.name),
                 escape_html(&sc.reason),
             );

@@ -934,8 +934,10 @@ pub fn read_generated_at(run_dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Read a run's per-gate check summary (`{id, status, reason, evidence}`) from
-/// `MERGE_GATE.json`. Empty when the file or `checks` array is absent.
+/// Read a run's per-gate check summary from `MERGE_GATE.json`. The MCP row is a
+/// lossless projection of the policy state needed by an agent; it does not
+/// collapse execution, finding, confidence and merge impact into `status`.
+/// Empty when the file or `checks` array is absent.
 pub fn read_gates(run_dir: &Path) -> Vec<serde_json::Value> {
     let gate_path = run_dir.join("00_summary").join("MERGE_GATE.json");
     let Ok(text) = std::fs::read_to_string(&gate_path) else {
@@ -947,18 +949,7 @@ pub fn read_gates(run_dir: &Path) -> Vec<serde_json::Value> {
     value
         .get("checks")
         .and_then(|c| c.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|g| {
-                    serde_json::json!({
-                        "id": g.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                        "status": g.get("status").cloned().unwrap_or(serde_json::Value::Null),
-                        "reason": g.get("reason").cloned().unwrap_or(serde_json::Value::Null),
-                        "evidence": g.get("evidence").cloned().unwrap_or(serde_json::Value::Null),
-                    })
-                })
-                .collect()
-        })
+        .cloned()
         .unwrap_or_default()
 }
 
@@ -976,6 +967,38 @@ mod tests {
             serde_json::to_string_pretty(gate).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn read_gates_preserves_policy_axes() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = serde_json::json!({
+            "id": "semgrep_scan",
+            "name": "Semgrep scan",
+            "status": "warnings",
+            "execution_state": "executed",
+            "outcome": "findings_warning",
+            "class": "INFO",
+            "severity": "warn",
+            "policy_conclusion": "advisory",
+            "blocking": false,
+            "merge_impact": "review_required",
+            "confidence_impact": "degraded",
+            "duration_secs": 1.25,
+            "cached": false,
+            "reason": "partial parse",
+            "evidence": "20_quality/semgrep_scan.result.json",
+            "log": "20_quality/semgrep_scan.log"
+        });
+        write_gate(
+            dir.path(),
+            &serde_json::json!({
+                "checks": [row.clone()]
+            }),
+        );
+
+        let gates = read_gates(dir.path());
+        assert_eq!(gates, vec![row]);
     }
 
     #[test]

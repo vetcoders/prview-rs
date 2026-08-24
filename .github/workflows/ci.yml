@@ -110,6 +110,9 @@ jobs:
   security:
     name: Security Audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       # WHY: quick-xml 0.39 sits in Cargo.lock only through comrak's target-gated (wasm) syntect variant; it is NOT part of the build graph on any release target (proof: cargo tree -i quick-xml empty on x86_64-unknown-linux-gnu and aarch64-apple-darwin) and prview parses no external XML.

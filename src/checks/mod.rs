@@ -25,12 +25,14 @@ mod python;
 mod semgrep;
 mod typescript;
 
+pub(crate) use cargo::validated_cargo_audit_vulnerability_list;
 pub use cargo::{
     CargoAuditCheck, CargoCheck, CargoGeigerCheck, CargoTestCheck, ClippyCheck, RustfmtCheck,
 };
 pub use python::{MypyCheck, PytestCheck, RuffCheck};
 pub use semgrep::SemgrepCheck;
 pub(crate) use semgrep::output_reports_scan_errors as semgrep_output_reports_scan_errors;
+pub(crate) use semgrep::scan_error_paths as semgrep_scan_error_paths;
 pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 
 /// Which tree a check's command actually read.
