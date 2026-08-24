@@ -928,11 +928,15 @@ fn config_box_inner_width(
 fn config_output_columns() -> Option<usize> {
     if io::stdout().is_terminal() {
         crossterm::terminal::size()
-            .map(|(columns, _)| usize::from(columns))
             .ok()
+            .and_then(|(columns, _)| nonzero_terminal_columns(columns))
     } else {
         Some(CONFIG_BOX_FALLBACK_COLUMNS)
     }
+}
+
+fn nonzero_terminal_columns(columns: u16) -> Option<usize> {
+    (columns > 0).then_some(usize::from(columns))
 }
 
 fn split_at_display_width(input: &str, max_width: usize) -> (&str, &str) {
@@ -980,7 +984,6 @@ fn wrap_config_line(input: &str, max_width: usize) -> Vec<String> {
     let leading: String = input.chars().take_while(|ch| *ch == ' ').collect();
     let widest_grapheme = input
         .graphemes(true)
-        .filter(|grapheme| !grapheme.chars().all(char::is_whitespace))
         .map(UnicodeWidthStr::width)
         .max()
         .unwrap_or(1);
@@ -1747,6 +1750,13 @@ mod tests {
     }
 
     #[test]
+    fn config_box_treats_zero_terminal_width_as_unknown() {
+        assert_eq!(nonzero_terminal_columns(0), None);
+        assert_eq!(nonzero_terminal_columns(1), Some(1));
+        assert_eq!(nonzero_terminal_columns(116), Some(116));
+    }
+
+    #[test]
     fn config_box_splitter_keeps_grapheme_clusters_intact() {
         let input = "a👩‍💻e\u{301}b";
         let (first, rest) = split_at_display_width(input, 3);
@@ -1767,6 +1777,18 @@ mod tests {
         assert_eq!(reconstructed, input.replace(' ', ""));
         assert!(reconstructed.contains('\u{a0}'));
         assert!(reconstructed.contains('\u{2003}'));
+    }
+
+    #[test]
+    fn config_box_wide_unicode_whitespace_never_overflows_narrow_terminal() {
+        let lines = wrap_config_line(" \u{3000}", 2);
+
+        assert_eq!(lines, vec!["\u{3000}"]);
+        assert!(
+            lines
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 2)
+        );
     }
 
     #[test]
