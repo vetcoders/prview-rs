@@ -956,8 +956,15 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // call every healthy BLOCK pack inconsistent with itself. It contradicts the
     // decision only when the DERIVED flag disagrees with the stated one.
     let textual_ranks: Vec<u8> = [merge_rank, verdict_rank].into_iter().flatten().collect();
-    let signals_disagree =
-        !normalized_to_block && textual_ranks.iter().any(|&rank| rank != final_rank);
+    let legal_approve_degraded = crate::gate::is_legal_approve_degraded_normalization(
+        merge_rank,
+        verdict_rank,
+        raw_analysis_status.as_deref(),
+        final_rank,
+    );
+    let signals_disagree = !normalized_to_block
+        && !legal_approve_degraded
+        && textual_ranks.iter().any(|&rank| rank != final_rank);
     let allow_contradicts =
         !normalized_to_block && raw_allow.map(|a| a != allow_merge).unwrap_or(false);
     // An ignored signal is itself a normalization: the returned decision is not
@@ -965,7 +972,8 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // situation one level up — the pack was written by a build this one does not
     // fully know, so the read is best-effort and the caveat must be backed by the
     // flag consumers actually branch on.
-    let normalized = signals_disagree
+    let normalized = legal_approve_degraded
+        || signals_disagree
         || allow_contradicts
         || !unknown_signal_caveats.is_empty()
         || !enforcement_caveats.is_empty()

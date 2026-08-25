@@ -1248,6 +1248,25 @@ pub(crate) fn known_analysis_status(s: &str) -> bool {
     matches!(s, "complete" | "degraded" | "incomplete")
 }
 
+/// Whether an approve recommendation is being compatibility-normalized solely
+/// because degraded analysis makes the legacy verdict CONDITIONAL.
+///
+/// This is a legal emitted shape: the product recommendation can remain
+/// `approve` while incomplete scan coverage prevents a clean PASS. Readers
+/// still publish one conservative vocabulary, but must not describe that
+/// compatibility normalization as contradictory evidence.
+pub(crate) fn is_legal_approve_degraded_normalization(
+    merge_rank: Option<u8>,
+    verdict_rank: Option<u8>,
+    analysis_status: Option<&str>,
+    final_rank: u8,
+) -> bool {
+    merge_rank == Some(1)
+        && verdict_rank == Some(2)
+        && analysis_status == Some("degraded")
+        && final_rank == 2
+}
+
 pub fn merge_rec_from_rank(rank: u8) -> &'static str {
     match rank {
         3 => "block",

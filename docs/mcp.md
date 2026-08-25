@@ -238,6 +238,13 @@ into the `PASS` / `CONDITIONAL` surface rather than failing loud. That fold is
 `gate::canonical_verdict`, shared by this adapter, the CLI summary and
 `prview gate`, and it ignores case: a stored `"pass"` reads as `PASS` on every
 surface instead of approving on one and normalizing to `BLOCK` on another.
+One emitted compatibility shape is deliberately not called inconsistent:
+`CONDITIONAL` with `merge_recommendation: "approve"` and
+`analysis_status: "degraded"`. Degraded coverage explains the conservative
+legacy verdict, so both readers publish a normalized `review_required` decision
+without a `core_inconsistency` caveat; MCP still sets `normalized: true` because
+the published recommendation changed. Real contradictions, such as `BLOCK`
+beside `approve` with a complete analysis, remain caveated and conservative.
 
 Schema 2.3 makes the disposition and its typed proof mandatory. The shared
 CLI/MCP reader cross-checks check execution/outcome/confidence/merge axes,

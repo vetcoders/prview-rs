@@ -664,11 +664,19 @@ fn read_merge_gate_summary(output_dir: &Path) -> anyhow::Result<MergeGateSummary
     // unreachable — the rank it contributes is what makes `final_rank == 1`
     // impossible. It is still NAMED in the caveat, so a reader can see which
     // axis forced the downgrade.
-    let textual_ranks = [crate::gate::rank_from_verdict(verdict), recommendation_rank];
-    let axes_disagree = textual_ranks
-        .iter()
-        .flatten()
-        .any(|rank| *rank != final_rank)
+    let verdict_rank = crate::gate::rank_from_verdict(verdict);
+    let textual_ranks = [verdict_rank, recommendation_rank];
+    let legal_approve_degraded = crate::gate::is_legal_approve_degraded_normalization(
+        recommendation_rank,
+        verdict_rank,
+        raw_analysis_status,
+        final_rank,
+    );
+    let axes_disagree = (!legal_approve_degraded
+        && textual_ranks
+            .iter()
+            .flatten()
+            .any(|rank| *rank != final_rank))
         || raw_allow_merge.is_some_and(|allow| allow != (final_rank == 1));
     if !normalized_to_block && axes_disagree {
         caveats.push(format!(
@@ -4451,6 +4459,64 @@ api-router/app/core/cache.py
         assert!(
             !mcp.normalized,
             "a healthy CONDITIONAL pack is a faithful read"
+        );
+    }
+
+    #[test]
+    fn residual_core_consistency() {
+        // A degraded analysis can make the compatibility verdict CONDITIONAL
+        // while the product recommendation remains approve. The emitter writes
+        // this shape for a passing scan with incomplete parse coverage; it is a
+        // normalization boundary, not contradictory evidence.
+        let legal = pack_with_gate(
+            r#"{"verdict":"CONDITIONAL","merge_recommendation":"approve","allow_merge":false,"quality_pass":true,"analysis_status":"degraded","policy_allow_merge":true,"blocking_issues":[]}"#,
+        );
+
+        let cli = read_merge_gate_summary(legal.path()).expect("CLI reads legal degraded pack");
+        assert_eq!(cli.verdict, "CONDITIONAL");
+        assert_eq!(
+            cli.merge_recommendation,
+            crate::policy::engine::MergeRecommendation::ReviewRequired
+        );
+        assert!(!cli.allow_merge);
+        assert!(
+            !cli.caveats
+                .iter()
+                .any(|c| c.starts_with("core_inconsistency:")),
+            "legal approve + degraded normalization is not a contradiction: {:?}",
+            cli.caveats
+        );
+
+        let mcp = crate::mcp::read::read_decision(legal.path()).expect("MCP reads same pack");
+        assert_eq!(mcp.verdict, cli.verdict);
+        assert_eq!(mcp.merge_recommendation, "review_required");
+        assert!(!mcp.allow_merge);
+        assert!(mcp.normalized, "the MCP adapter changed a published axis");
+        assert!(
+            !mcp.caveats.iter().any(|c| c.contains("core_inconsistency")),
+            "MCP must not invent a contradiction: {:?}",
+            mcp.caveats
+        );
+
+        // A genuinely contradictory pack remains fail-honest on both readers.
+        let contradictory = pack_with_gate(
+            r#"{"verdict":"BLOCK","merge_recommendation":"approve","allow_merge":false,"quality_pass":true,"analysis_status":"complete","policy_allow_merge":true,"blocking_issues":[]}"#,
+        );
+        let cli = read_merge_gate_summary(contradictory.path()).expect("CLI reads contradiction");
+        assert_eq!(cli.verdict, "BLOCK");
+        assert!(
+            cli.caveats
+                .iter()
+                .any(|c| c.starts_with("core_inconsistency:"))
+        );
+        let mcp =
+            crate::mcp::read::read_decision(contradictory.path()).expect("MCP reads contradiction");
+        assert_eq!(mcp.verdict, "BLOCK");
+        assert!(mcp.normalized);
+        assert!(
+            mcp.caveats.iter().any(|c| c.contains("core_inconsistency")),
+            "real contradictions remain visible: {:?}",
+            mcp.caveats
         );
     }
 
