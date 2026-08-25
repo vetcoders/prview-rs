@@ -760,7 +760,10 @@ A cache replay is keyed on the substrate of the run REPLAYING it (the cache key
 is content-derived, so a hit is an answer about the tree this run is reviewing)
 while its `origin` names the tree the ORIGINAL execution read, taken from the
 provenance stored beside the entry. The two are deliberately separate: the key is
-what a later stage asks about, the origin is what makes the replay auditable.
+what a later stage asks about, the origin is what makes the replay auditable. It
+also carries `cache_age_secs`, the age of the entry it replayed (see
+`cache/mod.rs`), so a gate reported as passing off a stored answer states how
+stale that answer is.
 
 Skips and replays are decided in the checks stage's *first pass*, which
 necessarily precedes `share_target_snapshot` — the runnable set is what decides
@@ -1822,6 +1825,17 @@ pub fn rust_hash(root: &Path) -> String {
     // Cargo.toml/Cargo.lock hash + Rust source hash, 16-byte digest segments
 }
 ```
+
+A hit also reports `age_secs`: how long ago the entry was published, read from
+the entry file's mtime — an entry is published by a single `rename`, so its mtime
+IS the moment the result became readable. Nothing changed on disk to carry it, so
+a cache warmed by an older prview reports its age too (the legacy layout keeps
+its status file as the entry, and the same mtime answers). `None` when the age is
+unknowable — no metadata, or a timestamp in the future after a clock moved
+backwards — never a fabricated zero. The age travels with the replay into the
+ledger's `Cached` state and out through `RUN.json`'s `ledger` view as
+`cache_age_secs`; it deliberately does NOT enter `CheckResult`, since it is a
+property of the entry, not of the check's verdict.
 
 ## Dependencies
 

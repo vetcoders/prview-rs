@@ -494,13 +494,15 @@ async fn run_all_checks(
             CheckEligibility::Run => {}
         }
 
-        if let Some(result) = load_cached_result(check.as_ref(), config, cache.as_ref()) {
+        if let Some((result, cache_age_secs)) =
+            load_cached_result(check.as_ref(), config, cache.as_ref())
+        {
             let (key_substrate, origin) = replay_substrates(result.provenance.as_ref(), ledger);
             ledger.record(TaskEntry {
                 key: TaskKey::new(check.name(), key_substrate),
                 kind: TaskKind::Check,
                 state: TaskState::Cached {
-                    cache_age_secs: None,
+                    cache_age_secs,
                     origin,
                 },
                 queued_at: None,
@@ -747,13 +749,13 @@ where
             CheckEligibility::Run => {}
         }
 
-        if let Some(result) = load_cached_result(check.as_ref(), config, &cache) {
+        if let Some((result, cache_age_secs)) = load_cached_result(check.as_ref(), config, &cache) {
             let (key_substrate, origin) = replay_substrates(result.provenance.as_ref(), ledger);
             ledger.record(TaskEntry {
                 key: TaskKey::new(check.name(), key_substrate),
                 kind: TaskKind::Check,
                 state: TaskState::Cached {
-                    cache_age_secs: None,
+                    cache_age_secs,
                     origin,
                 },
                 queued_at: None,
@@ -859,7 +861,18 @@ fn build_skipped_check(check: &dyn Check, reason: String) -> SkippedCheck {
     SkippedCheck { id, name, reason }
 }
 
-fn load_cached_result(check: &dyn Check, config: &Config, cache: &Cache) -> Option<CheckResult> {
+/// Replay a stored result, with the age of the entry it came from.
+///
+/// The age rides alongside rather than inside [`CheckResult`]: it is a property
+/// of the cache entry, not of the check's verdict, and the artifacts derived
+/// from a result must not start reporting it as one. The ledger is where it
+/// belongs — "this gate did not run, and the answer it replayed is N seconds
+/// old" is one fact about how the run resolved a task.
+fn load_cached_result(
+    check: &dyn Check,
+    config: &Config,
+    cache: &Cache,
+) -> Option<(CheckResult, Option<u64>)> {
     let cache_key = check.cache_key(config)?;
     let cached = cache.get(check.name(), &cache_key)?;
     let output = cached.output.unwrap_or_default();
@@ -869,14 +882,17 @@ fn load_cached_result(check: &dyn Check, config: &Config, cache: &Cache) -> Opti
         status = CheckStatus::Error;
     }
 
-    Some(CheckResult {
-        name: check.name().to_string(),
-        status,
-        duration: Duration::from_secs(0),
-        output,
-        cached: true,
-        provenance: replayed_provenance(cached.provenance.as_deref()),
-    })
+    Some((
+        CheckResult {
+            name: check.name().to_string(),
+            status,
+            duration: Duration::from_secs(0),
+            output,
+            cached: true,
+            provenance: replayed_provenance(cached.provenance.as_deref()),
+        },
+        cached.age_secs,
+    ))
 }
 
 /// Rebuild the provenance a cache hit is replaying.
@@ -2885,12 +2901,17 @@ test result: ok. 2 passed; 0 failed
         config.repo_root = repo.path().to_path_buf();
         config.quiet = true;
 
-        // A pre-populated entry so the cache-hit path is exercised for real.
+        // A pre-populated entry so the cache-hit path is exercised for real,
+        // aged an hour so the replay has a non-trivial age to report.
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let cache = Cache::with_dir(cache_dir.path().to_path_buf(), true);
         cache
             .set("Mock cached", "cached-key", "passed", Some("replay"), None)
             .expect("seed cache");
+        crate::cache::backdate(
+            &cache.entry_path("Mock cached", "cached-key"),
+            Duration::from_secs(3600),
+        );
 
         let checks: Vec<Box<dyn Check>> = vec![
             Box::new(MockCheck {
@@ -2944,13 +2965,23 @@ test result: ok. 2 passed; 0 failed
         );
 
         let cached = ledger.lookup(&key("Mock cached")).expect("cached check");
-        assert_eq!(
-            cached.state,
+        match cached.state {
             TaskState::Cached {
-                cache_age_secs: None,
-                origin: SubstrateKey::default(),
+                cache_age_secs,
+                origin,
+            } => {
+                assert_eq!(origin, SubstrateKey::default());
+                // The age of the ENTRY that was replayed, not of this run: a
+                // gate reported as passing off a stored answer states how stale
+                // that answer is.
+                let age = cache_age_secs.expect("a replay reports the age of its entry");
+                assert!(
+                    (3600..3660).contains(&age),
+                    "an entry backdated an hour replays as an hour old, got {age}s",
+                );
             }
-        );
+            other => panic!("expected a cache replay, got {other:?}"),
+        }
 
         let skipped_entry = ledger.lookup(&key("Mock skipped")).expect("skipped check");
         assert_eq!(
@@ -3253,9 +3284,13 @@ test result: ok. 2 passed; 0 failed
         let live_prov = live.provenance.expect("live run must carry provenance");
 
         // Pass 2 — served from cache.
-        let hit = load_cached_result(&MockCheck, &config, &cache)
+        let (hit, age_secs) = load_cached_result(&MockCheck, &config, &cache)
             .expect("second pass must hit the cache");
         assert!(hit.cached, "a replay must announce itself as cached");
+        assert!(
+            age_secs.is_some(),
+            "a replay must report how old the entry it replayed is",
+        );
         let hit_prov = hit
             .provenance
             .expect("a cache hit must carry the provenance of the run that filled it");
