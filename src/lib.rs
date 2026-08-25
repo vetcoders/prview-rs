@@ -124,6 +124,11 @@ impl App {
     /// Run the PR review process
     pub async fn run(&self) -> Result<output::Report> {
         use colored::Colorize;
+        // The governor may already be closed before the run starts a single
+        // stage — `--watch` shares one across iterations, and a cancel can land
+        // between `App` construction and here. Asked first so the run does no
+        // work it has already been told to abandon.
+        self.ensure_not_cancelled()?;
         let emit_human_stdout = self.should_emit_human_stdout();
 
         if emit_human_stdout {
@@ -154,38 +159,10 @@ impl App {
         // 3. Check for update mode
         if self.config.update_mode
             && let Some(prev_run) = self.find_previous_run()?
+            && let Some(report) =
+                self.reuse_unchanged_run(&target, &bases, prev_run, emit_human_stdout)?
         {
-            let prev_head = self.read_previous_head(&prev_run)?;
-            let current_head = target.commit_id.clone();
-
-            if commit_ids_match(&prev_head, &current_head) {
-                if emit_human_stdout {
-                    println!(
-                        "{} No new commits since last run (HEAD: {})",
-                        "ℹ".blue(),
-                        git::short_sha(&current_head)
-                    );
-                    println!("{} Previous artifacts: {}", "ℹ".blue(), prev_run.display());
-                    println!("{} Nothing to update.", "ℹ".blue());
-                }
-                return Ok(output::Report {
-                    target: target.name.clone(),
-                    bases: bases.iter().map(|b| b.name.clone()).collect(),
-                    diffs: vec![],
-                    checks: vec![],
-                    heuristics: None,
-                    artifacts_dir: prev_run,
-                    duration: self.start_time.elapsed(),
-                    unchanged: true,
-                });
-            }
-
-            if emit_human_stdout {
-                println!(
-                    "{} Found previous run, updating incrementally...",
-                    "ℹ".blue()
-                );
-            }
+            return Ok(report);
         }
 
         // 4. Generate diffs
@@ -745,6 +722,69 @@ impl App {
         }
     }
 
+    /// The `--update` short circuit: when HEAD has not moved since `prev_run`,
+    /// hand that pack back instead of building a new one.
+    ///
+    /// `Ok(None)` means the previous run is stale and the caller should go on to
+    /// review incrementally.
+    ///
+    /// This is the one early return in [`App::run`] that reaches `main` with a
+    /// report without passing a single `ensure_not_cancelled` — every other gate
+    /// sits after the checks stage. `prepare_refs` runs a `git fetch` that is not
+    /// a registered child of the governor, so `cancel` cannot kill it; a Ctrl-C
+    /// during that fetch on a repo with no new commits printed "^C stopping..."
+    /// and then reused the previous pack, and `main` computed an ACCEPT or a
+    /// BLOCK from it. The gate below is what makes the contract hold here too: a
+    /// run in which cancellation was requested never ends in a verdict, not even
+    /// one it is only quoting from last time.
+    ///
+    /// Split out of `run` so the seam can be driven with a fabricated previous
+    /// run: `find_previous_run` resolves through `PRVIEW_HOME`, and a library
+    /// test must not reach the operator's real one.
+    fn reuse_unchanged_run(
+        &self,
+        target: &git::ResolvedRef,
+        bases: &[git::ResolvedRef],
+        prev_run: std::path::PathBuf,
+        emit_human_stdout: bool,
+    ) -> Result<Option<output::Report>> {
+        use colored::Colorize;
+
+        let prev_head = self.read_previous_head(&prev_run)?;
+        let current_head = target.commit_id.clone();
+
+        if commit_ids_match(&prev_head, &current_head) {
+            self.ensure_not_cancelled()?;
+            if emit_human_stdout {
+                println!(
+                    "{} No new commits since last run (HEAD: {})",
+                    "ℹ".blue(),
+                    git::short_sha(&current_head)
+                );
+                println!("{} Previous artifacts: {}", "ℹ".blue(), prev_run.display());
+                println!("{} Nothing to update.", "ℹ".blue());
+            }
+            return Ok(Some(output::Report {
+                target: target.name.clone(),
+                bases: bases.iter().map(|b| b.name.clone()).collect(),
+                diffs: vec![],
+                checks: vec![],
+                heuristics: None,
+                artifacts_dir: prev_run,
+                duration: self.start_time.elapsed(),
+                unchanged: true,
+            }));
+        }
+
+        if emit_human_stdout {
+            println!(
+                "{} Found previous run, updating incrementally...",
+                "ℹ".blue()
+            );
+        }
+        Ok(None)
+    }
+
     fn find_previous_run(&self) -> Result<Option<std::path::PathBuf>> {
         let artifacts_base = self.config.artifacts_base();
 
@@ -1100,6 +1140,56 @@ mod tests {
             std::fs::read_dir(out.path()).unwrap().count(),
             0,
             "a cancelled watcher regenerates nothing",
+        );
+    }
+
+    /// `--update` is the one path that returns a report without running a
+    /// single stage, and so the one that reached `main` with a verdict while
+    /// the operator was pressing Ctrl-C. The interrupt lands during
+    /// `prepare_refs` — a `git fetch` the governor holds no pid for, so `cancel`
+    /// cannot cut it short — and on a HEAD with no new commits the run then
+    /// handed back the previous pack, from which `main` computed an ACCEPT or a
+    /// BLOCK. The pack itself is fine; claiming a verdict for a cancelled run
+    /// from it is not.
+    ///
+    /// Driven at the seam with a fabricated previous run: `find_previous_run`
+    /// resolves through `PRVIEW_HOME`, which a library test sharing a process
+    /// with every other lib test must not reach for or mutate.
+    #[tokio::test]
+    async fn a_cancelled_update_run_does_not_reuse_a_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let config = reviewable_repo(tmp.path(), out.path());
+        let head = rev_parse(tmp.path(), "HEAD");
+
+        // A previous pack recorded at exactly this HEAD — the input that makes
+        // `--update` short-circuit.
+        let prev = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(prev.path().join("00_summary")).unwrap();
+        std::fs::write(
+            prev.path().join("00_summary/pr-metadata.txt"),
+            format!("HEAD: feature ({head})\n"),
+        )
+        .unwrap();
+
+        let app = crate::App::from_config(config).unwrap();
+        let target = resolved(&head);
+
+        // Uncancelled, the seam does what `--update` exists to do.
+        let reused = app
+            .reuse_unchanged_run(&target, &[], prev.path().to_path_buf(), false)
+            .unwrap()
+            .expect("HEAD has not moved, so the previous pack is reused");
+        assert!(reused.unchanged, "the reused report is the unchanged one");
+        assert_eq!(reused.artifacts_dir, prev.path());
+
+        app.governor().cancel();
+        let err = app
+            .reuse_unchanged_run(&target, &[], prev.path().to_path_buf(), false)
+            .expect_err("a cancelled run must not hand back a pack to take a verdict from");
+        assert!(
+            crate::governor::is_cancellation(&err),
+            "the run must end as cancelled, not as some other failure: {err:?}",
         );
     }
 

@@ -993,8 +993,32 @@ pub async fn run_all_with_events<F>(
 where
     F: Fn(CheckEvent) + Send + Sync,
 {
-    let checks: Vec<Box<dyn Check>> = get_checks_for_profile(config);
-    let cache = Cache::new(config);
+    run_all_checks_with_events(
+        get_checks_for_profile(config),
+        Cache::new(config),
+        config,
+        ledger,
+        governor,
+        on_event,
+    )
+    .await
+}
+
+/// [`run_all_with_events`] with the check set and cache handed in — the same
+/// seam [`run_all_checks`] gives the headless dispatcher, and for the same
+/// reason: a test drives the loop with staged mocks instead of a profile
+/// detection and a `PRVIEW_HOME`-rooted cache.
+async fn run_all_checks_with_events<F>(
+    checks: Vec<Box<dyn Check>>,
+    cache: Cache,
+    config: &Config,
+    ledger: &TaskLedger,
+    governor: &Arc<ResourceGovernor>,
+    on_event: F,
+) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)>
+where
+    F: Fn(CheckEvent) + Send + Sync,
+{
     let mut results = Vec::new();
     let mut skipped = Vec::new();
     let mut runnable_checks: Vec<Box<dyn Check>> = Vec::new();
@@ -1043,19 +1067,18 @@ where
         runnable_checks.push(check);
     }
 
-    // Pre-sync Python venv before running checks, mirroring run_all behaviour.
-    // This keeps venv build time outside the per-check timeout budget.
+    // Pre-sync Python venv before running checks, through the SAME helper the
+    // headless dispatcher uses. It was a bare `run_command_with_timeout` under a
+    // comment claiming to mirror `run_all` — a copy that had stopped mirroring
+    // anything: no child scope, so `cancel` held no pid for the longest command
+    // a run issues, and no gates, so an already-cancelled run still paid for a
+    // cold venv build it would never consume.
     let has_python_checks = runnable_checks
         .iter()
         .any(|c| matches!(c.name(), "Ruff" | "Mypy" | "Pytest"));
     if has_python_checks && config.profile.runs_python_checks() && which::which("uv").is_ok() {
-        let _ = run_command_with_timeout(
-            "uv",
-            &["sync", "--quiet"],
-            &config.repo_root,
-            CHECK_TIMEOUT_SECS,
-        )
-        .await;
+        // `emit: false` — the TUI owns the screen; progress reaches it as events.
+        presync_python_venv(config, governor, false).await?;
     }
 
     // Second pass: run checks in parallel, fire events as they complete.
@@ -1110,13 +1133,30 @@ where
             })
             .collect();
 
-        while let Some(result) = futs.next().await {
-            let result = result?;
-            lock_board(&board).finish(&result.name);
-            on_event(CheckEvent::Completed {
-                result: Box::new(result.clone()),
-            });
-            results.push(result);
+        // Same shape as the headless dispatcher's loop, and for the same reason:
+        // cancellation is its own arm, not a thing noticed the next time a check
+        // happens to finish. A gate with a long timeout that has not spawned a
+        // child yet would otherwise hold the stage open after `cancel` has
+        // already SIGKILLed everything that had. The board condition covers the
+        // empty runnable set — with no futures left, its arm is disabled and a
+        // `select!` would have nothing to wait on but the cancel.
+        while !lock_board(&board).is_empty() {
+            tokio::select! {
+                biased;
+
+                Some(result) = futs.next() => {
+                    let result = result?;
+                    lock_board(&board).finish(&result.name);
+                    on_event(CheckEvent::Completed {
+                        result: Box::new(result.clone()),
+                    });
+                    results.push(result);
+                }
+
+                _ = governor.cancelled() => {
+                    return Err(Cancelled.into());
+                }
+            }
         }
     }
 
@@ -3799,6 +3839,61 @@ test result: ok. 2 passed; 0 failed
         let err = run_all_checks(checks, cache, &config, &ledger, &governor)
             .await
             .expect_err("a cancelled run does not produce results");
+        canceller.await.expect("canceller must not panic");
+
+        assert!(
+            err.downcast_ref::<Cancelled>().is_some(),
+            "the caller has to be able to tell a cancellation from a failure: {err}",
+        );
+    }
+
+    /// The TUI dispatcher is the same loop behind a different front end, and it
+    /// has to end the same way. It was a copy that had drifted: a plain
+    /// `while let` over the futures with no arm for the cancel at all, so a gate
+    /// holding a long timeout kept the stage open after `cancel` had already
+    /// SIGKILLed every child that had spawned.
+    #[tokio::test]
+    async fn a_cancelled_run_stops_the_event_check_loop() {
+        use async_trait::async_trait;
+
+        struct SlowMock;
+
+        #[async_trait]
+        impl Check for SlowMock {
+            fn name(&self) -> &str {
+                "Slow"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                unreachable!("the run is cancelled long before this")
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::with_budget(4, 2));
+
+        let canceller = {
+            let governor = Arc::clone(&governor);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                governor.cancel();
+            })
+        };
+
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(SlowMock)];
+        let err = run_all_checks_with_events(checks, cache, &config, &ledger, &governor, |_| {})
+            .await
+            .expect_err("a cancelled TUI run does not produce results either");
         canceller.await.expect("canceller must not panic");
 
         assert!(

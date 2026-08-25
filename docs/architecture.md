@@ -1075,10 +1075,17 @@ from the cache (an empty runnable set never builds that `select!` loop at all)
 was previously ignored outright. `App::run` would go on to write a pack whose
 context commands were every one of them recorded `cancelled`, return a report,
 and let `main` compute an ACCEPT or a BLOCK from it. `App::ensure_not_cancelled`
-now guards the seams — after the checks, before and after `artifacts::generate`,
-and at the top of a `--watch` iteration — so the run ends in `Cancelled` and exit
-`130` instead. A partial pack may remain on disk as evidence of what got done;
-nothing claims a verdict from it.
+now guards the seams — on entry to `App::run`, after the checks, before and after
+`artifacts::generate`, and at the top of a `--watch` iteration — so the run ends
+in `Cancelled` and exit `130` instead. A partial pack may remain on disk as
+evidence of what got done; nothing claims a verdict from it.
+
+`--update` needs a gate of its own (`App::reuse_unchanged_run`), because it is
+the one path that returns a report without reaching any of the others: an
+interrupt during `prepare_refs` — a `git fetch` that is not a registered child,
+so `cancel` cannot cut it short — followed by a HEAD with no new commits used to
+hand back the *previous* run's pack, and `main` computed an ACCEPT or a BLOCK
+from that. Reusing a pack is still reporting a verdict.
 
 Every child that can be reached this way must be registered, and every child
 prview spawns leads its own process group (`proc::harden` for the async checks,
@@ -1112,7 +1119,11 @@ heuristics stage needs no scope — it spawns no processes; loctree runs in-proc
 behind `spawn_blocking`.
 
 `--tui` is deliberately NOT wrapped: it puts the terminal in raw mode, so Ctrl-C
-arrives as a key event and the TUI owns its own quit path.
+arrives as a key event and the TUI owns its own quit path. Its dispatcher is
+nevertheless held to the same contract as the headless one — same
+`presync_python_venv`, same biased `governor.cancelled()` arm — because it was a
+copy that had drifted back into both of the bugs above while still claiming to
+mirror `run_all`.
 
 **Not yet configurable.** The budget is `available_parallelism()` with no CLI
 flag; an operator knob is a follow-up.

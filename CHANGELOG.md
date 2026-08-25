@@ -40,6 +40,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waited out the full five-minute timeout with `uv` still building. It is now
   registered like every other child, and is not started at all for a run that
   has already been cancelled.
+- `prview --update` no longer reports a verdict for a cancelled run. Every
+  cancellation gate sat after the checks stage, and `--update` returns before
+  reaching it: a Ctrl-C during the initial `git fetch` — which the governor holds
+  no pid for, so it cannot be cut short — on a HEAD with no new commits printed
+  "stopping running tools" and then handed back the *previous* run's pack, which
+  the exit code was computed from. The run is now asked on entry and again before
+  reusing that pack, so it exits `130` like any other cancelled run.
+- The TUI's check dispatcher stops on Ctrl-C the way the headless one does. It
+  was a copy that had drifted back into two already-fixed bugs while its comment
+  still claimed to mirror them: the `uv sync` pre-step ran outside any child
+  scope and with no cancellation gates, and the loop over the running gates had
+  no arm for a cancel at all, so a gate with a long timeout could hold the stage
+  open after every child had been killed. Both paths now go through the shared
+  helper and the shared loop shape.
 - The context stage no longer repeats a gate's work on a JS repository. When the
   gates share an analysis snapshot, the ledger entries that predate it are
   adopted onto that snapshot's revision signature — but the signature was
