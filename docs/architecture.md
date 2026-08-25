@@ -34,6 +34,8 @@ prview-rs/
 │   │   ├── typescript.rs
 │   │   ├── cargo.rs
 │   │   └── python.rs
+│   ├── ledger/
+│   │   └── mod.rs       # Task ledger: one record per unit of work in a run
 │   ├── heuristics/
 │   │   ├── mod.rs       # HeuristicsResult, runner
 │   │   └── loctree.rs   # Loctree heuristic (universal)
@@ -718,6 +720,29 @@ from returning no provenance at all. Making the substrate a *parameter* — a
 `CheckContext` carrying the resolved scan dir and substrate, with `run()` unable
 to look elsewhere — is the 0.8 cut. Until then the guarantee is "every check
 reports where it ran", not "no check can run anywhere else".
+
+### ledger/mod.rs
+
+A run-wide record of every unit of work it considered: one `TaskEntry` per task,
+stating what was resolved (`Run` / `Cached` / `Skipped` / `NotApplicable`) and
+under which `TaskKey`.
+
+The key is deliberately *semantic*: `TaskKey { tool, substrate }`, where `tool`
+is normalised through `check_id::check_id_from_name` and `substrate` is the pair
+(`target_sha`, `TreeState`) the task read. That makes "the same tool on the same
+tree" one key regardless of which surface asked for it — the TypeScript gate and
+a `tsc` context artifact are one task, not two — without a second alias table
+free to drift from `check_id`'s. Both substrate fields are optional, mirroring
+`checks::ScanSubstrate`: an unresolved substrate stays visibly unknown rather
+than being certified as anything.
+
+`TaskLedger` is shared across a run's concurrent tasks by reference; each field
+sits behind its own `Mutex` and no lock is held across an `await`. It also holds
+the run's shared target snapshot (`set_shared_snapshot` / `scan_dir`) so a later
+stage can borrow the same scan directory instead of materialising a second
+worktree.
+
+The ledger observes; it never runs, skips or caches anything itself.
 
 ### mcp/
 

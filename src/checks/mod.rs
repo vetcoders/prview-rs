@@ -40,7 +40,9 @@ pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 /// Provenance without this is not auditable: `cwd` alone cannot tell a reviewer
 /// whether the bytes a gate scanned were the reviewed commit or whatever the
 /// operator happened to have uncommitted on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `Hash` is derived so `TreeState` can be half of a task-ledger substrate key
+// (`crate::ledger::SubstrateKey`) — one enum for "which tree", not two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TreeState {
     /// A tree materialised from THIS repository's objects at the reviewed

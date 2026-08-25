@@ -12,6 +12,7 @@ pub mod config;
 pub mod gate;
 pub mod git;
 pub mod heuristics;
+pub mod ledger;
 pub mod mcp;
 pub mod mdrender;
 pub mod output;
