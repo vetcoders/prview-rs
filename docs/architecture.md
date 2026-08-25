@@ -1005,17 +1005,24 @@ Admission is what makes the distinction real, so the run reports it:
 #### Cancellation path (Ctrl-C)
 
 ```
-SIGINT ─► main::with_cancellation
-             │  first interrupt
-             ▼
-        governor.cancel()
-             ├─► semaphore.close()      ── refuses newcomers AND tasks already waiting
-             ├─► watch::send(true)      ── wakes the dispatcher's select! arm
-             └─► SIGKILL -pgid          ── every registered child's whole process tree
+governor::with_cancellation(work, governor, CtrlC)
+      │
+      ├─ tokio::spawn(supervise)  ── a SEPARATE task, aborted when work returns
+      │        │  first interrupt
+      │        ▼
+      │   governor.cancel()
+      │        ├─► semaphore.close()  ── refuses newcomers AND tasks already waiting
+      │        ├─► watch::send(true)  ── wakes the dispatcher's select! arm
+      │        └─► SIGKILL -pgid      ── every registered child's whole process tree
+      │        │  second interrupt
+      │        ▼
+      │   Interrupts::abandon_run()   ── exit(130) without waiting for the unwind
+      │
+      └─ work.await
              │
              ▼
         checks::run_all returns Err(Cancelled)   ── or the context stage stops admitting
-             │
+             │                                      ── or App::ensure_not_cancelled fires
              ▼
         App::run unwinds through `?`  ── Drop runs: ledger's shared WorktreeSnapshot,
              │                           heuristics AnalysisSnapshots
@@ -1023,11 +1030,36 @@ SIGINT ─► main::with_cancellation
         main exits `CANCELLED_EXIT_CODE` (130 = 128 + SIGINT)
 ```
 
-Cancelling rather than aborting is the whole point: `select!` could simply drop
-the run future, but returning through the ordinary error path is what lets the
-destructors on the way out remove the temporary worktrees a killed process would
-leave on disk. A **second** interrupt is the operator declining to wait for that
-and exits immediately.
+**The supervisor is its own task.** It used to be an arm of the same `select!`
+as the run, which works only while the run keeps yielding. `artifacts::generate`
+is synchronous and polls its children with `std::thread::sleep`, so for the whole
+of the longest stage of a review the task was never polled and NEITHER interrupt
+arm could fire — and `tokio::signal::ctrl_c` had by then replaced SIGINT's
+default disposition, so the terminal could not end the process either. Watching
+from a separate task removes the coupling. `governor::blocking_stage` wraps the
+`artifacts::generate` call for the remaining edge, a runtime with a single worker
+thread: it tells tokio the stage is about to block so the supervisor keeps a
+thread to be polled on. The interrupt source is the `Interrupts` trait rather
+than a direct `ctrl_c()` call, so the state machine is testable without raising a
+real signal at the test harness.
+
+Cancelling rather than aborting is the whole point: the supervisor could simply
+drop the run future, but returning through the ordinary error path is what lets
+the destructors on the way out remove the temporary worktrees a killed process
+would leave on disk. A **second** interrupt is the operator declining to wait for
+that and exits immediately.
+
+**Cancel ⇒ never a verdict.** Only the checks stage watches
+`governor.cancelled()` itself, and it is one stage of several: a cancel arriving
+in the heuristics, in the artifact stage, or in a run whose gates all replayed
+from the cache (an empty runnable set never builds that `select!` loop at all)
+was previously ignored outright. `App::run` would go on to write a pack whose
+context commands were every one of them recorded `cancelled`, return a report,
+and let `main` compute an ACCEPT or a BLOCK from it. `App::ensure_not_cancelled`
+now guards the seams — after the checks, before and after `artifacts::generate`,
+and at the top of a `--watch` iteration — so the run ends in `Cancelled` and exit
+`130` instead. A partial pack may remain on disk as evidence of what got done;
+nothing claims a verdict from it.
 
 Every child that can be reached this way must be registered, and every child
 prview spawns leads its own process group (`proc::harden` for the async checks,

@@ -13,9 +13,17 @@ they must not parse stdout.
 | `1` | `BLOCK` | Block in Warn and Required |
 | `2` | Review-required under `--strict`, or warnings-only with `--strict --fail-on-warnings` | Block in Required |
 | `3` | Gate execution failed before a trustworthy verdict was available | Block in Warn and Required |
+| `130` | The operator cancelled the run (Ctrl-C) | Block in Warn and Required |
 
 Use `prview gate --json` when CI needs a machine-readable summary, artifact
 paths, or SARIF path discovery. Pass/fail still comes from the process exit code.
+
+Exit `130` (128 + SIGINT) is deliberately outside the verdict codes: a cancelled
+run produced no verdict, so reporting `0`, `1` or `2` would claim it did. The
+contract is absolute — once cancellation is requested, the run ends there, even
+if the stage that was interrupted had already written part of a pack. CI never
+sees it, since nothing sends the process an interrupt; a local hook should treat
+it exactly like `3`.
 
 Exit `3` covers every way the run can end without a trustworthy verdict — the
 review failing to execute, and the pack's `00_summary/MERGE_GATE.json` being

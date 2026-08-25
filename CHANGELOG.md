@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Ctrl-C is observed in every phase of a run, including the artifact stage. The
+  interrupt was watched from the same `select!` as the run itself, which only
+  works while the run keeps yielding — `artifacts::generate` is synchronous and
+  polls its children with `std::thread::sleep`, so for the whole of the longest
+  stage of a review neither the first nor the second interrupt could fire, and
+  since `tokio::signal` had replaced SIGINT's default disposition the terminal
+  could not end the process either. The supervisor now watches from its own task.
+- A cancelled run never reports a verdict. Only the checks stage watched for
+  cancellation, so a Ctrl-C arriving during the heuristics or the artifact stage
+  — or during a run whose gates all replayed from the cache, where that stage's
+  wait loop is never built — was ignored: the run finished, wrote a pack whose
+  context commands were all recorded `cancelled`, and exited `0` or `1` on the
+  verdict computed from it. Cancellation is now checked between the stages, so
+  the run ends in exit `130` as the contract says. A partial pack may remain on
+  disk; nothing claims a verdict from it.
+
 ### Added
 
 - Ctrl-C cancels a run instead of killing it. The first interrupt stops the

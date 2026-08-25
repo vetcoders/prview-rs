@@ -124,6 +124,7 @@ generated merge-gate artifact, and exits with the automation contract:
 | `1` | `BLOCK` |
 | `2` | Review-required under `--strict`, or warnings-only with `--strict --fail-on-warnings` |
 | `3` | Gate execution failed before a trustworthy verdict was available |
+| `130` | The operator cancelled the run (Ctrl-C); it produced no verdict |
 
 Use `prview gate --json` for schema-friendly stdout with the verdict, caveats,
 blocking issues, typed `enforcement_disposition`, and artifact paths. A strict

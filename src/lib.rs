@@ -100,6 +100,27 @@ impl App {
         std::sync::Arc::clone(&self.governor)
     }
 
+    /// End the run here if a cancel has been asked for.
+    ///
+    /// The checks stage notices cancellation on its own — it has a `select!` arm
+    /// for it — but it is one stage of several, and a cancel that lands anywhere
+    /// else used to be ignored completely: the heuristics ran, the artifact
+    /// stage wrote a pack whose context commands were all recorded `cancelled`,
+    /// and `main` then computed an exit code from the verdict in it. The
+    /// operator asked the run to stop and was handed an ACCEPT.
+    ///
+    /// So the contract is absolute, and this is what enforces it between the
+    /// stages: a run in which cancellation was requested NEVER ends in a
+    /// verdict. It ends in [`governor::Cancelled`], which `main` turns into
+    /// [`governor::CANCELLED_EXIT_CODE`]. A partial pack may survive on disk —
+    /// it is evidence of what got done — but nothing claims a verdict from it.
+    fn ensure_not_cancelled(&self) -> Result<()> {
+        if self.governor.is_cancelled() {
+            return Err(governor::Cancelled.into());
+        }
+        Ok(())
+    }
+
     /// Run the PR review process
     pub async fn run(&self) -> Result<output::Report> {
         use colored::Colorize;
@@ -200,6 +221,10 @@ impl App {
         } else {
             checks::run_all(&self.config, &ledger, &self.governor).await?
         };
+        // A cancel that arrived while nothing was running — a run whose gates all
+        // replayed from the cache never builds the dispatcher's `select!` loop at
+        // all — reaches the run here and nowhere earlier.
+        self.ensure_not_cancelled()?;
 
         // 6. Run heuristics (loctree-suite)
         // In remote/remote-only mode, use git snapshots for deterministic analysis.
@@ -218,20 +243,31 @@ impl App {
         // 7. Generate artifacts. The ledger is still alive here, and with it the
         // run's shared target snapshot — that is what lets the context
         // generators read the reviewed tree instead of the local checkout.
-        let artifacts_dir = artifacts::generate(artifacts::GenerateInput {
-            config: &self.config,
-            ledger: &ledger,
-            diffs: &diffs,
-            checks: &check_results,
-            heuristics: Some(&heuristics_result),
-            resolved_target: &target,
-            resolved_bases: &bases,
-            run_start: self.start_time,
-            skipped_checks,
-            worktree_clean: self.worktree_clean_at_start,
-            worktree_status_digest: self.worktree_status_digest_at_start.clone(),
-            governor: &self.governor,
+        //
+        // `blocking_stage`: everything below is synchronous and does not yield
+        // for as long as it runs, so the runtime is told to keep a thread free
+        // for the interrupt supervisor.
+        self.ensure_not_cancelled()?;
+        let artifacts_dir = governor::blocking_stage(|| {
+            artifacts::generate(artifacts::GenerateInput {
+                config: &self.config,
+                ledger: &ledger,
+                diffs: &diffs,
+                checks: &check_results,
+                heuristics: Some(&heuristics_result),
+                resolved_target: &target,
+                resolved_bases: &bases,
+                run_start: self.start_time,
+                skipped_checks,
+                worktree_clean: self.worktree_clean_at_start,
+                worktree_status_digest: self.worktree_status_digest_at_start.clone(),
+                governor: &self.governor,
+            })
         })?;
+        // A cancel DURING the artifact stage leaves a pack whose context
+        // commands are all recorded `cancelled`. It is a partial pack, not a
+        // review, so the run must not go on to summarise it as one.
+        self.ensure_not_cancelled()?;
 
         // 8. Build report
         let report = output::Report {
@@ -478,6 +514,9 @@ impl App {
     /// Quick run for watch mode (skip heavy checks)
     async fn run_quick(&self) -> Result<output::Report> {
         let run_started_at = Instant::now();
+        // `--watch` reuses one governor across every iteration, and closing it is
+        // one-way, so a cancelled watcher must not start another pack.
+        self.ensure_not_cancelled()?;
         // `--watch` builds ONE App and then produces a pack per detected edit,
         // so the state frozen at construction describes the tree as it was when
         // the watcher started — by definition not the tree that just changed.
@@ -502,20 +541,23 @@ impl App {
         // and the context generators read the working tree — which is exactly
         // what `--watch` is watching.
         let ledger = ledger::TaskLedger::new();
-        let artifacts_dir = artifacts::generate(artifacts::GenerateInput {
-            config: &self.config,
-            ledger: &ledger,
-            diffs: &diffs,
-            checks: &[],
-            heuristics: None,
-            resolved_target: &target,
-            resolved_bases: &bases,
-            run_start: run_started_at,
-            skipped_checks: vec![],
-            worktree_clean: worktree.clean,
-            worktree_status_digest: worktree.status_digest.clone(),
-            governor: &self.governor,
+        let artifacts_dir = governor::blocking_stage(|| {
+            artifacts::generate(artifacts::GenerateInput {
+                config: &self.config,
+                ledger: &ledger,
+                diffs: &diffs,
+                checks: &[],
+                heuristics: None,
+                resolved_target: &target,
+                resolved_bases: &bases,
+                run_start: run_started_at,
+                skipped_checks: vec![],
+                worktree_clean: worktree.clean,
+                worktree_status_digest: worktree.status_digest.clone(),
+                governor: &self.governor,
+            })
         })?;
+        self.ensure_not_cancelled()?;
 
         Ok(output::Report {
             target: target.name.clone(),
@@ -914,6 +956,88 @@ mod tests {
             provenance["worktree"]["status_digest"].as_str(),
             app.worktree_status_digest_at_start.as_deref(),
             "a re-frozen digest must differ from the watcher's start-of-process one",
+        );
+    }
+
+    /// Build a two-commit repo and a config that reviews `feature` against
+    /// `main`, writing its pack into `out`.
+    fn reviewable_repo(repo: &std::path::Path, out: &std::path::Path) -> crate::Config {
+        git_run(repo, &["init", "-q", "-b", "main"]);
+        git_run(repo, &["config", "user.email", "t@t.t"]);
+        git_run(repo, &["config", "user.name", "T"]);
+        git_run(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn keep() {}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "base"]);
+        git_run(repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("src/lib.rs"), "pub fn keep() {}\n// edit\n").unwrap();
+        git_run(repo, &["commit", "-qam", "feature"]);
+
+        let mut config = test_config();
+        config.repo_root = repo.to_path_buf();
+        config.target = Some("feature".to_string());
+        config.bases = vec!["main".to_string()];
+        config.output_dir = Some(out.to_path_buf());
+        config.run_heuristics = false;
+        config.do_fetch = false;
+        config.quiet = true;
+        config.create_zip = false;
+        config
+    }
+
+    /// The contract behind exit 130, pinned end to end: a run in which
+    /// cancellation was requested NEVER ends in a verdict. The gates stage
+    /// notices a cancel on its own, but it is one stage of several — a cancel
+    /// landing between them used to be ignored outright, and the operator who
+    /// asked the run to stop was handed an ACCEPT or a BLOCK computed from a
+    /// pack the run had kept on building.
+    ///
+    /// Which stage catches it here depends on the machine (semgrep is runnable
+    /// wherever the binary is on `PATH`, whatever the flags say), so this pins
+    /// the outcome rather than the seam. The seam the checks stage cannot cover
+    /// is pinned by `a_cancelled_watch_iteration_produces_no_pack` below, which
+    /// runs no checks at all.
+    #[tokio::test]
+    async fn a_cancelled_run_never_reports_a_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let config = reviewable_repo(tmp.path(), out.path());
+
+        let app = crate::App::from_config(config).unwrap();
+        app.governor().cancel();
+
+        let err = app
+            .run()
+            .await
+            .expect_err("a cancelled run must not return a report to take a verdict from");
+        assert!(
+            crate::governor::is_cancellation(&err),
+            "the run must end as cancelled, not as some other failure: {err:?}",
+        );
+    }
+
+    /// `--watch` shares one governor across every iteration and closing it is
+    /// one-way, so a cancelled watcher must refuse the next pack instead of
+    /// quietly emitting one with an empty context stage.
+    #[tokio::test]
+    async fn a_cancelled_watch_iteration_produces_no_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let config = reviewable_repo(tmp.path(), out.path());
+
+        let app = crate::App::from_config(config).unwrap();
+        app.governor().cancel();
+
+        let err = app
+            .run_quick()
+            .await
+            .expect_err("a cancelled watcher must not regenerate artifacts");
+        assert!(crate::governor::is_cancellation(&err), "{err:?}");
+        assert_eq!(
+            std::fs::read_dir(out.path()).unwrap().count(),
+            0,
+            "nothing may be written for a run that was already cancelled",
         );
     }
 

@@ -17,6 +17,10 @@
 //! every child it spawns registers itself here through [`with_child_scope`], so the
 //! budget shapes when work starts and cancellation reaches what already did.
 
+mod supervisor;
+
+pub use supervisor::{CtrlC, Interrupts, blocking_stage, with_cancellation};
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -71,6 +75,19 @@ impl std::fmt::Display for Cancelled {
 }
 
 impl std::error::Error for Cancelled {}
+
+/// Whether `err` reports a run the operator cancelled.
+///
+/// One reader for the whole codebase: [`Cancelled`] travels as an
+/// [`anyhow::Error`] through `?` and picks up context layers on the way
+/// (`gate review run failed`), so every consumer has to downcast rather than
+/// match on a message. A cancelled run is not a failed run — it produced no
+/// verdict — and each place that mistakes one for the other reports a verdict
+/// the run never reached.
+#[must_use]
+pub fn is_cancellation(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<Cancelled>().is_some()
+}
 
 /// A slice of the run's budget, held for exactly as long as the task runs.
 ///
