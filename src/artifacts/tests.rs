@@ -323,6 +323,7 @@ macro_rules! generate_run_json_test {
             checks: $checks,
             skipped_checks: &[],
             heuristics: $heuristics,
+            diffs: &[],
             resolved_target: $resolved_target,
             resolved_bases: $resolved_bases,
             run_started_at: $run_started_at,
@@ -333,6 +334,87 @@ macro_rules! generate_run_json_test {
             regression: $regression,
         })
     };
+}
+
+fn write_run_json_freshness_fixture(
+    resolved_bases: &[ResolvedRef],
+    diffs: &[Diff],
+) -> serde_json::Value {
+    let config = create_test_config(PolicyConfig::default());
+    let resolved_target = ResolvedRef {
+        name: "feature/runtime-target".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let summary_dir = tempfile::tempdir().expect("summary tempdir");
+
+    generate_run_json(RunJsonInput {
+        dir: summary_dir.path(),
+        artifacts_root: summary_dir.path(),
+        config: &config,
+        checks: &[],
+        skipped_checks: &[],
+        heuristics: None,
+        diffs,
+        resolved_target: &resolved_target,
+        resolved_bases,
+        run_started_at: "2026-08-25T00:00:00Z",
+        total_duration_secs: 1.0,
+        stage_timings: &[],
+        context_artifacts: &[],
+        context_command_timings: &[],
+        regression: None,
+    })
+    .expect("generate RUN.json");
+
+    serde_json::from_str(
+        &std::fs::read_to_string(summary_dir.path().join("RUN.json")).expect("read RUN.json"),
+    )
+    .expect("parse RUN.json")
+}
+
+#[test]
+fn residual_freshness_base_sha() {
+    let resolved_bases = vec![
+        ResolvedRef {
+            name: "origin/main".to_string(),
+            commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            is_remote: true,
+        },
+        ResolvedRef {
+            name: "origin/release".to_string(),
+            commit_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            is_remote: true,
+        },
+    ];
+    let diff = |base: &str, merge_base: &str| Diff {
+        base: base.to_string(),
+        target: "feature/runtime-target".to_string(),
+        base_commit_id: merge_base.to_string(),
+        target_commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        files: vec![],
+        stats: DiffStats::default(),
+        commits: vec![],
+    };
+    let first_merge_base = "1111111111111111111111111111111111111111";
+    let second_merge_base = "2222222222222222222222222222222222222222";
+    let diffs = vec![
+        diff("origin/main", first_merge_base),
+        diff("origin/release", second_merge_base),
+    ];
+
+    let run = write_run_json_freshness_fixture(&resolved_bases, &diffs);
+    assert_eq!(
+        run["freshness"]["base_sha"], first_merge_base,
+        "multi-base compatibility keeps the first actual diff baseline"
+    );
+    assert_ne!(run["freshness"]["base_sha"], resolved_bases[0].commit_id);
+
+    let empty_diff_run = write_run_json_freshness_fixture(&resolved_bases, &[]);
+    assert_eq!(
+        empty_diff_run["freshness"]["base_sha"], resolved_bases[0].commit_id,
+        "without a diff, the first resolved base tip remains the compatibility fallback"
+    );
 }
 
 fn create_test_config(policy: PolicyConfig) -> Config {

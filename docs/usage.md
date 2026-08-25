@@ -513,6 +513,11 @@ confirmed removal.
   entry, kept for older consumers. A `cached: true` row replays the provenance of the earlier run
   that filled the cache entry, and a row with a non-null `skipped` is a gate that was ruled out
   before it ran, with the reason.
+- `00_summary/RUN.json.freshness.base_sha` carries that same first actual diff
+  baseline, so a diverged base records the merge base rather than the named
+  branch tip. Multi-base runs retain the first diff baseline in this scalar
+  compatibility field; when no diff exists, it falls back to the first resolved
+  base tip as before.
 - `PR_REVIEW.md` is a concise review narrative, not a raw log dump.
 - `00_summary/FAILURES_SUMMARY.md` summarizes blocking failures and advisories without copying whole JSON files.
 - When `30_context/INLINE_FINDINGS.sarif` exists, it emits findings per location/advisory and is suitable for annotation integrations.

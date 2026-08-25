@@ -147,6 +147,7 @@ struct RunJsonInput<'a> {
     checks: &'a [CheckResult],
     skipped_checks: &'a [crate::checks::SkippedCheck],
     heuristics: Option<&'a HeuristicsResult>,
+    diffs: &'a [Diff],
     resolved_target: &'a ResolvedRef,
     resolved_bases: &'a [ResolvedRef],
     run_started_at: &'a str,
@@ -762,6 +763,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         checks: &all_checks,
         skipped_checks: &skipped_checks,
         heuristics,
+        diffs,
         resolved_target,
         resolved_bases,
         run_started_at: &run_started_at,
@@ -1373,6 +1375,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
         checks,
         skipped_checks,
         heuristics,
+        diffs,
         resolved_target,
         resolved_bases,
         run_started_at,
@@ -1417,6 +1420,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
     let has_failures = checks.iter().any(|c| c.is_failure());
 
     let generated_at = chrono::Local::now().to_rfc3339();
+    let freshness_bases = provenance_bases(diffs, resolved_bases);
 
     let run = json!({
         "schema_version": "1.0",
@@ -1426,7 +1430,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
         "freshness": {
             "fresh": true,
             "target_sha": resolved_target.commit_id,
-            "base_sha": resolved_bases.first().map(|b| b.commit_id.as_str()).unwrap_or(""),
+            "base_sha": freshness_bases.first().map(|(_, sha)| *sha).unwrap_or(""),
             "generated_at": &generated_at,
         },
         "repo": {
