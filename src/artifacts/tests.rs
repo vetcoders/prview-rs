@@ -3749,7 +3749,8 @@ fn plan_context_artifacts_marks_tauri_info_deferred_for_fast_remote_only() {
         commits: vec![],
     }];
 
-    let decisions = plan_context_artifacts(&config, &diffs, &[]);
+    // No shared snapshot in this fixture, so the reviewed tree is the repo root.
+    let decisions = plan_context_artifacts(&config, &config.repo_root.clone(), &diffs, &[]);
     let tauri_info = decisions
         .iter()
         .find(|decision| decision.key == "tauri_info")

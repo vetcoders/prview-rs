@@ -118,16 +118,18 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
 /// exists.
 ///
 /// Shares its resolution with [`plan_cargo_run`] rather than repeating it, and
-/// materialises nothing: the caller is the error path in the dispatcher, which
-/// has the run-wide snapshot (or the local root) in hand and only needs to know
-/// where within it the command was headed. Collapsing every cargo run to the
-/// snapshot root there would report a directory the command did not run in —
-/// wrong in exactly the workspace-member case the cache key already learned to
+/// materialises nothing: its callers already have the run-wide snapshot (or the
+/// local root) in hand and only need to know where within it a cargo command
+/// belongs — the error path in the dispatcher, which reports the directory the
+/// check was headed for, and the context artifacts, which must run `cargo tree`
+/// in the same place the gates did. Collapsing every cargo run to the snapshot
+/// root there would name a directory the command did not run in — wrong in
+/// exactly the workspace-member case the cache key already learned to
 /// distinguish.
 ///
 /// Best effort by construction: a root the reviewed tree cannot offer falls back
 /// to the scan dir, which is the closest true statement available.
-pub(super) fn planned_cargo_cwd(config: &Config, scan_dir: &Path) -> PathBuf {
+pub(crate) fn planned_cargo_cwd(config: &Config, scan_dir: &Path) -> PathBuf {
     if scan_dir == config.repo_root {
         return cargo_cache_root(config).to_path_buf();
     }

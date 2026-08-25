@@ -2,8 +2,14 @@
 
 use super::*;
 
+/// `scan_root` is the reviewed tree — see [`plan_context_cmds`]. A decision
+/// recorded here says whether an artifact WILL be produced, so it must be taken
+/// against the same tree the generator will read; deciding from the local
+/// checkout would let `RUN.json` promise (or excuse) an artifact the reviewed
+/// snapshot never had the shape for.
 pub(super) fn plan_context_artifacts(
     config: &Config,
+    scan_root: &Path,
     diffs: &[Diff],
     checks: &[CheckResult],
 ) -> Vec<ContextArtifactDecision> {
@@ -12,7 +18,7 @@ pub(super) fn plan_context_artifacts(
     if config.profile.has_tsconfig {
         decisions.push(plan_tsc_trace_artifact(config, diffs, checks));
     }
-    if has_tauri_context(config) {
+    if has_tauri_context(config, scan_root) {
         decisions.push(plan_tauri_info_artifact(config, diffs));
     }
 
@@ -134,11 +140,11 @@ pub(super) fn find_ts_resolution_related_changes(diffs: &[Diff]) -> Vec<String> 
     matches
 }
 
-pub(super) fn has_tauri_context(config: &Config) -> bool {
+pub(super) fn has_tauri_context(config: &Config, scan_root: &Path) -> bool {
     if !config.profile.has_cargo {
         return false;
     }
-    is_tauri_project(&config.repo_root)
+    is_tauri_project(scan_root)
 }
 
 /// Detect whether the repository is actually a Tauri project.
@@ -303,13 +309,59 @@ fn js_exec_cmd(
 /// Skips tools already executed by the checks system.
 pub(super) fn generate_context_artifacts(
     config: &Config,
+    scan_root: &Path,
     checks: &[CheckResult],
     context_dir: &Path,
     emit_human_stdout: bool,
     decisions: &[ContextArtifactDecision],
 ) -> Result<Vec<ContextCommandTiming>> {
+    let cmds = plan_context_cmds(
+        config,
+        scan_root,
+        checks,
+        context_dir,
+        emit_human_stdout,
+        decisions,
+    );
+
+    if cmds.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Run all commands in parallel with a shared timeout
+    Ok(run_context_cmds_parallel(
+        &cmds,
+        CONTEXT_GEN_TIMEOUT_SECS,
+        emit_human_stdout,
+    ))
+}
+
+/// Decide WHICH context commands this run needs and WHERE each one runs.
+///
+/// Split out of [`generate_context_artifacts`] so the decision can be asserted
+/// on without spawning a single process — the execution half is a separate,
+/// already-tested concern.
+///
+/// `scan_root` is the reviewed tree: the run-wide target snapshot when there is
+/// one, the repo root otherwise. It is NOT `config.repo_root`, and the
+/// difference is the whole point. Every command's cwd and every filesystem
+/// probe below reads it, because a `--pr` run's gates judge the PR's snapshot
+/// while these artifacts used to be produced from whatever the operator had
+/// checked out locally — the same pack then carried two different revisions
+/// under one provenance (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). Deciding tool
+/// availability from the local tree while running the tool against the snapshot
+/// would reintroduce the same mixing in a smaller form, so the probes move with
+/// the cwd.
+fn plan_context_cmds(
+    config: &Config,
+    scan_root: &Path,
+    checks: &[CheckResult],
+    context_dir: &Path,
+    emit_human_stdout: bool,
+    decisions: &[ContextArtifactDecision],
+) -> Vec<ContextCmd> {
     let ctx = context_dir.to_path_buf();
-    let repo_root = config.repo_root.clone();
+    let scan_root = scan_root.to_path_buf();
     let has_pnpm = which::which("pnpm").is_ok();
 
     let mut cmds: Vec<ContextCmd> = Vec::new();
@@ -320,12 +372,11 @@ pub(super) fn generate_context_artifacts(
 
     // Cargo profile
     if config.profile.has_cargo {
-        let cwd = config
-            .profile
-            .cargo_root
-            .as_ref()
-            .unwrap_or(&config.repo_root)
-            .clone();
+        // `config.profile.cargo_root` names the LOCAL checkout's cargo root; a
+        // workspace member sits below the scan root, and the reviewed commit may
+        // have moved it. Resolve it the way the cargo gates do so `cargo tree`
+        // reports the crate they judged, not a sibling.
+        let cwd = crate::checks::planned_cargo_cwd(config, &scan_root);
         cmds.push(ContextCmd {
             label: "cargo tree".into(),
             cmd: "cargo".into(),
@@ -344,28 +395,28 @@ pub(super) fn generate_context_artifacts(
             out_file: "cargo-sbom.txt".into(),
         });
 
-        if let Some(cargo_root) = &config.profile.cargo_root {
-            let tauri_dir = if cargo_root.ends_with("src-tauri") {
-                cargo_root.clone()
+        if config.profile.cargo_root.is_some() {
+            let tauri_dir = if cwd.ends_with("src-tauri") {
+                cwd.clone()
             } else {
-                config.repo_root.join("src-tauri")
+                scan_root.join("src-tauri")
             };
             // Only generate tauri artifacts for actual Tauri projects.
             // Checking the directory alone is insufficient (leftover fixtures,
             // partial scaffolds). Require tauri.conf.json/toml, src-tauri/Cargo.toml,
             // or a "tauri" entry in the root Cargo.toml.
-            if is_tauri_project(&config.repo_root) && tauri_dir.exists() {
+            if is_tauri_project(&scan_root) && tauri_dir.exists() {
                 if tauri_info.is_none_or(|decision| decision.generated) {
                     // Resolve a directly-runnable tauri binary; skip the artifact
                     // when none is available rather than reaching npx --no-install,
                     // which still consults npm and can hang until timeout on a
                     // missing CLI (PR #12 review).
-                    if let Some((cmd, args)) = tauri_info_cmd(&repo_root, has_pnpm) {
+                    if let Some((cmd, args)) = tauri_info_cmd(&scan_root, has_pnpm) {
                         cmds.push(ContextCmd {
                             label: "tauri info".into(),
                             cmd,
                             args,
-                            cwd: repo_root.clone(),
+                            cwd: scan_root.clone(),
                             out_dir: ctx.clone(),
                             out_file: "tauri-info.log".into(),
                         });
@@ -397,14 +448,14 @@ pub(super) fn generate_context_artifacts(
         if let Some((cmd, args)) = js_exec_cmd(
             "tsc",
             vec!["--noEmit".into(), "--traceResolution".into()],
-            &repo_root,
+            &scan_root,
             has_pnpm,
         ) {
             cmds.push(ContextCmd {
                 label: "tsc trace".into(),
                 cmd,
                 args,
-                cwd: repo_root.clone(),
+                cwd: scan_root.clone(),
                 out_dir: ctx.clone(),
                 out_file: "tsc-trace.log".into(),
             });
@@ -434,7 +485,7 @@ pub(super) fn generate_context_artifacts(
             label: "npm sbom".into(),
             cmd: sbom_cmd.into(),
             args: sbom_args,
-            cwd: repo_root.clone(),
+            cwd: scan_root.clone(),
             out_dir: ctx.clone(),
             out_file: "npm-sbom.txt".into(),
         });
@@ -462,21 +513,21 @@ pub(super) fn generate_context_artifacts(
                     "-f".into(),
                     "json".into(),
                 ],
-                &repo_root,
+                &scan_root,
                 has_pnpm,
             ) {
                 cmds.push(ContextCmd {
                     label: "eslint json".into(),
                     cmd,
                     args,
-                    cwd: repo_root.clone(),
+                    cwd: scan_root.clone(),
                     out_dir: ctx.clone(),
                     out_file: "eslint.json".into(),
                 });
             }
         }
 
-        if repo_root.join("node_modules/.bin/stylelint").exists() && !checks_ran_stylelint {
+        if scan_root.join("node_modules/.bin/stylelint").exists() && !checks_ran_stylelint {
             cmds.push(ContextCmd {
                 label: "stylelint json".into(),
                 cmd: "sh".into(),
@@ -484,7 +535,7 @@ pub(super) fn generate_context_artifacts(
                     "-c".into(),
                     "pnpm exec stylelint 'src/**/*.css' -f json --allow-empty-input".into(),
                 ],
-                cwd: repo_root.clone(),
+                cwd: scan_root.clone(),
                 out_dir: ctx.clone(),
                 out_file: "stylelint.json".into(),
             });
@@ -505,10 +556,10 @@ pub(super) fn generate_context_artifacts(
         }
 
         // esbuild meta
-        if repo_root.join("node_modules/.bin/esbuild").exists() {
-            let entry = if repo_root.join("src/main.tsx").exists() {
+        if scan_root.join("node_modules/.bin/esbuild").exists() {
+            let entry = if scan_root.join("src/main.tsx").exists() {
                 Some("src/main.tsx")
-            } else if repo_root.join("src/main.ts").exists() {
+            } else if scan_root.join("src/main.ts").exists() {
                 Some("src/main.ts")
             } else {
                 None
@@ -527,14 +578,14 @@ pub(super) fn generate_context_artifacts(
                         meta_arg,
                         "--log-level=error".into(),
                     ],
-                    &repo_root,
+                    &scan_root,
                     has_pnpm,
                 ) {
                     cmds.push(ContextCmd {
                         label: "esbuild meta".into(),
                         cmd,
                         args,
-                        cwd: repo_root.clone(),
+                        cwd: scan_root.clone(),
                         out_dir: ctx.clone(),
                         out_file: String::new(),
                     });
@@ -543,16 +594,7 @@ pub(super) fn generate_context_artifacts(
         }
     }
 
-    if cmds.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Run all commands in parallel with a shared timeout
-    Ok(run_context_cmds_parallel(
-        &cmds,
-        CONTEXT_GEN_TIMEOUT_SECS,
-        emit_human_stdout,
-    ))
+    cmds
 }
 
 /// Spawn all context commands in parallel and poll them with a shared timeout.
@@ -800,8 +842,170 @@ pub(super) fn truncate_on_char_boundary(input: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{js_exec_cmd, tauri_info_cmd};
+    use super::{ContextCmd, js_exec_cmd, plan_context_cmds, tauri_info_cmd};
+    use crate::config::{Config, test_config, test_js_profile};
+    use crate::git::cmd::git_cmd;
+    use crate::ledger::TaskLedger;
     use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// A JS repo whose checked-out `HEAD` is NOT the reviewed target.
+    ///
+    /// `feature` (the target) entries through `src/main.tsx`; `main` (checked
+    /// out locally) entries through `src/main.ts`. The two revisions disagree on
+    /// a fact the context planner reads from disk, which is what makes "which
+    /// tree did this artifact come from" observable at all.
+    fn js_repo_with_off_head_target() -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "prview@example.test"]);
+        run_git(&["config", "user.name", "prview test"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+        fs::create_dir_all(root.join("src")).expect("src");
+        fs::write(root.join("package.json"), "{}\n").expect("package.json");
+        fs::write(root.join("tsconfig.json"), "{}\n").expect("tsconfig.json");
+        fs::write(root.join("src/main.ts"), "export {};\n").expect("main.ts");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "main entry"]);
+
+        run_git(&["checkout", "-q", "-b", "feature"]);
+        run_git(&["rm", "-q", "src/main.ts"]);
+        // `git rm` takes the now-empty directory with it.
+        fs::create_dir_all(root.join("src")).expect("src");
+        fs::write(root.join("src/main.tsx"), "export {};\n").expect("main.tsx");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "tsx entry"]);
+        let out = git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .expect("rev-parse");
+        assert!(out.status.success());
+        let target = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        run_git(&["checkout", "-q", "main"]);
+
+        // Untracked local tooling, the way a real checkout carries it. A
+        // worktree snapshot symlinks this in, so the same binaries resolve on
+        // both sides and only the SOURCE differs between the two trees.
+        let bin = root.join("node_modules/.bin");
+        fs::create_dir_all(&bin).expect("node_modules/.bin");
+        for tool in ["tsc", "eslint", "esbuild", "stylelint"] {
+            fs::write(bin.join(tool), "#!/bin/sh\n").expect("tool stub");
+        }
+
+        (tmp, target)
+    }
+
+    fn js_config(repo_root: &Path) -> Config {
+        let mut config = test_config();
+        config.repo_root = repo_root.to_path_buf();
+        config.profile = test_js_profile(true);
+        config
+    }
+
+    fn plan(config: &Config, scan_root: &Path, ctx: &Path) -> Vec<ContextCmd> {
+        plan_context_cmds(config, scan_root, &[], ctx, false, &[])
+    }
+
+    fn esbuild_entry(cmds: &[ContextCmd]) -> String {
+        let esbuild = cmds
+            .iter()
+            .find(|cmd| cmd.label == "esbuild meta")
+            .expect("the esbuild artifact is planned in both modes");
+        esbuild.args.first().expect("entry point").clone()
+    }
+
+    /// PRV-CONTEXT-SNAPSHOT-PROVENANCE, half two: in a `--pr`-style run the
+    /// gates judge a snapshot of the reviewed commit, but every context command
+    /// used to be pinned to `config.repo_root` — so one pack described two
+    /// revisions at once. Every cwd and every filesystem probe must follow the
+    /// reviewed tree instead.
+    #[test]
+    fn context_commands_run_in_the_reviewed_snapshot_not_the_local_checkout() {
+        let (repo, target) = js_repo_with_off_head_target();
+        let config = js_config(repo.path());
+        let ctx = tempfile::tempdir().expect("context dir");
+
+        let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target)
+            .expect("worktree snapshot of the reviewed commit");
+        let ledger = TaskLedger::new();
+        ledger.set_shared_snapshot(Some(snapshot));
+
+        let scan_root = ledger.scan_dir().expect("the ledger owns the snapshot");
+        let cmds = plan(&config, &scan_root, ctx.path());
+
+        assert!(
+            !cmds.is_empty(),
+            "a JS profile must plan context commands at all"
+        );
+        for cmd in &cmds {
+            assert_eq!(
+                cmd.cwd,
+                scan_root,
+                "{} must run in the reviewed snapshot, not in {}",
+                cmd.label,
+                config.repo_root.display(),
+            );
+            // A tool resolved out of the local checkout would be a second,
+            // quieter way for the local tree to leak back in.
+            if cmd.cmd.contains("node_modules") {
+                assert!(
+                    PathBuf::from(&cmd.cmd).starts_with(&scan_root),
+                    "{} resolved its binary outside the snapshot: {}",
+                    cmd.label,
+                    cmd.cmd,
+                );
+            }
+        }
+        assert_eq!(
+            esbuild_entry(&cmds),
+            "src/main.tsx",
+            "the entry point must be read from the reviewed tree; src/main.ts is \
+             what the LOCAL checkout has",
+        );
+    }
+
+    /// The other half of the same contract: with no shared snapshot — an
+    /// ordinary local review — the reviewed tree IS the repo root, and nothing
+    /// about the previous behaviour may change.
+    #[test]
+    fn context_commands_stay_on_the_repo_root_without_a_shared_snapshot() {
+        let (repo, _target) = js_repo_with_off_head_target();
+        let config = js_config(repo.path());
+        let ctx = tempfile::tempdir().expect("context dir");
+
+        let ledger = TaskLedger::new();
+        assert!(ledger.scan_dir().is_none(), "no snapshot was materialised");
+        let scan_root = ledger
+            .scan_dir()
+            .unwrap_or_else(|| config.repo_root.clone());
+
+        let cmds = plan(&config, &scan_root, ctx.path());
+
+        assert_eq!(scan_root, config.repo_root);
+        for cmd in &cmds {
+            assert_eq!(
+                cmd.cwd, config.repo_root,
+                "{} moved off the repo root",
+                cmd.label
+            );
+        }
+        assert_eq!(
+            esbuild_entry(&cmds),
+            "src/main.ts",
+            "a local review reads the working tree, which entries through main.ts",
+        );
+    }
 
     #[test]
     fn tauri_info_prefers_local_binary_over_npx() {

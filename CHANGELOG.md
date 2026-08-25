@@ -68,6 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `30_context/*` artifacts are now produced from the same reviewed tree the
+  quality gates judged. In `--pr` / `--remote` runs the gates scanned a snapshot
+  of the reviewed commit while the context generators (`cargo tree`, `tsc
+  --traceResolution`, `eslint`, `npm`/`pnpm` SBOM, `stylelint`, `esbuild`,
+  `tauri info`) ran against the operator's local checkout, so one pack could
+  describe two different revisions. The run's shared target snapshot is now
+  owned by the task ledger and stays alive through artifact generation, and
+  every context command's working directory — plus the filesystem probes that
+  decide which commands to plan at all — follows it. Local reviews are
+  unaffected: there the repo root is the reviewed tree.
+
 - The human-readable `PRVIEW CONFIG` panel now caps itself to the active
   terminal width and wraps long refs and preset notes before drawing its right
   wall. Narrow panes no longer let the terminal wrap border glyphs onto stray

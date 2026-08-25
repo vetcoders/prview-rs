@@ -159,7 +159,8 @@ impl App {
 
         // 5. Run checks (reduced set in update mode).
         // The ledger is the run's record of what work was considered and how it
-        // resolved. It is written here and read by nothing yet.
+        // resolved. It also OWNS the run's shared target snapshot, so it must
+        // outlive artifact generation (step 7), which reads that snapshot.
         let ledger = ledger::TaskLedger::new();
         let (check_results, skipped_checks) = if self.config.update_mode {
             // In update mode, skip heavy checks UNLESS user explicitly forced them
@@ -196,9 +197,12 @@ impl App {
             heuristics::run_all(&self.config, None).await?
         };
 
-        // 7. Generate artifacts
+        // 7. Generate artifacts. The ledger is still alive here, and with it the
+        // run's shared target snapshot — that is what lets the context
+        // generators read the reviewed tree instead of the local checkout.
         let artifacts_dir = artifacts::generate(artifacts::GenerateInput {
             config: &self.config,
+            ledger: &ledger,
             diffs: &diffs,
             checks: &check_results,
             heuristics: Some(&heuristics_result),
@@ -474,9 +478,14 @@ impl App {
             .repo
             .generate_diffs(&target, &diff_bases, self.config.quiet)?;
 
-        // Skip checks and heuristics in quick mode
+        // Skip checks and heuristics in quick mode. No checks run, so no shared
+        // snapshot is ever materialised: an empty ledger is the honest input,
+        // and the context generators read the working tree — which is exactly
+        // what `--watch` is watching.
+        let ledger = ledger::TaskLedger::new();
         let artifacts_dir = artifacts::generate(artifacts::GenerateInput {
             config: &self.config,
+            ledger: &ledger,
             diffs: &diffs,
             checks: &[],
             heuristics: None,

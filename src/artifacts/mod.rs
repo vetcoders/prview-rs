@@ -51,6 +51,7 @@ use crate::config::Config;
 use crate::git::git_cmd;
 use crate::git::{Diff, Repository, ResolvedRef};
 use crate::heuristics::HeuristicsResult;
+use crate::ledger::TaskLedger;
 use crate::paths::{read_dir_within, read_to_string_within, read_within};
 use crate::policy::{GateClass, PolicySeverity};
 use crate::regression;
@@ -121,6 +122,13 @@ struct ContextCommandTiming {
 
 pub struct GenerateInput<'a> {
     pub config: &'a Config,
+    /// The run's task ledger — here for the ONE fact the artifact stage cannot
+    /// derive on its own: which tree the run actually reviewed. `config` never
+    /// learns it, because the shared target snapshot is installed on a clone of
+    /// the config inside `checks::run_all`; without the ledger the context
+    /// generators fall back to the local checkout and a `--pr` pack ends up
+    /// mixing two revisions (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`).
+    pub ledger: &'a TaskLedger,
     pub diffs: &'a [Diff],
     pub checks: &'a [CheckResult],
     pub heuristics: Option<&'a HeuristicsResult>,
@@ -323,6 +331,7 @@ pub(super) fn build_heuristics_check(
 pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let GenerateInput {
         config,
+        ledger,
         diffs,
         checks,
         heuristics,
@@ -344,7 +353,16 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let heuristics_check = build_heuristics_check(heuristics, config);
     let mut all_checks: Vec<CheckResult> = checks.to_vec();
     all_checks.push(heuristics_check);
-    let context_artifacts = plan_context_artifacts(config, diffs, &all_checks);
+    // The reviewed tree, not the local one: in a `--pr` run the checks judged a
+    // snapshot of the PR's commit, and the 30_context artifacts must be planned
+    // and produced from the same bytes or the pack describes two revisions at
+    // once (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). Falling back to `repo_root` is
+    // the honest answer for a local review and for any run where no shared
+    // snapshot was materialised — there, the repo root IS the reviewed tree.
+    let context_scan_root = ledger
+        .scan_dir()
+        .unwrap_or_else(|| config.repo_root.clone());
+    let context_artifacts = plan_context_artifacts(config, &context_scan_root, diffs, &all_checks);
 
     let emit_human_stdout = !config.json && !config.quiet;
     let out_dir = config.allocate_artifacts_dir_for_commit(&resolved_target.commit_id)?;
@@ -712,10 +730,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         stage_timings.push(finish_timing(emit_human_stdout, "report.json", t));
     }
 
-    // 30_context/ — profile-specific artifacts (with timeouts, skip duplicates)
+    // 30_context/ — profile-specific artifacts (with timeouts, skip duplicates).
+    // Runs against `context_scan_root`, the same reviewed tree the decisions
+    // above were planned from.
     let t = Instant::now();
     let context_command_timings = generate_context_artifacts(
         config,
+        &context_scan_root,
         &all_checks,
         &context_dir,
         emit_human_stdout,

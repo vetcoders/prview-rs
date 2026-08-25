@@ -118,9 +118,11 @@ pub struct TaskEntry {
 #[derive(Default)]
 pub struct TaskLedger {
     entries: Mutex<Vec<TaskEntry>>,
-    /// The one target snapshot the run shares. Materialising it is still the
-    /// caller's job today; the ledger only holds it so a later stage can borrow
-    /// the same scan directory instead of building a second worktree.
+    /// The one target snapshot the run shares. Materialising it stays the
+    /// dispatcher's job, but OWNING it is the ledger's: the ledger outlives
+    /// every stage, so a snapshot parked here is still on disk when the artifact
+    /// stage asks for [`TaskLedger::scan_dir`], instead of having been dropped
+    /// with the frame that created it.
     shared_snapshot: Mutex<Option<WorktreeSnapshot>>,
     resolved_substrate: Mutex<Option<SubstrateKey>>,
 }

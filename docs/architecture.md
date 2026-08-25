@@ -737,10 +737,14 @@ free to drift from `check_id`'s. Both substrate fields are optional, mirroring
 than being certified as anything.
 
 `TaskLedger` is shared across a run's concurrent tasks by reference; each field
-sits behind its own `Mutex` and no lock is held across an `await`. It also holds
-the run's shared target snapshot (`set_shared_snapshot` / `scan_dir`) so a later
-stage can borrow the same scan directory instead of materialising a second
-worktree.
+sits behind its own `Mutex` and no lock is held across an `await`.
+
+The ledger also **owns** the run's shared target snapshot
+(`set_shared_snapshot` / `scan_dir`). Materialising it stays the check
+dispatcher's job, but the handle lives here because the ledger outlives every
+stage: a snapshot parked in it is still on disk when artifact generation asks
+where the reviewed tree is, instead of having been dropped with the frame that
+created it.
 
 The ledger observes; it never runs, skips or caches anything itself.
 
@@ -750,8 +754,29 @@ The ledger observes; it never runs, skips or caches anything itself.
 duration the result reports. A check that ran is keyed on the substrate its OWN
 provenance names — the tree it actually read — so no second resolution can
 contradict it; a check with no provenance falls back to the run's resolved
-substrate, and to unknown when that is unset too. The ledger is currently
-write-only: nothing outside its tests reads it back.
+substrate, and to unknown when that is unset too. The entries themselves are
+still write-only: nothing outside the ledger's tests reads them back.
+
+#### One reviewed tree per run
+
+`share_target_snapshot` (in `checks/mod.rs`) resolves the run's scan directory
+once, points the checks' config clone at it via `scan_dir_override`, records the
+resolved substrate on the ledger, and hands the ledger the snapshot handle.
+`artifacts::generate` takes the ledger in its `GenerateInput` and resolves the
+context generators' root as `ledger.scan_dir()`, falling back to
+`config.repo_root`.
+
+This is what keeps a pack describing ONE revision. `scan_dir_override` is set on
+a *clone* of the config inside `run_all`, so `App::run`'s own config never learns
+about the snapshot; before the ledger owned the handle, the worktree was also
+deleted when `run_all` returned. A `--pr` run therefore had its gates judge the
+reviewed snapshot while `30_context/*` was produced from whatever the operator
+had checked out locally (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). Every context
+command's cwd and every filesystem probe that decides which commands to plan now
+read the reviewed tree; a local review resolves to the repo root, which *is* the
+reviewed tree, so its behaviour is unchanged. Cargo context commands resolve
+their directory through `checks::planned_cargo_cwd`, the same resolution the
+cargo gates use, so a workspace member is not collapsed to the snapshot root.
 
 ### mcp/
 

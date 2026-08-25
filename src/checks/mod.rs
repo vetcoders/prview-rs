@@ -26,6 +26,7 @@ mod python;
 mod semgrep;
 mod typescript;
 
+pub(crate) use cargo::planned_cargo_cwd;
 pub(crate) use cargo::validated_cargo_audit_vulnerability_list;
 pub use cargo::{
     CargoAuditCheck, CargoCheck, CargoGeigerCheck, CargoTestCheck, ClippyCheck, RustfmtCheck,
@@ -545,10 +546,10 @@ async fn run_all_checks(
         // snapshot-backed check reuses it instead of creating (and cleaning up)
         // its own worktree (thread 1). On failure, leave the override unset so
         // each check falls back to resolving its own plan — the original
-        // per-check behaviour. `_shared_snapshot` stays alive until every check
-        // has finished.
+        // per-check behaviour. The ledger owns the snapshot, so the reviewed
+        // tree survives this frame and the artifact stage can still read it.
         let mut config = config.clone();
-        let _shared_snapshot = share_target_snapshot(&mut config, &runnable_checks);
+        share_target_snapshot(&mut config, &runnable_checks, ledger);
 
         // Launch all checks in parallel, stream results as they complete.
         // Cargo checks share one target/ build lock, so they serialize on a
@@ -766,9 +767,10 @@ where
             });
         }
 
-        // One shared target snapshot for the whole run (thread 1); see run_all.
+        // One shared target snapshot for the whole run, owned by the ledger so
+        // it outlives this frame (thread 1); see run_all.
         let mut config = config.clone();
-        let _shared_snapshot = share_target_snapshot(&mut config, &runnable_checks);
+        share_target_snapshot(&mut config, &runnable_checks, ledger);
 
         let config = Arc::new(config);
         let cache = Arc::new(cache);
@@ -1175,29 +1177,42 @@ pub fn off_head_target_commit(config: &Config) -> Option<String> {
     (target.commit_id != head).then_some(target.commit_id)
 }
 
-/// Materialise ONE target snapshot for the whole run and point `config` at it, so
-/// every snapshot-backed check reuses a single worktree instead of creating its
-/// own (thread 1). Returns the snapshot handle for the caller to keep alive until
-/// all checks finish; `None` (leaving `scan_dir_override` unset) when no runnable
-/// check needs a snapshot, or when snapshot creation fails — in which case each
-/// check falls back to resolving its own plan, the original per-check behaviour.
+/// Materialise ONE target snapshot for the whole run, point `config` at it and
+/// hand its ownership to the ledger (thread 1).
+///
+/// The snapshot used to be returned to a local binding in the dispatcher, which
+/// meant it — and the reviewed tree it holds on disk — died when `run_all`'s
+/// frame ended. Everything downstream of the checks (the context artifacts most
+/// of all) therefore had no reviewed tree left to read and silently fell back to
+/// the local checkout, which in a `--pr` run is a different revision entirely
+/// (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). The ledger outlives the whole run, so
+/// giving it the handle makes ONE snapshot the substrate of every stage instead
+/// of just the gates.
+///
+/// Nothing is installed (`scan_dir_override` stays unset, the ledger keeps no
+/// snapshot) when no runnable check needs one, or when snapshot creation fails —
+/// in which case each check falls back to resolving its own plan and later
+/// stages fall back to the repo root, the original per-check behaviour.
 fn share_target_snapshot(
     config: &mut Config,
     runnable_checks: &[Box<dyn Check>],
-) -> Option<crate::git::WorktreeSnapshot> {
+    ledger: &TaskLedger,
+) {
     if !runnable_checks
         .iter()
         .any(|c| uses_shared_scan_dir(c.name()))
     {
-        return None;
+        return;
     }
-    match plan_check_run(config) {
-        Ok(plan) => {
-            config.scan_dir_override = Some(plan.scan_dir.clone());
-            plan._snapshot
-        }
-        Err(_) => None,
-    }
+    let Ok(plan) = plan_check_run(config) else {
+        return;
+    };
+    config.scan_dir_override = Some(plan.scan_dir.clone());
+    // The run-wide substrate is the tree identity of the shared scan dir, with
+    // no per-command scaffolding judgement: a check that ran reports its own,
+    // finer provenance and overrides this in `ledger_substrate`.
+    ledger.set_substrate(resolve_scan_substrate(&plan.scan_dir, &config.repo_root, &[]).into());
+    ledger.set_shared_snapshot(plan._snapshot);
 }
 
 /// Security checks stay loud: a spawn failure here is NOT downgraded to Skipped
@@ -1613,6 +1628,88 @@ mod tests {
         (tmp, sha)
     }
 
+    /// A repo whose checked-out `HEAD` is NOT the reviewed target: `main` holds
+    /// revision "one", `feature` holds revision "two", and `main` is checked
+    /// out. Returns the temp dir and the target (`feature`) commit id.
+    fn repo_with_off_head_target() -> (tempfile::TempDir, String) {
+        use crate::git::cmd::git_cmd;
+
+        let (tmp, _head) = repo_with_one_commit();
+        let root = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {:?} failed", args);
+        };
+
+        run_git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(root.join("tracked.txt"), "two\n").expect("write fixture");
+        run_git(&["add", "tracked.txt"]);
+        run_git(&["commit", "-q", "-m", "two"]);
+        let out = git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .expect("rev-parse");
+        assert!(out.status.success());
+        let target = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        run_git(&["checkout", "-q", "main"]);
+
+        (tmp, target)
+    }
+
+    /// PRV-CONTEXT-SNAPSHOT-PROVENANCE, half one: the shared snapshot used to be
+    /// held in a local binding inside the dispatcher, so the reviewed tree was
+    /// deleted the moment `run_all` returned — every later stage then had
+    /// nothing but the local checkout to read. Ownership now sits in the ledger,
+    /// which outlives the whole run.
+    #[test]
+    fn the_shared_target_snapshot_outlives_the_dispatcher() {
+        let (repo, target) = repo_with_off_head_target();
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some("feature".to_string());
+
+        let ledger = TaskLedger::new();
+        let snapshot_backed: Vec<Box<dyn Check>> = vec![Box::new(cargo::CargoCheck)];
+        share_target_snapshot(&mut config, &snapshot_backed, &ledger);
+
+        let scan_dir = ledger
+            .scan_dir()
+            .expect("the run's shared snapshot must belong to the ledger");
+        assert_eq!(
+            config.scan_dir_override.as_ref(),
+            Some(&scan_dir),
+            "the checks and the ledger must name ONE scan dir",
+        );
+        assert_ne!(
+            scan_dir, config.repo_root,
+            "an off-HEAD review must not scan the local checkout",
+        );
+        // The decisive assertion: the worktree is still on disk AFTER the call
+        // that created it returned, and it carries the REVIEWED revision.
+        assert_eq!(
+            std::fs::read_to_string(scan_dir.join("tracked.txt")).expect("snapshot still on disk"),
+            "two\n",
+        );
+        assert_eq!(
+            std::fs::read_to_string(config.repo_root.join("tracked.txt")).expect("local checkout"),
+            "one\n",
+            "the fixture is only meaningful while the two trees disagree",
+        );
+        assert_eq!(
+            ledger.resolved_substrate(),
+            Some(crate::ledger::SubstrateKey {
+                target_sha: Some(target),
+                tree_state: Some(TreeState::Snapshot),
+            }),
+            "the run-wide substrate must name the reviewed commit, not HEAD",
+        );
+    }
+
     #[test]
     fn scan_substrate_of_a_target_snapshot_names_the_snapshot_commit() {
         // A snapshot-backed check scans an ephemeral worktree of the reviewed
@@ -1989,9 +2086,14 @@ mod tests {
         let mut config = rust_config(true, true, true);
         let semgrep_only: Vec<Box<dyn Check>> =
             vec![Box::new(crate::checks::semgrep::SemgrepCheck)];
-        let snapshot = share_target_snapshot(&mut config, &semgrep_only);
-        assert!(snapshot.is_none());
+        let ledger = TaskLedger::new();
+        share_target_snapshot(&mut config, &semgrep_only, &ledger);
         assert!(config.scan_dir_override.is_none());
+        assert!(
+            ledger.scan_dir().is_none(),
+            "no shared worktree means the ledger has none to hand to later stages"
+        );
+        assert!(ledger.resolved_substrate().is_none());
     }
 
     #[test]

@@ -373,6 +373,7 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
     // Generate artifacts
     let artifacts_dir = crate::artifacts::generate(crate::artifacts::GenerateInput {
         config: &config,
+        ledger: &ledger,
         diffs: &diffs,
         checks: &check_results,
         heuristics: Some(&heuristics),
