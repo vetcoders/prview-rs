@@ -614,9 +614,15 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
                         // the very next line look like the item closing again,
                         // so the context ended at the signature and the whole
                         // test body was recorded as production.
-                        seen_open |= sig_depth == 0;
-                        // A brace that is NOT the body opener holds expression or
-                        // pattern text, where `<` and `>` are operators.
+                        // After a top-level `=` the item states a VALUE, so even
+                        // a top-level brace belongs to an initializer (for
+                        // example `static X: T = T { ... }.finish();`). Closing
+                        // that struct literal must not end test context before
+                        // the initializer's own semicolon.
+                        seen_open |= sig_depth == 0 && !sig_initializes;
+                        // A brace that is NOT the body opener holds expression,
+                        // initializer, or pattern text, where `<` and `>` are
+                        // operators.
                         if !seen_open {
                             sig_block += 1;
                         }
@@ -657,7 +663,11 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
                 sig_depth = 0;
                 sig_block = 0;
                 sig_initializes = false;
-            } else if !seen_open && sig_depth == 0 && ends_the_annotated_item(trimmed) {
+            } else if !seen_open
+                && sig_depth == 0
+                && sig_block == 0
+                && ends_the_annotated_item(trimmed)
+            {
                 // Not every test item has a body. `#[cfg(test)] mod tests;` and
                 // `#[cfg(test)] use crate::helper;` never open a brace, so the
                 // "balanced again" close above could not fire and the context
@@ -665,7 +675,7 @@ fn added_line_test_context(file: &str, hunk: &str) -> Vec<bool> {
                 // and query below it was recorded as test-only and vanished from
                 // the signal. Such an item ends at its `;`, and so does the
                 // context it opened. A `;` still inside the signature's brackets
-                // (`fn f(x: [u8;\n N])`) is not that end.
+                // (`fn f(x: [u8;\n N])`) or an initializer block is not that end.
                 in_test = false;
                 depth = 0;
                 sig_depth = 0;
@@ -2077,6 +2087,72 @@ diff --git a/tests/handler_test.rs b/tests/handler_test.rs
         assert!(
             result.perf_regression_suspected,
             "a generic initializer must not mute the production code below it"
+        );
+        assert_eq!(result.query_in_loop_count, 1);
+        assert!(!result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn residual_perf_struct_literal_initializer_stays_in_test_context() {
+        // A brace after a top-level `=` belongs to the initializer, not to an
+        // annotated item's block body. Closing the first struct literal used to
+        // end the test context before the rest of the initializer, reporting
+        // the test-only loop/query below as production work.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,10 +1,18 @@
+ #[cfg(test)]
+ static TEST_CONFIG: Config = Config {
+     value: {
+         let n = 1;
+         n
+     },
+ }
++    .map(|_| {
++        for candidate in candidates.iter() {
++            let stored = db.query("SELECT 1");
++        }
++    });
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            !result.perf_regression_suspected,
+            "a struct literal in an initializer must not terminate test context"
+        );
+        assert_eq!(result.query_in_loop_count, 0);
+        assert!(result.suspected_files[0].test_context_only);
+    }
+
+    #[test]
+    fn residual_perf_struct_literal_real_block_boundary_terminates_context() {
+        // The initializer carve-out must not weaken ordinary body tracking: a
+        // real test function block still ends at its matching brace, and the
+        // production loop/query after it must remain visible.
+        let patch = r#"diff --git a/src/auth.rs b/src/auth.rs
++++ b/src/auth.rs
+@@ -1,4 +1,10 @@
+ #[test]
+ fn helper() {
+     let n = 1;
+ }
++for candidate in candidates.iter() {
++    let stored = db.query("SELECT 1");
++}
+"#;
+        let ctx = RegressionContext {
+            patch_text: Some(patch.to_string()),
+            ..Default::default()
+        };
+
+        let result = analyze(&ctx);
+        assert!(
+            result.perf_regression_suspected,
+            "a real block boundary must expose production context below it"
         );
         assert_eq!(result.query_in_loop_count, 1);
         assert!(!result.suspected_files[0].test_context_only);
