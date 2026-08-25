@@ -744,6 +744,15 @@ worktree.
 
 The ledger observes; it never runs, skips or caches anything itself.
 
+`App::run` builds one ledger per run and hands it to `checks::run_all` /
+`run_all_with_events`, which record every check as it resolves: a cache hit as
+`Cached`, an eligibility skip as `Skipped`, an execution as `Run` with the
+duration the result reports. A check that ran is keyed on the substrate its OWN
+provenance names — the tree it actually read — so no second resolution can
+contradict it; a check with no provenance falls back to the run's resolved
+substrate, and to unknown when that is unset too. The ledger is currently
+write-only: nothing outside its tests reads it back.
+
 ### mcp/
 
 The MCP server (`prview mcp`) is a thin contract adapter over the prview core.

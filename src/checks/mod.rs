@@ -4,6 +4,7 @@
 
 use crate::cache::Cache;
 use crate::config::{Config, ProfileKind};
+use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -389,15 +390,51 @@ pub trait Check: Send + Sync {
     }
 }
 
+/// The substrate a ledger entry is keyed on.
+///
+/// A check that ran resolved its own substrate and reported it in its
+/// provenance — that is the tree it actually read, and no second resolution can
+/// be more authoritative. A check with no provenance (an eligibility skip; a
+/// cache entry written before provenance was stored) falls back to the
+/// substrate the run resolved, and to "unknown" when even that is unset.
+fn ledger_substrate(provenance: Option<&CheckProvenance>, ledger: &TaskLedger) -> SubstrateKey {
+    match provenance {
+        Some(prov) => SubstrateKey {
+            target_sha: prov.target_sha.clone(),
+            tree_state: prov.tree_state,
+        },
+        None => ledger.resolved_substrate().unwrap_or_default(),
+    }
+}
+
 /// Run all applicable checks with caching (parallel execution, streaming output).
-pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)> {
+pub async fn run_all(
+    config: &Config,
+    ledger: &TaskLedger,
+) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)> {
+    run_all_checks(
+        get_checks_for_profile(config),
+        Cache::new(config),
+        config,
+        ledger,
+    )
+    .await
+}
+
+/// [`run_all`] with the check set and cache handed in, so a test can drive the
+/// runner without a profile detection and a `PRVIEW_HOME`-rooted cache.
+async fn run_all_checks(
+    checks: Vec<Box<dyn Check>>,
+    cache: Cache,
+    config: &Config,
+    ledger: &TaskLedger,
+) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)> {
     use colored::Colorize;
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::io::Write;
     use std::sync::Arc;
 
-    let checks: Vec<Box<dyn Check>> = get_checks_for_profile(config);
-    let cache = Arc::new(Cache::new(config));
+    let cache = Arc::new(cache);
     let emit = !config.json && !config.quiet;
 
     if emit {
@@ -413,6 +450,15 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
     for check in checks {
         match check.check_eligibility(config) {
             CheckEligibility::Skip(reason) => {
+                ledger.record(TaskEntry {
+                    key: TaskKey::new(check.name(), ledger_substrate(None, ledger)),
+                    kind: TaskKind::Check,
+                    state: TaskState::Skipped {
+                        reason: reason.clone(),
+                    },
+                    queued_at: None,
+                    started_at: None,
+                });
                 skipped.push(build_skipped_check(check.as_ref(), reason));
                 continue;
             }
@@ -420,6 +466,17 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
         }
 
         if let Some(result) = load_cached_result(check.as_ref(), config, cache.as_ref()) {
+            let origin = ledger_substrate(result.provenance.as_ref(), ledger);
+            ledger.record(TaskEntry {
+                key: TaskKey::new(check.name(), origin.clone()),
+                kind: TaskKind::Check,
+                state: TaskState::Cached {
+                    cache_age_secs: None,
+                    origin,
+                },
+                queued_at: None,
+                started_at: None,
+            });
             let status_str = format_status(result.status);
             if emit {
                 println!("  {} {} (cached)", status_str, check.name());
@@ -504,7 +561,9 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
                 let config = Arc::clone(&config);
                 let cache = Arc::clone(&cache);
                 let cargo_lock = Arc::clone(&cargo_lock);
+                let queued_at = std::time::Instant::now();
                 async move {
+                    let started_at = std::time::Instant::now();
                     let _permit = if is_cargo_target_check(check.name()) {
                         Some(
                             cargo_lock
@@ -515,7 +574,9 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
                     } else {
                         None
                     };
-                    execute_live_check(check, config.as_ref(), cache.as_ref()).await
+                    let result = execute_live_check(check, config.as_ref(), cache.as_ref()).await;
+                    record_executed_check(&result, ledger, queued_at, started_at);
+                    result
                 }
             })
             .collect();
@@ -623,6 +684,7 @@ pub enum CheckEvent {
 /// Run all applicable checks with event callbacks (for TUI mode)
 pub async fn run_all_with_events<F>(
     config: &Config,
+    ledger: &TaskLedger,
     on_event: F,
 ) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)>
 where
@@ -638,6 +700,15 @@ where
     for check in checks {
         match check.check_eligibility(config) {
             CheckEligibility::Skip(reason) => {
+                ledger.record(TaskEntry {
+                    key: TaskKey::new(check.name(), ledger_substrate(None, ledger)),
+                    kind: TaskKind::Check,
+                    state: TaskState::Skipped {
+                        reason: reason.clone(),
+                    },
+                    queued_at: None,
+                    started_at: None,
+                });
                 let skipped_check = build_skipped_check(check.as_ref(), reason);
                 let name = skipped_check.name.clone();
                 skipped.push(skipped_check);
@@ -648,6 +719,17 @@ where
         }
 
         if let Some(result) = load_cached_result(check.as_ref(), config, &cache) {
+            let origin = ledger_substrate(result.provenance.as_ref(), ledger);
+            ledger.record(TaskEntry {
+                key: TaskKey::new(check.name(), origin.clone()),
+                kind: TaskKind::Check,
+                state: TaskState::Cached {
+                    cache_age_secs: None,
+                    origin,
+                },
+                queued_at: None,
+                started_at: None,
+            });
             on_event(CheckEvent::Completed {
                 result: Box::new(result.clone()),
             });
@@ -699,7 +781,9 @@ where
                 let config = Arc::clone(&config);
                 let cache = Arc::clone(&cache);
                 let cargo_lock = Arc::clone(&cargo_lock);
+                let queued_at = std::time::Instant::now();
                 async move {
+                    let started_at = std::time::Instant::now();
                     let _permit = if is_cargo_target_check(check.name()) {
                         Some(
                             cargo_lock
@@ -710,7 +794,9 @@ where
                     } else {
                         None
                     };
-                    execute_live_check(check, config.as_ref(), cache.as_ref()).await
+                    let result = execute_live_check(check, config.as_ref(), cache.as_ref()).await;
+                    record_executed_check(&result, ledger, queued_at, started_at);
+                    result
                 }
             })
             .collect();
@@ -839,6 +925,33 @@ fn errored_check_provenance(
         }
         .with_scan_substrate(name, &scan_dir, &config.repo_root),
     )
+}
+
+/// Record a check that actually executed, keyed on the tree its own provenance
+/// says it read.
+///
+/// `queued_at` is when the check entered the execution set and `started_at` when
+/// its future first ran; today those differ only by scheduling latency, because
+/// nothing yet holds a check back from starting. A governor that does will make
+/// the split meaningful without moving these call sites.
+fn record_executed_check(
+    result: &CheckResult,
+    ledger: &TaskLedger,
+    queued_at: std::time::Instant,
+    started_at: std::time::Instant,
+) {
+    ledger.record(TaskEntry {
+        key: TaskKey::new(
+            &result.name,
+            ledger_substrate(result.provenance.as_ref(), ledger),
+        ),
+        kind: TaskKind::Check,
+        state: TaskState::Run {
+            duration: result.duration,
+        },
+        queued_at: Some(queued_at),
+        started_at: Some(started_at),
+    });
 }
 
 async fn execute_live_check(check: Box<dyn Check>, config: &Config, cache: &Cache) -> CheckResult {
@@ -2550,6 +2663,129 @@ test result: ok. 2 passed; 0 failed
         assert!(
             stdout.contains("LOCAL_BIN_RAN"),
             "run_js_command must exec the local bin directly, got: {stdout}"
+        );
+    }
+
+    /// Every check a run considers must leave exactly one ledger entry, stating
+    /// how it resolved. A gate that is missing from the ledger is a gate a later
+    /// consumer would re-run instead of recognising as already done.
+    #[tokio::test]
+    async fn run_all_records_one_ledger_entry_per_check() {
+        use crate::ledger::{SubstrateKey, TaskKey, TaskKind, TaskLedger, TaskState};
+        use async_trait::async_trait;
+
+        struct MockCheck {
+            name: &'static str,
+            eligibility: CheckEligibility,
+            cache_key: Option<&'static str>,
+        }
+
+        #[async_trait]
+        impl Check for MockCheck {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                self.eligibility.clone()
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                Ok(CheckResult {
+                    name: self.name.to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_millis(7),
+                    output: "ok".to_string(),
+                    cached: false,
+                    provenance: None,
+                })
+            }
+            fn cache_key(&self, _config: &Config) -> Option<String> {
+                self.cache_key.map(str::to_string)
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+
+        // A pre-populated entry so the cache-hit path is exercised for real.
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), true);
+        cache
+            .set("Mock cached", "cached-key", "passed", Some("replay"), None)
+            .expect("seed cache");
+
+        let checks: Vec<Box<dyn Check>> = vec![
+            Box::new(MockCheck {
+                name: "Mock ran",
+                eligibility: CheckEligibility::Run,
+                cache_key: None,
+            }),
+            Box::new(MockCheck {
+                name: "Mock cached",
+                eligibility: CheckEligibility::Run,
+                cache_key: Some("cached-key"),
+            }),
+            Box::new(MockCheck {
+                name: "Mock skipped",
+                eligibility: CheckEligibility::Skip("lint disabled".to_string()),
+                cache_key: None,
+            }),
+        ];
+
+        let ledger = TaskLedger::new();
+        let (results, skipped) = run_all_checks(checks, cache, &config, &ledger)
+            .await
+            .expect("run_all_checks");
+
+        // Behaviour is unchanged: the ledger is written alongside, not instead.
+        assert_eq!(results.len(), 2, "one live result plus one cache replay");
+        assert_eq!(skipped.len(), 1);
+
+        let entries = ledger.entries();
+        assert_eq!(entries.len(), 3, "exactly one ledger entry per check");
+        assert!(
+            entries.iter().all(|e| e.kind == TaskKind::Check),
+            "every entry recorded here is a check"
+        );
+
+        // Nothing resolved a run-wide substrate in this cut, and no mock reports
+        // provenance, so every key carries the honestly-unknown substrate.
+        let key = |name: &str| TaskKey::new(name, SubstrateKey::default());
+
+        let ran = ledger.lookup(&key("Mock ran")).expect("executed check");
+        assert_eq!(
+            ran.state,
+            TaskState::Run {
+                duration: Duration::from_millis(7)
+            },
+            "an executed check records the duration its result reports"
+        );
+        assert!(
+            ran.queued_at.is_some() && ran.started_at.is_some(),
+            "an executed check is queued and started"
+        );
+
+        let cached = ledger.lookup(&key("Mock cached")).expect("cached check");
+        assert_eq!(
+            cached.state,
+            TaskState::Cached {
+                cache_age_secs: None,
+                origin: SubstrateKey::default(),
+            }
+        );
+
+        let skipped_entry = ledger.lookup(&key("Mock skipped")).expect("skipped check");
+        assert_eq!(
+            skipped_entry.state,
+            TaskState::Skipped {
+                reason: "lint disabled".to_string()
+            },
+            "the skip reason is preserved verbatim"
+        );
+        assert!(
+            skipped_entry.queued_at.is_none() && skipped_entry.started_at.is_none(),
+            "a check that never entered the queue has no queue timestamps"
         );
     }
 

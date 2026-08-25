@@ -157,7 +157,10 @@ impl App {
             .repo
             .generate_diffs(&target, &diff_bases, self.config.quiet)?;
 
-        // 5. Run checks (reduced set in update mode)
+        // 5. Run checks (reduced set in update mode).
+        // The ledger is the run's record of what work was considered and how it
+        // resolved. It is written here and read by nothing yet.
+        let ledger = ledger::TaskLedger::new();
         let (check_results, skipped_checks) = if self.config.update_mode {
             // In update mode, skip heavy checks UNLESS user explicitly forced them
             // via --with-tests or --with-security (respect user intent over preset)
@@ -174,9 +177,9 @@ impl App {
             if emit_human_stdout && any_skipped {
                 println!("{}", "  Skipping heavy checks (--update mode)".yellow());
             }
-            checks::run_all(&update_config).await?
+            checks::run_all(&update_config, &ledger).await?
         } else {
-            checks::run_all(&self.config).await?
+            checks::run_all(&self.config, &ledger).await?
         };
 
         // 6. Run heuristics (loctree-suite)

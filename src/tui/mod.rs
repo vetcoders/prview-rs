@@ -331,8 +331,9 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
 
     // Run all checks with event callbacks for real-time updates
     let tx_checks = tx.clone();
+    let ledger = crate::ledger::TaskLedger::new();
     let (check_results, skipped_checks) =
-        crate::checks::run_all_with_events(&config, move |event| {
+        crate::checks::run_all_with_events(&config, &ledger, move |event| {
             let tx = tx_checks.clone();
             let _ = tx.send(map_check_event(event));
         })
