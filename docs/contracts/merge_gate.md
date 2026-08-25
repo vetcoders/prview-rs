@@ -659,10 +659,14 @@ naming its blocker beside `policy_allow_merge: false` and a `complete` analysis
 is exactly what this tool writes and reports no contradiction — while a pack
 that states one of them AGAINST a permissive verdict is caught by the textual
 axes disagreeing with the rank it forced. All three are named in the caveat.
-A single legal emitted exception is recognized before that comparison:
-`CONDITIONAL + approve + degraded`. The degraded confidence axis explains why
-the compatibility verdict is stricter than the product recommendation, so the
-readers normalize it without accusing the pack of contradiction.
+A legal reader normalization is recognized before that comparison:
+`CONDITIONAL + approve + degraded`. The degraded confidence axis is a sufficient
+rank-2 explanation for the compatibility verdict being stricter than the product
+recommendation, even when another conservative rank-2 axis such as
+`quality_pass: false` is also present. Readers therefore accept this broader
+validator-valid artifact vocabulary and normalize it without accusing the pack
+of contradiction; they do not require the stored bytes to match only the
+narrower shapes produced by the current emitter.
 A pack whose verdict was substituted
 reports the substitution (`unknown_verdict:`, `unreadable_<field>:`) and is not
 additionally accused of contradicting itself.

@@ -4498,6 +4498,46 @@ api-router/app/core/cache.py
             mcp.caveats
         );
 
+        // The same reader normalization remains legal when a failed quality
+        // axis supplies another conservative rank-2 signal. The current emitter
+        // normally promotes the product recommendation in this case, but
+        // readers accept the broader validator-valid artifact vocabulary.
+        let legal_with_failed_quality = pack_with_gate(
+            r#"{"verdict":"CONDITIONAL","merge_recommendation":"approve","allow_merge":false,"quality_pass":false,"analysis_status":"degraded","policy_allow_merge":true,"blocking_issues":[]}"#,
+        );
+
+        let cli = read_merge_gate_summary(legal_with_failed_quality.path())
+            .expect("CLI reads legal degraded pack with failed quality");
+        assert_eq!(cli.verdict, "CONDITIONAL");
+        assert_eq!(
+            cli.merge_recommendation,
+            crate::policy::engine::MergeRecommendation::ReviewRequired
+        );
+        assert!(!cli.allow_merge);
+        assert!(
+            !cli.quality_pass,
+            "CLI must preserve the stated quality axis"
+        );
+        assert!(
+            !cli.caveats
+                .iter()
+                .any(|c| c.starts_with("core_inconsistency:")),
+            "a second rank-2 signal does not invalidate degraded normalization: {:?}",
+            cli.caveats
+        );
+
+        let mcp = crate::mcp::read::read_decision(legal_with_failed_quality.path())
+            .expect("MCP reads legal degraded pack with failed quality");
+        assert_eq!(mcp.verdict, "CONDITIONAL");
+        assert_eq!(mcp.merge_recommendation, "review_required");
+        assert!(!mcp.allow_merge);
+        assert!(mcp.normalized, "the MCP adapter changed a published axis");
+        assert!(
+            !mcp.caveats.iter().any(|c| c.contains("core_inconsistency")),
+            "MCP must not invent a contradiction for aligned rank-2 signals: {:?}",
+            mcp.caveats
+        );
+
         // A genuinely contradictory pack remains fail-honest on both readers.
         let contradictory = pack_with_gate(
             r#"{"verdict":"BLOCK","merge_recommendation":"approve","allow_merge":false,"quality_pass":true,"analysis_status":"complete","policy_allow_merge":true,"blocking_issues":[]}"#,

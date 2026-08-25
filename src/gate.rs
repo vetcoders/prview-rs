@@ -1248,13 +1248,15 @@ pub(crate) fn known_analysis_status(s: &str) -> bool {
     matches!(s, "complete" | "degraded" | "incomplete")
 }
 
-/// Whether an approve recommendation is being compatibility-normalized solely
-/// because degraded analysis makes the legacy verdict CONDITIONAL.
+/// Whether an approve recommendation is being compatibility-normalized because
+/// degraded analysis supplies the rank-2 explanation for a CONDITIONAL legacy
+/// verdict.
 ///
-/// This is a legal emitted shape: the product recommendation can remain
-/// `approve` while incomplete scan coverage prevents a clean PASS. Readers
-/// still publish one conservative vocabulary, but must not describe that
-/// compatibility normalization as contradictory evidence.
+/// This remains legal when another conservative rank-2 axis, such as
+/// `quality_pass: false`, is also present: degraded coverage already explains
+/// why the product recommendation can remain `approve` while the legacy verdict
+/// cannot be PASS. Readers still publish one conservative vocabulary, but must
+/// not describe that compatibility normalization as contradictory evidence.
 pub(crate) fn is_legal_approve_degraded_normalization(
     merge_rank: Option<u8>,
     verdict_rank: Option<u8>,
