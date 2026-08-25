@@ -115,9 +115,9 @@ fn plan_context_tool(
 /// Record why a context artifact was NOT produced.
 ///
 /// Only the non-run decisions land here. A context command that DOES run is
-/// accounted for by `ContextCommandTiming`, which knows how long it took; the
-/// planner does not, and a `Run` entry carrying a duration it invented would be
-/// worse than no entry at all.
+/// recorded by [`record_context_runs`] once the runtime knows how long it took;
+/// the planner does not, and a `Run` entry carrying a duration it invented would
+/// be worse than no entry at all.
 fn record_context_decision(
     ledger: &TaskLedger,
     check_name: &str,
@@ -463,11 +463,29 @@ pub(super) fn find_tauri_diagnostic_changes(diffs: &[Diff]) -> Vec<String> {
 /// Descriptor for an external context command to run in parallel.
 pub(super) struct ContextCmd {
     pub(super) label: String,
+    /// The GATE this command stands in for, when one exists — the same check
+    /// name the planner asked the ledger about before deciding to run it.
+    ///
+    /// It is the identity, not the label, that the ledger is keyed on: `eslint
+    /// json` executed here and the `ESLint` gate are one tool on one tree, and
+    /// recording the executed one under `eslint_json` would file the two halves
+    /// of the same task under two ids — the drift class `check_id` exists to
+    /// close. `None` is the honest answer for a command no gate covers
+    /// (`cargo tree`, `tauri info`, `npm sbom`), which is then recorded under its
+    /// own label. No per-command alias table: the plan site already knows.
+    pub(super) gate: Option<&'static str>,
     pub(super) cmd: String,
     pub(super) args: Vec<String>,
     pub(super) cwd: PathBuf,
     pub(super) out_dir: PathBuf,
     pub(super) out_file: String,
+}
+
+impl ContextCmd {
+    /// The name this command is recorded under in the task ledger.
+    pub(super) fn tool(&self) -> &str {
+        self.gate.unwrap_or(&self.label)
+    }
 }
 
 /// Resolve the command for the optional `tauri info` context artifact.
@@ -541,11 +559,58 @@ pub(super) fn generate_context_artifacts(
     }
 
     // Run all commands in parallel with a shared timeout
-    Ok(run_context_cmds_parallel(
-        &cmds,
-        CONTEXT_GEN_TIMEOUT_SECS,
-        emit_human_stdout,
-    ))
+    let timings = run_context_cmds_parallel(&cmds, CONTEXT_GEN_TIMEOUT_SECS, emit_human_stdout);
+    record_context_runs(ledger, &config.repo_root, &cmds, &timings);
+    Ok(timings)
+}
+
+/// Record the context commands that actually executed.
+///
+/// The planner records only what it decided NOT to run, so a run's account of
+/// itself was half a ledger: the work the context stage skipped was auditable and
+/// the work it performed was not — and "did this tool already read this tree?"
+/// is a question the executed half answers best. The runtime is the first place
+/// that holds both the identity of the command and its duration, so it is where
+/// the entry is written.
+///
+/// Timings join back to their command by label, which is unique within a plan.
+/// A command that never started (`spawn_failed`) is a `Skipped`, not a `Run` of
+/// zero seconds: nothing read the tree, and a zero-duration run would claim
+/// otherwise. A command that started and then failed, timed out or errored IS a
+/// run — the tool read the tree and the run paid for it.
+fn record_context_runs(
+    ledger: &TaskLedger,
+    repo_root: &Path,
+    cmds: &[ContextCmd],
+    timings: &[ContextCommandTiming],
+) {
+    for timing in timings {
+        let Some(cmd) = cmds.iter().find(|cmd| cmd.label == timing.label) else {
+            continue;
+        };
+        let state = if timing.status == "spawn_failed" {
+            TaskState::Skipped {
+                reason: format!("`{}` could not be spawned in the reviewed tree", cmd.cmd),
+            }
+        } else {
+            TaskState::Run {
+                duration: std::time::Duration::from_secs_f32(timing.duration_secs),
+            }
+        };
+        ledger.record(TaskEntry {
+            // The command's own cwd, not the scan root: a cargo context command
+            // runs in a workspace member below it, and the substrate must name
+            // the tree the command actually read.
+            key: TaskKey::new(
+                cmd.tool(),
+                context_substrate(cmd.tool(), &cmd.cwd, repo_root),
+            ),
+            kind: TaskKind::ContextArtifact,
+            state,
+            queued_at: None,
+            started_at: None,
+        });
+    }
 }
 
 /// Decide WHICH context commands this run needs and WHERE each one runs.
@@ -598,6 +663,7 @@ fn plan_context_cmds(
         let cwd = crate::checks::planned_cargo_cwd(config, &scan_root);
         cmds.push(ContextCmd {
             label: "cargo tree".into(),
+            gate: None,
             cmd: "cargo".into(),
             args: vec!["tree".into(), "--depth".into(), "2".into()],
             cwd: cwd.clone(),
@@ -607,6 +673,7 @@ fn plan_context_cmds(
 
         cmds.push(ContextCmd {
             label: "cargo sbom".into(),
+            gate: None,
             cmd: "cargo".into(),
             args: vec!["tree".into(), "--format".into(), "{p} {l}".into()],
             cwd: cwd.clone(),
@@ -633,6 +700,7 @@ fn plan_context_cmds(
                     if let Some((cmd, args)) = tauri_info_cmd(&scan_root, has_pnpm) {
                         cmds.push(ContextCmd {
                             label: "tauri info".into(),
+                            gate: None,
                             cmd,
                             args,
                             cwd: scan_root.clone(),
@@ -672,6 +740,7 @@ fn plan_context_cmds(
         ) {
             cmds.push(ContextCmd {
                 label: "tsc trace".into(),
+                gate: Some("TypeScript"),
                 cmd,
                 args,
                 cwd: scan_root.clone(),
@@ -702,6 +771,7 @@ fn plan_context_cmds(
         };
         cmds.push(ContextCmd {
             label: "npm sbom".into(),
+            gate: None,
             cmd: sbom_cmd.into(),
             args: sbom_args,
             cwd: scan_root.clone(),
@@ -734,6 +804,7 @@ fn plan_context_cmds(
                 let (cmd, args) = eslint.expect("a runnable plan resolved a command");
                 cmds.push(ContextCmd {
                     label: "eslint json".into(),
+                    gate: Some("ESLint"),
                     cmd,
                     args,
                     cwd: scan_root.clone(),
@@ -759,6 +830,7 @@ fn plan_context_cmds(
             ContextToolPlan::Run => {
                 cmds.push(ContextCmd {
                     label: "stylelint json".into(),
+                    gate: Some("Stylelint"),
                     cmd: "sh".into(),
                     args: vec![
                         "-c".into(),
@@ -821,6 +893,7 @@ fn plan_context_cmds(
                 ) {
                     cmds.push(ContextCmd {
                         label: "esbuild meta".into(),
+                        gate: None,
                         cmd,
                         args,
                         cwd: scan_root.clone(),
@@ -1161,8 +1234,9 @@ mod tests {
     }
 
     /// A gate outcome recorded the way `checks::run_all` records it: an
-    /// eligibility skip lands in the first pass under an unknown substrate,
-    /// an execution lands under the substrate its own provenance named.
+    /// execution lands under the substrate its own provenance named, an
+    /// eligibility skip under the run's substrate once it is resolved (or an
+    /// unknown one in a run that never resolves one).
     fn record_gate(ledger: &TaskLedger, check: &str, substrate: SubstrateKey, state: TaskState) {
         ledger.record(TaskEntry {
             key: TaskKey::new(check, substrate),
@@ -1762,5 +1836,78 @@ mod tests {
         // No local binary and no pnpm: skip rather than fall through to
         // npx --no-install, which can hang on a missing CLI (PR #12 review).
         assert!(js_exec_cmd("tsc", vec!["--flag".into()], tmp.path(), false).is_none());
+    }
+
+    fn context_cmd(label: &str, gate: Option<&'static str>, cmd: &str, cwd: &Path) -> ContextCmd {
+        ContextCmd {
+            label: label.to_string(),
+            gate,
+            cmd: cmd.to_string(),
+            args: Vec::new(),
+            cwd: cwd.to_path_buf(),
+            out_dir: cwd.to_path_buf(),
+            out_file: String::new(),
+        }
+    }
+
+    /// The half of the account the ledger used to be missing: the planner
+    /// recorded only what it decided NOT to run, so a run could say why it
+    /// skipped a tool but not that it had just spent time on one.
+    #[test]
+    fn an_executed_context_command_is_recorded_as_a_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cmds = vec![
+            // A gate-backed command answers under the GATE's id, not its label,
+            // so the two halves of one task cannot land under two ids.
+            context_cmd("eslint json", Some("ESLint"), "/bin/echo", tmp.path()),
+            // No gate counterpart: recorded under its own slugged label.
+            context_cmd("cargo tree", None, "/bin/echo", tmp.path()),
+        ];
+
+        let ledger = TaskLedger::new();
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false);
+        super::record_context_runs(&ledger, tmp.path(), &cmds, &timings);
+
+        let entries = ledger.entries();
+        assert_eq!(entries.len(), 2, "one entry per executed command");
+        for entry in &entries {
+            assert_eq!(entry.kind, TaskKind::ContextArtifact);
+            match entry.state {
+                TaskState::Run { duration } => assert!(
+                    duration > Duration::ZERO,
+                    "an executed command reports the time it actually took",
+                ),
+                ref other => panic!("expected a run, got {other:?}"),
+            }
+        }
+        let tools: Vec<&str> = entries.iter().map(|e| e.key.tool.as_str()).collect();
+        assert!(tools.contains(&"eslint"), "got {tools:?}");
+        assert!(tools.contains(&"cargo_tree"), "got {tools:?}");
+    }
+
+    /// A command that never started did not read the tree. Recording it as a
+    /// zero-second run would say it did.
+    #[test]
+    fn a_context_command_that_never_spawned_is_not_a_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cmds = vec![context_cmd(
+            "tauri info",
+            None,
+            &tmp.path().join("no-such-binary").display().to_string(),
+            tmp.path(),
+        )];
+
+        let ledger = TaskLedger::new();
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false);
+        assert_eq!(timings[0].status, "spawn_failed");
+        super::record_context_runs(&ledger, tmp.path(), &cmds, &timings);
+
+        let entry = &ledger.entries()[0];
+        assert_eq!(entry.key.tool, "tauri_info");
+        assert!(
+            matches!(entry.state, TaskState::Skipped { .. }),
+            "got {:?}",
+            entry.state,
+        );
     }
 }

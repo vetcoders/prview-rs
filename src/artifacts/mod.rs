@@ -162,6 +162,8 @@ struct RunJsonInput<'a> {
     stage_timings: &'a [StageTiming],
     context_artifacts: &'a [ContextArtifactDecision],
     context_command_timings: &'a [ContextCommandTiming],
+    /// The run's task ledger, serialized as the additive `ledger` view.
+    ledger: &'a TaskLedger,
     regression: Option<&'a regression::RegressionReport>,
 }
 
@@ -791,6 +793,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         stage_timings: &stage_timings,
         context_artifacts: &context_artifacts,
         context_command_timings: &context_command_timings,
+        ledger,
         regression: Some(&regression_report),
     })?;
     stage_timings.push(finish_timing(emit_human_stdout, "RUN.json", t));
@@ -1385,6 +1388,75 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Version of the `ledger` object in `RUN.json`, independent of the pack's
+/// `schema_version`.
+///
+/// The ledger is an ADDITIVE view over work the pack already reports elsewhere
+/// (`checks[].cached`, `context_artifacts[]`, `context_commands[]`), which stay
+/// exactly as they were — a consumer that never looks at `ledger` cannot tell
+/// this cut happened, which is precisely why `schema_version` does not move (the
+/// precedent `CheckProvenance` set in `checks/mod.rs`). Its own counter is what
+/// lets the view's shape evolve, and be recognised, without renegotiating the
+/// pack contract.
+const LEDGER_SCHEMA: u32 = 1;
+
+/// The run's task ledger, as it appears in `RUN.json`.
+///
+/// One object per entry, stating WHAT tool the run considered, WHICH surface
+/// asked (`check` / `context_artifact`), how it resolved, and on which tree.
+/// `substrate` is serialized with the same `tree_state` strings as
+/// `checks[].tree_state` — one vocabulary for "which tree", not two.
+///
+/// Each lifecycle carries only the evidence it actually has: a `run` its
+/// duration, a `cached` the age of the entry it replayed and the substrate of
+/// the ORIGINAL execution, a `skipped` / `not_applicable` its reason. Nothing is
+/// filled in with a plausible-looking value where the run holds none.
+fn ledger_view(ledger: &TaskLedger) -> serde_json::Value {
+    use crate::ledger::TaskState;
+    use serde_json::json;
+
+    let substrate = |substrate: &crate::ledger::SubstrateKey| {
+        json!({
+            "target_sha": substrate.target_sha,
+            "tree_state": substrate.tree_state.map(|state| state.as_str()),
+        })
+    };
+
+    let entries: Vec<serde_json::Value> = ledger
+        .entries()
+        .iter()
+        .map(|entry| {
+            let mut row = json!({
+                "tool": entry.key.tool,
+                "kind": entry.kind.as_str(),
+                "lifecycle": entry.state.lifecycle(),
+                "substrate": substrate(&entry.key.substrate),
+            });
+            match &entry.state {
+                TaskState::Run { duration } => {
+                    row["duration_secs"] = json!(duration.as_secs_f32());
+                }
+                TaskState::Cached {
+                    cache_age_secs,
+                    origin,
+                } => {
+                    row["cache_age_secs"] = json!(cache_age_secs);
+                    row["origin"] = substrate(origin);
+                }
+                TaskState::Skipped { reason } | TaskState::NotApplicable { reason } => {
+                    row["reason"] = json!(reason);
+                }
+            }
+            row
+        })
+        .collect();
+
+    json!({
+        "schema": LEDGER_SCHEMA,
+        "entries": entries,
+    })
+}
+
 /// RUN.json — single source of truth (Artifact Pack v1)
 fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
     use serde_json::json;
@@ -1402,6 +1474,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
         stage_timings,
         context_artifacts,
         context_command_timings,
+        ledger,
         regression,
     } = input;
 
@@ -1537,6 +1610,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             "status": command.status,
             "duration_secs": command.duration_secs,
         })).collect::<Vec<_>>(),
+        "ledger": ledger_view(ledger),
     });
 
     fs::write(dir.join("RUN.json"), serde_json::to_string_pretty(&run)?)?;

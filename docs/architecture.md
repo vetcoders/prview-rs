@@ -756,6 +756,51 @@ provenance names — the tree it actually read — so no second resolution can
 contradict it; a check with no provenance falls back to the run's resolved
 substrate, and to unknown when that is unset too.
 
+A cache replay is keyed on the substrate of the run REPLAYING it (the cache key
+is content-derived, so a hit is an answer about the tree this run is reviewing)
+while its `origin` names the tree the ORIGINAL execution read, taken from the
+provenance stored beside the entry. The two are deliberately separate: the key is
+what a later stage asks about, the origin is what makes the replay auditable.
+
+Skips and replays are decided in the checks stage's *first pass*, which
+necessarily precedes `share_target_snapshot` — the runnable set is what decides
+whether a snapshot is materialised at all — so they are recorded under an unknown
+substrate. `TaskLedger::set_substrate` therefore **adopts** them: every entry
+still keyed on an unknown substrate is re-keyed onto the resolved one, because
+they were this run's decisions about the tree this run went on to read. Only the
+key moves; a replay's `origin` is never overwritten with the current run's
+substrate. An unknown key survives only where the run genuinely resolved no
+substrate (nothing needed a shared snapshot), which is what
+`TaskLedger::lookup_tool`'s fallback still covers.
+
+Context commands that actually execute are recorded too, by
+`artifacts::context_artifacts::record_context_runs`, once the runtime knows their
+duration: `Run` for anything that started (including a failure or a timeout — the
+tool read the tree either way), `Skipped` for a command that never spawned. A
+command is recorded under the GATE it stands in for when one exists (`eslint
+json` → `ESLint`, `tsc trace` → `TypeScript`), so one tool cannot land under two
+ids depending on which surface resolved it; a command with no gate counterpart
+(`cargo tree`, `tauri info`, `npm sbom`) is recorded under its own label, slugged
+by `check_id_from_name`. The plan site hands that identity over in
+`ContextCmd::gate` rather than leaving the label to be reverse-engineered, so
+there is no per-command alias table.
+
+#### The `ledger` view in RUN.json
+
+`RUN.json` carries the entries as an additive `ledger` object: `schema` (its own
+counter, currently `1`) and `entries[]`, one row per task with `tool`, `kind`
+(`check` / `context_artifact`), `lifecycle` (`run` / `cached` / `skipped` /
+`not_applicable`) and `substrate` (`target_sha` + the same `tree_state` strings
+`checks[].tree_state` uses). Each lifecycle adds only the evidence it has:
+`duration_secs` for a run, `cache_age_secs` + `origin` for a replay, `reason` for
+a ruled-out task.
+
+Everything the pack already reported — `checks[].cached`, `context_artifacts[]`,
+`context_commands[]`, the top-level `schema_version` — is untouched, so a
+consumer that ignores `ledger` cannot tell the section exists. That is why the
+pack's `schema_version` does not move (the precedent `CheckProvenance` set) and
+why the view versions itself instead.
+
 #### One tool, one execution per run
 
 The artifact stage reads the entries back through `TaskLedger::lookup_tool`,
@@ -794,10 +839,9 @@ too, so the run has one account of what it did not do rather than two.
 Both sides resolve the substrate through `checks::resolve_scan_substrate` with
 the same `consumable_scaffolding` set, so a gate and its artifact describe one
 tree identically instead of differing on `tree_state` alone. A lookup falls back
-to an unknown-substrate entry for the same tool, because eligibility skips are
-recorded in the checks stage's first pass — before the run resolves a substrate
-at all; it never crosses two *known* substrates, which would be evidence of
-different work.
+to an unknown-substrate entry for the same tool, which is what a run that never
+resolved a substrate of its own leaves behind; it never crosses two *known*
+substrates, which would be evidence of different work.
 
 #### One reviewed tree per run
 

@@ -405,12 +405,35 @@ pub trait Check: Send + Sync {
 /// substrate the run resolved, and to "unknown" when even that is unset.
 fn ledger_substrate(provenance: Option<&CheckProvenance>, ledger: &TaskLedger) -> SubstrateKey {
     match provenance {
-        Some(prov) => SubstrateKey {
-            target_sha: prov.target_sha.clone(),
-            tree_state: prov.tree_state,
-        },
+        Some(prov) => provenance_substrate(prov),
         None => ledger.resolved_substrate().unwrap_or_default(),
     }
+}
+
+/// The tree a stored provenance says was read.
+fn provenance_substrate(provenance: &CheckProvenance) -> SubstrateKey {
+    SubstrateKey {
+        target_sha: provenance.target_sha.clone(),
+        tree_state: provenance.tree_state,
+    }
+}
+
+/// The substrate a cache replay is keyed on, and the one it reports as `origin`.
+///
+/// These are deliberately two different trees. The KEY is this run's substrate:
+/// the cache key is content-derived, so a hit is an answer about the tree THIS
+/// run is reviewing, and that is what a later stage asks the ledger about. The
+/// `origin` is the substrate the ORIGINAL execution recorded in the provenance
+/// stored beside the entry — the audit half, which no re-resolution can supply
+/// and which the current run's substrate must never overwrite.
+fn replay_substrates(
+    provenance: Option<&CheckProvenance>,
+    ledger: &TaskLedger,
+) -> (SubstrateKey, SubstrateKey) {
+    (
+        ledger.resolved_substrate().unwrap_or_default(),
+        provenance.map(provenance_substrate).unwrap_or_default(),
+    )
 }
 
 /// Run all applicable checks with caching (parallel execution, streaming output).
@@ -472,9 +495,9 @@ async fn run_all_checks(
         }
 
         if let Some(result) = load_cached_result(check.as_ref(), config, cache.as_ref()) {
-            let origin = ledger_substrate(result.provenance.as_ref(), ledger);
+            let (key_substrate, origin) = replay_substrates(result.provenance.as_ref(), ledger);
             ledger.record(TaskEntry {
-                key: TaskKey::new(check.name(), origin.clone()),
+                key: TaskKey::new(check.name(), key_substrate),
                 kind: TaskKind::Check,
                 state: TaskState::Cached {
                     cache_age_secs: None,
@@ -725,9 +748,9 @@ where
         }
 
         if let Some(result) = load_cached_result(check.as_ref(), config, &cache) {
-            let origin = ledger_substrate(result.provenance.as_ref(), ledger);
+            let (key_substrate, origin) = replay_substrates(result.provenance.as_ref(), ledger);
             ledger.record(TaskEntry {
-                key: TaskKey::new(check.name(), origin.clone()),
+                key: TaskKey::new(check.name(), key_substrate),
                 kind: TaskKind::Check,
                 state: TaskState::Cached {
                     cache_age_secs: None,
@@ -1216,6 +1239,11 @@ fn share_target_snapshot(
     // The run-wide substrate is the tree identity of the shared scan dir, with
     // no per-command scaffolding judgement: a check that ran reports its own,
     // finer provenance and overrides this in `ledger_substrate`.
+    //
+    // Installing it also adopts the first pass's skips and cache replays, which
+    // were necessarily decided before this point — the runnable set is what
+    // decides whether a snapshot is materialised at all — and so were recorded
+    // under an unknown substrate.
     ledger.set_substrate(resolve_scan_substrate(&plan.scan_dir, &config.repo_root, &[]).into());
     ledger.set_shared_snapshot(plan._snapshot);
 }
@@ -1712,6 +1740,48 @@ mod tests {
                 tree_state: Some(TreeState::Snapshot),
             }),
             "the run-wide substrate must name the reviewed commit, not HEAD",
+        );
+    }
+
+    /// A skip is decided in the first pass, before the run can know which tree
+    /// it will read — the runnable set is what decides whether a snapshot is
+    /// materialised at all. It must not stay filed under an unknown substrate
+    /// once the run does know: `RUN.json` would then report the run's own
+    /// decisions as being about no particular tree.
+    #[test]
+    fn a_skip_recorded_before_the_snapshot_lands_on_the_reviewed_substrate() {
+        let (repo, target) = repo_with_off_head_target();
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some("feature".to_string());
+
+        let ledger = TaskLedger::new();
+        // Recorded exactly the way run_all's first pass records it.
+        ledger.record(TaskEntry {
+            key: TaskKey::new("ESLint", ledger_substrate(None, &ledger)),
+            kind: TaskKind::Check,
+            state: TaskState::Skipped {
+                reason: "lint disabled".to_string(),
+            },
+            queued_at: None,
+            started_at: None,
+        });
+        assert_eq!(
+            ledger.entries()[0].key.substrate,
+            crate::ledger::SubstrateKey::default(),
+            "the fixture is only meaningful while the skip starts out unkeyed",
+        );
+
+        let snapshot_backed: Vec<Box<dyn Check>> = vec![Box::new(cargo::CargoCheck)];
+        share_target_snapshot(&mut config, &snapshot_backed, &ledger);
+
+        assert_eq!(
+            ledger.entries()[0].key.substrate,
+            crate::ledger::SubstrateKey {
+                target_sha: Some(target),
+                tree_state: Some(TreeState::Snapshot),
+            },
+            "the skip names the reviewed tree it was a decision about",
         );
     }
 

@@ -14,6 +14,18 @@
 //! "which gate is this" — instead of introducing a second alias table that would
 //! be free to drift from the first one.
 //!
+//! # Naming a task that is not a gate
+//!
+//! A context command names the GATE it stands in for when one exists (`eslint
+//! json` is recorded as `ESLint`, the same name the planner asked the ledger
+//! about), so one tool cannot land under two ids depending on which surface
+//! resolved it. A command with no gate counterpart (`cargo tree`, `tauri info`,
+//! `npm sbom`) is recorded under its own label, which
+//! [`crate::check_id::check_id_from_name`] slugs (`cargo tree` → `cargo_tree`).
+//! That is the whole rule — there is no per-command alias table, because the
+//! plan site already knows which gate it is compensating for and hands that name
+//! over instead of leaving the label to be reverse-engineered here.
+//!
 //! This module is the data model only: it records outcomes and answers lookups.
 //! It never runs, skips or caches anything itself.
 
@@ -89,12 +101,36 @@ pub enum TaskState {
     NotApplicable { reason: String },
 }
 
+impl TaskState {
+    /// Stable wire name of the state, for the `ledger` view in `RUN.json`.
+    #[must_use]
+    pub fn lifecycle(&self) -> &'static str {
+        match self {
+            Self::Run { .. } => "run",
+            Self::Cached { .. } => "cached",
+            Self::Skipped { .. } => "skipped",
+            Self::NotApplicable { .. } => "not_applicable",
+        }
+    }
+}
+
 /// Which surface asked for the work. Two kinds can share one [`TaskKey`] — that
 /// is precisely the duplication the ledger exists to make visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskKind {
     Check,
     ContextArtifact,
+}
+
+impl TaskKind {
+    /// Stable wire name of the kind, for the `ledger` view in `RUN.json`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Check => "check",
+            Self::ContextArtifact => "context_artifact",
+        }
+    }
 }
 
 /// One recorded task.
@@ -158,14 +194,16 @@ impl TaskLedger {
     }
 
     /// The most recent entry for `tool_name`, matched on substrate but tolerant
-    /// of the one place a run cannot state its substrate yet.
+    /// of a run that never resolved a substrate of its own.
     ///
-    /// Eligibility skips and cache replays are recorded in the checks stage's
-    /// FIRST pass, which runs before `share_target_snapshot` resolves the run's
-    /// substrate — so those entries carry an unknown substrate even in a run
-    /// that later resolves one. An exact-key lookup would therefore miss
-    /// precisely the entries that say "this work was ruled out", which is the
-    /// answer a later stage most needs before repeating the work itself.
+    /// Entries recorded before [`TaskLedger::set_substrate`] are adopted onto the
+    /// run's substrate the moment it is resolved, so the unknown key survives
+    /// only where the run genuinely has no answer: nothing needed a shared
+    /// snapshot, so none was materialised and no substrate was resolved. A later
+    /// stage reading a tree of its own still resolves a real substrate for it, so
+    /// an exact-key lookup would miss precisely the entries that say "this work
+    /// was ruled out" — the answer that stage most needs before repeating the
+    /// work itself.
     ///
     /// So: an exact match first, then an entry recorded under an unknown
     /// substrate for the same tool. Never the reverse — a task recorded against
@@ -192,12 +230,42 @@ impl TaskLedger {
     }
 
     /// Install the substrate this run resolved once, for tasks that have no
-    /// provenance of their own to report.
+    /// provenance of their own to report — and adopt the entries recorded
+    /// before the run could state it.
     pub fn set_substrate(&self, substrate: SubstrateKey) {
+        self.adopt_unknown_substrate(&substrate);
         *self
             .resolved_substrate
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(substrate);
+    }
+
+    /// Re-key every entry recorded under an unknown substrate onto `resolved`.
+    ///
+    /// Eligibility skips and cache replays are decided in the checks stage's
+    /// FIRST pass, and that order is not incidental: which checks are runnable is
+    /// exactly what decides whether a shared snapshot is materialised at all, so
+    /// the decisions necessarily predate the substrate. They are not
+    /// substrate-less work, though — they are this run's decisions about the tree
+    /// this run went on to read, and once that tree is known the ledger says so
+    /// instead of leaving a later stage to guess through a fallback.
+    ///
+    /// Only the KEY moves. [`TaskState::Cached`]'s `origin` names the ORIGINAL
+    /// execution and is read back from the provenance stored with the cache
+    /// entry; the substrate of the run REPLAYING it is not evidence about it, and
+    /// overwriting it would turn "replayed from some other tree" into a claim
+    /// about this one.
+    fn adopt_unknown_substrate(&self, resolved: &SubstrateKey) {
+        let unknown = SubstrateKey::default();
+        for entry in self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+            .filter(|entry| entry.key.substrate == unknown)
+        {
+            entry.key.substrate = resolved.clone();
+        }
     }
 
     #[must_use]
@@ -474,6 +542,129 @@ mod tests {
             SubstrateKey::from(ScanSubstrate::default()),
             SubstrateKey::default(),
             "an unresolved substrate stays unknown rather than becoming a guess"
+        );
+    }
+
+    /// The fix for "a skip is recorded before the run knows which tree it is
+    /// reading": once the substrate is resolved, the entries decided under an
+    /// unknown one say which tree they were decided about, instead of relying on
+    /// a consumer to fall back.
+    #[test]
+    fn resolving_a_substrate_adopts_the_entries_recorded_without_one() {
+        let ledger = TaskLedger::new();
+        ledger.record(entry(
+            TaskKey::new("ESLint", SubstrateKey::default()),
+            TaskState::Skipped {
+                reason: "fast remote-only preset".to_string(),
+            },
+        ));
+
+        ledger.set_substrate(substrate("abc"));
+
+        assert_eq!(
+            ledger.entries()[0].key,
+            TaskKey::new("ESLint", substrate("abc")),
+            "the skip belongs to the tree this run went on to read",
+        );
+        assert!(
+            ledger
+                .lookup(&TaskKey::new("ESLint", substrate("abc")))
+                .is_some(),
+            "an EXACT lookup now answers, without the unknown-substrate fallback",
+        );
+    }
+
+    /// Adoption moves the key and nothing else: a replay's `origin` is evidence
+    /// about the execution that populated the cache, which this run did not do.
+    #[test]
+    fn adoption_never_rewrites_a_replays_origin() {
+        let ledger = TaskLedger::new();
+        ledger.record(entry(
+            TaskKey::new("TypeScript", SubstrateKey::default()),
+            TaskState::Cached {
+                cache_age_secs: Some(90),
+                origin: substrate("older"),
+            },
+        ));
+        ledger.record(entry(
+            TaskKey::new("Clippy", SubstrateKey::default()),
+            TaskState::Cached {
+                cache_age_secs: None,
+                origin: SubstrateKey::default(),
+            },
+        ));
+
+        ledger.set_substrate(substrate("abc"));
+
+        let entries = ledger.entries();
+        assert_eq!(entries[0].key.substrate, substrate("abc"));
+        assert_eq!(
+            entries[0].state,
+            TaskState::Cached {
+                cache_age_secs: Some(90),
+                origin: substrate("older"),
+            },
+            "the substrate of the ORIGINAL execution survives the run replaying it",
+        );
+        assert_eq!(
+            entries[1].state,
+            TaskState::Cached {
+                cache_age_secs: None,
+                origin: SubstrateKey::default(),
+            },
+            "an entry whose origin was never recorded stays honestly unknown",
+        );
+    }
+
+    /// A substrate resolved later must not relabel work recorded against a tree
+    /// that was already known — only the genuinely unknown keys move.
+    #[test]
+    fn adoption_leaves_a_known_substrate_alone() {
+        let ledger = TaskLedger::new();
+        ledger.record(entry(
+            TaskKey::new("Clippy", substrate("other")),
+            TaskState::Run {
+                duration: Duration::from_secs(2),
+            },
+        ));
+
+        ledger.set_substrate(substrate("abc"));
+
+        assert_eq!(ledger.entries()[0].key.substrate, substrate("other"));
+    }
+
+    #[test]
+    fn kind_and_lifecycle_have_stable_wire_names() {
+        assert_eq!(TaskKind::Check.as_str(), "check");
+        assert_eq!(TaskKind::ContextArtifact.as_str(), "context_artifact");
+        assert_eq!(
+            TaskState::Run {
+                duration: Duration::from_secs(1)
+            }
+            .lifecycle(),
+            "run"
+        );
+        assert_eq!(
+            TaskState::Cached {
+                cache_age_secs: None,
+                origin: SubstrateKey::default()
+            }
+            .lifecycle(),
+            "cached"
+        );
+        assert_eq!(
+            TaskState::Skipped {
+                reason: String::new()
+            }
+            .lifecycle(),
+            "skipped"
+        );
+        assert_eq!(
+            TaskState::NotApplicable {
+                reason: String::new()
+            }
+            .lifecycle(),
+            "not_applicable"
         );
     }
 

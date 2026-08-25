@@ -316,7 +316,25 @@ macro_rules! generate_merge_gate_test {
 
 macro_rules! generate_run_json_test {
     ($dir:expr, $artifacts_root:expr, $config:expr, $checks:expr, $heuristics:expr, $resolved_target:expr, $resolved_bases:expr, ($run_started_at:expr, $total_duration_secs:expr), $stage_timings:expr, $context_artifacts:expr, $context_command_timings:expr, $regression:expr $(,)?) => {
+        generate_run_json_test!(
+            $dir,
+            $artifacts_root,
+            $config,
+            $checks,
+            $heuristics,
+            $resolved_target,
+            $resolved_bases,
+            ($run_started_at, $total_duration_secs),
+            $stage_timings,
+            $context_artifacts,
+            $context_command_timings,
+            $regression,
+            &crate::ledger::TaskLedger::new(),
+        )
+    };
+    ($dir:expr, $artifacts_root:expr, $config:expr, $checks:expr, $heuristics:expr, $resolved_target:expr, $resolved_bases:expr, ($run_started_at:expr, $total_duration_secs:expr), $stage_timings:expr, $context_artifacts:expr, $context_command_timings:expr, $regression:expr, $ledger:expr $(,)?) => {
         generate_run_json(RunJsonInput {
+            ledger: $ledger,
             dir: $dir,
             artifacts_root: $artifacts_root,
             config: $config,
@@ -1123,6 +1141,241 @@ fn run_json_records_context_command_timings() {
     );
     assert_eq!(context_commands[1]["status"].as_str(), Some("timed_out"));
     assert_eq!(context_commands[1]["duration_secs"].as_f64(), Some(30.0));
+}
+
+/// The `ledger` view is the run's account of the work it considered: every
+/// lifecycle serializes with the evidence it holds and nothing else, under a
+/// schema counter of its own.
+#[test]
+fn run_json_records_the_task_ledger() {
+    use crate::checks::TreeState;
+    use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
+
+    let config = create_test_config(PolicyConfig::default());
+    let resolved_target = ResolvedRef {
+        name: "feature/ledger".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let resolved_bases = vec![ResolvedRef {
+        name: "origin/main".to_string(),
+        commit_id: "def5678def5678def5678def5678def5678de".to_string(),
+        is_remote: true,
+    }];
+
+    let substrate = SubstrateKey {
+        target_sha: Some("abc1234".to_string()),
+        tree_state: Some(TreeState::Snapshot),
+    };
+    let ledger = TaskLedger::new();
+    let record = |tool: &str, kind, state| {
+        ledger.record(TaskEntry {
+            key: TaskKey::new(tool, substrate.clone()),
+            kind,
+            state,
+            queued_at: None,
+            started_at: None,
+        });
+    };
+    record(
+        "TypeScript",
+        TaskKind::Check,
+        TaskState::Run {
+            duration: Duration::from_millis(8130),
+        },
+    );
+    record(
+        "TypeScript",
+        TaskKind::ContextArtifact,
+        TaskState::Cached {
+            cache_age_secs: Some(42),
+            origin: SubstrateKey {
+                target_sha: Some("older".to_string()),
+                tree_state: Some(TreeState::LocalDirty),
+            },
+        },
+    );
+    record(
+        "ESLint",
+        TaskKind::Check,
+        TaskState::Skipped {
+            reason: "fast remote-only preset".to_string(),
+        },
+    );
+    record(
+        "cargo tree",
+        TaskKind::ContextArtifact,
+        TaskState::NotApplicable {
+            reason: "no cargo project".to_string(),
+        },
+    );
+
+    let summary_dir = tempfile::tempdir().expect("summary tempdir");
+    generate_run_json_test!(
+        summary_dir.path(),
+        summary_dir.path(),
+        &config,
+        &[],
+        None,
+        &resolved_target,
+        &resolved_bases,
+        ("2026-03-08T12:00:00Z", 1.5),
+        &[],
+        &[],
+        &[],
+        None,
+        &ledger,
+    )
+    .expect("run json");
+
+    let raw = std::fs::read_to_string(summary_dir.path().join("RUN.json")).expect("read run json");
+    let run: serde_json::Value = serde_json::from_str(&raw).expect("parse run json");
+
+    assert_eq!(
+        run["schema_version"].as_str(),
+        Some("1.0"),
+        "an additive view must not move the pack's schema version",
+    );
+    assert_eq!(run["ledger"]["schema"].as_u64(), Some(1));
+
+    let entries = run["ledger"]["entries"].as_array().expect("ledger entries");
+    assert_eq!(entries.len(), 4);
+
+    assert_eq!(entries[0]["tool"].as_str(), Some("tsc"));
+    assert_eq!(entries[0]["kind"].as_str(), Some("check"));
+    assert_eq!(entries[0]["lifecycle"].as_str(), Some("run"));
+    let duration = entries[0]["duration_secs"].as_f64().expect("duration");
+    assert!(
+        (duration - 8.13).abs() < 1e-4,
+        "durations serialize as f32 seconds like the rest of RUN.json, got {duration}",
+    );
+    assert_eq!(
+        entries[0]["substrate"],
+        serde_json::json!({"target_sha": "abc1234", "tree_state": "snapshot"}),
+        "the substrate speaks the same tree_state vocabulary as checks[]",
+    );
+    assert!(entries[0].get("reason").is_none());
+    assert!(entries[0].get("cache_age_secs").is_none());
+
+    assert_eq!(entries[1]["kind"].as_str(), Some("context_artifact"));
+    assert_eq!(entries[1]["lifecycle"].as_str(), Some("cached"));
+    assert_eq!(entries[1]["cache_age_secs"].as_u64(), Some(42));
+    assert_eq!(
+        entries[1]["origin"],
+        serde_json::json!({"target_sha": "older", "tree_state": "local-dirty"}),
+        "a replay reports the tree the ORIGINAL execution read",
+    );
+
+    assert_eq!(entries[2]["tool"].as_str(), Some("eslint"));
+    assert_eq!(entries[2]["lifecycle"].as_str(), Some("skipped"));
+    assert_eq!(
+        entries[2]["reason"].as_str(),
+        Some("fast remote-only preset")
+    );
+
+    assert_eq!(
+        entries[3]["tool"].as_str(),
+        Some("cargo_tree"),
+        "a command with no gate counterpart is slugged from its own label",
+    );
+    assert_eq!(entries[3]["lifecycle"].as_str(), Some("not_applicable"));
+}
+
+/// A skip is decided before the run can know which tree it will read. By the
+/// time `RUN.json` is written the run does know, and the entry must say so —
+/// a reader of the pack cannot apply the in-memory fallback a later stage can.
+#[test]
+fn run_json_reports_the_reviewed_substrate_for_a_skip_recorded_before_it() {
+    use crate::checks::TreeState;
+    use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
+
+    let config = create_test_config(PolicyConfig::default());
+    let resolved_target = ResolvedRef {
+        name: "feature/ledger".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let summary_dir = tempfile::tempdir().expect("summary tempdir");
+
+    let ledger = TaskLedger::new();
+    // The checks stage's first pass: no substrate resolved yet.
+    ledger.record(TaskEntry {
+        key: TaskKey::new("ESLint", SubstrateKey::default()),
+        kind: TaskKind::Check,
+        state: TaskState::Skipped {
+            reason: "fast remote-only preset".to_string(),
+        },
+        queued_at: None,
+        started_at: None,
+    });
+    // …and then the run materialises its shared snapshot.
+    ledger.set_substrate(SubstrateKey {
+        target_sha: Some("abc1234".to_string()),
+        tree_state: Some(TreeState::Snapshot),
+    });
+
+    generate_run_json_test!(
+        summary_dir.path(),
+        summary_dir.path(),
+        &config,
+        &[],
+        None,
+        &resolved_target,
+        &[],
+        ("2026-03-08T12:00:00Z", 1.5),
+        &[],
+        &[],
+        &[],
+        None,
+        &ledger,
+    )
+    .expect("run json");
+
+    let raw = std::fs::read_to_string(summary_dir.path().join("RUN.json")).expect("read run json");
+    let run: serde_json::Value = serde_json::from_str(&raw).expect("parse run json");
+    assert_eq!(
+        run["ledger"]["entries"][0]["substrate"],
+        serde_json::json!({"target_sha": "abc1234", "tree_state": "snapshot"}),
+        "the pack must name the tree the skip was a decision about",
+    );
+}
+
+/// A run with no ledger entries still publishes the view, so a consumer can tell
+/// "this pack records nothing" from "this pack is too old to have the section".
+#[test]
+fn run_json_ledger_view_is_always_present() {
+    let config = create_test_config(PolicyConfig::default());
+    let resolved_target = ResolvedRef {
+        name: "feature/ledger".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let summary_dir = tempfile::tempdir().expect("summary tempdir");
+
+    generate_run_json_test!(
+        summary_dir.path(),
+        summary_dir.path(),
+        &config,
+        &[],
+        None,
+        &resolved_target,
+        &[],
+        ("2026-03-08T12:00:00Z", 1.5),
+        &[],
+        &[],
+        &[],
+        None,
+    )
+    .expect("run json");
+
+    let raw = std::fs::read_to_string(summary_dir.path().join("RUN.json")).expect("read run json");
+    let run: serde_json::Value = serde_json::from_str(&raw).expect("parse run json");
+    assert_eq!(run["ledger"]["schema"].as_u64(), Some(1));
+    assert_eq!(
+        run["ledger"]["entries"].as_array().map(Vec::len),
+        Some(0),
+        "an empty ledger is an empty list, not a missing section",
+    );
 }
 
 #[test]
