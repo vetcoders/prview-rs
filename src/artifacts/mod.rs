@@ -362,7 +362,8 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let context_scan_root = ledger
         .scan_dir()
         .unwrap_or_else(|| config.repo_root.clone());
-    let context_artifacts = plan_context_artifacts(config, &context_scan_root, diffs, &all_checks);
+    let context_artifacts =
+        plan_context_artifacts(config, &context_scan_root, diffs, &all_checks, ledger);
 
     let emit_human_stdout = !config.json && !config.quiet;
     let out_dir = config.allocate_artifacts_dir_for_commit(&resolved_target.commit_id)?;
