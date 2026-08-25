@@ -231,16 +231,38 @@ impl TaskLedger {
 
     /// Install the substrate this run resolved once, for tasks that have no
     /// provenance of their own to report — and adopt the entries recorded
-    /// before the run could state it.
+    /// before the run could state it, all onto that one key.
+    ///
+    /// Correct only where every entry would read the tree the same way. Where
+    /// they would not, use [`TaskLedger::set_substrate_keyed`].
     pub fn set_substrate(&self, substrate: SubstrateKey) {
-        self.adopt_unknown_substrate(&substrate);
+        let one = substrate.clone();
+        self.set_substrate_keyed(substrate, &move |_| one.clone());
+    }
+
+    /// [`TaskLedger::set_substrate`], with each adopted entry re-keyed onto the
+    /// substrate ITS OWN tool would resolve for the same tree.
+    ///
+    /// `resolved` is still the run-wide claim — the answer for a task with no
+    /// tool identity to ask about. `for_tool` is asked per entry, by canonical
+    /// tool id, and belongs to the caller because the ledger holds no knowledge
+    /// of tools: which dependency links a command can consume is a fact about
+    /// that command, and moving the table in here to save an argument would put
+    /// the checks stage's tool table inside the data model that records it.
+    pub fn set_substrate_keyed(
+        &self,
+        resolved: SubstrateKey,
+        for_tool: &dyn Fn(&str) -> SubstrateKey,
+    ) {
+        self.adopt_unknown_substrate(for_tool);
         *self
             .resolved_substrate
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(substrate);
+            .unwrap_or_else(|e| e.into_inner()) = Some(resolved);
     }
 
-    /// Re-key every entry recorded under an unknown substrate onto `resolved`.
+    /// Re-key every entry recorded under an unknown substrate onto the substrate
+    /// `for_tool` names for it.
     ///
     /// Eligibility skips and cache replays are decided in the checks stage's
     /// FIRST pass, and that order is not incidental: which checks are runnable is
@@ -250,12 +272,22 @@ impl TaskLedger {
     /// this run went on to read, and once that tree is known the ledger says so
     /// instead of leaving a later stage to guess through a fallback.
     ///
+    /// PER ENTRY, because one tree does not have one identity. A snapshot carries
+    /// prview's own `node_modules` link whoever runs there, so the same directory
+    /// is `snapshot` to a cargo gate and `snapshot-borrowed-deps` to an ESLint
+    /// one — and the substrate a later stage computes for ESLint is the second of
+    /// those. Adopting every entry onto a single run-wide key filed the ESLint
+    /// skip under the first, the exact-key lookup then missed, and the
+    /// unknown-substrate fallback that was supposed to catch it had just been
+    /// spent by this very adoption. The context stage read `Uncovered` and
+    /// repeated the gate's work — the regression the dedup exists to prevent.
+    ///
     /// Only the KEY moves. [`TaskState::Cached`]'s `origin` names the ORIGINAL
     /// execution and is read back from the provenance stored with the cache
     /// entry; the substrate of the run REPLAYING it is not evidence about it, and
     /// overwriting it would turn "replayed from some other tree" into a claim
     /// about this one.
-    fn adopt_unknown_substrate(&self, resolved: &SubstrateKey) {
+    fn adopt_unknown_substrate(&self, for_tool: &dyn Fn(&str) -> SubstrateKey) {
         let unknown = SubstrateKey::default();
         for entry in self
             .entries
@@ -264,7 +296,7 @@ impl TaskLedger {
             .iter_mut()
             .filter(|entry| entry.key.substrate == unknown)
         {
-            entry.key.substrate = resolved.clone();
+            entry.key.substrate = for_tool(&entry.key.tool);
         }
     }
 
@@ -613,6 +645,52 @@ mod tests {
                 origin: SubstrateKey::default(),
             },
             "an entry whose origin was never recorded stays honestly unknown",
+        );
+    }
+
+    /// One tree, two identities. Adoption asks per entry, by tool id, because
+    /// the substrate a later stage will compute for a tool is that tool's own
+    /// reading — and a key adopted onto anything else is a key nothing will ever
+    /// look up, with the unknown-substrate fallback already spent.
+    #[test]
+    fn adoption_asks_per_entry_which_tree_that_tool_reads() {
+        let borrowed = SubstrateKey {
+            target_sha: Some("abc".to_string()),
+            tree_state: Some(TreeState::SnapshotBorrowedDeps),
+        };
+        let ledger = TaskLedger::new();
+        for tool in ["ESLint", "Clippy"] {
+            ledger.record(entry(
+                TaskKey::new(tool, SubstrateKey::default()),
+                TaskState::Skipped {
+                    reason: "fast remote-only preset".to_string(),
+                },
+            ));
+        }
+
+        let borrowed_for_eslint = borrowed.clone();
+        ledger.set_substrate_keyed(substrate("abc"), &move |tool| {
+            if tool == "eslint" {
+                borrowed_for_eslint.clone()
+            } else {
+                substrate("abc")
+            }
+        });
+
+        assert_eq!(
+            ledger.entries()[0].key.substrate,
+            borrowed,
+            "ESLint resolves its toolchain through the linked tree, so that is its key",
+        );
+        assert_eq!(
+            ledger.entries()[1].key.substrate,
+            substrate("abc"),
+            "Clippy reads nothing through the link, so the same tree is an exact scan to it",
+        );
+        assert_eq!(
+            ledger.resolved_substrate(),
+            Some(substrate("abc")),
+            "the run-wide claim names no command and is unaffected",
         );
     }
 

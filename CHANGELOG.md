@@ -40,6 +40,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waited out the full five-minute timeout with `uv` still building. It is now
   registered like every other child, and is not started at all for a run that
   has already been cancelled.
+- The context stage no longer repeats a gate's work on a JS repository. When the
+  gates share an analysis snapshot, the ledger entries that predate it are
+  adopted onto that snapshot's revision signature — but the signature was
+  computed once for the whole run, ignoring which dependencies each tool borrows
+  from the working tree. An ESLint entry was therefore filed under `snapshot`
+  while the context stage went on to ask for `snapshot-borrowed-deps` for the
+  same directory, the lookup missed, and the context stage re-ran a full
+  `eslint . -f json` (and, off the fast path, a full `tsc` trace) that the gate
+  had already done — on exactly the two scenarios the shared snapshot exists
+  for. Each entry is now adopted under the signature its own tool will later
+  compute, so the gate's result is found — and a missing tool is no longer
+  reported as "no ESLint gate in this run" when the run did have one.
 
 ### Added
 

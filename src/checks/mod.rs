@@ -9,7 +9,8 @@ use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, Task
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -207,9 +208,16 @@ const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
 /// `tsc` trace and the TypeScript gate describe one tree identically instead of
 /// differing on `tree_state` alone — a difference that would silently partition
 /// the two into separate ledger tasks and defeat the dedup.
+///
+/// The lookup goes through [`crate::check_id::check_id_from_name`], so a display
+/// name (`"TypeScript"`) and the id a ledger entry carries (`"tsc"`) get the same
+/// answer. That is a requirement, not a convenience: the ledger keys tasks by id,
+/// so re-keying an entry has nothing but the id to ask with, and a table that
+/// only knew display names would answer "consumes nothing" for every one of them.
 pub(crate) fn consumable_scaffolding(check: &str) -> &'static [&'static str] {
-    match check {
-        "TypeScript" | "ESLint" | "Vitest" | "Stylelint" => &["node_modules"],
+    match crate::check_id::check_id_from_name(check).as_str() {
+        // "TypeScript", "ESLint", "Vitest", "Stylelint" — as their canonical ids.
+        "tsc" | "eslint" | "tests" | "stylelint" => &["node_modules"],
         _ => &[],
     }
 }
@@ -1555,10 +1563,52 @@ fn share_target_snapshot(
     // Installing it also adopts the first pass's skips and cache replays, which
     // were necessarily decided before this point — the first pass is what
     // produces the runnable set — and so were recorded under an unknown
-    // substrate.
-    ledger.set_substrate(resolve_scan_substrate(&plan.scan_dir, &config.repo_root, &[]).into());
+    // substrate. Those entries DO name a tool, so each is re-keyed on that tool's
+    // own reading of this tree rather than on the run-wide claim: the ESLint skip
+    // of a JS repo has to land on the key the context stage will later compute
+    // for ESLint, or the dedup misses it and lints the whole tree again.
+    let run_wide: SubstrateKey =
+        resolve_scan_substrate(&plan.scan_dir, &config.repo_root, &[]).into();
+    let per_tool = adopted_substrate(
+        plan.scan_dir.clone(),
+        config.repo_root.clone(),
+        run_wide.clone(),
+    );
+    ledger.set_substrate_keyed(run_wide, &per_tool);
     ledger.set_shared_snapshot(plan._snapshot);
 }
+
+/// How each tool reads `scan_dir`, for re-keying the entries decided before the
+/// run knew which tree it was reading.
+///
+/// One `git status` per distinct consumable set, not per entry: there are only
+/// two sets in the table ([`consumable_scaffolding`] answers either nothing or
+/// `node_modules`), and the run-wide resolution seeds the first of them, so a
+/// whole adoption costs at most one status read more than it used to.
+fn adopted_substrate(
+    scan_dir: PathBuf,
+    repo_root: PathBuf,
+    run_wide: SubstrateKey,
+) -> impl Fn(&str) -> SubstrateKey {
+    let cache: std::cell::RefCell<HashMap<&'static [&'static str], SubstrateKey>> =
+        std::cell::RefCell::new(HashMap::from([(NOTHING_CONSUMABLE, run_wide)]));
+
+    move |tool| {
+        let consumable = consumable_scaffolding(tool);
+        if let Some(known) = cache.borrow().get(consumable) {
+            return known.clone();
+        }
+        let resolved: SubstrateKey =
+            resolve_scan_substrate(&scan_dir, &repo_root, consumable).into();
+        cache.borrow_mut().insert(consumable, resolved.clone());
+        resolved
+    }
+}
+
+/// The answer [`consumable_scaffolding`] gives a tool that reads none of
+/// prview's dependency links — and the key the run-wide substrate is cached
+/// under, since that is resolved the same way.
+const NOTHING_CONSUMABLE: &[&str] = &[];
 
 /// Security checks stay loud: a spawn failure here is NOT downgraded to Skipped
 /// (PV-01), so a broken or half-installed security tool can't silently vanish
@@ -2097,6 +2147,92 @@ mod tests {
         );
     }
 
+    /// PRV-CONTEXT-WORK-DEDUP, through the door adoption opened. One tree does
+    /// not have one identity: a snapshot of a JS repo carries prview's own
+    /// `node_modules` link whoever runs there, so the same directory is
+    /// `snapshot` to a cargo gate and `snapshot-borrowed-deps` to ESLint — and
+    /// `snapshot-borrowed-deps` is exactly what the context stage resolves for
+    /// ESLint before asking whether the gate already covered it.
+    ///
+    /// Adopting every unkeyed entry onto ONE run-wide key filed the ESLint skip
+    /// under the cargo reading, the context stage's exact-key lookup missed, and
+    /// the unknown-substrate fallback that would have caught it had just been
+    /// spent by this very adoption. `Uncovered` meant a full `eslint .` over a
+    /// tree the run had already decided about — on both of the scenarios the
+    /// shared snapshot exists for: a warm second `--pr N`, and the fast
+    /// remote-only preset.
+    #[test]
+    fn an_adopted_skip_is_keyed_the_way_its_own_tool_reads_the_tree() {
+        let (repo, target) = repo_with_off_head_target();
+        let root = repo.path();
+        // What makes the snapshot carry a link at all: the operator's own
+        // dependency tree, which `create_worktree_snapshot` symlinks in.
+        std::fs::create_dir(root.join("node_modules")).expect("node_modules");
+        std::fs::write(root.join("node_modules/marker"), "dep\n").expect("dep file");
+
+        let mut config = rust_config(true, true, true);
+        config.repo_root = root.to_path_buf();
+        config.target = Some("feature".to_string());
+
+        let ledger = TaskLedger::new();
+        // Recorded exactly the way run_all's first pass records a preset skip or
+        // a cache replay: before the run knows which tree it will read.
+        ledger.record(TaskEntry {
+            key: TaskKey::new("ESLint", ledger_substrate(None, &ledger)),
+            kind: TaskKind::Check,
+            state: TaskState::Skipped {
+                reason: "fast remote-only preset".to_string(),
+            },
+            queued_at: None,
+            started_at: None,
+        });
+
+        let snapshot_backed: Vec<Box<dyn Check>> = vec![Box::new(cargo::CargoCheck)];
+        share_target_snapshot(&mut config, &snapshot_backed, &ledger);
+
+        let scan_dir = ledger
+            .scan_dir()
+            .expect("an off-HEAD run snapshots the target");
+        if !scan_dir.join("node_modules").exists() {
+            // Symlinking is unix-only; nothing to assert elsewhere.
+            return;
+        }
+
+        // The key the CONTEXT stage will compute for ESLint on this tree — the
+        // same call `context_substrate` makes, with the same consumable set.
+        let as_eslint_reads_it: crate::ledger::SubstrateKey =
+            resolve_scan_substrate(&scan_dir, root, consumable_scaffolding("ESLint")).into();
+        assert_eq!(
+            as_eslint_reads_it,
+            crate::ledger::SubstrateKey {
+                target_sha: Some(target.clone()),
+                tree_state: Some(TreeState::SnapshotBorrowedDeps),
+            },
+            "the fixture is only meaningful while the linked tree is what ESLint would read",
+        );
+
+        assert_eq!(
+            ledger.entries()[0].key.substrate,
+            as_eslint_reads_it,
+            "an adopted ESLint skip must land on the key ESLint's own reading produces",
+        );
+        assert!(
+            ledger
+                .lookup(&TaskKey::new("ESLint", as_eslint_reads_it))
+                .is_some(),
+            "the context stage's EXACT lookup must answer — the unknown-substrate \
+             fallback is gone, spent by this adoption",
+        );
+        assert_eq!(
+            ledger.resolved_substrate(),
+            Some(crate::ledger::SubstrateKey {
+                target_sha: Some(target),
+                tree_state: Some(TreeState::Snapshot),
+            }),
+            "the RUN-WIDE claim names no command, so it still consumes nothing",
+        );
+    }
+
     #[test]
     fn scan_substrate_of_a_target_snapshot_names_the_snapshot_commit() {
         // A snapshot-backed check scans an ephemeral worktree of the reviewed
@@ -2308,6 +2444,30 @@ mod tests {
                 consumable_scaffolding(check),
                 &["node_modules"],
                 "{check} resolves its toolchain through node_modules",
+            );
+        }
+    }
+
+    /// The table has to answer for a check ID as well as a display name: a
+    /// ledger entry carries only the id, so re-keying one has nothing else to
+    /// ask with. A display-name-only table answered "consumes nothing" for every
+    /// tool in the ledger — including `tsc` and `tests`, whose ids do not even
+    /// resemble the names.
+    #[test]
+    fn the_scaffolding_table_answers_for_a_check_id_too() {
+        for check in ["TypeScript", "ESLint", "Vitest", "Stylelint"] {
+            let id = crate::check_id::check_id_from_name(check);
+            assert_eq!(
+                consumable_scaffolding(&id),
+                consumable_scaffolding(check),
+                "{check} and its id {id} must read the same tree the same way",
+            );
+        }
+        for check in ["Cargo check", "Semgrep", "Ruff", "cargo tree"] {
+            let id = crate::check_id::check_id_from_name(check);
+            assert!(
+                consumable_scaffolding(&id).is_empty(),
+                "{id} reads nothing through prview's dependency links",
             );
         }
     }

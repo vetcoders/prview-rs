@@ -286,14 +286,29 @@ tree, and the artifact stage's fallback to `config.repo_root` is the right answe
 The call therefore sits *outside* the dispatcher's "anything to run" guard, since
 a run with an empty runnable set is exactly the case it exists to cover.
 
-Materialising also resolves the run-wide substrate (`ledger.set_substrate`),
-which adopts the first pass's skips and cache replays off the unknown substrate
-they were necessarily recorded under. That is the quiet half of the same bug: a
-warm `--pr` run used to report its own decisions as being about no particular
-tree. The run-wide substrate is resolved with an **empty** consumable-scaffolding
-list, so it reports `snapshot` and never `snapshot-borrowed-deps` — with no
-command to name, nothing at that point can consume the linked `node_modules`; a
-command that does resolve through the link reports that for itself.
+Materialising also resolves the run-wide substrate
+(`ledger.set_substrate_keyed`), which adopts the first pass's skips and cache
+replays off the unknown substrate they were necessarily recorded under. That is
+the quiet half of the same bug: a warm `--pr` run used to report its own
+decisions as being about no particular tree. The run-wide substrate is resolved
+with an **empty** consumable-scaffolding list, so it reports `snapshot` and never
+`snapshot-borrowed-deps` — with no command to name, nothing at that point can
+consume the linked `node_modules`; a command that does resolve through the link
+reports that for itself.
+
+The adopted ENTRIES are keyed differently, and must be: they each name a tool,
+and the substrate a later stage computes for that tool is that tool's own reading
+of the tree. `adopted_substrate` re-keys each one through
+`consumable_scaffolding(entry.key.tool)`, caching one `git status` per distinct
+consumable set (there are two, and the run-wide resolution seeds the first).
+Filing them all under the run-wide key instead put a JS repo's ESLint skip under
+`snapshot` while the context stage went on to resolve `snapshot-borrowed-deps`
+for the same directory: the exact-key lookup missed, `lookup_tool`'s
+unknown-substrate fallback had just been spent by this very adoption, and the
+context stage read `Uncovered` and re-ran the gate's work in full — on both
+scenarios the shared snapshot exists for. `consumable_scaffolding` therefore
+normalises its argument through `check_id_from_name`, since a ledger entry
+carries only the id (`tsc`, `tests`) and never the display name.
 
 The Python checks add one step on top of that symlink. `uv run` synchronises the
 project environment before executing, so a reviewed commit whose dependencies
@@ -807,13 +822,17 @@ stale that answer is.
 Skips and replays are decided in the checks stage's *first pass*, which
 necessarily precedes `share_target_snapshot` — the runnable set is what decides
 whether a snapshot is materialised at all — so they are recorded under an unknown
-substrate. `TaskLedger::set_substrate` therefore **adopts** them: every entry
-still keyed on an unknown substrate is re-keyed onto the resolved one, because
-they were this run's decisions about the tree this run went on to read. Only the
-key moves; a replay's `origin` is never overwritten with the current run's
-substrate. An unknown key survives only where the run genuinely resolved no
-substrate (nothing needed a shared snapshot), which is what
-`TaskLedger::lookup_tool`'s fallback still covers.
+substrate. `TaskLedger::set_substrate_keyed` therefore **adopts** them: every
+entry still keyed on an unknown substrate is re-keyed, because they were this
+run's decisions about the tree this run went on to read. The new key is asked for
+per entry, by tool id — one tree does not have one identity, and a snapshot that
+carries a `node_modules` link is `snapshot` to a cargo gate and
+`snapshot-borrowed-deps` to a JS one. The knowledge of which is which stays in
+`checks` (`consumable_scaffolding`) and is handed in as a closure; the ledger
+holds no table of tools. Only the key moves; a replay's `origin` is never
+overwritten with the current run's substrate. An unknown key survives only where
+the run genuinely resolved no substrate (nothing needed a shared snapshot), which
+is what `TaskLedger::lookup_tool`'s fallback still covers.
 
 Context commands that actually execute are recorded too, by
 `artifacts::context_artifacts::record_context_runs`, once the runtime knows their
