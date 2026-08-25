@@ -36,6 +36,8 @@ prview-rs/
 │   │   └── python.rs
 │   ├── ledger/
 │   │   └── mod.rs       # Task ledger: one record per unit of work in a run
+│   ├── governor/
+│   │   └── mod.rs       # Bounded execution: weighted budget + child registry (not wired yet)
 │   ├── heuristics/
 │   │   ├── mod.rs       # HeuristicsResult, runner
 │   │   └── loctree.rs   # Loctree heuristic (universal)
@@ -866,6 +868,63 @@ read the reviewed tree; a local review resolves to the repo root, which *is* the
 reviewed tree, so its behaviour is unchanged. Cargo context commands resolve
 their directory through `checks::planned_cargo_cwd`, the same resolution the
 cargo gates use, so a workspace member is not collapsed to the snapshot root.
+
+### governor/mod.rs
+
+**Status: primitive only — nothing in the run acquires from it yet.** Wiring the
+dispatcher to it is a separate change, so the budget can be reviewed before it
+starts shaping when checks run.
+
+Concurrency is currently decided per stage: the checks stage picks its own
+fan-out, the context stage picks another, and nothing holds the machine-wide
+number. Two stages each behaving reasonably still oversubscribe a laptop, and the
+tools are not equal — `cargo clippy` and `cargo test` each want the whole box
+while reading a manifest costs nothing.
+
+`ResourceGovernor` is that missing number, plus the registry that makes a run
+killable:
+
+```rust
+pub enum Weight { Light, Heavy }   // a declaration, not a permit count
+
+impl ResourceGovernor {
+    pub fn new() -> Self;                                  // budget = available_parallelism()
+    pub fn with_budget(total: u32, heavy_cost: u32) -> Self;
+    pub fn cost(&self, weight: Weight) -> u32;
+    pub async fn acquire(&self, weight: Weight) -> Result<GovernorPermit, Cancelled>;
+    pub fn register_child(&self, key: impl Into<String>, pid: u32);
+    pub fn unregister_child(&self, key: &str);
+    pub fn cancel(&self);
+    pub fn cancelled_signal(&self) -> tokio::sync::watch::Receiver<bool>;
+    pub fn is_cancelled(&self) -> bool;
+}
+```
+
+- **Weights cost what the governor says.** `Light` is one permit; `Heavy` is
+  `total.div_ceil(2)`, so eight cores admit two heavy tasks at once while light
+  work still fits beside them. What a weight costs depends on the budget, so the
+  enum carries no number.
+- **The budget is the machine.** `available_parallelism()`, falling back to `4`
+  when the syscall fails — not `1`, which would turn an unknown into a stall.
+  Both `with_budget` arguments are clamped (`total >= 1`,
+  `heavy_cost ∈ 1..=total`): a zero budget is a deadlock and a heavy cost above
+  the total parks that task forever on permits the semaphore will never hold.
+- **A permit is held, never released by hand.** `GovernorPermit` returns the
+  permits on drop, so an error path cannot leak budget.
+- **Cancellation closes the semaphore.** That refuses a newcomer and a task
+  ALREADY waiting alike — a task parked on the budget is work that has not
+  started. `cancelled_signal()` is a `watch::Receiver` a dispatcher loop can
+  `select!` on, and it starts at the current state so a late subscriber is not
+  left waiting for a change that already happened.
+- **`cancel()` SIGKILLs each registered child's process group** through the
+  existing `proc::sigkill_process_group`, reaching the whole `cargo` → `rustc` →
+  `cc` tree. It is idempotent in the strong sense: the registry is DRAINED, so a
+  second cancel signals nothing — a pid whose process died in between may by then
+  belong to another program. Callers must `unregister_child` on exit for the same
+  reason.
+
+Zero new dependencies: the budget is `tokio::sync::Semaphore::acquire_many_owned`
+and the signal is `tokio::sync::watch`, both already in the graph.
 
 ### mcp/
 

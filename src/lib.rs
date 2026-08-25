@@ -11,6 +11,7 @@ pub mod cli;
 pub mod config;
 pub mod gate;
 pub mod git;
+pub mod governor;
 pub mod heuristics;
 pub mod ledger;
 pub mod mcp;
