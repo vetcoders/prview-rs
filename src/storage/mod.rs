@@ -64,11 +64,19 @@ pub struct RunIndex {
 }
 
 fn index_path() -> PathBuf {
-    prview_home().join("index.jsonl")
+    index_path_for_home(&prview_home())
 }
 
 fn lock_path() -> PathBuf {
-    prview_home().join("index.jsonl.lock")
+    lock_path_for_home(&prview_home())
+}
+
+fn index_path_for_home(home: &Path) -> PathBuf {
+    home.join("index.jsonl")
+}
+
+fn lock_path_for_home(home: &Path) -> PathBuf {
+    home.join("index.jsonl.lock")
 }
 
 fn resolve_explicit_index_path(path: &Path) -> Result<PathBuf> {
@@ -227,7 +235,10 @@ impl RunIndex {
 
     /// Rebuild index by scanning `~/.prview/runs/` and parsing `report.json`.
     pub fn rebuild() -> Self {
-        let runs_dir = prview_home().join("runs");
+        Self::rebuild_from(&prview_home().join("runs"))
+    }
+
+    fn rebuild_from(runs_dir: &Path) -> Self {
         let mut entries = Vec::new();
 
         if !runs_dir.is_dir() {
@@ -235,7 +246,7 @@ impl RunIndex {
         }
 
         // runs/<repo>/<branch>/<run_id>/
-        let repos = read_subdirs(&runs_dir);
+        let repos = read_subdirs(runs_dir);
         for repo_dir in repos {
             let repo_name = dir_name(&repo_dir);
             let branches = read_subdirs(&repo_dir);
@@ -745,14 +756,24 @@ pub struct RunsOpts {
 }
 
 pub fn run_runs_command(opts: &RunsOpts) -> Result<()> {
+    // Keep the production contract unchanged: PRVIEW_HOME (or its default) is
+    // resolved at the entrypoint, then passed as ordinary state below.
+    let home = prview_home();
+    run_runs_command_with_home(opts, &home)
+}
+
+fn run_runs_command_with_home(opts: &RunsOpts, home: &Path) -> Result<()> {
+    let index_path = index_path_for_home(home);
+    let lock_path = lock_path_for_home(home);
+
     let index = if opts.rebuild {
         eprintln!("Rebuilding index from disk...");
         // Hold the lock across the disk scan AND the save so a concurrent
         // register_and_prune cannot have its freshly appended entry clobbered
         // by the rebuilt snapshot.
-        let _lock = acquire_lock()?;
-        let idx = RunIndex::rebuild();
-        idx.save()?;
+        let _lock = acquire_lock_at(&lock_path)?;
+        let idx = RunIndex::rebuild_from(&home.join("runs"));
+        idx.save_to(&index_path)?;
         eprintln!("Rebuilt index with {} entries", idx.entries().len());
         idx
     } else {
@@ -767,17 +788,17 @@ pub fn run_runs_command(opts: &RunsOpts) -> Result<()> {
         // live writer already holds the lock we skip the opportunistic cleanup
         // and just display what is on disk, rather than blocking or failing a
         // read-oriented command.
-        match acquire_lock() {
+        match acquire_lock_at(&lock_path) {
             Ok(_lock) => {
-                let mut idx = RunIndex::load();
+                let mut idx = RunIndex::load_from(&index_path);
                 let before = idx.entries().len();
                 idx.remove_stale();
                 if idx.entries().len() < before {
-                    idx.save()?;
+                    idx.save_to(&index_path)?;
                 }
                 idx
             }
-            Err(_) => RunIndex::load(),
+            Err(_) => RunIndex::load_from(&index_path),
         }
     };
 
@@ -1420,23 +1441,12 @@ mod tests {
         assert!(msg.contains("/tmp/dashboard.html"));
     }
 
-    // `run_runs_command` reaches the global index/lock via PRVIEW_HOME, so these
-    // tests serialize env mutation. No other storage test uses the global paths
-    // (they all pass explicit paths), so scoping PRVIEW_HOME here is safe.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn storage_env_contract_keeps_paths_below_prview_home() {
+        let home = Path::new("/tmp/prview-home-contract");
 
-    fn with_prview_home<R>(f: impl FnOnce(&Path) -> R) -> R {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = tempfile::tempdir().unwrap();
-        let prev = std::env::var("PRVIEW_HOME").ok();
-        // SAFETY: serialized by ENV_LOCK; restored before returning.
-        unsafe { std::env::set_var("PRVIEW_HOME", home.path()) };
-        let result = f(home.path());
-        match prev {
-            Some(v) => unsafe { std::env::set_var("PRVIEW_HOME", v) },
-            None => unsafe { std::env::remove_var("PRVIEW_HOME") },
-        }
-        result
+        assert_eq!(index_path_for_home(home), home.join("index.jsonl"));
+        assert_eq!(lock_path_for_home(home), home.join("index.jsonl.lock"));
     }
 
     fn runs_opts_all_json() -> RunsOpts {
@@ -1466,50 +1476,51 @@ mod tests {
 
     #[test]
     fn run_runs_command_cleanup_removes_stale_and_keeps_live() {
-        with_prview_home(|home| {
-            let mut index = RunIndex { entries: vec![] };
-            index.append(live_entry(home, "live-001"));
-            index.append(stale_entry(home, "stale-002"));
-            index.save().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let index_path = index_path_for_home(home.path());
+        let mut index = RunIndex { entries: vec![] };
+        index.append(live_entry(home.path(), "live-001"));
+        index.append(stale_entry(home.path(), "stale-002"));
+        index.save_to(&index_path).unwrap();
 
-            run_runs_command(&runs_opts_all_json()).expect("runs command");
+        run_runs_command_with_home(&runs_opts_all_json(), home.path()).expect("runs command");
 
-            // The stale-entry cleanup is a locked read-modify-write: the live
-            // entry survives, the stale one is dropped, and the change is
-            // persisted.
-            let reloaded = RunIndex::load();
-            let ids: Vec<&str> = reloaded.entries().iter().map(|e| e.id.as_str()).collect();
-            assert!(
-                ids.contains(&"live-001"),
-                "live entry must survive: {ids:?}"
-            );
-            assert!(
-                !ids.contains(&"stale-002"),
-                "stale entry must be pruned: {ids:?}"
-            );
-        });
+        // The stale-entry cleanup is a locked read-modify-write: the live entry
+        // survives, the stale one is dropped, and the change is persisted.
+        let reloaded = RunIndex::load_from(&index_path);
+        let ids: Vec<&str> = reloaded.entries().iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            ids.contains(&"live-001"),
+            "live entry must survive: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"stale-002"),
+            "stale entry must be pruned: {ids:?}"
+        );
     }
 
     #[test]
     fn run_runs_command_skips_cleanup_write_when_lock_is_held() {
-        with_prview_home(|home| {
-            let mut index = RunIndex { entries: vec![] };
-            index.append(live_entry(home, "live-001"));
-            index.append(stale_entry(home, "stale-002"));
-            index.save().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let index_path = index_path_for_home(home.path());
+        let lock_path = lock_path_for_home(home.path());
+        let mut index = RunIndex { entries: vec![] };
+        index.append(live_entry(home.path(), "live-001"));
+        index.append(stale_entry(home.path(), "stale-002"));
+        index.save_to(&index_path).unwrap();
 
-            // A concurrent writer owns the index lock. `runs` must not perform an
-            // unlocked cleanup write; it degrades to a read and leaves the index
-            // (including the not-yet-pruned stale entry) untouched.
-            let _held = acquire_lock().expect("acquire lock");
-            run_runs_command(&runs_opts_all_json()).expect("runs command stays read-only");
+        // A concurrent writer owns the index lock. `runs` must not perform an
+        // unlocked cleanup write; it degrades to a read and leaves the index
+        // (including the not-yet-pruned stale entry) untouched.
+        let _held = acquire_lock_at(&lock_path).expect("acquire lock");
+        run_runs_command_with_home(&runs_opts_all_json(), home.path())
+            .expect("runs command stays read-only");
 
-            let reloaded = RunIndex::load();
-            let ids: Vec<&str> = reloaded.entries().iter().map(|e| e.id.as_str()).collect();
-            assert!(
-                ids.contains(&"stale-002"),
-                "cleanup must be gated on the lock; stale entry must remain: {ids:?}"
-            );
-        });
+        let reloaded = RunIndex::load_from(&index_path);
+        let ids: Vec<&str> = reloaded.entries().iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            ids.contains(&"stale-002"),
+            "cleanup must be gated on the lock; stale entry must remain: {ids:?}"
+        );
     }
 }
