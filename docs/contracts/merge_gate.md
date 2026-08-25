@@ -170,6 +170,23 @@ when `breaking_escalation` is enabled. Unknown facts degrade analysis confidence
 and require review; they never masquerade as confirmed removals. Review caveats
 carry the same IDs, so consumers can join directly to this structure.
 
+The Rust value is frozen before checks. Its comparison anchors are the exact
+resolved bases/merge-bases, not ordinary patch `Diff` rows, so an equal-OID
+dirty-only comparison remains observable without manufacturing an empty patch.
+For a dirty local HEAD, `target_revision` names
+`WorkingTreeOverlay { target_oid, dirty_digest }`, where `dirty_digest` hashes
+the exact captured tracked inventory and owned bytes/states. This is distinct
+from the broader pack `PROVENANCE.json.worktree.status_digest`, which also
+fingerprints unrelated untracked state; the two digests are not required to
+match.
+
+The tracked capture budget is 64 MiB per run. Budget exhaustion is serialized
+through typed unknown evidence for the affected path, never by reading later
+filesystem bytes or silently substituting the target Git blob. Unchanged paths
+always come from the exact target `GitTree`. Because `artifacts::generate`
+receives the already-owned `ApiDelta`, edits or restoration after capture cannot
+change any of the four emitted Rust API surfaces.
+
 ## `decision`
 
 The decision object is the merge verdict. Its scalar fields are derived from two

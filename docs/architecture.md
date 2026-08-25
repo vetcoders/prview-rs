@@ -102,6 +102,7 @@ app.run()
     ├─► resolve_target()       ─── resolves the target branch
     ├─► resolve_bases()        ─── resolves bases (repo default plus tool fallbacks)
     ├─► generate_diffs()       ─── git2 diff with per-file stats (Patch API)
+    ├─► prepare_rust_api_delta() ─ exact anchors + frozen target capture
     ├─► checks::run_all()      ─── parallel checks (tsc, cargo, ruff...)
     ├─► heuristics::run()      ─── loctree (universal structural signals)
     └─► artifacts::generate()  ─── numbered layout + signal generators
@@ -178,6 +179,9 @@ impl Repository {
 Artifact diffs use `resolve_diff_bases()` before `generate_diffs()`, so the
 review pack matches GitHub's three-dot "Files changed" model: branch names stay
 displayable as bases, while each diff is anchored at the target/base merge-base.
+Rust API comparison uses that resolved `comparison_bases` vector directly,
+before patch generation can discard an equal-OID pair. Ordinary `Diff` remains
+the patch contract; it is not the owner of API comparison anchors.
 
 Advantages of git2 over the `git` CLI:
 - much faster for batch operations
@@ -639,6 +643,13 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   digest of an unchanged tree — does not depend on the order git reports them in.
   It is a stable fingerprint, not a capture of a specific
   `git status --porcelain` stdout;
+
+This pack-level digest is intentionally broader than Rust API overlay
+provenance: it includes unrelated untracked state so two whole packs remain
+distinguishable. A dirty Rust target instead carries a separate tracked-capture
+digest computed from the exact owned tracked inventory and bytes/states used by
+the backend. The values answer different questions and need not be equal.
+
 - `checks[]` — one row per configured check: `{id, cwd, target_sha, tree_state,
   started_at, cached, skipped}`, with `null` fields for a check that produced no
   provenance. `skipped` is `null` for a check that ran and carries the reason for
@@ -924,20 +935,41 @@ provenance. Finding IDs preserve Rust identifier case and serialize the complete
 semantic identity, including both sides' cfg regions, contracts, and typed
 unknown provenance; legal ambiguous input is data, never an assertion failure.
 
-`compare_rust_api_revisions` always constructs base snapshots from the exact
-`Diff.base_commit_id` Git trees. It selects the target substrate once per run:
+`prepare_rust_api_delta` constructs base snapshots from the exact resolved
+comparison bases (normally merge bases), independently of ordinary patch
+`Diff`s. Equal base/target OIDs remain real anchors: a dirty-only local change is
+compared against that exact commit even though `generate_diffs` correctly emits
+no synthetic empty patch. Normal CLI, every watch quick run, and the TUI sync
+phase call this preparation before checks or heuristics. `artifacts::generate`
+receives the resulting owned `ApiDelta` and only projects it; it never reopens a
+Rust revision source.
 
-| Declared target | Additional evidence | Rust API target substrate | Emitted provenance |
+Target selection happens once during that before-check preparation:
+
+| Declared target | Captured evidence | Rust API target substrate | Emitted provenance |
 |---|---|---|---|
-| Clean local target | `worktree_clean == Some(true)` | exact `GitTree` | `GitTree { commit_oid }` |
-| Dirty local target at checked-out HEAD | `worktree_clean == Some(false)` and a non-empty captured status digest | tracked `WorkingTreeOverlay` | `WorkingTreeOverlay { target_oid, dirty_digest }` |
+| Clean or untracked-only local target at checked-out HEAD | tracked capture inventory is empty | exact `GitTree` | `GitTree { commit_oid }` |
+| Dirty local target at checked-out HEAD | tracked capture contains modified, staged/added, renamed, deleted, non-regular, or unreadable state | immutable tracked `CapturedWorkingTreeOverlay` | `WorkingTreeOverlay { target_oid, dirty_digest }` |
 | Remote target, including an OID equal to local HEAD | `is_remote == true` | exact `GitTree` | `GitTree { commit_oid }` |
 | Local target not equal to checked-out HEAD | exact target OID differs from `head_commit_id()` | exact `GitTree` | `GitTree { commit_oid }` |
-| Local target at HEAD with unavailable status/digest | provenance cannot establish the dirty substrate | fail closed; no Rust API artifacts | error, never clean-HEAD fallback |
+| Local target at HEAD with unavailable tracked status | capture cannot establish the substrate | fail closed; no Rust API artifacts | error, never an exact-HEAD guess |
 
-The overlay inventory and reads include tracked modified, staged, added,
-renamed, and deleted state while excluding unrelated untracked paths. Duplicate
-exact base/target OID pairs are coalesced in stable first-seen order before
+The capture owns bytes for tracked modified, staged/added, and rename-destination
+files, and owns explicit terminal states for deleted, renamed-away, non-regular,
+unreadable, or over-budget paths. Unchanged reads delegate to the exact target
+Git blob. After capture, neither overlay inventory nor overlay reads consult the
+live filesystem, so a rewrite or restoration during checks cannot change facts
+under the earlier provenance.
+
+`dirty_digest` is deterministic SHA-256 over the exact target OID, sorted
+tracked change inventory, modes, owned bytes, and terminal states. Its capture
+budget is 64 MiB total per run. A file that would exceed the remaining budget is
+not read partially and never falls back to disk: it becomes typed unreadable
+evidence, which the Rust snapshot exposes as an unknown region. Unrelated
+untracked paths enter only the broad `PROVENANCE.json.worktree.status_digest`,
+not this tracked digest or source inventory.
+
+Duplicate exact base/target OID pairs are coalesced in stable first-seen order before
 comparison; one target snapshot is reused across distinct multi-base
 comparisons, which retain their own revision evidence and
 comparison-qualified finding IDs. Patch text never participates in Rust API

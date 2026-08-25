@@ -278,6 +278,7 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
         bases,
         target_snap,
         base_snap,
+        rust_api_delta,
         worktree_clean,
         worktree_status_digest,
     ) = {
@@ -294,6 +295,11 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
         let diffs = app
             .repo
             .generate_diffs(&target, &diff_bases, app.config.quiet)?;
+        // Keep git2 and all target-source reads in the synchronous phase. The
+        // async checks receive no live Rust source, and artifact generation
+        // later projects only this frozen owned delta.
+        let rust_api_delta =
+            crate::artifacts::api_delta::prepare_rust_api_delta(&app.repo, &diff_bases, &target)?;
 
         // Create snapshots synchronously (for remote/remote-only mode)
         let target_snap = if app.config.remote_mode || app.config.remote_only {
@@ -318,6 +324,7 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
             bases,
             target_snap,
             base_snap,
+            rust_api_delta,
             worktree_clean,
             worktree_status_digest,
         )
@@ -377,6 +384,7 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
         heuristics: Some(&heuristics),
         resolved_target: &target,
         resolved_bases: &bases,
+        rust_api_delta: rust_api_delta.as_ref(),
         run_start: t_start,
         skipped_checks,
         worktree_clean,

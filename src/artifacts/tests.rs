@@ -109,18 +109,23 @@ use std::time::Duration;
 
 #[test]
 fn api_delta_no_diff_only_runtime() {
-    let production = include_str!("mod.rs");
-    assert!(production.contains("compare_rust_api_revisions("));
-    assert!(production.contains("worktree_status_digest.as_deref()"));
-    assert!(production.contains("analyze_js_ts_public_api_diff(&patch_texts)"));
-    assert!(production.contains("analyze_js_ts_breaking_changes(&patch_texts)"));
-    assert!(production.contains("analyze_rust_env_requirements(&patch_texts)"));
+    let artifacts_production = include_str!("mod.rs");
+    let cli_production = include_str!("../lib.rs");
+    let tui_production = include_str!("../tui/mod.rs");
+    assert!(cli_production.contains("prepare_rust_api_delta("));
+    assert!(tui_production.contains("prepare_rust_api_delta("));
+    assert!(artifacts_production.contains("rust_api_delta.map(api_delta::breaking_changes_view)"));
+    assert!(!artifacts_production.contains("compare_rust_api_revisions"));
+    assert!(!artifacts_production.contains("CapturedWorkingTreeOverlay::"));
+    assert!(artifacts_production.contains("analyze_js_ts_public_api_diff(&patch_texts)"));
+    assert!(artifacts_production.contains("analyze_js_ts_breaking_changes(&patch_texts)"));
+    assert!(artifacts_production.contains("analyze_rust_env_requirements(&patch_texts)"));
     assert!(
-        !production.contains("generate_public_api_diff(&quality_dir, &patch_texts)"),
+        !artifacts_production.contains("generate_public_api_diff(&quality_dir, &patch_texts)"),
         "Rust production must never return to the diff-only PUBLIC_API backend"
     );
     assert!(
-        !production.contains("analyze_all_breaking_changes(&patch_texts)"),
+        !artifacts_production.contains("analyze_all_breaking_changes(&patch_texts)"),
         "Rust production must never return to the diff-only BREAKING backend"
     );
 }
@@ -558,6 +563,507 @@ async fn artifact_pipeline_diffs_from_merge_base_when_base_advanced() {
     assert_eq!(
         diff_bases.first().map(|base| base.commit_id.as_str()),
         Some(merge_base.as_str())
+    );
+}
+
+fn commit_pipeline_paths(repo: &Path, message: &str, paths: &[&str]) -> String {
+    let mut add = git_cmd();
+    add.arg("add").arg("--").args(paths).current_dir(repo);
+    let add_status = add.status().expect("git add pipeline paths");
+    assert!(add_status.success(), "git add failed with {add_status}");
+    run_git_fixture(
+        repo,
+        &[
+            "-c",
+            "user.name=prview test",
+            "-c",
+            "user.email=prview@example.test",
+            "commit",
+            "-m",
+            message,
+        ],
+    );
+    let output = git_cmd()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("pipeline rev-parse");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("pipeline oid")
+        .trim()
+        .to_owned()
+}
+
+fn init_dirty_pipeline_rust_repo(lib_rs: &str) -> (tempfile::TempDir, String) {
+    let repo_tmp = tempfile::tempdir().expect("repo tempdir");
+    run_git_fixture(repo_tmp.path(), &["init", "-q", "-b", "main"]);
+    fs::create_dir_all(repo_tmp.path().join("src")).expect("src dir");
+    fs::write(
+        repo_tmp.path().join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+    )
+    .expect("manifest");
+    fs::write(repo_tmp.path().join("src/lib.rs"), lib_rs).expect("lib.rs");
+    fs::write(repo_tmp.path().join("README.md"), "base\n").expect("README");
+    let base = commit_pipeline_paths(
+        repo_tmp.path(),
+        "base",
+        &["Cargo.toml", "src/lib.rs", "README.md"],
+    );
+    (repo_tmp, base)
+}
+
+struct FrozenDirtyPipeline {
+    config: Config,
+    repo: Repository,
+    target: ResolvedRef,
+    bases: Vec<ResolvedRef>,
+    comparison_bases: Vec<ResolvedRef>,
+    diffs: Vec<crate::git::Diff>,
+    rust_api_delta: Option<signal::api_delta::ApiDelta>,
+    worktree: WorktreeProvenance,
+}
+
+fn freeze_dirty_pipeline(
+    repo_path: &Path,
+    output_dir: PathBuf,
+    target_name: &str,
+    base_names: &[&str],
+    remote_target: bool,
+) -> FrozenDirtyPipeline {
+    let mut config = test_config_builder()
+        .repo_root(repo_path)
+        .target(Some(target_name))
+        .bases(base_names)
+        .profile(test_generic_profile())
+        .execution_mode(ExecutionMode::Standard)
+        .run_tests(false)
+        .run_lint(false)
+        .do_fetch(false)
+        .use_cache(false)
+        .create_zip(false)
+        .build();
+    config.remote_mode = remote_target;
+    config.run_bundle = false;
+    config.run_security = false;
+    config.run_heuristics = false;
+    config.create_dashboard = false;
+    config.quiet = true;
+    config.output_dir = Some(output_dir);
+
+    // This is the same ordering as App::run and the TUI sync phase: broad pack
+    // provenance, real ref resolution, real patch generation, then one frozen
+    // Rust delta before any check/heuristic await.
+    let worktree = capture_worktree_provenance(repo_path);
+    let repo = Repository::open(repo_path).expect("pipeline repo");
+    let target = repo.resolve_target(&config).expect("pipeline target");
+    let bases = repo.resolve_bases(&config).expect("pipeline bases");
+    let comparison_bases = repo.resolve_diff_bases(&target, &bases, true);
+    let diffs = repo
+        .generate_diffs(&target, &comparison_bases, true)
+        .expect("pipeline diffs");
+    let rust_api_delta =
+        signal::api_delta::prepare_rust_api_delta(&repo, &comparison_bases, &target)
+            .expect("pipeline Rust delta");
+
+    FrozenDirtyPipeline {
+        config,
+        repo,
+        target,
+        bases,
+        comparison_bases,
+        diffs,
+        rust_api_delta,
+        worktree,
+    }
+}
+
+fn emit_frozen_dirty_pipeline(pipeline: &FrozenDirtyPipeline) -> PathBuf {
+    generate(GenerateInput {
+        config: &pipeline.config,
+        diffs: &pipeline.diffs,
+        checks: &[],
+        heuristics: None,
+        resolved_target: &pipeline.target,
+        resolved_bases: &pipeline.bases,
+        rust_api_delta: pipeline.rust_api_delta.as_ref(),
+        run_start: Instant::now(),
+        skipped_checks: vec![],
+        worktree_clean: pipeline.worktree.clean,
+        worktree_status_digest: pipeline.worktree.status_digest.clone(),
+    })
+    .expect("emit frozen pipeline")
+}
+
+fn read_pipeline_json(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(
+        &fs::read(path)
+            .unwrap_or_else(|error| panic!("read emitted JSON {}: {error}", path.display())),
+    )
+    .unwrap_or_else(|error| panic!("parse emitted JSON {}: {error}", path.display()))
+}
+
+fn api_surface_payload(view: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "analysis_source": view["analysis_source"],
+        "base_revision": view["base_revision"],
+        "target_revision": view["target_revision"],
+        "counts": view["counts"],
+        "findings": view["findings"],
+    })
+}
+
+fn assert_dirty_overlay_four_surface_api_parity(
+    pack: &Path,
+    expected_symbol: &str,
+    forbidden_symbol: Option<&str>,
+) -> serde_json::Value {
+    let public = read_pipeline_json(&pack.join("20_quality/PUBLIC_API_DIFF.json"));
+    let breaking = read_pipeline_json(&pack.join("20_quality/BREAKING_CHANGES.json"));
+    let report = read_pipeline_json(&pack.join("report.json"));
+    let merge_gate = read_pipeline_json(&pack.join("00_summary/MERGE_GATE.json"));
+
+    let public_api = &public["rust_api_delta"];
+    let report_api = &report["quality"]["breaking_changes"]["rust_api_delta"];
+    let merge_api = &merge_gate["rust_api_delta"];
+    let expected = api_surface_payload(&breaking);
+    for (name, surface) in [
+        ("PUBLIC_API_DIFF", public_api),
+        ("report.json", report_api),
+        ("MERGE_GATE", merge_api),
+    ] {
+        assert_eq!(
+            api_surface_payload(surface),
+            expected,
+            "dirty overlay API surface parity failed for {name}"
+        );
+    }
+    assert_eq!(public_api["view"], "public_api_diff");
+    assert_eq!(breaking["view"], "breaking_changes");
+    assert_eq!(report_api["view"], "breaking_changes");
+    assert_eq!(merge_api["view"], "breaking_changes");
+
+    let findings = expected["findings"].as_array().expect("API findings");
+    assert!(
+        !findings.is_empty(),
+        "positive pipeline fixture must emit facts"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| { finding["identity"]["name"].as_str() == Some(expected_symbol) })
+    );
+    if let Some(forbidden) = forbidden_symbol {
+        assert!(
+            findings
+                .iter()
+                .all(|finding| { finding["identity"]["name"].as_str() != Some(forbidden) })
+        );
+    }
+    assert!(findings.iter().all(|finding| {
+        !finding["id"].as_str().unwrap_or_default().is_empty()
+            && finding["evidence"]
+                .as_array()
+                .is_some_and(|evidence| !evidence.is_empty())
+            && matches!(
+                finding["confidence"].as_str(),
+                Some("confirmed" | "unknown")
+            )
+            && finding
+                .get("before")
+                .and_then(|side| side.get("provenance"))
+                .or_else(|| finding.get("after").and_then(|side| side.get("provenance")))
+                .or_else(|| {
+                    finding
+                        .get("unknown_source")
+                        .and_then(|source| source.get("provenance"))
+                })
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+    }));
+    expected
+}
+
+#[test]
+fn dirty_overlay_pipeline_equal_oid_dirty_only() {
+    let (repo_tmp, target_oid) = init_dirty_pipeline_rust_repo("pub fn committed_api() {}\n");
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn dirty_only_api() {}\n",
+    )
+    .expect("dirty Rust");
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pipeline = freeze_dirty_pipeline(
+        repo_tmp.path(),
+        output_tmp.path().join("pack"),
+        "main",
+        &["main"],
+        false,
+    );
+
+    assert_eq!(pipeline.target.commit_id, target_oid);
+    assert_eq!(pipeline.comparison_bases[0].commit_id, target_oid);
+    assert!(
+        pipeline.diffs.is_empty(),
+        "equal OIDs produce no patch Diff"
+    );
+    assert!(
+        pipeline
+            .rust_api_delta
+            .as_ref()
+            .expect("equal-OID Rust delta")
+            .target_revision
+            .starts_with("working_tree_overlay:")
+    );
+    let pack = emit_frozen_dirty_pipeline(&pipeline);
+    assert_dirty_overlay_four_surface_api_parity(&pack, "dirty_only_api", None);
+}
+
+#[test]
+fn dirty_overlay_pipeline_non_rust_committed_diff_plus_dirty_rust() {
+    let (repo_tmp, _base) = init_dirty_pipeline_rust_repo("pub fn stable_api() {}\n");
+    run_git_fixture(repo_tmp.path(), &["checkout", "-q", "-b", "feature"]);
+    fs::write(repo_tmp.path().join("README.md"), "target docs only\n").expect("README");
+    commit_pipeline_paths(repo_tmp.path(), "docs only", &["README.md"]);
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn stable_api() {}\npub fn dirty_rust_api() {}\n",
+    )
+    .expect("dirty Rust");
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pipeline = freeze_dirty_pipeline(
+        repo_tmp.path(),
+        output_tmp.path().join("pack"),
+        "feature",
+        &["main"],
+        false,
+    );
+
+    assert!(
+        !pipeline.config.profile.has_cargo,
+        "fixture must use Generic profile"
+    );
+    assert_eq!(pipeline.diffs.len(), 1);
+    assert!(
+        pipeline.diffs[0]
+            .files
+            .iter()
+            .all(|file| !file.path.ends_with(".rs"))
+    );
+    let pack = emit_frozen_dirty_pipeline(&pipeline);
+    assert_dirty_overlay_four_surface_api_parity(&pack, "dirty_rust_api", None);
+}
+
+#[test]
+fn dirty_overlay_pipeline_manifest_deletion_or_rename_generic_profile() {
+    for operation in ["delete", "rename"] {
+        let (repo_tmp, _target) = init_dirty_pipeline_rust_repo("pub fn manifest_api() {}\n");
+        match operation {
+            "delete" => {
+                fs::remove_file(repo_tmp.path().join("Cargo.toml")).expect("delete manifest")
+            }
+            "rename" => run_git_fixture(repo_tmp.path(), &["mv", "Cargo.toml", "Cargo.saved"]),
+            _ => unreachable!(),
+        }
+        let output_tmp = tempfile::tempdir().expect("output");
+        let pipeline = freeze_dirty_pipeline(
+            repo_tmp.path(),
+            output_tmp.path().join(format!("pack-{operation}")),
+            "main",
+            &["main"],
+            false,
+        );
+        assert!(
+            !pipeline.config.profile.has_cargo,
+            "fixture must use Generic profile"
+        );
+        assert!(pipeline.diffs.is_empty());
+        let pack = emit_frozen_dirty_pipeline(&pipeline);
+        let api = assert_dirty_overlay_four_surface_api_parity(&pack, "ManifestRead", None);
+        assert!(
+            api["counts"]["unknown"]
+                .as_u64()
+                .is_some_and(|count| count >= 1)
+        );
+    }
+}
+
+#[test]
+fn dirty_overlay_pipeline_untracked_only() {
+    let (repo_tmp, target_oid) = init_dirty_pipeline_rust_repo("pub fn stable_api() {}\n");
+    fs::write(
+        repo_tmp.path().join("src/untracked.rs"),
+        "pub fn untracked_api() {}\n",
+    )
+    .expect("untracked");
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pipeline = freeze_dirty_pipeline(
+        repo_tmp.path(),
+        output_tmp.path().join("pack"),
+        "main",
+        &["main"],
+        false,
+    );
+
+    let delta = pipeline.rust_api_delta.as_ref().expect("Rust comparison");
+    assert_eq!(delta.target_revision, format!("git_tree:{target_oid}"));
+    assert!(delta.findings().is_empty());
+    let pack = emit_frozen_dirty_pipeline(&pipeline);
+    assert!(!pack.join("20_quality/PUBLIC_API_DIFF.json").exists());
+    let breaking = read_pipeline_json(&pack.join("20_quality/BREAKING_CHANGES.json"));
+    assert_eq!(
+        breaking["target_revision"],
+        format!("git_tree:{target_oid}")
+    );
+    assert!(
+        breaking["findings"]
+            .as_array()
+            .expect("findings")
+            .is_empty()
+    );
+    let merge_gate = read_pipeline_json(&pack.join("00_summary/MERGE_GATE.json"));
+    assert_eq!(
+        merge_gate["rust_api_delta"]["target_revision"],
+        format!("git_tree:{target_oid}")
+    );
+}
+
+#[test]
+fn dirty_overlay_pipeline_rewrite_after_capture() {
+    let (repo_tmp, _target) = init_dirty_pipeline_rust_repo("pub fn committed_api() {}\n");
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn captured_rewrite_api() {}\n",
+    )
+    .expect("captured state");
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pipeline = freeze_dirty_pipeline(
+        repo_tmp.path(),
+        output_tmp.path().join("pack"),
+        "main",
+        &["main"],
+        false,
+    );
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn later_rewrite_api() {}\n",
+    )
+    .expect("later rewrite");
+
+    let pack = emit_frozen_dirty_pipeline(&pipeline);
+    assert_dirty_overlay_four_surface_api_parity(
+        &pack,
+        "captured_rewrite_api",
+        Some("later_rewrite_api"),
+    );
+}
+
+#[test]
+fn dirty_overlay_pipeline_restore_after_capture() {
+    let committed = "pub fn committed_restore_api() {}\n";
+    let (repo_tmp, _target) = init_dirty_pipeline_rust_repo(committed);
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn captured_restore_api() {}\n",
+    )
+    .expect("captured state");
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pipeline = freeze_dirty_pipeline(
+        repo_tmp.path(),
+        output_tmp.path().join("pack"),
+        "main",
+        &["main"],
+        false,
+    );
+    fs::write(repo_tmp.path().join("src/lib.rs"), committed).expect("restore target bytes");
+
+    let pack = emit_frozen_dirty_pipeline(&pipeline);
+    assert_dirty_overlay_four_surface_api_parity(&pack, "captured_restore_api", None);
+}
+
+#[test]
+fn dirty_overlay_pipeline_remote_equal_head() {
+    let (repo_tmp, _base) = init_dirty_pipeline_rust_repo("pub fn base_api() {}\n");
+    run_git_fixture(repo_tmp.path(), &["checkout", "-q", "-b", "feature"]);
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn remote_api() {}\n",
+    )
+    .expect("remote target");
+    let target = commit_pipeline_paths(repo_tmp.path(), "feature", &["src/lib.rs"]);
+    run_git_fixture(
+        repo_tmp.path(),
+        &["update-ref", "refs/remotes/origin/feature", &target],
+    );
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn local_dirty_api() {}\n",
+    )
+    .expect("local dirty");
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pipeline = freeze_dirty_pipeline(
+        repo_tmp.path(),
+        output_tmp.path().join("pack"),
+        "feature",
+        &["main"],
+        true,
+    );
+
+    assert!(pipeline.target.is_remote);
+    assert_eq!(pipeline.target.commit_id, target);
+    assert!(
+        pipeline
+            .rust_api_delta
+            .as_ref()
+            .expect("remote delta")
+            .target_revision
+            .starts_with("git_tree:")
+    );
+    let pack = emit_frozen_dirty_pipeline(&pipeline);
+    assert_dirty_overlay_four_surface_api_parity(&pack, "remote_api", Some("local_dirty_api"));
+}
+
+#[test]
+fn dirty_overlay_pipeline_off_head() {
+    let (repo_tmp, _base) = init_dirty_pipeline_rust_repo("pub fn base_api() {}\n");
+    run_git_fixture(repo_tmp.path(), &["checkout", "-q", "-b", "review"]);
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn off_head_api() {}\n",
+    )
+    .expect("off-head target");
+    let target = commit_pipeline_paths(repo_tmp.path(), "review", &["src/lib.rs"]);
+    run_git_fixture(repo_tmp.path(), &["checkout", "-q", "main"]);
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn local_head_dirty_api() {}\n",
+    )
+    .expect("local HEAD dirt");
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pipeline = freeze_dirty_pipeline(
+        repo_tmp.path(),
+        output_tmp.path().join("pack"),
+        "review",
+        &["main"],
+        false,
+    );
+
+    assert_eq!(pipeline.target.commit_id, target);
+    assert_ne!(pipeline.repo.head_commit_id().expect("HEAD"), target);
+    assert!(
+        pipeline
+            .rust_api_delta
+            .as_ref()
+            .expect("off-head delta")
+            .target_revision
+            .starts_with("git_tree:")
+    );
+    let pack = emit_frozen_dirty_pipeline(&pipeline);
+    assert_dirty_overlay_four_surface_api_parity(
+        &pack,
+        "off_head_api",
+        Some("local_head_dirty_api"),
     );
 }
 

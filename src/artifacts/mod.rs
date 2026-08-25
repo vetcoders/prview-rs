@@ -126,6 +126,10 @@ pub struct GenerateInput<'a> {
     pub heuristics: Option<&'a HeuristicsResult>,
     pub resolved_target: &'a ResolvedRef,
     pub resolved_bases: &'a [ResolvedRef],
+    /// Canonical Rust API delta prepared from exact comparison anchors and a
+    /// frozen target capture before checks/heuristics run. Artifact generation
+    /// projects this value and never reopens the Rust target source.
+    pub rust_api_delta: Option<&'a api_delta::ApiDelta>,
     pub run_start: Instant,
     pub skipped_checks: Vec<crate::checks::SkippedCheck>,
     /// Working-tree cleanliness captured BEFORE checks ran and before any
@@ -329,6 +333,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         heuristics,
         resolved_target,
         resolved_bases,
+        rust_api_delta,
         run_start,
         skipped_checks,
         worktree_clean,
@@ -380,33 +385,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let patch_texts = generate_full_patch(&diff_dir, &repo, diffs)?;
     stage_timings.push(finish_timing(emit_human_stdout, "full.patch", t));
 
-    // Rust API truth is computed once from exact base revisions and the target
-    // substrate declared for this run. A qualifying dirty local HEAD uses its
-    // tracked working-tree overlay; clean, remote, and off-HEAD targets remain
-    // exact Git trees. The same delta feeds both artifact views and every
-    // verdict projection. JS/TS remains on its legacy diff parser behind a
-    // structural language boundary.
-    let has_rust_scope = config.profile.has_cargo
-        || diffs
-            .iter()
-            .flat_map(|diff| diff.files.iter())
-            .any(|file| file.path.ends_with(".rs"));
-    let rust_api_delta = has_rust_scope
-        .then(|| {
-            api_delta::compare_rust_api_revisions(
-                &repo,
-                diffs,
-                resolved_target,
-                worktree_clean,
-                worktree_status_digest.as_deref(),
-            )
-        })
-        .transpose()?
-        .flatten();
-    let rust_breaking_view = rust_api_delta
-        .as_ref()
-        .map(api_delta::breaking_changes_view);
-    let rust_public_api_view = rust_api_delta.as_ref().map(api_delta::public_api_diff_view);
+    // Rust truth is already frozen. The same owned delta feeds both artifact
+    // views and every verdict projection; only legacy JS/TS and Rust-env
+    // adapters continue to consume patch text.
+    let rust_breaking_view = rust_api_delta.map(api_delta::breaking_changes_view);
+    let rust_public_api_view = rust_api_delta.map(api_delta::public_api_diff_view);
     let js_ts_public_api = signal::analyze_js_ts_public_api_diff(&patch_texts);
     if let Some(api) = signal::write_public_api_diff(
         &quality_dir,
@@ -1269,16 +1252,16 @@ fn provenance_bases<'a>(
     diffs: &'a [Diff],
     resolved_bases: &'a [ResolvedRef],
 ) -> Vec<(&'a str, &'a str)> {
-    if diffs.is_empty() {
-        return resolved_bases
+    match diffs.first() {
+        None => resolved_bases
             .iter()
             .map(|base| (base.name.as_str(), base.commit_id.as_str()))
-            .collect();
+            .collect(),
+        Some(_) => diffs
+            .iter()
+            .map(|diff| (diff.base.as_str(), diff.base_commit_id.as_str()))
+            .collect(),
     }
-    diffs
-        .iter()
-        .map(|diff| (diff.base.as_str(), diff.base_commit_id.as_str()))
-        .collect()
 }
 
 /// PROVENANCE.json — pack-level record of WHAT was analysed.
@@ -1649,8 +1632,9 @@ fn collect_quick_wins(config: &Config, checks: &[CheckResult], exact_twins: usiz
     use std::collections::HashSet;
 
     let mut wins = Vec::new();
+    let crate::config::DetectedProfile { has_cargo, .. } = &config.profile;
 
-    if config.profile.has_cargo {
+    if *has_cargo {
         let has_cargo_test = checks
             .iter()
             .any(|check| check.name.eq_ignore_ascii_case("cargo test"));

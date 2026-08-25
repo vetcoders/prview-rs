@@ -155,6 +155,11 @@ impl App {
         let diffs = self
             .repo
             .generate_diffs(&target, &diff_bases, self.config.quiet)?;
+        // Freeze the canonical Rust API truth before the first check or
+        // heuristic await. Comparison anchors survive even when ordinary patch
+        // generation omits an equal-OID pair.
+        let rust_api_delta =
+            artifacts::api_delta::prepare_rust_api_delta(&self.repo, &diff_bases, &target)?;
 
         // 5. Run checks (reduced set in update mode)
         let (check_results, skipped_checks) = if self.config.update_mode {
@@ -200,6 +205,7 @@ impl App {
             heuristics: Some(&heuristics_result),
             resolved_target: &target,
             resolved_bases: &bases,
+            rust_api_delta: rust_api_delta.as_ref(),
             run_start: self.start_time,
             skipped_checks,
             worktree_clean: self.worktree_clean_at_start,
@@ -469,6 +475,8 @@ impl App {
         let diffs = self
             .repo
             .generate_diffs(&target, &diff_bases, self.config.quiet)?;
+        let rust_api_delta =
+            artifacts::api_delta::prepare_rust_api_delta(&self.repo, &diff_bases, &target)?;
 
         // Skip checks and heuristics in quick mode
         let artifacts_dir = artifacts::generate(artifacts::GenerateInput {
@@ -478,6 +486,7 @@ impl App {
             heuristics: None,
             resolved_target: &target,
             resolved_bases: &bases,
+            rust_api_delta: rust_api_delta.as_ref(),
             run_start: run_started_at,
             skipped_checks: vec![],
             worktree_clean: worktree.clean,

@@ -494,16 +494,30 @@ it has something worth showing:
 
 When a generator produces no file, the CLI prints an `i` note explaining why.
 
-Rust API facts are computed from the exact `Diff.base_commit_id` and
-`Diff.target_commit_id` Git trees; the working tree and patch text are not
-fallbacks. Duplicate exact OID pairs are compared once; distinct base/target
-comparisons retain separate provenance. JS/TS exports remain on the legacy diff
-analyzer behind a side-aware boundary: a cross-language rename retains only its
-JS/TS side, including standard quoted Git paths, so Rust lines cannot leak and
-removed JS exports cannot disappear. File markers must agree exactly with the
-decoded Git header identity; incoherent, truncated, or markerless hunk sections
-are discarded fail-closed, while coherent mode-only add/delete metadata remains
-valid. Confirmed removed, changed, relocated, and
+Rust API facts are prepared before checks from the exact resolved comparison
+bases/merge-bases and one frozen target source. These anchors are independent of
+ordinary patch `Diff`s: equal base/target OIDs still compare dirty tracked local
+work against the exact commit without a synthetic empty patch. Clean,
+untracked-only, remote, and local off-HEAD targets use exact `GitTree` bytes. A
+dirty local HEAD uses an immutable `WorkingTreeOverlay` whose `dirty_digest`
+hashes the exact captured tracked inventory and owned bytes/states.
+
+The tracked digest is separate from the broad pack-level
+`PROVENANCE.json.worktree.status_digest`, which also includes unrelated
+untracked state. The tracked capture budget is 64 MiB per run; an affected path
+that exceeds it becomes typed unreadable/unknown evidence and never falls back
+to a later filesystem read. Rewrites or restoration after capture cannot change
+the `ApiDelta` projected into `PUBLIC_API_DIFF.json`, `BREAKING_CHANGES.json`,
+`report.json`, or `MERGE_GATE.json`. Duplicate exact OID anchors are compared
+once; distinct bases retain separate provenance.
+
+JS/TS exports remain on the legacy diff analyzer behind a side-aware boundary:
+a cross-language rename retains only its JS/TS side, including standard quoted
+Git paths, so Rust lines cannot leak and removed JS exports cannot disappear.
+File markers must agree exactly with the decoded Git header identity;
+incoherent, truncated, or markerless hunk sections are discarded fail-closed,
+while coherent mode-only add/delete metadata remains valid. Confirmed removed,
+changed, relocated, and
 visibility-changed Rust facts are breaking; added-only facts are informational.
 Typed unknowns degrade confidence and require review without claiming a
 confirmed removal.

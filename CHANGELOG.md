@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Rust API comparison anchors now come directly from exact resolved
+  bases/merge-bases, independently of patch `Diff` rows, so an equal-OID
+  dirty-only run remains observable without a synthetic empty patch. One
+  `ApiDelta` is prepared before checks and reused by all four JSON surfaces.
+  Dirty local HEAD input is an immutable tracked `WorkingTreeOverlay`: changed
+  bytes and terminal states are captured once, unchanged paths use the exact
+  target Git tree, and a deterministic tracked digest names that substrate.
+  This digest remains separate from the broader pack worktree digest (which may
+  include untracked files). The 64 MiB capture budget fails honest as typed
+  unknown evidence instead of rereading live bytes or falling back to clean
+  HEAD. Remote, off-HEAD, clean, untracked-only, and genuinely non-Rust
+  comparisons remain exact-tree negative controls.
+
 - `prview gate --strict` now consumes a schema 2.3 typed enforcement
   disposition instead of collapsing every `CONDITIONAL` cause into one exit.
   Clean and proven warnings-only packs exit `0`; confirmed/potential breaking,

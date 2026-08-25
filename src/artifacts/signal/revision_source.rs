@@ -1,16 +1,24 @@
 //! Revision-bound repository file access for language backends.
 //!
 //! The source contract keeps bytes attached to one exact Git commit, or to a
-//! tracked working-tree overlay whose target commit and pre-captured dirty
-//! digest are supplied together. Overlay inventory admits only exact target
-//! entries and extra paths supplied by tracked Git status; untracked paths
-//! remain outside both inventory and reads. It deliberately performs no
-//! language or API classification.
+//! tracked working-tree overlay whose inventory and bytes/states are captured
+//! together and then hashed into their own dirty digest. Overlay inventory
+//! admits only exact target entries and extra paths supplied by tracked Git
+//! status; untracked paths remain outside both inventory and reads. It
+//! deliberately performs no language or API classification.
 
 use crate::git::{GitTreeEntryKind, GitWorktreeChange, Repository};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
+use std::io::Read;
+
+/// Maximum total regular-file content retained by one tracked overlay capture.
+///
+/// The budget is shared by every tracked change. A path that does not fit is
+/// retained as an explicit unreadable state, so snapshotting stays bounded and
+/// can never fall through to a later filesystem read.
+pub const TRACKED_CAPTURE_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
 
 /// Identity of the substrate that produced an entry or read result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,27 +241,108 @@ impl RevisionFileSource for GitTree<'_> {
     }
 }
 
-/// Tracked working-tree state over one exact target commit.
-pub struct WorkingTreeOverlay<'repo> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapturedPathState {
+    Bytes(Vec<u8>),
+    Deleted,
+    NonRegular { kind: RevisionEntryKind },
+    Unreadable { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedTrackedChange {
+    change: GitWorktreeChange,
+    path_state: Option<CapturedPathState>,
+}
+
+/// Immutable run-start inventory and owned content for every tracked change.
+///
+/// `dirty_digest` is derived from this exact inventory and these exact owned
+/// bytes/states. It is deliberately separate from the broader pack-level
+/// worktree status digest, which may also include unrelated untracked paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedOverlayCapture {
+    target_oid: String,
+    dirty_digest: String,
+    changes: Vec<CapturedTrackedChange>,
+    captured_bytes: u64,
+    byte_budget: u64,
+}
+
+impl TrackedOverlayCapture {
+    /// Capture all tracked target-to-worktree changes now, before checks run.
+    pub fn capture_tracked(
+        repo: &Repository,
+        target_oid: &str,
+        byte_budget: u64,
+    ) -> Result<Self, RevisionSourceError> {
+        validate_exact_oid(target_oid)?;
+        let changes = repo
+            .worktree_changes_from_oid(target_oid)
+            .map_err(|error| RevisionSourceError::WorktreeStatusUnavailable {
+                reason: error.to_string(),
+            })?;
+        let mut remaining = byte_budget;
+        let mut captured_bytes = 0_u64;
+        let mut captured = Vec::with_capacity(changes.len());
+
+        for change in changes {
+            let path_state = capture_change_path(repo, &change, &mut remaining)?;
+            if let Some(CapturedPathState::Bytes(bytes)) = &path_state {
+                captured_bytes = captured_bytes.saturating_add(bytes.len() as u64);
+            }
+            captured.push(CapturedTrackedChange { change, path_state });
+        }
+
+        let dirty_digest = digest_tracked_capture(target_oid, &captured);
+        Ok(Self {
+            target_oid: target_oid.to_owned(),
+            dirty_digest,
+            changes: captured,
+            captured_bytes,
+            byte_budget,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    pub fn dirty_digest(&self) -> &str {
+        &self.dirty_digest
+    }
+
+    pub fn captured_bytes(&self) -> u64 {
+        self.captured_bytes
+    }
+
+    pub fn byte_budget(&self) -> u64 {
+        self.byte_budget
+    }
+}
+
+/// Tracked working-tree state frozen over one exact target commit.
+pub struct CapturedWorkingTreeOverlay<'repo> {
     target: GitTree<'repo>,
     provenance: RevisionProvenance,
     entries: BTreeMap<String, RevisionEntry>,
+    captured_reads: BTreeMap<String, CapturedPathState>,
 }
 
-impl<'repo> WorkingTreeOverlay<'repo> {
-    pub fn new(
+impl<'repo> CapturedWorkingTreeOverlay<'repo> {
+    /// Construct a revision source from an already-owned run-start capture.
+    /// No current filesystem state is consulted here or by [`Self::read`].
+    pub fn from_capture(
         repo: &'repo Repository,
-        target_oid: &str,
-        dirty_digest: impl Into<String>,
+        capture: TrackedOverlayCapture,
     ) -> Result<Self, RevisionSourceError> {
-        let dirty_digest = dirty_digest.into();
-        if dirty_digest.trim().is_empty() {
+        if capture.dirty_digest.trim().is_empty() {
             return Err(RevisionSourceError::MissingDirtyDigest);
         }
-        let target = GitTree::new(repo, target_oid)?;
+        let target = GitTree::new(repo, &capture.target_oid)?;
         let provenance = RevisionProvenance::WorkingTreeOverlay {
-            target_oid: target_oid.to_owned(),
-            dirty_digest,
+            target_oid: capture.target_oid.clone(),
+            dirty_digest: capture.dirty_digest.clone(),
         };
         let mut entries: BTreeMap<_, _> = target
             .entries
@@ -264,23 +353,41 @@ impl<'repo> WorkingTreeOverlay<'repo> {
                 (entry.path.clone(), entry)
             })
             .collect();
-        let changes = repo
-            .worktree_changes_from_oid(target_oid)
-            .map_err(|error| RevisionSourceError::WorktreeStatusUnavailable {
-                reason: error.to_string(),
-            })?;
-        for change in changes {
-            record_tracked_change(&mut entries, &provenance, change);
+        let mut captured_reads = BTreeMap::new();
+        for captured in capture.changes {
+            let read_path = captured_change_read_path(&captured.change);
+            record_tracked_change(&mut entries, &provenance, captured.change);
+            if let (Some(path), Some(path_state)) = (read_path, captured.path_state) {
+                if let Some(entry) = entries.get_mut(&path) {
+                    match &path_state {
+                        CapturedPathState::Bytes(_) => {}
+                        CapturedPathState::Deleted => {
+                            entry.state = RevisionEntryState::Deleted;
+                        }
+                        CapturedPathState::NonRegular { kind } => {
+                            entry.kind = *kind;
+                            entry.state = RevisionEntryState::NonRegular { kind: *kind };
+                        }
+                        CapturedPathState::Unreadable { reason } => {
+                            entry.state = RevisionEntryState::Unreadable {
+                                reason: reason.clone(),
+                            };
+                        }
+                    }
+                }
+                captured_reads.insert(path, path_state);
+            }
         }
         Ok(Self {
             target,
             provenance,
             entries,
+            captured_reads,
         })
     }
 }
 
-impl RevisionFileSource for WorkingTreeOverlay<'_> {
+impl RevisionFileSource for CapturedWorkingTreeOverlay<'_> {
     fn provenance(&self) -> &RevisionProvenance {
         &self.provenance
     }
@@ -331,44 +438,208 @@ impl RevisionFileSource for WorkingTreeOverlay<'_> {
             });
         }
 
-        let disk_path = self.target.repo.path().join(path);
-        let metadata = match fs::symlink_metadata(&disk_path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(RevisionRead::Deleted {
-                    provenance: self.provenance.clone(),
-                });
-            }
-            Err(error) => {
-                return Ok(RevisionRead::Unreadable {
-                    reason: error.to_string(),
-                    provenance: self.provenance.clone(),
-                });
-            }
+        if let Some(captured) = self.captured_reads.get(path) {
+            return Ok(captured_revision_read(captured, &self.provenance));
+        }
+
+        // Unchanged paths are not worktree inputs. Delegate to the exact target
+        // blob, then relabel only the source identity of the composed overlay.
+        self.target
+            .read(path)
+            .map(|read| with_provenance(read, &self.provenance))
+    }
+}
+
+fn capture_change_path(
+    repo: &Repository,
+    change: &GitWorktreeChange,
+    remaining: &mut u64,
+) -> Result<Option<CapturedPathState>, RevisionSourceError> {
+    let Some(path) = captured_change_read_path(change) else {
+        return Ok(None);
+    };
+    validate_path(&path)?;
+
+    let state = match change.status {
+        git2::Delta::Deleted => CapturedPathState::Deleted,
+        git2::Delta::Typechange => CapturedPathState::NonRegular {
+            kind: map_entry_kind(change.new_mode),
+        },
+        git2::Delta::Unreadable | git2::Delta::Conflicted => CapturedPathState::Unreadable {
+            reason: format!(
+                "Git status reported {:?} during tracked capture",
+                change.status
+            ),
+        },
+        _ if change.new_mode != GitTreeEntryKind::RegularFile => CapturedPathState::NonRegular {
+            kind: map_entry_kind(change.new_mode),
+        },
+        _ => capture_regular_file(repo, &path, remaining),
+    };
+    Ok(Some(state))
+}
+
+fn captured_change_read_path(change: &GitWorktreeChange) -> Option<String> {
+    match change.status {
+        git2::Delta::Renamed | git2::Delta::Added => change.new_path.clone(),
+        _ => change.old_path.clone().or_else(|| change.new_path.clone()),
+    }
+}
+
+fn capture_regular_file(repo: &Repository, path: &str, remaining: &mut u64) -> CapturedPathState {
+    let disk_path = repo.path().join(path);
+    let file = match std::fs::File::open(&disk_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CapturedPathState::Deleted;
+        }
+        Err(error) => {
+            return CapturedPathState::Unreadable {
+                reason: format!("tracked capture could not open {path}: {error}"),
+            };
+        }
+    };
+    let declared_len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            return CapturedPathState::Unreadable {
+                reason: format!("tracked capture could not stat {path}: {error}"),
+            };
+        }
+    };
+    if declared_len > *remaining {
+        return CapturedPathState::Unreadable {
+            reason: format!(
+                "tracked capture byte budget exceeded for {path}: {declared_len} bytes exceeds {remaining} remaining"
+            ),
         };
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            return Ok(RevisionRead::NonRegular {
-                kind: RevisionEntryKind::Symlink,
-                provenance: self.provenance.clone(),
-            });
+    }
+
+    let read_limit = remaining.saturating_add(1);
+    let mut bytes = Vec::with_capacity(declared_len as usize);
+    match file.take(read_limit).read_to_end(&mut bytes) {
+        Ok(_) if bytes.len() as u64 <= *remaining => {
+            *remaining -= bytes.len() as u64;
+            CapturedPathState::Bytes(bytes)
         }
-        if !file_type.is_file() {
-            return Ok(RevisionRead::NonRegular {
-                kind: RevisionEntryKind::Tree,
-                provenance: self.provenance.clone(),
-            });
+        Ok(_) => CapturedPathState::Unreadable {
+            reason: format!(
+                "tracked capture byte budget exceeded while reading {path}: more than {remaining} bytes"
+            ),
+        },
+        Err(error) => CapturedPathState::Unreadable {
+            reason: format!("tracked capture could not read {path}: {error}"),
+        },
+    }
+}
+
+fn digest_tracked_capture(target_oid: &str, changes: &[CapturedTrackedChange]) -> String {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"prview-tracked-overlay-v1");
+    hash_field(&mut hasher, target_oid.as_bytes());
+    for captured in changes {
+        hash_field(&mut hasher, delta_name(captured.change.status).as_bytes());
+        hash_optional_field(&mut hasher, captured.change.old_path.as_deref());
+        hash_optional_field(&mut hasher, captured.change.new_path.as_deref());
+        hash_field(
+            &mut hasher,
+            captured.change.new_mode_raw.to_string().as_bytes(),
+        );
+        match &captured.path_state {
+            None => hash_field(&mut hasher, b"no-read-state"),
+            Some(CapturedPathState::Bytes(bytes)) => {
+                hash_field(&mut hasher, b"bytes");
+                hash_field(&mut hasher, bytes);
+            }
+            Some(CapturedPathState::Deleted) => hash_field(&mut hasher, b"deleted"),
+            Some(CapturedPathState::NonRegular { kind }) => {
+                hash_field(&mut hasher, format!("non-regular:{kind:?}").as_bytes());
+            }
+            Some(CapturedPathState::Unreadable { reason }) => {
+                hash_field(&mut hasher, b"unreadable");
+                hash_field(&mut hasher, reason.as_bytes());
+            }
         }
-        match fs::read(disk_path) {
-            Ok(bytes) => Ok(RevisionRead::Bytes(classify_bytes(
-                bytes,
-                self.provenance.clone(),
-            ))),
-            Err(error) => Ok(RevisionRead::Unreadable {
-                reason: error.to_string(),
-                provenance: self.provenance.clone(),
-            }),
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash_field(hasher, b"some");
+            hash_field(hasher, value.as_bytes());
         }
+        None => hash_field(hasher, b"none"),
+    }
+}
+
+fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn delta_name(delta: git2::Delta) -> &'static str {
+    match delta {
+        git2::Delta::Unmodified => "unmodified",
+        git2::Delta::Added => "added",
+        git2::Delta::Deleted => "deleted",
+        git2::Delta::Modified => "modified",
+        git2::Delta::Renamed => "renamed",
+        git2::Delta::Copied => "copied",
+        git2::Delta::Ignored => "ignored",
+        git2::Delta::Untracked => "untracked",
+        git2::Delta::Typechange => "typechange",
+        git2::Delta::Unreadable => "unreadable",
+        git2::Delta::Conflicted => "conflicted",
+    }
+}
+
+fn captured_revision_read(
+    captured: &CapturedPathState,
+    provenance: &RevisionProvenance,
+) -> RevisionRead {
+    match captured {
+        CapturedPathState::Bytes(bytes) => {
+            RevisionRead::Bytes(classify_bytes(bytes.clone(), provenance.clone()))
+        }
+        CapturedPathState::Deleted => RevisionRead::Deleted {
+            provenance: provenance.clone(),
+        },
+        CapturedPathState::NonRegular { kind } => RevisionRead::NonRegular {
+            kind: *kind,
+            provenance: provenance.clone(),
+        },
+        CapturedPathState::Unreadable { reason } => RevisionRead::Unreadable {
+            reason: reason.clone(),
+            provenance: provenance.clone(),
+        },
+    }
+}
+
+fn with_provenance(read: RevisionRead, provenance: &RevisionProvenance) -> RevisionRead {
+    match read {
+        RevisionRead::Bytes(bytes) => {
+            RevisionRead::Bytes(classify_bytes(bytes.bytes, provenance.clone()))
+        }
+        RevisionRead::Missing { .. } => RevisionRead::Missing {
+            provenance: provenance.clone(),
+        },
+        RevisionRead::Deleted { .. } => RevisionRead::Deleted {
+            provenance: provenance.clone(),
+        },
+        RevisionRead::Renamed { to, .. } => RevisionRead::Renamed {
+            to,
+            provenance: provenance.clone(),
+        },
+        RevisionRead::NonRegular { kind, .. } => RevisionRead::NonRegular {
+            kind,
+            provenance: provenance.clone(),
+        },
+        RevisionRead::Unreadable { reason, .. } => RevisionRead::Unreadable {
+            reason,
+            provenance: provenance.clone(),
+        },
     }
 }
 
@@ -525,7 +796,9 @@ fn classify_bytes(bytes: Vec<u8>, provenance: RevisionProvenance) -> RevisionByt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::signal::api_surface::{RustApiUnknownKind, snapshot_rust_api};
     use crate::git::git_cmd;
+    use std::fs;
     use std::path::Path;
 
     fn run_git(repo: &Path, args: &[&str]) -> Vec<u8> {
@@ -769,11 +1042,17 @@ mod tests {
         fs::write(temp.path().join("untracked.rs"), b"pub fn unrelated() {}\n").expect("untracked");
 
         let repo = Repository::open(temp.path()).expect("repo");
-        let digest = "sha256:captured-before-analysis";
-        let overlay = WorkingTreeOverlay::new(&repo, &target, digest).expect("overlay");
+        let capture =
+            TrackedOverlayCapture::capture_tracked(&repo, &target, TRACKED_CAPTURE_BYTE_BUDGET)
+                .expect("capture");
+        assert!(!capture.is_empty());
+        assert!(capture.captured_bytes() > 0);
+        assert_eq!(capture.byte_budget(), TRACKED_CAPTURE_BYTE_BUDGET);
+        let digest = capture.dirty_digest().to_owned();
+        let overlay = CapturedWorkingTreeOverlay::from_capture(&repo, capture).expect("overlay");
         let expected_provenance = RevisionProvenance::WorkingTreeOverlay {
             target_oid: target.clone(),
-            dirty_digest: digest.to_owned(),
+            dirty_digest: digest,
         };
         assert_eq!(overlay.provenance(), &expected_provenance);
         let entries = overlay.entries();
@@ -887,10 +1166,6 @@ mod tests {
                 provenance: expected_provenance
             }
         );
-        assert!(matches!(
-            WorkingTreeOverlay::new(&repo, &target, ""),
-            Err(RevisionSourceError::MissingDirtyDigest)
-        ));
     }
 
     #[test]
@@ -904,8 +1179,10 @@ mod tests {
             .expect("filesystem-only rename");
 
         let repo = Repository::open(temp.path()).expect("repo");
-        let overlay =
-            WorkingTreeOverlay::new(&repo, &target, "sha256:unstaged-pair").expect("overlay");
+        let capture =
+            TrackedOverlayCapture::capture_tracked(&repo, &target, TRACKED_CAPTURE_BYTE_BUDGET)
+                .expect("capture");
+        let overlay = CapturedWorkingTreeOverlay::from_capture(&repo, capture).expect("overlay");
 
         assert!(matches!(
             overlay.read("old.rs").expect("old read"),
@@ -916,5 +1193,122 @@ mod tests {
             RevisionRead::Missing { .. }
         ));
         assert!(!overlay.entries().iter().any(|entry| entry.path == "new.rs"));
+    }
+
+    #[test]
+    fn revision_source_capture_owns_changed_bytes_and_delegates_unchanged_to_git() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        run_git(temp.path(), &["init", "-q", "-b", "main"]);
+        fs::write(
+            temp.path().join("changed.rs"),
+            b"pub fn target_changed() {}\n",
+        )
+        .expect("changed target");
+        fs::write(
+            temp.path().join("unchanged.rs"),
+            b"pub fn target_unchanged() {}\n",
+        )
+        .expect("unchanged target");
+        let target = commit(temp.path(), "target");
+
+        fs::write(temp.path().join("changed.rs"), b"pub fn captured() {}\n")
+            .expect("captured change");
+        let repo = Repository::open(temp.path()).expect("repo");
+        let capture =
+            TrackedOverlayCapture::capture_tracked(&repo, &target, TRACKED_CAPTURE_BYTE_BUDGET)
+                .expect("capture");
+
+        // Both paths move after capture. The tracked changed path must retain
+        // its owned bytes; the previously unchanged path must read the exact
+        // target Git blob rather than the later filesystem bytes.
+        fs::write(
+            temp.path().join("changed.rs"),
+            b"pub fn later_changed() {}\n",
+        )
+        .expect("later changed");
+        fs::write(
+            temp.path().join("unchanged.rs"),
+            b"pub fn later_unchanged() {}\n",
+        )
+        .expect("later unchanged");
+        let overlay = CapturedWorkingTreeOverlay::from_capture(&repo, capture).expect("overlay");
+
+        assert_eq!(
+            bytes(overlay.read("changed.rs").expect("changed read")).bytes,
+            b"pub fn captured() {}\n"
+        );
+        assert_eq!(
+            bytes(overlay.read("unchanged.rs").expect("unchanged read")).bytes,
+            b"pub fn target_unchanged() {}\n"
+        );
+    }
+
+    #[test]
+    fn revision_source_tracked_digest_ignores_unrelated_untracked_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        run_git(temp.path(), &["init", "-q", "-b", "main"]);
+        fs::write(temp.path().join("tracked.rs"), b"pub fn target() {}\n").expect("target");
+        let target = commit(temp.path(), "target");
+        fs::write(temp.path().join("tracked.rs"), b"pub fn captured() {}\n")
+            .expect("tracked change");
+        let repo = Repository::open(temp.path()).expect("repo");
+
+        let first =
+            TrackedOverlayCapture::capture_tracked(&repo, &target, TRACKED_CAPTURE_BYTE_BUDGET)
+                .expect("first capture");
+        fs::write(
+            temp.path().join("unrelated-untracked.rs"),
+            b"pub fn unrelated() {}\n",
+        )
+        .expect("untracked");
+        let second =
+            TrackedOverlayCapture::capture_tracked(&repo, &target, TRACKED_CAPTURE_BYTE_BUDGET)
+                .expect("second capture");
+
+        assert_eq!(first.dirty_digest(), second.dirty_digest());
+        assert_eq!(first.captured_bytes(), second.captured_bytes());
+    }
+
+    #[test]
+    fn revision_source_capture_budget_exhaustion_is_typed_unknown_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        run_git(temp.path(), &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(temp.path().join("src")).expect("src");
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            b"[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+        )
+        .expect("manifest");
+        fs::write(temp.path().join("src/lib.rs"), b"pub fn target() {}\n").expect("target");
+        let target = commit(temp.path(), "target");
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            b"pub fn captured_but_over_budget() {}\n",
+        )
+        .expect("oversized change");
+        let repo = Repository::open(temp.path()).expect("repo");
+        let capture =
+            TrackedOverlayCapture::capture_tracked(&repo, &target, 4).expect("bounded capture");
+        let overlay = CapturedWorkingTreeOverlay::from_capture(&repo, capture).expect("overlay");
+
+        assert!(matches!(
+            overlay.read("src/lib.rs").expect("typed read"),
+            RevisionRead::Unreadable { ref reason, .. }
+                if reason.contains("tracked capture byte budget exceeded")
+        ));
+        let snapshot = snapshot_rust_api(&overlay);
+        assert!(
+            snapshot.unknowns.iter().any(|unknown| {
+                matches!(
+                    unknown.kind,
+                    RustApiUnknownKind::SourceRead | RustApiUnknownKind::MissingLibRoot
+                ) && unknown.source_path == "src/lib.rs"
+                    && unknown
+                        .evidence
+                        .contains("tracked capture byte budget exceeded")
+            }),
+            "typed snapshot unknowns: {:#?}",
+            snapshot.unknowns
+        );
     }
 }

@@ -52,6 +52,10 @@ A typical artifact pack looks like this:
 For Rust, `PUBLIC_API_DIFF.json`, `BREAKING_CHANGES.json`, `report.json`, and
 `00_summary/MERGE_GATE.json` serialize the same revision-backed API-delta IDs,
 counts, confidence, evidence, unknown reasons, and base/target provenance. The
+delta is frozen before checks from exact comparison anchors; an equal-OID dirty
+local target uses an immutable tracked `WorkingTreeOverlay`, while clean,
+untracked-only, remote, and off-HEAD targets use exact Git trees. Its tracked
+digest is separate from the broader pack worktree digest. The
 legacy compatibility rows in `PUBLIC_API_DIFF.json` and the JS/TS and
 environment sections in `BREAKING_CHANGES.md` are separate bounded signals;
 they are not a second Rust API analyzer. The generic `CONSISTENCY_CHECK` keeps
