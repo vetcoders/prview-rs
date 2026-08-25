@@ -72,7 +72,12 @@ prview gate --json
 
 `prview gate` runs the standard fast gate profile, consumes the existing
 policy/merge-gate verdict, and exits with a stable automation contract. It does
-not compute a second verdict path.
+not compute a second verdict path. A local `prview gate` uses only refs already
+present in the repository and performs no fetch, so the pre-push path remains
+network-free. This is scoped to the `gate` subcommand: ordinary explicit
+`prview --pr ...`, `prview --remote ...`, and `prview --remote-only ...`
+analyses keep their normal fetch behavior, with `--no-fetch` remaining their
+opt-out.
 
 | Exit code | Meaning |
 |-----------|---------|

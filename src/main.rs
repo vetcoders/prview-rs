@@ -176,6 +176,10 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     // `gate` forces `ci = false` and derives its exit from the gate contract, so
     // the `--ci`-scoped warnings escape hatch must not leak into it.
     run_cli.fail_on_warnings = false;
+    // The pre-push gate reviews refs already present in the local repository
+    // and must remain usable offline. This override is scoped to the gate
+    // subcommand; ordinary --pr/--remote analyses retain their fetch path.
+    run_cli.no_fetch = true;
 
     let mut config = Config::from_cli(&run_cli)?;
     let enforcement_mode = prview::policy::engine::EnforcementMode::from_gate_flags(

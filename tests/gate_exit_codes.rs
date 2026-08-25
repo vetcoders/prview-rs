@@ -161,6 +161,47 @@ fn gate_exits_zero_for_non_strict_conditional() {
 }
 
 #[test]
+fn residual_gate_no_fetch() {
+    let temp = create_gate_fixture();
+    let repo = temp.path();
+    let home = tempfile::tempdir().expect("prview home");
+    let path = path_without_semgrep(repo);
+    let missing_origin = repo.join("network-must-not-be-used.git");
+    run_git(
+        repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            missing_origin.to_str().expect("UTF-8 fixture path"),
+        ],
+    );
+
+    // A local gate has every ref it needs in the fixture. The poisoned origin
+    // must therefore be irrelevant rather than turning an offline pre-push
+    // check into an execution error.
+    Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(repo)
+        .env("PATH", &path)
+        .env("PRVIEW_HOME", home.path())
+        .arg("gate")
+        .assert()
+        .code(0);
+
+    // Explicit remote analysis retains the existing fetch behavior. The same
+    // poisoned origin must now be observed rather than inheriting the gate-only
+    // local override.
+    Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(repo)
+        .env("PATH", &path)
+        .env("PRVIEW_HOME", home.path())
+        .args(["--remote", "feature/gate-exit-codes", "main"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("fetch"));
+}
+
+#[test]
 fn gate_exits_two_for_strict_conditional() {
     let temp = create_gate_fixture();
 
