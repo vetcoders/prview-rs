@@ -840,6 +840,28 @@ async fn run_all_checks(
                     }
                 }
 
+                // Cancellation, as its own arm rather than as a thing noticed
+                // the next time a check happens to finish: the checks still
+                // running have just had their process groups SIGKILLed, but a
+                // gate with a long timeout and no child yet would otherwise
+                // hold the stage open. Returning here unwinds `App::run`
+                // through its ordinary `?`, which is what lets the ledger's
+                // shared worktree snapshot and the analysis snapshots be
+                // dropped — an aborted process leaves both on disk.
+                _ = governor.cancelled() => {
+                    if emit {
+                        let board = lock_board(&board);
+                        print!("\r\x1b[2K");
+                        println!(
+                            "  {} Cancelled — {} check(s) stopped, {} never started.",
+                            "✗".red(),
+                            board.names_where(true).len(),
+                            board.names_where(false).len(),
+                        );
+                    }
+                    return Err(Cancelled.into());
+                }
+
                 _ = timer.tick(), if emit && !lock_board(&board).is_empty() => {
                     let now = std::time::Instant::now();
                     let elapsed = start.elapsed().as_secs();
@@ -3281,6 +3303,61 @@ test result: ok. 2 passed; 0 failed
             "a budget of 6 with heavy=3 admits exactly two heavy checks at a time",
         );
         assert_eq!(live.load(Ordering::SeqCst), 0, "nothing is left running");
+    }
+
+    /// Cancelling must take the dispatcher down through its ordinary error
+    /// path, not leave it waiting for checks whose children have just been
+    /// killed. Driven by calling `cancel()` directly: sending a real SIGINT from
+    /// a test is a known flake class, and the signal is not what is under test —
+    /// what the loop does about it is.
+    #[tokio::test]
+    async fn a_cancelled_run_stops_the_check_loop() {
+        use async_trait::async_trait;
+
+        struct SlowMock;
+
+        #[async_trait]
+        impl Check for SlowMock {
+            fn name(&self) -> &str {
+                "Slow"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                unreachable!("the run is cancelled long before this")
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::with_budget(4, 2));
+
+        let canceller = {
+            let governor = Arc::clone(&governor);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                governor.cancel();
+            })
+        };
+
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(SlowMock)];
+        let err = run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect_err("a cancelled run does not produce results");
+        canceller.await.expect("canceller must not panic");
+
+        assert!(
+            err.downcast_ref::<Cancelled>().is_some(),
+            "the caller has to be able to tell a cancellation from a failure: {err}",
+        );
     }
 
     /// A check that has not been admitted is QUEUED, and the progress line has

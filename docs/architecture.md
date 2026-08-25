@@ -37,7 +37,7 @@ prview-rs/
 │   ├── ledger/
 │   │   └── mod.rs       # Task ledger: one record per unit of work in a run
 │   ├── governor/
-│   │   └── mod.rs       # Bounded execution: weighted budget + child registry (not wired yet)
+│   │   └── mod.rs       # Bounded execution: weighted budget + child registry
 │   ├── heuristics/
 │   │   ├── mod.rs       # HeuristicsResult, runner
 │   │   └── loctree.rs   # Loctree heuristic (universal)
@@ -106,7 +106,8 @@ app.run()
     ├─► resolve_target()       ─── resolves the target branch
     ├─► resolve_bases()        ─── resolves bases (repo default plus tool fallbacks)
     ├─► generate_diffs()       ─── git2 diff with per-file stats (Patch API)
-    ├─► checks::run_all()      ─── parallel checks (tsc, cargo, ruff...)
+    ├─► checks::run_all()      ─── parallel checks (tsc, cargo, ruff...), bounded
+    │                              by the run's ResourceGovernor
     ├─► heuristics::run()      ─── loctree (universal structural signals)
     └─► artifacts::generate()  ─── numbered layout + signal generators
 ```
@@ -871,18 +872,16 @@ cargo gates use, so a workspace member is not collapsed to the snapshot root.
 
 ### governor/mod.rs
 
-**Status: primitive only — nothing in the run acquires from it yet.** Wiring the
-dispatcher to it is a separate change, so the budget can be reviewed before it
-starts shaping when checks run.
-
-Concurrency is currently decided per stage: the checks stage picks its own
-fan-out, the context stage picks another, and nothing holds the machine-wide
+Concurrency used to be decided per stage: the checks stage picked its own
+fan-out, the context stage picked another, and nothing held the machine-wide
 number. Two stages each behaving reasonably still oversubscribe a laptop, and the
 tools are not equal — `cargo clippy` and `cargo test` each want the whole box
 while reading a manifest costs nothing.
 
 `ResourceGovernor` is that missing number, plus the registry that makes a run
-killable:
+killable. One governor per run, owned by `App` (and by `tui::run_tui`, which is
+its own entry point) so BOTH stages that put load on the machine draw on the same
+budget:
 
 ```rust
 pub enum Weight { Light, Heavy }   // a declaration, not a permit count
@@ -892,12 +891,19 @@ impl ResourceGovernor {
     pub fn with_budget(total: u32, heavy_cost: u32) -> Self;
     pub fn cost(&self, weight: Weight) -> u32;
     pub async fn acquire(&self, weight: Weight) -> Result<GovernorPermit, Cancelled>;
+    pub fn try_acquire(&self, weight: Weight) -> Option<GovernorPermit>;
     pub fn register_child(&self, key: impl Into<String>, pid: u32);
     pub fn unregister_child(&self, key: &str);
     pub fn cancel(&self);
     pub fn cancelled_signal(&self) -> tokio::sync::watch::Receiver<bool>;
+    pub async fn cancelled(&self);
     pub fn is_cancelled(&self) -> bool;
 }
+
+// Attribute a task's spawned children to a governor without threading it
+// through `Check::run`.
+pub async fn with_child_scope<F: Future>(g: Arc<ResourceGovernor>, label: &str, f: F) -> F::Output;
+pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
 ```
 
 - **Weights cost what the governor says.** `Light` is one permit; `Heavy` is
@@ -925,6 +931,85 @@ impl ResourceGovernor {
 
 Zero new dependencies: the budget is `tokio::sync::Semaphore::acquire_many_owned`
 and the signal is `tokio::sync::watch`, both already in the graph.
+
+#### Who acquires, and in what order
+
+- **Checks** (`checks::run_all`, `run_all_with_events`) take a permit per check
+  before the process starts. The weight comes from `Check::resource_weight`,
+  which defaults to `Light`; the `Heavy` list lives on that trait method and is
+  the cargo family, `TypeScript`, `Vitest`, `ESLint` and `Semgrep`.
+- **Context commands** (`artifacts::context_artifacts`) take a permit before each
+  spawn, via the synchronous `try_acquire` — `artifacts::generate` is a blocking
+  pipeline with a poll loop and has nothing to `.await` on. The weight comes from
+  `context_cmd_weight`: `tsc trace`, `eslint json`, `stylelint json` and
+  `esbuild meta` are `Heavy`; the metadata readers (`cargo tree`, `cargo sbom`,
+  `npm sbom`, `tauri info`) are `Light`.
+- **The cargo `target/` lock stays.** It is a correctness lock — one writer per
+  `target/` — and the budget is not that. A check that takes both takes them in
+  ONE order: **cargo lock first, then budget**. Same order everywhere is what
+  makes two locks deadlock-free, and this direction also avoids parking half the
+  budget on a cargo check that is still queueing for `target/`. Nothing acquires
+  the cargo lock once it holds budget, so there is no cycle the other way.
+
+#### Queued vs running
+
+Admission is what makes the distinction real, so the run reports it:
+
+- the progress line separates the two — `Running: X (12s) · Queued: Y, Z`;
+- the ledger's `started_at` is the moment of admission, not the first poll of the
+  check's future, so `started_at − queued_at` is time spent waiting for the
+  machine;
+- the PV-18 slow notice measures from admission. A check parked on the budget for
+  ten minutes has not been slow, it has not started, and naming it would blame
+  the tool for the queue;
+- TUI mode gets the same split: `CheckEvent::Started` means "the run considered
+  this check" (mapped to the `Pending` lifecycle) and the added
+  `CheckEvent::Running` means a process began.
+
+#### Cancellation path (Ctrl-C)
+
+```
+SIGINT ─► main::with_cancellation
+             │  first interrupt
+             ▼
+        governor.cancel()
+             ├─► semaphore.close()      ── refuses newcomers AND tasks already waiting
+             ├─► watch::send(true)      ── wakes the dispatcher's select! arm
+             └─► SIGKILL -pgid          ── every registered child's whole process tree
+             │
+             ▼
+        checks::run_all returns Err(Cancelled)   ── or the context stage stops admitting
+             │
+             ▼
+        App::run unwinds through `?`  ── Drop runs: ledger's shared WorktreeSnapshot,
+             │                           heuristics AnalysisSnapshots
+             ▼
+        main exits `CANCELLED_EXIT_CODE` (130 = 128 + SIGINT)
+```
+
+Cancelling rather than aborting is the whole point: `select!` could simply drop
+the run future, but returning through the ordinary error path is what lets the
+destructors on the way out remove the temporary worktrees a killed process would
+leave on disk. A **second** interrupt is the operator declining to wait for that
+and exits immediately.
+
+Every child that can be reached this way must be registered, and every child
+prview spawns leads its own process group (`proc::harden` for the async checks,
+`proc::harden_std` for the synchronous context commands) so one signal reaches
+`cargo → rustc → cc` and `sh → pnpm → tool`. Checks register through the
+`with_child_scope` task-local rather than an argument: the governor is known at
+the dispatcher, the pid at the single spawn point five frames below it behind
+`Check::run(&self, config)`, and a trait method cannot grow a parameter without
+every check and every `run_command_*` call site growing one it never reads. The
+returned guard unregisters on drop, so the success, timeout and error paths all
+leave the registry clean — a pid the governor still believes in is a pid it may
+signal, and pids are reused.
+
+`--tui` is deliberately NOT wrapped: it puts the terminal in raw mode, so Ctrl-C
+arrives as a key event and the TUI owns its own quit path.
+
+**Not yet configurable.** The budget is `available_parallelism()` with no CLI
+flag; an operator knob is a follow-up.
 
 ### mcp/
 

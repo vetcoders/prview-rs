@@ -591,14 +591,18 @@ fn record_context_runs(
         let Some(cmd) = cmds.iter().find(|cmd| cmd.label == timing.label) else {
             continue;
         };
-        let state = if timing.status == "spawn_failed" {
-            TaskState::Skipped {
+        let state = match timing.status {
+            // Neither of these delivered an answer about the reviewed tree, so
+            // neither is a Run: one never started, the other was stopped.
+            "spawn_failed" => TaskState::Skipped {
                 reason: format!("`{}` could not be spawned in the reviewed tree", cmd.cmd),
-            }
-        } else {
-            TaskState::Run {
+            },
+            "cancelled" => TaskState::Skipped {
+                reason: format!("`{}` did not run: the review was cancelled", cmd.cmd),
+            },
+            _ => TaskState::Run {
                 duration: std::time::Duration::from_secs_f32(timing.duration_secs),
-            }
+            },
         };
         ledger.record(TaskEntry {
             // The command's own cwd, not the scan root: a cargo context command
@@ -982,6 +986,14 @@ pub(super) fn run_context_cmds_parallel(
         // also the one that reaps finished commands — blocking here would stop
         // the budget from ever coming back.
         while let Some(&(idx, cmd)) = pending.front() {
+            // A cancelled run must not start new work. `try_acquire` refuses
+            // anyway once the budget is closed, but silently and identically to
+            // "the machine is busy" — this is the branch that tells them apart,
+            // and it is the one that stops the loop instead of waiting for a
+            // budget that is never coming back.
+            if governor.is_cancelled() {
+                break;
+            }
             let Some(budget) = governor.try_acquire(context_cmd_weight(cmd)) else {
                 break;
             };
@@ -1049,6 +1061,19 @@ pub(super) fn run_context_cmds_parallel(
             }
         }
 
+        if governor.is_cancelled() {
+            // Say so for every command that will now never run, rather than
+            // leaving it out of the account entirely.
+            for (_, cmd) in pending.drain(..) {
+                timings.push(ContextCommandTiming {
+                    label: cmd.label.clone(),
+                    artifact: None,
+                    status: "cancelled",
+                    duration_secs: 0.0,
+                });
+            }
+        }
+
         if running.is_empty() {
             if pending.is_empty() {
                 break;
@@ -1074,7 +1099,12 @@ pub(super) fn run_context_cmds_parallel(
                                 .display()
                                 .to_string()
                         }),
-                        status: if exit.success() {
+                        // A command the cancel SIGKILLed exits non-zero. That
+                        // is not the tool failing, and the pack must not read
+                        // as though it were.
+                        status: if governor.is_cancelled() {
+                            "cancelled"
+                        } else if exit.success() {
                             "completed"
                         } else {
                             "failed"
@@ -2072,6 +2102,45 @@ mod tests {
             0,
             "a finished command leaves no pid the governor may signal",
         );
+    }
+
+    /// A cancelled run starts nothing further, and says so about what it did
+    /// not start. Silence would leave the pack claiming a context command was
+    /// simply not planned.
+    #[test]
+    fn a_cancelled_run_starts_no_further_context_commands() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cmds = vec![
+            sleeping_cmd("cargo tree", tmp.path(), "30"),
+            sleeping_cmd("npm sbom", tmp.path(), "30"),
+        ];
+
+        let governor = ResourceGovernor::new();
+        governor.cancel();
+
+        let started = Instant::now();
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a cancelled stage must not wait out a budget that is never coming back",
+        );
+        assert_eq!(timings.len(), 2, "both commands are accounted for");
+        assert!(
+            timings.iter().all(|t| t.status == "cancelled"),
+            "got {:?}",
+            timings.iter().map(|t| t.status).collect::<Vec<_>>(),
+        );
+
+        // And a cancelled command is not a run: it read nothing.
+        let ledger = TaskLedger::new();
+        super::record_context_runs(&ledger, tmp.path(), &cmds, &timings);
+        for entry in ledger.entries() {
+            assert!(
+                matches!(entry.state, TaskState::Skipped { .. }),
+                "got {:?}",
+                entry.state,
+            );
+        }
     }
 
     /// A command that never started did not read the tree. Recording it as a

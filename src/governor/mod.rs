@@ -47,6 +47,14 @@ pub enum Weight {
     Heavy,
 }
 
+/// Exit code for a run the operator cancelled.
+///
+/// 128 + SIGINT, the shell convention for "terminated by an interrupt". It is
+/// deliberately outside prview's own map (0 accept, 1 reject/block/quality
+/// failure, 3 gate execution error): a cancelled run produced no verdict, and
+/// reporting one of those would claim it did.
+pub const CANCELLED_EXIT_CODE: i32 = 130;
+
 /// The governor refused because the run was cancelled.
 ///
 /// Returned instead of a permit both to a caller arriving after
@@ -244,6 +252,27 @@ impl ResourceGovernor {
     #[must_use]
     pub fn cancelled_signal(&self) -> watch::Receiver<bool> {
         self.cancel_tx.subscribe()
+    }
+
+    /// Resolves when the run is cancelled — and never otherwise.
+    ///
+    /// [`cancelled_signal`](Self::cancelled_signal) as a plain future, which is
+    /// what a `select!` arm actually wants. It exists because the raw receiver
+    /// has two edges a caller must not get wrong: `changed()` waits for the NEXT
+    /// transition, so a receiver created after the cancel would wait forever for
+    /// one that already happened; and a dropped sender means nothing can ever
+    /// cancel, which must read as "never", not as "cancelled now".
+    pub async fn cancelled(&self) {
+        let mut signal = self.cancelled_signal();
+        if *signal.borrow() {
+            return;
+        }
+        while signal.changed().await.is_ok() {
+            if *signal.borrow() {
+                return;
+            }
+        }
+        std::future::pending().await
     }
 
     /// The registry, recovering from a poisoned lock rather than propagating it:
@@ -605,6 +634,74 @@ mod tests {
             governor.acquire(Weight::Light).await.unwrap_err(),
             Cancelled,
             "a second cancel must not reopen the budget"
+        );
+    }
+
+    /// The registration path end to end: a child spawned by the shared helper
+    /// inside a [`with_child_scope`] is reachable by `cancel`, grandchildren
+    /// included. No SIGINT is sent anywhere — the signal is not what is under
+    /// test, and the only process signalled is one this test spawned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_reaps_a_child_spawned_inside_a_scope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > {} ; wait", pidfile.display());
+
+        let governor = Arc::new(ResourceGovernor::with_budget(4, 2));
+        let worker = {
+            let governor = Arc::clone(&governor);
+            tokio::spawn(async move {
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.arg("-c").arg(&script);
+                with_child_scope(
+                    governor,
+                    "Mock gate",
+                    crate::proc::run_capture_with_timeout(
+                        cmd,
+                        Duration::from_secs(60),
+                        "sh-tree",
+                        || anyhow::anyhow!("unexpected timeout"),
+                    ),
+                )
+                .await
+            })
+        };
+
+        let mut grandchild = None;
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                grandchild = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let grandchild = grandchild.expect("sh should record the grandchild pid");
+        assert_eq!(
+            governor.inflight_count(),
+            1,
+            "the running child is registered while it runs",
+        );
+
+        governor.cancel();
+        let _ = worker.await.expect("worker must not panic");
+
+        let mut gone = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(grandchild, 0) } == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if errno == Some(libc::ESRCH) || errno == Some(libc::EPERM) {
+                    gone = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            gone,
+            "grandchild {grandchild} survived cancellation of the run",
         );
     }
 

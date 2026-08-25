@@ -11,7 +11,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Ctrl-C cancels a run instead of killing it. The first interrupt stops the
+  governor granting work, SIGKILLs the process group of every tool the run
+  spawned (reaching `cargo → rustc → cc` and `sh → pnpm → tool`, not just the
+  direct child), and unwinds the run through its ordinary error path so the
+  temporary worktrees and analysis snapshots are removed on the way out — an
+  aborted process left all of them on disk. A cancelled run exits `130`
+  (128 + SIGINT), deliberately outside prview's verdict codes because it
+  produced no verdict; a second interrupt exits immediately. Context commands
+  that never started are recorded as `cancelled` rather than omitted. `--tui`
+  keeps its own quit path.
+
 ### Changed
+
+- Quality checks and context commands now run under one machine-wide budget
+  (`ResourceGovernor`) instead of each stage picking its own fan-out. Checks
+  declare `Light` or `Heavy` via `Check::resource_weight`; the compilers,
+  whole-project linters and test runners (the cargo family, TypeScript, Vitest,
+  ESLint, Semgrep) are `Heavy` and cost half the budget each, so a mixed
+  Rust+JS profile no longer starts four toolchains that each size their worker
+  pool to the whole machine. The cargo `target/` write lock is unchanged and is
+  always taken before the budget. Context commands (`tsc --traceResolution`,
+  `eslint`, `stylelint`, `esbuild`) draw on the same budget and now lead their
+  own process groups like the checks always have. The budget is
+  `available_parallelism()` and is not yet configurable.
+
+- Progress output tells queued work from running work. The stage line reads
+  `Running: X (12s) · Queued: Y, Z` instead of naming every runnable check as
+  running from the first instant; the task ledger's `started_at` is the moment a
+  check was admitted rather than first polled, so the gap from `queued_at` is
+  time spent waiting for the machine; and the "still running after Ns" notice
+  measures from admission, so a check parked on the budget is no longer reported
+  as a slow tool. TUI mode gains `CheckEvent::Running` beside the existing
+  `Started`, which now maps to the `Pending` lifecycle.
+
 
 - `prview gate --strict` now consumes a schema 2.3 typed enforcement
   disposition instead of collapsing every `CONDITIONAL` cause into one exit.
