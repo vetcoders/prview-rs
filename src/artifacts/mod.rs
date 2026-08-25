@@ -146,6 +146,13 @@ pub struct GenerateInput<'a> {
     /// `worktree_clean`. Recorded in `00_summary/PROVENANCE.json`; `None` when
     /// the repository could not be inspected.
     pub worktree_status_digest: Option<String>,
+    /// The run's machine-wide budget, shared with the checks stage.
+    ///
+    /// The context stage shells out to the same class of tools the gates do — a
+    /// project-wide `tsc`, a project-wide `eslint`, a bundler — so it must draw
+    /// on the same budget rather than pick its own fan-out. It is also what a
+    /// Ctrl-C reaches those children through.
+    pub governor: &'a crate::governor::ResourceGovernor,
 }
 
 struct RunJsonInput<'a> {
@@ -347,6 +354,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         skipped_checks,
         worktree_clean,
         worktree_status_digest,
+        governor,
     } = input;
     let t_total = Instant::now();
     let mut stage_timings = Vec::new();
@@ -749,6 +757,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         &context_dir,
         emit_human_stdout,
         &context_artifacts,
+        governor,
     )?;
     stage_timings.push(finish_timing(emit_human_stdout, "context-tools", t));
 

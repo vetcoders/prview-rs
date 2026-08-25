@@ -393,6 +393,7 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
         skipped_checks,
         worktree_clean,
         worktree_status_digest,
+        governor: &governor,
     })?;
     let _ = tx.send(TuiEvent::ArtifactsReady {
         dir: artifacts_dir.clone(),

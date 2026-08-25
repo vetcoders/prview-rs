@@ -166,6 +166,22 @@ impl ResourceGovernor {
             .map_err(|_| Cancelled)
     }
 
+    /// Take `weight`'s share of the budget if it is free right now.
+    ///
+    /// The synchronous counterpart of [`ResourceGovernor::acquire`], for the
+    /// artifact stage: `artifacts::generate` is a blocking pipeline with a
+    /// poll loop, so it has nothing to `.await` on. `None` means "not now" —
+    /// either the budget is spoken for or the run was cancelled, which the
+    /// caller separates with [`ResourceGovernor::is_cancelled`] because only
+    /// one of the two is worth waiting out.
+    #[must_use]
+    pub fn try_acquire(&self, weight: Weight) -> Option<GovernorPermit> {
+        Arc::clone(&self.semaphore)
+            .try_acquire_many_owned(self.cost(weight))
+            .ok()
+            .map(GovernorPermit)
+    }
+
     /// Record a spawned child so [`ResourceGovernor::cancel`] can reach it.
     ///
     /// `pid` must be the pid of a child spawned through [`crate::proc::harden`],

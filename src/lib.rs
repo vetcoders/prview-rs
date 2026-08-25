@@ -230,6 +230,7 @@ impl App {
             skipped_checks,
             worktree_clean: self.worktree_clean_at_start,
             worktree_status_digest: self.worktree_status_digest_at_start.clone(),
+            governor: &self.governor,
         })?;
 
         // 8. Build report
@@ -513,6 +514,7 @@ impl App {
             skipped_checks: vec![],
             worktree_clean: worktree.clean,
             worktree_status_digest: worktree.status_digest.clone(),
+            governor: &self.governor,
         })?;
 
         Ok(output::Report {

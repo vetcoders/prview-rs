@@ -38,6 +38,23 @@ pub fn harden(cmd: &mut TokioCommand) {
     cmd.process_group(0);
 }
 
+/// The half of [`harden`] that a synchronous [`std::process::Command`] can take:
+/// detached stdin and, on unix, its own process group.
+///
+/// `kill_on_drop` has no std equivalent — a caller here owns the `Child` and
+/// reaps it itself. The process group is the half that matters anyway: the
+/// context stage spawns `sh -c 'pnpm exec …'` wrappers whose grandchildren
+/// outlive a plain `Child::kill`, and it is the pgid that the run's resource
+/// governor signals on cancellation.
+pub fn harden_std(cmd: &mut std::process::Command) {
+    cmd.stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+}
+
 /// Spawn `cmd` under the standard rails with piped output, drain stdout+stderr
 /// concurrently (a high-output child cannot deadlock on a full pipe buffer),
 /// and enforce `timeout`.

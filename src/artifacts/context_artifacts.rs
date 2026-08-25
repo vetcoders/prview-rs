@@ -1,6 +1,7 @@
 //! Context generator planning and parallel execution (loctree/tsc-trace/tauri info).
 
 use super::*;
+use crate::governor::{GovernorPermit, ResourceGovernor, Weight};
 use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
 
 /// The substrate a context command reading `scan_root` would report, resolved
@@ -544,6 +545,7 @@ pub(super) fn generate_context_artifacts(
     context_dir: &Path,
     emit_human_stdout: bool,
     decisions: &[ContextArtifactDecision],
+    governor: &ResourceGovernor,
 ) -> Result<Vec<ContextCommandTiming>> {
     let cmds = plan_context_cmds(
         config,
@@ -559,7 +561,8 @@ pub(super) fn generate_context_artifacts(
     }
 
     // Run all commands in parallel with a shared timeout
-    let timings = run_context_cmds_parallel(&cmds, CONTEXT_GEN_TIMEOUT_SECS, emit_human_stdout);
+    let timings =
+        run_context_cmds_parallel(&cmds, CONTEXT_GEN_TIMEOUT_SECS, emit_human_stdout, governor);
     record_context_runs(ledger, &config.repo_root, &cmds, &timings);
     Ok(timings)
 }
@@ -908,19 +911,57 @@ fn plan_context_cmds(
     cmds
 }
 
-/// Spawn all context commands in parallel and poll them with a shared timeout.
+/// What a context command costs the machine, for the run's resource governor.
+///
+/// The heavy ones are the same class the gates declare `Heavy`, for the same
+/// reason: a project-wide type check, a project-wide lint, a bundler. `tsc
+/// --traceResolution` is the most expensive thing the context stage runs at all.
+///
+/// The rest read metadata and are `Light`: `cargo tree` (and the sbom variant it
+/// shares a binary with) resolve the dependency graph from the lockfile without
+/// compiling anything, `npm`/`pnpm list` walks `node_modules`, and `tauri info`
+/// probes the environment. Getting one of these wrong only wastes budget, which
+/// is why the default falls this way.
+fn context_cmd_weight(cmd: &ContextCmd) -> Weight {
+    match cmd.label.as_str() {
+        "tsc trace" | "eslint json" | "stylelint json" | "esbuild meta" => Weight::Heavy,
+        // "cargo tree", "cargo sbom", "npm sbom", "tauri info"
+        _ => Weight::Light,
+    }
+}
+
+/// Spawn context commands under the run's budget and poll them with a shared
+/// timeout.
+///
 /// Each command gets `timeout_secs` from its own spawn time. Results are written
 /// to the specified output files. Commands that exceed the timeout are killed.
+///
+/// "In parallel" now means "as parallel as the machine allows": a command waits
+/// for its share of the governor's budget before it is spawned, so the context
+/// stage can no longer put a bundler and a whole-project type check on a box
+/// that the checks stage has already filled. The stages do not overlap in time
+/// today — step 5 is fully awaited before step 7 — so this is one budget being
+/// honoured rather than a measured collision being fixed.
 pub(super) fn run_context_cmds_parallel(
     cmds: &[ContextCmd],
     timeout_secs: u64,
     emit: bool,
+    governor: &ResourceGovernor,
 ) -> Vec<ContextCommandTiming> {
+    use std::collections::VecDeque;
     use std::time::Duration;
 
     struct RunningCmd {
         label: String,
         child: std::process::Child,
+        /// The key this child is registered under, so cancellation can reach its
+        /// process group. Dropped from the registry the moment it exits: a pid
+        /// the governor still believes in is a pid it may signal, and pids are
+        /// reused.
+        registry_key: String,
+        /// This command's slice of the machine, returned when it finishes rather
+        /// than when the whole stage does.
+        budget: Option<GovernorPermit>,
         started_at: Instant,
         deadline: Instant,
         out_dir: PathBuf,
@@ -932,68 +973,93 @@ pub(super) fn run_context_cmds_parallel(
 
     let mut running: Vec<RunningCmd> = Vec::new();
     let mut timings = Vec::new();
-
-    for cmd in cmds {
-        let args: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
-        let idx = running.len();
-        let stdout_path = cmd.out_dir.join(format!(".context-cmd-{idx}.stdout.tmp"));
-        let stderr_path = cmd.out_dir.join(format!(".context-cmd-{idx}.stderr.tmp"));
-        let stdout_file = match File::create(&stdout_path) {
-            Ok(file) => file,
-            Err(_) => continue,
-        };
-        let stderr_file = match File::create(&stderr_path) {
-            Ok(file) => file,
-            Err(_) => {
-                let _ = fs::remove_file(&stdout_path);
-                continue;
-            }
-        };
-
-        match Command::new(&cmd.cmd)
-            .args(&args)
-            .current_dir(&cmd.cwd)
-            // Context tools must never read the operator's terminal: an
-            // interactive prompt (npx install, credential ask) with stdout
-            // redirected to a file is invisible and steals keystrokes.
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::from(stdout_file))
-            .stderr(std::process::Stdio::from(stderr_file))
-            .spawn()
-        {
-            Ok(child) => {
-                let started_at = Instant::now();
-                running.push(RunningCmd {
-                    label: cmd.label.clone(),
-                    child,
-                    started_at,
-                    deadline: started_at + Duration::from_secs(timeout_secs),
-                    out_dir: cmd.out_dir.clone(),
-                    out_file: cmd.out_file.clone(),
-                    stdout_path,
-                    stderr_path,
-                    done: false,
-                });
-            }
-            Err(_) => {
-                let _ = fs::remove_file(&stdout_path);
-                let _ = fs::remove_file(&stderr_path);
-                // Command not available: record it instead of skipping
-                // silently, so the timings tell the truth about the pack.
-                timings.push(ContextCommandTiming {
-                    label: cmd.label.clone(),
-                    artifact: None,
-                    status: "spawn_failed",
-                    duration_secs: 0.0,
-                });
-            }
-        }
-    }
-
+    let mut pending: VecDeque<(usize, &ContextCmd)> = cmds.iter().enumerate().collect();
     let poll_interval = Duration::from_millis(200);
 
-    // Poll all until done or timed out
-    while running.iter().any(|r| !r.done) {
+    loop {
+        // Admit as many queued commands as the budget currently allows, in plan
+        // order. `try_acquire` rather than a blocking wait because this loop is
+        // also the one that reaps finished commands — blocking here would stop
+        // the budget from ever coming back.
+        while let Some(&(idx, cmd)) = pending.front() {
+            let Some(budget) = governor.try_acquire(context_cmd_weight(cmd)) else {
+                break;
+            };
+            pending.pop_front();
+
+            let args: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
+            let stdout_path = cmd.out_dir.join(format!(".context-cmd-{idx}.stdout.tmp"));
+            let stderr_path = cmd.out_dir.join(format!(".context-cmd-{idx}.stderr.tmp"));
+            let stdout_file = match File::create(&stdout_path) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            let stderr_file = match File::create(&stderr_path) {
+                Ok(file) => file,
+                Err(_) => {
+                    let _ = fs::remove_file(&stdout_path);
+                    continue;
+                }
+            };
+
+            let mut command = Command::new(&cmd.cmd);
+            command.args(&args).current_dir(&cmd.cwd);
+            // Shared rails: stdin detached, so a context tool can never read the
+            // operator's terminal (an interactive prompt with stdout redirected
+            // to a file is invisible and steals keystrokes), and its own process
+            // group, so one signal reaches the tree under an `sh -c` wrapper.
+            // The checks stage has always spawned this way; the context stage
+            // not doing so was an omission, not a decision.
+            crate::proc::harden_std(&mut command);
+            match command
+                .stdout(std::process::Stdio::from(stdout_file))
+                .stderr(std::process::Stdio::from(stderr_file))
+                .spawn()
+            {
+                Ok(child) => {
+                    let started_at = Instant::now();
+                    let registry_key = format!("context:{idx}:{}", cmd.label);
+                    governor.register_child(registry_key.clone(), child.id());
+                    running.push(RunningCmd {
+                        label: cmd.label.clone(),
+                        child,
+                        registry_key,
+                        budget: Some(budget),
+                        started_at,
+                        deadline: started_at + Duration::from_secs(timeout_secs),
+                        out_dir: cmd.out_dir.clone(),
+                        out_file: cmd.out_file.clone(),
+                        stdout_path,
+                        stderr_path,
+                        done: false,
+                    });
+                }
+                Err(_) => {
+                    let _ = fs::remove_file(&stdout_path);
+                    let _ = fs::remove_file(&stderr_path);
+                    // Command not available: record it instead of skipping
+                    // silently, so the timings tell the truth about the pack.
+                    timings.push(ContextCommandTiming {
+                        label: cmd.label.clone(),
+                        artifact: None,
+                        status: "spawn_failed",
+                        duration_secs: 0.0,
+                    });
+                }
+            }
+        }
+
+        if running.is_empty() {
+            if pending.is_empty() {
+                break;
+            }
+            // Nothing running and nothing admitted: the budget is held
+            // elsewhere. Wait for it rather than spinning.
+            std::thread::sleep(poll_interval);
+            continue;
+        }
+
+        // Poll everything that is running
         for r in running.iter_mut().filter(|r| !r.done) {
             match r.child.try_wait() {
                 Ok(Some(exit)) => {
@@ -1018,6 +1084,10 @@ pub(super) fn run_context_cmds_parallel(
                 }
                 Ok(None) => {
                     if Instant::now() >= r.deadline {
+                        // The child leads its own group, so reach the whole tree
+                        // — `sh -c 'pnpm exec …'` outlives a kill of the wrapper.
+                        #[cfg(unix)]
+                        crate::proc::sigkill_process_group(r.child.id());
                         let _ = r.child.kill();
                         let _ = r.child.wait();
                         r.done = true;
@@ -1060,7 +1130,21 @@ pub(super) fn run_context_cmds_parallel(
             }
         }
 
-        if running.iter().any(|r| !r.done) {
+        // A finished command gives its permit and its registry slot back before
+        // the next admission pass, so the budget it held goes to whatever is
+        // still queued.
+        running.retain_mut(|r| {
+            if r.done {
+                governor.unregister_child(&r.registry_key);
+                drop(r.budget.take());
+            }
+            !r.done
+        });
+
+        if running.is_empty() && pending.is_empty() {
+            break;
+        }
+        if !running.is_empty() {
             std::thread::sleep(poll_interval);
         }
     }
@@ -1160,10 +1244,12 @@ mod tests {
     use crate::checks::{CheckProvenance, CheckResult, CheckStatus};
     use crate::config::{Config, test_config, test_js_profile};
     use crate::git::cmd::git_cmd;
+    use crate::governor::{ResourceGovernor, Weight};
     use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+    use std::time::Instant;
 
     /// A JS repo whose checked-out `HEAD` is NOT the reviewed target.
     ///
@@ -1865,7 +1951,8 @@ mod tests {
         ];
 
         let ledger = TaskLedger::new();
-        let timings = super::run_context_cmds_parallel(&cmds, 30, false);
+        let governor = ResourceGovernor::new();
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor);
         super::record_context_runs(&ledger, tmp.path(), &cmds, &timings);
 
         let entries = ledger.entries();
@@ -1885,6 +1972,108 @@ mod tests {
         assert!(tools.contains(&"cargo_tree"), "got {tools:?}");
     }
 
+    /// A sleeping context command, for the tests that care about scheduling
+    /// rather than about output.
+    fn sleeping_cmd(label: &str, cwd: &Path, secs: &str) -> ContextCmd {
+        ContextCmd {
+            label: label.to_string(),
+            gate: None,
+            cmd: "sh".to_string(),
+            args: vec!["-c".to_string(), format!("sleep {secs}")],
+            cwd: cwd.to_path_buf(),
+            out_dir: cwd.to_path_buf(),
+            out_file: String::new(),
+        }
+    }
+
+    /// The classification is one list and it is load-bearing, so it is asserted
+    /// rather than left to the reader of the match arm.
+    #[test]
+    fn context_commands_declare_the_same_weights_the_gates_do() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for label in ["tsc trace", "eslint json", "stylelint json", "esbuild meta"] {
+            assert_eq!(
+                super::context_cmd_weight(&sleeping_cmd(label, tmp.path(), "0")),
+                Weight::Heavy,
+                "{label} is a project-wide compile/lint/bundle",
+            );
+        }
+        for label in ["cargo tree", "cargo sbom", "npm sbom", "tauri info"] {
+            assert_eq!(
+                super::context_cmd_weight(&sleeping_cmd(label, tmp.path(), "0")),
+                Weight::Light,
+                "{label} reads metadata",
+            );
+        }
+    }
+
+    /// The budget bounds the context stage the same way it bounds the gates:
+    /// with room for one heavy command, three of them run one after another
+    /// instead of all at once. Asserted on wall time as a LOWER bound — the
+    /// unbounded version finishes in about one sleep, the bounded one cannot.
+    #[test]
+    fn context_commands_wait_for_the_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cmds: Vec<ContextCmd> = ["tsc trace", "eslint json", "stylelint json"]
+            .into_iter()
+            .map(|label| sleeping_cmd(label, tmp.path(), "0.3"))
+            .collect();
+
+        // Heavy costs the whole budget, so exactly one command runs at a time.
+        let governor = ResourceGovernor::with_budget(2, 2);
+        let started = Instant::now();
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor);
+        let elapsed = started.elapsed();
+
+        assert_eq!(timings.len(), 3, "every command still runs and reports");
+        assert!(
+            timings.iter().all(|t| t.status == "completed"),
+            "got {:?}",
+            timings.iter().map(|t| t.status).collect::<Vec<_>>(),
+        );
+        assert!(
+            elapsed >= Duration::from_millis(750),
+            "three serialised 0.3s commands cannot finish in {elapsed:?}",
+        );
+    }
+
+    /// Cancellation can only reach a context child the governor knows about, and
+    /// only for as long as that pid is really its child. Both halves are the
+    /// test: the pid appears while the command runs and is gone afterwards.
+    #[test]
+    fn a_running_context_command_is_registered_with_the_governor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cmds = vec![sleeping_cmd("cargo tree", tmp.path(), "1")];
+        let governor = ResourceGovernor::new();
+
+        std::thread::scope(|scope| {
+            let runner =
+                scope.spawn(|| super::run_context_cmds_parallel(&cmds, 30, false, &governor));
+
+            let mut seen = false;
+            for _ in 0..200 {
+                if governor.inflight_count() == 1 {
+                    seen = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                seen,
+                "a spawned context command must be reachable by cancel"
+            );
+
+            let timings = runner.join().expect("runner must not panic");
+            assert_eq!(timings.len(), 1);
+        });
+
+        assert_eq!(
+            governor.inflight_count(),
+            0,
+            "a finished command leaves no pid the governor may signal",
+        );
+    }
+
     /// A command that never started did not read the tree. Recording it as a
     /// zero-second run would say it did.
     #[test]
@@ -1898,7 +2087,8 @@ mod tests {
         )];
 
         let ledger = TaskLedger::new();
-        let timings = super::run_context_cmds_parallel(&cmds, 30, false);
+        let governor = ResourceGovernor::new();
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor);
         assert_eq!(timings[0].status, "spawn_failed");
         super::record_context_runs(&ledger, tmp.path(), &cmds, &timings);
 
