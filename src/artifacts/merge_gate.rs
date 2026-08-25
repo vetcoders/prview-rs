@@ -2,6 +2,44 @@
 
 use super::*;
 
+/// How old a replayed result may be before a verdict resting on it earns an
+/// advisory caveat.
+///
+/// Seven days is deliberately loose. The caveat exists for the shape seen in the
+/// Vista dogfood run (`PRV-CACHE-STALENESS`): a `Cargo audit` result replayed
+/// from a cache written before a reboot co-authored a `BLOCK`, and nothing in
+/// the pack said the blocking evidence was days old. A tight threshold would
+/// annotate ordinary same-day replays and teach readers to ignore the field, so
+/// the bar is set where "this evidence may simply be out of date" is the honest
+/// reading.
+///
+/// The caveat is WARN-ONLY: it is an additive report about the pack and changes
+/// no verdict, no exit code, and no other field. The threshold is a constant on
+/// purpose — making it configurable is a follow-up, not part of stating the
+/// fact.
+const STALE_CACHE_CAVEAT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The age of the stored result `check_name` was replayed from, when this run
+/// replayed one and the ledger recorded how old it was.
+///
+/// Only [`TaskKind::Check`] entries answer. A context artifact backed by the
+/// same tool is different work under the same id, and its replay says nothing
+/// about the gate row this caveat is about.
+fn replayed_cache_age_secs(ledger: &crate::ledger::TaskLedger, check_name: &str) -> Option<u64> {
+    use crate::ledger::{TaskKind, TaskState};
+
+    let tool = crate::check_id::check_id_from_name(check_name);
+    let entries = ledger.entries();
+    entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == TaskKind::Check && entry.key.tool == tool)
+        .and_then(|entry| match &entry.state {
+            TaskState::Cached { cache_age_secs, .. } => *cache_age_secs,
+            _ => None,
+        })
+}
+
 pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     use crate::policy::engine::{
         AnalysisStatus, EnforcementDisposition, MergeRecommendation, PolicyEngine,
@@ -11,6 +49,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     let MergeGateInput {
         dir,
         config,
+        ledger,
         checks,
         heuristics,
         inline,
@@ -47,6 +86,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     let mut enforcement_disposition =
         EnforcementDisposition::from_evaluations(&outcome.effective_evals);
     let mut gate_checks = Vec::new();
+    let mut stale_cache_caveats = Vec::new();
 
     let inline_findings_path =
         (inline.findings_count > 0).then_some("30_context/INLINE_FINDINGS.sarif");
@@ -100,6 +140,25 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
                 .as_ref()
                 .map(|id| format!("20_quality/{}.log", id)),
         }));
+
+        // A verdict may rest on evidence this run never produced. The row counts
+        // as blocking influence when policy ruled it a hard blocker, or when the
+        // tool failed outright — a failure gates `quality_pass` and ratchets the
+        // merge axis even where severity stops short of a block. Only then is an
+        // old replay worth naming; a stale PASS misleads nobody.
+        let blocking_influence = matches!(effective_eval.merge_impact, MergeRecommendation::Block)
+            || matches!(eval.raw_status.as_str(), "failed" | "error");
+        if blocking_influence
+            && let Some(age) = replayed_cache_age_secs(ledger, &eval.name)
+            && age > STALE_CACHE_CAVEAT_MAX_AGE_SECS
+        {
+            stale_cache_caveats.push(json!({
+                "check_id": eval.check_id,
+                "check_name": eval.name,
+                "cache_age_secs": age,
+                "threshold_secs": STALE_CACHE_CAVEAT_MAX_AGE_SECS,
+            }));
+        }
     }
 
     // Only add heuristics gate check if not already present via synthetic check in all_checks
@@ -327,6 +386,11 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             "preexisting_count": preexisting_inline
         },
         "rust_api_delta": rust_api_delta,
+        // Additive, advisory, and deliberately OUTSIDE `decision`: naming a
+        // blocking row whose evidence was replayed from an old cache is a report
+        // about the pack, not an axis of it. The decision object is closed by
+        // contract, and every field in it ranks the verdict — this one must not.
+        "stale_cache_caveats": stale_cache_caveats,
         "decision": {
             "enforcement_disposition": enforcement_disposition,
             "analysis_status": worst_confidence,
@@ -537,6 +601,12 @@ mod tests {
     use crate::git::ResolvedRef;
     use std::time::Duration;
 
+    /// A ledger with nothing recorded: the shape of a run where no gate row was
+    /// replayed, so none of them can be stale.
+    fn empty_ledger() -> crate::ledger::TaskLedger {
+        crate::ledger::TaskLedger::new()
+    }
+
     fn semgrep_check() -> CheckResult {
         CheckResult {
             name: "Semgrep scan".to_string(),
@@ -614,6 +684,7 @@ mod tests {
         generate_merge_gate(MergeGateInput {
             dir: tmp.path(),
             config: &config,
+            ledger: &empty_ledger(),
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -631,6 +702,103 @@ mod tests {
             serde_json::from_slice(&std::fs::read(tmp.path().join("MERGE_GATE.json")).unwrap())
                 .unwrap();
         assert_eq!(gate["rust_api_delta"], serde_json::to_value(view).unwrap());
+    }
+
+    /// One gate run whose failing row was REPLAYED from a stored result of the
+    /// given age — the `PRV-CACHE-STALENESS` shape, with the age as the only
+    /// variable.
+    fn run_gate_with_cached_semgrep(cache_age_secs: u64) -> serde_json::Value {
+        use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config();
+        let mut check = semgrep_check();
+        check.cached = true;
+        let checks = vec![check];
+        let inline = InlineFindingsSummary {
+            status: "failed".to_string(),
+            findings_count: 1,
+            dashboard_findings: vec![semgrep_dashboard_finding("src/b.rs", true)],
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+
+        let ledger = TaskLedger::new();
+        ledger.record(TaskEntry {
+            key: TaskKey::new("Semgrep scan", SubstrateKey::default()),
+            kind: TaskKind::Check,
+            state: TaskState::Cached {
+                cache_age_secs: Some(cache_age_secs),
+                origin: SubstrateKey::default(),
+            },
+            queued_at: None,
+            started_at: None,
+        });
+
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            ledger: &ledger,
+            checks: &checks,
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            rust_api_delta: None,
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+        })
+        .expect("merge gate");
+
+        serde_json::from_slice(&std::fs::read(tmp.path().join("MERGE_GATE.json")).unwrap()).unwrap()
+    }
+
+    /// The Vista dogfood shape: the row holding the merge came out of a cache
+    /// written a week ago, and until now the pack said only "cached: true".
+    #[test]
+    fn a_blocking_row_replayed_from_an_old_cache_is_named() {
+        let gate = run_gate_with_cached_semgrep(STALE_CACHE_CAVEAT_MAX_AGE_SECS + 60);
+        let caveats = gate["stale_cache_caveats"]
+            .as_array()
+            .expect("stale_cache_caveats is an array");
+
+        assert_eq!(caveats.len(), 1, "one stale blocking row, one caveat");
+        assert_eq!(caveats[0]["check_id"], "semgrep_scan");
+        assert_eq!(caveats[0]["check_name"], "Semgrep scan");
+        assert_eq!(
+            caveats[0]["cache_age_secs"],
+            STALE_CACHE_CAVEAT_MAX_AGE_SECS + 60
+        );
+        assert_eq!(
+            caveats[0]["threshold_secs"],
+            STALE_CACHE_CAVEAT_MAX_AGE_SECS
+        );
+    }
+
+    /// The caveat is advisory in the strong sense: the ONLY difference a stale
+    /// replay makes to the pack is the additive field itself. A fresh replay of
+    /// the same failing row raises nothing at all.
+    #[test]
+    fn the_stale_cache_caveat_moves_no_other_field() {
+        let fresh = run_gate_with_cached_semgrep(60);
+        assert!(
+            fresh["stale_cache_caveats"]
+                .as_array()
+                .expect("stale_cache_caveats is an array")
+                .is_empty(),
+            "a minute-old replay is not stale evidence"
+        );
+
+        let stale = run_gate_with_cached_semgrep(STALE_CACHE_CAVEAT_MAX_AGE_SECS + 60);
+        assert_eq!(
+            stale["decision"], fresh["decision"],
+            "the caveat must not move the verdict or any decision field"
+        );
+        assert_eq!(stale["checks"], fresh["checks"]);
+        assert_eq!(stale["inline_findings"], fresh["inline_findings"]);
     }
 
     fn run_gate_with_semgrep_finding(in_diff: bool, security_full: bool) -> serde_json::Value {
@@ -663,6 +831,7 @@ mod tests {
         generate_merge_gate(MergeGateInput {
             dir: tmp.path(),
             config: &config,
+            ledger: &empty_ledger(),
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -707,6 +876,7 @@ mod tests {
         generate_merge_gate(MergeGateInput {
             dir: tmp.path(),
             config: &config,
+            ledger: &empty_ledger(),
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -758,6 +928,7 @@ mod tests {
         generate_merge_gate(MergeGateInput {
             dir: tmp.path(),
             config: &config,
+            ledger: &empty_ledger(),
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -802,6 +973,7 @@ mod tests {
         generate_merge_gate(MergeGateInput {
             dir: tmp.path(),
             config: &config,
+            ledger: &empty_ledger(),
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -857,6 +1029,7 @@ mod tests {
         generate_merge_gate(MergeGateInput {
             dir: tmp.path(),
             config: &config,
+            ledger: &empty_ledger(),
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -920,6 +1093,7 @@ mod tests {
         generate_merge_gate(MergeGateInput {
             dir: tmp.path(),
             config: &config,
+            ledger: &empty_ledger(),
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -1271,6 +1445,7 @@ mod tests {
         generate_merge_gate(MergeGateInput {
             dir: tmp.path(),
             config: &config,
+            ledger: &empty_ledger(),
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -1403,6 +1578,7 @@ mod tests {
         generate_merge_gate(MergeGateInput {
             dir: tmp.path(),
             config: &config,
+            ledger: &empty_ledger(),
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -1444,6 +1620,7 @@ mod tests {
         generate_merge_gate(MergeGateInput {
             dir: tmp.path(),
             config: &config,
+            ledger: &empty_ledger(),
             checks: &checks,
             heuristics: None,
             inline: &inline,

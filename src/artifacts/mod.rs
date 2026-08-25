@@ -170,6 +170,10 @@ struct RunJsonInput<'a> {
 struct MergeGateInput<'a> {
     dir: &'a Path,
     config: &'a Config,
+    /// The run's task ledger, read for ONE fact no `CheckResult` carries: how
+    /// old the stored result behind a replayed check was. A blocking row built
+    /// on a days-old replay earns the advisory `stale_cache_caveats` entry.
+    ledger: &'a TaskLedger,
     checks: &'a [CheckResult],
     heuristics: Option<&'a HeuristicsResult>,
     inline: &'a InlineFindingsSummary,
@@ -547,6 +551,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     generate_merge_gate(MergeGateInput {
         dir: &summary_dir,
         config,
+        ledger,
         checks: &all_checks,
         heuristics,
         inline: &inline_summary,

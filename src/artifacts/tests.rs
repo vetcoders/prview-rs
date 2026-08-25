@@ -299,6 +299,9 @@ macro_rules! generate_merge_gate_test {
         generate_merge_gate(MergeGateInput {
             dir: $dir,
             config: $config,
+            // Nothing recorded: these packs replay no stored result, so no gate
+            // row can carry a stale-cache caveat.
+            ledger: &crate::ledger::TaskLedger::new(),
             checks: $checks,
             heuristics: $heuristics,
             inline: $inline,

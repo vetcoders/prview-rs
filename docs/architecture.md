@@ -887,6 +887,35 @@ The core artifact generator. Builds the numbered directory layout
 - `30_context/`: optional `INLINE_FINDINGS.sarif`, `changed-tests.txt`, profile-specific (`cargo-tree`, `tsc-trace`, `eslint`, `vitest`)
 - `latest` symlink in the parent dir
 
+#### Stale-cache caveats (`MERGE_GATE.json.stale_cache_caveats`)
+
+A verdict can rest on evidence the run never produced. In the Vista dogfood run
+(`PRV-CACHE-STALENESS`) a `Cargo audit` result replayed from a cache written
+before a reboot co-authored a `BLOCK`, and the pack said only `cached: true` —
+nothing named the age of the evidence.
+
+`generate_merge_gate` therefore reads the run's ledger (the only place that
+carries `cache_age_secs`, see [ledger/mod.rs](#ledgermodrs)) and, for every gate
+row with BLOCKING influence on the verdict — policy conclusion `Block`, or a raw
+`failed`/`error` status, which gates `quality_pass` — emits one entry per row
+whose replay is older than `STALE_CACHE_CAVEAT_MAX_AGE_SECS` (7 days, a constant
+in `src/artifacts/merge_gate.rs`; a CLI knob is a follow-up):
+
+```json
+"stale_cache_caveats": [
+  { "check_id": "cargo_audit", "check_name": "Cargo audit",
+    "cache_age_secs": 806400, "threshold_secs": 604800 }
+]
+```
+
+The field is **WARN-ONLY and additive**. It sits at the top level, deliberately
+outside `decision`: that object is closed by contract and every field in it ranks
+the verdict, so a report ABOUT the pack must not live there. A stale replay
+changes no verdict, no exit code, and no other field — pinned by
+`the_stale_cache_caveat_moves_no_other_field`, which diffs the whole `decision`,
+`checks`, and `inline_findings` of a stale run against a fresh one. A stale
+PASSING row raises nothing: only blocking evidence is worth dating.
+
 ### artifacts/signal/ (module directory)
 
 Domain-specific signal generators, each producing an artifact **only when** it
