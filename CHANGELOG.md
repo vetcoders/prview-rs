@@ -103,6 +103,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `--pr` / `--remote` run with nothing snapshot-backed to run now still reads
+  the reviewed tree. The shared target snapshot was materialised only when a
+  runnable check needed one, which silently excluded two ordinary runs: the
+  **second** run of the same PR, where every gate replays from a cache keyed on
+  the reviewed commit, and the fast remote-only preset, where the
+  snapshot-backed gates all skip and only semgrep (which owns its worktree)
+  remains. Both left the task ledger with no scan dir, so every `30_context`
+  command fell back to the operator's local checkout while the diffs and
+  `MERGE_GATE.json` described the PR's commit — the same
+  `PRV-CONTEXT-SNAPSHOT-PROVENANCE` split pack, reached through a quieter door,
+  with nothing in `RUN.json` to distinguish it. An off-`HEAD` target is now
+  enough to materialise the snapshot on its own, which also resolves the
+  run-wide substrate so `RUN.json` stops reporting a warm `--pr` run's replays
+  and skips as being about no particular tree. A warm `--pr` run pays for one
+  `git worktree` its gates do not need. Local reviews (target == `HEAD`) still
+  materialise nothing.
+
 - `30_context/*` artifacts are now produced from the same reviewed tree the
   quality gates judged. In `--pr` / `--remote` runs the gates scanned a snapshot
   of the reviewed commit while the context generators (`cargo tree`, `tsc

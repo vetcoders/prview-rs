@@ -370,9 +370,12 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     // The reviewed tree, not the local one: in a `--pr` run the checks judged a
     // snapshot of the PR's commit, and the 30_context artifacts must be planned
     // and produced from the same bytes or the pack describes two revisions at
-    // once (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). Falling back to `repo_root` is
-    // the honest answer for a local review and for any run where no shared
-    // snapshot was materialised — there, the repo root IS the reviewed tree.
+    // once (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). `share_target_snapshot` therefore
+    // materialises one whenever the target is off-`HEAD`, whether or not a gate
+    // needed it, so the fallback below is reached only for a local review (target
+    // == `HEAD`, where the repo root IS the reviewed tree) or for a run whose
+    // snapshot could not be created at all — the same degraded path the checks
+    // themselves take.
     let context_scan_root = ledger
         .scan_dir()
         .unwrap_or_else(|| config.repo_root.clone());

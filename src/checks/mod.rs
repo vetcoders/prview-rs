@@ -737,6 +737,20 @@ async fn run_all_checks(
         }
     }
 
+    // Materialise ONE shared target snapshot for the whole run so every
+    // snapshot-backed check reuses it instead of creating (and cleaning up) its
+    // own worktree (thread 1). On failure, leave the override unset so each
+    // check falls back to resolving its own plan — the original per-check
+    // behaviour. The ledger owns the snapshot, so the reviewed tree survives
+    // this frame and the artifact stage can still read it.
+    //
+    // OUTSIDE the "anything to run" guard on purpose: a run whose every gate hit
+    // the cache or was ruled out still goes on to read the reviewed tree in the
+    // context stage, and it is `share_target_snapshot` that decides whether a
+    // snapshot is needed at all.
+    let mut config = config.clone();
+    share_target_snapshot(&mut config, &runnable_checks, ledger);
+
     if !runnable_checks.is_empty() {
         let board = Arc::new(std::sync::Mutex::new(RunBoard::new(
             runnable_checks.iter().map(|c| c.name()),
@@ -751,15 +765,6 @@ async fn run_all_checks(
             );
             let _ = std::io::stdout().flush();
         }
-
-        // Materialise ONE shared target snapshot for the whole run so every
-        // snapshot-backed check reuses it instead of creating (and cleaning up)
-        // its own worktree (thread 1). On failure, leave the override unset so
-        // each check falls back to resolving its own plan — the original
-        // per-check behaviour. The ledger owns the snapshot, so the reviewed
-        // tree survives this frame and the artifact stage can still read it.
-        let mut config = config.clone();
-        share_target_snapshot(&mut config, &runnable_checks, ledger);
 
         // Launch all checks in parallel, stream results as they complete.
         // Cargo checks share one target/ build lock, so they serialize on a
@@ -1459,19 +1464,35 @@ pub fn off_head_target_commit(config: &Config) -> Option<String> {
 /// giving it the handle makes ONE snapshot the substrate of every stage instead
 /// of just the gates.
 ///
+/// A snapshot is materialised when EITHER a runnable check needs one
+/// ([`uses_shared_scan_dir`]) OR the reviewed target is off-`HEAD`. The second
+/// arm is not redundant: the gates are not the only stage that reads the tree.
+/// The context stage plans and produces the whole of `30_context` from
+/// `ledger.scan_dir()`, so tying materialisation to the runnable set alone gave
+/// back `PRV-CONTEXT-SNAPSHOT-PROVENANCE` through a quieter door — the SECOND
+/// `--pr N` run of the same PR, where every gate replays from the cache, and the
+/// fast remote-only preset, where the snapshot-backed gates all skip and only
+/// semgrep (which owns its worktree) remains. Both left the ledger with no scan
+/// dir, and the context commands then read the operator's local checkout while
+/// the diffs and the gate described the PR's commit. A warm `--pr` run therefore
+/// pays for one `git worktree` it does not strictly need for its gates: a
+/// correct pack is worth more than a saved checkout.
+///
 /// Nothing is installed (`scan_dir_override` stays unset, the ledger keeps no
-/// snapshot) when no runnable check needs one, or when snapshot creation fails —
-/// in which case each check falls back to resolving its own plan and later
-/// stages fall back to the repo root, the original per-check behaviour.
+/// snapshot) when the target IS the checked-out `HEAD` and no runnable check
+/// wants one — there the repo root genuinely is the reviewed tree — or when
+/// snapshot creation fails, in which case each check falls back to resolving its
+/// own plan and later stages fall back to the repo root, the original per-check
+/// behaviour.
 fn share_target_snapshot(
     config: &mut Config,
     runnable_checks: &[Box<dyn Check>],
     ledger: &TaskLedger,
 ) {
-    if !runnable_checks
+    let wanted_by_a_gate = runnable_checks
         .iter()
-        .any(|c| uses_shared_scan_dir(c.name()))
-    {
+        .any(|c| uses_shared_scan_dir(c.name()));
+    if !wanted_by_a_gate && off_head_target_commit(config).is_none() {
         return;
     }
     let Ok(plan) = plan_check_run(config) else {
@@ -1482,10 +1503,19 @@ fn share_target_snapshot(
     // no per-command scaffolding judgement: a check that ran reports its own,
     // finer provenance and overrides this in `ledger_substrate`.
     //
+    // The empty `consumable` list is the honest reading of a run-wide claim, and
+    // it is what keeps a gate-less run truthful: `create_worktree_snapshot` links
+    // `node_modules` into every snapshot regardless of who will run there, but
+    // "this tree carries a link" is not "this run consumed one". With no command
+    // to name, nothing here can consume anything, so the run-wide substrate is
+    // `snapshot` — never `snapshot-borrowed-deps`. A command that DOES resolve
+    // through the link (a JS gate, the context stage's `tsc` trace) reports that
+    // for itself via `consumable_scaffolding`.
+    //
     // Installing it also adopts the first pass's skips and cache replays, which
-    // were necessarily decided before this point — the runnable set is what
-    // decides whether a snapshot is materialised at all — and so were recorded
-    // under an unknown substrate.
+    // were necessarily decided before this point — the first pass is what
+    // produces the runnable set — and so were recorded under an unknown
+    // substrate.
     ledger.set_substrate(resolve_scan_substrate(&plan.scan_dir, &config.repo_root, &[]).into());
     ledger.set_shared_snapshot(plan._snapshot);
 }
@@ -3222,6 +3252,207 @@ test result: ok. 2 passed; 0 failed
             skipped_entry.queued_at.is_none() && skipped_entry.started_at.is_none(),
             "a check that never entered the queue has no queue timestamps"
         );
+    }
+
+    /// A gate that resolves exactly the way a test stages it, with no toolchain
+    /// behind it — so a dispatcher-level scenario (everything replayed,
+    /// everything skipped) can be staged hermetically.
+    struct StagedCheck {
+        name: &'static str,
+        eligibility: CheckEligibility,
+        cache_key: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Check for StagedCheck {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+            self.eligibility.clone()
+        }
+        async fn run(&self, _config: &Config) -> Result<CheckResult> {
+            Ok(CheckResult {
+                name: self.name.to_string(),
+                status: CheckStatus::Passed,
+                duration: Duration::from_millis(1),
+                output: "ok".to_string(),
+                cached: false,
+                provenance: None,
+            })
+        }
+        fn cache_key(&self, _config: &Config) -> Option<String> {
+            self.cache_key.map(str::to_string)
+        }
+    }
+
+    /// The substrate an off-HEAD run of the `repo_with_off_head_target` fixture
+    /// must resolve: the reviewed commit, read out of a snapshot.
+    fn reviewed_substrate(target: &str) -> crate::ledger::SubstrateKey {
+        crate::ledger::SubstrateKey {
+            target_sha: Some(target.to_string()),
+            tree_state: Some(TreeState::Snapshot),
+        }
+    }
+
+    /// Assert that `scan_dir` is the reviewed tree of the fixture and not the
+    /// local checkout — the whole point of the shared snapshot.
+    fn assert_scans_the_reviewed_tree(scan_dir: &std::path::Path, repo_root: &std::path::Path) {
+        assert_ne!(
+            scan_dir, repo_root,
+            "an off-HEAD review must not scan the local checkout",
+        );
+        assert_eq!(
+            std::fs::read_to_string(scan_dir.join("tracked.txt")).expect("snapshot on disk"),
+            "two\n",
+            "the shared scan dir must hold the REVIEWED revision",
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_root.join("tracked.txt")).expect("local checkout"),
+            "one\n",
+            "the fixture is only meaningful while the two trees disagree",
+        );
+    }
+
+    /// PRV-CONTEXT-SNAPSHOT-PROVENANCE, the quiet half: the SECOND `--pr N` run
+    /// of the same PR replays every gate off the cache (`tsc-<sha>` and friends
+    /// are keyed on the reviewed commit, so the second run hits them all), which
+    /// left NOTHING runnable — and the reviewed tree was then never materialised
+    /// at all. The context stage went on to read the operator's own checkout
+    /// while the diffs and MERGE_GATE described the PR's commit, and `RUN.json`
+    /// looked identical either way. The tree is what the context stage needs, so
+    /// an off-HEAD target is enough to require it.
+    #[tokio::test]
+    async fn a_fully_cached_off_head_run_still_materialises_the_reviewed_tree() {
+        let (repo, target) = repo_with_off_head_target();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some("feature".to_string());
+        config.quiet = true;
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), true);
+        cache
+            .set("TypeScript", "tsc-target", "passed", Some("replay"), None)
+            .expect("seed cache");
+
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(StagedCheck {
+            name: "TypeScript",
+            eligibility: CheckEligibility::Run,
+            cache_key: Some("tsc-target"),
+        })];
+
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::new());
+        let (results, skipped) = run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect("run_all_checks");
+
+        assert_eq!((results.len(), skipped.len()), (1, 0));
+        assert!(
+            results[0].cached,
+            "the fixture is only meaningful while every gate replays and nothing runs",
+        );
+
+        let scan_dir = ledger
+            .scan_dir()
+            .expect("a warm --pr run still owes the context stage the reviewed tree");
+        assert_scans_the_reviewed_tree(&scan_dir, &config.repo_root);
+
+        // The other half of the silence: with no snapshot there was no substrate
+        // either, so RUN.json reported the replay as being about no particular
+        // tree. Resolving one adopts the first pass's entries onto it.
+        assert_eq!(
+            ledger.resolved_substrate(),
+            Some(reviewed_substrate(&target))
+        );
+        assert_eq!(
+            ledger.entries()[0].key.substrate,
+            reviewed_substrate(&target),
+            "the replay is keyed to the tree this run went on to read",
+        );
+    }
+
+    /// The other way to end up with nothing snapshot-backed to run: the fast
+    /// remote-only preset, where the snapshot-backed gates are ruled out at
+    /// eligibility and the one runnable check is semgrep — which owns its own
+    /// worktree and is deliberately outside `uses_shared_scan_dir`. A non-empty
+    /// runnable set is therefore not evidence that a shared snapshot was made.
+    #[tokio::test]
+    async fn an_off_head_run_with_only_semgrep_runnable_still_materialises_the_tree() {
+        let (repo, target) = repo_with_off_head_target();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some("feature".to_string());
+        config.quiet = true;
+
+        let checks: Vec<Box<dyn Check>> = vec![
+            Box::new(StagedCheck {
+                name: "TypeScript",
+                eligibility: CheckEligibility::Skip("fast remote-only preset".to_string()),
+                cache_key: None,
+            }),
+            Box::new(StagedCheck {
+                name: "Semgrep scan",
+                eligibility: CheckEligibility::Run,
+                cache_key: None,
+            }),
+        ];
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::new());
+        let (results, skipped) = run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect("run_all_checks");
+
+        assert_eq!((results.len(), skipped.len()), (1, 1));
+        let scan_dir = ledger
+            .scan_dir()
+            .expect("semgrep owning its own worktree does not excuse the context stage");
+        assert_scans_the_reviewed_tree(&scan_dir, &config.repo_root);
+        assert_eq!(
+            ledger.resolved_substrate(),
+            Some(reviewed_substrate(&target))
+        );
+    }
+
+    /// The counterpart guard: with the target checked out, the repo root really
+    /// IS the reviewed tree, so a fully cached local run must still cost no
+    /// worktree. Materialising one "to be safe" would charge every local run for
+    /// a checkout that answers a question it does not have.
+    #[tokio::test]
+    async fn a_fully_cached_local_run_makes_no_snapshot() {
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), true);
+        cache
+            .set("TypeScript", "tsc-local", "passed", Some("replay"), None)
+            .expect("seed cache");
+
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(StagedCheck {
+            name: "TypeScript",
+            eligibility: CheckEligibility::Run,
+            cache_key: Some("tsc-local"),
+        })];
+
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::new());
+        let (results, _skipped) = run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect("run_all_checks");
+
+        assert!(results[0].cached);
+        assert!(
+            ledger.scan_dir().is_none(),
+            "target == HEAD: the artifact stage's fallback to repo_root is the right answer",
+        );
+        assert!(ledger.resolved_substrate().is_none());
     }
 
     /// The point of the governor: however many heavy gates a profile enables,

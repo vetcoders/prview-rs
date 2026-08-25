@@ -261,6 +261,40 @@ The Python and JS checks (`Ruff`, `Mypy`, `Pytest`, `TypeScript`, `ESLint`,
 its own — see `uses_shared_scan_dir()`. `SemgrepCheck` is the single deliberate
 opt-out: it manages its own worktree because it also needs a baseline commit.
 
+`share_target_snapshot()` decides whether that snapshot is materialised at all,
+and the condition is **not** "some gate needs it". It is:
+
+> a runnable check is in `uses_shared_scan_dir()`, **or** the reviewed target is
+> off-`HEAD` (`off_head_target_commit()`).
+
+The second arm exists because the gates are not the only stage that reads the
+tree: the context stage plans and produces the whole of `30_context` from
+`ledger.scan_dir()`. Two ordinary runs have an off-`HEAD` target and nothing
+snapshot-backed to run — the **second** `prview --pr N` of the same PR, where
+every gate replays from a cache keyed on the reviewed commit, and the fast
+remote-only preset, where the snapshot-backed gates all skip and only semgrep
+remains. Tying materialisation to the runnable set left both with no scan dir, so
+`cargo tree`, the SBOMs, `tauri info` and the entry-point probes read the
+operator's local checkout while the diffs and `MERGE_GATE.json` described the PR's
+commit, and `RUN.json` looked identical either way
+(`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). A warm `--pr` run therefore pays for one
+`git worktree` its gates do not need: a correct pack outranks a saved checkout.
+
+When the target **is** the checked-out `HEAD` and no runnable check wants a
+snapshot, nothing is materialised — there the repo root genuinely is the reviewed
+tree, and the artifact stage's fallback to `config.repo_root` is the right answer.
+The call therefore sits *outside* the dispatcher's "anything to run" guard, since
+a run with an empty runnable set is exactly the case it exists to cover.
+
+Materialising also resolves the run-wide substrate (`ledger.set_substrate`),
+which adopts the first pass's skips and cache replays off the unknown substrate
+they were necessarily recorded under. That is the quiet half of the same bug: a
+warm `--pr` run used to report its own decisions as being about no particular
+tree. The run-wide substrate is resolved with an **empty** consumable-scaffolding
+list, so it reports `snapshot` and never `snapshot-borrowed-deps` — with no
+command to name, nothing at that point can consume the linked `node_modules`; a
+command that does resolve through the link reports that for itself.
+
 The Python checks add one step on top of that symlink. `uv run` synchronises the
 project environment before executing, so a reviewed commit whose dependencies
 differ from the local branch would install into — and remove packages from — the
@@ -747,7 +781,9 @@ The ledger also **owns** the run's shared target snapshot
 dispatcher's job, but the handle lives here because the ledger outlives every
 stage: a snapshot parked in it is still on disk when artifact generation asks
 where the reviewed tree is, instead of having been dropped with the frame that
-created it.
+created it. Because the artifact stage reads it too, an off-`HEAD` target is on
+its own enough to materialise one, whether or not any gate had to run — see
+*Where checks run*.
 
 The ledger observes; it never runs, skips or caches anything itself.
 
