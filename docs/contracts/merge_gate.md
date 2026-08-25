@@ -197,6 +197,12 @@ authoritative axes — `analysis_status` (confidence) and `merge_recommendation`
 | `review_caveats` | string[] | Non-blocking caveats requiring reviewer attention |
 | `blocking_issues` | string[] | Issues that block the merge |
 
+The stored `blocking_issues` array preserves every emitted entry for schema and
+reader compatibility. Its human decision headline counts exact-string-unique
+issues in first-seen order, so two producers repeating the same text do not
+inflate `N blocking issues found`; case, whitespace, and wording are not folded
+and therefore do not redefine blocker identity.
+
 ## Verdict semantics
 
 `verdict` collapses the decision into one enum for AI consumers. It is produced

@@ -643,11 +643,17 @@ pub(crate) fn build_merge_decision_view(
         }
         MergeDecisionState::Block => {
             if !blocking_issues.is_empty() {
+                let mut seen = std::collections::HashSet::new();
+                let unique_issues: Vec<&str> = blocking_issues
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|issue| seen.insert(*issue))
+                    .collect();
                 format!(
                     "{} blocking issue{} found: {}",
-                    blocking_issues.len(),
-                    if blocking_issues.len() == 1 { "" } else { "s" },
-                    blocking_issues.join(", ")
+                    unique_issues.len(),
+                    if unique_issues.len() == 1 { "" } else { "s" },
+                    unique_issues.join(", ")
                 )
             } else if !quality_pass {
                 "Blocking policy violations detected".to_string()
@@ -1772,6 +1778,24 @@ mod tests {
             vec![],
         );
         assert_eq!(view.state, MergeDecisionState::Block);
+    }
+
+    #[test]
+    fn residual_blocking_count() {
+        let blockers = vec![
+            "Clippy (failed)".to_string(),
+            "Clippy (failed)".to_string(),
+            "clippy (failed)".to_string(),
+            "Semgrep (failed)".to_string(),
+        ];
+        let view = build_merge_decision_view(false, false, false, &[], &[], &blockers, vec![]);
+
+        assert_eq!(view.state, MergeDecisionState::Block);
+        assert_eq!(
+            view.reason,
+            "3 blocking issues found: Clippy (failed), clippy (failed), Semgrep (failed)"
+        );
+        assert_eq!(blockers.len(), 4, "the stored blocker schema is unchanged");
     }
 
     #[test]
