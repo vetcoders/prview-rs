@@ -50,6 +50,16 @@ pub struct App {
     /// status read. Recorded in `00_summary/PROVENANCE.json` so a reviewer can
     /// tell two dirty runs apart instead of only knowing "dirty".
     pub(crate) worktree_status_digest_at_start: Option<String>,
+    /// The ONE machine-wide budget for this run, and the registry of the
+    /// children it spawned.
+    ///
+    /// It lives here rather than inside `checks::run_all` because two callers
+    /// need it and neither is that function: the checks stage and the artifact
+    /// stage both put load on the same machine, so a governor scoped to one of
+    /// them would be a budget per stage — the exact thing it exists to replace.
+    /// The signal handler in `main` needs it too, and can only reach it through
+    /// something that outlives the run future.
+    governor: std::sync::Arc<governor::ResourceGovernor>,
 }
 
 impl App {
@@ -80,7 +90,14 @@ impl App {
             start_time: Instant::now(),
             worktree_clean_at_start: worktree.clean,
             worktree_status_digest_at_start: worktree.status_digest,
+            governor: std::sync::Arc::new(governor::ResourceGovernor::new()),
         })
+    }
+
+    /// This run's resource governor, for a supervisor that has to cancel it.
+    #[must_use]
+    pub fn governor(&self) -> std::sync::Arc<governor::ResourceGovernor> {
+        std::sync::Arc::clone(&self.governor)
     }
 
     /// Run the PR review process
@@ -179,9 +196,9 @@ impl App {
             if emit_human_stdout && any_skipped {
                 println!("{}", "  Skipping heavy checks (--update mode)".yellow());
             }
-            checks::run_all(&update_config, &ledger).await?
+            checks::run_all(&update_config, &ledger, &self.governor).await?
         } else {
-            checks::run_all(&self.config, &ledger).await?
+            checks::run_all(&self.config, &ledger, &self.governor).await?
         };
 
         // 6. Run heuristics (loctree-suite)

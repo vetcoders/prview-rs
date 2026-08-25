@@ -1003,6 +1003,12 @@ impl Check for CargoCheck {
         "Cargo check"
     }
 
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
+    }
+
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
         if !config.profile.has_cargo {
             return super::CheckEligibility::Skip(format!(
@@ -1073,6 +1079,12 @@ impl Check for CargoCheck {
 impl Check for ClippyCheck {
     fn name(&self) -> &str {
         "Clippy"
+    }
+
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
@@ -1189,6 +1201,12 @@ fn clippy_has_real_warnings(combined: &str) -> bool {
 impl Check for CargoTestCheck {
     fn name(&self) -> &str {
         "Cargo test"
+    }
+
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
@@ -1383,6 +1401,12 @@ impl Check for CargoAuditCheck {
         "Cargo audit"
     }
 
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
+    }
+
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
         if !config.profile.has_cargo {
             return super::CheckEligibility::Skip(format!(
@@ -1554,6 +1578,12 @@ fn count_cargo_audit_warning_items(value: &serde_json::Value) -> usize {
 impl Check for CargoGeigerCheck {
     fn name(&self) -> &str {
         "Cargo geiger"
+    }
+
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {

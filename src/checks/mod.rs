@@ -4,6 +4,7 @@
 
 use crate::cache::Cache;
 use crate::config::{Config, ProfileKind};
+use crate::governor::{Cancelled, ResourceGovernor};
 use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Output;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -394,6 +396,31 @@ pub trait Check: Send + Sync {
     fn cache_key(&self, _config: &Config) -> Option<String> {
         None
     }
+
+    /// How much of the machine this check wants, for the run's resource
+    /// governor (`crate::governor`).
+    ///
+    /// `Light` is the default because it is the safe one: mis-declaring a cheap
+    /// tool as heavy only wastes budget, while the reverse oversubscribes the
+    /// box. The checks that override it to `Heavy` are the compilers, the
+    /// whole-project linters and the test runners — each of these spawns its own
+    /// worker pool sized to the machine, so two of them at once is already twice
+    /// the machine:
+    ///
+    /// - Rust: `CargoCheck`, `ClippyCheck`, `CargoTestCheck`, `CargoAuditCheck`,
+    ///   `CargoGeigerCheck` (the last two compile the crate graph to reach it).
+    /// - JS/TS: `TypeScriptCheck`, `VitestCheck`, `ESLintCheck`.
+    /// - Security: `SemgrepCheck`, which parses every file in the tree.
+    ///
+    /// Everything else — `RustfmtCheck` and `StylelintCheck` (single-pass over
+    /// changed files), the Python gates, which run behind their own `uv sync`
+    /// pre-step — stays `Light`. The Python runners are the closest call: `Mypy`
+    /// and `Pytest` are heavy by the same rule and are deliberately left at the
+    /// default in this cut, so the first bounded run changes the scheduling of
+    /// the toolchains whose cost is already known and nothing else.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Light
+    }
 }
 
 /// The substrate a ledger entry is keyed on.
@@ -436,16 +463,165 @@ fn replay_substrates(
     )
 }
 
+/// Which runnable checks are holding budget and which are still waiting for it.
+///
+/// Before the governor these were the same set: everything runnable started at
+/// once, so one "Running:" list told the whole truth. Now a check can sit on the
+/// budget for minutes, and calling that "running" is the specific lie this board
+/// exists to prevent — both on the progress line and in the slow-notice
+/// threshold, which must measure work, not queueing.
+///
+/// Order follows the order checks were dispatched in, so the line reads the same
+/// way twice in a row.
+#[derive(Default)]
+struct RunBoard {
+    entries: Vec<BoardEntry>,
+}
+
+struct BoardEntry {
+    name: String,
+    /// When the check was admitted by the governor; `None` while it waits.
+    started_at: Option<std::time::Instant>,
+}
+
+impl RunBoard {
+    fn new<'a>(names: impl Iterator<Item = &'a str>) -> Self {
+        Self {
+            entries: names
+                .map(|name| BoardEntry {
+                    name: name.to_string(),
+                    started_at: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// The check was granted its share of the budget and its process is next.
+    fn mark_running(&mut self, name: &str, at: std::time::Instant) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.name == name) {
+            entry.started_at = Some(at);
+        }
+    }
+
+    fn finish(&mut self, name: &str) {
+        self.entries.retain(|e| e.name != name);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn names_where(&self, running: bool) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|e| e.started_at.is_some() == running)
+            .map(|e| e.name.as_str())
+            .collect()
+    }
+
+    /// How long the longest-running check has actually been RUNNING, or `None`
+    /// when everything outstanding is still queued.
+    ///
+    /// This, not the stage's wall clock, is what a "still running after Ns"
+    /// notice is about: a check that has been parked on the budget for ten
+    /// minutes has not been slow, it has not started.
+    fn longest_running_secs(&self, now: std::time::Instant) -> Option<u64> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.started_at)
+            .map(|start| now.duration_since(start).as_secs())
+            .max()
+    }
+
+    /// The progress line's payload — `None` when nothing is outstanding.
+    ///
+    /// `elapsed_secs` is the stage's wall clock, unchanged from before the
+    /// governor: it answers "how long have I been waiting for this stage", which
+    /// is the question the operator staring at the line is asking.
+    fn progress_line(&self, elapsed_secs: u64) -> Option<String> {
+        let running = self.names_where(true);
+        let queued = self.names_where(false);
+        let mut parts = Vec::new();
+        if !running.is_empty() {
+            parts.push(format!(
+                "Running: {} ({}s)",
+                running.join(", "),
+                elapsed_secs
+            ));
+        }
+        if !queued.is_empty() {
+            parts.push(format!("Queued: {}", queued.join(", ")));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
+/// The board, recovering from a poisoned lock rather than propagating it: a
+/// panicking check must not also take down the progress line of the ones still
+/// running.
+fn lock_board(board: &std::sync::Mutex<RunBoard>) -> std::sync::MutexGuard<'_, RunBoard> {
+    board
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Everything a check must keep hold of for as long as its process runs: its
+/// slice of the machine, and — for the cargo family — the `target/` write lock.
+type Admission = (
+    Option<tokio::sync::OwnedSemaphorePermit>,
+    crate::governor::GovernorPermit,
+);
+
+/// Wait for everything a check needs before its process may start, and report
+/// the instant it actually got it.
+///
+/// THE ORDER IS PART OF THE CONTRACT: the `target/` lock first, the governor's
+/// budget second, for every check that takes both. Same order everywhere is what
+/// makes a two-lock system deadlock-free; this direction is also the one that
+/// does not waste the machine. A cargo check holding Heavy permits while it
+/// queues behind another cargo check for `target/` would park half the budget on
+/// work that has not begun, starving the light checks. Taking the cargo lock
+/// first — it costs nothing but waiting — means budget is only ever held by a
+/// check that can actually proceed. There is no cycle to close in the other
+/// direction: nothing acquires the cargo lock once it holds budget.
+///
+/// The returned instant is the honest `started_at`: the ledger's queued/started
+/// split is only meaningful if "started" means the process was allowed to begin,
+/// not that its future was polled.
+async fn admit_check(
+    check: &dyn Check,
+    cargo_lock: &Arc<Semaphore>,
+    governor: &ResourceGovernor,
+    board: &std::sync::Mutex<RunBoard>,
+) -> Result<(std::time::Instant, Admission), Cancelled> {
+    let cargo_permit = if is_cargo_target_check(check.name()) {
+        Some(
+            Arc::clone(cargo_lock)
+                .acquire_owned()
+                .await
+                .expect("cargo-target semaphore never closed"),
+        )
+    } else {
+        None
+    };
+    let budget = governor.acquire(check.resource_weight()).await?;
+    let started_at = std::time::Instant::now();
+    lock_board(board).mark_running(check.name(), started_at);
+    Ok((started_at, (cargo_permit, budget)))
+}
+
 /// Run all applicable checks with caching (parallel execution, streaming output).
 pub async fn run_all(
     config: &Config,
     ledger: &TaskLedger,
+    governor: &Arc<ResourceGovernor>,
 ) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)> {
     run_all_checks(
         get_checks_for_profile(config),
         Cache::new(config),
         config,
         ledger,
+        governor,
     )
     .await
 }
@@ -457,11 +633,11 @@ async fn run_all_checks(
     cache: Cache,
     config: &Config,
     ledger: &TaskLedger,
+    governor: &Arc<ResourceGovernor>,
 ) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)> {
     use colored::Colorize;
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::io::Write;
-    use std::sync::Arc;
 
     let cache = Arc::new(cache);
     let emit = !config.json && !config.quiet;
@@ -562,13 +738,17 @@ async fn run_all_checks(
     }
 
     if !runnable_checks.is_empty() {
-        let mut remaining: Vec<String> = runnable_checks
-            .iter()
-            .map(|c| c.name().to_string())
-            .collect();
+        let board = Arc::new(std::sync::Mutex::new(RunBoard::new(
+            runnable_checks.iter().map(|c| c.name()),
+        )));
 
         if emit {
-            print!("  {} Running: {}", "●".blue(), remaining.join(", "));
+            // Nothing has been admitted yet, so everything is honestly queued.
+            print!(
+                "  {} {}",
+                "●".blue(),
+                lock_board(&board).progress_line(0).unwrap_or_default()
+            );
             let _ = std::io::stdout().flush();
         }
 
@@ -584,6 +764,7 @@ async fn run_all_checks(
         // Launch all checks in parallel, stream results as they complete.
         // Cargo checks share one target/ build lock, so they serialize on a
         // single-permit semaphore while non-cargo checks stay parallel (PV-17).
+        // The governor bounds how many of them the machine runs at once.
         let config = Arc::new(config);
         let cargo_lock = Arc::new(Semaphore::new(1));
         let mut futs: FuturesUnordered<_> = runnable_checks
@@ -592,27 +773,26 @@ async fn run_all_checks(
                 let config = Arc::clone(&config);
                 let cache = Arc::clone(&cache);
                 let cargo_lock = Arc::clone(&cargo_lock);
+                let governor = Arc::clone(governor);
+                let board = Arc::clone(&board);
                 let queued_at = std::time::Instant::now();
                 async move {
-                    let started_at = std::time::Instant::now();
-                    let _permit = if is_cargo_target_check(check.name()) {
-                        Some(
-                            cargo_lock
-                                .acquire()
-                                .await
-                                .expect("cargo-target semaphore never closed"),
-                        )
-                    } else {
-                        None
-                    };
-                    let result = execute_live_check(check, config.as_ref(), cache.as_ref()).await;
+                    let (started_at, _admission) =
+                        admit_check(check.as_ref(), &cargo_lock, &governor, &board).await?;
+                    let name = check.name().to_string();
+                    let result = crate::governor::with_child_scope(
+                        governor,
+                        &name,
+                        execute_live_check(check, config.as_ref(), cache.as_ref()),
+                    )
+                    .await;
                     record_executed_check(&result, ledger, queued_at, started_at);
-                    result
+                    Ok::<CheckResult, Cancelled>(result)
                 }
             })
             .collect();
 
-        // Elapsed timer — ticks every second on the "Running" line
+        // Elapsed timer — ticks every second on the progress line
         let start = std::time::Instant::now();
         let mut timer = tokio::time::interval(tokio::time::Duration::from_secs(1));
         timer.tick().await; // consume immediate first tick
@@ -629,11 +809,11 @@ async fn run_all_checks(
                 biased;
 
                 Some(result) = futs.next() => {
-                    // Remove completed check from remaining list
-                    remaining.retain(|n| n != &result.name);
+                    let result = result?;
+                    lock_board(&board).finish(&result.name);
 
                     if emit {
-                        // Clear the "Running" line and print the result
+                        // Clear the progress line and print the result
                         print!("\r\x1b[2K");
                         let status_str = format_status(result.status);
                         println!(
@@ -643,33 +823,36 @@ async fn run_all_checks(
                             result.duration.as_secs_f32(),
                         );
 
-                        // Show updated "Running" line if checks remain
-                        if !remaining.is_empty() {
-                            let elapsed = start.elapsed().as_secs();
-                            print!(
-                                "  {} Running: {} ({}s)",
-                                "●".blue(),
-                                remaining.join(", "),
-                                elapsed
-                            );
+                        // Show the updated progress line if checks remain
+                        if let Some(line) =
+                            lock_board(&board).progress_line(start.elapsed().as_secs())
+                        {
+                            print!("  {} {}", "●".blue(), line);
                             let _ = std::io::stdout().flush();
                         }
                     }
 
+                    let done = lock_board(&board).is_empty();
                     results.push(result);
 
-                    if remaining.is_empty() {
+                    if done {
                         break;
                     }
                 }
 
-                _ = timer.tick(), if emit && !remaining.is_empty() => {
+                _ = timer.tick(), if emit && !lock_board(&board).is_empty() => {
+                    let now = std::time::Instant::now();
                     let elapsed = start.elapsed().as_secs();
-                    // PV-18: when a run crosses a soft threshold, print a
-                    // one-time note naming what's still running and how to bail.
-                    // We inform, we do not abort — the checks own their timeouts.
+                    let board = lock_board(&board);
+                    // PV-18: when a check has been RUNNING past a soft threshold,
+                    // print a one-time note naming it and how to bail. Measured
+                    // from admission, not from enqueue: a check still waiting for
+                    // the budget is not slow, and saying so would blame the tool
+                    // for the queue. We inform, we do not abort — the checks own
+                    // their timeouts.
+                    let running_secs = board.longest_running_secs(now).unwrap_or(0);
                     if next_slow_notice < SLOW_NOTICE_THRESHOLDS_SECS.len()
-                        && elapsed >= SLOW_NOTICE_THRESHOLDS_SECS[next_slow_notice]
+                        && running_secs >= SLOW_NOTICE_THRESHOLDS_SECS[next_slow_notice]
                     {
                         next_slow_notice += 1;
                         println!(
@@ -677,18 +860,15 @@ async fn run_all_checks(
                              the whole workspace and can take several minutes (each has its \
                              own timeout). Press Ctrl-C to abort.",
                             "ℹ".cyan(),
-                            elapsed,
-                            remaining.join(", "),
+                            running_secs,
+                            board.names_where(true).join(", "),
                         );
                     }
-                    // Update elapsed time on the "Running" line
-                    print!(
-                        "\r\x1b[2K  {} Running: {} ({}s)",
-                        "●".blue(),
-                        remaining.join(", "),
-                        elapsed
-                    );
-                    let _ = std::io::stdout().flush();
+                    // Update elapsed time on the progress line
+                    if let Some(line) = board.progress_line(elapsed) {
+                        print!("\r\x1b[2K  {} {}", "●".blue(), line);
+                        let _ = std::io::stdout().flush();
+                    }
                 }
             }
         }
@@ -707,15 +887,32 @@ pub type CheckEventCallback = Box<dyn Fn(CheckEvent) + Send + Sync>;
 /// Events emitted during check execution
 #[derive(Debug, Clone)]
 pub enum CheckEvent {
-    Started { name: String },
-    Completed { result: Box<CheckResult> },
-    Skipped { name: String },
+    /// The check entered the execution set. It is not necessarily running: the
+    /// resource governor may hold it in the queue for as long as the machine is
+    /// busy. `Running` is what says the process was allowed to start.
+    Started {
+        name: String,
+    },
+    /// The governor admitted the check and its process is beginning.
+    ///
+    /// Added rather than folded into `Started` so a consumer that only wants
+    /// "the run considered this check" keeps the event it already had.
+    Running {
+        name: String,
+    },
+    Completed {
+        result: Box<CheckResult>,
+    },
+    Skipped {
+        name: String,
+    },
 }
 
 /// Run all applicable checks with event callbacks (for TUI mode)
 pub async fn run_all_with_events<F>(
     config: &Config,
     ledger: &TaskLedger,
+    governor: &Arc<ResourceGovernor>,
     on_event: F,
 ) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)>
 where
@@ -789,7 +986,6 @@ where
     // Second pass: run checks in parallel, fire events as they complete.
     {
         use futures::stream::{FuturesUnordered, StreamExt};
-        use std::sync::Arc;
 
         for check in &runnable_checks {
             on_event(CheckEvent::Started {
@@ -806,34 +1002,42 @@ where
         let cache = Arc::new(cache);
         // Cargo checks share one target/ build lock, so they serialize on a
         // single-permit semaphore while non-cargo checks stay parallel (PV-17).
+        // The governor bounds how many of them the machine runs at once; see
+        // `admit_check` for why the two are taken in that order.
         let cargo_lock = Arc::new(Semaphore::new(1));
+        let board = Arc::new(std::sync::Mutex::new(RunBoard::new(
+            runnable_checks.iter().map(|c| c.name()),
+        )));
+        let on_event = &on_event;
         let mut futs: FuturesUnordered<_> = runnable_checks
             .into_iter()
             .map(|check| {
                 let config = Arc::clone(&config);
                 let cache = Arc::clone(&cache);
                 let cargo_lock = Arc::clone(&cargo_lock);
+                let governor = Arc::clone(governor);
+                let board = Arc::clone(&board);
                 let queued_at = std::time::Instant::now();
                 async move {
-                    let started_at = std::time::Instant::now();
-                    let _permit = if is_cargo_target_check(check.name()) {
-                        Some(
-                            cargo_lock
-                                .acquire()
-                                .await
-                                .expect("cargo-target semaphore never closed"),
-                        )
-                    } else {
-                        None
-                    };
-                    let result = execute_live_check(check, config.as_ref(), cache.as_ref()).await;
+                    let (started_at, _admission) =
+                        admit_check(check.as_ref(), &cargo_lock, &governor, &board).await?;
+                    let name = check.name().to_string();
+                    on_event(CheckEvent::Running { name: name.clone() });
+                    let result = crate::governor::with_child_scope(
+                        governor,
+                        &name,
+                        execute_live_check(check, config.as_ref(), cache.as_ref()),
+                    )
+                    .await;
                     record_executed_check(&result, ledger, queued_at, started_at);
-                    result
+                    Ok::<CheckResult, Cancelled>(result)
                 }
             })
             .collect();
 
         while let Some(result) = futs.next().await {
+            let result = result?;
+            lock_board(&board).finish(&result.name);
             on_event(CheckEvent::Completed {
                 result: Box::new(result.clone()),
             });
@@ -977,9 +1181,9 @@ fn errored_check_provenance(
 /// says it read.
 ///
 /// `queued_at` is when the check entered the execution set and `started_at` when
-/// its future first ran; today those differ only by scheduling latency, because
-/// nothing yet holds a check back from starting. A governor that does will make
-/// the split meaningful without moving these call sites.
+/// the resource governor admitted it — the gap between them is time the check
+/// spent waiting for the machine, which is exactly the fact a reader comparing
+/// two runs of the same gate needs and cannot reconstruct from the duration.
 fn record_executed_check(
     result: &CheckResult,
     ledger: &TaskLedger,
@@ -2932,7 +3136,8 @@ test result: ok. 2 passed; 0 failed
         ];
 
         let ledger = TaskLedger::new();
-        let (results, skipped) = run_all_checks(checks, cache, &config, &ledger)
+        let governor = Arc::new(ResourceGovernor::new());
+        let (results, skipped) = run_all_checks(checks, cache, &config, &ledger, &governor)
             .await
             .expect("run_all_checks");
 
@@ -2994,6 +3199,184 @@ test result: ok. 2 passed; 0 failed
         assert!(
             skipped_entry.queued_at.is_none() && skipped_entry.started_at.is_none(),
             "a check that never entered the queue has no queue timestamps"
+        );
+    }
+
+    /// The point of the governor: however many heavy gates a profile enables,
+    /// the number of them ON THE MACHINE at once never exceeds the budget. Uses
+    /// sleeping mocks rather than real toolchains — what is under test is the
+    /// dispatcher's admission, not any tool.
+    #[tokio::test]
+    async fn heavy_checks_never_exceed_the_budget() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct HeavyMock {
+            name: &'static str,
+            live: Arc<AtomicU32>,
+            peak: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl Check for HeavyMock {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> crate::governor::Weight {
+                crate::governor::Weight::Heavy
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(live, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                Ok(CheckResult {
+                    name: self.name.to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_millis(30),
+                    output: String::new(),
+                    cached: false,
+                    provenance: None,
+                })
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+
+        let live = Arc::new(AtomicU32::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        // Budget 6, heavy 3 — two heavy checks fit, a third must wait. Names are
+        // deliberately not cargo names, so the target/ lock is not what bounds
+        // them and the governor is the only thing under test.
+        let names = ["Mock A", "Mock B", "Mock C", "Mock D", "Mock E"];
+        let checks: Vec<Box<dyn Check>> = names
+            .into_iter()
+            .map(|name| {
+                Box::new(HeavyMock {
+                    name,
+                    live: Arc::clone(&live),
+                    peak: Arc::clone(&peak),
+                }) as Box<dyn Check>
+            })
+            .collect();
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::with_budget(6, 3));
+        let (results, _skipped) = run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect("run_all_checks");
+
+        assert_eq!(results.len(), names.len(), "every mock check reports");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "a budget of 6 with heavy=3 admits exactly two heavy checks at a time",
+        );
+        assert_eq!(live.load(Ordering::SeqCst), 0, "nothing is left running");
+    }
+
+    /// A check that has not been admitted is QUEUED, and the progress line has
+    /// to say so. Reporting it as running is the lie the split exists to stop:
+    /// the operator reads "Running: Clippy" and concludes clippy is slow, when
+    /// clippy has not started.
+    #[tokio::test]
+    async fn a_check_waiting_for_the_budget_is_queued_not_running() {
+        use async_trait::async_trait;
+
+        struct HeavyMock;
+
+        #[async_trait]
+        impl Check for HeavyMock {
+            fn name(&self) -> &str {
+                "Waiting"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> crate::governor::Weight {
+                crate::governor::Weight::Heavy
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                unreachable!("never admitted")
+            }
+        }
+
+        let governor = Arc::new(ResourceGovernor::with_budget(2, 2));
+        let cargo_lock = Arc::new(Semaphore::new(1));
+        let board = Arc::new(std::sync::Mutex::new(RunBoard::new(
+            ["Admitted", "Waiting"].into_iter(),
+        )));
+
+        // Somebody else already holds the whole budget.
+        let hog = governor
+            .acquire(crate::governor::Weight::Heavy)
+            .await
+            .expect("budget");
+        lock_board(&board).mark_running("Admitted", std::time::Instant::now());
+
+        let waiter = {
+            let governor = Arc::clone(&governor);
+            let cargo_lock = Arc::clone(&cargo_lock);
+            let board = Arc::clone(&board);
+            tokio::spawn(
+                async move { admit_check(&HeavyMock, &cargo_lock, &governor, &board).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        {
+            let board = lock_board(&board);
+            assert_eq!(board.names_where(true), vec!["Admitted"]);
+            assert_eq!(board.names_where(false), vec!["Waiting"]);
+            let line = board
+                .progress_line(12)
+                .expect("two outstanding checks produce a line");
+            assert_eq!(line, "Running: Admitted (12s) · Queued: Waiting");
+        }
+
+        drop(hog);
+        waiter
+            .await
+            .expect("waiter must not panic")
+            .expect("a released permit admits the queued check");
+        assert_eq!(
+            lock_board(&board).names_where(false),
+            Vec::<&str>::new(),
+            "an admitted check leaves the queue",
+        );
+    }
+
+    /// The slow notice is about work, not about waiting. A check parked on the
+    /// budget for an hour has not been slow — it has not begun — and naming it
+    /// in "still running after Ns" would blame the tool for the queue.
+    #[test]
+    fn the_slow_notice_clock_ignores_queued_checks() {
+        let now = std::time::Instant::now();
+        let mut board = RunBoard::new(["Queued only"].into_iter());
+        assert_eq!(
+            board.longest_running_secs(now),
+            None,
+            "nothing admitted, so nothing has been running for any time at all",
+        );
+        assert_eq!(
+            board.progress_line(90).as_deref(),
+            Some("Queued: Queued only"),
+            "a line with nothing admitted claims nothing is running",
+        );
+
+        board.mark_running("Queued only", now - Duration::from_secs(61));
+        assert_eq!(
+            board.longest_running_secs(now),
+            Some(61),
+            "the clock starts at admission",
         );
     }
 

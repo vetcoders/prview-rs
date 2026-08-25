@@ -13,13 +13,13 @@
 //! registry of live child processes, so one [`ResourceGovernor::cancel`] takes
 //! the whole run down instead of leaving orphaned toolchains behind.
 //!
-//! This module is the primitive only. Nothing in the run acquires from it yet —
-//! wiring the dispatcher is a separate change, so the budget can be reviewed on
-//! its own before it starts shaping when checks run.
+//! The checks stage acquires from it per check ([`crate::checks::run_all`]) and
+//! every child it spawns registers itself here through [`with_child_scope`], so the
+//! budget shapes when work starts and cancellation reaches what already did.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -249,6 +249,99 @@ fn heavy_cost_for(total_budget: u32) -> u32 {
     total_budget.div_ceil(2).max(1)
 }
 
+tokio::task_local! {
+    /// The governor the currently-running task's children belong to.
+    ///
+    /// A task-local rather than an argument because of where the two halves of
+    /// this fact live. The governor is known at the DISPATCHER — one per run,
+    /// held by [`crate::App`]. The pid is known at the single spawn point,
+    /// [`crate::proc::run_capture_with_timeout`], five frames below it behind
+    /// `Check::run(&self, config)`: a trait method the checks stage does not get
+    /// to add parameters to without every check and all twenty-odd
+    /// `run_command_*` call sites growing a governor argument they never read.
+    ///
+    /// The scope is established per check future and the checks are polled by
+    /// one task, so each sees its own value and no other's — a `tokio::spawn`
+    /// inside a check would NOT inherit it, which is why the checks stage keeps
+    /// its concurrency in `FuturesUnordered` rather than spawned tasks.
+    static CHILD_SCOPE: ChildScope;
+}
+
+/// Which run, and under whose name, a child spawned by the current task belongs.
+#[derive(Clone)]
+struct ChildScope {
+    governor: Arc<ResourceGovernor>,
+    label: Arc<str>,
+}
+
+/// Distinguishes concurrent children of ONE labelled task.
+///
+/// The registry is a map, so two children registered under the same key would
+/// collide: the second would evict the first from the kill list, and the first
+/// to exit would then unregister the second. A check that runs `cargo metadata`
+/// beside its main command is exactly that case.
+static CHILD_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Run `future` with its spawned children attributed to `governor` under `label`.
+///
+/// Outside such a scope [`register_active_child`] is a no-op, which is the
+/// correct behaviour for the process-spawning helpers the run also calls outside
+/// the checks stage (the `uv sync` pre-step, the MCP adapter): they are not part
+/// of a governed run and must not be killed as if they were.
+pub async fn with_child_scope<F>(
+    governor: Arc<ResourceGovernor>,
+    label: &str,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    CHILD_SCOPE
+        .scope(
+            ChildScope {
+                governor,
+                label: Arc::from(label),
+            },
+            future,
+        )
+        .await
+}
+
+/// Register `pid` with the governor of the enclosing [`with_child_scope`], if any.
+///
+/// The returned guard unregisters on drop, so the success, timeout and spawn-error
+/// paths all forget the pid without any of them remembering to — a pid the
+/// governor still believes in is a pid it may signal, and pids are reused.
+#[must_use]
+pub fn register_active_child(pid: u32) -> Option<ChildRegistration> {
+    CHILD_SCOPE
+        .try_with(|scope| {
+            let key = format!(
+                "{}#{}",
+                scope.label,
+                CHILD_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            scope.governor.register_child(key.clone(), pid);
+            ChildRegistration {
+                governor: Arc::clone(&scope.governor),
+                key,
+            }
+        })
+        .ok()
+}
+
+/// A live registration in the governor's child registry, released on drop.
+pub struct ChildRegistration {
+    governor: Arc<ResourceGovernor>,
+    key: String,
+}
+
+impl Drop for ChildRegistration {
+    fn drop(&mut self) {
+        self.governor.unregister_child(&self.key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +533,41 @@ mod tests {
         assert_eq!(governor.inflight_count(), 1);
         governor.unregister_child("nobody spawned this");
         assert_eq!(governor.inflight_count(), 1);
+    }
+
+    /// The scope is what makes `register_active_child` safe to call from the
+    /// one shared spawn helper: outside a governed run it registers nothing, and
+    /// inside one it must not let a check's second child evict its first.
+    #[tokio::test]
+    async fn children_register_only_inside_a_scope() {
+        let governor = Arc::new(ResourceGovernor::with_budget(2, 1));
+
+        assert!(
+            register_active_child(4242).is_none(),
+            "the MCP adapter and the uv pre-step spawn outside any run scope",
+        );
+        assert_eq!(governor.inflight_count(), 0);
+
+        let inner = Arc::clone(&governor);
+        with_child_scope(Arc::clone(&governor), "Clippy", async move {
+            let first = register_active_child(4242).expect("inside a scope");
+            let second = register_active_child(4243).expect("a second child of one check");
+            assert_eq!(
+                inner.inflight_count(),
+                2,
+                "two concurrent children of one check must not share a key",
+            );
+            drop(second);
+            assert_eq!(inner.inflight_count(), 1);
+            drop(first);
+        })
+        .await;
+
+        assert_eq!(
+            governor.inflight_count(),
+            0,
+            "leaving the scope leaves no pid the governor may signal",
+        );
     }
 
     /// Cancelling twice must be safe. Deliberately registers NOTHING: a test

@@ -46,6 +46,12 @@ pub fn harden(cmd: &mut TokioCommand) {
 /// child) and, on unix, the whole process group is SIGKILLed so grandchildren
 /// die too; the returned error is `on_timeout()`. `label` names the tool in the
 /// spawn/wait error messages.
+///
+/// This is the one place a check's external tool is spawned, so it is also where
+/// the pid is handed to the run's resource governor
+/// ([`crate::governor::with_child_scope`]) — that is what lets one Ctrl-C reach a
+/// `cargo` → `rustc` → `cc` tree instead of leaving it behind. Outside a
+/// governed scope the registration is a no-op.
 pub async fn run_capture_with_timeout(
     mut cmd: TokioCommand,
     timeout: Duration,
@@ -64,6 +70,10 @@ pub async fn run_capture_with_timeout(
     // the handle moves into wait_with_output(); needed to signal the group.
     #[cfg(unix)]
     let pid = child.id();
+
+    // Held for the whole wait: dropping it unregisters, so the success, timeout
+    // and wait-error paths all leave the registry clean without saying so.
+    let _registration = child.id().and_then(crate::governor::register_active_child);
 
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(result) => result.map_err(|e| anyhow::anyhow!("failed to run {label}: {e}")),
