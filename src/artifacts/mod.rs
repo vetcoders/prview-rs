@@ -737,7 +737,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let context_command_timings = generate_context_artifacts(
         config,
         &context_scan_root,
-        &all_checks,
+        ledger,
         &context_dir,
         emit_human_stdout,
         &context_artifacts,

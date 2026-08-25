@@ -1,6 +1,130 @@
 //! Context generator planning and parallel execution (loctree/tsc-trace/tauri info).
 
 use super::*;
+use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
+
+/// The substrate a context command reading `scan_root` would report, resolved
+/// exactly the way the matching check resolves its own provenance.
+///
+/// Same function, same consumable set: a `tsc` trace reads `node_modules` for
+/// the same reason the TypeScript gate does, so both must land on one
+/// `TreeState`. Resolving it any other way (say, with an empty consumable set)
+/// would make the artifact claim `snapshot` where the gate reported
+/// `snapshot-borrowed-deps` — two ledger tasks for one piece of work, and the
+/// dedup would miss exactly the case it exists for.
+fn context_substrate(check_name: &str, scan_root: &Path, repo_root: &Path) -> SubstrateKey {
+    crate::checks::resolve_scan_substrate(
+        scan_root,
+        repo_root,
+        crate::checks::consumable_scaffolding(check_name),
+    )
+    .into()
+}
+
+/// What the checks stage already resolved for a tool the context stage is about
+/// to run itself.
+#[derive(Debug, PartialEq, Eq)]
+enum GateCoverage {
+    /// A gate for this tool executed, or replayed a stored result, on this
+    /// substrate. The signal exists; running the tool again buys nothing.
+    Covered { origin: SubstrateKey },
+    /// A gate for this tool was configured and deliberately ruled out — a preset
+    /// that excludes it, a disabled flag, a tool the environment lacks. The
+    /// missing signal is a decision, not a gap.
+    RuledOut { reason: String },
+    /// This run holds no gate for the tool at all, so nothing was decided about
+    /// it and the context artifact is the only place its signal can come from.
+    Uncovered,
+}
+
+fn gate_coverage(ledger: &TaskLedger, check_name: &str, substrate: &SubstrateKey) -> GateCoverage {
+    let Some(entry) = ledger.lookup_tool(check_name, substrate) else {
+        return GateCoverage::Uncovered;
+    };
+    match entry.state {
+        // A gate that executed paid the cost already, whatever it concluded:
+        // a failing or erroring run is still a run, and repeating it here would
+        // buy the same answer twice.
+        TaskState::Run { .. } => GateCoverage::Covered {
+            origin: entry.key.substrate,
+        },
+        TaskState::Cached { origin, .. } => GateCoverage::Covered { origin },
+        TaskState::Skipped { reason } | TaskState::NotApplicable { reason } => {
+            GateCoverage::RuledOut { reason }
+        }
+    }
+}
+
+/// Whether the context stage runs a tool itself, and — when it does not — the
+/// reason, already recorded in the ledger.
+enum ContextToolPlan {
+    Run,
+    Skip { reason: String },
+}
+
+/// Decide whether the context stage compensates for a missing gate result, and
+/// record WHY when it does not.
+///
+/// The old rule was "the checks list holds no result for this tool, so run it",
+/// which reads a deliberate exclusion as a gap: a fast remote-only preset rules
+/// ESLint out precisely to avoid a full-tree lint, and the context stage then
+/// spent 23 s doing exactly that (`PRV-CONTEXT-WORK-DEDUP`). Absence of a result
+/// is not absence of a decision — the ledger holds the decision, so it decides.
+///
+/// `runnable` is the context stage's own answer, on the tree it would actually
+/// read, to "could this tool run here at all". It picks the ledger state for a
+/// tool that will not run: `Skipped` says this run chose not to, which another
+/// preset would undo; `NotApplicable` says this environment could not, which no
+/// switch would. The gate states its reason but not its class, and re-deriving
+/// the class from the reason text would just couple two modules through a
+/// string.
+fn plan_context_tool(
+    ledger: &TaskLedger,
+    check_name: &str,
+    substrate: &SubstrateKey,
+    runnable: bool,
+) -> ContextToolPlan {
+    let state = match gate_coverage(ledger, check_name, substrate) {
+        GateCoverage::Covered { origin } => TaskState::Cached {
+            cache_age_secs: None,
+            origin,
+        },
+        GateCoverage::RuledOut { reason } if runnable => TaskState::Skipped { reason },
+        GateCoverage::RuledOut { reason } => TaskState::NotApplicable { reason },
+        GateCoverage::Uncovered if runnable => return ContextToolPlan::Run,
+        GateCoverage::Uncovered => TaskState::NotApplicable {
+            reason: format!(
+                "no {check_name} gate in this run and no runnable tool in the reviewed tree"
+            ),
+        },
+    };
+
+    let reason = match &state {
+        TaskState::Cached { .. } => {
+            format!("the {check_name} gate already produced this signal for the reviewed tree")
+        }
+        TaskState::Skipped { reason } | TaskState::NotApplicable { reason } => reason.clone(),
+        TaskState::Run { .. } => unreachable!("a plan that runs returns before recording"),
+    };
+
+    ledger.record(TaskEntry {
+        key: TaskKey::new(check_name, substrate.clone()),
+        kind: TaskKind::ContextArtifact,
+        state,
+        queued_at: None,
+        started_at: None,
+    });
+
+    ContextToolPlan::Skip { reason }
+}
+
+/// One-line note that a context artifact was not produced, and why.
+fn announce_skip(emit: bool, artifact: &str, reason: &str) {
+    if emit {
+        use colored::Colorize;
+        println!("  {} {artifact}: skipped ({reason})", "ℹ".blue());
+    }
+}
 
 /// `scan_root` is the reviewed tree — see [`plan_context_cmds`]. A decision
 /// recorded here says whether an artifact WILL be produced, so it must be taken
@@ -310,7 +434,7 @@ fn js_exec_cmd(
 pub(super) fn generate_context_artifacts(
     config: &Config,
     scan_root: &Path,
-    checks: &[CheckResult],
+    ledger: &TaskLedger,
     context_dir: &Path,
     emit_human_stdout: bool,
     decisions: &[ContextArtifactDecision],
@@ -318,7 +442,7 @@ pub(super) fn generate_context_artifacts(
     let cmds = plan_context_cmds(
         config,
         scan_root,
-        checks,
+        ledger,
         context_dir,
         emit_human_stdout,
         decisions,
@@ -352,10 +476,17 @@ pub(super) fn generate_context_artifacts(
 /// availability from the local tree while running the tool against the snapshot
 /// would reintroduce the same mixing in a smaller form, so the probes move with
 /// the cwd.
+///
+/// `ledger` is the single source of truth for "did a gate already do this work",
+/// replacing the `checks_ran_*` booleans this function used to derive from the
+/// results list. The results list can only report what SUCCEEDED in reaching a
+/// result; the ledger also reports what was deliberately ruled out, which is the
+/// half that decides whether compensating here is help or duplicated cost
+/// (`PRV-CONTEXT-WORK-DEDUP`).
 fn plan_context_cmds(
     config: &Config,
     scan_root: &Path,
-    checks: &[CheckResult],
+    ledger: &TaskLedger,
     context_dir: &Path,
     emit_human_stdout: bool,
     decisions: &[ContextArtifactDecision],
@@ -490,32 +621,29 @@ fn plan_context_cmds(
             out_file: "npm-sbom.txt".into(),
         });
 
-        let checks_ran_eslint = checks
-            .iter()
-            .any(|c| c.name.to_lowercase().contains("eslint"));
-        let checks_ran_stylelint = checks
-            .iter()
-            .any(|c| c.name.to_lowercase().contains("stylelint"));
-        let checks_ran_vitest = checks
-            .iter()
-            .any(|c| c.name.to_lowercase().contains("vitest"));
-
-        if !checks_ran_eslint {
-            // Resolve a directly-runnable eslint binary; skip the artifact when
-            // none is available rather than reaching npx --no-install, which can
-            // hang on a missing CLI (PR #12 review).
-            if let Some((cmd, args)) = js_exec_cmd(
-                "eslint",
-                vec![
-                    ".".into(),
-                    "--ext".into(),
-                    ".ts,.tsx,.js,.jsx".into(),
-                    "-f".into(),
-                    "json".into(),
-                ],
-                &scan_root,
-                has_pnpm,
-            ) {
+        // Resolve a directly-runnable eslint binary; skip the artifact when
+        // none is available rather than reaching npx --no-install, which can
+        // hang on a missing CLI (PR #12 review).
+        let eslint = js_exec_cmd(
+            "eslint",
+            vec![
+                ".".into(),
+                "--ext".into(),
+                ".ts,.tsx,.js,.jsx".into(),
+                "-f".into(),
+                "json".into(),
+            ],
+            &scan_root,
+            has_pnpm,
+        );
+        match plan_context_tool(
+            ledger,
+            "ESLint",
+            &context_substrate("ESLint", &scan_root, &config.repo_root),
+            eslint.is_some(),
+        ) {
+            ContextToolPlan::Run => {
+                let (cmd, args) = eslint.expect("a runnable plan resolved a command");
                 cmds.push(ContextCmd {
                     label: "eslint json".into(),
                     cmd,
@@ -525,33 +653,55 @@ fn plan_context_cmds(
                     out_file: "eslint.json".into(),
                 });
             }
+            ContextToolPlan::Skip { reason } => {
+                announce_skip(emit_human_stdout, "eslint.json", &reason);
+            }
         }
 
-        if scan_root.join("node_modules/.bin/stylelint").exists() && !checks_ran_stylelint {
-            cmds.push(ContextCmd {
-                label: "stylelint json".into(),
-                cmd: "sh".into(),
-                args: vec![
-                    "-c".into(),
-                    "pnpm exec stylelint 'src/**/*.css' -f json --allow-empty-input".into(),
-                ],
-                cwd: scan_root.clone(),
-                out_dir: ctx.clone(),
-                out_file: "stylelint.json".into(),
-            });
-        } else if checks_ran_stylelint && emit_human_stdout {
-            use colored::Colorize;
-            println!(
-                "  {} stylelint.json: skipped (stylelint check already captured this signal)",
-                "ℹ".blue()
-            );
+        // Stylelint resolves through a shell so its glob is expanded by the
+        // tool, so its availability probe is the local binary itself rather
+        // than js_exec_cmd's.
+        let stylelint_available = scan_root.join("node_modules/.bin/stylelint").exists();
+        match plan_context_tool(
+            ledger,
+            "Stylelint",
+            &context_substrate("Stylelint", &scan_root, &config.repo_root),
+            stylelint_available,
+        ) {
+            ContextToolPlan::Run => {
+                cmds.push(ContextCmd {
+                    label: "stylelint json".into(),
+                    cmd: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "pnpm exec stylelint 'src/**/*.css' -f json --allow-empty-input".into(),
+                    ],
+                    cwd: scan_root.clone(),
+                    out_dir: ctx.clone(),
+                    out_file: "stylelint.json".into(),
+                });
+            }
+            ContextToolPlan::Skip { reason } => {
+                announce_skip(emit_human_stdout, "stylelint.json", &reason);
+            }
         }
 
-        if !checks_ran_vitest && emit_human_stdout {
-            use colored::Colorize;
-            println!(
-                "  {} vitest-report.json: skipped (use checks for test results)",
-                "ℹ".blue()
+        // Vitest is the one tool the context stage never compensates for: test
+        // results come from the gate or not at all. There is no command to plan
+        // and so no decision to record — only a note when the gate did not
+        // deliver them.
+        if !matches!(
+            gate_coverage(
+                ledger,
+                "Vitest",
+                &context_substrate("Vitest", &scan_root, &config.repo_root),
+            ),
+            GateCoverage::Covered { .. }
+        ) {
+            announce_skip(
+                emit_human_stdout,
+                "vitest-report.json",
+                "use checks for test results",
             );
         }
 
@@ -842,12 +992,13 @@ pub(super) fn truncate_on_char_boundary(input: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextCmd, js_exec_cmd, plan_context_cmds, tauri_info_cmd};
+    use super::{ContextCmd, context_substrate, js_exec_cmd, plan_context_cmds, tauri_info_cmd};
     use crate::config::{Config, test_config, test_js_profile};
     use crate::git::cmd::git_cmd;
-    use crate::ledger::TaskLedger;
+    use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     /// A JS repo whose checked-out `HEAD` is NOT the reviewed target.
     ///
@@ -913,8 +1064,44 @@ mod tests {
         config
     }
 
-    fn plan(config: &Config, scan_root: &Path, ctx: &Path) -> Vec<ContextCmd> {
-        plan_context_cmds(config, scan_root, &[], ctx, false, &[])
+    fn plan(config: &Config, scan_root: &Path, ledger: &TaskLedger, ctx: &Path) -> Vec<ContextCmd> {
+        plan_context_cmds(config, scan_root, ledger, ctx, false, &[])
+    }
+
+    /// A gate outcome recorded the way `checks::run_all` records it: an
+    /// eligibility skip lands in the first pass under an unknown substrate,
+    /// an execution lands under the substrate its own provenance named.
+    fn record_gate(ledger: &TaskLedger, check: &str, substrate: SubstrateKey, state: TaskState) {
+        ledger.record(TaskEntry {
+            key: TaskKey::new(check, substrate),
+            kind: TaskKind::Check,
+            state,
+            queued_at: None,
+            started_at: None,
+        });
+    }
+
+    fn planned(cmds: &[ContextCmd], label: &str) -> bool {
+        cmds.iter().any(|cmd| cmd.label == label)
+    }
+
+    fn context_entry(ledger: &TaskLedger, check: &str, root: &Path) -> TaskEntry {
+        let entry = ledger
+            .lookup_tool(check, &context_substrate(check, root, root))
+            .unwrap_or_else(|| panic!("{check} must leave a decision in the ledger"));
+        assert_eq!(
+            entry.kind,
+            TaskKind::ContextArtifact,
+            "the context stage's own decision must be the latest word on {check}",
+        );
+        entry
+    }
+
+    fn reason_of(state: &TaskState) -> &str {
+        match state {
+            TaskState::Skipped { reason } | TaskState::NotApplicable { reason } => reason,
+            other => panic!("expected a ruled-out state, got {other:?}"),
+        }
     }
 
     fn esbuild_entry(cmds: &[ContextCmd]) -> String {
@@ -942,7 +1129,7 @@ mod tests {
         ledger.set_shared_snapshot(Some(snapshot));
 
         let scan_root = ledger.scan_dir().expect("the ledger owns the snapshot");
-        let cmds = plan(&config, &scan_root, ctx.path());
+        let cmds = plan(&config, &scan_root, &ledger, ctx.path());
 
         assert!(
             !cmds.is_empty(),
@@ -990,7 +1177,7 @@ mod tests {
             .scan_dir()
             .unwrap_or_else(|| config.repo_root.clone());
 
-        let cmds = plan(&config, &scan_root, ctx.path());
+        let cmds = plan(&config, &scan_root, &ledger, ctx.path());
 
         assert_eq!(scan_root, config.repo_root);
         for cmd in &cmds {
@@ -1004,6 +1191,171 @@ mod tests {
             esbuild_entry(&cmds),
             "src/main.ts",
             "a local review reads the working tree, which entries through main.ts",
+        );
+    }
+
+    /// PRV-CONTEXT-WORK-DEDUP, the inverted compensation. A fast remote-only
+    /// preset rules the lint gate out ON PURPOSE — to avoid a full-tree lint —
+    /// and the context stage used to read the resulting hole in the results list
+    /// as "nobody linted this, better do it myself", spending 23 s on exactly
+    /// the work the preset had excluded.
+    #[test]
+    fn a_gate_the_preset_ruled_out_is_not_compensated_for() {
+        let (repo, _target) = js_repo_with_off_head_target();
+        let config = js_config(repo.path());
+        let ctx = tempfile::tempdir().expect("context dir");
+
+        let ledger = TaskLedger::new();
+        record_gate(
+            &ledger,
+            "ESLint",
+            // An eligibility skip is recorded before the run resolves its
+            // substrate, so it really does land under an unknown one.
+            SubstrateKey::default(),
+            TaskState::Skipped {
+                reason: "fast remote-only preset".to_string(),
+            },
+        );
+
+        let cmds = plan(&config, repo.path(), &ledger, ctx.path());
+
+        assert!(
+            !planned(&cmds, "eslint json"),
+            "the preset excluded the lint; the context stage must not reinstate it",
+        );
+        let entry = context_entry(&ledger, "ESLint", repo.path());
+        assert!(
+            matches!(entry.state, TaskState::Skipped { .. }),
+            "the tree can run eslint; this run chose not to, got {:?}",
+            entry.state,
+        );
+        assert!(
+            reason_of(&entry.state).contains("fast remote-only preset"),
+            "the ledger must carry the gate's own reason, got {:?}",
+            entry.state,
+        );
+    }
+
+    /// The environmental half of the same decision: a tool the reviewed tree
+    /// cannot run is `NotApplicable` — no preset would produce this artifact
+    /// here — while a configuration exclusion stays `Skipped`.
+    #[test]
+    fn a_tool_missing_from_the_reviewed_tree_is_not_applicable() {
+        let (repo, _target) = js_repo_with_off_head_target();
+        fs::remove_file(repo.path().join("node_modules/.bin/stylelint")).expect("drop stylelint");
+        let config = js_config(repo.path());
+        let ctx = tempfile::tempdir().expect("context dir");
+
+        let ledger = TaskLedger::new();
+        record_gate(
+            &ledger,
+            "Stylelint",
+            SubstrateKey::default(),
+            TaskState::Skipped {
+                reason: "tool not installed (node_modules/.bin/stylelint is missing)".to_string(),
+            },
+        );
+
+        let cmds = plan(&config, repo.path(), &ledger, ctx.path());
+
+        assert!(!planned(&cmds, "stylelint json"));
+        let entry = context_entry(&ledger, "Stylelint", repo.path());
+        assert!(
+            matches!(entry.state, TaskState::NotApplicable { .. }),
+            "an absent tool is not a choice this run made, got {:?}",
+            entry.state,
+        );
+    }
+
+    /// The behaviour that already worked must keep working, and now says so in
+    /// the ledger: a gate that ran leaves the artifact deduped against the
+    /// substrate that gate actually read.
+    #[test]
+    fn a_gate_that_ran_leaves_the_artifact_deduped() {
+        let (repo, _target) = js_repo_with_off_head_target();
+        let config = js_config(repo.path());
+        let ctx = tempfile::tempdir().expect("context dir");
+
+        let substrate = context_substrate("ESLint", repo.path(), repo.path());
+        let ledger = TaskLedger::new();
+        record_gate(
+            &ledger,
+            "ESLint",
+            substrate.clone(),
+            TaskState::Run {
+                duration: Duration::from_secs(23),
+            },
+        );
+
+        let cmds = plan(&config, repo.path(), &ledger, ctx.path());
+
+        assert!(
+            !planned(&cmds, "eslint json"),
+            "the gate already linted this tree",
+        );
+        let entry = context_entry(&ledger, "ESLint", repo.path());
+        assert_eq!(
+            entry.state,
+            TaskState::Cached {
+                cache_age_secs: None,
+                origin: substrate,
+            },
+            "the artifact replays the gate's execution, and names whose",
+        );
+    }
+
+    /// A gate that executed and FAILED still executed. The tool read the tree
+    /// and reported on it; re-running it in the context stage would buy the
+    /// same answer at the same price, so a failing gate dedups exactly like a
+    /// passing one.
+    #[test]
+    fn a_gate_that_ran_and_failed_still_dedups() {
+        let (repo, _target) = js_repo_with_off_head_target();
+        let config = js_config(repo.path());
+        let ctx = tempfile::tempdir().expect("context dir");
+
+        let ledger = TaskLedger::new();
+        // `run_all` records an execution as `Run` whatever the check concluded
+        // — passed, failed or errored — so a failing gate looks like this.
+        record_gate(
+            &ledger,
+            "ESLint",
+            context_substrate("ESLint", repo.path(), repo.path()),
+            TaskState::Run {
+                duration: Duration::from_secs(1),
+            },
+        );
+
+        assert!(!planned(
+            &plan(&config, repo.path(), &ledger, ctx.path()),
+            "eslint json",
+        ));
+    }
+
+    /// The one case where compensating is still right: no gate for this tool
+    /// resolved at all, so nothing was decided about it and the context artifact
+    /// is the only place its signal can come from. Unchanged old behaviour.
+    #[test]
+    fn a_tool_no_gate_decided_on_is_still_generated() {
+        let (repo, _target) = js_repo_with_off_head_target();
+        let config = js_config(repo.path());
+        let ctx = tempfile::tempdir().expect("context dir");
+
+        let ledger = TaskLedger::new();
+        let cmds = plan(&config, repo.path(), &ledger, ctx.path());
+
+        assert!(
+            planned(&cmds, "eslint json"),
+            "an empty ledger is a gap, not a decision",
+        );
+        assert!(
+            ledger
+                .lookup_tool(
+                    "ESLint",
+                    &context_substrate("ESLint", repo.path(), repo.path())
+                )
+                .is_none(),
+            "a planned command records no decision NOT to run",
         );
     }
 

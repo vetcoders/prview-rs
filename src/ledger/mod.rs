@@ -157,6 +157,31 @@ impl TaskLedger {
             .cloned()
     }
 
+    /// The most recent entry for `tool_name`, matched on substrate but tolerant
+    /// of the one place a run cannot state its substrate yet.
+    ///
+    /// Eligibility skips and cache replays are recorded in the checks stage's
+    /// FIRST pass, which runs before `share_target_snapshot` resolves the run's
+    /// substrate — so those entries carry an unknown substrate even in a run
+    /// that later resolves one. An exact-key lookup would therefore miss
+    /// precisely the entries that say "this work was ruled out", which is the
+    /// answer a later stage most needs before repeating the work itself.
+    ///
+    /// So: an exact match first, then an entry recorded under an unknown
+    /// substrate for the same tool. Never the reverse — a task recorded against
+    /// a DIFFERENT known substrate stays a miss, because a different tree is
+    /// evidence of different work, not of the same work under another name.
+    #[must_use]
+    pub fn lookup_tool(&self, tool_name: &str, substrate: &SubstrateKey) -> Option<TaskEntry> {
+        if let Some(entry) = self.lookup(&TaskKey::new(tool_name, substrate.clone())) {
+            return Some(entry);
+        }
+        if substrate == &SubstrateKey::default() {
+            return None;
+        }
+        self.lookup(&TaskKey::new(tool_name, SubstrateKey::default()))
+    }
+
     /// Every recorded entry, in the order it was recorded.
     #[must_use]
     pub fn entries(&self) -> Vec<TaskEntry> {
@@ -315,6 +340,61 @@ mod tests {
             "the same tool on another commit is not this task"
         );
         assert_eq!(ledger.entries().len(), 1);
+    }
+
+    /// A tool lookup must find the entries the checks stage could not key
+    /// properly: an eligibility skip is recorded before the run resolves its
+    /// substrate, so it lands under an unknown one. A consumer asking "was this
+    /// tool ruled out?" on the resolved substrate must still get the answer.
+    #[test]
+    fn a_tool_lookup_falls_back_to_an_unknown_substrate_entry() {
+        let ledger = TaskLedger::new();
+        ledger.record(entry(
+            TaskKey::new("ESLint", SubstrateKey::default()),
+            TaskState::Skipped {
+                reason: "fast remote-only preset".to_string(),
+            },
+        ));
+
+        let found = ledger
+            .lookup_tool("eslint", &substrate("abc"))
+            .expect("an unknown-substrate skip still answers for this tool");
+        assert_eq!(
+            found.state,
+            TaskState::Skipped {
+                reason: "fast remote-only preset".to_string()
+            }
+        );
+        assert!(
+            ledger.lookup_tool("Stylelint", &substrate("abc")).is_none(),
+            "the fallback must not answer for a tool nobody recorded"
+        );
+    }
+
+    /// The fallback is one-directional. A task recorded against a KNOWN, and
+    /// different, substrate is evidence of different work — answering with it
+    /// would let a stage skip work on the tree it actually has to read.
+    #[test]
+    fn a_tool_lookup_never_crosses_two_known_substrates() {
+        let ledger = TaskLedger::new();
+        ledger.record(entry(
+            TaskKey::new("TypeScript", substrate("abc")),
+            TaskState::Run {
+                duration: Duration::from_secs(8),
+            },
+        ));
+
+        assert!(
+            ledger.lookup_tool("tsc", &substrate("def")).is_none(),
+            "another commit's compile is not this commit's"
+        );
+        assert!(
+            ledger
+                .lookup_tool("tsc", &SubstrateKey::default())
+                .is_none(),
+            "an unknown substrate must not claim a run recorded on a known one"
+        );
+        assert!(ledger.lookup_tool("tsc", &substrate("abc")).is_some());
     }
 
     #[test]

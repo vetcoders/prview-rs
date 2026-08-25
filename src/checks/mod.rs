@@ -200,7 +200,12 @@ const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
 /// reviewed dependency set, never the link. Without uv the commands come off
 /// `PATH` and use the ambient interpreter, which is not the link either. Should
 /// that redirect ever be removed, `.venv` belongs back in this list.
-fn consumable_scaffolding(check: &str) -> &'static [&'static str] {
+///
+/// The context stage resolves its own substrate through this same table, so a
+/// `tsc` trace and the TypeScript gate describe one tree identically instead of
+/// differing on `tree_state` alone — a difference that would silently partition
+/// the two into separate ledger tasks and defeat the dedup.
+pub(crate) fn consumable_scaffolding(check: &str) -> &'static [&'static str] {
     match check {
         "TypeScript" | "ESLint" | "Vitest" | "Stylelint" => &["node_modules"],
         _ => &[],
