@@ -110,7 +110,8 @@ use std::time::Duration;
 #[test]
 fn api_delta_no_diff_only_runtime() {
     let production = include_str!("mod.rs");
-    assert!(production.contains("compare_rust_api_revisions(&repo, diffs)"));
+    assert!(production.contains("compare_rust_api_revisions("));
+    assert!(production.contains("worktree_status_digest.as_deref()"));
     assert!(production.contains("analyze_js_ts_public_api_diff(&patch_texts)"));
     assert!(production.contains("analyze_js_ts_breaking_changes(&patch_texts)"));
     assert!(production.contains("analyze_rust_env_requirements(&patch_texts)"));

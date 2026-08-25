@@ -9,8 +9,8 @@ use super::api_surface::{
     RustNamespace, RustSourceCertainty, guards_proven_disjoint,
 };
 use super::revision_source::RevisionProvenance;
-use crate::git::{Diff, Repository};
-use anyhow::Result;
+use crate::git::{Diff, Repository, ResolvedRef};
+use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const REPO_BACKED_RUST_API_SOURCE: &str = "repo_backed_rust_api";
@@ -291,13 +291,89 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
     delta
 }
 
-/// Build the production Rust API delta from the exact Git trees that own each
-/// artifact diff. Every multi-base comparison retains its own base OID; no
-/// checkout, working tree, patch text, or `diffs.first()` fallback participates.
-/// Target snapshots are reused by exact OID, while every base/target pair is
-/// compared exactly once and then folded into one deterministic delta consumed
-/// by both artifact views.
-pub fn compare_rust_api_revisions(repo: &Repository, diffs: &[Diff]) -> Result<Option<ApiDelta>> {
+enum TargetTree<'repo> {
+    GitTree(super::revision_source::GitTree<'repo>),
+    WorkingTreeOverlay(super::revision_source::WorkingTreeOverlay<'repo>),
+}
+
+impl TargetTree<'_> {
+    fn snapshot(&self) -> RustApiSnapshot {
+        use super::api_surface::snapshot_rust_api;
+
+        match self {
+            Self::GitTree(tree) => snapshot_rust_api(tree),
+            Self::WorkingTreeOverlay(overlay) => snapshot_rust_api(overlay),
+        }
+    }
+}
+
+fn select_target_tree<'repo>(
+    repo: &'repo Repository,
+    resolved_target: &ResolvedRef,
+    worktree_clean: Option<bool>,
+    worktree_status_digest: Option<&str>,
+) -> Result<TargetTree<'repo>> {
+    use super::revision_source::{GitTree, WorkingTreeOverlay};
+
+    let exact_tree = || {
+        GitTree::new(repo, &resolved_target.commit_id)
+            .map(TargetTree::GitTree)
+            .map_err(Into::into)
+    };
+
+    // A fetched target never inherits local bytes, even when its OID happens
+    // to equal the commit checked out in this repository.
+    if resolved_target.is_remote || worktree_clean == Some(true) {
+        return exact_tree();
+    }
+
+    // A dirty/unknown local tree can participate only when the declared target
+    // is exactly the checked-out commit. Failure to establish HEAD is not
+    // permission to pretend the target was off-HEAD and read a clean tree.
+    let head_oid = repo
+        .head_commit_id()
+        .context("cannot establish HEAD for local Rust API target substrate")?;
+    if head_oid != resolved_target.commit_id {
+        return exact_tree();
+    }
+
+    if worktree_clean.is_none() {
+        bail!(
+            "cannot establish working-tree status for local Rust API target at HEAD {}",
+            resolved_target.commit_id
+        );
+    }
+    let dirty_digest = worktree_status_digest
+        .filter(|digest| !digest.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "dirty local Rust API target at HEAD {} is missing its captured status digest",
+                resolved_target.commit_id
+            )
+        })?;
+
+    Ok(TargetTree::WorkingTreeOverlay(WorkingTreeOverlay::new(
+        repo,
+        &resolved_target.commit_id,
+        dirty_digest,
+    )?))
+}
+
+/// Build the production Rust API delta from exact base Git trees and one
+/// explicitly selected target substrate. A non-remote dirty local target at
+/// checked-out HEAD uses tracked working-tree bytes bound to the captured dirty
+/// digest; clean, remote, and off-HEAD targets remain exact Git trees.
+///
+/// Every multi-base comparison retains its own base OID. The target snapshot is
+/// built once and reused for every unique base/target pair, then all comparisons
+/// are folded into one deterministic delta consumed by both artifact views.
+pub fn compare_rust_api_revisions(
+    repo: &Repository,
+    diffs: &[Diff],
+    resolved_target: &ResolvedRef,
+    worktree_clean: Option<bool>,
+    worktree_status_digest: Option<&str>,
+) -> Result<Option<ApiDelta>> {
     use super::api_surface::snapshot_rust_api;
     use super::revision_source::GitTree;
 
@@ -305,19 +381,29 @@ pub fn compare_rust_api_revisions(repo: &Repository, diffs: &[Diff]) -> Result<O
         return Ok(None);
     }
 
+    if let Some(mismatched) = diffs
+        .iter()
+        .find(|diff| diff.target_commit_id != resolved_target.commit_id)
+    {
+        bail!(
+            "Rust API diff target {} does not match resolved target {}",
+            mismatched.target_commit_id,
+            resolved_target.commit_id
+        );
+    }
+
+    let target = select_target_tree(
+        repo,
+        resolved_target,
+        worktree_clean,
+        worktree_status_digest,
+    )?
+    .snapshot();
     let unique_diffs = unique_exact_revision_pairs(diffs);
-    let mut target_snapshots = BTreeMap::new();
     let mut comparisons = Vec::with_capacity(diffs.len());
     for diff in unique_diffs {
         let base = snapshot_rust_api(&GitTree::new(repo, &diff.base_commit_id)?);
-        if !target_snapshots.contains_key(&diff.target_commit_id) {
-            let target = snapshot_rust_api(&GitTree::new(repo, &diff.target_commit_id)?);
-            target_snapshots.insert(diff.target_commit_id.clone(), target);
-        }
-        let target = target_snapshots
-            .get(&diff.target_commit_id)
-            .expect("target snapshot inserted for exact OID");
-        comparisons.push(compare_rust_api(&base, target));
+        comparisons.push(compare_rust_api(&base, &target));
     }
 
     Ok(Some(merge_comparisons(comparisons)))
@@ -1275,6 +1361,32 @@ mod tests {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
+    fn resolved_target(commit_id: &str, is_remote: bool) -> ResolvedRef {
+        ResolvedRef {
+            name: if is_remote {
+                "origin/feature"
+            } else {
+                "feature"
+            }
+            .to_owned(),
+            commit_id: commit_id.to_owned(),
+            is_remote,
+        }
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = git_cmd()
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn fixture_delta(cell: &str) -> ApiDelta {
         let root = corpus_root().join(cell);
         let base = snapshot_rust_api(&MemorySource::from_root(
@@ -1932,6 +2044,372 @@ mod tests {
     }
 
     #[test]
+    fn dirty_overlay_clean_local_head_stays_exact_tree() {
+        let (_tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "", "pub fn committed_api() {}\n"),
+        ]);
+        let diff = make_diff_with_ids(base, target.clone(), Vec::new());
+
+        let delta = compare_rust_api_revisions(
+            &repo,
+            &[diff],
+            &resolved_target(&target, false),
+            Some(true),
+            Some("sha256:clean-status"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(delta.target_revision, format!("git_tree:{target}"));
+        let committed = delta
+            .added
+            .iter()
+            .find(|finding| finding.identity.name == "committed_api")
+            .expect("committed API fact");
+        assert_eq!(
+            committed.after.as_ref().unwrap().provenance,
+            format!("git_tree:{target}")
+        );
+    }
+
+    #[test]
+    fn dirty_overlay_tracked_modification_emits_overlay_api_facts() {
+        let (tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn base_api() {}\n",
+                "pub fn committed_api() {}\n",
+            ),
+        ]);
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn dirty_api() {}\n").unwrap();
+        let diff = make_diff_with_ids(base, target.clone(), Vec::new());
+        let digest = "sha256:tracked-modification";
+
+        let delta = compare_rust_api_revisions(
+            &repo,
+            &[diff],
+            &resolved_target(&target, false),
+            Some(false),
+            Some(digest),
+        )
+        .unwrap()
+        .unwrap();
+
+        let provenance = format!("working_tree_overlay:{target}:{digest}");
+        assert_eq!(delta.target_revision, provenance);
+        let dirty = delta
+            .added
+            .iter()
+            .find(|finding| finding.identity.name == "dirty_api")
+            .expect("dirty API fact");
+        assert_eq!(dirty.after.as_ref().unwrap().provenance, provenance);
+        assert!(
+            delta
+                .findings()
+                .iter()
+                .all(|finding| finding.identity.name != "committed_api"),
+            "overlay must not silently analyze clean HEAD bytes"
+        );
+    }
+
+    #[test]
+    fn dirty_overlay_staged_addition_is_part_of_emitted_api_truth() {
+        let (tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "", ""),
+        ]);
+        fs::write(tmp.path().join("src/lib.rs"), "pub mod staged;\n").unwrap();
+        fs::write(tmp.path().join("src/staged.rs"), "pub fn staged_api() {}\n").unwrap();
+        run_git(tmp.path(), &["add", "src/lib.rs", "src/staged.rs"]);
+        let diff = make_diff_with_ids(base, target.clone(), Vec::new());
+        let digest = "sha256:staged-addition";
+
+        let delta = compare_rust_api_revisions(
+            &repo,
+            &[diff],
+            &resolved_target(&target, false),
+            Some(false),
+            Some(digest),
+        )
+        .unwrap()
+        .unwrap();
+
+        let staged = delta
+            .added
+            .iter()
+            .find(|finding| finding.identity.name == "staged_api")
+            .expect("staged API fact");
+        assert_eq!(
+            staged.after.as_ref().unwrap().provenance,
+            format!("working_tree_overlay:{target}:{digest}")
+        );
+    }
+
+    #[test]
+    fn dirty_overlay_delete_rename_and_untracked_are_truthful() {
+        let (tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub mod gone;\npub mod moved;\n",
+                "pub mod gone;\npub mod moved;\n",
+            ),
+            (
+                "src/gone.rs",
+                "pub fn gone_api() {}\n",
+                "pub fn gone_api() {}\n",
+            ),
+            (
+                "src/moved.rs",
+                "pub fn moved_api() {}\n",
+                "pub fn moved_api() {}\n",
+            ),
+        ]);
+        fs::remove_file(tmp.path().join("src/gone.rs")).unwrap();
+        run_git(tmp.path(), &["mv", "src/moved.rs", "src/renamed.rs"]);
+        fs::write(tmp.path().join("src/lib.rs"), "pub mod renamed;\n").unwrap();
+        fs::write(
+            tmp.path().join("src/untracked.rs"),
+            "pub fn unrelated_api() {}\n",
+        )
+        .unwrap();
+        let diff = make_diff_with_ids(base, target.clone(), Vec::new());
+
+        let delta = compare_rust_api_revisions(
+            &repo,
+            &[diff],
+            &resolved_target(&target, false),
+            Some(false),
+            Some("sha256:delete-rename-untracked"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            delta
+                .removed
+                .iter()
+                .any(|finding| finding.identity.name == "gone_api")
+        );
+        assert!(delta.relocated.iter().any(|finding| {
+            finding.identity.name == "moved_api"
+                && finding.before.as_ref().unwrap().identity.module_path == ["moved"]
+                && finding.after.as_ref().unwrap().identity.module_path == ["renamed"]
+        }));
+        assert!(
+            delta
+                .findings()
+                .iter()
+                .all(|finding| finding.identity.name != "unrelated_api"),
+            "untracked paths are not overlay inputs"
+        );
+    }
+
+    #[test]
+    fn dirty_overlay_remote_target_equal_to_head_stays_exact_tree() {
+        let (tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "", "pub fn committed_api() {}\n"),
+        ]);
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn dirty_api() {}\n").unwrap();
+        let diff = make_diff_with_ids(base, target.clone(), Vec::new());
+
+        let delta = compare_rust_api_revisions(
+            &repo,
+            &[diff],
+            &resolved_target(&target, true),
+            Some(false),
+            Some("sha256:must-not-route-remote"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(delta.target_revision, format!("git_tree:{target}"));
+        assert!(
+            delta
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "committed_api")
+        );
+        assert!(
+            delta
+                .findings()
+                .iter()
+                .all(|finding| finding.identity.name != "dirty_api")
+        );
+    }
+
+    #[test]
+    fn dirty_overlay_off_head_target_stays_exact_tree() {
+        let (tmp, repo, base, head) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn base_api() {}\n",
+                "pub fn head_api() {}\n",
+            ),
+        ]);
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn dirty_api() {}\n").unwrap();
+        let diff = make_diff_with_ids(base.clone(), base.clone(), Vec::new());
+
+        let delta = compare_rust_api_revisions(
+            &repo,
+            &[diff],
+            &resolved_target(&base, false),
+            Some(false),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_ne!(base, head, "fixture target must be off checked-out HEAD");
+        assert_eq!(delta.target_revision, format!("git_tree:{base}"));
+        assert!(delta.findings().is_empty());
+    }
+
+    #[test]
+    fn dirty_overlay_missing_digest_never_falls_back_to_head() {
+        let (tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "", "pub fn committed_api() {}\n"),
+        ]);
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn dirty_api() {}\n").unwrap();
+        let diff = make_diff_with_ids(base, target.clone(), Vec::new());
+
+        for digest in [None, Some("  ")] {
+            let error = compare_rust_api_revisions(
+                &repo,
+                std::slice::from_ref(&diff),
+                &resolved_target(&target, false),
+                Some(false),
+                digest,
+            )
+            .expect_err("dirty local HEAD without digest must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("missing its captured status digest")
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_overlay_unreadable_status_never_falls_back_to_head() {
+        let (_tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "", "pub fn committed_api() {}\n"),
+        ]);
+        let diff = make_diff_with_ids(base, target.clone(), Vec::new());
+
+        let error = compare_rust_api_revisions(
+            &repo,
+            &[diff],
+            &resolved_target(&target, false),
+            None,
+            None,
+        )
+        .expect_err("unknown local HEAD status must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot establish working-tree status")
+        );
+    }
+
+    #[test]
+    fn dirty_overlay_multi_base_reuses_one_target_snapshot() {
+        let (tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "", "pub fn committed_api() {}\n"),
+        ]);
+        fs::write(
+            tmp.path().join("src/lib.rs"),
+            "pub fn committed_api() {}\npub fn dirty_api() {}\n",
+        )
+        .unwrap();
+        let diffs = [
+            make_diff_with_ids(base.clone(), target.clone(), Vec::new()),
+            make_diff_with_ids(target.clone(), target.clone(), Vec::new()),
+        ];
+        let digest = "sha256:shared-multi-base-target";
+
+        let delta = compare_rust_api_revisions(
+            &repo,
+            &diffs,
+            &resolved_target(&target, false),
+            Some(false),
+            Some(digest),
+        )
+        .unwrap()
+        .unwrap();
+
+        let provenance = format!("working_tree_overlay:{target}:{digest}");
+        assert_eq!(delta.target_revision, format!("multiple:[{provenance}]"));
+        let dirty_facts: Vec<_> = delta
+            .added
+            .iter()
+            .filter(|finding| finding.identity.name == "dirty_api")
+            .collect();
+        assert_eq!(dirty_facts.len(), 2, "one fact survives per distinct base");
+        assert!(dirty_facts.iter().all(|finding| {
+            finding.after.as_ref().unwrap().provenance == provenance
+                && finding.id.contains("|comparison:")
+        }));
+        let evidence: Vec<_> = dirty_facts
+            .iter()
+            .flat_map(|finding| finding.evidence.iter())
+            .collect();
+        assert!(
+            evidence
+                .iter()
+                .any(|line| line.contains(&format!("git_tree:{base}")))
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|line| line.contains(&format!("git_tree:{target}")))
+        );
+    }
+
+    #[test]
     fn duplicate_exact_revision_pair_is_compared_and_emitted_once() {
         let (_tmp, repo, base, target) = make_test_repo(&[
             (
@@ -1941,15 +2419,21 @@ mod tests {
             ),
             ("src/lib.rs", "", "pub fn added_once() {}\n"),
         ]);
-        let diff = make_diff_with_ids(base, target, Vec::new());
+        let diff = make_diff_with_ids(base, target.clone(), Vec::new());
         assert_eq!(
             unique_exact_revision_pairs(&[diff.clone(), diff.clone()]).len(),
             1,
             "dedup must happen before either snapshot/comparison is executed"
         );
-        let delta = compare_rust_api_revisions(&repo, &[diff.clone(), diff])
-            .unwrap()
-            .unwrap();
+        let delta = compare_rust_api_revisions(
+            &repo,
+            &[diff.clone(), diff],
+            &resolved_target(&target, false),
+            Some(true),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(delta.added.len(), 1);
         assert!(!delta.base_revision.starts_with("multiple:"));
         assert!(!delta.added[0].id.contains("|comparison:"));
@@ -1967,15 +2451,21 @@ mod tests {
         ]);
         let mut main = make_diff_with_ids(base.clone(), target.clone(), Vec::new());
         main.base = "main".to_owned();
-        let mut release = make_diff_with_ids(base, target, Vec::new());
+        let mut release = make_diff_with_ids(base, target.clone(), Vec::new());
         release.base = "release".to_owned();
         assert_eq!(
             unique_exact_revision_pairs(&[main.clone(), release.clone()]).len(),
             1
         );
-        let delta = compare_rust_api_revisions(&repo, &[main, release])
-            .unwrap()
-            .unwrap();
+        let delta = compare_rust_api_revisions(
+            &repo,
+            &[main, release],
+            &resolved_target(&target, false),
+            Some(true),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(delta.added.len(), 1);
         assert!(!delta.base_revision.starts_with("multiple:"));
     }
@@ -2018,10 +2508,18 @@ mod tests {
         let repo = crate::git::Repository::open(tmp.path()).unwrap();
         let diffs = [
             make_diff_with_ids(base, head.clone(), Vec::new()),
-            make_diff_with_ids(middle, head, Vec::new()),
+            make_diff_with_ids(middle, head.clone(), Vec::new()),
         ];
         assert_eq!(unique_exact_revision_pairs(&diffs).len(), 2);
-        let delta = compare_rust_api_revisions(&repo, &diffs).unwrap().unwrap();
+        let delta = compare_rust_api_revisions(
+            &repo,
+            &diffs,
+            &resolved_target(&head, false),
+            Some(true),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(delta.added.len(), 2);
         assert_ne!(delta.added[0].id, delta.added[1].id);
         assert!(

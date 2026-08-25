@@ -924,12 +924,24 @@ provenance. Finding IDs preserve Rust identifier case and serialize the complete
 semantic identity, including both sides' cfg regions, contracts, and typed
 unknown provenance; legal ambiguous input is data, never an assertion failure.
 
-`compare_rust_api_revisions` constructs snapshots only from the exact
-`Diff.base_commit_id` and `Diff.target_commit_id` Git trees. It never reads a
-checkout, working-tree overlay, or patch fallback. Duplicate exact base/target
-OID pairs are coalesced in stable first-seen order before either snapshot is
-built; distinct multi-base comparisons each retain their own revision evidence
-and comparison-qualified finding ID.
+`compare_rust_api_revisions` always constructs base snapshots from the exact
+`Diff.base_commit_id` Git trees. It selects the target substrate once per run:
+
+| Declared target | Additional evidence | Rust API target substrate | Emitted provenance |
+|---|---|---|---|
+| Clean local target | `worktree_clean == Some(true)` | exact `GitTree` | `GitTree { commit_oid }` |
+| Dirty local target at checked-out HEAD | `worktree_clean == Some(false)` and a non-empty captured status digest | tracked `WorkingTreeOverlay` | `WorkingTreeOverlay { target_oid, dirty_digest }` |
+| Remote target, including an OID equal to local HEAD | `is_remote == true` | exact `GitTree` | `GitTree { commit_oid }` |
+| Local target not equal to checked-out HEAD | exact target OID differs from `head_commit_id()` | exact `GitTree` | `GitTree { commit_oid }` |
+| Local target at HEAD with unavailable status/digest | provenance cannot establish the dirty substrate | fail closed; no Rust API artifacts | error, never clean-HEAD fallback |
+
+The overlay inventory and reads include tracked modified, staged, added,
+renamed, and deleted state while excluding unrelated untracked paths. Duplicate
+exact base/target OID pairs are coalesced in stable first-seen order before
+comparison; one target snapshot is reused across distinct multi-base
+comparisons, which retain their own revision evidence and
+comparison-qualified finding IDs. Patch text never participates in Rust API
+truth.
 `breaking_changes_view` and `public_api_diff_view` are pure deterministic
 projections over the same delta. Their shared counts, IDs, confidence, evidence,
 unknown reasons, and provenance therefore cannot drift through independent

@@ -380,17 +380,27 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let patch_texts = generate_full_patch(&diff_dir, &repo, diffs)?;
     stage_timings.push(finish_timing(emit_human_stdout, "full.patch", t));
 
-    // Rust API truth is computed once from the exact revision trees named by
-    // each Diff. The same delta feeds both artifact views and every verdict
-    // projection. JS/TS remains on its legacy diff parser behind a structural
-    // language boundary.
+    // Rust API truth is computed once from exact base revisions and the target
+    // substrate declared for this run. A qualifying dirty local HEAD uses its
+    // tracked working-tree overlay; clean, remote, and off-HEAD targets remain
+    // exact Git trees. The same delta feeds both artifact views and every
+    // verdict projection. JS/TS remains on its legacy diff parser behind a
+    // structural language boundary.
     let has_rust_scope = config.profile.has_cargo
         || diffs
             .iter()
             .flat_map(|diff| diff.files.iter())
             .any(|file| file.path.ends_with(".rs"));
     let rust_api_delta = has_rust_scope
-        .then(|| api_delta::compare_rust_api_revisions(&repo, diffs))
+        .then(|| {
+            api_delta::compare_rust_api_revisions(
+                &repo,
+                diffs,
+                resolved_target,
+                worktree_clean,
+                worktree_status_digest.as_deref(),
+            )
+        })
         .transpose()?
         .flatten();
     let rust_breaking_view = rust_api_delta
