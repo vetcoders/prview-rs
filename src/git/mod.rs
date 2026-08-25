@@ -15,6 +15,8 @@ use crate::Config;
 use anyhow::{Context, Result};
 use git2::{DiffOptions, Repository as Git2Repo};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Minimum similarity percentage for rename/copy detection (like `git diff -M50`).
@@ -27,6 +29,7 @@ pub const MAX_COMMITS: usize = 500;
 
 const TRUNCATED_COMMIT_SENTINEL_ID: &str = "0000000000000000000000000000000000000000";
 const TRUNCATED_COMMIT_SENTINEL_SHORT_ID: &str = "0000000";
+const HEAD_REFLOG_READ_BUFFER_SIZE: usize = 8 * 1024;
 
 /// Truncate a SHA to 7 chars safely (returns full string if shorter).
 pub fn short_sha(sha: &str) -> &str {
@@ -107,6 +110,47 @@ pub(crate) struct GitWorktreeChange {
     pub status: git2::Delta,
     pub new_mode_raw: u32,
     pub new_mode: GitTreeEntryKind,
+}
+
+/// Read-only selector proof for the current worktree's `HEAD`.
+///
+/// The token deliberately includes more than the current OID. A normal
+/// `T -> H -> T` checkout leaves the OID unchanged but appends records to this
+/// worktree's `logs/HEAD`, so the entry count, byte length and reflog SHA-256
+/// still make the ABA observable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeadSelectorToken {
+    pub(crate) head_oid: String,
+    pub(crate) entry_count: u64,
+    pub(crate) byte_len: u64,
+    pub(crate) reflog_sha256: String,
+}
+
+impl HeadSelectorToken {
+    pub(crate) fn state(&self) -> String {
+        format!(
+            "HEAD={}, entries={}, bytes={}, reflog_sha256={}",
+            self.head_oid, self.entry_count, self.byte_len, self.reflog_sha256
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeadReflogMetadata {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -198,6 +242,198 @@ impl Repository {
     pub fn head_commit_id(&self) -> Result<String> {
         let commit = self.inner.head()?.peel_to_commit()?;
         Ok(commit.id().to_string())
+    }
+
+    /// Read a stable token from this exact worktree's `logs/HEAD` without
+    /// invoking libgit2's reflog API or opening the file for write.
+    ///
+    /// `Ok(None)` is reserved for a genuinely absent reflog. Every other
+    /// inability to prove a stable read is an error. The caller may apply the
+    /// narrow clean-overlay fallback only after independently proving that the
+    /// tracked change inventory is empty.
+    pub(crate) fn head_selector_token(&self) -> Result<Option<HeadSelectorToken>> {
+        let reflog_path = self.inner.path().join("logs").join("HEAD");
+        let head_before = self
+            .head_commit_id()
+            .context("unstable HEAD reflog: cannot read HEAD before selector token")?;
+        let path_metadata_before_open = match std::fs::symlink_metadata(&reflog_path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    anyhow::bail!(
+                        "unstable HEAD reflog: path is not a regular file ({}) at {}",
+                        head_reflog_file_type(&metadata),
+                        reflog_path.display()
+                    );
+                }
+                metadata
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let head_after = self
+                    .head_commit_id()
+                    .context("unstable HEAD reflog: cannot read HEAD after missing-reflog check")?;
+                if head_before != head_after {
+                    anyhow::bail!(
+                        "unstable HEAD reflog: HEAD changed while proving reflog absence (before={head_before}, after={head_after})"
+                    );
+                }
+                match std::fs::symlink_metadata(&reflog_path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Ok(metadata) => anyhow::bail!(
+                        "unstable HEAD reflog: {} appeared during missing-reflog proof as {}",
+                        reflog_path.display(),
+                        head_reflog_file_type(&metadata)
+                    ),
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "HEAD reflog absence is unavailable for read-only selector proof at {}",
+                                reflog_path.display()
+                            )
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "HEAD reflog is unavailable for read-only selector proof at {}",
+                        reflog_path.display()
+                    )
+                });
+            }
+        };
+
+        let mut reflog = std::fs::File::open(&reflog_path).with_context(|| {
+            format!(
+                "unstable HEAD reflog: regular path changed before read at {}",
+                reflog_path.display()
+            )
+        })?;
+
+        let metadata_before = head_reflog_metadata(
+            &reflog
+                .metadata()
+                .context("unstable HEAD reflog: cannot stat opened file before read")?,
+        )?;
+        let metadata_before_path = head_reflog_metadata(&path_metadata_before_open)?;
+        if metadata_before_path != metadata_before {
+            anyhow::bail!(
+                "unstable HEAD reflog: path/handle identity changed before reading {} (path_before={metadata_before_path:?}, handle_before={metadata_before:?})",
+                reflog_path.display()
+            );
+        }
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; HEAD_REFLOG_READ_BUFFER_SIZE];
+        let mut record_prefix = [0_u8; 82];
+        let mut record_prefix_len = 0_usize;
+        let mut record_len = 0_u64;
+        let mut entry_count = 0_u64;
+        let mut byte_len = 0_u64;
+        let mut last_new_oid = None;
+
+        loop {
+            let read = reflog
+                .read(&mut buffer)
+                .context("unstable HEAD reflog: read failed")?;
+            if read == 0 {
+                break;
+            }
+            let bytes = &buffer[..read];
+            hasher.update(bytes);
+            byte_len = byte_len
+                .checked_add(read as u64)
+                .context("unstable HEAD reflog: byte length overflow")?;
+            for byte in bytes {
+                if *byte == b'\n' {
+                    last_new_oid = Some(parse_complete_head_reflog_record(
+                        &record_prefix[..record_prefix_len],
+                        record_len,
+                    )?);
+                    entry_count = entry_count
+                        .checked_add(1)
+                        .context("unstable HEAD reflog: entry count overflow")?;
+                    record_prefix_len = 0;
+                    record_len = 0;
+                } else {
+                    if record_prefix_len < record_prefix.len() {
+                        record_prefix[record_prefix_len] = *byte;
+                        record_prefix_len += 1;
+                    }
+                    record_len = record_len
+                        .checked_add(1)
+                        .context("unstable HEAD reflog: record length overflow")?;
+                }
+            }
+        }
+
+        if record_len != 0 {
+            anyhow::bail!(
+                "unstable HEAD reflog: incomplete trailing record in {}",
+                reflog_path.display()
+            );
+        }
+        let metadata_after_handle = head_reflog_metadata(
+            &reflog
+                .metadata()
+                .context("unstable HEAD reflog: cannot stat opened file after read")?,
+        )?;
+        let metadata_after_path_raw =
+            std::fs::symlink_metadata(&reflog_path).with_context(|| {
+                format!(
+                    "unstable HEAD reflog: path disappeared after read: {}",
+                    reflog_path.display()
+                )
+            })?;
+        if !metadata_after_path_raw.file_type().is_file() {
+            anyhow::bail!(
+                "unstable HEAD reflog: path is no longer a regular file ({}) after read at {}",
+                head_reflog_file_type(&metadata_after_path_raw),
+                reflog_path.display()
+            );
+        }
+        let metadata_after_path =
+            head_reflog_metadata(&metadata_after_path_raw).with_context(|| {
+                format!(
+                    "unstable HEAD reflog: cannot stat path after read: {}",
+                    reflog_path.display()
+                )
+            })?;
+        let head_after = self
+            .head_commit_id()
+            .context("unstable HEAD reflog: cannot read HEAD after selector token")?;
+
+        if metadata_before != metadata_after_handle
+            || metadata_before != metadata_after_path
+            || byte_len != metadata_before.len
+        {
+            anyhow::bail!(
+                "unstable HEAD reflog: metadata changed while reading {} (before={metadata_before:?}, handle_after={metadata_after_handle:?}, path_after={metadata_after_path:?}, bytes_read={byte_len})",
+                reflog_path.display()
+            );
+        }
+        if head_before != head_after {
+            anyhow::bail!(
+                "unstable HEAD reflog: HEAD changed while reading selector token (before={head_before}, after={head_after})"
+            );
+        }
+        let last_new_oid = last_new_oid.with_context(|| {
+            format!(
+                "unstable HEAD reflog: no complete entries in {}",
+                reflog_path.display()
+            )
+        })?;
+        if last_new_oid != head_after {
+            anyhow::bail!(
+                "unstable HEAD reflog: final reflog OID {last_new_oid} does not match HEAD {head_after}"
+            );
+        }
+
+        Ok(Some(HeadSelectorToken {
+            head_oid: head_after,
+            entry_count,
+            byte_len,
+            reflog_sha256: format!("sha256:{:x}", hasher.finalize()),
+        }))
     }
 
     /// Resolve target branch/ref
@@ -1179,6 +1415,57 @@ fn git_tree_entry_kind(mode: i32) -> GitTreeEntryKind {
     }
 }
 
+fn head_reflog_metadata(metadata: &std::fs::Metadata) -> Result<HeadReflogMetadata> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(HeadReflogMetadata {
+        len: metadata.len(),
+        modified: metadata
+            .modified()
+            .context("unstable HEAD reflog: modification time is unavailable")?,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        modified_seconds: metadata.mtime(),
+        #[cfg(unix)]
+        modified_nanoseconds: metadata.mtime_nsec(),
+        #[cfg(unix)]
+        changed_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+fn head_reflog_file_type(metadata: &std::fs::Metadata) -> &'static str {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_file() {
+        "regular file"
+    } else {
+        "non-regular"
+    }
+}
+
+fn parse_complete_head_reflog_record(prefix: &[u8], record_len: u64) -> Result<String> {
+    if record_len < 82 || prefix.len() < 82 || prefix[40] != b' ' || prefix[81] != b' ' {
+        anyhow::bail!("unstable HEAD reflog: malformed complete record (length={record_len})");
+    }
+    let old_oid =
+        std::str::from_utf8(&prefix[..40]).context("unstable HEAD reflog: old OID is not UTF-8")?;
+    let new_oid = std::str::from_utf8(&prefix[41..81])
+        .context("unstable HEAD reflog: new OID is not UTF-8")?;
+    git2::Oid::from_str(old_oid).context("unstable HEAD reflog: old OID is malformed")?;
+    let new_oid =
+        git2::Oid::from_str(new_oid).context("unstable HEAD reflog: new OID is malformed")?;
+    Ok(new_oid.to_string())
+}
+
 fn diff_path_to_string(path: Option<&Path>) -> Result<Option<String>> {
     path.map(|path| {
         path.to_str()
@@ -1287,6 +1574,13 @@ mod tests {
         (tmp, merge_base, target, base_tip)
     }
 
+    fn init_head_selector_repo() -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let head = write_commit(tmp.path(), "tracked.txt", "target\n");
+        (tmp, head)
+    }
+
     fn commit(id_suffix: usize) -> CommitInfo {
         let full_id = format!("{id_suffix:040x}");
         CommitInfo {
@@ -1297,6 +1591,173 @@ mod tests {
             date: format!("2024-01-{day:02}T00:00:00", day = (id_suffix % 28) + 1),
             message: format!("commit {id_suffix}"),
         }
+    }
+
+    #[test]
+    fn head_selector_token_is_stable_and_strictly_read_only() {
+        let (tmp, head) = init_head_selector_repo();
+        let repo = Repository::open(tmp.path()).expect("repo");
+        let reflog_path = repo.inner.path().join("logs/HEAD");
+        let bytes_before = fs::read(&reflog_path).expect("HEAD reflog before");
+        let metadata_before = fs::metadata(&reflog_path).expect("HEAD reflog metadata before");
+
+        let first = repo
+            .head_selector_token()
+            .expect("selector token")
+            .expect("present reflog");
+        let second = repo
+            .head_selector_token()
+            .expect("selector token repeat")
+            .expect("present reflog repeat");
+
+        assert_eq!(first, second);
+        assert_eq!(first.head_oid, head);
+        assert!(first.entry_count >= 1);
+        assert_eq!(first.byte_len, bytes_before.len() as u64);
+        assert_eq!(
+            first.reflog_sha256,
+            format!("sha256:{:x}", Sha256::digest(&bytes_before))
+        );
+        assert_eq!(
+            fs::read(&reflog_path).expect("HEAD reflog after"),
+            bytes_before
+        );
+        assert_eq!(
+            fs::metadata(&reflog_path)
+                .expect("HEAD reflog metadata after")
+                .len(),
+            metadata_before.len()
+        );
+    }
+
+    #[test]
+    fn head_selector_token_detects_normal_head_aba() {
+        let (tmp, head) = init_head_selector_repo();
+        let repo = Repository::open(tmp.path()).expect("repo");
+        let token_before = repo
+            .head_selector_token()
+            .expect("selector before")
+            .expect("present reflog before");
+
+        run_git(tmp.path(), &["checkout", "-q", "-b", "detour"]);
+        let detour = write_commit(tmp.path(), "detour.txt", "detour\n");
+        run_git(tmp.path(), &["checkout", "-q", "main"]);
+
+        let token_after = repo
+            .head_selector_token()
+            .expect("selector after")
+            .expect("present reflog after");
+        assert_ne!(detour, head);
+        assert_eq!(token_before.head_oid, head);
+        assert_eq!(token_after.head_oid, head);
+        assert!(token_after.entry_count > token_before.entry_count);
+        assert!(token_after.byte_len > token_before.byte_len);
+        assert_ne!(token_after.reflog_sha256, token_before.reflog_sha256);
+        assert_ne!(
+            token_after, token_before,
+            "T -> H -> T must change the token"
+        );
+    }
+
+    #[test]
+    fn head_selector_token_without_reflog_returns_none_without_creating_it() {
+        let (tmp, _head) = init_head_selector_repo();
+        let repo = Repository::open(tmp.path()).expect("repo");
+        let reflog_path = repo.inner.path().join("logs/HEAD");
+        fs::remove_file(&reflog_path).expect("remove fixture HEAD reflog");
+        assert!(!reflog_path.exists());
+
+        assert_eq!(repo.head_selector_token().expect("missing reflog"), None);
+        assert!(
+            !reflog_path.exists(),
+            "read-only selector must not create a missing reflog"
+        );
+    }
+
+    #[test]
+    fn head_selector_token_empty_regular_reflog_fails_closed_without_mutation() {
+        let (tmp, _head) = init_head_selector_repo();
+        let repo = Repository::open(tmp.path()).expect("repo");
+        let reflog_path = repo.inner.path().join("logs/HEAD");
+        fs::write(&reflog_path, b"").expect("empty regular HEAD reflog");
+
+        let error = repo
+            .head_selector_token()
+            .expect_err("empty regular reflog must fail closed");
+        assert!(
+            error.to_string().contains("no complete entries"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&reflog_path).expect("empty reflog after failure"),
+            b""
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn head_selector_token_rejects_symlink_before_open_without_touching_target() {
+        let (tmp, _head) = init_head_selector_repo();
+        let repo = Repository::open(tmp.path()).expect("repo");
+        let reflog_path = repo.inner.path().join("logs/HEAD");
+        let target_path = tmp.path().join("must-not-read-reflog-target");
+        let target_bytes = b"reader must never parse this target\n";
+        fs::write(&target_path, target_bytes).expect("symlink target");
+        fs::remove_file(&reflog_path).expect("remove fixture HEAD reflog");
+        std::os::unix::fs::symlink(&target_path, &reflog_path).expect("HEAD reflog symlink");
+
+        let error = repo
+            .head_selector_token()
+            .expect_err("symlink reflog must fail before open");
+        assert!(
+            error
+                .to_string()
+                .contains("path is not a regular file (symlink)"),
+            "{error:#}"
+        );
+        assert!(
+            fs::symlink_metadata(&reflog_path)
+                .expect("HEAD symlink after failure")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(&target_path).expect("symlink target after failure"),
+            target_bytes
+        );
+    }
+
+    #[test]
+    fn head_selector_token_uses_per_worktree_logs_head() {
+        let (tmp, head) = init_head_selector_repo();
+        let linked_parent = tempfile::tempdir().expect("linked parent");
+        let linked_path = linked_parent.path().join("linked");
+        run_git(
+            tmp.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                linked_path.to_str().expect("linked path"),
+                &head,
+            ],
+        );
+        let main_repo = Repository::open(tmp.path()).expect("main repo");
+        let linked_repo = Repository::open(&linked_path).expect("linked repo");
+        let linked_reflog = linked_repo.inner.path().join("logs/HEAD");
+
+        assert_ne!(linked_repo.inner.path(), main_repo.inner.path());
+        assert!(linked_reflog.exists(), "linked worktree HEAD reflog");
+        assert_eq!(
+            linked_repo
+                .head_selector_token()
+                .expect("linked selector")
+                .expect("linked reflog")
+                .head_oid,
+            head
+        );
     }
 
     #[test]

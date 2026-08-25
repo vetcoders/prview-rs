@@ -24,7 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   include untracked files). The 64 MiB capture budget fails honest as typed
   unknown evidence instead of rereading live bytes or falling back to clean
   HEAD. Remote, off-HEAD, clean, untracked-only, and genuinely non-Rust
-  comparisons remain exact-tree negative controls.
+  comparisons remain exact-tree negative controls. Local overlay eligibility
+  is now bound across capture by identical read-only per-worktree HEAD tokens
+  (OID, complete reflog-entry count, byte length, and reflog SHA-256) before the
+  seam, immediately before capture, and after capture. Detected HEAD drift or
+  reflog-recorded ABA fails closed; a missing reflog permits only an empty
+  tracked inventory and dirty tracked input fails explicitly. Rust scope now
+  requires a live regular `Cargo.toml`: directory, symlink, deleted,
+  renamed-away, and other non-regular-only entries do not establish it, while
+  the opposite exact revision preserves manifest deletion/rename/type-change
+  truth. A regular manifest captured as unreadable still establishes Rust scope
+  and emits typed `ManifestRead` unknown evidence; directory, symlink, deleted,
+  renamed-away, and other non-regular-only entries stay out of scope. Reflog
+  selector reads now reject symlink and non-regular `logs/HEAD` paths before
+  opening them. No-comparison and non-Rust cases leave optional Rust artifacts
+  absent and embedded Rust fields null.
 
 - `prview gate --strict` now consumes a schema 2.3 typed enforcement
   disposition instead of collapsing every `CONDITIONAL` cause into one exit.

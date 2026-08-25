@@ -948,11 +948,27 @@ Target selection happens once during that before-check preparation:
 
 | Declared target | Captured evidence | Rust API target substrate | Emitted provenance |
 |---|---|---|---|
-| Clean or untracked-only local target at checked-out HEAD | tracked capture inventory is empty | exact `GitTree` | `GitTree { commit_oid }` |
-| Dirty local target at checked-out HEAD | tracked capture contains modified, staged/added, renamed, deleted, non-regular, or unreadable state | immutable tracked `CapturedWorkingTreeOverlay` | `WorkingTreeOverlay { target_oid, dirty_digest }` |
+| Clean or untracked-only local target at checked-out HEAD | read-only per-worktree HEAD tokens A/B/C match, or `logs/HEAD` is absent and the tracked capture inventory is empty | exact `GitTree` | `GitTree { commit_oid }` |
+| Dirty local target at checked-out HEAD | identical read-only per-worktree HEAD tokens A/B/C surround a tracked capture containing modified, staged/added, renamed, deleted, non-regular, or unreadable state | immutable tracked `CapturedWorkingTreeOverlay` | `WorkingTreeOverlay { target_oid, dirty_digest }` |
 | Remote target, including an OID equal to local HEAD | `is_remote == true` | exact `GitTree` | `GitTree { commit_oid }` |
 | Local target not equal to checked-out HEAD | exact target OID differs from `head_commit_id()` | exact `GitTree` | `GitTree { commit_oid }` |
-| Local target at HEAD with unavailable tracked status | capture cannot establish the substrate | fail closed; no Rust API artifacts | error, never an exact-HEAD guess |
+| Local target at HEAD with HEAD drift, reflog-recorded ABA, symlink/non-regular reflog path, unstable/unavailable selector proof, or unavailable tracked status | selector/capture coherence cannot be established | fail closed; no partial pack or Rust API artifacts | contextual error naming the failed phase and expected/observed selector state |
+| Dirty local target at HEAD with no per-worktree HEAD reflog | tracked inventory is non-empty but ABA proof is unavailable | fail closed; no partial pack or Rust API artifacts | `dirty local overlay requires stable per-worktree HEAD reflog` |
+
+Local overlay eligibility is a transaction, not a one-time OID check. Token A
+is read before the private pre-capture seam, B immediately before capture, and
+C after capture. `Repository::head_selector_token` opens the current
+worktree's own `<gitdir>/logs/HEAD` read-only (never the common gitdir and never
+`git2::Repository::reflog`), streams it through a fixed buffer, and binds the
+current HEAD OID, complete-record count, byte length, and whole-file SHA-256.
+Before opening, `symlink_metadata` rejects symlink, directory, and other
+non-regular paths; after opening, handle/path identity and stability checks are
+retained. It also verifies size, HEAD before/after, and the last complete reflog
+new-OID. An empty regular reflog fails closed because it cannot bind a final
+OID. Therefore both `T -> H` drift and a normal `T -> H -> T` ABA change the
+selector proof and fail closed before emission. An absent reflog has one narrow
+fallback: an empty tracked inventory may use the exact target `GitTree`; any
+tracked change fails honestly.
 
 The capture owns bytes for tracked modified, staged/added, and rename-destination
 files, and owns explicit terminal states for deleted, renamed-away, non-regular,
@@ -974,6 +990,17 @@ comparison; one target snapshot is reused across distinct multi-base
 comparisons, which retain their own revision evidence and
 comparison-qualified finding IDs. Patch text never participates in Rust API
 truth.
+
+Revision Rust scope requires a regular-file entry whose basename is
+`Cargo.toml`. Present, added, renamed-in, and unreadable regular manifests
+establish scope; unreadable bytes become typed `ManifestRead` unknown evidence
+rather than absence. A directory, symlink, gitlink, deleted manifest,
+renamed-away manifest, or explicitly non-regular state does not establish scope
+on that revision. A regular manifest on the opposite exact revision still keeps
+a manifest deletion, rename, or type-change observable. With no comparison
+base, or when neither exact side has a scope-establishing manifest, preparation
+returns no Rust delta: optional Rust artifacts are absent and embedded
+`rust_api_delta` fields are null.
 `breaking_changes_view` and `public_api_diff_view` are pure deterministic
 projections over the same delta. Their shared counts, IDs, confidence, evidence,
 unknown reasons, and provenance therefore cannot drift through independent

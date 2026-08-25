@@ -180,12 +180,35 @@ from the broader pack `PROVENANCE.json.worktree.status_digest`, which also
 fingerprints unrelated untracked state; the two digests are not required to
 match.
 
+Overlay eligibility is bound across capture by three identical read-only
+tokens from the current worktree's own `<gitdir>/logs/HEAD`: A before the
+pre-capture seam, B immediately before capture, and C after it. Each token
+contains the current HEAD OID, complete reflog-entry count, byte length, and
+whole-file SHA-256, with stable metadata/size, before/after HEAD, and final
+reflog OID checks. Detected HEAD drift or reflog-recorded `T -> H -> T` ABA
+fails closed with a phase-specific expected/observed error and emits no partial
+pack. Before opening, the reader rejects symlink, directory, and other
+non-regular `logs/HEAD` paths without following them; an empty regular reflog
+also fails closed. The reader never creates a missing reflog. Only a clean or
+untracked-only empty tracked inventory may fall back to the exact target tree
+without one; dirty tracked input fails with `dirty local overlay requires
+stable per-worktree HEAD reflog`.
+
 The tracked capture budget is 64 MiB per run. Budget exhaustion is serialized
 through typed unknown evidence for the affected path, never by reading later
 filesystem bytes or silently substituting the target Git blob. Unchanged paths
 always come from the exact target `GitTree`. Because `artifacts::generate`
 receives the already-owned `ApiDelta`, edits or restoration after capture cannot
 change any of the four emitted Rust API surfaces.
+
+A present, added, renamed-in, or unreadable regular `Cargo.toml` on an exact
+revision establishes Rust scope. An unreadable regular manifest emits typed
+`ManifestRead` unknown evidence. Directory, symlink, gitlink, deleted,
+renamed-away, and explicitly non-regular manifest entries do not establish
+scope on that side. A regular manifest on the opposite exact revision still
+preserves deletion, rename, and type-change truth. When there is no comparison,
+or neither side has a scope-establishing manifest, standalone Rust artifacts
+are absent and this optional `rust_api_delta` field is `null`.
 
 ## `decision`
 

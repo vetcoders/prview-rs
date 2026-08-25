@@ -632,6 +632,25 @@ fn freeze_dirty_pipeline(
     base_names: &[&str],
     remote_target: bool,
 ) -> FrozenDirtyPipeline {
+    try_freeze_dirty_pipeline(
+        repo_path,
+        output_dir,
+        target_name,
+        base_names,
+        remote_target,
+        || Ok(()),
+    )
+    .expect("freeze dirty pipeline")
+}
+
+fn try_freeze_dirty_pipeline(
+    repo_path: &Path,
+    output_dir: PathBuf,
+    target_name: &str,
+    base_names: &[&str],
+    remote_target: bool,
+    before_capture: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<FrozenDirtyPipeline> {
     let mut config = test_config_builder()
         .repo_root(repo_path)
         .target(Some(target_name))
@@ -656,18 +675,19 @@ fn freeze_dirty_pipeline(
     // provenance, real ref resolution, real patch generation, then one frozen
     // Rust delta before any check/heuristic await.
     let worktree = capture_worktree_provenance(repo_path);
-    let repo = Repository::open(repo_path).expect("pipeline repo");
-    let target = repo.resolve_target(&config).expect("pipeline target");
-    let bases = repo.resolve_bases(&config).expect("pipeline bases");
+    let repo = Repository::open(repo_path)?;
+    let target = repo.resolve_target(&config)?;
+    let bases = repo.resolve_bases(&config)?;
     let comparison_bases = repo.resolve_diff_bases(&target, &bases, true);
-    let diffs = repo
-        .generate_diffs(&target, &comparison_bases, true)
-        .expect("pipeline diffs");
-    let rust_api_delta =
-        signal::api_delta::prepare_rust_api_delta(&repo, &comparison_bases, &target)
-            .expect("pipeline Rust delta");
+    let diffs = repo.generate_diffs(&target, &comparison_bases, true)?;
+    let rust_api_delta = signal::api_delta::prepare_rust_api_delta_with_before_capture_for_test(
+        &repo,
+        &comparison_bases,
+        &target,
+        before_capture,
+    )?;
 
-    FrozenDirtyPipeline {
+    Ok(FrozenDirtyPipeline {
         config,
         repo,
         target,
@@ -676,7 +696,7 @@ fn freeze_dirty_pipeline(
         diffs,
         rust_api_delta,
         worktree,
-    }
+    })
 }
 
 fn emit_frozen_dirty_pipeline(pipeline: &FrozenDirtyPipeline) -> PathBuf {
@@ -714,11 +734,131 @@ fn api_surface_payload(view: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+fn canonical_json(value: &serde_json::Value) -> String {
+    fn sorted(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut keys = map.keys().collect::<Vec<_>>();
+                keys.sort_unstable();
+                let mut canonical = serde_json::Map::new();
+                for key in keys {
+                    canonical.insert(key.clone(), sorted(&map[key]));
+                }
+                serde_json::Value::Object(canonical)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(sorted).collect())
+            }
+            scalar => scalar.clone(),
+        }
+    }
+
+    serde_json::to_string(&sorted(value)).expect("canonical JSON")
+}
+
+struct RawTrackedOverlayFixture<'a> {
+    status: &'a str,
+    old_path: Option<&'a str>,
+    new_path: Option<&'a str>,
+    new_mode: u32,
+    bytes: &'a [u8],
+}
+
+/// Test-only provenance oracle over raw fixture inputs.
+///
+/// This deliberately does not consume `ApiDelta`, an emitted view, a capture,
+/// or any production digest helper. Keeping the framing here makes a production
+/// change to the tracked-overlay digest visible as an exact fixture failure.
+fn independent_tracked_overlay_provenance(
+    target_oid: &str,
+    changes: &[RawTrackedOverlayFixture<'_>],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    fn optional_field(hasher: &mut Sha256, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                field(hasher, b"some");
+                field(hasher, value.as_bytes());
+            }
+            None => field(hasher, b"none"),
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    field(&mut hasher, b"prview-tracked-overlay-v1");
+    field(&mut hasher, target_oid.as_bytes());
+    for change in changes {
+        field(&mut hasher, change.status.as_bytes());
+        optional_field(&mut hasher, change.old_path);
+        optional_field(&mut hasher, change.new_path);
+        field(&mut hasher, change.new_mode.to_string().as_bytes());
+        field(&mut hasher, b"bytes");
+        field(&mut hasher, change.bytes);
+    }
+    format!(
+        "working_tree_overlay:{target_oid}:sha256:{:x}",
+        hasher.finalize()
+    )
+}
+
+#[derive(Clone, Copy)]
+struct FourSurfaceFact<'a> {
+    symbol: &'a str,
+    forbidden_symbol: Option<&'a str>,
+    kind: &'a str,
+    confidence: &'a str,
+    before: bool,
+    after: bool,
+    unknown_side: Option<&'a str>,
+    occurrences: usize,
+    target_overlay: bool,
+}
+
+impl<'a> FourSurfaceFact<'a> {
+    fn added(symbol: &'a str, forbidden_symbol: Option<&'a str>, target_overlay: bool) -> Self {
+        Self {
+            symbol,
+            forbidden_symbol,
+            kind: "added",
+            confidence: "confirmed",
+            before: false,
+            after: true,
+            unknown_side: None,
+            occurrences: 1,
+            target_overlay,
+        }
+    }
+
+    fn target_unknown(symbol: &'a str) -> Self {
+        Self {
+            symbol,
+            forbidden_symbol: None,
+            kind: "unknown",
+            confidence: "unknown",
+            before: false,
+            after: false,
+            unknown_side: Some("target"),
+            occurrences: 1,
+            target_overlay: true,
+        }
+    }
+}
+
 fn assert_dirty_overlay_four_surface_api_parity(
+    pipeline: &FrozenDirtyPipeline,
     pack: &Path,
-    expected_symbol: &str,
-    forbidden_symbol: Option<&str>,
+    fact: FourSurfaceFact<'_>,
 ) -> serde_json::Value {
+    let frozen_delta = pipeline
+        .rust_api_delta
+        .as_ref()
+        .expect("four-surface fixture frozen delta");
     let public = read_pipeline_json(&pack.join("20_quality/PUBLIC_API_DIFF.json"));
     let breaking = read_pipeline_json(&pack.join("20_quality/BREAKING_CHANGES.json"));
     let report = read_pipeline_json(&pack.join("report.json"));
@@ -727,16 +867,21 @@ fn assert_dirty_overlay_four_surface_api_parity(
     let public_api = &public["rust_api_delta"];
     let report_api = &report["quality"]["breaking_changes"]["rust_api_delta"];
     let merge_api = &merge_gate["rust_api_delta"];
-    let expected = api_surface_payload(&breaking);
+    let typed_expected =
+        serde_json::to_value(signal::api_delta::breaking_changes_view(frozen_delta))
+            .expect("serialize frozen Rust delta view");
+    let expected = api_surface_payload(&typed_expected);
+    let expected_canonical = canonical_json(&expected);
     for (name, surface) in [
+        ("BREAKING_CHANGES", &breaking),
         ("PUBLIC_API_DIFF", public_api),
         ("report.json", report_api),
         ("MERGE_GATE", merge_api),
     ] {
         assert_eq!(
-            api_surface_payload(surface),
-            expected,
-            "dirty overlay API surface parity failed for {name}"
+            canonical_json(&api_surface_payload(surface)),
+            expected_canonical,
+            "canonical four_surface Rust payload mismatch for {name}"
         );
     }
     assert_eq!(public_api["view"], "public_api_diff");
@@ -744,17 +889,93 @@ fn assert_dirty_overlay_four_surface_api_parity(
     assert_eq!(report_api["view"], "breaking_changes");
     assert_eq!(merge_api["view"], "breaking_changes");
 
+    let unique_base_revisions = pipeline
+        .comparison_bases
+        .iter()
+        .map(|base| format!("git_tree:{}", base.commit_id))
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_base_revision = if unique_base_revisions.len() == 1 {
+        unique_base_revisions
+            .iter()
+            .next()
+            .expect("one base revision")
+            .clone()
+    } else {
+        format!(
+            "multiple:[{}]",
+            unique_base_revisions
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    assert_eq!(
+        frozen_delta.base_revision, expected_base_revision,
+        "fixture-specific exact base revision"
+    );
+
+    let target_prefix = if fact.target_overlay {
+        format!("working_tree_overlay:{}:sha256:", pipeline.target.commit_id)
+    } else {
+        format!("git_tree:{}", pipeline.target.commit_id)
+    };
+    let target_source = if fact.target_overlay {
+        frozen_delta
+            .findings()
+            .iter()
+            .find_map(|finding| {
+                finding
+                    .after
+                    .as_ref()
+                    .map(|side| side.provenance.as_str())
+                    .or_else(|| {
+                        finding
+                            .unknown_source
+                            .as_ref()
+                            .filter(|source| {
+                                source.side == signal::api_delta::ApiSnapshotSide::Target
+                            })
+                            .map(|source| source.provenance.as_str())
+                    })
+            })
+            .expect("target-side overlay provenance")
+            .to_owned()
+    } else {
+        target_prefix.clone()
+    };
+    if fact.target_overlay {
+        assert!(
+            target_source.starts_with(&target_prefix),
+            "fixture-specific target overlay provenance: {target_source}"
+        );
+        assert_eq!(target_source.len(), target_prefix.len() + 64);
+    }
+    let expected_target_revision = if unique_base_revisions.len() > 1 {
+        format!("multiple:[{target_source}]")
+    } else {
+        target_source.clone()
+    };
+    assert_eq!(
+        frozen_delta.target_revision, expected_target_revision,
+        "fixture-specific exact target revision"
+    );
+
     let findings = expected["findings"].as_array().expect("API findings");
     assert!(
         !findings.is_empty(),
         "positive pipeline fixture must emit facts"
     );
-    assert!(
-        findings
-            .iter()
-            .any(|finding| { finding["identity"]["name"].as_str() == Some(expected_symbol) })
+    let expected_facts = findings
+        .iter()
+        .filter(|finding| finding["identity"]["name"].as_str() == Some(fact.symbol))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        expected_facts.len(),
+        fact.occurrences,
+        "fixture-specific symbol count"
     );
-    if let Some(forbidden) = forbidden_symbol {
+    if let Some(forbidden) = fact.forbidden_symbol {
         assert!(
             findings
                 .iter()
@@ -782,17 +1003,77 @@ fn assert_dirty_overlay_four_surface_api_parity(
                 .and_then(serde_json::Value::as_str)
                 .is_some()
     }));
+    for finding in expected_facts {
+        assert_eq!(finding["kind"], fact.kind);
+        assert_eq!(finding["confidence"], fact.confidence);
+        assert_eq!(!finding["before"].is_null(), fact.before);
+        assert_eq!(!finding["after"].is_null(), fact.after);
+        assert_eq!(
+            finding
+                .get("unknown_source")
+                .and_then(|source| source["side"].as_str()),
+            fact.unknown_side
+        );
+        if let Some(before) = finding.get("before").filter(|value| !value.is_null()) {
+            assert!(
+                unique_base_revisions
+                    .contains(before["provenance"].as_str().expect("before provenance")),
+                "before side must retain an exact qualified base"
+            );
+        }
+        if let Some(after) = finding.get("after").filter(|value| !value.is_null()) {
+            assert_eq!(after["provenance"], target_source);
+        }
+        if let Some(unknown_source) = finding.get("unknown_source")
+            && unknown_source["side"] == "target"
+        {
+            assert_eq!(unknown_source["provenance"], target_source);
+        }
+    }
+
+    let count_for = |kind: &str| {
+        findings
+            .iter()
+            .filter(|finding| finding["kind"].as_str() == Some(kind))
+            .count() as u64
+    };
+    for (count_key, kind) in [
+        ("added", "added"),
+        ("removed", "removed"),
+        ("changed", "changed"),
+        ("relocated", "relocated"),
+        ("visibility_changed", "visibility_changed"),
+        ("unknown", "unknown"),
+    ] {
+        assert_eq!(
+            expected["counts"][count_key].as_u64(),
+            Some(count_for(kind))
+        );
+    }
+    let count_findings: u64 = [
+        "added",
+        "removed",
+        "changed",
+        "relocated",
+        "visibility_changed",
+        "unknown",
+    ]
+    .into_iter()
+    .map(|key| expected["counts"][key].as_u64().expect("typed count"))
+    .sum();
+    assert_eq!(
+        count_findings as usize,
+        findings.len(),
+        "count findings arithmetic"
+    );
     expected
 }
 
 #[test]
 fn dirty_overlay_pipeline_equal_oid_dirty_only() {
     let (repo_tmp, target_oid) = init_dirty_pipeline_rust_repo("pub fn committed_api() {}\n");
-    fs::write(
-        repo_tmp.path().join("src/lib.rs"),
-        "pub fn dirty_only_api() {}\n",
-    )
-    .expect("dirty Rust");
+    let dirty_bytes = b"pub fn dirty_only_api() {}\n";
+    fs::write(repo_tmp.path().join("src/lib.rs"), dirty_bytes).expect("dirty Rust");
     let output_tmp = tempfile::tempdir().expect("output");
     let pipeline = freeze_dirty_pipeline(
         repo_tmp.path(),
@@ -808,16 +1089,40 @@ fn dirty_overlay_pipeline_equal_oid_dirty_only() {
         pipeline.diffs.is_empty(),
         "equal OIDs produce no patch Diff"
     );
-    assert!(
-        pipeline
-            .rust_api_delta
+    let expected_target_provenance = independent_tracked_overlay_provenance(
+        &target_oid,
+        &[RawTrackedOverlayFixture {
+            status: "modified",
+            old_path: Some("src/lib.rs"),
+            new_path: Some("src/lib.rs"),
+            new_mode: 0o100644,
+            bytes: dirty_bytes,
+        }],
+    );
+    let delta = pipeline
+        .rust_api_delta
+        .as_ref()
+        .expect("equal-OID Rust delta");
+    assert_eq!(delta.target_revision, expected_target_provenance);
+    let dirty_finding = delta
+        .added
+        .iter()
+        .find(|finding| finding.identity.name == "dirty_only_api")
+        .expect("dirty-only finding");
+    assert_eq!(
+        dirty_finding
+            .after
             .as_ref()
-            .expect("equal-OID Rust delta")
-            .target_revision
-            .starts_with("working_tree_overlay:")
+            .expect("dirty-only target side")
+            .provenance,
+        expected_target_provenance
     );
     let pack = emit_frozen_dirty_pipeline(&pipeline);
-    assert_dirty_overlay_four_surface_api_parity(&pack, "dirty_only_api", None);
+    assert_dirty_overlay_four_surface_api_parity(
+        &pipeline,
+        &pack,
+        FourSurfaceFact::added("dirty_only_api", None, true),
+    );
 }
 
 #[test]
@@ -852,18 +1157,31 @@ fn dirty_overlay_pipeline_non_rust_committed_diff_plus_dirty_rust() {
             .all(|file| !file.path.ends_with(".rs"))
     );
     let pack = emit_frozen_dirty_pipeline(&pipeline);
-    assert_dirty_overlay_four_surface_api_parity(&pack, "dirty_rust_api", None);
+    assert_dirty_overlay_four_surface_api_parity(
+        &pipeline,
+        &pack,
+        FourSurfaceFact::added("dirty_rust_api", None, true),
+    );
 }
 
 #[test]
 fn dirty_overlay_pipeline_manifest_deletion_or_rename_generic_profile() {
-    for operation in ["delete", "rename"] {
+    let mut operations = vec!["delete", "rename"];
+    #[cfg(unix)]
+    operations.push("typechange");
+    for operation in operations {
         let (repo_tmp, _target) = init_dirty_pipeline_rust_repo("pub fn manifest_api() {}\n");
         match operation {
             "delete" => {
                 fs::remove_file(repo_tmp.path().join("Cargo.toml")).expect("delete manifest")
             }
             "rename" => run_git_fixture(repo_tmp.path(), &["mv", "Cargo.toml", "Cargo.saved"]),
+            #[cfg(unix)]
+            "typechange" => {
+                fs::remove_file(repo_tmp.path().join("Cargo.toml")).expect("remove manifest");
+                std::os::unix::fs::symlink("README.md", repo_tmp.path().join("Cargo.toml"))
+                    .expect("manifest symlink type-change");
+            }
             _ => unreachable!(),
         }
         let output_tmp = tempfile::tempdir().expect("output");
@@ -880,7 +1198,11 @@ fn dirty_overlay_pipeline_manifest_deletion_or_rename_generic_profile() {
         );
         assert!(pipeline.diffs.is_empty());
         let pack = emit_frozen_dirty_pipeline(&pipeline);
-        let api = assert_dirty_overlay_four_surface_api_parity(&pack, "ManifestRead", None);
+        let api = assert_dirty_overlay_four_surface_api_parity(
+            &pipeline,
+            &pack,
+            FourSurfaceFact::target_unknown("ManifestRead"),
+        );
         assert!(
             api["counts"]["unknown"]
                 .as_u64()
@@ -927,6 +1249,11 @@ fn dirty_overlay_pipeline_untracked_only() {
         merge_gate["rust_api_delta"]["target_revision"],
         format!("git_tree:{target_oid}")
     );
+    let report = read_pipeline_json(&pack.join("report.json"));
+    assert_eq!(
+        report["quality"]["breaking_changes"]["rust_api_delta"]["target_revision"],
+        format!("git_tree:{target_oid}")
+    );
 }
 
 #[test]
@@ -953,9 +1280,9 @@ fn dirty_overlay_pipeline_rewrite_after_capture() {
 
     let pack = emit_frozen_dirty_pipeline(&pipeline);
     assert_dirty_overlay_four_surface_api_parity(
+        &pipeline,
         &pack,
-        "captured_rewrite_api",
-        Some("later_rewrite_api"),
+        FourSurfaceFact::added("captured_rewrite_api", Some("later_rewrite_api"), true),
     );
 }
 
@@ -979,7 +1306,11 @@ fn dirty_overlay_pipeline_restore_after_capture() {
     fs::write(repo_tmp.path().join("src/lib.rs"), committed).expect("restore target bytes");
 
     let pack = emit_frozen_dirty_pipeline(&pipeline);
-    assert_dirty_overlay_four_surface_api_parity(&pack, "captured_restore_api", None);
+    assert_dirty_overlay_four_surface_api_parity(
+        &pipeline,
+        &pack,
+        FourSurfaceFact::added("captured_restore_api", None, true),
+    );
 }
 
 #[test]
@@ -1001,6 +1332,8 @@ fn dirty_overlay_pipeline_remote_equal_head() {
         "pub fn local_dirty_api() {}\n",
     )
     .expect("local dirty");
+    let reflog = repo_tmp.path().join(".git/logs/HEAD");
+    fs::remove_file(&reflog).expect("remove remote-control reflog");
     let output_tmp = tempfile::tempdir().expect("output");
     let pipeline = freeze_dirty_pipeline(
         repo_tmp.path(),
@@ -1013,6 +1346,10 @@ fn dirty_overlay_pipeline_remote_equal_head() {
     assert!(pipeline.target.is_remote);
     assert_eq!(pipeline.target.commit_id, target);
     assert!(
+        !reflog.exists(),
+        "remote target must not read/create HEAD token"
+    );
+    assert!(
         pipeline
             .rust_api_delta
             .as_ref()
@@ -1021,7 +1358,11 @@ fn dirty_overlay_pipeline_remote_equal_head() {
             .starts_with("git_tree:")
     );
     let pack = emit_frozen_dirty_pipeline(&pipeline);
-    assert_dirty_overlay_four_surface_api_parity(&pack, "remote_api", Some("local_dirty_api"));
+    assert_dirty_overlay_four_surface_api_parity(
+        &pipeline,
+        &pack,
+        FourSurfaceFact::added("remote_api", Some("local_dirty_api"), false),
+    );
 }
 
 #[test]
@@ -1040,6 +1381,8 @@ fn dirty_overlay_pipeline_off_head() {
         "pub fn local_head_dirty_api() {}\n",
     )
     .expect("local HEAD dirt");
+    let reflog = repo_tmp.path().join(".git/logs/HEAD");
+    fs::remove_file(&reflog).expect("remove off-HEAD-control reflog");
     let output_tmp = tempfile::tempdir().expect("output");
     let pipeline = freeze_dirty_pipeline(
         repo_tmp.path(),
@@ -1052,6 +1395,10 @@ fn dirty_overlay_pipeline_off_head() {
     assert_eq!(pipeline.target.commit_id, target);
     assert_ne!(pipeline.repo.head_commit_id().expect("HEAD"), target);
     assert!(
+        !reflog.exists(),
+        "initially off-HEAD target must not read/create HEAD token"
+    );
+    assert!(
         pipeline
             .rust_api_delta
             .as_ref()
@@ -1061,9 +1408,228 @@ fn dirty_overlay_pipeline_off_head() {
     );
     let pack = emit_frozen_dirty_pipeline(&pipeline);
     assert_dirty_overlay_four_surface_api_parity(
+        &pipeline,
         &pack,
-        "off_head_api",
-        Some("local_head_dirty_api"),
+        FourSurfaceFact::added("off_head_api", Some("local_head_dirty_api"), false),
+    );
+}
+
+#[test]
+fn dirty_overlay_pipeline_head_drift_fails_closed_before_capture() {
+    let (repo_tmp, target) = init_dirty_pipeline_rust_repo("pub fn target_api() {}\n");
+    run_git_fixture(repo_tmp.path(), &["checkout", "-q", "-b", "detour"]);
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn detour_api() {}\n",
+    )
+    .expect("detour source");
+    let detour = commit_pipeline_paths(repo_tmp.path(), "detour", &["src/lib.rs"]);
+    run_git_fixture(repo_tmp.path(), &["checkout", "-q", "main"]);
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pack = output_tmp.path().join("pack");
+
+    let error = try_freeze_dirty_pipeline(
+        repo_tmp.path(),
+        pack.clone(),
+        "main",
+        &["main"],
+        false,
+        || {
+            run_git_fixture(repo_tmp.path(), &["checkout", "-q", "detour"]);
+            Ok(())
+        },
+    )
+    .err()
+    .expect("HEAD drift must fail closed");
+
+    assert_ne!(target, detour);
+    assert!(
+        error.to_string().contains("selector token mismatch"),
+        "{error:#}"
+    );
+    assert!(error.to_string().contains("token B"), "{error:#}");
+    assert!(error.to_string().contains("expected HEAD="), "{error:#}");
+    assert!(error.to_string().contains("observed HEAD="), "{error:#}");
+    assert!(!pack.exists(), "HEAD drift must fail before pack emission");
+}
+
+#[test]
+fn dirty_overlay_pipeline_head_aba_fails_closed_before_capture() {
+    let (repo_tmp, target) = init_dirty_pipeline_rust_repo("pub fn target_api() {}\n");
+    run_git_fixture(repo_tmp.path(), &["checkout", "-q", "-b", "detour"]);
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn detour_api() {}\n",
+    )
+    .expect("detour source");
+    let detour = commit_pipeline_paths(repo_tmp.path(), "detour", &["src/lib.rs"]);
+    run_git_fixture(repo_tmp.path(), &["checkout", "-q", "main"]);
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pack = output_tmp.path().join("pack");
+
+    let error = try_freeze_dirty_pipeline(
+        repo_tmp.path(),
+        pack.clone(),
+        "main",
+        &["main"],
+        false,
+        || {
+            run_git_fixture(repo_tmp.path(), &["checkout", "-q", "detour"]);
+            run_git_fixture(repo_tmp.path(), &["checkout", "-q", "main"]);
+            Ok(())
+        },
+    )
+    .err()
+    .expect("HEAD ABA must fail closed");
+
+    assert_ne!(target, detour);
+    assert_eq!(
+        Repository::open(repo_tmp.path())
+            .expect("repo after ABA")
+            .head_commit_id()
+            .expect("HEAD after ABA"),
+        target
+    );
+    assert!(
+        error.to_string().contains("selector token mismatch"),
+        "{error:#}"
+    );
+    assert!(
+        error.to_string().contains("before tracked capture"),
+        "{error:#}"
+    );
+    assert!(error.to_string().contains("entries="), "{error:#}");
+    assert!(error.to_string().contains("reflog_sha256="), "{error:#}");
+    assert!(!pack.exists(), "HEAD ABA must fail before pack emission");
+}
+
+#[test]
+fn dirty_overlay_pipeline_current_only_no_base_has_no_optional_rust_surfaces() {
+    let (repo_tmp, _target) = init_dirty_pipeline_rust_repo("pub fn current_only() {}\n");
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn dirty_current_only() {}\n",
+    )
+    .expect("dirty current-only source");
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pipeline = freeze_dirty_pipeline(
+        repo_tmp.path(),
+        output_tmp.path().join("pack"),
+        "main",
+        &[],
+        false,
+    );
+
+    assert!(pipeline.bases.is_empty());
+    assert!(pipeline.comparison_bases.is_empty());
+    assert!(pipeline.diffs.is_empty());
+    assert!(pipeline.rust_api_delta.is_none());
+    let pack = emit_frozen_dirty_pipeline(&pipeline);
+    assert!(!pack.join("20_quality/PUBLIC_API_DIFF.json").exists());
+    assert!(!pack.join("20_quality/BREAKING_CHANGES.json").exists());
+    assert!(!pack.join("20_quality/BREAKING_CHANGES.md").exists());
+    let report = read_pipeline_json(&pack.join("report.json"));
+    let merge_gate = read_pipeline_json(&pack.join("00_summary/MERGE_GATE.json"));
+    assert!(report["quality"]["breaking_changes"]["rust_api_delta"].is_null());
+    assert!(merge_gate["rust_api_delta"].is_null());
+}
+
+#[test]
+fn dirty_overlay_pipeline_duplicate_equal_oid_anchors_emit_once() {
+    let (repo_tmp, base) = init_dirty_pipeline_rust_repo("");
+    run_git_fixture(repo_tmp.path(), &["checkout", "-q", "-b", "feature"]);
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn duplicate_anchor_api() {}\n",
+    )
+    .expect("target source");
+    let target = commit_pipeline_paths(repo_tmp.path(), "feature", &["src/lib.rs"]);
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pipeline = freeze_dirty_pipeline(
+        repo_tmp.path(),
+        output_tmp.path().join("pack"),
+        "feature",
+        &["main", "main"],
+        false,
+    );
+
+    assert_eq!(pipeline.comparison_bases.len(), 2);
+    assert!(
+        pipeline
+            .comparison_bases
+            .iter()
+            .all(|anchor| anchor.commit_id == base)
+    );
+    assert_eq!(pipeline.target.commit_id, target);
+    let delta = pipeline.rust_api_delta.as_ref().expect("duplicate delta");
+    assert_eq!(delta.added.len(), 1);
+    assert!(!delta.base_revision.starts_with("multiple:"));
+    assert!(!delta.added[0].id.contains("|comparison:"));
+    let pack = emit_frozen_dirty_pipeline(&pipeline);
+    assert_dirty_overlay_four_surface_api_parity(
+        &pipeline,
+        &pack,
+        FourSurfaceFact::added("duplicate_anchor_api", None, false),
+    );
+}
+
+#[test]
+fn dirty_overlay_pipeline_multi_base_shared_target_retains_qualified_facts() {
+    let (repo_tmp, base) = init_dirty_pipeline_rust_repo("");
+    run_git_fixture(repo_tmp.path(), &["branch", "base", &base]);
+    fs::write(repo_tmp.path().join("README.md"), "middle\n").expect("middle docs");
+    let middle = commit_pipeline_paths(repo_tmp.path(), "middle", &["README.md"]);
+    run_git_fixture(repo_tmp.path(), &["branch", "middle", &middle]);
+    run_git_fixture(repo_tmp.path(), &["checkout", "-q", "-b", "feature"]);
+    fs::write(
+        repo_tmp.path().join("src/lib.rs"),
+        "pub fn shared_target_api() {}\n",
+    )
+    .expect("shared target source");
+    let target = commit_pipeline_paths(repo_tmp.path(), "feature", &["src/lib.rs"]);
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pipeline = freeze_dirty_pipeline(
+        repo_tmp.path(),
+        output_tmp.path().join("pack"),
+        "feature",
+        &["base", "middle"],
+        false,
+    );
+
+    assert_eq!(
+        pipeline
+            .comparison_bases
+            .iter()
+            .map(|anchor| anchor.commit_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![base.as_str(), middle.as_str()]
+    );
+    let delta = pipeline.rust_api_delta.as_ref().expect("multi-base delta");
+    let target_provenance = format!("git_tree:{target}");
+    let shared = delta
+        .added
+        .iter()
+        .filter(|finding| finding.identity.name == "shared_target_api")
+        .collect::<Vec<_>>();
+    assert_eq!(shared.len(), 2);
+    assert!(shared.iter().all(|finding| {
+        finding.id.contains("|comparison:")
+            && finding
+                .after
+                .as_ref()
+                .is_some_and(|after| after.provenance == target_provenance)
+    }));
+    assert!(delta.target_revision.contains(&target_provenance));
+    assert!(delta.base_revision.contains(&format!("git_tree:{base}")));
+    assert!(delta.base_revision.contains(&format!("git_tree:{middle}")));
+    let pack = emit_frozen_dirty_pipeline(&pipeline);
+    assert_dirty_overlay_four_surface_api_parity(
+        &pipeline,
+        &pack,
+        FourSurfaceFact {
+            occurrences: 2,
+            ..FourSurfaceFact::added("shared_target_api", None, false)
+        },
     );
 }
 

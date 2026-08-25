@@ -502,6 +502,17 @@ untracked-only, remote, and local off-HEAD targets use exact `GitTree` bytes. A
 dirty local HEAD uses an immutable `WorkingTreeOverlay` whose `dirty_digest`
 hashes the exact captured tracked inventory and owned bytes/states.
 
+Before accepting that overlay, prview reads the current worktree's own
+`<gitdir>/logs/HEAD` without modifying it and compares one HEAD selector token
+before the capture seam, one immediately before capture, and one after capture.
+The token binds HEAD, complete reflog-entry count, byte length, and reflog
+SHA-256. Before opening, symlink, directory, and other non-regular reflog paths
+are rejected without being followed; an empty regular reflog also fails closed.
+A checkout drift or `T -> H -> T` ABA therefore fails closed instead of mixing
+another checkout's bytes into the target. If the reflog is missing, clean and
+untracked-only input may still use the exact target tree; a dirty tracked
+overlay fails with an explicit stable-reflog error and emits no partial pack.
+
 The tracked digest is separate from the broad pack-level
 `PROVENANCE.json.worktree.status_digest`, which also includes unrelated
 untracked state. The tracked capture budget is 64 MiB per run; an affected path
@@ -510,6 +521,15 @@ to a later filesystem read. Rewrites or restoration after capture cannot change
 the `ApiDelta` projected into `PUBLIC_API_DIFF.json`, `BREAKING_CHANGES.json`,
 `report.json`, or `MERGE_GATE.json`. Duplicate exact OID anchors are compared
 once; distinct bases retain separate provenance.
+
+Rust scope requires a present, added, renamed-in, or unreadable regular
+`Cargo.toml` on at least one exact side. An unreadable regular manifest emits
+typed `ManifestRead` unknown evidence. Directories, symlinks,
+deleted/renamed-away manifests, and explicitly non-regular entries do not
+establish it, while a regular manifest on the opposite revision still exposes
+deletion, rename, or type-change truth. With no comparison, or with no
+scope-establishing manifest on either side, optional Rust artifacts are absent
+and the embedded Rust fields in `report.json` and `MERGE_GATE.json` are null.
 
 JS/TS exports remain on the legacy diff analyzer behind a side-aware boundary:
 a cross-language rename retains only its JS/TS side, including standard quoted

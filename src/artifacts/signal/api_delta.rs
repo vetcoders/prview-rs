@@ -317,6 +317,7 @@ impl TargetTree<'_> {
 fn select_target_tree<'repo>(
     repo: &'repo Repository,
     resolved_target: &ResolvedRef,
+    before_capture: impl FnOnce() -> Result<()>,
 ) -> Result<TargetTree<'repo>> {
     use super::revision_source::{
         CapturedWorkingTreeOverlay, GitTree, TRACKED_CAPTURE_BYTE_BUDGET, TrackedOverlayCapture,
@@ -343,13 +344,45 @@ fn select_target_tree<'repo>(
         return exact_tree();
     }
 
+    // Token A binds the eligibility decision itself. The private closure is a
+    // deterministic test seam placed after that decision and before token B;
+    // production always supplies a no-op.
+    let token_before = local_selector_token(
+        repo,
+        &resolved_target.commit_id,
+        "token A before capture seam",
+    )?;
+    before_capture().context("local overlay before_capture seam failed")?;
+    let token_before_capture = local_selector_token(
+        repo,
+        &resolved_target.commit_id,
+        "token B immediately before tracked capture",
+    )?;
+    require_matching_selector_token(
+        "before tracked capture",
+        &token_before,
+        &token_before_capture,
+    )?;
+
     let capture = TrackedOverlayCapture::capture_tracked(
         repo,
         &resolved_target.commit_id,
         TRACKED_CAPTURE_BYTE_BUDGET,
     )?;
+    let token_after_capture = local_selector_token(
+        repo,
+        &resolved_target.commit_id,
+        "token C after tracked capture",
+    )?;
+    require_matching_selector_token("after tracked capture", &token_before, &token_after_capture)?;
     if capture.is_empty() {
         return exact_tree();
+    }
+    if token_before.is_none() {
+        anyhow::bail!(
+            "dirty local overlay requires stable per-worktree HEAD reflog for target {}",
+            resolved_target.commit_id
+        );
     }
 
     Ok(TargetTree::WorkingTreeOverlay(
@@ -357,12 +390,78 @@ fn select_target_tree<'repo>(
     ))
 }
 
+fn local_selector_token(
+    repo: &Repository,
+    expected_target_oid: &str,
+    phase: &str,
+) -> Result<Option<crate::git::HeadSelectorToken>> {
+    let token = repo.head_selector_token().with_context(|| {
+        format!(
+            "local overlay selector token unavailable at {phase} for target {expected_target_oid}"
+        )
+    })?;
+    if token.is_none() {
+        let observed_head = repo.head_commit_id().with_context(|| {
+            format!(
+                "local overlay HEAD unavailable at {phase} after missing-reflog proof for target {expected_target_oid}"
+            )
+        })?;
+        if observed_head != expected_target_oid {
+            anyhow::bail!(
+                "local overlay selector token mismatch at {phase}: expected HEAD={expected_target_oid}, observed HEAD={observed_head} with missing per-worktree logs/HEAD"
+            );
+        }
+    }
+    if let Some(observed) = &token
+        && observed.head_oid != expected_target_oid
+    {
+        anyhow::bail!(
+            "local overlay selector token mismatch at {phase}: expected HEAD={expected_target_oid}, observed {}",
+            observed.state()
+        );
+    }
+    Ok(token)
+}
+
+fn require_matching_selector_token(
+    phase: &str,
+    expected: &Option<crate::git::HeadSelectorToken>,
+    observed: &Option<crate::git::HeadSelectorToken>,
+) -> Result<()> {
+    if expected == observed {
+        return Ok(());
+    }
+    let state = |token: &Option<crate::git::HeadSelectorToken>| {
+        token
+            .as_ref()
+            .map(crate::git::HeadSelectorToken::state)
+            .unwrap_or_else(|| "missing per-worktree logs/HEAD".to_owned())
+    };
+    anyhow::bail!(
+        "local overlay selector token mismatch at {phase}: expected [{}], observed [{}]",
+        state(expected),
+        state(observed)
+    )
+}
+
 fn revision_has_rust_manifest_scope(source: &dyn RevisionFileSource) -> bool {
     source.entries().iter().any(|entry| {
-        std::path::Path::new(&entry.path)
+        let is_manifest = std::path::Path::new(&entry.path)
             .file_name()
             .and_then(|name| name.to_str())
-            == Some("Cargo.toml")
+            == Some("Cargo.toml");
+        if !is_manifest || entry.kind != super::revision_source::RevisionEntryKind::RegularFile {
+            return false;
+        }
+        match &entry.state {
+            super::revision_source::RevisionEntryState::Present
+            | super::revision_source::RevisionEntryState::Added
+            | super::revision_source::RevisionEntryState::RenamedFrom { .. }
+            | super::revision_source::RevisionEntryState::Unreadable { .. } => true,
+            super::revision_source::RevisionEntryState::Deleted
+            | super::revision_source::RevisionEntryState::Renamed { .. }
+            | super::revision_source::RevisionEntryState::NonRegular { .. } => false,
+        }
     })
 }
 
@@ -381,6 +480,15 @@ pub fn prepare_rust_api_delta(
     comparison_bases: &[ResolvedRef],
     resolved_target: &ResolvedRef,
 ) -> Result<Option<ApiDelta>> {
+    prepare_rust_api_delta_with_before_capture(repo, comparison_bases, resolved_target, || Ok(()))
+}
+
+fn prepare_rust_api_delta_with_before_capture(
+    repo: &Repository,
+    comparison_bases: &[ResolvedRef],
+    resolved_target: &ResolvedRef,
+    before_capture: impl FnOnce() -> Result<()>,
+) -> Result<Option<ApiDelta>> {
     use super::api_surface::snapshot_rust_api;
     use super::revision_source::GitTree;
 
@@ -388,7 +496,7 @@ pub fn prepare_rust_api_delta(
         return Ok(None);
     }
 
-    let target_tree = select_target_tree(repo, resolved_target)?;
+    let target_tree = select_target_tree(repo, resolved_target, before_capture)?;
     let unique_bases = unique_exact_comparison_bases(comparison_bases);
     let base_trees = unique_bases
         .iter()
@@ -414,6 +522,21 @@ pub fn prepare_rust_api_delta(
     }
 
     Ok(Some(merge_comparisons(comparisons)))
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_rust_api_delta_with_before_capture_for_test(
+    repo: &Repository,
+    comparison_bases: &[ResolvedRef],
+    resolved_target: &ResolvedRef,
+    before_capture: impl FnOnce() -> Result<()>,
+) -> Result<Option<ApiDelta>> {
+    prepare_rust_api_delta_with_before_capture(
+        repo,
+        comparison_bases,
+        resolved_target,
+        before_capture,
+    )
 }
 
 fn unique_exact_comparison_bases(bases: &[ResolvedRef]) -> Vec<&ResolvedRef> {
@@ -1360,6 +1483,42 @@ mod tests {
         }
     }
 
+    struct UnreadableManifestSource {
+        provenance: RevisionProvenance,
+    }
+
+    impl RevisionFileSource for UnreadableManifestSource {
+        fn provenance(&self) -> &RevisionProvenance {
+            &self.provenance
+        }
+
+        fn entries(&self) -> Vec<RevisionEntry> {
+            vec![RevisionEntry {
+                path: "Cargo.toml".to_owned(),
+                baseline_object_id: Some("fixture:Cargo.toml".to_owned()),
+                mode: 0o100644,
+                kind: RevisionEntryKind::RegularFile,
+                state: RevisionEntryState::Unreadable {
+                    reason: "fixture manifest read refused".to_owned(),
+                },
+                provenance: self.provenance.clone(),
+            }]
+        }
+
+        fn read(&self, path: &str) -> Result<RevisionRead, RevisionSourceError> {
+            Ok(if path == "Cargo.toml" {
+                RevisionRead::Unreadable {
+                    reason: "fixture manifest read refused".to_owned(),
+                    provenance: self.provenance.clone(),
+                }
+            } else {
+                RevisionRead::Missing {
+                    provenance: self.provenance.clone(),
+                }
+            })
+        }
+    }
+
     fn corpus_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/api_surface")
     }
@@ -1400,6 +1559,32 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn commit_all(repo: &Path, message: &str) -> String {
+        run_git(repo, &["add", "-A"]);
+        run_git(
+            repo,
+            &[
+                "-c",
+                "user.name=prview test",
+                "-c",
+                "user.email=prview@example.test",
+                "commit",
+                "-m",
+                message,
+            ],
+        );
+        let output = git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .expect("rev-parse");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("ASCII OID")
+            .trim()
+            .to_owned()
     }
 
     fn fixture_delta(cell: &str) -> ApiDelta {
@@ -2303,6 +2488,90 @@ mod tests {
     }
 
     #[test]
+    fn dirty_overlay_without_reflog_clean_and_untracked_only_use_exact_tree() {
+        let (tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "", "pub fn committed_api() {}\n"),
+        ]);
+        let reflog = git2::Repository::open(tmp.path())
+            .expect("git repo")
+            .path()
+            .join("logs/HEAD");
+        fs::remove_file(&reflog).expect("remove fixture reflog");
+
+        let clean = prepare_rust_api_delta(
+            &repo,
+            &[comparison_base("main", &base)],
+            &resolved_target(&target, false),
+        )
+        .expect("clean missing-reflog fallback")
+        .expect("clean delta");
+        assert_eq!(clean.target_revision, format!("git_tree:{target}"));
+        assert!(!reflog.exists(), "clean fallback must not create logs/HEAD");
+
+        fs::write(
+            tmp.path().join("src/untracked.rs"),
+            "pub fn untracked_api() {}\n",
+        )
+        .expect("untracked source");
+        let untracked = prepare_rust_api_delta(
+            &repo,
+            &[comparison_base("main", &base)],
+            &resolved_target(&target, false),
+        )
+        .expect("untracked missing-reflog fallback")
+        .expect("untracked delta");
+        assert_eq!(untracked.target_revision, format!("git_tree:{target}"));
+        assert!(
+            untracked
+                .findings()
+                .iter()
+                .all(|finding| finding.identity.name != "untracked_api")
+        );
+        assert!(
+            !reflog.exists(),
+            "untracked fallback must not create logs/HEAD"
+        );
+    }
+
+    #[test]
+    fn dirty_overlay_without_reflog_tracked_change_fails_closed() {
+        let (tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "", "pub fn committed_api() {}\n"),
+        ]);
+        let reflog = git2::Repository::open(tmp.path())
+            .expect("git repo")
+            .path()
+            .join("logs/HEAD");
+        fs::remove_file(&reflog).expect("remove fixture reflog");
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn dirty_api() {}\n")
+            .expect("dirty tracked source");
+
+        let error = prepare_rust_api_delta(
+            &repo,
+            &[comparison_base("main", &base)],
+            &resolved_target(&target, false),
+        )
+        .expect_err("dirty missing-reflog overlay must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("dirty local overlay requires stable per-worktree HEAD reflog"),
+            "{error:#}"
+        );
+        assert!(!reflog.exists(), "failure must not create logs/HEAD");
+    }
+
+    #[test]
     fn revision_scope_rejects_a_genuinely_non_rust_comparison() {
         let (_tmp, repo, base, target) = make_test_repo(&[("README.md", "base\n", "target\n")]);
         assert!(
@@ -2313,6 +2582,90 @@ mod tests {
             )
             .unwrap()
             .is_none()
+        );
+    }
+
+    #[test]
+    fn regular_unreadable_manifest_alone_establishes_scope_and_emits_typed_unknown() {
+        let no_manifest = MemorySource {
+            provenance: RevisionProvenance::GitTree {
+                commit_oid: "1111111111111111111111111111111111111111".to_owned(),
+            },
+            files: BTreeMap::new(),
+        };
+        let unreadable_manifest = UnreadableManifestSource {
+            provenance: RevisionProvenance::GitTree {
+                commit_oid: "2222222222222222222222222222222222222222".to_owned(),
+            },
+        };
+
+        assert!(
+            !revision_has_rust_manifest_scope(&no_manifest),
+            "the opposite side must not provide a manifest that masks this branch"
+        );
+        assert!(revision_has_rust_manifest_scope(&unreadable_manifest));
+
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&no_manifest),
+            &snapshot_rust_api(&unreadable_manifest),
+        );
+        assert_eq!(delta.unknown.len(), 1);
+        let unknown = &delta.unknown[0];
+        assert_eq!(unknown.identity.name, "ManifestRead");
+        assert_eq!(unknown.kind, ApiDeltaKind::Unknown);
+        assert_eq!(unknown.confidence, ApiDeltaConfidence::Unknown);
+        assert!(unknown.before.is_none());
+        assert!(unknown.after.is_none());
+        assert!(unknown.unknown_source.as_ref().is_some_and(|source| {
+            source.side == ApiSnapshotSide::Target
+                && source.source_path == "Cargo.toml"
+                && source.provenance == "git_tree:2222222222222222222222222222222222222222"
+        }));
+    }
+
+    #[test]
+    fn revision_scope_rejects_directory_only_cargo_toml() {
+        let (_tmp, repo, base, target) = make_test_repo(&[
+            ("Cargo.toml/not-a-manifest", "base\n", "target\n"),
+            ("src/lib.rs", "pub fn base() {}\n", "pub fn target() {}\n"),
+        ]);
+        assert!(
+            prepare_rust_api_delta(
+                &repo,
+                &[comparison_base("main", &base)],
+                &resolved_target(&target, false),
+            )
+            .expect("directory-only scope")
+            .is_none(),
+            "a Tree entry named Cargo.toml is not a live regular manifest"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revision_scope_rejects_symlink_only_cargo_toml() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(tmp.path().join("src")).expect("src");
+        fs::write(tmp.path().join("README.md"), "base\n").expect("README base");
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn base() {}\n").expect("base source");
+        std::os::unix::fs::symlink("README.md", tmp.path().join("Cargo.toml"))
+            .expect("Cargo.toml symlink");
+        let base = commit_all(tmp.path(), "base");
+        fs::write(tmp.path().join("README.md"), "target\n").expect("README target");
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn target() {}\n").expect("target source");
+        let target = commit_all(tmp.path(), "target");
+        let repo = Repository::open(tmp.path()).expect("repo");
+
+        assert!(
+            prepare_rust_api_delta(
+                &repo,
+                &[comparison_base("main", &base)],
+                &resolved_target(&target, false),
+            )
+            .expect("symlink-only scope")
+            .is_none(),
+            "a Symlink entry named Cargo.toml is not a live regular manifest"
         );
     }
 
