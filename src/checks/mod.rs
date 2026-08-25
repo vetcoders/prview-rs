@@ -701,40 +701,7 @@ async fn run_all_checks(
         .iter()
         .any(|c| matches!(c.name(), "Ruff" | "Mypy" | "Pytest"));
     if has_python_checks && config.profile.runs_python_checks() && which::which("uv").is_ok() {
-        if emit {
-            print!("  {} Syncing Python venv...", "●".blue());
-            let _ = std::io::stdout().flush();
-        }
-        match run_command_with_timeout(
-            "uv",
-            &["sync", "--quiet"],
-            &config.repo_root,
-            CHECK_TIMEOUT_SECS,
-        )
-        .await
-        {
-            Ok(output) => {
-                if emit {
-                    if output.status.success() {
-                        print!("\r\x1b[2K  {} Python venv ready\n", "✓".green());
-                    } else {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        print!(
-                            "\r\x1b[2K  {} uv sync failed: {}\n",
-                            "⚠".yellow(),
-                            stderr.lines().next().unwrap_or("unknown error")
-                        );
-                    }
-                    let _ = std::io::stdout().flush();
-                }
-            }
-            Err(e) => {
-                if emit {
-                    print!("\r\x1b[2K  {} uv sync: {}\n", "⚠".yellow(), e);
-                    let _ = std::io::stdout().flush();
-                }
-            }
-        }
+        presync_python_venv(config, governor, emit).await?;
     }
 
     // Materialise ONE shared target snapshot for the whole run so every
@@ -906,6 +873,79 @@ async fn run_all_checks(
     }
 
     Ok((results, skipped))
+}
+
+/// Build the Python venv once, before the gates that need it start their own
+/// timeout clocks.
+///
+/// Runs INSIDE a child scope, which is what makes it cancellable. `uv sync` on a
+/// cold venv is one of the longest single commands a run issues, and outside a
+/// scope [`crate::governor::register_active_child`] is a no-op: `cancel` had no
+/// pid to signal, so a Ctrl-C during it printed "stopping running tools" and
+/// then waited out the full five-minute timeout with the build still running.
+///
+/// Refuses to start at all on an already-cancelled run — the checks that would
+/// consume the venv are never going to run.
+async fn presync_python_venv(
+    config: &Config,
+    governor: &Arc<ResourceGovernor>,
+    emit: bool,
+) -> Result<(), Cancelled> {
+    use colored::Colorize;
+    use std::io::Write;
+
+    if governor.is_cancelled() {
+        return Err(Cancelled);
+    }
+
+    if emit {
+        print!("  {} Syncing Python venv...", "●".blue());
+        let _ = std::io::stdout().flush();
+    }
+
+    let outcome = crate::governor::with_child_scope(
+        Arc::clone(governor),
+        "uv sync",
+        run_command_with_timeout(
+            "uv",
+            &["sync", "--quiet"],
+            &config.repo_root,
+            CHECK_TIMEOUT_SECS,
+        ),
+    )
+    .await;
+
+    match outcome {
+        Ok(output) => {
+            if emit {
+                if output.status.success() {
+                    print!("\r\x1b[2K  {} Python venv ready\n", "✓".green());
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    print!(
+                        "\r\x1b[2K  {} uv sync failed: {}\n",
+                        "⚠".yellow(),
+                        stderr.lines().next().unwrap_or("unknown error")
+                    );
+                }
+                let _ = std::io::stdout().flush();
+            }
+        }
+        Err(e) => {
+            if emit {
+                print!("\r\x1b[2K  {} uv sync: {}\n", "⚠".yellow(), e);
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+
+    // A cancel that landed mid-sync SIGKILLed the build; the run is over, and
+    // going on to start the gates it was preparing for would be worse than
+    // saying so.
+    if governor.is_cancelled() {
+        return Err(Cancelled);
+    }
+    Ok(())
 }
 
 /// Callback type for check events (used by TUI)
@@ -2423,6 +2463,22 @@ mod tests {
         assert!(
             !uses_shared_scan_dir("Semgrep"),
             "semgrep manages its own worktree (needs a baseline commit) and must stay out",
+        );
+    }
+
+    /// `uv sync` on a cold venv is one of the longest single commands a run
+    /// issues. Starting one for a run that has already been cancelled means the
+    /// operator waits out a build whose gates are never going to run.
+    #[tokio::test]
+    async fn a_cancelled_run_does_not_start_a_cold_venv_build() {
+        let config = rust_config(true, true, true);
+        let governor = Arc::new(ResourceGovernor::with_budget(2, 1));
+        governor.cancel();
+
+        assert_eq!(
+            presync_python_venv(&config, &governor, false).await,
+            Err(Cancelled),
+            "a cancelled run must not begin building a venv it will never use",
         );
     }
 

@@ -347,9 +347,10 @@ static CHILD_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Run `future` with its spawned children attributed to `governor` under `label`.
 ///
 /// Outside such a scope [`register_active_child`] is a no-op, which is the
-/// correct behaviour for the process-spawning helpers the run also calls outside
-/// the checks stage (the `uv sync` pre-step, the MCP adapter): they are not part
-/// of a governed run and must not be killed as if they were.
+/// correct behaviour for the process-spawning helpers that are not part of a
+/// governed run (the MCP adapter) and must not be killed as if they were. It is
+/// NOT a licence to leave a run's own long commands unscoped: the `uv sync`
+/// pre-step spent five minutes ignoring a Ctrl-C that way, and is scoped now.
 pub async fn with_child_scope<F>(
     governor: Arc<ResourceGovernor>,
     label: &str,
@@ -606,7 +607,7 @@ mod tests {
 
         assert!(
             register_active_child(4242).is_none(),
-            "the MCP adapter and the uv pre-step spawn outside any run scope",
+            "the MCP adapter spawns outside any run scope",
         );
         assert_eq!(governor.inflight_count(), 0);
 

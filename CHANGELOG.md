@@ -28,6 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verdict computed from it. Cancellation is now checked between the stages, so
   the run ends in exit `130` as the contract says. A partial pack may remain on
   disk; nothing claims a verdict from it.
+- `--watch` ends on the first Ctrl-C. The iteration reported a cancelled run as
+  an ordinary error and carried on watching, but the governor it shares with
+  every later iteration was by then permanently closed — so each subsequent edit
+  emitted a pack with an empty `30_context` and announced "Regenerated
+  artifacts", until a second interrupt killed the process and left the temporary
+  worktrees behind. A cancel arriving while the watcher is idle ends it too.
+- Ctrl-C during the `uv sync` pre-step stops it. The Python venv build ran
+  outside any child scope, so the governor held no pid for it and `cancel()`
+  signalled nothing: the run announced that it was stopping its tools and then
+  waited out the full five-minute timeout with `uv` still building. It is now
+  registered like every other child, and is not started at all for a run that
+  has already been cancelled.
 
 ### Added
 

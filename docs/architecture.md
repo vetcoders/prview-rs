@@ -1073,6 +1073,25 @@ returned guard unregisters on drop, so the success, timeout and error paths all
 leave the registry clean — a pid the governor still believes in is a pid it may
 signal, and pids are reused.
 
+**`--watch` ends on the first interrupt.** One `App`, and therefore one governor,
+is shared by every iteration, and `Semaphore::close` is one-way — so a cancelled
+watcher can never grant work again. The iteration used to report any failure of
+its quick run as an ordinary error and carry on, which turned that into a silent
+degradation: every later edit produced a pack with an empty `30_context` under a
+cheerful "Regenerated artifacts", until the operator interrupted a second time
+and took the cleanup with them. A cancellation is now propagated out of the
+iteration, and both watch loops (the filesystem watcher and the polling fallback)
+carry a biased `governor.cancelled()` arm so a cancel arriving while the watcher
+is idle ends it too.
+
+**Everything long the run spawns must be in a child scope.** The `uv sync`
+pre-step was not, and outside a scope `register_active_child` is a no-op, so
+`cancel()` had no pid to signal: a Ctrl-C during a cold venv build printed
+"stopping running tools" and then waited out the full timeout with `uv` still
+running. It is scoped now, and refuses to start on an already-cancelled run. The
+heuristics stage needs no scope — it spawns no processes; loctree runs in-process
+behind `spawn_blocking`.
+
 `--tui` is deliberately NOT wrapped: it puts the terminal in raw mode, so Ctrl-C
 arrives as a key event and the TUI owns its own quit path.
 

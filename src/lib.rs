@@ -459,6 +459,21 @@ impl App {
 
                 loop {
                     tokio::select! {
+                        biased;
+
+                        // A cancelled watcher has nothing left to run. One
+                        // governor is shared by every iteration and closing it
+                        // is one-way, so without this arm the first Ctrl-C left
+                        // the watcher alive on a budget that could never grant
+                        // work again: each later edit produced a pack with an
+                        // empty context stage and printed "Regenerated
+                        // artifacts" over it, until the operator interrupted a
+                        // second time. Biased so the cancel wins a race with an
+                        // edit that landed at the same moment.
+                        () = self.governor.cancelled() => {
+                            return Err(governor::Cancelled.into());
+                        }
+
                         maybe_signal = receiver.recv() => match maybe_signal {
                             Some(WatchSignal::FilesChanged) => {
                                 tokio::time::sleep(debounce_window).await;
@@ -609,6 +624,10 @@ impl App {
     ) -> Result<()> {
         use colored::Colorize;
 
+        // Asked before the change is even measured: a cancelled watcher is over,
+        // and reading the repo state for it would only delay saying so.
+        self.ensure_not_cancelled()?;
+
         let current_hash = self.get_repo_state_hash()?;
         if current_hash == *last_hash {
             return Ok(());
@@ -628,6 +647,11 @@ impl App {
                     println!("{} Regenerated artifacts", "✓".green());
                 }
             }
+            // A cancelled run is not a failed iteration — it is the end of the
+            // watch, and the only thing that can end it. Reporting it as an
+            // ordinary error and carrying on is what kept `--watch` running
+            // after the first Ctrl-C.
+            Err(e) if governor::is_cancellation(&e) => return Err(e),
             Err(e) => {
                 if emit_human_stdout {
                     println!("{} Error: {}", "✗".red(), e);
@@ -651,7 +675,17 @@ impl App {
         emit_human_stdout: bool,
     ) -> Result<()> {
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                biased;
+
+                // Same reason as the watcher loop above: a cancel must end the
+                // polling fallback too, not wait out its next interval.
+                () = self.governor.cancelled() => {
+                    return Err(governor::Cancelled.into());
+                }
+
+                () = tokio::time::sleep(interval) => {}
+            }
             self.run_watch_iteration(last_hash, emit_human_stdout)
                 .await?;
         }
@@ -1038,6 +1072,34 @@ mod tests {
             std::fs::read_dir(out.path()).unwrap().count(),
             0,
             "nothing may be written for a run that was already cancelled",
+        );
+    }
+
+    /// The first Ctrl-C must END `--watch`, not degrade it. The iteration used
+    /// to report every failure from the quick run as an ordinary error and carry
+    /// on, so a cancelled watcher stayed alive on a governor that can never
+    /// grant work again: each later edit produced a pack with an empty context
+    /// stage under a cheerful "Regenerated artifacts", until the operator
+    /// interrupted a second time and took the cleanup with them.
+    #[tokio::test]
+    async fn a_cancelled_watch_iteration_ends_the_watch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let config = reviewable_repo(tmp.path(), out.path());
+
+        let app = crate::App::from_config(config).unwrap();
+        app.governor().cancel();
+
+        let mut last_hash = String::new();
+        let err = app
+            .run_watch_iteration(&mut last_hash, false)
+            .await
+            .expect_err("a cancelled iteration must end the watch, not be reported and skipped");
+        assert!(crate::governor::is_cancellation(&err), "{err:?}");
+        assert_eq!(
+            std::fs::read_dir(out.path()).unwrap().count(),
+            0,
+            "a cancelled watcher regenerates nothing",
         );
     }
 
