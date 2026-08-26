@@ -952,6 +952,16 @@ pub(super) fn run_context_cmds_parallel(
     emit: bool,
     governor: &ResourceGovernor,
 ) -> Vec<ContextCommandTiming> {
+    run_context_cmds_parallel_after_spawn(cmds, timeout_secs, emit, governor, |_| {})
+}
+
+fn run_context_cmds_parallel_after_spawn(
+    cmds: &[ContextCmd],
+    timeout_secs: u64,
+    emit: bool,
+    governor: &ResourceGovernor,
+    mut after_spawn: impl FnMut(u32),
+) -> Vec<ContextCommandTiming> {
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -1031,6 +1041,7 @@ pub(super) fn run_context_cmds_parallel(
                 Ok(child) => {
                     let started_at = Instant::now();
                     let registry_key = format!("context:{idx}:{}", cmd.label);
+                    after_spawn(child.id());
                     governor.register_child(registry_key.clone(), child.id());
                     running.push(RunningCmd {
                         label: cmd.label.clone(),
@@ -2102,6 +2113,65 @@ mod tests {
             0,
             "a finished command leaves no pid the governor may signal",
         );
+    }
+
+    /// The synchronous spawn seam has the same late-registration window as the
+    /// async check runner. Force cancellation after `spawn` but before
+    /// `register_child`, then prove the worker-owned process group is reaped
+    /// without waiting for the context timeout.
+    #[cfg(unix)]
+    #[test]
+    fn registration_after_cancellation_kills_the_sync_process_group() {
+        use std::io::Read;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("late-context-grandchild.pid");
+        let script = format!("sleep 30 & echo $! > {} ; wait", pidfile.display());
+        let cmds = vec![ContextCmd {
+            label: "late context tree".to_owned(),
+            gate: None,
+            cmd: "sh".to_owned(),
+            args: vec!["-c".to_owned(), script],
+            cwd: tmp.path().to_path_buf(),
+            out_dir: tmp.path().to_path_buf(),
+            out_file: String::new(),
+        }];
+        let governor = ResourceGovernor::new();
+        let marker = pidfile.clone();
+
+        let timings =
+            super::run_context_cmds_parallel_after_spawn(&cmds, 2, false, &governor, |_| {
+                for _ in 0..100 {
+                    if marker.exists() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(marker.exists(), "child must publish its grandchild pid");
+                governor.cancel();
+            });
+
+        let mut contents = String::new();
+        std::fs::File::open(&pidfile)
+            .expect("grandchild pidfile")
+            .read_to_string(&mut contents)
+            .expect("read grandchild pid");
+        let grandchild: i32 = contents.trim().parse().expect("numeric grandchild pid");
+        let mut gone = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(grandchild, 0) } == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if errno == Some(libc::ESRCH) || errno == Some(libc::EPERM) {
+                    gone = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(gone, "grandchild {grandchild} survived late registration");
+        assert_eq!(governor.inflight_count(), 0);
+        assert_eq!(timings[0].status, "cancelled");
     }
 
     /// A cancelled run starts nothing further, and says so about what it did

@@ -213,8 +213,23 @@ impl ResourceGovernor {
     /// which makes it the leader of its own process group — that is what lets
     /// one signal take down a `cargo` → `rustc` → `cc` tree rather than just its
     /// root.
-    pub fn register_child(&self, key: impl Into<String>, pid: u32) {
-        self.lock_inflight().insert(key.into(), pid);
+    ///
+    /// Registration and cancellation share the registry lock. If cancellation
+    /// won the race after `spawn` but before this call, the child is refused and
+    /// its process group is killed immediately; it must never enter a registry
+    /// that the completed cancellation pass has already drained.
+    pub fn register_child(&self, key: impl Into<String>, pid: u32) -> bool {
+        let mut inflight = self.lock_inflight();
+        if self.cancelled.load(Ordering::SeqCst) {
+            drop(inflight);
+            #[cfg(unix)]
+            crate::proc::sigkill_process_group(pid);
+            #[cfg(not(unix))]
+            let _ = pid;
+            return false;
+        }
+        inflight.insert(key.into(), pid);
+        true
     }
 
     /// Forget a child that has exited. A pid the governor still believes in is a
@@ -384,13 +399,16 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration> {
                 scope.label,
                 CHILD_SEQ.fetch_add(1, Ordering::Relaxed)
             );
-            scope.governor.register_child(key.clone(), pid);
-            ChildRegistration {
-                governor: Arc::clone(&scope.governor),
-                key,
-            }
+            scope
+                .governor
+                .register_child(key.clone(), pid)
+                .then(|| ChildRegistration {
+                    governor: Arc::clone(&scope.governor),
+                    key,
+                })
         })
         .ok()
+        .flatten()
 }
 
 /// A live registration in the governor's child registry, released on drop.

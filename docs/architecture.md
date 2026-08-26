@@ -947,7 +947,7 @@ impl ResourceGovernor {
     pub fn cost(&self, weight: Weight) -> u32;
     pub async fn acquire(&self, weight: Weight) -> Result<GovernorPermit, Cancelled>;
     pub fn try_acquire(&self, weight: Weight) -> Option<GovernorPermit>;
-    pub fn register_child(&self, key: impl Into<String>, pid: u32);
+    pub fn register_child(&self, key: impl Into<String>, pid: u32) -> bool;
     pub fn unregister_child(&self, key: &str);
     pub fn cancel(&self);
     pub fn cancelled_signal(&self) -> tokio::sync::watch::Receiver<bool>;
@@ -981,8 +981,10 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
   existing `proc::sigkill_process_group`, reaching the whole `cargo` → `rustc` →
   `cc` tree. It is idempotent in the strong sense: the registry is DRAINED, so a
   second cancel signals nothing — a pid whose process died in between may by then
-  belong to another program. Callers must `unregister_child` on exit for the same
-  reason.
+  belong to another program. Registration checks cancellation while holding that
+  same registry lock: a process spawned after the drain is refused (`false`) and
+  its process group is killed immediately instead of being inserted too late.
+  Callers must `unregister_child` on exit for the same pid-reuse reason.
 
 Zero new dependencies: the budget is `tokio::sync::Semaphore::acquire_many_owned`
 and the signal is `tokio::sync::watch`, both already in the graph.
