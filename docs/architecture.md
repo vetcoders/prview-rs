@@ -1360,9 +1360,14 @@ from both revisions before any exact, cfg, relocation, or visibility fact can
 be confirmed. A glob, include, source-parse, or other relevant unknown therefore
 blocks a contradictory confirmed fact at either the source or destination.
 Standalone unknown findings retain their source side, source path, and revision
-provenance. Finding IDs preserve Rust identifier case and serialize the complete
-semantic identity, including both sides' cfg regions, contracts, and typed
-unknown provenance; legal ambiguous input is data, never an assertion failure.
+provenance. Before those findings are emitted, identical one-to-one unknown
+proofs on base and target cancel out: kind, crate/module, source path, cfg guard,
+evidence, and provenance class must match, and each proof must belong to its
+own snapshot. Changed, one-sided, duplicate, detached, or Git-tree-versus-overlay
+proofs remain typed unknowns. Finding IDs preserve Rust identifier case and
+serialize the complete semantic identity, including both sides' cfg regions,
+contracts, and typed unknown provenance; legal ambiguous input is data, never
+an assertion failure.
 
 `compare_rust_api_revisions` constructs snapshots only from the exact
 `Diff.base_commit_id` and `Diff.target_commit_id` Git trees. It never reads a

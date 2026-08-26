@@ -176,11 +176,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         changed: Vec::new(),
         relocated: Vec::new(),
         visibility_changed: Vec::new(),
-        unknown: snapshot_unknown_findings(base, ApiSnapshotSide::Base),
+        unknown: snapshot_unknown_findings(base, target),
     };
-    delta
-        .unknown
-        .extend(snapshot_unknown_findings(target, ApiSnapshotSide::Target));
 
     let base_items: Vec<_> = base.items.iter().map(item_side).collect();
     let target_items: Vec<_> = target.items.iter().map(item_side).collect();
@@ -1015,51 +1012,110 @@ fn guards_may_overlap(left: &[String], right: &[String]) -> bool {
 }
 
 fn snapshot_unknown_findings(
-    snapshot: &RustApiSnapshot,
-    side: ApiSnapshotSide,
+    base: &RustApiSnapshot,
+    target: &RustApiSnapshot,
 ) -> Vec<ApiDeltaFinding> {
-    snapshot
-        .unknowns
-        .iter()
-        .map(|unknown| {
-            let identity = ApiIdentity {
-                crate_name: unknown
-                    .crate_name
-                    .clone()
-                    .unwrap_or_else(|| "<unknown-crate>".to_owned()),
-                module_path: unknown.module_path.clone(),
-                namespace: "unknown".to_owned(),
-                name: format!("{:?}", unknown.kind),
-                cfg_region: unknown.cfg_guard.clone(),
-            };
-            let side_name = match side {
-                ApiSnapshotSide::Base => "base",
-                ApiSnapshotSide::Target => "target",
-            };
-            let reason = format!(
-                "{side_name} snapshot {:?}: {}",
-                unknown.kind, unknown.evidence
-            );
-            let mut finding = ApiDeltaFinding {
-                id: String::new(),
-                kind: ApiDeltaKind::Unknown,
-                identity,
-                before: None,
-                after: None,
-                analysis_source: REPO_BACKED_RUST_API_SOURCE,
-                confidence: ApiDeltaConfidence::Unknown,
-                evidence: vec![unknown.evidence.clone()],
-                unknown_reason: Some(reason),
-                unknown_source: Some(ApiUnknownSource {
-                    side,
-                    source_path: unknown.source_path.clone(),
-                    provenance: provenance_id(&unknown.provenance),
-                }),
-            };
-            finding.id = stable_finding_id(&finding);
-            finding
-        })
-        .collect()
+    let mut target_used = vec![false; target.unknowns.len()];
+    let mut findings = Vec::new();
+
+    for unknown in &base.unknowns {
+        let counterpart = target
+            .unknowns
+            .iter()
+            .enumerate()
+            .find(|(index, candidate)| {
+                !target_used[*index] && unknown_proofs_match(base, unknown, target, candidate)
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = counterpart {
+            target_used[index] = true;
+        } else {
+            findings.push(snapshot_unknown_finding(unknown, ApiSnapshotSide::Base));
+        }
+    }
+
+    findings.extend(
+        target
+            .unknowns
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !target_used[*index])
+            .map(|(_, unknown)| snapshot_unknown_finding(unknown, ApiSnapshotSide::Target)),
+    );
+    findings
+}
+
+fn unknown_proofs_match(
+    base: &RustApiSnapshot,
+    left: &RustApiUnknown,
+    target: &RustApiSnapshot,
+    right: &RustApiUnknown,
+) -> bool {
+    left.kind == right.kind
+        && left.crate_name == right.crate_name
+        && left.module_path == right.module_path
+        && left.source_path == right.source_path
+        && left.cfg_guard == right.cfg_guard
+        && left.evidence == right.evidence
+        // Revision ids necessarily differ across the comparison. What must not
+        // differ is the provenance class, and each proof must still belong to
+        // the snapshot that supplied it; an overlay is not silently equated to
+        // a Git tree and a detached proof is never neutralized.
+        && left.provenance == base.provenance
+        && right.provenance == target.provenance
+        && same_provenance_class(&left.provenance, &right.provenance)
+}
+
+fn same_provenance_class(left: &RevisionProvenance, right: &RevisionProvenance) -> bool {
+    matches!(
+        (left, right),
+        (
+            RevisionProvenance::GitTree { .. },
+            RevisionProvenance::GitTree { .. }
+        ) | (
+            RevisionProvenance::WorkingTreeOverlay { .. },
+            RevisionProvenance::WorkingTreeOverlay { .. }
+        )
+    )
+}
+
+fn snapshot_unknown_finding(unknown: &RustApiUnknown, side: ApiSnapshotSide) -> ApiDeltaFinding {
+    let identity = ApiIdentity {
+        crate_name: unknown
+            .crate_name
+            .clone()
+            .unwrap_or_else(|| "<unknown-crate>".to_owned()),
+        module_path: unknown.module_path.clone(),
+        namespace: "unknown".to_owned(),
+        name: format!("{:?}", unknown.kind),
+        cfg_region: unknown.cfg_guard.clone(),
+    };
+    let side_name = match side {
+        ApiSnapshotSide::Base => "base",
+        ApiSnapshotSide::Target => "target",
+    };
+    let reason = format!(
+        "{side_name} snapshot {:?}: {}",
+        unknown.kind, unknown.evidence
+    );
+    let mut finding = ApiDeltaFinding {
+        id: String::new(),
+        kind: ApiDeltaKind::Unknown,
+        identity,
+        before: None,
+        after: None,
+        analysis_source: REPO_BACKED_RUST_API_SOURCE,
+        confidence: ApiDeltaConfidence::Unknown,
+        evidence: vec![unknown.evidence.clone()],
+        unknown_reason: Some(reason),
+        unknown_source: Some(ApiUnknownSource {
+            side,
+            source_path: unknown.source_path.clone(),
+            provenance: provenance_id(&unknown.provenance),
+        }),
+    };
+    finding.id = stable_finding_id(&finding);
+    finding
 }
 
 fn known_finding(
@@ -1396,6 +1452,62 @@ mod tests {
                     .as_deref()
                     .is_some_and(|reason| reason.contains("target counterpart"))
         }));
+    }
+
+    #[test]
+    fn unchanged_unknown_proof_is_neutral_but_non_equivalent_proof_is_not() {
+        let unchanged = "mod donor { pub fn item() {} } pub use donor::*;";
+        let base = snapshot_rust_api(&MemorySource::source(unchanged, "base"));
+        let target = snapshot_rust_api(&MemorySource::source(
+            "mod donor { pub fn item() {} } pub use donor::*; fn unrelated_private_change() {}",
+            "target",
+        ));
+        let neutral = compare_rust_api(&base, &target);
+        assert!(
+            neutral.unknown.is_empty(),
+            "the same unsupported proof on both revisions is not a delta: {:?}",
+            neutral.unknown
+        );
+
+        let changed = compare_rust_api(
+            &base,
+            &snapshot_rust_api(&MemorySource::source(
+                "mod donor { pub fn item() {} } pub use donor::*; include!(\"extra.rs\");",
+                "target",
+            )),
+        );
+        assert!(
+            !changed.unknown.is_empty(),
+            "changed unknown evidence remains review-required"
+        );
+
+        let unilateral = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source("fn private() {}", "base")),
+            &snapshot_rust_api(&MemorySource::source(
+                "fn private() {} include!(\"generated.rs\");",
+                "target",
+            )),
+        );
+        assert_eq!(
+            unilateral.unknown.len(),
+            1,
+            "one-sided unknown proof must remain visible"
+        );
+
+        let mut overlay = snapshot_rust_api(&MemorySource::source(unchanged, "target"));
+        let overlay_provenance = RevisionProvenance::WorkingTreeOverlay {
+            target_oid: "target".to_owned(),
+            dirty_digest: "dirty".to_owned(),
+        };
+        overlay.provenance = overlay_provenance.clone();
+        for unknown in &mut overlay.unknowns {
+            unknown.provenance = overlay_provenance.clone();
+        }
+        let provenance_changed = compare_rust_api(&base, &overlay);
+        assert!(
+            !provenance_changed.unknown.is_empty(),
+            "a provenance-class change is evidence, not a neutral pair"
+        );
     }
 
     #[test]
