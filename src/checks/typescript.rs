@@ -209,6 +209,12 @@ impl Check for TypeScriptCheck {
         "TypeScript"
     }
 
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
+    }
+
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
         if !config.profile.has_tsconfig {
             return super::CheckEligibility::Skip(format!(
@@ -292,6 +298,12 @@ impl Check for TypeScriptCheck {
 impl Check for ESLintCheck {
     fn name(&self) -> &str {
         "ESLint"
+    }
+
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
@@ -431,6 +443,12 @@ fn eslint_problem_counts(output: &str) -> Option<(usize, usize, usize)> {
 impl Check for VitestCheck {
     fn name(&self) -> &str {
         "Vitest"
+    }
+
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {

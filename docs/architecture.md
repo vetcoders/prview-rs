@@ -34,6 +34,10 @@ prview-rs/
 │   │   ├── typescript.rs
 │   │   ├── cargo.rs
 │   │   └── python.rs
+│   ├── ledger/
+│   │   └── mod.rs       # Task ledger: one record per unit of work in a run
+│   ├── governor/
+│   │   └── mod.rs       # Bounded execution: weighted budget + child registry
 │   ├── heuristics/
 │   │   ├── mod.rs       # HeuristicsResult, runner
 │   │   └── loctree.rs   # Loctree heuristic (universal)
@@ -103,7 +107,8 @@ app.run()
     ├─► resolve_bases()        ─── resolves bases (repo default plus tool fallbacks)
     ├─► generate_diffs()       ─── git2 diff with per-file stats (Patch API)
     ├─► prepare_rust_api_delta() ─ exact anchors + frozen target capture
-    ├─► checks::run_all()      ─── parallel checks (tsc, cargo, ruff...)
+    ├─► checks::run_all()      ─── parallel checks (tsc, cargo, ruff...), bounded
+    │                              by the run's ResourceGovernor
     ├─► heuristics::run()      ─── loctree (universal structural signals)
     └─► artifacts::generate()  ─── numbered layout + signal generators
 ```
@@ -259,6 +264,55 @@ The Python and JS checks (`Ruff`, `Mypy`, `Pytest`, `TypeScript`, `ESLint`,
 `Vitest`, `Stylelint`) share **one** run-wide snapshot rather than each creating
 its own — see `uses_shared_scan_dir()`. `SemgrepCheck` is the single deliberate
 opt-out: it manages its own worktree because it also needs a baseline commit.
+
+`share_target_snapshot()` decides whether that snapshot is materialised at all,
+and the condition is **not** "some gate needs it". It is:
+
+> a runnable check is in `uses_shared_scan_dir()`, **or** the reviewed target is
+> off-`HEAD` (`off_head_target_commit()`).
+
+The second arm exists because the gates are not the only stage that reads the
+tree: the context stage plans and produces the whole of `30_context` from
+`ledger.scan_dir()`. Two ordinary runs have an off-`HEAD` target and nothing
+snapshot-backed to run — the **second** `prview --pr N` of the same PR, where
+every gate replays from a cache keyed on the reviewed commit, and the fast
+remote-only preset, where the snapshot-backed gates all skip and only semgrep
+remains. Tying materialisation to the runnable set left both with no scan dir, so
+`cargo tree`, the SBOMs, `tauri info` and the entry-point probes read the
+operator's local checkout while the diffs and `MERGE_GATE.json` described the PR's
+commit, and `RUN.json` looked identical either way
+(`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). A warm `--pr` run therefore pays for one
+`git worktree` its gates do not need: a correct pack outranks a saved checkout.
+
+When the target **is** the checked-out `HEAD` and no runnable check wants a
+snapshot, nothing is materialised — there the repo root genuinely is the reviewed
+tree, and the artifact stage's fallback to `config.repo_root` is the right answer.
+The call therefore sits *outside* the dispatcher's "anything to run" guard, since
+a run with an empty runnable set is exactly the case it exists to cover.
+
+Materialising also resolves the run-wide substrate
+(`ledger.set_substrate_keyed`), which adopts the first pass's skips and cache
+replays off the unknown substrate they were necessarily recorded under. That is
+the quiet half of the same bug: a warm `--pr` run used to report its own
+decisions as being about no particular tree. The run-wide substrate is resolved
+with an **empty** consumable-scaffolding list, so it reports `snapshot` and never
+`snapshot-borrowed-deps` — with no command to name, nothing at that point can
+consume the linked `node_modules`; a command that does resolve through the link
+reports that for itself.
+
+The adopted ENTRIES are keyed differently, and must be: they each name a tool,
+and the substrate a later stage computes for that tool is that tool's own reading
+of the tree. `adopted_substrate` re-keys each one through
+`consumable_scaffolding(entry.key.tool)`, caching one `git status` per distinct
+consumable set (there are two, and the run-wide resolution seeds the first).
+Filing them all under the run-wide key instead put a JS repo's ESLint skip under
+`snapshot` while the context stage went on to resolve `snapshot-borrowed-deps`
+for the same directory: the exact-key lookup missed, `lookup_tool`'s
+unknown-substrate fallback had just been spent by this very adoption, and the
+context stage read `Uncovered` and re-ran the gate's work in full — on both
+scenarios the shared snapshot exists for. `consumable_scaffolding` therefore
+normalises its argument through `check_id_from_name`, since a ledger entry
+carries only the id (`tsc`, `tests`) and never the display name.
 
 The Python checks add one step on top of that symlink. `uv run` synchronises the
 project environment before executing, so a reviewed commit whose dependencies
@@ -730,6 +784,363 @@ from returning no provenance at all. Making the substrate a *parameter* — a
 to look elsewhere — is the 0.8 cut. Until then the guarantee is "every check
 reports where it ran", not "no check can run anywhere else".
 
+### ledger/mod.rs
+
+A run-wide record of every unit of work it considered: one `TaskEntry` per task,
+stating what was resolved (`Run` / `Cached` / `Skipped` / `NotApplicable`) and
+under which `TaskKey`.
+
+The key is deliberately *semantic*: `TaskKey { tool, substrate }`, where `tool`
+is normalised through `check_id::check_id_from_name` and `substrate` is the pair
+(`target_sha`, `TreeState`) the task read. That makes "the same tool on the same
+tree" one key regardless of which surface asked for it — the TypeScript gate and
+a `tsc` context artifact are one task, not two — without a second alias table
+free to drift from `check_id`'s. Both substrate fields are optional, mirroring
+`checks::ScanSubstrate`: an unresolved substrate stays visibly unknown rather
+than being certified as anything.
+
+`TaskLedger` is shared across a run's concurrent tasks by reference; each field
+sits behind its own `Mutex` and no lock is held across an `await`.
+
+The ledger also **owns** the run's shared target snapshot
+(`set_shared_snapshot` / `scan_dir`). Materialising it stays the check
+dispatcher's job, but the handle lives here because the ledger outlives every
+stage: a snapshot parked in it is still on disk when artifact generation asks
+where the reviewed tree is, instead of having been dropped with the frame that
+created it. Because the artifact stage reads it too, an off-`HEAD` target is on
+its own enough to materialise one, whether or not any gate had to run — see
+*Where checks run*.
+
+The ledger observes; it never runs, skips or caches anything itself.
+
+`App::run` builds one ledger per run and hands it to `checks::run_all` /
+`run_all_with_events`, which record every check as it resolves: a cache hit as
+`Cached`, an eligibility skip as `Skipped`, an execution as `Run` with the
+duration the result reports. A check that ran is keyed on the substrate its OWN
+provenance names — the tree it actually read — so no second resolution can
+contradict it; a check with no provenance falls back to the run's resolved
+substrate, and to unknown when that is unset too.
+
+A cache replay is keyed on the substrate of the run REPLAYING it (the cache key
+is content-derived, so a hit is an answer about the tree this run is reviewing)
+while its `origin` names the tree the ORIGINAL execution read, taken from the
+provenance stored beside the entry. The two are deliberately separate: the key is
+what a later stage asks about, the origin is what makes the replay auditable. It
+also carries `cache_age_secs`, the age of the entry it replayed (see
+`cache/mod.rs`), so a gate reported as passing off a stored answer states how
+stale that answer is.
+
+Skips and replays are decided in the checks stage's *first pass*, which
+necessarily precedes `share_target_snapshot` — the runnable set is what decides
+whether a snapshot is materialised at all — so they are recorded under an unknown
+substrate. `TaskLedger::set_substrate_keyed` therefore **adopts** them: every
+entry still keyed on an unknown substrate is re-keyed, because they were this
+run's decisions about the tree this run went on to read. The new key is asked for
+per entry, by tool id — one tree does not have one identity, and a snapshot that
+carries a `node_modules` link is `snapshot` to a cargo gate and
+`snapshot-borrowed-deps` to a JS one. The knowledge of which is which stays in
+`checks` (`consumable_scaffolding`) and is handed in as a closure; the ledger
+holds no table of tools. Only the key moves; a replay's `origin` is never
+overwritten with the current run's substrate. An unknown key survives only where
+the run genuinely resolved no substrate (nothing needed a shared snapshot), which
+is what `TaskLedger::lookup_tool`'s fallback still covers.
+
+Context commands that actually execute are recorded too, by
+`artifacts::context_artifacts::record_context_runs`, once the runtime knows their
+duration: `Run` for anything that started (including a failure or a timeout — the
+tool read the tree either way), `Skipped` for a command that never spawned. A
+command is recorded under the GATE it stands in for when one exists (`eslint
+json` → `ESLint`, `tsc trace` → `TypeScript`), so one tool cannot land under two
+ids depending on which surface resolved it; a command with no gate counterpart
+(`cargo tree`, `tauri info`, `npm sbom`) is recorded under its own label, slugged
+by `check_id_from_name`. The plan site hands that identity over in
+`ContextCmd::gate` rather than leaving the label to be reverse-engineered, so
+there is no per-command alias table.
+
+#### The `ledger` view in RUN.json
+
+`RUN.json` carries the entries as an additive `ledger` object: `schema` (its own
+counter, currently `1`) and `entries[]`, one row per task with `tool`, `kind`
+(`check` / `context_artifact`), `lifecycle` (`run` / `cached` / `skipped` /
+`not_applicable`) and `substrate` (`target_sha` + the same `tree_state` strings
+`checks[].tree_state` uses). Each lifecycle adds only the evidence it has:
+`duration_secs` for a run, `cache_age_secs` + `origin` for a replay, `reason` for
+a ruled-out task.
+
+Everything the pack already reported — `checks[].cached`, `context_artifacts[]`,
+`context_commands[]`, the top-level `schema_version` — is untouched, so a
+consumer that ignores `ledger` cannot tell the section exists. That is why the
+pack's `schema_version` does not move (the precedent `CheckProvenance` set) and
+why the view versions itself instead.
+
+#### One tool, one execution per run
+
+The artifact stage reads the entries back through `TaskLedger::lookup_tool`,
+which answers "did a gate already do this work on this tree?" before a context
+generator repeats it.
+
+The context stage used to derive that answer from the *results* list
+(`checks_ran_eslint` and friends), which can only report what reached a result.
+A gate ruled out by a preset leaves no result, so absence read as a gap: a fast
+remote-only run excluded the lint gate on purpose and the context stage then
+spent 23 s linting the whole tree by itself (`PRV-CONTEXT-WORK-DEDUP`).
+The ledger holds the missing half — what was
+deliberately ruled out and why — so the decision moved there:
+
+- a gate that **ran or replayed a cache** covers the artifact, which is recorded
+  as `Cached` naming the substrate that execution read. A gate that ran and
+  *failed* still covers it: the tool read the tree and reported, and a second run
+  buys the same answer at the same price;
+- a gate that was **ruled out** leaves the artifact unproduced, recorded with the
+  gate's own reason — `Skipped` when the reviewed tree could run the tool anyway
+  (this run chose not to), `NotApplicable` when it could not (no switch would
+  change that);
+- a tool **no gate decided on** is still generated by the context stage, which is
+  the one case where compensating was ever right.
+
+The `tsc` trace answers to the same rule: a deep run used to compile the
+reviewed tree twice, once as the TypeScript gate and once as
+`tsc --noEmit --traceResolution`, so the trace is now deduped against a gate
+that already compiled the same tree. One exception stands — a gate that failed
+with module-resolution errors still forces the trace, because there the second
+compile answers a question the gate's own output cannot: which candidate paths
+the compiler tried. `tauri info` has no gate to dedup against and keeps its
+behaviour; what changed is that a deferred one records its reason in the ledger
+too, so the run has one account of what it did not do rather than two.
+
+Both sides resolve the substrate through `checks::resolve_scan_substrate` with
+the same `consumable_scaffolding` set, so a gate and its artifact describe one
+tree identically instead of differing on `tree_state` alone. A lookup falls back
+to an unknown-substrate entry for the same tool, which is what a run that never
+resolved a substrate of its own leaves behind; it never crosses two *known*
+substrates, which would be evidence of different work.
+
+#### One reviewed tree per run
+
+`share_target_snapshot` (in `checks/mod.rs`) resolves the run's scan directory
+once, points the checks' config clone at it via `scan_dir_override`, records the
+resolved substrate on the ledger, and hands the ledger the snapshot handle.
+`artifacts::generate` takes the ledger in its `GenerateInput` and resolves the
+context generators' root as `ledger.scan_dir()`, falling back to
+`config.repo_root`.
+
+This is what keeps a pack describing ONE revision. `scan_dir_override` is set on
+a *clone* of the config inside `run_all`, so `App::run`'s own config never learns
+about the snapshot; before the ledger owned the handle, the worktree was also
+deleted when `run_all` returned. A `--pr` run therefore had its gates judge the
+reviewed snapshot while `30_context/*` was produced from whatever the operator
+had checked out locally (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). Every context
+command's cwd and every filesystem probe that decides which commands to plan now
+read the reviewed tree; a local review resolves to the repo root, which *is* the
+reviewed tree, so its behaviour is unchanged. Cargo context commands resolve
+their directory through `checks::planned_cargo_cwd`, the same resolution the
+cargo gates use, so a workspace member is not collapsed to the snapshot root.
+
+### governor/mod.rs
+
+Concurrency used to be decided per stage: the checks stage picked its own
+fan-out, the context stage picked another, and nothing held the machine-wide
+number. Two stages each behaving reasonably still oversubscribe a laptop, and the
+tools are not equal — `cargo clippy` and `cargo test` each want the whole box
+while reading a manifest costs nothing.
+
+`ResourceGovernor` is that missing number, plus the registry that makes a run
+killable. One governor per run, owned by `App` (and by `tui::run_tui`, which is
+its own entry point) so BOTH stages that put load on the machine draw on the same
+budget:
+
+```rust
+pub enum Weight { Light, Heavy }   // a declaration, not a permit count
+
+impl ResourceGovernor {
+    pub fn new() -> Self;                                  // budget = available_parallelism()
+    pub fn with_budget(total: u32, heavy_cost: u32) -> Self;
+    pub fn cost(&self, weight: Weight) -> u32;
+    pub async fn acquire(&self, weight: Weight) -> Result<GovernorPermit, Cancelled>;
+    pub fn try_acquire(&self, weight: Weight) -> Option<GovernorPermit>;
+    pub fn register_child(&self, key: impl Into<String>, pid: u32) -> bool;
+    pub fn unregister_child(&self, key: &str);
+    pub fn cancel(&self);
+    pub fn cancelled_signal(&self) -> tokio::sync::watch::Receiver<bool>;
+    pub async fn cancelled(&self);
+    pub fn is_cancelled(&self) -> bool;
+}
+
+// Attribute a task's spawned children to a governor without threading it
+// through `Check::run`.
+pub async fn with_child_scope<F: Future>(g: Arc<ResourceGovernor>, label: &str, f: F) -> F::Output;
+pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
+```
+
+- **Weights cost what the governor says.** `Light` is one permit; `Heavy` is
+  `total.div_ceil(2)`, so eight cores admit two heavy tasks at once while light
+  work still fits beside them. What a weight costs depends on the budget, so the
+  enum carries no number.
+- **The budget is the machine.** `available_parallelism()`, falling back to `4`
+  when the syscall fails — not `1`, which would turn an unknown into a stall.
+  Both `with_budget` arguments are clamped (`total >= 1`,
+  `heavy_cost ∈ 1..=total`): a zero budget is a deadlock and a heavy cost above
+  the total parks that task forever on permits the semaphore will never hold.
+- **A permit is held, never released by hand.** `GovernorPermit` returns the
+  permits on drop, so an error path cannot leak budget.
+- **Cancellation closes the semaphore.** That refuses a newcomer and a task
+  ALREADY waiting alike — a task parked on the budget is work that has not
+  started. `cancelled_signal()` is a `watch::Receiver` a dispatcher loop can
+  `select!` on, and it starts at the current state so a late subscriber is not
+  left waiting for a change that already happened.
+- **`cancel()` SIGKILLs each registered child's process group** through the
+  existing `proc::sigkill_process_group`, reaching the whole `cargo` → `rustc` →
+  `cc` tree. It is idempotent in the strong sense: the registry is DRAINED, so a
+  second cancel signals nothing — a pid whose process died in between may by then
+  belong to another program. Registration checks cancellation while holding that
+  same registry lock: a process spawned after the drain is refused (`false`) and
+  its process group is killed immediately instead of being inserted too late.
+  Callers must `unregister_child` on exit for the same pid-reuse reason.
+
+Zero new dependencies: the budget is `tokio::sync::Semaphore::acquire_many_owned`
+and the signal is `tokio::sync::watch`, both already in the graph.
+
+#### Who acquires, and in what order
+
+- **Checks** (`checks::run_all`, `run_all_with_events`) take a permit per check
+  before the process starts. The weight comes from `Check::resource_weight`,
+  which defaults to `Light`; the `Heavy` list lives on that trait method and is
+  the cargo family, `TypeScript`, `Vitest`, `ESLint` and `Semgrep`.
+- **Context commands** (`artifacts::context_artifacts`) take a permit before each
+  spawn, via the synchronous `try_acquire` — `artifacts::generate` is a blocking
+  pipeline with a poll loop and has nothing to `.await` on. The weight comes from
+  `context_cmd_weight`: `tsc trace`, `eslint json`, `stylelint json` and
+  `esbuild meta` are `Heavy`; the metadata readers (`cargo tree`, `cargo sbom`,
+  `npm sbom`, `tauri info`) are `Light`.
+- **The cargo `target/` lock stays.** It is a correctness lock — one writer per
+  `target/` — and the budget is not that. A check that takes both takes them in
+  ONE order: **cargo lock first, then budget**. Same order everywhere is what
+  makes two locks deadlock-free, and this direction also avoids parking half the
+  budget on a cargo check that is still queueing for `target/`. Nothing acquires
+  the cargo lock once it holds budget, so there is no cycle the other way.
+
+#### Queued vs running
+
+Admission is what makes the distinction real, so the run reports it:
+
+- the progress line separates the two — `Running: X (12s) · Queued: Y, Z`;
+- the ledger's `started_at` is the moment of admission, not the first poll of the
+  check's future, so `started_at − queued_at` is time spent waiting for the
+  machine;
+- the PV-18 slow notice measures from admission. A check parked on the budget for
+  ten minutes has not been slow, it has not started, and naming it would blame
+  the tool for the queue;
+- TUI mode gets the same split: `CheckEvent::Started` means "the run considered
+  this check" (mapped to the `Pending` lifecycle) and the added
+  `CheckEvent::Running` means a process began.
+
+#### Cancellation path (Ctrl-C)
+
+```
+governor::with_cancellation(work, governor, CtrlC)
+      │
+      ├─ tokio::spawn(supervise)  ── a SEPARATE task, aborted when work returns
+      │        │  first interrupt
+      │        ▼
+      │   governor.cancel()
+      │        ├─► semaphore.close()  ── refuses newcomers AND tasks already waiting
+      │        ├─► watch::send(true)  ── wakes the dispatcher's select! arm
+      │        └─► SIGKILL -pgid      ── every registered child's whole process tree
+      │        │  second interrupt
+      │        ▼
+      │   Interrupts::abandon_run()   ── exit(130) without waiting for the unwind
+      │
+      └─ work.await
+             │
+             ▼
+        checks::run_all returns Err(Cancelled)   ── or the context stage stops admitting
+             │                                      ── or App::ensure_not_cancelled fires
+             ▼
+        App::run unwinds through `?`  ── Drop runs: ledger's shared WorktreeSnapshot,
+             │                           heuristics AnalysisSnapshots
+             ▼
+        main exits `CANCELLED_EXIT_CODE` (130 = 128 + SIGINT)
+```
+
+**The supervisor is its own task.** It used to be an arm of the same `select!`
+as the run, which works only while the run keeps yielding. `artifacts::generate`
+is synchronous and polls its children with `std::thread::sleep`, so for the whole
+of the longest stage of a review the task was never polled and NEITHER interrupt
+arm could fire — and `tokio::signal::ctrl_c` had by then replaced SIGINT's
+default disposition, so the terminal could not end the process either. Watching
+from a separate task removes the coupling. `governor::blocking_stage` wraps the
+`artifacts::generate` call for the remaining edge, a runtime with a single worker
+thread: it tells tokio the stage is about to block so the supervisor keeps a
+thread to be polled on. The interrupt source is the `Interrupts` trait rather
+than a direct `ctrl_c()` call, so the state machine is testable without raising a
+real signal at the test harness.
+
+Cancelling rather than aborting is the whole point: the supervisor could simply
+drop the run future, but returning through the ordinary error path is what lets
+the destructors on the way out remove the temporary worktrees a killed process
+would leave on disk. A **second** interrupt is the operator declining to wait for
+that and exits immediately.
+
+**Cancel ⇒ never a verdict.** Only the checks stage watches
+`governor.cancelled()` itself, and it is one stage of several: a cancel arriving
+in the heuristics, in the artifact stage, or in a run whose gates all replayed
+from the cache (an empty runnable set never builds that `select!` loop at all)
+was previously ignored outright. `App::run` would go on to write a pack whose
+context commands were every one of them recorded `cancelled`, return a report,
+and let `main` compute an ACCEPT or a BLOCK from it. `App::ensure_not_cancelled`
+now guards the seams — on entry to `App::run`, after the checks, before and after
+`artifacts::generate`, and at the top of a `--watch` iteration — so the run ends
+in `Cancelled` and exit `130` instead. A partial pack may remain on disk as
+evidence of what got done; nothing claims a verdict from it.
+
+`--update` needs a gate of its own (`App::reuse_unchanged_run`), because it is
+the one path that returns a report without reaching any of the others: an
+interrupt during `prepare_refs` — a `git fetch` that is not a registered child,
+so `cancel` cannot cut it short — followed by a HEAD with no new commits used to
+hand back the *previous* run's pack, and `main` computed an ACCEPT or a BLOCK
+from that. Reusing a pack is still reporting a verdict.
+
+Every child that can be reached this way must be registered, and every child
+prview spawns leads its own process group (`proc::harden` for the async checks,
+`proc::harden_std` for the synchronous context commands) so one signal reaches
+`cargo → rustc → cc` and `sh → pnpm → tool`. Checks register through the
+`with_child_scope` task-local rather than an argument: the governor is known at
+the dispatcher, the pid at the single spawn point five frames below it behind
+`Check::run(&self, config)`, and a trait method cannot grow a parameter without
+every check and every `run_command_*` call site growing one it never reads. The
+returned guard unregisters on drop, so the success, timeout and error paths all
+leave the registry clean — a pid the governor still believes in is a pid it may
+signal, and pids are reused.
+
+**`--watch` ends on the first interrupt.** One `App`, and therefore one governor,
+is shared by every iteration, and `Semaphore::close` is one-way — so a cancelled
+watcher can never grant work again. The iteration used to report any failure of
+its quick run as an ordinary error and carry on, which turned that into a silent
+degradation: every later edit produced a pack with an empty `30_context` under a
+cheerful "Regenerated artifacts", until the operator interrupted a second time
+and took the cleanup with them. A cancellation is now propagated out of the
+iteration, and both watch loops (the filesystem watcher and the polling fallback)
+carry a biased `governor.cancelled()` arm so a cancel arriving while the watcher
+is idle ends it too.
+
+**Everything long the run spawns must be in a child scope.** The `uv sync`
+pre-step was not, and outside a scope `register_active_child` is a no-op, so
+`cancel()` had no pid to signal: a Ctrl-C during a cold venv build printed
+"stopping running tools" and then waited out the full timeout with `uv` still
+running. It is scoped now, and refuses to start on an already-cancelled run. The
+heuristics stage needs no scope — it spawns no processes; loctree runs in-process
+behind `spawn_blocking`.
+
+`--tui` is deliberately NOT wrapped: it puts the terminal in raw mode, so Ctrl-C
+arrives as a key event and the TUI owns its own quit path. Its dispatcher is
+nevertheless held to the same contract as the headless one — same
+`presync_python_venv`, same biased `governor.cancelled()` arm — because it was a
+copy that had drifted back into both of the bugs above while still claiming to
+mirror `run_all`.
+
+**Not yet configurable.** The budget is `available_parallelism()` with no CLI
+flag; an operator knob is a follow-up.
+
 ### mcp/
 
 The MCP server (`prview mcp`) is a thin contract adapter over the prview core.
@@ -749,6 +1160,35 @@ The core artifact generator. Builds the numbered directory layout
 - `20_quality/`: per-check `*.result.json` + `*.log`, `full-checks.log`, `checks-errors.log`, `coverage-delta.txt`, `PUBLIC_API_DIFF.json/md`, `BREAKING_CHANGES.json/md`
 - `30_context/`: optional `INLINE_FINDINGS.sarif`, `changed-tests.txt`, profile-specific (`cargo-tree`, `tsc-trace`, `eslint`, `vitest`)
 - `latest` symlink in the parent dir
+
+#### Stale-cache caveats (`MERGE_GATE.json.stale_cache_caveats`)
+
+A verdict can rest on evidence the run never produced. In the Vista dogfood run
+(`PRV-CACHE-STALENESS`) a `Cargo audit` result replayed from a cache written
+before a reboot co-authored a `BLOCK`, and the pack said only `cached: true` —
+nothing named the age of the evidence.
+
+`generate_merge_gate` therefore reads the run's ledger (the only place that
+carries `cache_age_secs`, see [ledger/mod.rs](#ledgermodrs)) and, for every gate
+row with BLOCKING influence on the verdict — policy conclusion `Block`, or a raw
+`failed`/`error` status, which gates `quality_pass` — emits one entry per row
+whose replay is older than `STALE_CACHE_CAVEAT_MAX_AGE_SECS` (7 days, a constant
+in `src/artifacts/merge_gate.rs`; a CLI knob is a follow-up):
+
+```json
+"stale_cache_caveats": [
+  { "check_id": "cargo_audit", "check_name": "Cargo audit",
+    "cache_age_secs": 806400, "threshold_secs": 604800 }
+]
+```
+
+The field is **WARN-ONLY and additive**. It sits at the top level, deliberately
+outside `decision`: that object is closed by contract and every field in it ranks
+the verdict, so a report ABOUT the pack must not live there. A stale replay
+changes no verdict, no exit code, and no other field — pinned by
+`the_stale_cache_caveat_moves_no_other_field`, which diffs the whole `decision`,
+`checks`, and `inline_findings` of a stale run against a fresh one. A stale
+PASSING row raises nothing: only blocking evidence is worth dating.
 
 ### artifacts/signal/ (module directory)
 
@@ -906,6 +1346,12 @@ share semantic names. Nested `cfg`/`cfg_attr` use the same recursive sorted and
 deduplicated `all(...)`/`any(...)` canonicalization as top-level guards, without
 evaluating host configuration.
 
+Function parameter patterns are canonicalized to `_`, and generic, const, and
+lifetime binders are alpha-normalized by declaration order across free, trait,
+inherent, foreign, and higher-ranked function signatures. The mapping is reused
+at every bound occurrence, so renaming a binder is neutral while generic order,
+types, ABI, and lifetime relationships remain part of the contract.
+
 #### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
 
 The W2-01 backend compares each exact base and target
@@ -919,6 +1365,13 @@ addition/removal. Parsed ordinary declarations include private counterparts
 only as evidence for a proven public/non-public transition; externally
 reachable `items` remain the API surface.
 
+Named-struct field projection is policy-aware. A public field added to an
+existing exhaustive struct is a `Changed` parent contract because downstream
+struct literals and exhaustive patterns stop compiling. The same field on an
+existing `#[non_exhaustive]` struct remains an informational `Added` field, and
+a wholly new public struct remains an added item; neither case inherits the
+existing-exhaustive breaking rule.
+
 Exact identity is grouped on both sides before any fact is consumed: only a
 `1 ↔ 1` component may become a confirmed change, while wider components are
 consumed as deterministic typed ambiguity, including one-sided duplicate
@@ -931,9 +1384,14 @@ from both revisions before any exact, cfg, relocation, or visibility fact can
 be confirmed. A glob, include, source-parse, or other relevant unknown therefore
 blocks a contradictory confirmed fact at either the source or destination.
 Standalone unknown findings retain their source side, source path, and revision
-provenance. Finding IDs preserve Rust identifier case and serialize the complete
-semantic identity, including both sides' cfg regions, contracts, and typed
-unknown provenance; legal ambiguous input is data, never an assertion failure.
+provenance. Before those findings are emitted, identical one-to-one unknown
+proofs on base and target cancel out: kind, crate/module, source path, cfg guard,
+evidence, and provenance class must match, and each proof must belong to its
+own snapshot. Changed, one-sided, duplicate, detached, or Git-tree-versus-overlay
+proofs remain typed unknowns. Finding IDs preserve Rust identifier case and
+serialize the complete semantic identity, including both sides' cfg regions,
+contracts, and typed unknown provenance; legal ambiguous input is data, never
+an assertion failure.
 
 `prepare_rust_api_delta` constructs base snapshots from the exact resolved
 comparison bases (normally merge bases), independently of ordinary patch
@@ -1748,6 +2206,17 @@ pub fn rust_hash(root: &Path) -> String {
     // Cargo.toml/Cargo.lock hash + Rust source hash, 16-byte digest segments
 }
 ```
+
+A hit also reports `age_secs`: how long ago the entry was published, read from
+the entry file's mtime — an entry is published by a single `rename`, so its mtime
+IS the moment the result became readable. Nothing changed on disk to carry it, so
+a cache warmed by an older prview reports its age too (the legacy layout keeps
+its status file as the entry, and the same mtime answers). `None` when the age is
+unknowable — no metadata, or a timestamp in the future after a clock moved
+backwards — never a fabricated zero. The age travels with the replay into the
+ledger's `Cached` state and out through `RUN.json`'s `ledger` view as
+`cache_age_secs`; it deliberately does NOT enter `CheckResult`, since it is a
+property of the entry, not of the check's verdict.
 
 ## Dependencies
 

@@ -139,6 +139,9 @@ fn handle_tui_event(state: &mut TuiState, event: TuiEvent) {
         TuiEvent::Key(_) => {
             // Handled in event loop
         }
+        TuiEvent::CheckQueued { name } => {
+            state.update_check(&name, types::CheckLifecycle::Pending);
+        }
         TuiEvent::CheckStarted { name } => {
             state.update_check(&name, types::CheckLifecycle::Running);
         }
@@ -170,7 +173,11 @@ fn handle_tui_event(state: &mut TuiState, event: TuiEvent) {
 
 fn map_check_event(event: CheckEvent) -> TuiEvent {
     match event {
-        CheckEvent::Started { name } => TuiEvent::CheckStarted { name },
+        // `Started` is the run considering the check; the governor may hold it
+        // in the queue for minutes yet. `Running` is the one that means a
+        // process began, so it is the one that lights the spinner.
+        CheckEvent::Started { name } => TuiEvent::CheckQueued { name },
+        CheckEvent::Running { name } => TuiEvent::CheckStarted { name },
         CheckEvent::Completed { result } => TuiEvent::CheckCompleted { result },
         CheckEvent::Skipped { name } => TuiEvent::CheckCompleted {
             result: Box::new(CheckResult {
@@ -338,8 +345,12 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
 
     // Run all checks with event callbacks for real-time updates
     let tx_checks = tx.clone();
+    let ledger = crate::ledger::TaskLedger::new();
+    // The TUI is its own entry point, so it owns the run's single budget the way
+    // `App` does for the CLI.
+    let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::new());
     let (check_results, skipped_checks) =
-        crate::checks::run_all_with_events(&config, move |event| {
+        crate::checks::run_all_with_events(&config, &ledger, &governor, move |event| {
             let tx = tx_checks.clone();
             let _ = tx.send(map_check_event(event));
         })
@@ -379,6 +390,7 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
     // Generate artifacts
     let artifacts_dir = crate::artifacts::generate(crate::artifacts::GenerateInput {
         config: &config,
+        ledger: &ledger,
         diffs: &diffs,
         checks: &check_results,
         heuristics: Some(&heuristics),
@@ -389,6 +401,7 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
         skipped_checks,
         worktree_clean,
         worktree_status_digest,
+        governor: &governor,
     })?;
     let _ = tx.send(TuiEvent::ArtifactsReady {
         dir: artifacts_dir.clone(),

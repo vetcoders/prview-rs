@@ -17,6 +17,12 @@ impl Check for SemgrepCheck {
         "Semgrep scan"
     }
 
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
+    }
+
     fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
         if which::which("semgrep").is_ok() {
             CheckEligibility::Run

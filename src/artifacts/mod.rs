@@ -51,6 +51,7 @@ use crate::config::Config;
 use crate::git::git_cmd;
 use crate::git::{Diff, Repository, ResolvedRef};
 use crate::heuristics::HeuristicsResult;
+use crate::ledger::TaskLedger;
 use crate::paths::{read_dir_within, read_to_string_within, read_within};
 use crate::policy::{GateClass, PolicySeverity};
 use crate::regression;
@@ -121,6 +122,13 @@ struct ContextCommandTiming {
 
 pub struct GenerateInput<'a> {
     pub config: &'a Config,
+    /// The run's task ledger — here for the ONE fact the artifact stage cannot
+    /// derive on its own: which tree the run actually reviewed. `config` never
+    /// learns it, because the shared target snapshot is installed on a clone of
+    /// the config inside `checks::run_all`; without the ledger the context
+    /// generators fall back to the local checkout and a `--pr` pack ends up
+    /// mixing two revisions (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`).
+    pub ledger: &'a TaskLedger,
     pub diffs: &'a [Diff],
     pub checks: &'a [CheckResult],
     pub heuristics: Option<&'a HeuristicsResult>,
@@ -142,6 +150,13 @@ pub struct GenerateInput<'a> {
     /// `worktree_clean`. Recorded in `00_summary/PROVENANCE.json`; `None` when
     /// the repository could not be inspected.
     pub worktree_status_digest: Option<String>,
+    /// The run's machine-wide budget, shared with the checks stage.
+    ///
+    /// The context stage shells out to the same class of tools the gates do — a
+    /// project-wide `tsc`, a project-wide `eslint`, a bundler — so it must draw
+    /// on the same budget rather than pick its own fan-out. It is also what a
+    /// Ctrl-C reaches those children through.
+    pub governor: &'a crate::governor::ResourceGovernor,
 }
 
 struct RunJsonInput<'a> {
@@ -159,12 +174,18 @@ struct RunJsonInput<'a> {
     stage_timings: &'a [StageTiming],
     context_artifacts: &'a [ContextArtifactDecision],
     context_command_timings: &'a [ContextCommandTiming],
+    /// The run's task ledger, serialized as the additive `ledger` view.
+    ledger: &'a TaskLedger,
     regression: Option<&'a regression::RegressionReport>,
 }
 
 struct MergeGateInput<'a> {
     dir: &'a Path,
     config: &'a Config,
+    /// The run's task ledger, read for ONE fact no `CheckResult` carries: how
+    /// old the stored result behind a replayed check was. A blocking row built
+    /// on a days-old replay earns the advisory `stale_cache_caveats` entry.
+    ledger: &'a TaskLedger,
     checks: &'a [CheckResult],
     heuristics: Option<&'a HeuristicsResult>,
     inline: &'a InlineFindingsSummary,
@@ -328,6 +349,7 @@ pub(super) fn build_heuristics_check(
 pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let GenerateInput {
         config,
+        ledger,
         diffs,
         checks,
         heuristics,
@@ -338,6 +360,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         skipped_checks,
         worktree_clean,
         worktree_status_digest,
+        governor,
     } = input;
     let t_total = Instant::now();
     let mut stage_timings = Vec::new();
@@ -350,7 +373,20 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let heuristics_check = build_heuristics_check(heuristics, config);
     let mut all_checks: Vec<CheckResult> = checks.to_vec();
     all_checks.push(heuristics_check);
-    let context_artifacts = plan_context_artifacts(config, diffs, &all_checks);
+    // The reviewed tree, not the local one: in a `--pr` run the checks judged a
+    // snapshot of the PR's commit, and the 30_context artifacts must be planned
+    // and produced from the same bytes or the pack describes two revisions at
+    // once (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). `share_target_snapshot` therefore
+    // materialises one whenever the target is off-`HEAD`, whether or not a gate
+    // needed it, so the fallback below is reached only for a local review (target
+    // == `HEAD`, where the repo root IS the reviewed tree) or for a run whose
+    // snapshot could not be created at all — the same degraded path the checks
+    // themselves take.
+    let context_scan_root = ledger
+        .scan_dir()
+        .unwrap_or_else(|| config.repo_root.clone());
+    let context_artifacts =
+        plan_context_artifacts(config, &context_scan_root, diffs, &all_checks, ledger);
 
     let emit_human_stdout = !config.json && !config.quiet;
     let out_dir = config.allocate_artifacts_dir_for_commit(&resolved_target.commit_id)?;
@@ -520,6 +556,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     generate_merge_gate(MergeGateInput {
         dir: &summary_dir,
         config,
+        ledger,
         checks: &all_checks,
         heuristics,
         inline: &inline_summary,
@@ -706,14 +743,18 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         stage_timings.push(finish_timing(emit_human_stdout, "report.json", t));
     }
 
-    // 30_context/ — profile-specific artifacts (with timeouts, skip duplicates)
+    // 30_context/ — profile-specific artifacts (with timeouts, skip duplicates).
+    // Runs against `context_scan_root`, the same reviewed tree the decisions
+    // above were planned from.
     let t = Instant::now();
     let context_command_timings = generate_context_artifacts(
         config,
-        &all_checks,
+        &context_scan_root,
+        ledger,
         &context_dir,
         emit_human_stdout,
         &context_artifacts,
+        governor,
     )?;
     stage_timings.push(finish_timing(emit_human_stdout, "context-tools", t));
 
@@ -764,6 +805,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         stage_timings: &stage_timings,
         context_artifacts: &context_artifacts,
         context_command_timings: &context_command_timings,
+        ledger,
         regression: Some(&regression_report),
     })?;
     stage_timings.push(finish_timing(emit_human_stdout, "RUN.json", t));
@@ -1358,6 +1400,75 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Version of the `ledger` object in `RUN.json`, independent of the pack's
+/// `schema_version`.
+///
+/// The ledger is an ADDITIVE view over work the pack already reports elsewhere
+/// (`checks[].cached`, `context_artifacts[]`, `context_commands[]`), which stay
+/// exactly as they were — a consumer that never looks at `ledger` cannot tell
+/// this cut happened, which is precisely why `schema_version` does not move (the
+/// precedent `CheckProvenance` set in `checks/mod.rs`). Its own counter is what
+/// lets the view's shape evolve, and be recognised, without renegotiating the
+/// pack contract.
+const LEDGER_SCHEMA: u32 = 1;
+
+/// The run's task ledger, as it appears in `RUN.json`.
+///
+/// One object per entry, stating WHAT tool the run considered, WHICH surface
+/// asked (`check` / `context_artifact`), how it resolved, and on which tree.
+/// `substrate` is serialized with the same `tree_state` strings as
+/// `checks[].tree_state` — one vocabulary for "which tree", not two.
+///
+/// Each lifecycle carries only the evidence it actually has: a `run` its
+/// duration, a `cached` the age of the entry it replayed and the substrate of
+/// the ORIGINAL execution, a `skipped` / `not_applicable` its reason. Nothing is
+/// filled in with a plausible-looking value where the run holds none.
+fn ledger_view(ledger: &TaskLedger) -> serde_json::Value {
+    use crate::ledger::TaskState;
+    use serde_json::json;
+
+    let substrate = |substrate: &crate::ledger::SubstrateKey| {
+        json!({
+            "target_sha": substrate.target_sha,
+            "tree_state": substrate.tree_state.map(|state| state.as_str()),
+        })
+    };
+
+    let entries: Vec<serde_json::Value> = ledger
+        .entries()
+        .iter()
+        .map(|entry| {
+            let mut row = json!({
+                "tool": entry.key.tool,
+                "kind": entry.kind.as_str(),
+                "lifecycle": entry.state.lifecycle(),
+                "substrate": substrate(&entry.key.substrate),
+            });
+            match &entry.state {
+                TaskState::Run { duration } => {
+                    row["duration_secs"] = json!(duration.as_secs_f32());
+                }
+                TaskState::Cached {
+                    cache_age_secs,
+                    origin,
+                } => {
+                    row["cache_age_secs"] = json!(cache_age_secs);
+                    row["origin"] = substrate(origin);
+                }
+                TaskState::Skipped { reason } | TaskState::NotApplicable { reason } => {
+                    row["reason"] = json!(reason);
+                }
+            }
+            row
+        })
+        .collect();
+
+    json!({
+        "schema": LEDGER_SCHEMA,
+        "entries": entries,
+    })
+}
+
 /// RUN.json — single source of truth (Artifact Pack v1)
 fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
     use serde_json::json;
@@ -1376,6 +1487,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
         stage_timings,
         context_artifacts,
         context_command_timings,
+        ledger,
         regression,
     } = input;
 
@@ -1512,6 +1624,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             "status": command.status,
             "duration_secs": command.duration_secs,
         })).collect::<Vec<_>>(),
+        "ledger": ledger_view(ledger),
     });
 
     fs::write(dir.join("RUN.json"), serde_json::to_string_pretty(&run)?)?;

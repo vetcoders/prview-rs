@@ -59,6 +59,12 @@ impl Cache {
         Self { dir, enabled }
     }
 
+    /// The on-disk path of one entry (test-only), so a test can age it.
+    #[cfg(test)]
+    pub(crate) fn entry_path(&self, check_name: &str, key: &str) -> PathBuf {
+        self.dir.join(check_name).join(key)
+    }
+
     /// Check if cached result exists
     pub fn get(&self, check_name: &str, key: &str) -> Option<CachedResult> {
         if !self.enabled {
@@ -66,7 +72,9 @@ impl Cache {
         }
 
         let cache_dir = self.dir.join(check_name);
-        let raw = fs::read_to_string(cache_dir.join(key)).ok()?;
+        let entry_path = cache_dir.join(key);
+        let raw = fs::read_to_string(&entry_path).ok()?;
+        let age_secs = entry_age_secs(&entry_path);
 
         // An entry written by this prview is one self-contained JSON document.
         if let Ok(entry) = serde_json::from_str::<CacheEntry>(&raw) {
@@ -74,6 +82,7 @@ impl Cache {
                 status: entry.status.trim().to_string(),
                 output: entry.output,
                 provenance: entry.provenance,
+                age_secs,
             });
         }
 
@@ -85,6 +94,7 @@ impl Cache {
             status: raw.trim().to_string(),
             output: fs::read_to_string(sidecar(&cache_dir, key, LOG_SUFFIX)).ok(),
             provenance: fs::read_to_string(sidecar(&cache_dir, key, PROVENANCE_SUFFIX)).ok(),
+            age_secs,
         })
     }
 
@@ -194,6 +204,50 @@ pub struct CachedResult {
     /// the caller stored it. `None` for entries written before the sidecar
     /// existed, or for a check that produced no provenance.
     pub provenance: Option<String>,
+    /// How long ago this entry was published, in whole seconds — see
+    /// [`entry_age_secs`]. `None` when the age cannot be established.
+    pub age_secs: Option<u64>,
+}
+
+/// Move an entry's mtime `by` into the past (test-only), so the age a replay
+/// reports can be asserted without waiting for wall-clock time to pass.
+///
+/// Only the timestamp moves — the entry's bytes are exactly what `set` wrote,
+/// which is what makes this a test of the real published-at reading rather than
+/// of a fixture format.
+#[cfg(test)]
+pub(crate) fn backdate(path: &Path, by: std::time::Duration) {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("cache entry must exist to be aged");
+    let modified = file
+        .metadata()
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    file.set_modified(modified - by).expect("set mtime");
+}
+
+/// How old the entry file at `path` is, in whole seconds.
+///
+/// Read from the file's mtime rather than from anything inside it: an entry is
+/// published by a single `rename`, so its mtime IS the moment the result became
+/// readable, and taking the age this way costs one `stat` and keeps the on-disk
+/// format untouched — every entry a previous prview wrote already carries it.
+///
+/// `None` rather than a guess when the age is unknowable: no metadata to read,
+/// a filesystem that does not report mtime, or a timestamp in the future (a
+/// clock that moved backwards, a copied tree). A replay of unknown age is a fact
+/// a reviewer can act on; a fabricated zero is not.
+fn entry_age_secs(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(modified)
+            .ok()?
+            .as_secs(),
+    )
 }
 
 /// Generate a content-based cache key for TypeScript checks.
@@ -288,6 +342,7 @@ fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
 mod tests {
     use super::*;
     use crate::git::git_cmd;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
@@ -296,6 +351,7 @@ mod tests {
             status: "passed".to_string(),
             output: Some("test output".to_string()),
             provenance: None,
+            age_secs: None,
         };
         assert_eq!(result.status, "passed");
         assert_eq!(result.output, Some("test output".to_string()));
@@ -307,6 +363,7 @@ mod tests {
             status: "failed".to_string(),
             output: None,
             provenance: None,
+            age_secs: None,
         };
         assert_eq!(result.status, "failed");
         assert!(result.output.is_none());
@@ -354,6 +411,65 @@ mod tests {
         assert_eq!(result.status, "passed");
         assert_eq!(result.output.as_deref(), Some("out"));
         assert!(result.provenance.is_none());
+    }
+
+    /// A replay is only as good as the answer it replays, and until now the
+    /// pack could not say how old that answer was. The age comes from the entry
+    /// file's mtime — the moment the single `rename` published it — so no entry
+    /// on disk had to change format to carry it.
+    #[test]
+    fn a_cache_hit_reports_how_old_the_entry_is() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Cache {
+            dir: temp_dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        cache
+            .set("check", "key", "passed", Some("out"), None)
+            .unwrap();
+        assert_eq!(
+            cache.get("check", "key").unwrap().age_secs,
+            Some(0),
+            "an entry written just now is zero whole seconds old",
+        );
+
+        backdate(&cache.entry_path("check", "key"), Duration::from_secs(7200));
+
+        let aged = cache.get("check", "key").unwrap();
+        let age = aged.age_secs.expect("an entry on disk has an age");
+        assert!(
+            (7200..7260).contains(&age),
+            "an entry backdated two hours replays as two hours old, got {age}s",
+        );
+        assert_eq!(
+            aged.status, "passed",
+            "reading the age must not disturb the entry itself",
+        );
+        assert_eq!(aged.output.as_deref(), Some("out"));
+    }
+
+    /// The legacy layout keeps its status file as the entry, so the same mtime
+    /// answers for it — a warm cache from an older prview is not ageless.
+    #[test]
+    fn a_legacy_cache_hit_also_reports_an_age() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Cache {
+            dir: temp_dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        let legacy_dir = temp_dir.path().join("check");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(legacy_dir.join("legacy-key"), "passed").unwrap();
+        backdate(&legacy_dir.join("legacy-key"), Duration::from_secs(60));
+
+        let age = cache
+            .get("check", "legacy-key")
+            .unwrap()
+            .age_secs
+            .expect("a legacy entry has an mtime like any other file");
+        assert!((60..120).contains(&age), "got {age}s");
     }
 
     #[test]

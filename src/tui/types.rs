@@ -686,6 +686,9 @@ pub enum TuiEvent {
     Tick,
     /// Keyboard input
     Key(crossterm::event::KeyEvent),
+    /// Check entered the execution set but has not been admitted by the
+    /// resource governor yet — queued, not running.
+    CheckQueued { name: String },
     /// Check started
     CheckStarted { name: String },
     /// Check completed

@@ -38,6 +38,23 @@ pub fn harden(cmd: &mut TokioCommand) {
     cmd.process_group(0);
 }
 
+/// The half of [`harden`] that a synchronous [`std::process::Command`] can take:
+/// detached stdin and, on unix, its own process group.
+///
+/// `kill_on_drop` has no std equivalent — a caller here owns the `Child` and
+/// reaps it itself. The process group is the half that matters anyway: the
+/// context stage spawns `sh -c 'pnpm exec …'` wrappers whose grandchildren
+/// outlive a plain `Child::kill`, and it is the pgid that the run's resource
+/// governor signals on cancellation.
+pub fn harden_std(cmd: &mut std::process::Command) {
+    cmd.stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+}
+
 /// Spawn `cmd` under the standard rails with piped output, drain stdout+stderr
 /// concurrently (a high-output child cannot deadlock on a full pipe buffer),
 /// and enforce `timeout`.
@@ -46,11 +63,27 @@ pub fn harden(cmd: &mut TokioCommand) {
 /// child) and, on unix, the whole process group is SIGKILLed so grandchildren
 /// die too; the returned error is `on_timeout()`. `label` names the tool in the
 /// spawn/wait error messages.
+///
+/// This is the one place a check's external tool is spawned, so it is also where
+/// the pid is handed to the run's resource governor
+/// ([`crate::governor::with_child_scope`]) — that is what lets one Ctrl-C reach a
+/// `cargo` → `rustc` → `cc` tree instead of leaving it behind. Outside a
+/// governed scope the registration is a no-op.
 pub async fn run_capture_with_timeout(
+    cmd: TokioCommand,
+    timeout: Duration,
+    label: &str,
+    on_timeout: impl FnOnce() -> anyhow::Error,
+) -> anyhow::Result<Output> {
+    run_capture_with_timeout_after_spawn(cmd, timeout, label, on_timeout, |_| {}).await
+}
+
+async fn run_capture_with_timeout_after_spawn(
     mut cmd: TokioCommand,
     timeout: Duration,
     label: &str,
     on_timeout: impl FnOnce() -> anyhow::Error,
+    after_spawn: impl FnOnce(Option<u32>),
 ) -> anyhow::Result<Output> {
     harden(&mut cmd);
     cmd.stdout(std::process::Stdio::piped())
@@ -64,6 +97,12 @@ pub async fn run_capture_with_timeout(
     // the handle moves into wait_with_output(); needed to signal the group.
     #[cfg(unix)]
     let pid = child.id();
+
+    after_spawn(child.id());
+
+    // Held for the whole wait: dropping it unregisters, so the success, timeout
+    // and wait-error paths all leave the registry clean without saying so.
+    let _registration = child.id().and_then(crate::governor::register_active_child);
 
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(result) => result.map_err(|e| anyhow::anyhow!("failed to run {label}: {e}")),
@@ -150,6 +189,62 @@ mod tests {
         let grandchild: i32 = s.trim().parse().expect("grandchild pid");
 
         assert_grandchild_reaped(grandchild).await;
+    }
+
+    /// Deterministic version of the spawn/register race: cancellation drains
+    /// an empty registry after the process group exists but before its pid is
+    /// registered. Registration must close that window instead of making the
+    /// command wait for its ordinary timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registration_after_cancellation_kills_the_async_process_group() {
+        use std::io::Read;
+        use std::sync::Arc;
+        use std::thread::sleep;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("late-grandchild.pid");
+        let script = format!("sleep 30 & echo $! > {} ; wait", pidfile.display());
+        let mut cmd = TokioCommand::new("sh");
+        cmd.arg("-c").arg(&script);
+
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        let canceller = Arc::clone(&governor);
+        let marker = pidfile.clone();
+        let run = run_capture_with_timeout_after_spawn(
+            cmd,
+            Duration::from_secs(2),
+            "late-async-tree",
+            || anyhow::anyhow!("late async tree timed out"),
+            move |_| {
+                for _ in 0..100 {
+                    if marker.exists() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10));
+                }
+                assert!(marker.exists(), "child must publish its grandchild pid");
+                canceller.cancel();
+            },
+        );
+
+        let output =
+            crate::governor::with_child_scope(Arc::clone(&governor), "late-async-tree", run)
+                .await
+                .expect("late registration must kill before the timeout branch wins");
+
+        let mut contents = String::new();
+        std::fs::File::open(&pidfile)
+            .expect("grandchild pidfile")
+            .read_to_string(&mut contents)
+            .expect("read grandchild pid");
+        let grandchild = contents.trim().parse().expect("numeric grandchild pid");
+        assert_grandchild_reaped(grandchild).await;
+        assert_eq!(governor.inflight_count(), 0);
+        assert!(
+            !output.status.success(),
+            "the cancelled process group must not report a successful command",
+        );
     }
 
     /// Direct primitive test: `sigkill_process_group` reaps a grandchild through

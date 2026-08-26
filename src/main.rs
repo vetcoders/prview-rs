@@ -3,6 +3,7 @@ use clap::Parser;
 use colored::Colorize;
 use prview::cli::{GateArgs, McpArgs};
 use prview::git::git_cmd;
+use prview::governor::{CtrlC, is_cancellation, with_cancellation};
 use prview::{App, Cli, CliCommand, Config, OpenArgs, RunsArgs, ScopeArgs, StateArgs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,6 +11,13 @@ use std::process::Command;
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
+        // A cancelled run produced no verdict. Reporting one of prview's own
+        // codes would claim it did, so it exits on the shell's interrupt
+        // convention instead.
+        if is_cancellation(&err) {
+            eprintln!("{} run cancelled", "^C".yellow().bold());
+            std::process::exit(prview::governor::CANCELLED_EXIT_CODE);
+        }
         display_error(&err);
         std::process::exit(1);
     }
@@ -69,6 +77,9 @@ async fn run() -> Result<()> {
         return match command {
             CliCommand::Gate(args) => match run_gate_command(&cli, args).await {
                 Ok(exit_code) => std::process::exit(exit_code),
+                // A cancelled gate run did not fail to execute — it was stopped.
+                // `main` owns that distinction and the exit code for it.
+                Err(err) if is_cancellation(&err) => Err(err),
                 Err(err) => {
                     display_error(&err);
                     std::process::exit(prview::gate::GATE_EXECUTION_ERROR_EXIT_CODE);
@@ -100,15 +111,18 @@ async fn run() -> Result<()> {
     }
 
     let app = App::from_config(config)?;
+    // The TUI is deliberately not wrapped: it puts the terminal in raw mode, so
+    // Ctrl-C reaches it as a key event and it owns its own quit path.
+    let governor = app.governor();
 
     // Watch mode
     if cli.watch {
-        app.run_watch().await?;
+        with_cancellation(app.run_watch(), &governor, CtrlC).await?;
         return Ok(());
     }
 
     // Normal run
-    let report = app.run().await?;
+    let report = with_cancellation(app.run(), &governor, CtrlC).await?;
 
     // The verdict comes from the pack's MERGE_GATE.json and nowhere else. If it
     // cannot be read, prview cannot report a verdict — that is an execution
@@ -188,7 +202,10 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     );
     config.apply_gate_profile(enforcement_mode);
     let app = App::from_config(config)?;
-    let report = app.run().await.context("gate review run failed")?;
+    let governor = app.governor();
+    let report = with_cancellation(app.run(), &governor, CtrlC)
+        .await
+        .context("gate review run failed")?;
     let cli_summary = prview::output::build_cli_json_summary(&app.config, &report)?;
     let merge_gate_path = report
         .artifacts_dir

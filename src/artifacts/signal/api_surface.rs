@@ -2509,6 +2509,7 @@ fn normalized_contract(mut item: Item) -> String {
     match &mut item {
         Item::Fn(function) => {
             *function.block = syn::parse_quote!({});
+            alpha_normalize_signature(&mut function.sig);
             trim_signature_punctuation(&mut function.sig);
         }
         Item::Struct(value) => {
@@ -2535,14 +2536,25 @@ fn normalized_contract(mut item: Item) -> String {
             }
         }
         Item::Trait(value) => {
+            let mut normalizer = SignatureAlphaNormalizer::default();
+            normalizer.push_generics(&value.generics);
+            value.generics = normalizer.fold_generics(value.generics.clone());
+            value.supertraits = value
+                .supertraits
+                .clone()
+                .into_iter()
+                .map(|bound| normalizer.fold_type_param_bound(bound))
+                .collect();
             trim_generics_punctuation(&mut value.generics);
             for trait_item in &mut value.items {
                 if let syn::TraitItem::Fn(function) = trait_item {
                     function.default = None;
                     function.semi_token = Some(Default::default());
+                    normalizer.normalize_signature(&mut function.sig);
                     trim_signature_punctuation(&mut function.sig);
                 }
             }
+            normalizer.pop_scope();
         }
         Item::Type(value) => trim_generics_punctuation(&mut value.generics),
         _ => {}
@@ -2704,6 +2716,206 @@ fn trim_signature_punctuation(signature: &mut syn::Signature) {
     trim_generics_punctuation(&mut signature.generics);
 }
 
+fn alpha_normalize_signature(signature: &mut syn::Signature) {
+    SignatureAlphaNormalizer::default().normalize_signature(signature);
+}
+
+/// Canonicalize names that bind only inside a public signature while retaining
+/// every use relationship. Generic order remains observable; spelling does not.
+#[derive(Default)]
+struct SignatureAlphaNormalizer {
+    ident_scopes: Vec<BTreeMap<String, syn::Ident>>,
+    lifetime_scopes: Vec<BTreeMap<String, syn::Lifetime>>,
+    next_type: usize,
+    next_const: usize,
+    next_lifetime: usize,
+}
+
+impl SignatureAlphaNormalizer {
+    fn normalize_signature(&mut self, signature: &mut syn::Signature) {
+        self.push_generics(&signature.generics);
+        signature.generics = self.fold_generics(signature.generics.clone());
+        for argument in &mut signature.inputs {
+            match argument {
+                syn::FnArg::Receiver(receiver) => {
+                    *receiver = self.fold_receiver(receiver.clone());
+                }
+                syn::FnArg::Typed(argument) => {
+                    *argument.ty = self.fold_type((*argument.ty).clone());
+                    *argument.pat = syn::parse_quote!(_);
+                }
+            }
+        }
+        signature.output = self.fold_return_type(signature.output.clone());
+        self.pop_scope();
+    }
+
+    fn push_generics(&mut self, generics: &syn::Generics) {
+        let params = generics.params.iter().cloned().collect::<Vec<_>>();
+        self.push_params(&params);
+    }
+
+    fn push_params(&mut self, params: &[syn::GenericParam]) {
+        let mut idents = BTreeMap::new();
+        let mut lifetimes = BTreeMap::new();
+        for parameter in params {
+            match parameter {
+                syn::GenericParam::Lifetime(parameter) => {
+                    let replacement = syn::Lifetime::new(
+                        &format!("'__prview_l{}", self.next_lifetime),
+                        parameter.lifetime.ident.span(),
+                    );
+                    self.next_lifetime += 1;
+                    lifetimes.insert(parameter.lifetime.to_string(), replacement);
+                }
+                syn::GenericParam::Type(parameter) => {
+                    let replacement = syn::Ident::new(
+                        &format!("__PrviewT{}", self.next_type),
+                        parameter.ident.span(),
+                    );
+                    self.next_type += 1;
+                    idents.insert(parameter.ident.to_string(), replacement);
+                }
+                syn::GenericParam::Const(parameter) => {
+                    let replacement = syn::Ident::new(
+                        &format!("__PRVIEW_C{}", self.next_const),
+                        parameter.ident.span(),
+                    );
+                    self.next_const += 1;
+                    idents.insert(parameter.ident.to_string(), replacement);
+                }
+            }
+        }
+        self.ident_scopes.push(idents);
+        self.lifetime_scopes.push(lifetimes);
+    }
+
+    fn pop_scope(&mut self) {
+        self.ident_scopes.pop();
+        self.lifetime_scopes.pop();
+    }
+
+    fn fold_path_idents(&mut self, mut path: syn::Path, fold_head: bool) -> syn::Path {
+        if fold_head
+            && path.leading_colon.is_none()
+            && let Some(segment) = path.segments.first_mut()
+        {
+            segment.ident = self.fold_ident(segment.ident.clone());
+        }
+        for segment in &mut path.segments {
+            segment.arguments = self.fold_path_arguments(segment.arguments.clone());
+        }
+        path
+    }
+}
+
+impl Fold for SignatureAlphaNormalizer {
+    fn fold_ident(&mut self, ident: syn::Ident) -> syn::Ident {
+        self.ident_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&ident.to_string()).cloned())
+            .unwrap_or(ident)
+    }
+
+    fn fold_lifetime(&mut self, lifetime: syn::Lifetime) -> syn::Lifetime {
+        self.lifetime_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&lifetime.to_string()).cloned())
+            .unwrap_or(lifetime)
+    }
+
+    fn fold_path(&mut self, path: syn::Path) -> syn::Path {
+        // Only the head of an unqualified path can name a type or const
+        // binder. Later segments are associated items and remain public API.
+        self.fold_path_idents(path, true)
+    }
+
+    fn fold_type_path(&mut self, type_path: syn::TypePath) -> syn::TypePath {
+        let qualified = type_path.qself.is_some();
+        syn::TypePath {
+            qself: type_path.qself.map(|qself| self.fold_qself(qself)),
+            // In `<T as Trait>::Item`, the binder lives in `qself.ty`;
+            // `Trait` and `Item` are public names, even if one is spelled T.
+            path: self.fold_path_idents(type_path.path, !qualified),
+        }
+    }
+
+    fn fold_assoc_type(&mut self, associated: syn::AssocType) -> syn::AssocType {
+        syn::AssocType {
+            ident: associated.ident,
+            generics: associated
+                .generics
+                .map(|generics| self.fold_angle_bracketed_generic_arguments(generics)),
+            eq_token: associated.eq_token,
+            ty: self.fold_type(associated.ty),
+        }
+    }
+
+    fn fold_assoc_const(&mut self, associated: syn::AssocConst) -> syn::AssocConst {
+        syn::AssocConst {
+            ident: associated.ident,
+            generics: associated
+                .generics
+                .map(|generics| self.fold_angle_bracketed_generic_arguments(generics)),
+            eq_token: associated.eq_token,
+            value: self.fold_expr(associated.value),
+        }
+    }
+
+    fn fold_constraint(&mut self, constraint: syn::Constraint) -> syn::Constraint {
+        syn::Constraint {
+            ident: constraint.ident,
+            generics: constraint
+                .generics
+                .map(|generics| self.fold_angle_bracketed_generic_arguments(generics)),
+            colon_token: constraint.colon_token,
+            bounds: constraint
+                .bounds
+                .into_iter()
+                .map(|bound| self.fold_type_param_bound(bound))
+                .collect(),
+        }
+    }
+
+    fn fold_member(&mut self, member: syn::Member) -> syn::Member {
+        member
+    }
+
+    fn fold_type_bare_fn(&mut self, bare_fn: syn::TypeBareFn) -> syn::TypeBareFn {
+        let has_binders = bare_fn.lifetimes.is_some();
+        if let Some(lifetimes) = &bare_fn.lifetimes {
+            let params = lifetimes.lifetimes.iter().cloned().collect::<Vec<_>>();
+            self.push_params(&params);
+        }
+        let folded = syn::fold::fold_type_bare_fn(self, bare_fn);
+        if has_binders {
+            self.pop_scope();
+        }
+        folded
+    }
+
+    fn fold_trait_bound(&mut self, bound: syn::TraitBound) -> syn::TraitBound {
+        let has_binders = bound.lifetimes.is_some();
+        if let Some(lifetimes) = &bound.lifetimes {
+            let params = lifetimes.lifetimes.iter().cloned().collect::<Vec<_>>();
+            self.push_params(&params);
+        }
+        let folded = syn::fold::fold_trait_bound(self, bound);
+        if has_binders {
+            self.pop_scope();
+        }
+        folded
+    }
+
+    fn fold_bare_fn_arg(&mut self, argument: syn::BareFnArg) -> syn::BareFnArg {
+        let mut folded = syn::fold::fold_bare_fn_arg(self, argument);
+        folded.name = None;
+        folded
+    }
+}
+
 fn trim_generics_punctuation(generics: &mut syn::Generics) {
     trim_trailing_punct(&mut generics.params);
     if let Some(where_clause) = &mut generics.where_clause {
@@ -2752,9 +2964,11 @@ fn normalized_associated_contract(
     normalize_attrs(&mut impl_attrs, true);
     let defaultness = &item_impl.defaultness;
     let unsafety = &item_impl.unsafety;
-    let mut generics = item_impl.generics.clone();
+    let mut normalizer = SignatureAlphaNormalizer::default();
+    normalizer.push_generics(&item_impl.generics);
+    let mut generics = normalizer.fold_generics(item_impl.generics.clone());
     trim_generics_punctuation(&mut generics);
-    let mut self_ty = (*item_impl.self_ty).clone();
+    let mut self_ty = normalizer.fold_type((*item_impl.self_ty).clone());
     if hide_owner
         && let syn::Type::Path(type_path) = &mut self_ty
         && let Some(last) = type_path.path.segments.last().cloned()
@@ -2770,6 +2984,7 @@ fn normalized_associated_contract(
         syn::ImplItem::Fn(mut function) => {
             normalize_attrs(&mut function.attrs, false);
             function.block = syn::parse_quote!({});
+            normalizer.normalize_signature(&mut function.sig);
             trim_signature_punctuation(&mut function.sig);
             function.to_token_stream()
         }
@@ -2779,6 +2994,7 @@ fn normalized_associated_contract(
         }
         _ => return String::new(),
     };
+    normalizer.pop_scope();
     let tokens =
         quote!(#(#impl_attrs)* #defaultness #unsafety impl #generics #self_ty { #item_tokens });
     canonical_tokens(tokens)
@@ -2794,6 +3010,8 @@ fn normalized_foreign_contract(foreign: &syn::ItemForeignMod, item: &syn::Foreig
         syn::ForeignItem::Fn(value) => {
             normalize_attrs(&mut value.attrs, false);
             value.sig.ident = syn::Ident::new("__prview_name", value.sig.ident.span());
+            alpha_normalize_signature(&mut value.sig);
+            trim_signature_punctuation(&mut value.sig);
         }
         syn::ForeignItem::Static(value) => {
             normalize_attrs(&mut value.attrs, false);
@@ -3757,6 +3975,74 @@ mod tests {
         assert_eq!(left.items, right.items);
         let changed = snapshot_rust_api(&source("pub fn café(x: u16) -> u8 { 0 }"));
         assert_ne!(left.items[0].contract, changed.items[0].contract);
+    }
+
+    #[test]
+    fn rust_api_snapshot_alpha_normalizes_parameter_generic_and_lifetime_binders() {
+        let before = snapshot_rust_api(&source(
+            "pub fn parse<'input, T: Clone, const N: usize>(input: &'input [T; N]) -> &'input T { &input[0] }",
+        ));
+        let renamed = snapshot_rust_api(&source(
+            "pub fn parse<'source, U: Clone, const M: usize>(source: &'source [U; M]) -> &'source U { &source[0] }",
+        ));
+        assert_eq!(
+            before.items, renamed.items,
+            "binder spelling and parameter patterns are not caller-observable"
+        );
+
+        let nested_before = snapshot_rust_api(&source(
+            "pub struct Parser; \
+             pub trait Service { fn call<'a, T>(&'a self, input: T) -> (&'a Self, T); } \
+             impl Parser { pub fn parse<'a, T>(&'a self, input: T) -> (&'a Self, T) { (self, input) } } \
+             unsafe extern \"C\" { pub fn foreign<'a>(input: &'a u8) -> &'a u8; } \
+             pub fn map<T>(callback: for<'a> fn(&'a T) -> &'a T) {}",
+        ));
+        let nested_renamed = snapshot_rust_api(&source(
+            "pub struct Parser; \
+             pub trait Service { fn call<'value, U>(&'value self, value: U) -> (&'value Self, U); } \
+             impl Parser { pub fn parse<'value, U>(&'value self, value: U) -> (&'value Self, U) { (self, value) } } \
+             unsafe extern \"C\" { pub fn foreign<'value>(value: &'value u8) -> &'value u8; } \
+             pub fn map<U>(function: for<'value> fn(&'value U) -> &'value U) {}",
+        ));
+        assert_eq!(
+            nested_before.items, nested_renamed.items,
+            "trait, inherent, foreign, and higher-ranked binders share the alpha contract"
+        );
+
+        let associated_before = snapshot_rust_api(&source(
+            "pub trait Marker { type Item; } \
+             pub fn project<Item: Marker>() -> <Item as Marker>::Item { todo!() }",
+        ));
+        let associated_renamed = snapshot_rust_api(&source(
+            "pub trait Marker { type Item; } \
+             pub fn project<U: Marker>() -> <U as Marker>::Item { todo!() }",
+        ));
+        assert_eq!(
+            associated_before.items, associated_renamed.items,
+            "an alpha rename must not rename a same-spelled associated item"
+        );
+    }
+
+    #[test]
+    fn rust_api_snapshot_keeps_type_abi_and_lifetime_relations_observable() {
+        let typed = snapshot_rust_api(&source("pub fn parse(value: u8) {}"));
+        let type_changed = snapshot_rust_api(&source("pub fn parse(value: u16) {}"));
+        assert_ne!(typed.items, type_changed.items);
+
+        let c_abi = snapshot_rust_api(&source("pub extern \"C\" fn parse(value: u8) {}"));
+        let system_abi = snapshot_rust_api(&source("pub extern \"system\" fn parse(value: u8) {}"));
+        assert_ne!(c_abi.items, system_abi.items);
+
+        let returns_first = snapshot_rust_api(&source(
+            "pub fn pick<'left, 'right>(left: &'left str, right: &'right str) -> &'left str { left }",
+        ));
+        let returns_second = snapshot_rust_api(&source(
+            "pub fn pick<'a, 'b>(first: &'a str, second: &'b str) -> &'b str { second }",
+        ));
+        assert_ne!(
+            returns_first.items, returns_second.items,
+            "alpha normalization must preserve which lifetime reaches the output"
+        );
     }
 
     #[test]

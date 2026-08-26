@@ -11,6 +11,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Ctrl-C is observed in every phase of a run, including the artifact stage. The
+  interrupt was watched from the same `select!` as the run itself, which only
+  works while the run keeps yielding — `artifacts::generate` is synchronous and
+  polls its children with `std::thread::sleep`, so for the whole of the longest
+  stage of a review neither the first nor the second interrupt could fire, and
+  since `tokio::signal` had replaced SIGINT's default disposition the terminal
+  could not end the process either. The supervisor now watches from its own task.
+- A cancelled run never reports a verdict. Only the checks stage watched for
+  cancellation, so a Ctrl-C arriving during the heuristics or the artifact stage
+  — or during a run whose gates all replayed from the cache, where that stage's
+  wait loop is never built — was ignored: the run finished, wrote a pack whose
+  context commands were all recorded `cancelled`, and exited `0` or `1` on the
+  verdict computed from it. Cancellation is now checked between the stages, so
+  the run ends in exit `130` as the contract says. A partial pack may remain on
+  disk; nothing claims a verdict from it.
+- `--watch` ends on the first Ctrl-C. The iteration reported a cancelled run as
+  an ordinary error and carried on watching, but the governor it shares with
+  every later iteration was by then permanently closed — so each subsequent edit
+  emitted a pack with an empty `30_context` and announced "Regenerated
+  artifacts", until a second interrupt killed the process and left the temporary
+  worktrees behind. A cancel arriving while the watcher is idle ends it too.
+- Ctrl-C during the `uv sync` pre-step stops it. The Python venv build ran
+  outside any child scope, so the governor held no pid for it and `cancel()`
+  signalled nothing: the run announced that it was stopping its tools and then
+  waited out the full five-minute timeout with `uv` still building. It is now
+  registered like every other child, and is not started at all for a run that
+  has already been cancelled.
+- `prview --update` no longer reports a verdict for a cancelled run. Every
+  cancellation gate sat after the checks stage, and `--update` returns before
+  reaching it: a Ctrl-C during the initial `git fetch` — which the governor holds
+  no pid for, so it cannot be cut short — on a HEAD with no new commits printed
+  "stopping running tools" and then handed back the *previous* run's pack, which
+  the exit code was computed from. The run is now asked on entry and again before
+  reusing that pack, so it exits `130` like any other cancelled run.
+- The TUI's check dispatcher stops on Ctrl-C the way the headless one does. It
+  was a copy that had drifted back into two already-fixed bugs while its comment
+  still claimed to mirror them: the `uv sync` pre-step ran outside any child
+  scope and with no cancellation gates, and the loop over the running gates had
+  no arm for a cancel at all, so a gate with a long timeout could hold the stage
+  open after every child had been killed. Both paths now go through the shared
+  helper and the shared loop shape.
+- The context stage no longer repeats a gate's work on a JS repository. When the
+  gates share an analysis snapshot, the ledger entries that predate it are
+  adopted onto that snapshot's revision signature — but the signature was
+  computed once for the whole run, ignoring which dependencies each tool borrows
+  from the working tree. An ESLint entry was therefore filed under `snapshot`
+  while the context stage went on to ask for `snapshot-borrowed-deps` for the
+  same directory, the lookup missed, and the context stage re-ran a full
+  `eslint . -f json` (and, off the fast path, a full `tsc` trace) that the gate
+  had already done — on exactly the two scenarios the shared snapshot exists
+  for. Each entry is now adopted under the signature its own tool will later
+  compute, so the gate's result is found — and a missing tool is no longer
+  reported as "no ESLint gate in this run" when the run did have one.
+
+### Added
+
+- Ctrl-C cancels a run instead of killing it. The first interrupt stops the
+  governor granting work, SIGKILLs the process group of every tool the run
+  spawned (reaching `cargo → rustc → cc` and `sh → pnpm → tool`, not just the
+  direct child), and unwinds the run through its ordinary error path so the
+  temporary worktrees and analysis snapshots are removed on the way out — an
+  aborted process left all of them on disk. A cancelled run exits `130`
+  (128 + SIGINT), deliberately outside prview's verdict codes because it
+  produced no verdict; a second interrupt exits immediately. Context commands
+  that never started are recorded as `cancelled` rather than omitted. `--tui`
+  keeps its own quit path.
+
 ### Changed
 
 - Rust API comparison anchors now come directly from exact resolved
@@ -39,6 +108,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selector reads now reject symlink and non-regular `logs/HEAD` paths before
   opening them. No-comparison and non-Rust cases leave optional Rust artifacts
   absent and embedded Rust fields null.
+
+- Quality checks and context commands now run under one machine-wide budget
+  (`ResourceGovernor`) instead of each stage picking its own fan-out. Checks
+  declare `Light` or `Heavy` via `Check::resource_weight`; the compilers,
+  whole-project linters and test runners (the cargo family, TypeScript, Vitest,
+  ESLint, Semgrep) are `Heavy` and cost half the budget each, so a mixed
+  Rust+JS profile no longer starts four toolchains that each size their worker
+  pool to the whole machine. The cargo `target/` write lock is unchanged and is
+  always taken before the budget. Context commands (`tsc --traceResolution`,
+  `eslint`, `stylelint`, `esbuild`) draw on the same budget and now lead their
+  own process groups like the checks always have. The budget is
+  `available_parallelism()` and is not yet configurable.
+
+- Progress output tells queued work from running work. The stage line reads
+  `Running: X (12s) · Queued: Y, Z` instead of naming every runnable check as
+  running from the first instant; the task ledger's `started_at` is the moment a
+  check was admitted rather than first polled, so the gap from `queued_at` is
+  time spent waiting for the machine; and the "still running after Ns" notice
+  measures from admission, so a check parked on the budget is no longer reported
+  as a slow tool. TUI mode gains `CheckEvent::Running` beside the existing
+  `Started`, which now maps to the `Pending` lifecycle.
 
 - `prview gate --strict` now consumes a schema 2.3 typed enforcement
   disposition instead of collapsing every `CONDITIONAL` cause into one exit.
@@ -94,6 +184,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JSON `errors[]` payload.
 
 ### Fixed
+
+- A `--pr` / `--remote` run with nothing snapshot-backed to run now still reads
+  the reviewed tree. The shared target snapshot was materialised only when a
+  runnable check needed one, which silently excluded two ordinary runs: the
+  **second** run of the same PR, where every gate replays from a cache keyed on
+  the reviewed commit, and the fast remote-only preset, where the
+  snapshot-backed gates all skip and only semgrep (which owns its worktree)
+  remains. Both left the task ledger with no scan dir, so every `30_context`
+  command fell back to the operator's local checkout while the diffs and
+  `MERGE_GATE.json` described the PR's commit — the same
+  `PRV-CONTEXT-SNAPSHOT-PROVENANCE` split pack, reached through a quieter door,
+  with nothing in `RUN.json` to distinguish it. An off-`HEAD` target is now
+  enough to materialise the snapshot on its own, which also resolves the
+  run-wide substrate so `RUN.json` stops reporting a warm `--pr` run's replays
+  and skips as being about no particular tree. A warm `--pr` run pays for one
+  `git worktree` its gates do not need. Local reviews (target == `HEAD`) still
+  materialise nothing.
+
+- `30_context/*` artifacts are now produced from the same reviewed tree the
+  quality gates judged. In `--pr` / `--remote` runs the gates scanned a snapshot
+  of the reviewed commit while the context generators (`cargo tree`, `tsc
+  --traceResolution`, `eslint`, `npm`/`pnpm` SBOM, `stylelint`, `esbuild`,
+  `tauri info`) ran against the operator's local checkout, so one pack could
+  describe two different revisions. The run's shared target snapshot is now
+  owned by the task ledger and stays alive through artifact generation, and
+  every context command's working directory — plus the filesystem probes that
+  decide which commands to plan at all — follows it. Local reviews are
+  unaffected: there the repo root is the reviewed tree.
 
 - The human-readable `PRVIEW CONFIG` panel now caps itself to the active
   terminal width and wraps long refs and preset notes before drawing its right

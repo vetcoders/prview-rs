@@ -176,11 +176,8 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
         changed: Vec::new(),
         relocated: Vec::new(),
         visibility_changed: Vec::new(),
-        unknown: snapshot_unknown_findings(base, ApiSnapshotSide::Base),
+        unknown: snapshot_unknown_findings(base, target),
     };
-    delta
-        .unknown
-        .extend(snapshot_unknown_findings(target, ApiSnapshotSide::Target));
 
     let base_items: Vec<_> = base.items.iter().map(item_side).collect();
     let target_items: Vec<_> = target.items.iter().map(item_side).collect();
@@ -648,7 +645,7 @@ fn declaration_side(declaration: &RustApiDeclaration) -> ApiFactSide {
 }
 
 fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &ApiFactSide) {
-    let Some(before_fields) = public_struct_fields(&before.contract) else {
+    let Some(before_struct) = public_struct_contract(&before.contract) else {
         delta.changed.push(known_finding(
             ApiDeltaKind::Changed,
             before.identity.clone(),
@@ -657,7 +654,7 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
         ));
         return;
     };
-    let Some(after_fields) = public_struct_fields(&after.contract) else {
+    let Some(after_struct) = public_struct_contract(&after.contract) else {
         delta.changed.push(known_finding(
             ApiDeltaKind::Changed,
             before.identity.clone(),
@@ -666,23 +663,44 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
         ));
         return;
     };
-    let mut emitted = false;
-    for name in before_fields
+    let exhaustive_field_added = !before_struct.non_exhaustive
+        && after_struct
+            .fields
+            .keys()
+            .any(|name| !before_struct.fields.contains_key(name));
+    let parent_policy_changed = before_struct.non_exhaustive != after_struct.non_exhaustive;
+    let mut emitted = exhaustive_field_added || parent_policy_changed;
+    if emitted {
+        delta.changed.push(known_finding(
+            ApiDeltaKind::Changed,
+            before.identity.clone(),
+            Some(before.clone()),
+            Some(after.clone()),
+        ));
+    }
+    for name in before_struct
+        .fields
         .keys()
-        .chain(after_fields.keys())
+        .chain(after_struct.fields.keys())
         .cloned()
         .collect::<BTreeSet<_>>()
     {
-        let before_field = before_fields
+        let before_field = before_struct
+            .fields
             .get(&name)
             .map(|contract| field_side(before, &name, contract));
-        let after_field = after_fields
+        let after_field = after_struct
+            .fields
             .get(&name)
             .map(|contract| field_side(after, &name, contract));
         let kind = match (&before_field, &after_field) {
             (Some(left), Some(right)) if left.contract == right.contract => continue,
             (Some(_), Some(_)) => ApiDeltaKind::Changed,
             (Some(_), None) => ApiDeltaKind::Removed,
+            // Existing exhaustive structs are constructed and matched by
+            // downstream callers. Their added field is represented by the
+            // parent Changed finding above, not by an informational field add.
+            (None, Some(_)) if exhaustive_field_added => continue,
             (None, Some(_)) => ApiDeltaKind::Added,
             (None, None) => unreachable!(),
         };
@@ -709,15 +727,24 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
     }
 }
 
-fn public_struct_fields(contract: &str) -> Option<BTreeMap<String, String>> {
+struct PublicStructContract {
+    fields: BTreeMap<String, String>,
+    non_exhaustive: bool,
+}
+
+fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
     let syn::Item::Struct(item) = syn::parse_str::<syn::Item>(contract).ok()? else {
         return None;
     };
+    let non_exhaustive = item
+        .attrs
+        .iter()
+        .any(|attribute| attribute.path().is_ident("non_exhaustive"));
     let syn::Fields::Named(fields) = item.fields else {
         return None;
     };
-    Some(
-        fields
+    Some(PublicStructContract {
+        fields: fields
             .named
             .into_iter()
             .filter_map(|field| {
@@ -728,7 +755,8 @@ fn public_struct_fields(contract: &str) -> Option<BTreeMap<String, String>> {
                 Some((name, quote::ToTokens::to_token_stream(&field).to_string()))
             })
             .collect(),
-    )
+        non_exhaustive,
+    })
 }
 
 fn field_side(parent: &ApiFactSide, name: &str, contract: &str) -> ApiFactSide {
@@ -1231,51 +1259,110 @@ fn guards_may_overlap(left: &[String], right: &[String]) -> bool {
 }
 
 fn snapshot_unknown_findings(
-    snapshot: &RustApiSnapshot,
-    side: ApiSnapshotSide,
+    base: &RustApiSnapshot,
+    target: &RustApiSnapshot,
 ) -> Vec<ApiDeltaFinding> {
-    snapshot
-        .unknowns
-        .iter()
-        .map(|unknown| {
-            let identity = ApiIdentity {
-                crate_name: unknown
-                    .crate_name
-                    .clone()
-                    .unwrap_or_else(|| "<unknown-crate>".to_owned()),
-                module_path: unknown.module_path.clone(),
-                namespace: "unknown".to_owned(),
-                name: format!("{:?}", unknown.kind),
-                cfg_region: unknown.cfg_guard.clone(),
-            };
-            let side_name = match side {
-                ApiSnapshotSide::Base => "base",
-                ApiSnapshotSide::Target => "target",
-            };
-            let reason = format!(
-                "{side_name} snapshot {:?}: {}",
-                unknown.kind, unknown.evidence
-            );
-            let mut finding = ApiDeltaFinding {
-                id: String::new(),
-                kind: ApiDeltaKind::Unknown,
-                identity,
-                before: None,
-                after: None,
-                analysis_source: REPO_BACKED_RUST_API_SOURCE,
-                confidence: ApiDeltaConfidence::Unknown,
-                evidence: vec![unknown.evidence.clone()],
-                unknown_reason: Some(reason),
-                unknown_source: Some(ApiUnknownSource {
-                    side,
-                    source_path: unknown.source_path.clone(),
-                    provenance: provenance_id(&unknown.provenance),
-                }),
-            };
-            finding.id = stable_finding_id(&finding);
-            finding
-        })
-        .collect()
+    let mut target_used = vec![false; target.unknowns.len()];
+    let mut findings = Vec::new();
+
+    for unknown in &base.unknowns {
+        let counterpart = target
+            .unknowns
+            .iter()
+            .enumerate()
+            .find(|(index, candidate)| {
+                !target_used[*index] && unknown_proofs_match(base, unknown, target, candidate)
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = counterpart {
+            target_used[index] = true;
+        } else {
+            findings.push(snapshot_unknown_finding(unknown, ApiSnapshotSide::Base));
+        }
+    }
+
+    findings.extend(
+        target
+            .unknowns
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !target_used[*index])
+            .map(|(_, unknown)| snapshot_unknown_finding(unknown, ApiSnapshotSide::Target)),
+    );
+    findings
+}
+
+fn unknown_proofs_match(
+    base: &RustApiSnapshot,
+    left: &RustApiUnknown,
+    target: &RustApiSnapshot,
+    right: &RustApiUnknown,
+) -> bool {
+    left.kind == right.kind
+        && left.crate_name == right.crate_name
+        && left.module_path == right.module_path
+        && left.source_path == right.source_path
+        && left.cfg_guard == right.cfg_guard
+        && left.evidence == right.evidence
+        // Revision ids necessarily differ across the comparison. What must not
+        // differ is the provenance class, and each proof must still belong to
+        // the snapshot that supplied it; an overlay is not silently equated to
+        // a Git tree and a detached proof is never neutralized.
+        && left.provenance == base.provenance
+        && right.provenance == target.provenance
+        && same_provenance_class(&left.provenance, &right.provenance)
+}
+
+fn same_provenance_class(left: &RevisionProvenance, right: &RevisionProvenance) -> bool {
+    matches!(
+        (left, right),
+        (
+            RevisionProvenance::GitTree { .. },
+            RevisionProvenance::GitTree { .. }
+        ) | (
+            RevisionProvenance::WorkingTreeOverlay { .. },
+            RevisionProvenance::WorkingTreeOverlay { .. }
+        )
+    )
+}
+
+fn snapshot_unknown_finding(unknown: &RustApiUnknown, side: ApiSnapshotSide) -> ApiDeltaFinding {
+    let identity = ApiIdentity {
+        crate_name: unknown
+            .crate_name
+            .clone()
+            .unwrap_or_else(|| "<unknown-crate>".to_owned()),
+        module_path: unknown.module_path.clone(),
+        namespace: "unknown".to_owned(),
+        name: format!("{:?}", unknown.kind),
+        cfg_region: unknown.cfg_guard.clone(),
+    };
+    let side_name = match side {
+        ApiSnapshotSide::Base => "base",
+        ApiSnapshotSide::Target => "target",
+    };
+    let reason = format!(
+        "{side_name} snapshot {:?}: {}",
+        unknown.kind, unknown.evidence
+    );
+    let mut finding = ApiDeltaFinding {
+        id: String::new(),
+        kind: ApiDeltaKind::Unknown,
+        identity,
+        before: None,
+        after: None,
+        analysis_source: REPO_BACKED_RUST_API_SOURCE,
+        confidence: ApiDeltaConfidence::Unknown,
+        evidence: vec![unknown.evidence.clone()],
+        unknown_reason: Some(reason),
+        unknown_source: Some(ApiUnknownSource {
+            side,
+            source_path: unknown.source_path.clone(),
+            provenance: provenance_id(&unknown.provenance),
+        }),
+    };
+    finding.id = stable_finding_id(&finding);
+    finding
 }
 
 fn known_finding(
@@ -1707,6 +1794,120 @@ mod tests {
                     .unknown_reason
                     .as_deref()
                     .is_some_and(|reason| reason.contains("target counterpart"))
+        }));
+    }
+
+    #[test]
+    fn unchanged_unknown_proof_is_neutral_but_non_equivalent_proof_is_not() {
+        let unchanged = "mod donor { pub fn item() {} } pub use donor::*;";
+        let base = snapshot_rust_api(&MemorySource::source(unchanged, "base"));
+        let target = snapshot_rust_api(&MemorySource::source(
+            "mod donor { pub fn item() {} } pub use donor::*; fn unrelated_private_change() {}",
+            "target",
+        ));
+        let neutral = compare_rust_api(&base, &target);
+        assert!(
+            neutral.unknown.is_empty(),
+            "the same unsupported proof on both revisions is not a delta: {:?}",
+            neutral.unknown
+        );
+
+        let changed = compare_rust_api(
+            &base,
+            &snapshot_rust_api(&MemorySource::source(
+                "mod donor { pub fn item() {} } pub use donor::*; include!(\"extra.rs\");",
+                "target",
+            )),
+        );
+        assert!(
+            !changed.unknown.is_empty(),
+            "changed unknown evidence remains review-required"
+        );
+
+        let unilateral = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source("fn private() {}", "base")),
+            &snapshot_rust_api(&MemorySource::source(
+                "fn private() {} include!(\"generated.rs\");",
+                "target",
+            )),
+        );
+        assert_eq!(
+            unilateral.unknown.len(),
+            1,
+            "one-sided unknown proof must remain visible"
+        );
+
+        let mut overlay = snapshot_rust_api(&MemorySource::source(unchanged, "target"));
+        let overlay_provenance = RevisionProvenance::WorkingTreeOverlay {
+            target_oid: "target".to_owned(),
+            dirty_digest: "dirty".to_owned(),
+        };
+        overlay.provenance = overlay_provenance.clone();
+        for unknown in &mut overlay.unknowns {
+            unknown.provenance = overlay_provenance.clone();
+        }
+        let provenance_changed = compare_rust_api(&base, &overlay);
+        assert!(
+            !provenance_changed.unknown.is_empty(),
+            "a provenance-class change is evidence, not a neutral pair"
+        );
+    }
+
+    #[test]
+    fn added_field_policy_distinguishes_exhaustive_non_exhaustive_and_new_structs() {
+        let exhaustive = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub struct Options { pub a: u8 }",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub struct Options { pub a: u8, pub b: u8 }",
+                "target",
+            )),
+        );
+        assert!(
+            exhaustive.changed.iter().any(|finding| {
+                finding.identity.name == "Options" && finding.identity.module_path.is_empty()
+            }),
+            "adding a field to an exhaustive struct must change the parent contract"
+        );
+        assert!(
+            !exhaustive
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "b"),
+            "the breaking addition must not survive only in the informational bucket"
+        );
+
+        let non_exhaustive = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "#[non_exhaustive] pub struct Options { pub a: u8 }",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "#[non_exhaustive] pub struct Options { pub a: u8, pub b: u8 }",
+                "target",
+            )),
+        );
+        assert!(non_exhaustive.changed.is_empty());
+        assert!(
+            non_exhaustive
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "b"),
+            "non_exhaustive opts downstream callers out of exhaustive construction"
+        );
+
+        let new_item = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source("fn private() {}", "base")),
+            &snapshot_rust_api(&MemorySource::source(
+                "fn private() {} pub struct Options { pub a: u8, pub b: u8 }",
+                "target",
+            )),
+        );
+        assert!(new_item.changed.is_empty());
+        assert!(new_item.added.iter().any(|finding| {
+            finding.identity.name == "Options" && finding.identity.module_path.is_empty()
         }));
     }
 
