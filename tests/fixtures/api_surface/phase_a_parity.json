@@ -10,7 +10,7 @@
       "legacy_public_api_artifact": null,
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"before_contract\":\"pub extern \\\"C\\\" fn __prview_name (x : u32) -> u32 { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"after_contract\":\"pub extern \\\"system\\\" fn __prview_name (x : u32) -> u32 { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"before_contract\":\"pub extern \\\"C\\\" fn __prview_name (_ : u32) -> u32 { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_abi_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"call\",\"cfg_region\":[]},\"after_contract\":\"pub extern \\\"system\\\" fn __prview_name (_ : u32) -> u32 { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
           "kind": "changed",
           "identity": {
             "crate_name": "fixture_abi_changed",
@@ -27,9 +27,9 @@
               "name": "call",
               "cfg_region": []
             },
-            "contract": "pub extern \"C\" fn __prview_name (x : u32) -> u32 { }",
+            "contract": "pub extern \"C\" fn __prview_name (_ : u32) -> u32 { }",
             "source_path": "src/lib.rs",
-            "evidence": "pub extern \"C\" fn __prview_name (x : u32) -> u32 { }",
+            "evidence": "pub extern \"C\" fn __prview_name (_ : u32) -> u32 { }",
             "provenance": "git_tree:fixture://abi_changed/base",
             "declared_public": true
           },
@@ -41,17 +41,17 @@
               "name": "call",
               "cfg_region": []
             },
-            "contract": "pub extern \"system\" fn __prview_name (x : u32) -> u32 { }",
+            "contract": "pub extern \"system\" fn __prview_name (_ : u32) -> u32 { }",
             "source_path": "src/lib.rs",
-            "evidence": "pub extern \"system\" fn __prview_name (x : u32) -> u32 { }",
+            "evidence": "pub extern \"system\" fn __prview_name (_ : u32) -> u32 { }",
             "provenance": "git_tree:fixture://abi_changed/head",
             "declared_public": true
           },
           "analysis_source": "repo_backed_rust_api",
           "confidence": "confirmed",
           "evidence": [
-            "pub extern \"C\" fn __prview_name (x : u32) -> u32 { }",
-            "pub extern \"system\" fn __prview_name (x : u32) -> u32 { }"
+            "pub extern \"C\" fn __prview_name (_ : u32) -> u32 { }",
+            "pub extern \"system\" fn __prview_name (_ : u32) -> u32 { }"
           ]
         }
       ],
@@ -749,7 +749,7 @@
       "legacy_public_api_artifact": null,
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name (a00 : u8 , a01 : u8 , a02 : u8) { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name (a00 : u8 , a01 : u16 , a02 : u8) { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name (_ : u8 , _ : u8 , _ : u8) { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_long_within_cap_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"long\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name (_ : u8 , _ : u16 , _ : u8) { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
           "kind": "changed",
           "identity": {
             "crate_name": "fixture_long_within_cap_changed",
@@ -766,9 +766,9 @@
               "name": "long",
               "cfg_region": []
             },
-            "contract": "pub fn __prview_name (a00 : u8 , a01 : u8 , a02 : u8) { }",
+            "contract": "pub fn __prview_name (_ : u8 , _ : u8 , _ : u8) { }",
             "source_path": "src/lib.rs",
-            "evidence": "pub fn __prview_name (a00 : u8 , a01 : u8 , a02 : u8) { }",
+            "evidence": "pub fn __prview_name (_ : u8 , _ : u8 , _ : u8) { }",
             "provenance": "git_tree:fixture://long_within_cap_changed/base",
             "declared_public": true
           },
@@ -780,17 +780,17 @@
               "name": "long",
               "cfg_region": []
             },
-            "contract": "pub fn __prview_name (a00 : u8 , a01 : u16 , a02 : u8) { }",
+            "contract": "pub fn __prview_name (_ : u8 , _ : u16 , _ : u8) { }",
             "source_path": "src/lib.rs",
-            "evidence": "pub fn __prview_name (a00 : u8 , a01 : u16 , a02 : u8) { }",
+            "evidence": "pub fn __prview_name (_ : u8 , _ : u16 , _ : u8) { }",
             "provenance": "git_tree:fixture://long_within_cap_changed/head",
             "declared_public": true
           },
           "analysis_source": "repo_backed_rust_api",
           "confidence": "confirmed",
           "evidence": [
-            "pub fn __prview_name (a00 : u8 , a01 : u8 , a02 : u8) { }",
-            "pub fn __prview_name (a00 : u8 , a01 : u16 , a02 : u8) { }"
+            "pub fn __prview_name (_ : u8 , _ : u8 , _ : u8) { }",
+            "pub fn __prview_name (_ : u8 , _ : u16 , _ : u8) { }"
           ]
         }
       ],
@@ -1651,7 +1651,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name (x : u8) { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name (x : u16) { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:{\"kind\":\"changed\",\"identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"before_contract\":\"pub fn __prview_name (_ : u8) { }\",\"before_declared_public\":true,\"after_identity\":{\"crate_name\":\"fixture_declaration_pairing_changed\",\"module_path\":[],\"namespace\":\"value\",\"name\":\"paired\",\"cfg_region\":[]},\"after_contract\":\"pub fn __prview_name (_ : u16) { }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
           "kind": "changed",
           "identity": {
             "crate_name": "fixture_declaration_pairing_changed",
@@ -1668,9 +1668,9 @@
               "name": "paired",
               "cfg_region": []
             },
-            "contract": "pub fn __prview_name (x : u8) { }",
+            "contract": "pub fn __prview_name (_ : u8) { }",
             "source_path": "src/lib.rs",
-            "evidence": "pub fn __prview_name (x : u8) { }",
+            "evidence": "pub fn __prview_name (_ : u8) { }",
             "provenance": "git_tree:fixture://declaration_pairing_changed/base",
             "declared_public": true
           },
@@ -1682,17 +1682,17 @@
               "name": "paired",
               "cfg_region": []
             },
-            "contract": "pub fn __prview_name (x : u16) { }",
+            "contract": "pub fn __prview_name (_ : u16) { }",
             "source_path": "src/lib.rs",
-            "evidence": "pub fn __prview_name (x : u16) { }",
+            "evidence": "pub fn __prview_name (_ : u16) { }",
             "provenance": "git_tree:fixture://declaration_pairing_changed/head",
             "declared_public": true
           },
           "analysis_source": "repo_backed_rust_api",
           "confidence": "confirmed",
           "evidence": [
-            "pub fn __prview_name (x : u8) { }",
-            "pub fn __prview_name (x : u16) { }"
+            "pub fn __prview_name (_ : u8) { }",
+            "pub fn __prview_name (_ : u16) { }"
           ]
         }
       ],

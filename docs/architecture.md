@@ -1335,6 +1335,12 @@ share semantic names. Nested `cfg`/`cfg_attr` use the same recursive sorted and
 deduplicated `all(...)`/`any(...)` canonicalization as top-level guards, without
 evaluating host configuration.
 
+Function parameter patterns are canonicalized to `_`, and generic, const, and
+lifetime binders are alpha-normalized by declaration order across free, trait,
+inherent, foreign, and higher-ranked function signatures. The mapping is reused
+at every bound occurrence, so renaming a binder is neutral while generic order,
+types, ABI, and lifetime relationships remain part of the contract.
+
 #### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
 
 The W2-01 backend compares each exact base and target
