@@ -209,17 +209,6 @@ pub struct CachedResult {
     pub age_secs: Option<u64>,
 }
 
-/// How old the entry file at `path` is, in whole seconds.
-///
-/// Read from the file's mtime rather than from anything inside it: an entry is
-/// published by a single `rename`, so its mtime IS the moment the result became
-/// readable, and taking the age this way costs one `stat` and keeps the on-disk
-/// format untouched — every entry a previous prview wrote already carries it.
-///
-/// `None` rather than a guess when the age is unknowable: no metadata to read,
-/// a filesystem that does not report mtime, or a timestamp in the future (a
-/// clock that moved backwards, a copied tree). A replay of unknown age is a fact
-/// a reviewer can act on; a fabricated zero is not.
 /// Move an entry's mtime `by` into the past (test-only), so the age a replay
 /// reports can be asserted without waiting for wall-clock time to pass.
 ///
@@ -240,6 +229,17 @@ pub(crate) fn backdate(path: &Path, by: std::time::Duration) {
     file.set_modified(modified - by).expect("set mtime");
 }
 
+/// How old the entry file at `path` is, in whole seconds.
+///
+/// Read from the file's mtime rather than from anything inside it: an entry is
+/// published by a single `rename`, so its mtime IS the moment the result became
+/// readable, and taking the age this way costs one `stat` and keeps the on-disk
+/// format untouched — every entry a previous prview wrote already carries it.
+///
+/// `None` rather than a guess when the age is unknowable: no metadata to read,
+/// a filesystem that does not report mtime, or a timestamp in the future (a
+/// clock that moved backwards, a copied tree). A replay of unknown age is a fact
+/// a reviewer can act on; a fabricated zero is not.
 fn entry_age_secs(path: &Path) -> Option<u64> {
     let modified = fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
     Some(
