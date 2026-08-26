@@ -429,7 +429,7 @@ fn declaration_side(declaration: &RustApiDeclaration) -> ApiFactSide {
 }
 
 fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &ApiFactSide) {
-    let Some(before_fields) = public_struct_fields(&before.contract) else {
+    let Some(before_struct) = public_struct_contract(&before.contract) else {
         delta.changed.push(known_finding(
             ApiDeltaKind::Changed,
             before.identity.clone(),
@@ -438,7 +438,7 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
         ));
         return;
     };
-    let Some(after_fields) = public_struct_fields(&after.contract) else {
+    let Some(after_struct) = public_struct_contract(&after.contract) else {
         delta.changed.push(known_finding(
             ApiDeltaKind::Changed,
             before.identity.clone(),
@@ -447,23 +447,44 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
         ));
         return;
     };
-    let mut emitted = false;
-    for name in before_fields
+    let exhaustive_field_added = !before_struct.non_exhaustive
+        && after_struct
+            .fields
+            .keys()
+            .any(|name| !before_struct.fields.contains_key(name));
+    let parent_policy_changed = before_struct.non_exhaustive != after_struct.non_exhaustive;
+    let mut emitted = exhaustive_field_added || parent_policy_changed;
+    if emitted {
+        delta.changed.push(known_finding(
+            ApiDeltaKind::Changed,
+            before.identity.clone(),
+            Some(before.clone()),
+            Some(after.clone()),
+        ));
+    }
+    for name in before_struct
+        .fields
         .keys()
-        .chain(after_fields.keys())
+        .chain(after_struct.fields.keys())
         .cloned()
         .collect::<BTreeSet<_>>()
     {
-        let before_field = before_fields
+        let before_field = before_struct
+            .fields
             .get(&name)
             .map(|contract| field_side(before, &name, contract));
-        let after_field = after_fields
+        let after_field = after_struct
+            .fields
             .get(&name)
             .map(|contract| field_side(after, &name, contract));
         let kind = match (&before_field, &after_field) {
             (Some(left), Some(right)) if left.contract == right.contract => continue,
             (Some(_), Some(_)) => ApiDeltaKind::Changed,
             (Some(_), None) => ApiDeltaKind::Removed,
+            // Existing exhaustive structs are constructed and matched by
+            // downstream callers. Their added field is represented by the
+            // parent Changed finding above, not by an informational field add.
+            (None, Some(_)) if exhaustive_field_added => continue,
             (None, Some(_)) => ApiDeltaKind::Added,
             (None, None) => unreachable!(),
         };
@@ -490,15 +511,24 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
     }
 }
 
-fn public_struct_fields(contract: &str) -> Option<BTreeMap<String, String>> {
+struct PublicStructContract {
+    fields: BTreeMap<String, String>,
+    non_exhaustive: bool,
+}
+
+fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
     let syn::Item::Struct(item) = syn::parse_str::<syn::Item>(contract).ok()? else {
         return None;
     };
+    let non_exhaustive = item
+        .attrs
+        .iter()
+        .any(|attribute| attribute.path().is_ident("non_exhaustive"));
     let syn::Fields::Named(fields) = item.fields else {
         return None;
     };
-    Some(
-        fields
+    Some(PublicStructContract {
+        fields: fields
             .named
             .into_iter()
             .filter_map(|field| {
@@ -509,7 +539,8 @@ fn public_struct_fields(contract: &str) -> Option<BTreeMap<String, String>> {
                 Some((name, quote::ToTokens::to_token_stream(&field).to_string()))
             })
             .collect(),
-    )
+        non_exhaustive,
+    })
 }
 
 fn field_side(parent: &ApiFactSide, name: &str, contract: &str) -> ApiFactSide {
@@ -1508,6 +1539,64 @@ mod tests {
             !provenance_changed.unknown.is_empty(),
             "a provenance-class change is evidence, not a neutral pair"
         );
+    }
+
+    #[test]
+    fn added_field_policy_distinguishes_exhaustive_non_exhaustive_and_new_structs() {
+        let exhaustive = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "pub struct Options { pub a: u8 }",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "pub struct Options { pub a: u8, pub b: u8 }",
+                "target",
+            )),
+        );
+        assert!(
+            exhaustive.changed.iter().any(|finding| {
+                finding.identity.name == "Options" && finding.identity.module_path.is_empty()
+            }),
+            "adding a field to an exhaustive struct must change the parent contract"
+        );
+        assert!(
+            !exhaustive
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "b"),
+            "the breaking addition must not survive only in the informational bucket"
+        );
+
+        let non_exhaustive = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "#[non_exhaustive] pub struct Options { pub a: u8 }",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "#[non_exhaustive] pub struct Options { pub a: u8, pub b: u8 }",
+                "target",
+            )),
+        );
+        assert!(non_exhaustive.changed.is_empty());
+        assert!(
+            non_exhaustive
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "b"),
+            "non_exhaustive opts downstream callers out of exhaustive construction"
+        );
+
+        let new_item = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source("fn private() {}", "base")),
+            &snapshot_rust_api(&MemorySource::source(
+                "fn private() {} pub struct Options { pub a: u8, pub b: u8 }",
+                "target",
+            )),
+        );
+        assert!(new_item.changed.is_empty());
+        assert!(new_item.added.iter().any(|finding| {
+            finding.identity.name == "Options" && finding.identity.module_path.is_empty()
+        }));
     }
 
     #[test]

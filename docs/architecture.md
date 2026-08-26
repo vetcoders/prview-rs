@@ -1348,6 +1348,13 @@ addition/removal. Parsed ordinary declarations include private counterparts
 only as evidence for a proven public/non-public transition; externally
 reachable `items` remain the API surface.
 
+Named-struct field projection is policy-aware. A public field added to an
+existing exhaustive struct is a `Changed` parent contract because downstream
+struct literals and exhaustive patterns stop compiling. The same field on an
+existing `#[non_exhaustive]` struct remains an informational `Added` field, and
+a wholly new public struct remains an added item; neither case inherits the
+existing-exhaustive breaking rule.
+
 Exact identity is grouped on both sides before any fact is consumed: only a
 `1 ↔ 1` component may become a confirmed change, while wider components are
 consumed as deterministic typed ambiguity, including one-sided duplicate
