@@ -286,22 +286,23 @@ prview gate --strict
 
 ## CI required check
 
-Use the composite Action for the final required stage:
+Use the currently published composite Action for the final required stage:
 
 ```yaml
-- uses: vetcoders/prview-rs@v0.8.0 # typed warning policy requires 0.8+
+- uses: vetcoders/prview-rs@v0.7.0 # current published Action
   id: prview
   with:
     strict: "true"
-    fail-on-warnings: "false"
-    version: "latest"
+    version: "0.7.0"
 ```
 
-Use `strict: "false"` during advisory CI rollout. `CONDITIONAL` remains exit
-`0`, while `BLOCK` remains exit `1`. In strict mode, set
-`fail-on-warnings: "true"` only for a warning-clean Required check. That input
-requires both the Action and installed `prview` to be `0.8.0` or newer; older
-pins expose the historical verdict-only gate and must omit it.
+This copy-pasteable example uses the historical verdict-only strict contract:
+`strict: "true"` rejects `CONDITIONAL`, while `strict: "false"` accepts it and
+`BLOCK` remains exit `1`. Typed review-required/warnings-only policy and the
+`fail-on-warnings` input are staged for `0.8.0`; release preparation owns
+switching both pins and adding that input only after the tag and crate are
+published. Until then, exercise the 0.8 contract from source rather than using
+an unissued release pin.
 
 ## Troubleshooting
 

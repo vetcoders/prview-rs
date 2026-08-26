@@ -140,12 +140,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: vetcoders/prview-rs@v0.8.0 # fail-on-warnings requires 0.8+
+      - uses: vetcoders/prview-rs@v0.7.0 # current published Action
         id: prview
         with:
           strict: "true"
-          fail-on-warnings: "false"
-          version: "latest"
+          version: "0.7.0"
       - uses: github/codeql-action/upload-sarif@v3
         if: ${{ steps.prview.outputs['sarif-path'] != '' }}
         with:
@@ -154,15 +153,20 @@ jobs:
 
 Use `strict: "false"` for advisory rollout: `CONDITIONAL` remains exit `0`,
 while `BLOCK` still exits `1`. Extra CLI flags can be passed as whitespace-
-separated `args`. With `strict: "true"`, typed warnings-only remains successful;
-set `fail-on-warnings: "true"` to require a warning-clean pack as well.
+separated `args`. On the published 0.7 lane, `strict: "true"` rejects every
+`CONDITIONAL`. In the staged 0.8 source contract, typed warnings-only remains
+successful under strict mode; after 0.8 is published and the pins move, set
+`fail-on-warnings: "true"` to require a warning-clean pack as well.
 
 The Action prefers `cargo-binstall` when that binary is already available on the
 runner and falls back to `cargo install prview --locked --force`. The base gate
 exists from `0.6.0`; typed warnings-only enforcement and the
-`fail-on-warnings` Action input require Action/runtime `0.8.0` or newer.
-`latest` resolves that lane after 0.8 is published. Older pins must omit that
-input and retain their historical gate semantics.
+`fail-on-warnings` Action input are staged for `0.8.0`; release preparation
+owns switching both pins and adding that input only after the tag and crate are
+published. This copy-pasteable example deliberately uses the currently
+published `v0.7.0` Action/runtime and its historical verdict-only strict
+semantics. Until 0.8 is published, exercise its contract from source rather
+than using an unissued release pin.
 
 SARIF upload requires `permissions: security-events: write`. prview writes
 `30_context/INLINE_FINDINGS.sarif` only when there are inline findings or
