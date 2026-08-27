@@ -953,6 +953,33 @@ fn assert_dirty_overlay_four_surface_api_parity(
     assert_eq!(report_api["view"], "breaking_changes");
     assert_eq!(merge_api["view"], "breaking_changes");
 
+    let public_markdown = fs::read_to_string(pack.join("20_quality/PUBLIC_API_DIFF.md"))
+        .expect("read emitted PUBLIC_API_DIFF.md");
+    for finding in expected["findings"].as_array().expect("API findings") {
+        let kind = finding["kind"].as_str().expect("finding kind");
+        let kind_label = match kind {
+            "added" => "Added",
+            "removed" => "Removed",
+            "changed" => "Changed",
+            "relocated" => "Relocated",
+            "visibility_changed" => "VisibilityChanged",
+            "unknown" => "Unknown",
+            unexpected => panic!("unexpected API finding kind: {unexpected}"),
+        };
+        let identity = finding["identity"]["name"]
+            .as_str()
+            .expect("finding identity name");
+        let identity_marker = format!("- **{kind_label} `{identity}`**");
+        assert!(
+            public_markdown.contains(&identity_marker),
+            "emitted Markdown must preserve canonical Rust identity and kind: {identity_marker}\n{public_markdown}"
+        );
+    }
+    assert!(
+        !public_markdown.contains("- **Added `__prview_name`**"),
+        "normalization sentinel must never replace the displayed identity"
+    );
+
     let unique_base_revisions = pipeline
         .comparison_bases
         .iter()
@@ -1186,6 +1213,88 @@ fn dirty_overlay_pipeline_equal_oid_dirty_only() {
         &pipeline,
         &pack,
         FourSurfaceFact::added("dirty_only_api", None, true),
+    );
+}
+
+#[test]
+fn emitted_pack_markdown_preserves_rust_identities_and_legacy_js_ts_rows() {
+    let base_rust = "pub fn removed_api() {}\n\
+                     pub fn changed_api() {}\n\
+                     pub fn relocated_api() {}\n\
+                     pub fn visibility_api() {}\n";
+    let target_rust = "pub fn changed_api(value: u32) {}\n\
+                       fn visibility_api() {}\n\
+                       pub fn added_api() {}\n\
+                       pub mod moved { pub fn relocated_api() {} }\n";
+    let (repo_tmp, _initial_base) = init_dirty_pipeline_rust_repo(base_rust);
+    fs::write(
+        repo_tmp.path().join("src/legacy.ts"),
+        "export function legacy_removed() {}\n",
+    )
+    .expect("legacy base");
+    commit_pipeline_paths(repo_tmp.path(), "legacy base", &["src/legacy.ts"]);
+    run_git_fixture(repo_tmp.path(), &["checkout", "-q", "-b", "feature"]);
+    fs::write(repo_tmp.path().join("src/lib.rs"), target_rust).expect("target Rust");
+    fs::write(
+        repo_tmp.path().join("src/legacy.ts"),
+        "export function legacy_added() {}\n",
+    )
+    .expect("legacy target");
+    commit_pipeline_paths(
+        repo_tmp.path(),
+        "mixed API changes",
+        &["src/lib.rs", "src/legacy.ts"],
+    );
+
+    let output_tmp = tempfile::tempdir().expect("output");
+    let pipeline = freeze_dirty_pipeline(
+        repo_tmp.path(),
+        output_tmp.path().join("pack"),
+        "feature",
+        &["main"],
+        false,
+    );
+    let delta = pipeline.rust_api_delta.as_ref().expect("Rust API delta");
+    assert_eq!(delta.counts().added, 1);
+    assert_eq!(delta.counts().removed, 1);
+    assert_eq!(delta.counts().changed, 1);
+    assert_eq!(delta.counts().relocated, 1);
+    assert_eq!(delta.counts().visibility_changed, 1);
+
+    let pack = emit_frozen_dirty_pipeline(&pipeline);
+    assert_dirty_overlay_four_surface_api_parity(
+        &pipeline,
+        &pack,
+        FourSurfaceFact::added("added_api", None, false),
+    );
+    let markdown = fs::read_to_string(pack.join("20_quality/PUBLIC_API_DIFF.md"))
+        .expect("read emitted PUBLIC_API_DIFF.md");
+    for (kind, name) in [
+        ("Added", "added_api"),
+        ("Removed", "removed_api"),
+        ("Changed", "changed_api"),
+        ("Relocated", "relocated_api"),
+        ("VisibilityChanged", "visibility_api"),
+    ] {
+        assert!(
+            markdown.contains(&format!("- **{kind} `{name}`**")),
+            "missing canonical {kind} identity {name}:\n{markdown}"
+        );
+    }
+    assert!(
+        markdown.contains("- **export** in `src/legacy.ts`: `export function legacy_added() {}`"),
+        "legacy added row changed or erased:\n{markdown}"
+    );
+    assert!(
+        markdown.contains("- **export** in `src/legacy.ts`: `export function legacy_removed() {}`"),
+        "legacy removed row changed or erased:\n{markdown}"
+    );
+    assert!(
+        markdown
+            .lines()
+            .filter(|line| line.starts_with("- **"))
+            .all(|line| !line.contains("`__prview_name`**")),
+        "normalization sentinel replaced a displayed identity:\n{markdown}"
     );
 }
 

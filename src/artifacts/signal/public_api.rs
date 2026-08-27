@@ -589,8 +589,10 @@ fn format_public_api_diff(diff: &PublicApiDiff) -> String {
     if let Some(view) = &diff.rust_api_delta {
         let _ = writeln!(
             md,
-            "- Rust analysis source: `{}`\n- Rust counts: added={}, removed={}, changed={}, relocated={}, visibility_changed={}, unknown={}\n",
+            "- Rust analysis source: `{}`\n- Rust base revision: `{}`\n- Rust target revision: `{}`\n- Rust counts: added={}, removed={}, changed={}, relocated={}, visibility_changed={}, unknown={}\n",
             view.analysis_source,
+            view.base_revision,
+            view.target_revision,
             view.counts.added,
             view.counts.removed,
             view.counts.changed,
@@ -598,6 +600,68 @@ fn format_public_api_diff(diff: &PublicApiDiff) -> String {
             view.counts.visibility_changed,
             view.counts.unknown,
         );
+
+        if !view.findings.is_empty() {
+            let _ = writeln!(md, "## Canonical Rust API findings\n");
+            for finding in &view.findings {
+                let kind = match finding.kind {
+                    ApiDeltaKind::Added => "Added",
+                    ApiDeltaKind::Removed => "Removed",
+                    ApiDeltaKind::Changed => "Changed",
+                    ApiDeltaKind::Relocated => "Relocated",
+                    ApiDeltaKind::VisibilityChanged => "VisibilityChanged",
+                    ApiDeltaKind::Unknown => "Unknown",
+                };
+                let confidence = match finding.confidence {
+                    ApiDeltaConfidence::Confirmed => "confirmed",
+                    ApiDeltaConfidence::Unknown => "unknown",
+                };
+                let _ = writeln!(
+                    md,
+                    "- **{} `{}`** — `{}` in `{}` ({})",
+                    kind,
+                    finding.identity.name,
+                    finding.identity.namespace,
+                    finding.identity.external_path(),
+                    confidence,
+                );
+                if let Some(before) = &finding.before {
+                    let _ = writeln!(
+                        md,
+                        "  - Before: `{}` — `{}` (`{}`)",
+                        before.contract, before.source_path, before.provenance,
+                    );
+                }
+                if let Some(after) = &finding.after {
+                    let _ = writeln!(
+                        md,
+                        "  - After: `{}` — `{}` (`{}`)",
+                        after.contract, after.source_path, after.provenance,
+                    );
+                }
+                if let Some(source) = &finding.unknown_source {
+                    let side = match source.side {
+                        super::api_delta::ApiSnapshotSide::Base => "base",
+                        super::api_delta::ApiSnapshotSide::Target => "target",
+                    };
+                    let _ = writeln!(
+                        md,
+                        "  - Unknown source: `{side}` `{}` (`{}`)",
+                        source.source_path, source.provenance,
+                    );
+                }
+                if let Some(reason) = &finding.unknown_reason {
+                    let _ = writeln!(md, "  - Unknown reason: {reason}");
+                }
+                let _ = writeln!(
+                    md,
+                    "  - Evidence: {}\n  - Finding ID: `{}`",
+                    finding.evidence.join("; "),
+                    finding.id,
+                );
+            }
+            let _ = writeln!(md);
+        }
     }
 
     if !diff.added.is_empty() {
