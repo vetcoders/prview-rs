@@ -20,6 +20,7 @@ document disagree, the code is the contract and this document is the bug.
 | `policy` | object | `{ version, mode, default_severity, source }` |
 | `checks` | object[] | Per-check evaluation records (see below) |
 | `inline_findings` | object | Inline SARIF summary (see below) |
+| `rust_api_delta` | object \| null | Canonical revision-backed Rust API delta; `null` for non-Rust runs (see below) |
 | `stale_cache_caveats` | object[] | Advisory, additive: blocking rows whose evidence was replayed from an old cache (see below) |
 | `decision` | object | The merge decision (see below) |
 | `files` | object | Artifact-root-relative paths (see below) |
