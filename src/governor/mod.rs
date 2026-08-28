@@ -19,7 +19,7 @@
 
 mod supervisor;
 
-pub use supervisor::{CtrlC, Interrupts, blocking_stage, with_cancellation};
+pub use supervisor::{CtrlC, Interrupts, blocking_stage};
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -381,9 +381,10 @@ impl ResourceGovernor {
         // Closing wakes every task parked on the budget with an error, so a
         // waiter is refused exactly like a newcomer.
         self.semaphore.close();
-        // A watch send fails only when nobody is listening, which is a perfectly
-        // ordinary state for a run nothing is supervising.
-        let _ = self.cancel_tx.send(true);
+        // Persist the level even when no receiver exists yet. `send` discards
+        // the value in that ordinary state, which parked a late `cancelled()`
+        // subscriber forever despite the atomic already being true.
+        self.cancel_tx.send_replace(true);
 
         let children = std::mem::take(&mut *self.lock_inflight());
         for pid in children.into_values() {
@@ -417,6 +418,9 @@ impl ResourceGovernor {
     /// one that already happened; and a dropped sender means nothing can ever
     /// cancel, which must read as "never", not as "cancelled now".
     pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
         let mut signal = self.cancelled_signal();
         if *signal.borrow() {
             return;
@@ -462,6 +466,43 @@ fn current_load_average() -> Option<f64> {
 /// machine, which is the honest answer rather than a deadlock.
 fn heavy_cost_for(total_budget: u32) -> u32 {
     total_budget.div_ceil(2).max(1)
+}
+
+tokio::task_local! {
+    /// The governor for the whole run future.
+    ///
+    /// Unlike `CHILD_SCOPE`, this spans stage boundaries. It lets in-process
+    /// work such as loctree observe the same cancellation requested by the CLI
+    /// supervisor without threading a second governor through `App`'s public
+    /// API or moving its non-Send git repository to another task.
+    static RUN_SCOPE: Arc<ResourceGovernor>;
+}
+
+/// Run a future under one run-wide governor cancellation scope.
+pub(crate) async fn with_run_scope<F>(governor: Arc<ResourceGovernor>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    RUN_SCOPE.scope(governor, future).await
+}
+
+/// The governor attached to the current run future, when one exists.
+#[must_use]
+pub(crate) fn current_run_governor() -> Option<Arc<ResourceGovernor>> {
+    RUN_SCOPE.try_with(Arc::clone).ok()
+}
+
+/// Supervise a run and expose its governor to every in-process stage.
+pub async fn with_cancellation<T>(
+    work: impl std::future::Future<Output = anyhow::Result<T>>,
+    governor: &Arc<ResourceGovernor>,
+    interrupts: impl Interrupts,
+) -> anyhow::Result<T> {
+    with_run_scope(
+        Arc::clone(governor),
+        supervisor::with_cancellation(work, governor, interrupts),
+    )
+    .await
 }
 
 tokio::task_local! {
@@ -771,6 +812,18 @@ mod tests {
         // Subscribing afterwards must not wait for a change that already
         // happened.
         assert!(*governor.cancelled_signal().borrow());
+    }
+
+    #[tokio::test]
+    async fn cancelled_returns_for_a_subscriber_created_after_cancel() {
+        let governor = ResourceGovernor::with_budget(2, 1);
+
+        // No watch receiver exists at this point. Before send_replace plus the
+        // atomic fast path, cancel() dropped the watch value and this timed out.
+        governor.cancel();
+        tokio::time::timeout(Duration::from_millis(100), governor.cancelled())
+            .await
+            .expect("a late cancelled() subscriber must observe the stored level");
     }
 
     #[test]

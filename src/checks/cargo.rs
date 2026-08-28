@@ -125,6 +125,27 @@ fn cargo_jobs_env(config: &Config) -> (String, String) {
     )
 }
 
+/// Exact `cargo test` command surface for the run-wide resource envelope.
+///
+/// Cargo's build-job cap does not constrain libtest's own worker pool. Keep the
+/// optional test filter on Cargo's side of `--`, then cap the harness after it.
+fn cargo_test_args(config: &Config) -> Vec<String> {
+    let mut args = vec![
+        "test".to_string(),
+        "--all-targets".to_string(),
+        "--no-fail-fast".to_string(),
+    ];
+    if let Some(pattern) = &config.tests_pattern {
+        args.push(pattern.clone());
+    }
+    args.extend([
+        "--".to_string(),
+        "--test-threads".to_string(),
+        config.resource_plan.worker_limit.max(1).to_string(),
+    ]);
+    args
+}
+
 /// The directory a cargo check would have run in, given a scan dir that already
 /// exists.
 ///
@@ -1254,9 +1275,10 @@ impl Check for CargoTestCheck {
         let run = plan_cargo_run(config)?;
         let cwd = run.cwd.as_path();
 
-        let args = &["test", "--all-targets", "--no-fail-fast"];
+        let owned_args = cargo_test_args(config);
+        let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         let output =
-            run_command_with_timeout_and_env("cargo", args, cwd, TEST_TIMEOUT_SECS, &run.env)
+            run_command_with_timeout_and_env("cargo", &args, cwd, TEST_TIMEOUT_SECS, &run.env)
                 .await?;
         let finished_at = Local::now().to_rfc3339();
 
@@ -1280,7 +1302,7 @@ impl Check for CargoTestCheck {
                 ProvenanceBuilder {
                     check: self.name(),
                     cmd: "cargo",
-                    args,
+                    args: &args,
                     cwd,
                     repo_root: &config.repo_root,
                     exit_code: output.status.code(),
@@ -2039,6 +2061,44 @@ mod tests {
             check.check_eligibility(&config),
             super::super::CheckEligibility::Skip(_)
         ));
+    }
+
+    #[test]
+    fn cargo_test_args_cap_safe_libtest_threads_exactly() {
+        let mut config = create_test_config(true, false, true);
+        config.resource_plan.worker_limit = 1;
+
+        assert_eq!(
+            cargo_test_args(&config),
+            vec![
+                "test",
+                "--all-targets",
+                "--no-fail-fast",
+                "--",
+                "--test-threads",
+                "1",
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_test_args_cap_balanced_threads_and_preserve_filter() {
+        let mut config = create_test_config(true, false, true);
+        config.resource_plan.worker_limit = 3;
+        config.tests_pattern = Some("critical path".to_string());
+
+        assert_eq!(
+            cargo_test_args(&config),
+            vec![
+                "test",
+                "--all-targets",
+                "--no-fail-fast",
+                "critical path",
+                "--",
+                "--test-threads",
+                "3",
+            ]
+        );
     }
 
     #[test]

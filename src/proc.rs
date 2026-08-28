@@ -16,6 +16,28 @@ use std::process::Output;
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 
+#[cfg(windows)]
+fn system_taskkill_path() -> std::path::PathBuf {
+    let windows_dir = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    windows_dir.join("System32").join("taskkill.exe")
+}
+
+#[cfg(windows)]
+fn taskkill_process_tree_at(
+    taskkill: &std::path::Path,
+    pid: u32,
+) -> std::io::Result<std::process::ExitStatus> {
+    std::process::Command::new(taskkill)
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+}
+
 /// SIGKILL an entire unix process group by its leader pid.
 ///
 /// The child must have been spawned with `process_group(0)` so `pid` is also
@@ -39,12 +61,18 @@ pub fn terminate_process_tree(pid: u32) {
 
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill.exe")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let taskkill = system_taskkill_path();
+        match taskkill_process_tree_at(&taskkill, pid) {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!(
+                "prview: {} failed to terminate process tree {pid} (status {status})",
+                taskkill.display()
+            ),
+            Err(err) => eprintln!(
+                "prview: failed to run {} for process tree {pid}: {err}",
+                taskkill.display()
+            ),
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -519,5 +547,25 @@ mod tests {
         terminate_process_tree(tree.root_pid());
 
         tree.assert_all_gone("direct taskkill primitive");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn taskkill_uses_an_absolute_system_path_and_exposes_spawn_failure() {
+        let taskkill = system_taskkill_path();
+        assert!(
+            taskkill.is_absolute(),
+            "taskkill path must not use PATH lookup"
+        );
+        assert_eq!(
+            taskkill.file_name().and_then(|name| name.to_str()),
+            Some("taskkill.exe")
+        );
+
+        let missing = std::path::Path::new(r"C:\prview-missing\taskkill.exe");
+        assert!(
+            taskkill_process_tree_at(missing, u32::MAX).is_err(),
+            "spawn failure must remain observable to the caller"
+        );
     }
 }

@@ -479,6 +479,10 @@ pub fn acquire_lock_at(path: &Path) -> Result<LockGuard> {
 const LOCK_STALE_MAX_AGE_NANOS: u128 = 3600 * 1_000_000_000;
 
 fn lock_is_stale(content: &str) -> bool {
+    lock_is_stale_with(content, is_process_alive)
+}
+
+fn lock_is_stale_with(content: &str, is_alive: impl FnOnce(u32) -> bool) -> bool {
     let mut parts = content.trim().split(':');
     let pid = parts.next().and_then(|part| part.parse::<u32>().ok());
     let created_nanos = parts.next().and_then(|part| part.parse::<u128>().ok());
@@ -489,7 +493,7 @@ fn lock_is_stale(content: &str) -> bool {
     };
 
     // Primary signal: the owning process is gone.
-    if !is_process_alive(pid) {
+    if !is_alive(pid) {
         return true;
     }
 
@@ -527,18 +531,17 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
 
     #[cfg(unix)]
     {
-        // kill(pid, 0) checks if a process exists without sending a signal.
-        // SAFETY: signal 0 performs only the liveness/permission probe; `pid`
-        // is a non-zero process identifier supplied by an existing marker.
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        if rc == 0 {
-            return true;
-        }
-
-        matches!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EPERM)
-        )
+        unix_process_alive_with(|| {
+            // kill(pid, 0) checks if a process exists without sending a signal.
+            // SAFETY: signal 0 performs only the liveness/permission probe;
+            // `pid` is a non-zero process identifier supplied by a marker.
+            let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error().raw_os_error())
+            }
+        })
     }
 
     #[cfg(windows)]
@@ -576,6 +579,20 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
     #[cfg(not(any(unix, windows)))]
     {
         false
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_alive_with(mut probe: impl FnMut() -> Result<(), Option<i32>>) -> bool {
+    loop {
+        match probe() {
+            Ok(()) => return true,
+            Err(Some(libc::EINTR)) => continue,
+            Err(Some(libc::ESRCH)) => return false,
+            // EPERM and every indeterminate probe failure retain ownership.
+            // Only ESRCH is affirmative evidence that the process is gone.
+            Err(_) => return true,
+        }
     }
 }
 
@@ -1204,6 +1221,25 @@ mod tests {
     fn process_liveness_reports_zero_and_current_process_truthfully() {
         assert!(!is_process_alive(0));
         assert!(is_process_alive(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_eintr_cannot_make_a_live_lock_stale() {
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fresh = format!("4242:{now_nanos}");
+        let mut probes = [Err(Some(libc::EINTR)), Ok(())].into_iter();
+
+        assert!(!lock_is_stale_with(&fresh, |_| {
+            unix_process_alive_with(|| probes.next().expect("bounded errno oracle"))
+        }));
+        assert!(
+            probes.next().is_none(),
+            "EINTR must be retried exactly once"
+        );
     }
 
     #[cfg(windows)]

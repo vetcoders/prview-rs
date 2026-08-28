@@ -9,6 +9,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+#[cfg(test)]
+use std::sync::Arc;
 
 // Import loctree library directly
 use loctree::analyzer::twins::detect_exact_twins;
@@ -109,6 +111,8 @@ fn is_valid_dead_export_symbol(symbol: &str) -> bool {
 
 /// Run loctree analysis using the library directly (no subprocess!)
 pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
+    let governor = crate::governor::current_run_governor();
+    ensure_not_cancelled(governor.as_deref())?;
     let mut analysis = LoctreeAnalysis::default();
 
     // Try to load existing snapshot or create new one.
@@ -118,12 +122,13 @@ pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
     // branch in `run_all` and keeps the zeroed summary out of regression deltas
     // (a failed scan would otherwise read as a real +N/-N change against the
     // other side).
-    let snapshot = match load_or_create_snapshot(root).await {
+    let snapshot = match load_or_create_snapshot(root, governor.as_deref()).await {
         Ok(s) => s,
         Err(e) => {
             return Err(e.context("loctree analysis unavailable (snapshot load/create failed)"));
         }
     };
+    cancellation_checkpoint(governor.as_deref()).await?;
 
     analysis.available = true;
 
@@ -132,7 +137,10 @@ pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
     analysis.stats.total_loc = snapshot.metadata.total_loc;
 
     // Build language stats from file analyses
-    for file in &snapshot.files {
+    for (index, file) in snapshot.files.iter().enumerate() {
+        if index % 64 == 0 {
+            cancellation_checkpoint(governor.as_deref()).await?;
+        }
         let lang = &file.language;
         let entry = analysis
             .stats
@@ -145,6 +153,7 @@ pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
 
     // Find dead exports using the correct API
     let dead_config = dead_parrots::DeadFilterConfig::default();
+    cancellation_checkpoint(governor.as_deref()).await?;
     let dead = dead_parrots::find_dead_exports(
         &snapshot.files,
         true, // high_confidence
@@ -152,7 +161,11 @@ pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
         dead_config,
     );
 
-    for d in dead {
+    cancellation_checkpoint(governor.as_deref()).await?;
+    for (index, d) in dead.into_iter().enumerate() {
+        if index % 64 == 0 {
+            cancellation_checkpoint(governor.as_deref()).await?;
+        }
         if !is_valid_dead_export_symbol(&d.symbol) {
             continue;
         }
@@ -172,8 +185,13 @@ pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
         .map(|e| (e.from.clone(), e.to.clone(), e.label.clone()))
         .collect();
 
+    cancellation_checkpoint(governor.as_deref()).await?;
     let (strict_cycles, _lazy_cycles) = cycles::find_cycles_with_lazy(&edges);
-    for cycle in strict_cycles {
+    cancellation_checkpoint(governor.as_deref()).await?;
+    for (index, cycle) in strict_cycles.into_iter().enumerate() {
+        if index % 64 == 0 {
+            cancellation_checkpoint(governor.as_deref()).await?;
+        }
         let len = cycle.len();
         analysis.cycles.push(CycleInfo {
             files: cycle,
@@ -182,6 +200,7 @@ pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
     }
 
     // Find dead parrots (symbols with 0 imports)
+    cancellation_checkpoint(governor.as_deref()).await?;
     let twins_result = twins::find_dead_parrots(
         &snapshot.files,
         false, // dead_only
@@ -189,7 +208,11 @@ pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
     );
 
     analysis.twins.total_symbols = twins_result.total_symbols;
-    for parrot in twins_result.dead_parrots {
+    cancellation_checkpoint(governor.as_deref()).await?;
+    for (index, parrot) in twins_result.dead_parrots.into_iter().enumerate() {
+        if index % 64 == 0 {
+            cancellation_checkpoint(governor.as_deref()).await?;
+        }
         analysis.twins.dead_parrots.push(DeadParrot {
             file: parrot.file_path.clone(),
             symbol: parrot.name.clone(),
@@ -199,8 +222,13 @@ pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
     }
 
     // Find exact twins (symbols exported from multiple files)
+    cancellation_checkpoint(governor.as_deref()).await?;
     let exact_twins = detect_exact_twins(&snapshot.files, false);
-    for twin in exact_twins {
+    cancellation_checkpoint(governor.as_deref()).await?;
+    for (index, twin) in exact_twins.into_iter().enumerate() {
+        if index % 64 == 0 {
+            cancellation_checkpoint(governor.as_deref()).await?;
+        }
         if let [a, b, ..] = &twin.locations[..] {
             analysis.twins.exact_twins.push(TwinPair {
                 file_a: a.file_path.clone(),
@@ -210,7 +238,26 @@ pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
         }
     }
 
+    ensure_not_cancelled(governor.as_deref())?;
     Ok(analysis)
+}
+
+fn ensure_not_cancelled(governor: Option<&crate::governor::ResourceGovernor>) -> Result<()> {
+    if governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled) {
+        return Err(crate::governor::Cancelled.into());
+    }
+    Ok(())
+}
+
+async fn cancellation_checkpoint(
+    governor: Option<&crate::governor::ResourceGovernor>,
+) -> Result<()> {
+    ensure_not_cancelled(governor)?;
+    // The analysis loops are otherwise fully synchronous. Yielding at bounded
+    // intervals gives the independent interrupt/TUI task a chance to flip the
+    // governor before the next checkpoint.
+    tokio::task::yield_now().await;
+    ensure_not_cancelled(governor)
 }
 
 /// Extract "major.minor" from a semver string (e.g. "0.8.14" -> "0.8")
@@ -227,7 +274,11 @@ fn schema_major_minor(version: &str) -> &str {
 /// Load existing snapshot or create a new one.
 /// Rejects snapshots with mismatched major.minor schema version to avoid
 /// stale data from older loctree versions producing false positives.
-async fn load_or_create_snapshot(root: &std::path::Path) -> Result<Snapshot> {
+async fn load_or_create_snapshot(
+    root: &std::path::Path,
+    governor: Option<&crate::governor::ResourceGovernor>,
+) -> Result<Snapshot> {
+    ensure_not_cancelled(governor)?;
     let expected = loctree::snapshot::SNAPSHOT_SCHEMA_VERSION;
 
     // Try loading existing snapshot first
@@ -240,6 +291,7 @@ async fn load_or_create_snapshot(root: &std::path::Path) -> Result<Snapshot> {
             // on staleness. is_stale() returns false for non-git dirs (extracted
             // base/target snapshots), so remote-mode scans are unaffected.
             if !snapshot.is_stale(root) {
+                ensure_not_cancelled(governor)?;
                 return Ok(snapshot);
             }
             eprintln!("  [loctree] Snapshot stale (HEAD moved or worktree dirty), re-scanning");
@@ -257,9 +309,27 @@ async fn load_or_create_snapshot(root: &std::path::Path) -> Result<Snapshot> {
 
     let roots_clone = roots.clone();
     let parsed_clone = parsed.clone();
-    tokio::task::spawn_blocking(move || loctree::snapshot::run_init(&roots_clone, &parsed_clone))
-        .await?
-        .context("Failed to run loctree scan")?;
+    let mut scan = tokio::task::spawn_blocking(move || {
+        loctree::snapshot::run_init(&roots_clone, &parsed_clone)
+    });
+    let scan_result = if let Some(governor) = governor {
+        tokio::select! {
+            biased;
+            _ = governor.cancelled() => {
+                // This prevents a queued blocking scan from starting. Tokio
+                // cannot preempt one already inside third-party synchronous
+                // code, but the run stops awaiting it and can never publish a
+                // success-shaped heuristics result or final review pack.
+                scan.abort();
+                return Err(crate::governor::Cancelled.into());
+            }
+            result = &mut scan => result?,
+        }
+    } else {
+        scan.await?
+    };
+    scan_result.context("Failed to run loctree scan")?;
+    ensure_not_cancelled(governor)?;
 
     // Load from the exact cache path where run_init() saves (not Snapshot::load()
     // which may still pick up a legacy .loctree/ snapshot before the new cache entry).
@@ -269,6 +339,7 @@ async fn load_or_create_snapshot(root: &std::path::Path) -> Result<Snapshot> {
         .with_context(|| format!("Failed to read snapshot from {}", snapshot_path.display()))?;
     let snapshot: Snapshot =
         serde_json::from_str(&content).context("Failed to parse freshly created snapshot")?;
+    ensure_not_cancelled(governor)?;
     Ok(snapshot)
 }
 
@@ -301,7 +372,7 @@ mod tests {
         run_git(&["add", "."]);
         run_git(&["commit", "-m", "one"]);
 
-        let snap1 = load_or_create_snapshot(root)
+        let snap1 = load_or_create_snapshot(root, None)
             .await
             .expect("first scan should succeed");
         let files1 = snap1.metadata.file_count;
@@ -311,7 +382,7 @@ mod tests {
         run_git(&["add", "."]);
         run_git(&["commit", "-m", "two"]);
 
-        let snap2 = load_or_create_snapshot(root)
+        let snap2 = load_or_create_snapshot(root, None)
             .await
             .expect("second scan should succeed");
         assert!(
@@ -320,6 +391,38 @@ mod tests {
             files1,
             snap2.metadata.file_count
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_stops_a_long_snapshot_without_a_success_result() {
+        let repo = tempfile::tempdir().expect("scan root");
+        for index in 0..4_000 {
+            std::fs::write(
+                repo.path().join(format!("module_{index}.ts")),
+                format!("export const value_{index} = {index};\n"),
+            )
+            .expect("write scan fixture");
+        }
+
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        let run_governor = Arc::clone(&governor);
+        let root = repo.path().to_path_buf();
+        let scan = tokio::spawn(async move {
+            crate::governor::with_run_scope(run_governor, async move { run_loctree(&root).await })
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let cancelled_at = std::time::Instant::now();
+        governor.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), scan)
+            .await
+            .expect("loctree call must stop promptly after cancellation")
+            .expect("scan task must not panic")
+            .expect_err("a cancelled scan must not return LoctreeAnalysis");
+
+        assert!(crate::governor::is_cancellation(&result));
+        assert!(cancelled_at.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[test]

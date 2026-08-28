@@ -10,6 +10,7 @@ pub mod ui;
 pub mod widgets;
 
 use std::io::stdout;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -24,6 +25,29 @@ use tokio::sync::mpsc;
 use crate::checks::{CheckEvent, CheckResult, CheckStatus as CrateCheckStatus};
 use crate::{App, Config};
 use types::{TuiEvent, TuiState};
+
+struct AnalysisTask {
+    governor: Arc<crate::governor::ResourceGovernor>,
+    handle: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl AnalysisTask {
+    fn spawn(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -> Self {
+        let governor = Arc::new(crate::governor::ResourceGovernor::from_plan(
+            config.resource_plan,
+        ));
+        let run_governor = Arc::clone(&governor);
+        let analysis_governor = Arc::clone(&governor);
+        let handle = tokio::spawn(async move {
+            crate::governor::with_run_scope(
+                run_governor,
+                run_analysis(config, tx, analysis_governor),
+            )
+            .await
+        });
+        Self { governor, handle }
+    }
+}
 
 /// Run the TUI application
 pub async fn run_tui(config: Config) -> Result<()> {
@@ -58,9 +82,10 @@ pub async fn run_tui(config: Config) -> Result<()> {
         // fill a fixed buffer and drop a CheckCompleted, which would leave a
         // check stuck rendering as "running" forever.
         let (tx, mut rx) = mpsc::unbounded_channel::<TuiEvent>();
+        let mut analysis = None;
 
         // Run event loop
-        run_event_loop(&mut terminal, &mut state, &tx, &mut rx).await
+        run_event_loop(&mut terminal, &mut state, &tx, &mut rx, &mut analysis).await
     }
     .await;
 
@@ -88,6 +113,7 @@ async fn run_event_loop<B: Backend>(
     state: &mut TuiState,
     tx: &mpsc::UnboundedSender<TuiEvent>,
     rx: &mut mpsc::UnboundedReceiver<TuiEvent>,
+    analysis: &mut Option<AnalysisTask>,
 ) -> Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -95,6 +121,8 @@ where
     let tick_rate = Duration::from_millis(100);
 
     loop {
+        reap_finished_analysis(analysis, tx).await;
+
         // Draw UI (clear first to handle any stdout pollution from subprocesses)
         terminal.clear()?;
         terminal.draw(|f| ui::draw(f, state))?;
@@ -113,7 +141,21 @@ where
                 continue;
             }
             // Handle key event
-            keys::handle_key(state, key, tx).await?;
+            if key.code == crossterm::event::KeyCode::Char('r')
+                && !state.running
+                && analysis.is_none()
+            {
+                state.running = true;
+                state.start_time = Some(std::time::Instant::now());
+                state.message = "Starting analysis...".to_string();
+                *analysis = Some(AnalysisTask::spawn(state.config.clone(), tx.clone()));
+            } else {
+                keys::handle_key(state, key, tx).await?;
+            }
+            if state.should_quit {
+                cancel_analysis(analysis).await?;
+                break;
+            }
         }
 
         // Process any pending async events
@@ -127,7 +169,49 @@ where
         }
     }
 
-    Ok(())
+    cancel_analysis(analysis).await
+}
+
+async fn reap_finished_analysis(
+    analysis: &mut Option<AnalysisTask>,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+) {
+    if !analysis
+        .as_ref()
+        .is_some_and(|task| task.handle.is_finished())
+    {
+        return;
+    }
+
+    let task = analysis.take().expect("finished task was present");
+    match task.handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) if crate::governor::is_cancellation(&err) => {}
+        Ok(Err(err)) => {
+            let _ = tx.send(TuiEvent::Error {
+                message: err.to_string(),
+            });
+        }
+        Err(join_err) => {
+            let _ = tx.send(TuiEvent::Error {
+                message: format!("analysis task aborted: {join_err}"),
+            });
+        }
+    }
+}
+
+async fn cancel_analysis(analysis: &mut Option<AnalysisTask>) -> Result<()> {
+    let Some(task) = analysis.take() else {
+        return Ok(());
+    };
+
+    task.governor.cancel();
+    match task.handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) if crate::governor::is_cancellation(&err) => Ok(()),
+        Ok(Err(err)) => Err(err),
+        Err(join_err) => Err(anyhow::anyhow!("analysis task aborted: {join_err}")),
+    }
 }
 
 /// Handle async TUI events
@@ -254,7 +338,8 @@ pub async fn run_tui_state(config: Config, repo_state: crate::state::RepoState) 
     let run_result = async {
         let mut state = TuiState::new_state_view(config, repo_state);
         let (tx, mut rx) = mpsc::unbounded_channel::<TuiEvent>();
-        run_event_loop(&mut terminal, &mut state, &tx, &mut rx).await
+        let mut analysis = None;
+        run_event_loop(&mut terminal, &mut state, &tx, &mut rx, &mut analysis).await
     }
     .await;
 
@@ -274,7 +359,11 @@ pub async fn run_tui_state(config: Config, repo_state: crate::state::RepoState) 
 /// All `git2::Repository` (non-Send) access is done synchronously before
 /// the first `.await`, so the resulting future is `Send` and can be used
 /// with `tokio::spawn` on a multi-threaded runtime.
-pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -> Result<()> {
+pub async fn run_analysis(
+    config: Config,
+    tx: mpsc::UnboundedSender<TuiEvent>,
+    governor: Arc<crate::governor::ResourceGovernor>,
+) -> Result<()> {
     let t_start = std::time::Instant::now();
 
     // --- Sync phase: all git2 (non-Send) work happens here ---
@@ -332,6 +421,8 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
 
     // --- Async phase: all work below is Send-safe ---
 
+    ensure_analysis_active(&governor)?;
+
     let _ = tx.send(TuiEvent::DiffsReady {
         diffs: diffs.clone(),
     });
@@ -339,17 +430,13 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
     // Run all checks with event callbacks for real-time updates
     let tx_checks = tx.clone();
     let ledger = crate::ledger::TaskLedger::new();
-    // The TUI is its own entry point, so it owns the run's single budget the way
-    // `App` does for the CLI.
-    let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::from_plan(
-        config.resource_plan,
-    ));
     let (check_results, skipped_checks) =
         crate::checks::run_all_with_events(&config, &ledger, &governor, move |event| {
             let tx = tx_checks.clone();
             let _ = tx.send(map_check_event(event));
         })
         .await?;
+    ensure_analysis_active(&governor)?;
 
     // Run heuristics
     let heuristics = if let Some(ref snap) = target_snap {
@@ -378,11 +465,13 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
     } else {
         crate::heuristics::run_all(&config, None).await?
     };
+    ensure_analysis_active(&governor)?;
     let _ = tx.send(TuiEvent::HeuristicsReady {
         result: heuristics.clone(),
     });
 
     // Generate artifacts
+    ensure_analysis_active(&governor)?;
     let artifacts_dir = crate::artifacts::generate(crate::artifacts::GenerateInput {
         config: &config,
         ledger: &ledger,
@@ -397,6 +486,7 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
         worktree_status_digest,
         governor: &governor,
     })?;
+    ensure_analysis_active(&governor)?;
     let _ = tx.send(TuiEvent::ArtifactsReady {
         dir: artifacts_dir.clone(),
     });
@@ -413,8 +503,16 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
         unchanged: false,
     };
 
+    ensure_analysis_active(&governor)?;
     let _ = tx.send(TuiEvent::AnalysisComplete { report });
 
+    Ok(())
+}
+
+fn ensure_analysis_active(governor: &crate::governor::ResourceGovernor) -> Result<()> {
+    if governor.is_cancelled() {
+        return Err(crate::governor::Cancelled.into());
+    }
     Ok(())
 }
 
@@ -426,6 +524,84 @@ mod tests {
 
     fn default_config() -> Config {
         test_config()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tui_quit_cancels_joins_and_reaps_a_real_process_tree() {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+
+        let tmp = tempfile::tempdir().expect("process-tree tempdir");
+        let pidfile = tmp.path().join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > {} ; wait", pidfile.display());
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(script).process_group(0);
+        let mut child = command.spawn().expect("spawn TUI process tree");
+        let root_pid = child.id();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !pidfile.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild pid was not published"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut pid = String::new();
+        std::fs::File::open(&pidfile)
+            .expect("open grandchild pid")
+            .read_to_string(&mut pid)
+            .expect("read grandchild pid");
+        let grandchild_pid: i32 = pid.trim().parse().expect("numeric grandchild pid");
+
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        assert!(governor.register_child("tui-test", root_pid));
+        let wait_governor = Arc::clone(&governor);
+        let handle = tokio::spawn(async move {
+            wait_governor.cancelled().await;
+            Err(crate::governor::Cancelled.into())
+        });
+        let mut analysis = Some(AnalysisTask { governor, handle });
+        let mut state = TuiState::new(default_config());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        keys::handle_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('q'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &tx,
+        )
+        .await
+        .expect("handle quit");
+        assert!(state.should_quit);
+        cancel_analysis(&mut analysis)
+            .await
+            .expect("joined cancellation");
+        assert!(analysis.is_none());
+        let _ = child.wait();
+
+        let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal 0 only probes the PID published by this fixture.
+            if unsafe { libc::kill(grandchild_pid, 0) } == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if matches!(errno, Some(libc::ESRCH) | Some(libc::EPERM)) {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < gone_deadline,
+                "TUI quit left grandchild {grandchild_pid} alive"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled analysis must not publish a completion/verdict event"
+        );
     }
 
     #[test]
