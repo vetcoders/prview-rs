@@ -342,31 +342,87 @@ pub(super) fn build_heuristics_check(
     }
 }
 
+macro_rules! artifact_generation_seams {
+    ($( $variant:ident => $label:literal ),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ArtifactGenerationSeam {
+            $( $variant ),+
+        }
+
+        impl ArtifactGenerationSeam {
+            #[cfg(test)]
+            const ALL: [Self; artifact_generation_seams!(@count $( $variant )+)] = [
+                $( Self::$variant ),+
+            ];
+
+            const fn label(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $label ),+
+                }
+            }
+        }
+    };
+    (@count $( $variant:ident )+) => {
+        <[()]>::len(&[$(artifact_generation_seams!(@unit $variant)),+])
+    };
+    (@unit $variant:ident) => { () };
+}
+
+// This is the single ordered registry for the artifact pipeline's cancellation
+// boundaries. The enum, stable marker labels, and test matrix are all expanded
+// from these entries, so a production callsite cannot drift to an ad-hoc string.
+artifact_generation_seams! {
+    ArtifactDirectorySetup => "artifact directory setup",
+    DiffGeneration => "diff generation",
+    StructuralSignalGeneration => "structural signal generation",
+    SummaryMetadata => "summary metadata",
+    PerCommitDiffs => "per-commit diffs",
+    QualityArtifacts => "quality artifacts",
+    PerFileDiffs => "per-file diffs",
+    StaticContextArtifacts => "static context artifacts",
+    ContextTools => "context tools",
+    MergeGate => "merge gate",
+    PrReview => "PR review",
+    ReportAndDashboard => "report and dashboard",
+    ReviewHandoffSurfaces => "review handoff surfaces",
+    Provenance => "provenance",
+    RunJson => "RUN.json",
+    ManifestJson => "MANIFEST.json",
+    SanityChecks => "SANITY checks",
+    PackPublication => "pack publication",
+    RunIndexPublication => "run index publication",
+}
+
+const CANCELLED_GENERATION_SUCCESS_SURFACES: [&str; 12] = [
+    "00_summary/MERGE_GATE.json",
+    "00_summary/MERGE_GATE.md",
+    "00_summary/RUN.json",
+    "00_summary/MANIFEST.json",
+    "00_summary/SANITY.json",
+    "report.json",
+    "dashboard.html",
+    "review.html",
+    "PR_REVIEW.md",
+    "REVIEW_SUMMARY.md",
+    "AI_INDEX.md",
+    "artifacts.zip",
+];
+
 /// Cancellation turns the directory into typed incomplete evidence and removes
 /// every success-shaped surface that may have been written before the seam.
 fn ensure_generation_active(
     governor: &crate::governor::ResourceGovernor,
     out_dir: &Path,
-    stage: &str,
+    seam: ArtifactGenerationSeam,
 ) -> Result<()> {
+    #[cfg(test)]
+    generation_seam_test_hook::observe_and_maybe_cancel(seam, governor);
+
     if !governor.is_cancelled() {
         return Ok(());
     }
 
-    for relative in [
-        "00_summary/MERGE_GATE.json",
-        "00_summary/MERGE_GATE.md",
-        "00_summary/RUN.json",
-        "00_summary/MANIFEST.json",
-        "00_summary/SANITY.json",
-        "report.json",
-        "dashboard.html",
-        "review.html",
-        "PR_REVIEW.md",
-        "REVIEW_SUMMARY.md",
-        "AI_INDEX.md",
-        "artifacts.zip",
-    ] {
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
         let _ = fs::remove_file(out_dir.join(relative));
     }
 
@@ -378,7 +434,7 @@ fn ensure_generation_active(
             "schema_version": "1.0",
             "status": "incomplete",
             "reason": "cancelled",
-            "stage": stage,
+            "stage": seam.label(),
         }))?,
     )?;
     Err(crate::governor::Cancelled.into())
@@ -445,7 +501,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     fs::create_dir_all(&quality_dir)?;
     fs::create_dir_all(&context_dir)?;
     fs::create_dir_all(&per_commit_dir)?;
-    ensure_generation_active(governor, &out_dir, "artifact directory setup")?;
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::ArtifactDirectorySetup,
+    )?;
 
     // Artifact Pack version marker
     fs::write(summary_dir.join("ARTIFACT_VERSION.txt"), "1.0\n")?;
@@ -459,7 +519,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let t = Instant::now();
     let patch_texts = generate_full_patch(&diff_dir, &repo, diffs)?;
     stage_timings.push(finish_timing(emit_human_stdout, "full.patch", t));
-    ensure_generation_active(governor, &out_dir, "diff generation")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::DiffGeneration)?;
 
     // Rust API truth is computed once from the exact revision trees named by
     // each Diff. The same delta feeds both artifact views and every verdict
@@ -492,7 +552,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     if let Some(ghr) = signal::generate_ghost_refs(&context_dir, diffs, &repo)? {
         all_checks.push(ghr);
     }
-    ensure_generation_active(governor, &out_dir, "structural signal generation")?;
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::StructuralSignalGeneration,
+    )?;
 
     // 00_summary/
     let t = Instant::now();
@@ -502,12 +566,12 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     generate_system_meta(&summary_dir)?;
     generate_git_meta(&summary_dir, config, resolved_target, resolved_bases)?;
     stage_timings.push(finish_timing(emit_human_stdout, "00_summary", t));
-    ensure_generation_active(governor, &out_dir, "summary metadata")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::SummaryMetadata)?;
 
     let t = Instant::now();
     generate_per_commit_diffs(&repo, &per_commit_dir, diffs, emit_human_stdout)?;
     stage_timings.push(finish_timing(emit_human_stdout, "per-commit-diffs", t));
-    ensure_generation_active(governor, &out_dir, "per-commit diffs")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PerCommitDiffs)?;
 
     // 20_quality/ — per-gate result.json + .log, then aggregate logs
     let t = Instant::now();
@@ -530,13 +594,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let coverage_delta = signal::CoverageDelta::from_signal(&coverage_signal);
     signal::generate_coverage_delta(&quality_dir, &coverage_signal)?;
     stage_timings.push(finish_timing(emit_human_stdout, "20_quality", t));
-    ensure_generation_active(governor, &out_dir, "quality artifacts")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::QualityArtifacts)?;
 
     // 10_diff/ — per-file diffs for hotspots
     let t = Instant::now();
     signal::generate_per_file_diffs(&diff_dir, &repo, diffs)?;
     stage_timings.push(finish_timing(emit_human_stdout, "per-file-diffs", t));
-    ensure_generation_active(governor, &out_dir, "per-file diffs")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PerFileDiffs)?;
 
     // Log signal generator status for human output
     if emit_human_stdout {
@@ -596,7 +660,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         eprintln!("Warning: failed scanning tauri commands: {}", e);
     }
     stage_timings.push(finish_timing(emit_human_stdout, "30_context", t));
-    ensure_generation_active(governor, &out_dir, "static context artifacts")?;
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::StaticContextArtifacts,
+    )?;
 
     // External context tools finish before any verdict/report surface. A
     // cancellation here therefore cannot leave a final-shaped pack behind.
@@ -611,7 +679,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         governor,
     )?;
     stage_timings.push(finish_timing(emit_human_stdout, "context-tools", t));
-    ensure_generation_active(governor, &out_dir, "context tools")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::ContextTools)?;
 
     // 00_summary/ — merge gate + failures summary
     let t = Instant::now();
@@ -648,7 +716,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         "MERGE_GATE + FAILURES_SUMMARY",
         t,
     ));
-    ensure_generation_active(governor, &out_dir, "merge gate")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::MergeGate)?;
 
     // Root-level content generators
     let t = Instant::now();
@@ -663,7 +731,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         heuristics,
     )?;
     stage_timings.push(finish_timing(emit_human_stdout, "PR_REVIEW", t));
-    ensure_generation_active(governor, &out_dir, "PR review")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PrReview)?;
 
     // Load base coverage from previous run (if available)
     let prev_coverage = load_previous_coverage(&out_dir);
@@ -817,7 +885,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     } else {
         stage_timings.push(finish_timing(emit_human_stdout, "report.json", t));
     }
-    ensure_generation_active(governor, &out_dir, "report and dashboard")?;
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::ReportAndDashboard,
+    )?;
 
     // REVIEW_SUMMARY.md + review.html + AI_INDEX.md — consolidated human
     // review, the always-present browser handoff, and the reading-order map
@@ -832,7 +904,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         "REVIEW_SUMMARY + review.html + AI_INDEX",
         t,
     ));
-    ensure_generation_active(governor, &out_dir, "review handoff surfaces")?;
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::ReviewHandoffSurfaces,
+    )?;
 
     // 00_summary/PROVENANCE.json — pack-level substrate record. Written before
     // RUN.json/MANIFEST so the manifest hashes it like any other pack file.
@@ -849,7 +925,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         worktree_status_digest: worktree_status_digest.as_deref(),
     })?;
     stage_timings.push(finish_timing(emit_human_stdout, "PROVENANCE.json", t));
-    ensure_generation_active(governor, &out_dir, "provenance")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::Provenance)?;
 
     // 00_summary/RUN.json — after all generators complete for accurate timing
     let t = Instant::now();
@@ -871,19 +947,19 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         regression: Some(&regression_report),
     })?;
     stage_timings.push(finish_timing(emit_human_stdout, "RUN.json", t));
-    ensure_generation_active(governor, &out_dir, "RUN.json")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::RunJson)?;
 
     // 00_summary/MANIFEST.json — runs LAST (hashes all files)
     let t = Instant::now();
     generate_manifest(&out_dir)?;
     stage_timings.push(finish_timing(emit_human_stdout, "MANIFEST.json", t));
-    ensure_generation_active(governor, &out_dir, "MANIFEST.json")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::ManifestJson)?;
 
     // Sanity checks — verify pack integrity after manifest
     let t = Instant::now();
     let sanity = run_sanity_checks(&out_dir)?;
     stage_timings.push(finish_timing(emit_human_stdout, "SANITY checks", t));
-    ensure_generation_active(governor, &out_dir, "SANITY checks")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::SanityChecks)?;
     if emit_human_stdout {
         use colored::Colorize;
         if sanity.valid {
@@ -917,7 +993,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         create_zip(&out_dir, emit_human_stdout)?;
         stage_timings.push(finish_timing(emit_human_stdout, "artifacts.zip", t));
     }
-    ensure_generation_active(governor, &out_dir, "pack publication")?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PackPublication)?;
 
     // Create `latest` symlink in parent directory
     create_latest_symlink(&out_dir)?;
@@ -981,7 +1057,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         }
     }
 
-    ensure_generation_active(governor, &out_dir, "run index publication")?;
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::RunIndexPublication,
+    )?;
 
     if emit_human_stdout {
         use colored::Colorize;
@@ -2212,4 +2292,69 @@ fn generate_checks_status_json(
         serde_json::to_string_pretty(&serde_json::Value::Object(status_map))?,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod generation_seam_test_hook {
+    use super::ArtifactGenerationSeam;
+    use crate::governor::ResourceGovernor;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct ProbeState {
+        cancel_at: Option<ArtifactGenerationSeam>,
+        observed: Vec<ArtifactGenerationSeam>,
+    }
+
+    thread_local! {
+        static PROBE: RefCell<Option<ProbeState>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct ProbeGuard;
+
+    impl ProbeGuard {
+        pub(super) fn install(cancel_at: Option<ArtifactGenerationSeam>) -> Self {
+            PROBE.with(|probe| {
+                let previous = probe.borrow_mut().replace(ProbeState {
+                    cancel_at,
+                    observed: Vec::new(),
+                });
+                assert!(previous.is_none(), "nested artifact seam probe");
+            });
+            Self
+        }
+
+        pub(super) fn observed(&self) -> Vec<ArtifactGenerationSeam> {
+            PROBE.with(|probe| {
+                probe
+                    .borrow()
+                    .as_ref()
+                    .expect("artifact seam probe is installed")
+                    .observed
+                    .clone()
+            })
+        }
+    }
+
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            PROBE.with(|probe| {
+                probe.borrow_mut().take();
+            });
+        }
+    }
+
+    pub(super) fn observe_and_maybe_cancel(
+        seam: ArtifactGenerationSeam,
+        governor: &ResourceGovernor,
+    ) {
+        PROBE.with(|probe| {
+            if let Some(state) = probe.borrow_mut().as_mut() {
+                state.observed.push(seam);
+                if state.cancel_at == Some(seam) {
+                    governor.cancel();
+                }
+            }
+        });
+    }
 }

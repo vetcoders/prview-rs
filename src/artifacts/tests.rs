@@ -1,41 +1,163 @@
 use super::*;
 
-#[test]
-fn cancellation_marks_pack_incomplete_and_removes_final_surfaces() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let summary = tmp.path().join("00_summary");
-    fs::create_dir_all(&summary).expect("summary dir");
-    for path in [
-        summary.join("MERGE_GATE.json"),
-        summary.join("RUN.json"),
-        summary.join("SANITY.json"),
-        tmp.path().join("report.json"),
-        tmp.path().join("dashboard.html"),
-    ] {
-        fs::write(path, "final-shaped").expect("fixture artifact");
-    }
-    let governor = crate::governor::ResourceGovernor::new();
-    governor.cancel();
+fn generate_fixture_pack(
+    repo_root: &Path,
+    output_dir: &Path,
+    target_sha: &str,
+    base_sha: &str,
+    governor: &crate::governor::ResourceGovernor,
+) -> Result<PathBuf> {
+    let mut config = test_config_builder()
+        .repo_root(repo_root)
+        .target(Some("feature"))
+        .bases(&["main"])
+        .profile(test_generic_profile())
+        .execution_mode(ExecutionMode::Standard)
+        .run_tests(false)
+        .run_lint(false)
+        .do_fetch(false)
+        .use_cache(false)
+        .create_zip(true)
+        .build();
+    config.run_bundle = false;
+    config.run_security = false;
+    config.run_heuristics = false;
+    config.create_dashboard = true;
+    config.quiet = true;
+    config.output_dir = Some(output_dir.to_path_buf());
 
-    let error = ensure_generation_active(&governor, tmp.path(), "injected stage")
-        .expect_err("cancelled generation must stop");
-    assert!(crate::governor::is_cancellation(&error));
-    for path in [
-        summary.join("MERGE_GATE.json"),
-        summary.join("RUN.json"),
-        summary.join("SANITY.json"),
-        tmp.path().join("report.json"),
-        tmp.path().join("dashboard.html"),
-    ] {
-        assert!(!path.exists(), "{} survived cancellation", path.display());
+    let ledger = crate::ledger::TaskLedger::new();
+    let resolved_target = ResolvedRef {
+        name: "feature".to_string(),
+        commit_id: target_sha.to_string(),
+        is_remote: false,
+    };
+    let resolved_bases = [ResolvedRef {
+        name: "main".to_string(),
+        commit_id: base_sha.to_string(),
+        is_remote: false,
+    }];
+
+    generate(GenerateInput {
+        config: &config,
+        ledger: &ledger,
+        diffs: &[],
+        checks: &[],
+        heuristics: None,
+        resolved_target: &resolved_target,
+        resolved_bases: &resolved_bases,
+        run_start: Instant::now(),
+        skipped_checks: Vec::new(),
+        worktree_clean: Some(true),
+        worktree_status_digest: None,
+        governor,
+    })
+}
+
+fn assert_no_success_surfaces(output_dir: &Path, seam: ArtifactGenerationSeam) {
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        let path = output_dir.join(relative);
+        assert!(
+            !path.exists(),
+            "{} survived cancellation at {}",
+            path.display(),
+            seam.label()
+        );
     }
-    let incomplete: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(summary.join("INCOMPLETE.json")).expect("incomplete marker"),
-    )
-    .expect("valid incomplete JSON");
-    assert_eq!(incomplete["status"], "incomplete");
-    assert_eq!(incomplete["reason"], "cancelled");
-    assert_eq!(incomplete["stage"], "injected stage");
+}
+
+#[test]
+fn cancellation_injection_stops_every_artifact_generation_seam() {
+    assert_eq!(ArtifactGenerationSeam::ALL.len(), 19);
+    let unique_labels: std::collections::HashSet<_> = ArtifactGenerationSeam::ALL
+        .iter()
+        .map(|seam| seam.label())
+        .collect();
+    assert_eq!(unique_labels.len(), ArtifactGenerationSeam::ALL.len());
+
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    for (index, seam) in ArtifactGenerationSeam::ALL.iter().copied().enumerate() {
+        let output = tempfile::tempdir().expect("output tempdir");
+        let output_dir = output.path().join("pack");
+        let governor = crate::governor::ResourceGovernor::new();
+        let probe = generation_seam_test_hook::ProbeGuard::install(Some(seam));
+
+        let error =
+            generate_fixture_pack(repo.path(), &output_dir, &target_sha, &base_sha, &governor)
+                .expect_err("injected cancellation must stop artifact generation");
+        let observed = probe.observed();
+        drop(probe);
+
+        assert!(
+            crate::governor::is_cancellation(&error),
+            "{} returned {error:#}",
+            seam.label()
+        );
+        assert_eq!(
+            observed,
+            ArtifactGenerationSeam::ALL[..=index],
+            "generation did not stop exactly at {}",
+            seam.label()
+        );
+        if let Some(next) = ArtifactGenerationSeam::ALL.get(index + 1) {
+            assert!(
+                !observed.contains(next),
+                "stage after {} was observed: {}",
+                seam.label(),
+                next.label()
+            );
+        }
+
+        assert_no_success_surfaces(&output_dir, seam);
+        let incomplete: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(output_dir.join("00_summary/INCOMPLETE.json"))
+                .expect("incomplete marker"),
+        )
+        .expect("valid incomplete JSON");
+        assert_eq!(incomplete["status"], "incomplete");
+        assert_eq!(incomplete["reason"], "cancelled");
+        assert_eq!(incomplete["stage"], seam.label());
+    }
+}
+
+#[test]
+fn artifact_generation_registry_is_exact_and_success_path_reaches_every_seam() {
+    let expected = ArtifactGenerationSeam::ALL;
+    let mut duplicate = expected;
+    duplicate[18] = duplicate[17];
+    let mut reordered = expected;
+    reordered.swap(8, 9);
+    assert_ne!(
+        &expected[..18],
+        expected.as_slice(),
+        "missing seam accepted"
+    );
+    assert_ne!(duplicate, expected, "duplicate seam accepted");
+    assert_ne!(reordered, expected, "reordered seams accepted");
+
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let output_dir = output.path().join("pack");
+    let governor = crate::governor::ResourceGovernor::new();
+    let probe = generation_seam_test_hook::ProbeGuard::install(None);
+    let generated =
+        generate_fixture_pack(repo.path(), &output_dir, &target_sha, &base_sha, &governor)
+            .expect("positive-control artifact generation");
+    let observed = probe.observed();
+    drop(probe);
+
+    assert_eq!(generated, output_dir);
+    assert_eq!(
+        observed, expected,
+        "production callsites drifted from registry"
+    );
+    assert!(!output_dir.join("00_summary/INCOMPLETE.json").exists());
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        assert!(
+            output_dir.join(relative).exists(),
+            "positive control did not publish {relative}"
+        );
+    }
 }
 
 #[test]
