@@ -33,6 +33,16 @@ pub fn short_sha(sha: &str) -> &str {
     if sha.len() >= 7 { &sha[..7] } else { sha }
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 /// Wrapper around git2::Repository with prview-specific operations
 pub struct Repository {
     inner: Git2Repo,
@@ -89,6 +99,11 @@ pub(crate) enum GitTreeEntryKind {
     Gitlink,
     Unsupported,
 }
+
+/// Prefix for a deterministic, printable surrogate of a Git path component
+/// that cannot be represented as UTF-8. Consumers must retain the entry as
+/// typed uncertainty instead of attempting to read the surrogate path.
+pub(crate) const NON_UTF8_GIT_PATH_PREFIX: &str = "<git-path-bytes:";
 
 /// One entry from an exact commit tree, including non-regular entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -741,13 +756,26 @@ impl Repository {
     pub(crate) fn tree_entries_at_oid(&self, commit_oid: &str) -> Result<Vec<GitTreeEntry>> {
         let tree = self.exact_commit_tree(commit_oid)?;
         let mut entries = Vec::new();
-        let mut path_error = None;
         let walked = tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
             let Some(name) = entry.name() else {
-                path_error = Some(anyhow::anyhow!(
-                    "Git tree entry contains a non-UTF-8 path component"
-                ));
-                return git2::TreeWalkResult::Abort;
+                let path = format!(
+                    "{dir}{NON_UTF8_GIT_PATH_PREFIX}{}>",
+                    hex_bytes(entry.name_bytes())
+                );
+                entries.push(GitTreeEntry {
+                    path,
+                    object_id: entry.id().to_string(),
+                    mode: entry.filemode_raw() as u32,
+                    kind: GitTreeEntryKind::Unsupported,
+                });
+                return if entry.kind() == Some(git2::ObjectType::Tree) {
+                    // libgit2 cannot provide a UTF-8 prefix for descendants of
+                    // this tree. The surrogate entry preserves provenance and
+                    // Skip keeps valid siblings analyzable.
+                    git2::TreeWalkResult::Skip
+                } else {
+                    git2::TreeWalkResult::Ok
+                };
             };
             let path = format!("{dir}{name}");
             entries.push(GitTreeEntry {
@@ -758,9 +786,6 @@ impl Repository {
             });
             git2::TreeWalkResult::Ok
         });
-        if let Some(error) = path_error {
-            return Err(error);
-        }
         walked?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(entries)

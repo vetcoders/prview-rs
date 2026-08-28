@@ -6,7 +6,7 @@
 
 use super::api_surface::{
     RustApiDeclaration, RustApiItem, RustApiItemKey, RustApiSnapshot, RustApiUnknown,
-    RustNamespace, RustSourceCertainty, guards_proven_disjoint,
+    RustApiUnknownKind, RustNamespace, RustSourceCertainty, guards_proven_disjoint,
 };
 use super::revision_source::RevisionProvenance;
 use crate::git::{Diff, Repository};
@@ -429,6 +429,55 @@ fn declaration_side(declaration: &RustApiDeclaration) -> ApiFactSide {
 }
 
 fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &ApiFactSide) {
+    match (
+        public_enum_contract(&before.contract),
+        public_enum_contract(&after.contract),
+    ) {
+        (Some(before_enum), Some(after_enum)) => {
+            let additive_non_exhaustive = before_enum.non_exhaustive
+                && after_enum.non_exhaustive
+                && before_enum.header == after_enum.header
+                && after_enum.variants.len() > before_enum.variants.len()
+                && before_enum
+                    .variants
+                    .iter()
+                    .all(|(name, contract)| after_enum.variants.get(name) == Some(contract));
+            if additive_non_exhaustive {
+                for (name, contract) in after_enum
+                    .variants
+                    .iter()
+                    .filter(|(name, _)| !before_enum.variants.contains_key(*name))
+                {
+                    let after_variant = variant_side(after, name, contract);
+                    delta.added.push(known_finding(
+                        ApiDeltaKind::Added,
+                        after_variant.identity.clone(),
+                        None,
+                        Some(after_variant),
+                    ));
+                }
+            } else {
+                delta.changed.push(known_finding(
+                    ApiDeltaKind::Changed,
+                    before.identity.clone(),
+                    Some(before.clone()),
+                    Some(after.clone()),
+                ));
+            }
+            return;
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            delta.changed.push(known_finding(
+                ApiDeltaKind::Changed,
+                before.identity.clone(),
+                Some(before.clone()),
+                Some(after.clone()),
+            ));
+            return;
+        }
+        (None, None) => {}
+    }
+
     let Some(before_struct) = public_struct_contract(&before.contract) else {
         delta.changed.push(known_finding(
             ApiDeltaKind::Changed,
@@ -511,6 +560,43 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
     }
 }
 
+struct PublicEnumContract {
+    variants: BTreeMap<String, String>,
+    non_exhaustive: bool,
+    header: String,
+}
+
+fn public_enum_contract(contract: &str) -> Option<PublicEnumContract> {
+    let syn::Item::Enum(item) = syn::parse_str::<syn::Item>(contract).ok()? else {
+        return None;
+    };
+    let non_exhaustive = item
+        .attrs
+        .iter()
+        .any(|attribute| attribute.path().is_ident("non_exhaustive"));
+    let variants = item
+        .variants
+        .iter()
+        .map(|variant| {
+            (
+                variant.ident.to_string(),
+                quote::ToTokens::to_token_stream(variant).to_string(),
+            )
+        })
+        .collect();
+    let mut header = item.clone();
+    header.variants.clear();
+    Some(PublicEnumContract {
+        variants,
+        non_exhaustive,
+        header: quote::ToTokens::to_token_stream(&header).to_string(),
+    })
+}
+
+fn variant_side(parent: &ApiFactSide, name: &str, contract: &str) -> ApiFactSide {
+    field_side(parent, name, contract)
+}
+
 struct PublicStructContract {
     fields: BTreeMap<String, String>,
     non_exhaustive: bool,
@@ -527,6 +613,16 @@ fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
     let syn::Fields::Named(fields) = item.fields else {
         return None;
     };
+    if fields.named.iter().any(|field| {
+        field
+            .ident
+            .as_ref()
+            .is_some_and(|name| name.to_string().starts_with("__prview_private_field_"))
+    }) {
+        // A repr-sensitive private layout delta belongs to the parent type.
+        // Do not leak synthetic private field identities into public artifacts.
+        return None;
+    }
     Some(PublicStructContract {
         fields: fields
             .named
@@ -573,6 +669,9 @@ fn namespace_name(namespace: RustNamespace) -> &'static str {
         RustNamespace::Type => "type",
         RustNamespace::Value => "value",
         RustNamespace::Macro => "macro",
+        RustNamespace::Module => "module",
+        RustNamespace::Crate => "crate",
+        RustNamespace::CargoFeature => "cargo_feature",
     }
 }
 
@@ -1027,7 +1126,10 @@ fn consume_one_sided_ambiguities(
 
 fn region_is_unknown(unknowns: &[RustApiUnknown], identity: &ApiIdentity) -> bool {
     unknowns.iter().any(|unknown| {
-        unknown
+        !matches!(
+            unknown.kind,
+            RustApiUnknownKind::PathNonUtf8 | RustApiUnknownKind::TraitImplResolution
+        ) && unknown
             .crate_name
             .as_ref()
             .is_none_or(|crate_name| crate_name == &identity.crate_name)
@@ -1082,7 +1184,8 @@ fn unknown_proofs_match(
     target: &RustApiSnapshot,
     right: &RustApiUnknown,
 ) -> bool {
-    left.kind == right.kind
+    left.kind != RustApiUnknownKind::PathNonUtf8
+        && left.kind == right.kind
         && left.crate_name == right.crate_name
         && left.module_path == right.module_path
         && left.source_path == right.source_path
@@ -1576,8 +1679,22 @@ mod tests {
     fn api_delta_pairing_is_one_to_one_and_relocation_is_exclusive() {
         let delta = fixture_delta("move_relocated");
         assert_eq!(delta.relocated.len(), 1);
-        assert!(delta.added.is_empty());
-        assert!(delta.removed.is_empty());
+        assert_eq!(
+            delta
+                .added
+                .iter()
+                .map(|finding| finding.identity.name.as_str())
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+        assert_eq!(
+            delta
+                .removed
+                .iter()
+                .map(|finding| finding.identity.name.as_str())
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
 
         let base = snapshot_rust_api(&MemorySource::source(
             "pub mod a { pub fn item() {} }\npub mod b { pub fn item() {} }",
@@ -1588,8 +1705,16 @@ mod tests {
             "target",
         ));
         let ambiguous = compare_rust_api(&base, &target);
-        assert!(ambiguous.added.is_empty());
-        assert!(ambiguous.removed.is_empty());
+        assert_eq!(ambiguous.added.len(), 2);
+        assert_eq!(ambiguous.removed.len(), 2);
+        assert!(ambiguous.added.iter().all(|finding| {
+            finding.identity.namespace == "module"
+                && matches!(finding.identity.name.as_str(), "c" | "d")
+        }));
+        assert!(ambiguous.removed.iter().all(|finding| {
+            finding.identity.namespace == "module"
+                && matches!(finding.identity.name.as_str(), "a" | "b")
+        }));
         assert!(ambiguous.relocated.is_empty());
         assert!(ambiguous.unknown.iter().any(|finding| {
             finding.unknown_reason.as_deref().is_some_and(|reason| {
