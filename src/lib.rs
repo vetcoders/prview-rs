@@ -83,6 +83,8 @@ impl App {
         // Freeze cleanliness now — before any check runs or artifact is written
         // (R4-19).
         let worktree = artifacts::capture_worktree_provenance(&config.repo_root);
+        let governor =
+            std::sync::Arc::new(governor::ResourceGovernor::from_plan(config.resource_plan));
 
         Ok(Self {
             config,
@@ -90,7 +92,7 @@ impl App {
             start_time: Instant::now(),
             worktree_clean_at_start: worktree.clean,
             worktree_status_digest_at_start: worktree.status_digest,
-            governor: std::sync::Arc::new(governor::ResourceGovernor::new()),
+            governor,
         })
     }
 
@@ -142,7 +144,9 @@ impl App {
         }
 
         // 1. Refresh refs when remote/default fetch behavior is enabled
+        self.ensure_not_cancelled()?;
         self.repo.prepare_refs(&self.config)?;
+        self.ensure_not_cancelled()?;
 
         // 2. Resolve target and base refs
         let target = self.repo.resolve_target(&self.config)?;
@@ -151,12 +155,14 @@ impl App {
         } else {
             self.repo.resolve_bases(&self.config)?
         };
+        self.ensure_not_cancelled()?;
 
         if emit_human_stdout {
             output::print_config(&self.config, &target, &bases);
         }
 
         // 3. Check for update mode
+        self.ensure_not_cancelled()?;
         if self.config.update_mode
             && let Some(prev_run) = self.find_previous_run()?
             && let Some(report) =
@@ -172,6 +178,8 @@ impl App {
         let diffs = self
             .repo
             .generate_diffs(&target, &diff_bases, self.config.quiet)?;
+        self.ensure_not_cancelled()?;
+
         // Freeze the canonical Rust API truth before the first check or
         // heuristic await. Comparison anchors survive even when ordinary patch
         // generation omits an equal-OID pair.
@@ -215,12 +223,14 @@ impl App {
         // snapshotting the tip would compute the regression delta against base-only
         // files the patch excludes, fabricating regressions/caveats. All signals
         // must share one range.
+        self.ensure_not_cancelled()?;
         let heuristics_result = if self.config.remote_mode || self.config.remote_only {
             self.run_heuristics_with_snapshots(&target, &diff_bases)
                 .await?
         } else {
             heuristics::run_all(&self.config, None).await?
         };
+        self.ensure_not_cancelled()?;
 
         // 7. Generate artifacts. The ledger is still alive here, and with it the
         // run's shared target snapshot — that is what lets the context

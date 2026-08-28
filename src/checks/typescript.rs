@@ -61,6 +61,18 @@ fn stylelint_args(config: &Config) -> Vec<String> {
     args
 }
 
+fn vitest_args(config: &Config) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "--maxWorkers".to_string(),
+        config.resource_plan.worker_limit.to_string(),
+    ];
+    if let Some(pattern) = &config.tests_pattern {
+        args.extend(["--grep".to_string(), pattern.clone()]);
+    }
+    args
+}
+
 fn is_generated_artifact_path(path: &str, config: &Config) -> bool {
     let normalized = path.replace('\\', "/");
     let mut is_gen = normalized.contains("/node_modules/")
@@ -209,10 +221,9 @@ impl Check for TypeScriptCheck {
         "TypeScript"
     }
 
-    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
-    /// want the whole machine.
+    /// `tsc` exposes no stable worker-pool cap, so it must serialize.
     fn resource_weight(&self) -> crate::governor::Weight {
-        crate::governor::Weight::Heavy
+        crate::governor::Weight::Exclusive
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
@@ -300,10 +311,10 @@ impl Check for ESLintCheck {
         "ESLint"
     }
 
-    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
-    /// want the whole machine.
+    /// ESLint worker controls vary by installed major version; serialize instead
+    /// of passing an option an older project may reject.
     fn resource_weight(&self) -> crate::governor::Weight {
-        crate::governor::Weight::Heavy
+        crate::governor::Weight::Exclusive
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
@@ -484,19 +495,14 @@ impl Check for VitestCheck {
         let plan = plan_check_run(config)?;
         let run_dir = &plan.scan_dir;
 
-        // Build args
-        let mut args = vec!["run"];
-
-        // Add pattern filter if specified
-        let pattern_args: Vec<String>;
-        if let Some(pattern) = &config.tests_pattern {
-            pattern_args = vec!["--grep".to_string(), pattern.clone()];
-            args.extend(pattern_args.iter().map(|s| s.as_str()));
-        }
+        // Vitest's supported worker cap bounds its descendant pool. Keep owned
+        // strings because the limit is selected at runtime.
+        let args = vitest_args(config);
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
 
         // Use longer timeout for tests
         let output =
-            run_js_command_with_timeout("vitest", &args, run_dir, TEST_TIMEOUT_SECS).await?;
+            run_js_command_with_timeout("vitest", &args_ref, run_dir, TEST_TIMEOUT_SECS).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -781,6 +787,18 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--ignore-pattern", "**/tmp/**"])
+        );
+    }
+
+    #[test]
+    fn vitest_args_cap_workers_and_preserve_pattern() {
+        let mut config = create_test_config(true);
+        config.resource_plan.worker_limit = 3;
+        config.tests_pattern = Some("critical path".to_string());
+
+        assert_eq!(
+            vitest_args(&config),
+            vec!["run", "--maxWorkers", "3", "--grep", "critical path"]
         );
     }
 

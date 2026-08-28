@@ -1,5 +1,166 @@
 use super::*;
 
+fn generate_fixture_pack(
+    repo_root: &Path,
+    output_dir: &Path,
+    target_sha: &str,
+    base_sha: &str,
+    governor: &crate::governor::ResourceGovernor,
+) -> Result<PathBuf> {
+    let mut config = test_config_builder()
+        .repo_root(repo_root)
+        .target(Some("feature"))
+        .bases(&["main"])
+        .profile(test_generic_profile())
+        .execution_mode(ExecutionMode::Standard)
+        .run_tests(false)
+        .run_lint(false)
+        .do_fetch(false)
+        .use_cache(false)
+        .create_zip(true)
+        .build();
+    config.run_bundle = false;
+    config.run_security = false;
+    config.run_heuristics = false;
+    config.create_dashboard = true;
+    config.quiet = true;
+    config.output_dir = Some(output_dir.to_path_buf());
+
+    let ledger = crate::ledger::TaskLedger::new();
+    let resolved_target = ResolvedRef {
+        name: "feature".to_string(),
+        commit_id: target_sha.to_string(),
+        is_remote: false,
+    };
+    let resolved_bases = [ResolvedRef {
+        name: "main".to_string(),
+        commit_id: base_sha.to_string(),
+        is_remote: false,
+    }];
+
+    generate(GenerateInput {
+        config: &config,
+        ledger: &ledger,
+        diffs: &[],
+        checks: &[],
+        heuristics: None,
+        resolved_target: &resolved_target,
+        resolved_bases: &resolved_bases,
+        rust_api_delta: None,
+        run_start: Instant::now(),
+        skipped_checks: Vec::new(),
+        worktree_clean: Some(true),
+        worktree_status_digest: None,
+        governor,
+    })
+}
+
+fn assert_no_success_surfaces(output_dir: &Path, seam: ArtifactGenerationSeam) {
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        let path = output_dir.join(relative);
+        assert!(
+            !path.exists(),
+            "{} survived cancellation at {}",
+            path.display(),
+            seam.label()
+        );
+    }
+}
+
+#[test]
+fn cancellation_injection_stops_every_artifact_generation_seam() {
+    assert_eq!(ArtifactGenerationSeam::ALL.len(), 19);
+    let unique_labels: std::collections::HashSet<_> = ArtifactGenerationSeam::ALL
+        .iter()
+        .map(|seam| seam.label())
+        .collect();
+    assert_eq!(unique_labels.len(), ArtifactGenerationSeam::ALL.len());
+
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    for (index, seam) in ArtifactGenerationSeam::ALL.iter().copied().enumerate() {
+        let output = tempfile::tempdir().expect("output tempdir");
+        let output_dir = output.path().join("pack");
+        let governor = crate::governor::ResourceGovernor::new();
+        let probe = generation_seam_test_hook::ProbeGuard::install(Some(seam));
+
+        let error =
+            generate_fixture_pack(repo.path(), &output_dir, &target_sha, &base_sha, &governor)
+                .expect_err("injected cancellation must stop artifact generation");
+        let observed = probe.observed();
+        drop(probe);
+
+        assert!(
+            crate::governor::is_cancellation(&error),
+            "{} returned {error:#}",
+            seam.label()
+        );
+        assert_eq!(
+            observed,
+            ArtifactGenerationSeam::ALL[..=index],
+            "generation did not stop exactly at {}",
+            seam.label()
+        );
+        if let Some(next) = ArtifactGenerationSeam::ALL.get(index + 1) {
+            assert!(
+                !observed.contains(next),
+                "stage after {} was observed: {}",
+                seam.label(),
+                next.label()
+            );
+        }
+
+        assert_no_success_surfaces(&output_dir, seam);
+        let incomplete: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(output_dir.join("00_summary/INCOMPLETE.json"))
+                .expect("incomplete marker"),
+        )
+        .expect("valid incomplete JSON");
+        assert_eq!(incomplete["status"], "incomplete");
+        assert_eq!(incomplete["reason"], "cancelled");
+        assert_eq!(incomplete["stage"], seam.label());
+    }
+}
+
+#[test]
+fn artifact_generation_registry_is_exact_and_success_path_reaches_every_seam() {
+    let expected = ArtifactGenerationSeam::ALL;
+    let mut duplicate = expected;
+    duplicate[18] = duplicate[17];
+    let mut reordered = expected;
+    reordered.swap(8, 9);
+    assert_ne!(
+        &expected[..18],
+        expected.as_slice(),
+        "missing seam accepted"
+    );
+    assert_ne!(duplicate, expected, "duplicate seam accepted");
+    assert_ne!(reordered, expected, "reordered seams accepted");
+
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let output_dir = output.path().join("pack");
+    let governor = crate::governor::ResourceGovernor::new();
+    let probe = generation_seam_test_hook::ProbeGuard::install(None);
+    let generated =
+        generate_fixture_pack(repo.path(), &output_dir, &target_sha, &base_sha, &governor)
+            .expect("positive-control artifact generation");
+    let observed = probe.observed();
+    drop(probe);
+
+    assert_eq!(generated, output_dir);
+    assert_eq!(
+        observed, expected,
+        "production callsites drifted from registry"
+    );
+    assert!(!output_dir.join("00_summary/INCOMPLETE.json").exists());
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        assert!(
+            output_dir.join(relative).exists(),
+            "positive control did not publish {relative}"
+        );
+    }
+}
+
 #[test]
 fn junk_files_excluded_from_zip_and_manifest() {
     use std::fs::File;
@@ -1255,7 +1416,10 @@ fn emitted_pack_markdown_preserves_rust_identities_and_legacy_js_ts_rows() {
         false,
     );
     let delta = pipeline.rust_api_delta.as_ref().expect("Rust API delta");
-    assert_eq!(delta.counts().added, 1);
+    assert_eq!(delta.counts().added, 2);
+    assert!(delta.added.iter().any(|finding| {
+        finding.identity.namespace == "module" && finding.identity.name == "moved"
+    }));
     assert_eq!(delta.counts().removed, 1);
     assert_eq!(delta.counts().changed, 1);
     assert_eq!(delta.counts().relocated, 1);
@@ -1289,12 +1453,21 @@ fn emitted_pack_markdown_preserves_rust_identities_and_legacy_js_ts_rows() {
         markdown.contains("- **export** in `src/legacy.ts`: `export function legacy_removed() {}`"),
         "legacy removed row changed or erased:\n{markdown}"
     );
+    let identity_rows = markdown
+        .lines()
+        .filter(|line| line.starts_with("- **"))
+        .collect::<Vec<_>>();
     assert!(
-        markdown
-            .lines()
-            .filter(|line| line.starts_with("- **"))
-            .all(|line| !line.contains("`__prview_name`**")),
-        "normalization sentinel replaced a displayed identity:\n{markdown}"
+        identity_rows
+            .iter()
+            .all(|line| !line.contains("__prview_name")),
+        "normalization sentinel appeared in a displayed identity row:\n{markdown}"
+    );
+    assert!(
+        identity_rows
+            .iter()
+            .all(|line| !line.contains(" in `src/lib.rs`")),
+        "canonical Rust facts were duplicated as namespace-only compatibility rows:\n{markdown}"
     );
 }
 
@@ -2328,6 +2501,15 @@ fn run_json_records_stage_timings() {
         Some("report.json + dashboard")
     );
     assert_eq!(timings[1]["duration_secs"].as_f64(), Some(1.75));
+    assert_eq!(run["resources"]["requested_budget"], "safe");
+    assert_eq!(run["resources"]["effective_budget"], "safe");
+    assert_eq!(run["resources"]["parent_permits"], 1);
+    assert_eq!(run["resources"]["child_worker_limit"], 1);
+    assert!(
+        run["resources"]["schedule"]
+            .as_str()
+            .is_some_and(|schedule| schedule.starts_with("cheap orientation/checks"))
+    );
 }
 
 #[test]
@@ -2412,12 +2594,14 @@ fn run_json_records_context_command_timings() {
             artifact: Some("30_context/cargo-tree.txt".to_string()),
             status: "completed",
             duration_secs: 3.5,
+            reason: None,
         },
         ContextCommandTiming {
             label: "tauri info".to_string(),
             artifact: Some("30_context/tauri-info.log".to_string()),
             status: "timed_out",
             duration_secs: 30.0,
+            reason: Some("exceeded 30s context timeout".to_string()),
         },
     ];
 

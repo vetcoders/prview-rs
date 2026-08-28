@@ -7,6 +7,8 @@ use clap_complete::{Shell, generate};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::governor::ResourceBudget;
+
 /// PR Review & Artifact Generator by Vetcoders - cross-language PR analysis tool
 ///
 /// Generates Artifact Pack v1: structured, verifiable PR review artifacts
@@ -180,6 +182,10 @@ pub struct Cli {
     /// Disable result caching; re-run all checks from scratch
     #[arg(long = "no-cache")]
     pub no_cache: bool,
+
+    /// Machine resource envelope: safe serial execution or capped balanced throughput
+    #[arg(long = "resource-budget", value_enum, default_value = "safe")]
+    pub resource_budget: ResourceBudget,
 
     // === Output ===
     /// Suppress progress output; only print errors and final summary
@@ -615,6 +621,7 @@ mod tests {
             local_only: false,
             remote_only: false,
             no_cache: false,
+            resource_budget: ResourceBudget::Safe,
             quiet: false,
             json: false,
             no_color: false,
@@ -640,6 +647,16 @@ mod tests {
     fn test_should_run_tests_default() {
         let cli = default_cli();
         assert!(cli.should_run_tests());
+    }
+
+    #[test]
+    fn resource_budget_defaults_safe_and_parses_balanced_opt_in() {
+        let default = Cli::try_parse_from(["prview"]).expect("default CLI");
+        assert_eq!(default.resource_budget, ResourceBudget::Safe);
+
+        let balanced =
+            Cli::try_parse_from(["prview", "--resource-budget", "balanced"]).expect("balanced CLI");
+        assert_eq!(balanced.resource_budget, ResourceBudget::Balanced);
     }
 
     #[test]

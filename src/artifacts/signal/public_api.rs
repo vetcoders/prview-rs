@@ -571,6 +571,10 @@ fn dedupe_signature_changes(findings: &mut Vec<ApiSignatureChange>) {
     });
 }
 
+fn is_legacy_markdown_row(diff: &PublicApiDiff, file: &str) -> bool {
+    diff.rust_api_delta.is_none() || Path::new(file).extension() != Some(std::ffi::OsStr::new("rs"))
+}
+
 fn format_public_api_diff(diff: &PublicApiDiff) -> String {
     let mut md = String::new();
     let _ = writeln!(md, "# Public API Diff\n");
@@ -664,9 +668,14 @@ fn format_public_api_diff(diff: &PublicApiDiff) -> String {
         }
     }
 
-    if !diff.added.is_empty() {
-        let _ = writeln!(md, "## Added ({} elements)", diff.added.len());
-        for item in &diff.added {
+    let legacy_added = diff
+        .added
+        .iter()
+        .filter(|item| is_legacy_markdown_row(diff, &item.file))
+        .collect::<Vec<_>>();
+    if !legacy_added.is_empty() {
+        let _ = writeln!(md, "## Added ({} elements)", legacy_added.len());
+        for item in legacy_added {
             let _ = writeln!(
                 md,
                 "- **{}** in `{}`: `{}`",
@@ -676,9 +685,14 @@ fn format_public_api_diff(diff: &PublicApiDiff) -> String {
         let _ = writeln!(md);
     }
 
-    if !diff.removed.is_empty() {
-        let _ = writeln!(md, "## Removed ({} elements)", diff.removed.len());
-        for item in &diff.removed {
+    let legacy_removed = diff
+        .removed
+        .iter()
+        .filter(|item| is_legacy_markdown_row(diff, &item.file))
+        .collect::<Vec<_>>();
+    if !legacy_removed.is_empty() {
+        let _ = writeln!(md, "## Removed ({} elements)", legacy_removed.len());
+        for item in legacy_removed {
             let _ = writeln!(
                 md,
                 "- **{}** in `{}`: `{}`",
@@ -688,9 +702,14 @@ fn format_public_api_diff(diff: &PublicApiDiff) -> String {
         let _ = writeln!(md);
     }
 
-    if !diff.changed.is_empty() {
-        let _ = writeln!(md, "## Changed ({} elements)", diff.changed.len());
-        for item in &diff.changed {
+    let legacy_changed = diff
+        .changed
+        .iter()
+        .filter(|item| is_legacy_markdown_row(diff, &item.file))
+        .collect::<Vec<_>>();
+    if !legacy_changed.is_empty() {
+        let _ = writeln!(md, "## Changed ({} elements)", legacy_changed.len());
+        for item in legacy_changed {
             let _ = writeln!(
                 md,
                 "- **{}** in `{}`:\n  - Before: `{}`\n  - After: `{}`",

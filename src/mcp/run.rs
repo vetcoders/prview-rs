@@ -383,9 +383,8 @@ pub async fn start(
                 Err(_) => {
                     // Kill the whole group first so the check-tool grandchildren
                     // die, then reap the direct child.
-                    #[cfg(unix)]
                     if let Some(pid) = child_pid {
-                        crate::proc::sigkill_process_group(pid);
+                        crate::proc::terminate_process_tree(pid);
                     }
                     let _ = child.start_kill();
                     Err(ToolError::with_extra(
@@ -857,6 +856,6 @@ mod tests {
         assert_eq!(err.class, error_class::STORAGE_CORRUPT);
     }
 
-    // The quick-timeout process-group kill uses crate::proc::sigkill_process_group,
-    // proven canonically in crate::proc::tests (grandchild reap).
+    // The quick-timeout tree kill uses crate::proc::terminate_process_tree,
+    // proven canonically on Unix and by a real Windows-only descendant test.
 }

@@ -95,6 +95,9 @@ prview
 # Full analysis with stricter presets
 prview --deep feature/x main
 
+# Opt into higher throughput with capped child pools (safe is the default)
+prview --deep --resource-budget balanced feature/x main
+
 # Incremental update after new commits
 prview --update feature/x main
 
@@ -112,6 +115,11 @@ prview --tui
 ```
 
 The full flag reference is always one command away: `prview --help`. A written guide lives in [`docs/usage.md`](docs/usage.md).
+
+Deep reviews use a conservative whole-machine resource contract by default:
+one expensive tool and one supported child worker at a time. The preflight names
+the effective budget, expensive checks, and schedule; `balanced` remains capped
+and falls back to `safe` under load.
 
 ## Quality gate
 

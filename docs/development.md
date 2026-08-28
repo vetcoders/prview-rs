@@ -50,6 +50,22 @@ cargo test --lib
 cargo test --test json_contract
 ```
 
+Process-tree cancellation has platform-specific proof. Unix coverage runs in the
+normal Linux/macOS suites. `.github/workflows/ci.yml` also runs the Windows-only
+PowerShell child+grandchild census on `windows-latest`; cross-compilation alone
+is not accepted as Windows cancellation evidence.
+
+The same workflow has an `ubuntu-latest` ordinary-machine acceptance job. It
+builds the release binary and runs `prview --deep --resource-budget safe`
+against `tools/fixtures/bounded-runtime`, a real mixed Rust and Vitest repo. The
+stdlib-only `tools/bounded_runtime_acceptance.py` sampler fails when more than
+one whole-machine tool is active, when a Cargo/rustc, Vitest, or Semgrep pool
+exceeds the selected cap, or when the final pack and its resource metadata do
+not agree. The job has an internal 20-minute deadline inside a 45-minute Actions
+timeout, then always uploads a compact JSON receipt plus the captured CLI log.
+Only the published job on the exact candidate SHA is platform evidence; a local
+run validates the harness, not the `ubuntu-latest` envelope.
+
 For Rust review flow, a standard `prview` run executes tests by default.
 You disable them only with a lighter preset (`--quick`, `--update`, `--ai-only`)
 or an explicit `--skip-tests`. Exception: standard `--remote-only` is now a
@@ -337,6 +353,16 @@ cargo build --release --target x86_64-unknown-linux-gnu
 # Windows (from Mac)
 cargo build --release --target x86_64-pc-windows-gnu
 ```
+
+The Windows build above is only a compile check. Claimed Windows cancellation
+support depends on the real `windows-latest` process-tree test, which exercises
+`taskkill /T /F` and verifies both child PIDs disappear.
+
+Cancellation is deliberately immediate: Unix sends `SIGKILL` to the owned
+process group and Windows force-terminates the owned tree. A killed Cargo/rustc
+tree can leave a shared target directory dirty. The next Cargo invocation should
+validate/rebuild it; remove that target directory only if Cargo reports persistent
+corruption.
 
 ## Status note
 

@@ -950,11 +950,13 @@ its own entry point) so BOTH stages that put load on the machine draw on the sam
 budget:
 
 ```rust
-pub enum Weight { Light, Heavy }   // a declaration, not a permit count
+pub enum Weight { Light, Heavy, Exclusive } // semantic declaration
 
 impl ResourceGovernor {
-    pub fn new() -> Self;                                  // budget = available_parallelism()
+    pub fn new() -> Self;                                  // safe default
+    pub fn for_resource_budget(ResourceBudget) -> Self;    // safe | balanced
     pub fn with_budget(total: u32, heavy_cost: u32) -> Self;
+    pub fn plan(&self) -> ResourcePlan;                     // parent + child envelope
     pub fn cost(&self, weight: Weight) -> u32;
     pub async fn acquire(&self, weight: Weight) -> Result<GovernorPermit, Cancelled>;
     pub fn try_acquire(&self, weight: Weight) -> Option<GovernorPermit>;
@@ -972,15 +974,17 @@ pub async fn with_child_scope<F: Future>(g: Arc<ResourceGovernor>, label: &str, 
 pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
 ```
 
-- **Weights cost what the governor says.** `Light` is one permit; `Heavy` is
-  `total.div_ceil(2)`, so eight cores admit two heavy tasks at once while light
-  work still fits beside them. What a weight costs depends on the budget, so the
-  enum carries no number.
-- **The budget is the machine.** `available_parallelism()`, falling back to `4`
-  when the syscall fails — not `1`, which would turn an unknown into a stall.
-  Both `with_budget` arguments are clamped (`total >= 1`,
-  `heavy_cost ∈ 1..=total`): a zero budget is a deadlock and a heavy cost above
-  the total parks that task forever on permits the semaphore will never hold.
+- **Weights cost what the governor says.** `Light` is cheap metadata work;
+  `Heavy` is a whole-project tool with an explicit descendant-worker cap;
+  `Exclusive` consumes the entire budget for unsupported or unbounded child
+  pools. The safe default therefore serializes every whole-machine tool.
+- **The default is intentionally conservative.** `--resource-budget safe` uses
+  one parent permit and one child worker. The opt-in `balanced` plan admits at
+  most two capped heavy parents, caps each supported child pool at four, and caps
+  the logical permit envelope at eight even on a large host. A one-minute load at
+  or above `0.75/core` (or an unavailable load reading) backpressures a requested
+  balanced run to the safe plan. This is a CPU/memory envelope, not a claim that
+  future peak memory can be predicted exactly.
 - **A permit is held, never released by hand.** `GovernorPermit` returns the
   permits on drop, so an error path cannot leak budget.
 - **Cancellation closes the semaphore.** That refuses a newcomer and a task
@@ -988,9 +992,10 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
   started. `cancelled_signal()` is a `watch::Receiver` a dispatcher loop can
   `select!` on, and it starts at the current state so a late subscriber is not
   left waiting for a change that already happened.
-- **`cancel()` SIGKILLs each registered child's process group** through the
-  existing `proc::sigkill_process_group`, reaching the whole `cargo` → `rustc` →
-  `cc` tree. It is idempotent in the strong sense: the registry is DRAINED, so a
+- **`cancel()` force-terminates each registered process tree.** Unix uses
+  immediate `SIGKILL` on the child's process group; Windows uses the native
+  `taskkill /T /F` tree operation and has a Windows-runner child+grandchild test.
+  It is idempotent in the strong sense: the registry is DRAINED, so a
   second cancel signals nothing — a pid whose process died in between may by then
   belong to another program. Registration checks cancellation while holding that
   same registry lock: a process spawned after the drain is refused (`false`) and
@@ -1004,17 +1009,21 @@ and the signal is `tokio::sync::watch`, both already in the graph.
 
 - **Checks** (`checks::run_all`, `run_all_with_events`) take a permit per check
   before the process starts. The weight comes from `Check::resource_weight`,
-  which defaults to `Light`; the `Heavy` list lives on that trait method and is
-  the cargo family, `TypeScript`, `Vitest`, `ESLint` and `Semgrep`.
+  which defaults to `Exclusive`. Rustfmt opts into `Light`; Cargo/rustc, Vitest
+  and Semgrep opt into `Heavy` because they receive `CARGO_BUILD_JOBS`,
+  `--maxWorkers`, and `--jobs` respectively. TSC, ESLint, Stylelint, Python gates
+  and other uncapped pools stay `Exclusive`.
 - **Context commands** (`artifacts::context_artifacts`) take a permit before each
   spawn, via the synchronous `try_acquire` — `artifacts::generate` is a blocking
   pipeline with a poll loop and has nothing to `.await` on. The weight comes from
   `context_cmd_weight`: `tsc trace`, `eslint json`, `stylelint json` and
-  `esbuild meta` are `Heavy`; the metadata readers (`cargo tree`, `cargo sbom`,
+  `esbuild meta` are `Exclusive`; the metadata readers (`cargo tree`, `cargo sbom`,
   `npm sbom`, `tauri info`) are `Light`.
 - **The cargo `target/` lock stays.** It is a correctness lock — one writer per
   `target/` — and the budget is not that. A check that takes both takes them in
-  ONE order: **cargo lock first, then budget**. Same order everywhere is what
+  ONE order: **cargo lock first, then budget**. Waiting for that lock races the
+  cancellation signal, so a cancelled waiter exits immediately rather than
+  waiting for an unrelated Cargo timeout. Same order everywhere is what
   makes two locks deadlock-free, and this direction also avoids parking half the
   budget on a cargo check that is still queueing for `target/`. Nothing acquires
   the cargo lock once it holds budget, so there is no cycle the other way.
@@ -1045,7 +1054,7 @@ governor::with_cancellation(work, governor, CtrlC)
       │   governor.cancel()
       │        ├─► semaphore.close()  ── refuses newcomers AND tasks already waiting
       │        ├─► watch::send(true)  ── wakes the dispatcher's select! arm
-      │        └─► SIGKILL -pgid      ── every registered child's whole process tree
+      │        └─► kill process tree  ── SIGKILL -pgid (Unix) / taskkill /T /F (Windows)
       │        │  second interrupt
       │        ▼
       │   Interrupts::abandon_run()   ── exit(130) without waiting for the unwind
@@ -1088,10 +1097,11 @@ from the cache (an empty runnable set never builds that `select!` loop at all)
 was previously ignored outright. `App::run` would go on to write a pack whose
 context commands were every one of them recorded `cancelled`, return a report,
 and let `main` compute an ACCEPT or a BLOCK from it. `App::ensure_not_cancelled`
-now guards the seams — on entry to `App::run`, after the checks, before and after
-`artifacts::generate`, and at the top of a `--watch` iteration — so the run ends
-in `Cancelled` and exit `130` instead. A partial pack may remain on disk as
-evidence of what got done; nothing claims a verdict from it.
+now guards every substantial orchestration/artifact seam. External context tools
+finish before merge/report generation. If cancellation reaches artifact
+generation, success-shaped verdict/report/RUN/MANIFEST/SANITY surfaces are
+removed and `00_summary/INCOMPLETE.json` records `status=incomplete`, the reason,
+and the interrupted stage. The run ends in `Cancelled` and exit `130`.
 
 `--update` needs a gate of its own (`App::reuse_unchanged_run`), because it is
 the one path that returns a report without reaching any of the others: an
@@ -1138,8 +1148,9 @@ nevertheless held to the same contract as the headless one — same
 copy that had drifted back into both of the bugs above while still claiming to
 mirror `run_all`.
 
-**Not yet configurable.** The budget is `available_parallelism()` with no CLI
-flag; an operator knob is a follow-up.
+**Operator surface.** `--resource-budget safe|balanced` selects the plan; preflight
+prints requested/effective budget, parent permits, child-worker cap, current-load
+decision, expensive tools, and cheap-first schedule before checks execute.
 
 ### mcp/
 
@@ -1319,8 +1330,12 @@ location, exact evidence, and guards, while continuing to exclude source paths,
 provenance, and private reexport target/origin spelling.
 
 Item identity is `crate + external module path + Rust namespace + NFC external
-name`. Value, type, and macro namespaces are separate. Tuple and unit struct
-constructors also occupy Value; named-field structs remain Type-only.
+name`. Value, type, and macro namespaces are separate. The snapshot also emits
+explicit Module, Crate, and CargoFeature identities: public empty modules,
+library-crate declaration changes, and removed or redefined Cargo features
+therefore cannot disappear merely because no ordinary item changed. These
+container namespaces do not participate in Rust `use`-leaf resolution. Tuple
+and unit struct constructors occupy Value; named-field structs remain Type-only.
 `macro_export` is projected to the crate-root Macro namespace, with docs,
 rustfmt, and lint attributes normalized away. Proc-macro crate exports use their
 external macro/derive names only for public functions declared at crate root;
@@ -1332,7 +1347,10 @@ evidence. Foreign functions/statics inherit the parent ABI, safety, and relevant
 attributes.
 
 Contracts are emitted from normalized `syn` ASTs. Function/default bodies and
-private member types are excluded, while ABI, qualifiers,
+ordinary named private member types are excluded. Tuple-field position and
+privacy remain structural because any private tuple element changes constructor
+callability and arity; explicit `repr(...)` types retain anonymized private field
+types because they participate in the declared layout contract. ABI, qualifiers,
 generics/bounds/where clauses, return types, public fields with structural tuple
 indices, enum variants/discriminants, trait headers and associated items, type
 aliases, public constants/statics, and relevant attributes remain. Inherent
@@ -1348,9 +1366,14 @@ evaluating host configuration.
 
 Function parameter patterns are canonicalized to `_`, and generic, const, and
 lifetime binders are alpha-normalized by declaration order across free, trait,
-inherent, foreign, and higher-ranked function signatures. The mapping is reused
-at every bound occurrence, so renaming a binder is neutral while generic order,
-types, ABI, and lifetime relationships remain part of the contract.
+inherent, foreign, and higher-ranked function signatures as well as public
+structs, unions, enums, and type aliases. The mapping is reused at every bound
+occurrence, so renaming a binder is neutral while generic order, types, ABI, and
+lifetime relationships remain part of the contract. Source-only analysis does
+not pretend to resolve trait selection or coherence: an impl whose trait and
+owner are both externally reachable is retained as `TraitImplResolution`
+uncertainty with its normalized source contract until compiler-backed resolution
+exists; private/private impls do not degrade the public surface.
 
 #### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
 
@@ -1371,6 +1394,12 @@ struct literals and exhaustive patterns stop compiling. The same field on an
 existing `#[non_exhaustive]` struct remains an informational `Added` field, and
 a wholly new public struct remains an added item; neither case inherits the
 existing-exhaustive breaking rule.
+
+Enum projection applies the corresponding exhaustiveness policy independently:
+adding variants to an exhaustive public enum changes the parent contract, while
+an otherwise unchanged public `#[non_exhaustive]` enum exposes each new variant
+as informational `Added`. Removing or changing an existing variant, or changing
+the enum header/policy, remains a parent `Changed` fact.
 
 Exact identity is grouped on both sides before any fact is consumed: only a
 `1 ↔ 1` component may become a confirmed change, while wider components are
@@ -1459,6 +1488,13 @@ a manifest deletion, rename, or type-change observable. With no comparison
 base, or when neither exact side has a scope-establishing manifest, preparation
 returns no Rust delta: optional Rust artifacts are absent and embedded
 `rust_api_delta` fields are null.
+
+A legal non-UTF-8 Git tree component is represented by a deterministic
+`<git-path-bytes:...>` inventory surrogate and a side-specific `PathNonUtf8`
+unknown. The tree walk skips only descendants whose prefix cannot be represented
+and continues through valid siblings. Unlike an unchanged parser/resolver
+unknown, path uncertainty is deliberately not neutralized across revisions and
+does not contaminate confirmed facts from independently parsed valid paths.
 `breaking_changes_view` and `public_api_diff_view` are pure deterministic
 projections over the same delta. Their shared counts, IDs, confidence, evidence,
 unknown reasons, and provenance therefore cannot drift through independent

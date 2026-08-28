@@ -490,6 +490,10 @@ pub fn acquire_lock_at(path: &Path) -> Result<LockGuard> {
 const LOCK_STALE_MAX_AGE_NANOS: u128 = 3600 * 1_000_000_000;
 
 fn lock_is_stale(content: &str) -> bool {
+    lock_is_stale_with(content, is_process_alive)
+}
+
+fn lock_is_stale_with(content: &str, is_alive: impl FnOnce(u32) -> bool) -> bool {
     let mut parts = content.trim().split(':');
     let pid = parts.next().and_then(|part| part.parse::<u32>().ok());
     let created_nanos = parts.next().and_then(|part| part.parse::<u128>().ok());
@@ -500,7 +504,7 @@ fn lock_is_stale(content: &str) -> bool {
     };
 
     // Primary signal: the owning process is gone.
-    if !is_process_alive(pid) {
+    if !is_alive(pid) {
         return true;
     }
 
@@ -524,7 +528,7 @@ fn lock_is_stale(content: &str) -> bool {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Check whether a process is alive via `kill(pid, 0)`.
+/// Check whether a process is alive using the native platform probe.
 ///
 /// Shared with the MCP run-liveness reader (`mcp::read::run_status`) which
 /// derives deep-run status deterministically from a pid marker.
@@ -535,16 +539,85 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    // kill(pid, 0) checks if process exists without sending signal
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
+
+    #[cfg(unix)]
+    {
+        unix_process_alive_with(|| {
+            // kill(pid, 0) checks if a process exists without sending a signal.
+            // SAFETY: signal 0 performs only the liveness/permission probe;
+            // `pid` is a non-zero process identifier supplied by a marker.
+            let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error().raw_os_error())
+            }
+        })
     }
 
-    matches!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EPERM)
-    )
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        // SAFETY: the call receives a non-zero PID, requests only the right to
+        // wait on the process object, and does not inherit the returned handle.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            return windows_open_failure_may_be_live(
+                std::io::Error::last_os_error().raw_os_error(),
+            );
+        }
+
+        // SAFETY: `handle` grants synchronization access and a zero timeout is
+        // a non-blocking status probe of the process object's signaled state.
+        let wait = unsafe { WaitForSingleObject(handle, 0) };
+        // SAFETY: `handle` was returned by `OpenProcess` above and is closed
+        // exactly once after the wait, regardless of whether the wait worked.
+        let _ = unsafe { CloseHandle(handle) };
+
+        match wait {
+            WAIT_OBJECT_0 => false,
+            WAIT_TIMEOUT => true,
+            // Any unexpected wait status is indeterminate. Retain the marker
+            // rather than falsely declaring a possibly-live owner dead.
+            _ => true,
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_alive_with(mut probe: impl FnMut() -> Result<(), Option<i32>>) -> bool {
+    loop {
+        match probe() {
+            Ok(()) => return true,
+            Err(Some(libc::EINTR)) => continue,
+            Err(Some(libc::ESRCH)) => return false,
+            // EPERM and every indeterminate probe failure retain ownership.
+            // Only ESRCH is affirmative evidence that the process is gone.
+            Err(_) => return true,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_open_failure_may_be_live(error: Option<i32>) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+
+    // OpenProcess documents INVALID_PARAMETER for an invalid/nonexistent PID.
+    // ACCESS_DENIED instead means the process can exist but is protected; all
+    // other/unknown query failures are likewise indeterminate and conservative.
+    if error == Some(ERROR_ACCESS_DENIED as i32) {
+        return true;
+    }
+    error != Some(ERROR_INVALID_PARAMETER as i32)
 }
 
 /// Best-effort directory fsync so a just-published rename survives power loss.
@@ -1163,6 +1236,60 @@ mod tests {
 
         // pid 0 is the unknown-pid sentinel: never a live owner.
         assert!(lock_is_stale("0:1"));
+    }
+
+    #[test]
+    fn process_liveness_reports_zero_and_current_process_truthfully() {
+        assert!(!is_process_alive(0));
+        assert!(is_process_alive(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_eintr_cannot_make_a_live_lock_stale() {
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fresh = format!("4242:{now_nanos}");
+        let mut probes = [Err(Some(libc::EINTR)), Ok(())].into_iter();
+
+        assert!(!lock_is_stale_with(&fresh, |_| {
+            unix_process_alive_with(|| probes.next().expect("bounded errno oracle"))
+        }));
+        assert!(
+            probes.next().is_none(),
+            "EINTR must be retried exactly once"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_liveness_reports_an_exited_child_as_dead() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived Windows child");
+        let pid = child.id();
+        assert!(child.wait().expect("wait for Windows child").success());
+
+        // `Child` still owns the process handle here, so Windows cannot recycle
+        // the PID before the probe observes its terminated exit code.
+        assert!(!is_process_alive(pid));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_liveness_keeps_inaccessible_owners_conservative() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+
+        assert!(windows_open_failure_may_be_live(Some(
+            ERROR_ACCESS_DENIED as i32
+        )));
+        assert!(!windows_open_failure_may_be_live(Some(
+            ERROR_INVALID_PARAMETER as i32
+        )));
+        assert!(windows_open_failure_may_be_live(None));
     }
 
     #[test]

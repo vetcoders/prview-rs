@@ -408,26 +408,27 @@ pub trait Check: Send + Sync {
     /// How much of the machine this check wants, for the run's resource
     /// governor (`crate::governor`).
     ///
-    /// `Light` is the default because it is the safe one: mis-declaring a cheap
-    /// tool as heavy only wastes budget, while the reverse oversubscribes the
-    /// box. The checks that override it to `Heavy` are the compilers, the
-    /// whole-project linters and the test runners — each of these spawns its own
-    /// worker pool sized to the machine, so two of them at once is already twice
-    /// the machine:
+    /// `Exclusive` is the safe default: a tool is allowed to overlap only after
+    /// its descendant pool has a supported, tested cap. Known cheap checks opt
+    /// into `Light`; capped whole-project tools opt into `Heavy`.
     ///
     /// - Rust: `CargoCheck`, `ClippyCheck`, `CargoTestCheck`, `CargoAuditCheck`,
     ///   `CargoGeigerCheck` (the last two compile the crate graph to reach it).
     /// - JS/TS: `TypeScriptCheck`, `VitestCheck`, `ESLintCheck`.
     /// - Security: `SemgrepCheck`, which parses every file in the tree.
     ///
-    /// Everything else — `RustfmtCheck` and `StylelintCheck` (single-pass over
-    /// changed files), the Python gates, which run behind their own `uv sync`
-    /// pre-step — stays `Light`. The Python runners are the closest call: `Mypy`
-    /// and `Pytest` are heavy by the same rule and are deliberately left at the
-    /// default in this cut, so the first bounded run changes the scheduling of
-    /// the toolchains whose cost is already known and nothing else.
     fn resource_weight(&self) -> crate::governor::Weight {
-        crate::governor::Weight::Light
+        crate::governor::Weight::Exclusive
+    }
+}
+
+/// Cheap orientation precedes bounded whole-workspace work. Stable sorting
+/// preserves profile order inside each cost class.
+fn schedule_rank(check: &dyn Check) -> u8 {
+    match check.resource_weight() {
+        crate::governor::Weight::Light => 0,
+        crate::governor::Weight::Heavy => 1,
+        crate::governor::Weight::Exclusive => 2,
     }
 }
 
@@ -603,12 +604,13 @@ async fn admit_check(
     board: &std::sync::Mutex<RunBoard>,
 ) -> Result<(std::time::Instant, Admission), Cancelled> {
     let cargo_permit = if is_cargo_target_check(check.name()) {
-        Some(
-            Arc::clone(cargo_lock)
-                .acquire_owned()
-                .await
-                .expect("cargo-target semaphore never closed"),
-        )
+        Some(tokio::select! {
+            biased;
+            _ = governor.cancelled() => return Err(Cancelled),
+            permit = Arc::clone(cargo_lock).acquire_owned() => {
+                permit.map_err(|_| Cancelled)?
+            }
+        })
     } else {
         None
     };
@@ -702,6 +704,8 @@ async fn run_all_checks(
 
         runnable_checks.push(check);
     }
+
+    runnable_checks.sort_by_key(|check| schedule_rank(check.as_ref()));
 
     // Pre-sync Python venv if any Python checks will run and uv is available.
     // This separates venv build time from the per-check timeout budget.
@@ -1066,6 +1070,8 @@ where
 
         runnable_checks.push(check);
     }
+
+    runnable_checks.sort_by_key(|check| schedule_rank(check.as_ref()));
 
     // Pre-sync Python venv before running checks, through the SAME helper the
     // headless dispatcher uses. It was a bare `run_command_with_timeout` under a
@@ -3792,6 +3798,130 @@ test result: ok. 2 passed; 0 failed
         assert_eq!(live.load(Ordering::SeqCst), 0, "nothing is left running");
     }
 
+    #[test]
+    fn check_schedule_is_cheap_then_capped_then_exclusive() {
+        use async_trait::async_trait;
+
+        struct Weighted(&'static str, crate::governor::Weight);
+        #[async_trait]
+        impl Check for Weighted {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> crate::governor::Weight {
+                self.1
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                unreachable!("schedule test never executes checks")
+            }
+        }
+
+        let mut checks: Vec<Box<dyn Check>> = vec![
+            Box::new(Weighted("tsc", crate::governor::Weight::Exclusive)),
+            Box::new(Weighted("cargo", crate::governor::Weight::Heavy)),
+            Box::new(Weighted("rustfmt", crate::governor::Weight::Light)),
+            Box::new(Weighted("semgrep", crate::governor::Weight::Heavy)),
+        ];
+        checks.sort_by_key(|check| schedule_rank(check.as_ref()));
+        assert_eq!(
+            checks.iter().map(|check| check.name()).collect::<Vec<_>>(),
+            vec!["rustfmt", "cargo", "semgrep", "tsc"]
+        );
+    }
+
+    /// A parent permit and a child cap are one contract: with two admitted heavy
+    /// parents and two workers each, the simulated descendant census peaks at
+    /// four, never at the host's core count per parent.
+    #[tokio::test]
+    async fn capped_heavy_parents_bound_the_descendant_census() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct PoolMock {
+            name: &'static str,
+            parents: Arc<AtomicU32>,
+            parent_peak: Arc<AtomicU32>,
+            descendants: Arc<AtomicU32>,
+            descendant_peak: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl Check for PoolMock {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> crate::governor::Weight {
+                crate::governor::Weight::Heavy
+            }
+            async fn run(&self, config: &Config) -> Result<CheckResult> {
+                let parents = self.parents.fetch_add(1, Ordering::SeqCst) + 1;
+                self.parent_peak.fetch_max(parents, Ordering::SeqCst);
+                let mut workers = Vec::new();
+                for _ in 0..config.resource_plan.worker_limit {
+                    let descendants = Arc::clone(&self.descendants);
+                    let peak = Arc::clone(&self.descendant_peak);
+                    workers.push(tokio::spawn(async move {
+                        let live = descendants.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(live, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        descendants.fetch_sub(1, Ordering::SeqCst);
+                    }));
+                }
+                for worker in workers {
+                    worker.await.expect("fake descendant must not panic");
+                }
+                self.parents.fetch_sub(1, Ordering::SeqCst);
+                Ok(CheckResult {
+                    name: self.name.to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_millis(30),
+                    output: String::new(),
+                    cached: false,
+                    provenance: None,
+                })
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+        config.resource_plan.worker_limit = 2;
+        let parents = Arc::new(AtomicU32::new(0));
+        let parent_peak = Arc::new(AtomicU32::new(0));
+        let descendants = Arc::new(AtomicU32::new(0));
+        let descendant_peak = Arc::new(AtomicU32::new(0));
+        let checks: Vec<Box<dyn Check>> = ["Pool A", "Pool B", "Pool C", "Pool D"]
+            .into_iter()
+            .map(|name| {
+                Box::new(PoolMock {
+                    name,
+                    parents: Arc::clone(&parents),
+                    parent_peak: Arc::clone(&parent_peak),
+                    descendants: Arc::clone(&descendants),
+                    descendant_peak: Arc::clone(&descendant_peak),
+                }) as Box<dyn Check>
+            })
+            .collect();
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::with_budget(4, 2));
+
+        run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect("bounded fake pools");
+        assert_eq!(parent_peak.load(Ordering::SeqCst), 2);
+        assert_eq!(descendant_peak.load(Ordering::SeqCst), 4);
+        assert_eq!(descendants.load(Ordering::SeqCst), 0);
+    }
+
     /// Cancelling must take the dispatcher down through its ordinary error
     /// path, not leave it waiting for checks whose children have just been
     /// killed. Driven by calling `cancel()` directly: sending a real SIGINT from
@@ -3971,6 +4101,56 @@ test result: ok. 2 passed; 0 failed
             Vec::<&str>::new(),
             "an admitted check leaves the queue",
         );
+    }
+
+    #[tokio::test]
+    async fn a_cargo_lock_waiter_races_cancellation() {
+        use async_trait::async_trait;
+
+        struct CargoWaiter;
+        #[async_trait]
+        impl Check for CargoWaiter {
+            fn name(&self) -> &str {
+                "Cargo test"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> crate::governor::Weight {
+                crate::governor::Weight::Heavy
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                unreachable!("the waiter must be cancelled before admission")
+            }
+        }
+
+        let governor = Arc::new(ResourceGovernor::with_budget(2, 2));
+        let cargo_lock = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&cargo_lock)
+            .acquire_owned()
+            .await
+            .expect("hold cargo lock");
+        let board = Arc::new(std::sync::Mutex::new(RunBoard::new(
+            ["Cargo test"].into_iter(),
+        )));
+        let waiter = {
+            let governor = Arc::clone(&governor);
+            let cargo_lock = Arc::clone(&cargo_lock);
+            let board = Arc::clone(&board);
+            tokio::spawn(
+                async move { admit_check(&CargoWaiter, &cargo_lock, &governor, &board).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        governor.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancellation must wake the cargo-lock waiter")
+            .expect("waiter must not panic");
+        assert!(matches!(result, Err(Cancelled)));
+        assert_eq!(lock_board(&board).names_where(false), vec!["Cargo test"]);
+        drop(held);
     }
 
     /// The slow notice is about work, not about waiting. A check parked on the

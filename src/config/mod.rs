@@ -7,6 +7,7 @@ pub use manifest::*;
 
 use crate::cli::{Cli, ExecutionMode, PolicyModeArg, Profile};
 use crate::git::{git_cmd, short_sha};
+use crate::governor::{ResourceBudget, ResourcePlan};
 use crate::policy::engine::EnforcementMode;
 use crate::policy::{PolicyConfig, PolicyMode, load_policy, resolve_policy_path};
 use anyhow::{Context, Result, bail};
@@ -51,6 +52,11 @@ pub struct Config {
 
     // Cache
     pub use_cache: bool,
+    /// Operator-selected whole-machine resource envelope.
+    pub resource_budget: ResourceBudget,
+    /// Concrete envelope detected once, so admission, child caps and preflight
+    /// all report and enforce the same observation.
+    pub resource_plan: ResourcePlan,
 
     // Output
     pub quiet: bool,
@@ -636,6 +642,8 @@ impl Config {
             local_only: false,
             remote_only: false,
             use_cache: true,
+            resource_budget: ResourceBudget::Safe,
+            resource_plan: ResourcePlan::detect(ResourceBudget::Safe),
             quiet: false,
             json: false,
             create_zip: false,
@@ -787,6 +795,8 @@ impl Config {
         config.current_only = cli.current_only;
         config.tui_mode = cli.tui;
         config.use_cache = !cli.no_cache;
+        config.resource_budget = cli.resource_budget;
+        config.resource_plan = ResourcePlan::detect(cli.resource_budget);
         config.output_dir = cli.output_dir.clone();
         config.pr_number = cli.pr;
         config.pr_url = pr_url;

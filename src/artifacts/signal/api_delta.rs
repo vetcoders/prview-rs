@@ -6,7 +6,7 @@
 
 use super::api_surface::{
     RustApiDeclaration, RustApiItem, RustApiItemKey, RustApiSnapshot, RustApiUnknown,
-    RustNamespace, RustSourceCertainty, guards_proven_disjoint,
+    RustApiUnknownKind, RustNamespace, RustSourceCertainty, guards_proven_disjoint,
 };
 use super::revision_source::{RevisionFileSource, RevisionProvenance};
 use crate::git::{Repository, ResolvedRef};
@@ -645,6 +645,55 @@ fn declaration_side(declaration: &RustApiDeclaration) -> ApiFactSide {
 }
 
 fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &ApiFactSide) {
+    match (
+        public_enum_contract(&before.contract),
+        public_enum_contract(&after.contract),
+    ) {
+        (Some(before_enum), Some(after_enum)) => {
+            let additive_non_exhaustive = before_enum.non_exhaustive
+                && after_enum.non_exhaustive
+                && before_enum.header == after_enum.header
+                && after_enum.variants.len() > before_enum.variants.len()
+                && before_enum
+                    .variants
+                    .iter()
+                    .all(|(name, contract)| after_enum.variants.get(name) == Some(contract));
+            if additive_non_exhaustive {
+                for (name, contract) in after_enum
+                    .variants
+                    .iter()
+                    .filter(|(name, _)| !before_enum.variants.contains_key(*name))
+                {
+                    let after_variant = variant_side(after, name, contract);
+                    delta.added.push(known_finding(
+                        ApiDeltaKind::Added,
+                        after_variant.identity.clone(),
+                        None,
+                        Some(after_variant),
+                    ));
+                }
+            } else {
+                delta.changed.push(known_finding(
+                    ApiDeltaKind::Changed,
+                    before.identity.clone(),
+                    Some(before.clone()),
+                    Some(after.clone()),
+                ));
+            }
+            return;
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            delta.changed.push(known_finding(
+                ApiDeltaKind::Changed,
+                before.identity.clone(),
+                Some(before.clone()),
+                Some(after.clone()),
+            ));
+            return;
+        }
+        (None, None) => {}
+    }
+
     let Some(before_struct) = public_struct_contract(&before.contract) else {
         delta.changed.push(known_finding(
             ApiDeltaKind::Changed,
@@ -727,6 +776,43 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
     }
 }
 
+struct PublicEnumContract {
+    variants: BTreeMap<String, String>,
+    non_exhaustive: bool,
+    header: String,
+}
+
+fn public_enum_contract(contract: &str) -> Option<PublicEnumContract> {
+    let syn::Item::Enum(item) = syn::parse_str::<syn::Item>(contract).ok()? else {
+        return None;
+    };
+    let non_exhaustive = item
+        .attrs
+        .iter()
+        .any(|attribute| attribute.path().is_ident("non_exhaustive"));
+    let variants = item
+        .variants
+        .iter()
+        .map(|variant| {
+            (
+                variant.ident.to_string(),
+                quote::ToTokens::to_token_stream(variant).to_string(),
+            )
+        })
+        .collect();
+    let mut header = item.clone();
+    header.variants.clear();
+    Some(PublicEnumContract {
+        variants,
+        non_exhaustive,
+        header: quote::ToTokens::to_token_stream(&header).to_string(),
+    })
+}
+
+fn variant_side(parent: &ApiFactSide, name: &str, contract: &str) -> ApiFactSide {
+    field_side(parent, name, contract)
+}
+
 struct PublicStructContract {
     fields: BTreeMap<String, String>,
     non_exhaustive: bool,
@@ -743,6 +829,16 @@ fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
     let syn::Fields::Named(fields) = item.fields else {
         return None;
     };
+    if fields.named.iter().any(|field| {
+        field
+            .ident
+            .as_ref()
+            .is_some_and(|name| name.to_string().starts_with("__prview_private_field_"))
+    }) {
+        // A repr-sensitive private layout delta belongs to the parent type.
+        // Do not leak synthetic private field identities into public artifacts.
+        return None;
+    }
     Some(PublicStructContract {
         fields: fields
             .named
@@ -789,6 +885,9 @@ fn namespace_name(namespace: RustNamespace) -> &'static str {
         RustNamespace::Type => "type",
         RustNamespace::Value => "value",
         RustNamespace::Macro => "macro",
+        RustNamespace::Module => "module",
+        RustNamespace::Crate => "crate",
+        RustNamespace::CargoFeature => "cargo_feature",
     }
 }
 
@@ -1243,7 +1342,10 @@ fn consume_one_sided_ambiguities(
 
 fn region_is_unknown(unknowns: &[RustApiUnknown], identity: &ApiIdentity) -> bool {
     unknowns.iter().any(|unknown| {
-        unknown
+        !matches!(
+            unknown.kind,
+            RustApiUnknownKind::PathNonUtf8 | RustApiUnknownKind::TraitImplResolution
+        ) && unknown
             .crate_name
             .as_ref()
             .is_none_or(|crate_name| crate_name == &identity.crate_name)
@@ -1298,7 +1400,8 @@ fn unknown_proofs_match(
     target: &RustApiSnapshot,
     right: &RustApiUnknown,
 ) -> bool {
-    left.kind == right.kind
+    left.kind != RustApiUnknownKind::PathNonUtf8
+        && left.kind == right.kind
         && left.crate_name == right.crate_name
         && left.module_path == right.module_path
         && left.source_path == right.source_path
@@ -1498,7 +1601,9 @@ mod tests {
     use crate::artifacts::signal::test_helpers::make_test_repo;
     use crate::git::git_cmd;
     use std::fs;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
+    use std::process::Stdio;
 
     #[derive(Clone)]
     struct MemorySource {
@@ -1687,6 +1792,139 @@ mod tests {
         compare_rust_api(&base, &target)
     }
 
+    fn repository_delta(files: &[(&str, &str, &str)]) -> ApiDelta {
+        let (_tmp, repo, base, target) = make_test_repo(files);
+        prepare_rust_api_delta(
+            &repo,
+            &[comparison_base("base", &base)],
+            &resolved_target(&target, false),
+        )
+        .expect("repository-backed comparison")
+        .expect("Rust revisions")
+    }
+
+    fn git_with_input(repo: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
+        let mut child = git_cmd()
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "prview test")
+            .env("GIT_AUTHOR_EMAIL", "prview@example.test")
+            .env("GIT_COMMITTER_NAME", "prview test")
+            .env("GIT_COMMITTER_EMAIL", "prview@example.test")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn git object command");
+        child
+            .stdin
+            .take()
+            .expect("git stdin")
+            .write_all(input)
+            .expect("write git object input");
+        let output = child
+            .wait_with_output()
+            .expect("wait for git object command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn repository_with_unchanged_non_utf8_entry()
+    -> (tempfile::TempDir, crate::git::Repository, String, String) {
+        let (tmp, _repo, _initial, seed) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "pub fn stable() {}\n", "pub fn stable() {}\n"),
+        ]);
+
+        let mut tree_records = git_with_input(
+            tmp.path(),
+            &["ls-tree", "-z", &format!("{seed}^{{tree}}")],
+            &[],
+        );
+        let blob = String::from_utf8(git_with_input(
+            tmp.path(),
+            &["hash-object", "-w", "--stdin"],
+            b"pub fn hidden_by_path_encoding() {}\n",
+        ))
+        .expect("blob oid")
+        .trim()
+        .to_owned();
+        tree_records.extend_from_slice(format!("100644 blob {blob}\t").as_bytes());
+        tree_records.extend_from_slice(b"non_utf8_\xff.rs\0");
+        let tree = String::from_utf8(git_with_input(tmp.path(), &["mktree", "-z"], &tree_records))
+            .expect("tree oid")
+            .trim()
+            .to_owned();
+        let base = String::from_utf8(git_with_input(
+            tmp.path(),
+            &["commit-tree", &tree, "-p", &seed],
+            b"base with non-UTF-8 path\n",
+        ))
+        .expect("commit oid")
+        .trim()
+        .to_owned();
+        let target_lib_blob = String::from_utf8(git_with_input(
+            tmp.path(),
+            &["hash-object", "-w", "--stdin"],
+            b"pub fn stable() {}\npub fn valid_sibling() {}\n",
+        ))
+        .expect("target lib blob oid")
+        .trim()
+        .to_owned();
+        let src_tree_record = format!("100644 blob {target_lib_blob}\tlib.rs\0");
+        let src_tree = String::from_utf8(git_with_input(
+            tmp.path(),
+            &["mktree", "-z"],
+            src_tree_record.as_bytes(),
+        ))
+        .expect("target src tree oid")
+        .trim()
+        .to_owned();
+        let base_root_records = git_with_input(
+            tmp.path(),
+            &["ls-tree", "-z", &format!("{base}^{{tree}}")],
+            &[],
+        );
+        let mut replaced_src = false;
+        let mut target_root_records = Vec::new();
+        for record in base_root_records.split_inclusive(|byte| *byte == 0) {
+            if record.ends_with(b"\tsrc\0") {
+                target_root_records
+                    .extend_from_slice(format!("040000 tree {src_tree}\tsrc\0").as_bytes());
+                replaced_src = true;
+            } else {
+                target_root_records.extend_from_slice(record);
+            }
+        }
+        assert!(replaced_src, "seed tree carries src/");
+        let target_tree = String::from_utf8(git_with_input(
+            tmp.path(),
+            &["mktree", "-z"],
+            &target_root_records,
+        ))
+        .expect("target root tree oid")
+        .trim()
+        .to_owned();
+        let target = String::from_utf8(git_with_input(
+            tmp.path(),
+            &["commit-tree", &target_tree, "-p", &base],
+            b"target with preserved non-UTF-8 path\n",
+        ))
+        .expect("target commit oid")
+        .trim()
+        .to_owned();
+        let repo = crate::git::Repository::open(tmp.path()).unwrap();
+        (tmp, repo, base, target)
+    }
+
     fn expected_projection(expected: &CorpusExpected) -> BTreeSet<(ExpectedKind, String, String)> {
         expected
             .repo_backed_records
@@ -1757,8 +1995,22 @@ mod tests {
     fn api_delta_pairing_is_one_to_one_and_relocation_is_exclusive() {
         let delta = fixture_delta("move_relocated");
         assert_eq!(delta.relocated.len(), 1);
-        assert!(delta.added.is_empty());
-        assert!(delta.removed.is_empty());
+        assert_eq!(
+            delta
+                .added
+                .iter()
+                .map(|finding| finding.identity.name.as_str())
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+        assert_eq!(
+            delta
+                .removed
+                .iter()
+                .map(|finding| finding.identity.name.as_str())
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
 
         let base = snapshot_rust_api(&MemorySource::source(
             "pub mod a { pub fn item() {} }\npub mod b { pub fn item() {} }",
@@ -1769,8 +2021,16 @@ mod tests {
             "target",
         ));
         let ambiguous = compare_rust_api(&base, &target);
-        assert!(ambiguous.added.is_empty());
-        assert!(ambiguous.removed.is_empty());
+        assert_eq!(ambiguous.added.len(), 2);
+        assert_eq!(ambiguous.removed.len(), 2);
+        assert!(ambiguous.added.iter().all(|finding| {
+            finding.identity.namespace == "module"
+                && matches!(finding.identity.name.as_str(), "c" | "d")
+        }));
+        assert!(ambiguous.removed.iter().all(|finding| {
+            finding.identity.namespace == "module"
+                && matches!(finding.identity.name.as_str(), "a" | "b")
+        }));
         assert!(ambiguous.relocated.is_empty());
         assert!(ambiguous.unknown.iter().any(|finding| {
             finding.unknown_reason.as_deref().is_some_and(|reason| {
@@ -1909,6 +2169,268 @@ mod tests {
         assert!(new_item.added.iter().any(|finding| {
             finding.identity.name == "Options" && finding.identity.module_path.is_empty()
         }));
+    }
+
+    #[test]
+    fn repository_backed_t1_t3_contracts_are_non_vacuous() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Options { pub a: u8 }\n#[non_exhaustive] pub struct Flexible { pub a: u8 }\npub fn parse<'a, T>(value: &'a T) -> &'a T { value }\n",
+                "pub struct Options { pub a: u8, pub b: u8 }\n#[non_exhaustive] pub struct Flexible { pub a: u8, pub b: u8 }\npub struct New { pub value: u8 }\npub fn parse<'value, U>(input: &'value U) -> &'value U { input }\n",
+            ),
+        ]);
+        assert!(delta.changed.iter().any(|finding| {
+            finding.identity.name == "Options" && finding.identity.namespace == "type"
+        }));
+        assert!(delta.added.iter().any(|finding| {
+            finding.identity.name == "b" && finding.identity.module_path == ["Flexible".to_owned()]
+        }));
+        assert!(
+            delta
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "New")
+        );
+        assert!(
+            delta
+                .findings()
+                .iter()
+                .all(|finding| finding.identity.name != "parse"),
+            "parameter, generic, and lifetime alpha-renames stay neutral through exact Git trees"
+        );
+
+        for (base, target) in [
+            (
+                "pub fn changed(value: u8) {}",
+                "pub fn changed(value: u16) {}",
+            ),
+            (
+                "pub extern \"C\" fn changed(value: u8) {}",
+                "pub extern \"system\" fn changed(value: u8) {}",
+            ),
+            (
+                "pub fn changed<'a, 'b>(left: &'a str, right: &'b str) -> &'a str { left }",
+                "pub fn changed<'x, 'y>(left: &'x str, right: &'y str) -> &'y str { right }",
+            ),
+        ] {
+            let mutation = repository_delta(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("src/lib.rs", base, target),
+            ]);
+            assert!(
+                mutation
+                    .changed
+                    .iter()
+                    .any(|finding| finding.identity.name == "changed"),
+                "type, ABI, and lifetime-relation controls must remain observable: {base} -> {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_backed_t2_tuple_private_tail_changes_parent_contract() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Tuple(pub u8);\npub struct Stable(pub u8, pub u16);\n",
+                "pub struct Tuple(pub u8, u16);\npub struct Stable(pub u8, pub u16);\n",
+            ),
+        ]);
+        assert!(delta.changed.iter().any(|finding| {
+            finding.identity.name == "Tuple" && finding.identity.namespace == "type"
+        }));
+        assert!(
+            delta
+                .findings()
+                .iter()
+                .all(|finding| finding.identity.name != "Stable"),
+            "an unchanged public-only tuple is a stable control"
+        );
+    }
+
+    #[test]
+    fn repository_backed_t4_non_exhaustive_enum_addition_is_informational() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[non_exhaustive] pub enum Flexible { A }\npub enum Strict { A }\n",
+                "#[non_exhaustive] pub enum Flexible { A, B }\npub enum Strict { A, B }\n",
+            ),
+        ]);
+        assert!(delta.added.iter().any(|finding| {
+            finding.identity.name == "B" && finding.identity.module_path == ["Flexible".to_owned()]
+        }));
+        assert!(!delta.changed.iter().any(|finding| {
+            finding.identity.name == "Flexible" && finding.identity.namespace == "type"
+        }));
+        assert!(delta.changed.iter().any(|finding| {
+            finding.identity.name == "Strict" && finding.identity.namespace == "type"
+        }));
+    }
+
+    #[test]
+    fn git_object_t5_non_utf8_entry_preserves_valid_api_siblings() {
+        let (_tmp, repo, base, target) = repository_with_unchanged_non_utf8_entry();
+        let delta = prepare_rust_api_delta(
+            &repo,
+            &[comparison_base("base", &base)],
+            &resolved_target(&target, false),
+        )
+        .expect("a legal non-UTF-8 Git path must not abort API analysis")
+        .expect("Rust revisions");
+        assert!(
+            delta
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "valid_sibling"),
+            "valid siblings remain analyzable"
+        );
+        let path_unknowns: Vec<_> = delta
+            .unknown
+            .iter()
+            .filter(|finding| finding.identity.name == "PathNonUtf8")
+            .collect();
+        assert_eq!(
+            path_unknowns.len(),
+            2,
+            "both exact revisions retain typed path uncertainty instead of becoming clean"
+        );
+        assert!(path_unknowns.iter().all(|finding| {
+            finding
+                .unknown_source
+                .as_ref()
+                .is_some_and(|source| source.source_path.contains("git-path-bytes"))
+        }));
+    }
+
+    #[test]
+    fn repository_backed_module_feature_and_crate_contracts_are_observable() {
+        let module_and_feature = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[features]\ndefault=[]\nlegacy=[]\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[features]\ndefault=[]\n",
+            ),
+            ("src/lib.rs", "pub mod empty {}\n", "fn private() {}\n"),
+        ]);
+        assert!(module_and_feature.removed.iter().any(|finding| {
+            finding.identity.name == "empty" && finding.identity.namespace == "module"
+        }));
+        assert!(module_and_feature.removed.iter().any(|finding| {
+            finding.identity.name == "legacy" && finding.identity.namespace == "cargo_feature"
+        }));
+
+        let crate_removed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nautolib=false\n",
+            ),
+            ("src/lib.rs", "", ""),
+        ]);
+        assert!(crate_removed.removed.iter().any(|finding| {
+            finding.identity.name == "fixture" && finding.identity.namespace == "crate"
+        }));
+    }
+
+    #[test]
+    fn repository_backed_repr_layout_and_data_binders_are_semantic() {
+        let binder_rename = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Wrapper<'a, T, const N: usize> { pub value: &'a [T; N] }\n",
+                "pub struct Wrapper<'value, U, const M: usize> { pub value: &'value [U; M] }\n",
+            ),
+        ]);
+        assert!(
+            binder_rename.findings().is_empty(),
+            "public data-type binder spelling is not caller-observable"
+        );
+
+        let repr_layout = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[repr(C)] pub struct Layout { pub tag: u8, hidden: u8 }\n",
+                "#[repr(C)] pub struct Layout { pub tag: u8, hidden: u16 }\n",
+            ),
+        ]);
+        assert!(
+            repr_layout
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Layout"),
+            "repr(C) makes private field layout part of the observable contract"
+        );
+    }
+
+    #[test]
+    fn repository_backed_public_trait_impl_change_is_typed() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Marker {}\npub struct Value;\n",
+                "pub trait Marker {}\npub struct Value;\nimpl Marker for Value {}\n",
+            ),
+        ]);
+        assert!(delta.unknown.iter().any(|finding| {
+            finding.identity.name == "TraitImplResolution"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("impl Marker for Value"))
+        }));
+
+        let private_control = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "trait PrivateMarker {}\nstruct PrivateValue;\n",
+                "trait PrivateMarker {}\nstruct PrivateValue;\nimpl PrivateMarker for PrivateValue {}\n",
+            ),
+        ]);
+        assert!(
+            private_control.findings().is_empty(),
+            "an impl whose trait and owner are both private is not public API uncertainty"
+        );
     }
 
     #[test]

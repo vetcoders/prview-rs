@@ -16,6 +16,50 @@ use std::process::Output;
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 
+#[cfg(windows)]
+fn system_taskkill_path() -> std::path::PathBuf {
+    let windows_dir = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    windows_dir.join("System32").join("taskkill.exe")
+}
+
+#[cfg(windows)]
+fn taskkill_process_tree_at(
+    taskkill: &std::path::Path,
+    pid: u32,
+) -> std::io::Result<std::process::ExitStatus> {
+    std::process::Command::new(taskkill)
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+}
+
+#[cfg(any(windows, test))]
+fn terminate_windows_process_tree_with(
+    taskkill: &std::path::Path,
+    pid: u32,
+    executor: impl FnOnce(&std::path::Path, u32) -> std::io::Result<std::process::ExitStatus>,
+) -> std::io::Result<()> {
+    match executor(taskkill, pid) {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(std::io::Error::other(format!(
+            "{} failed to terminate process tree {pid} (status {status})",
+            taskkill.display()
+        ))),
+        Err(err) => Err(std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed to run {} for process tree {pid}: {err}",
+                taskkill.display()
+            ),
+        )),
+    }
+}
+
 /// SIGKILL an entire unix process group by its leader pid.
 ///
 /// The child must have been spawned with `process_group(0)` so `pid` is also
@@ -26,6 +70,29 @@ pub fn sigkill_process_group(pid: u32) {
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
+}
+
+/// Terminate the full process tree led by `pid` on every supported platform.
+///
+/// Unix children lead their own process group, so one negative-pgid SIGKILL is
+/// sufficient. Windows has no inherited Unix-style process group contract;
+/// the built-in `taskkill /T /F` primitive walks and force-terminates the tree.
+pub fn terminate_process_tree(pid: u32) {
+    #[cfg(unix)]
+    sigkill_process_group(pid);
+
+    #[cfg(windows)]
+    {
+        let taskkill = system_taskkill_path();
+        if let Err(err) =
+            terminate_windows_process_tree_with(&taskkill, pid, taskkill_process_tree_at)
+        {
+            eprintln!("prview: {err}");
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    compile_error!("prview process-tree cancellation is unsupported on this platform");
 }
 
 /// Apply the standard rails to `cmd`: detached stdin, `kill_on_drop`, and (unix)
@@ -95,7 +162,6 @@ async fn run_capture_with_timeout_after_spawn(
 
     // Capture the pid (also the pgid, since the child leads its group) BEFORE
     // the handle moves into wait_with_output(); needed to signal the group.
-    #[cfg(unix)]
     let pid = child.id();
 
     after_spawn(child.id());
@@ -107,13 +173,177 @@ async fn run_capture_with_timeout_after_spawn(
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(result) => result.map_err(|e| anyhow::anyhow!("failed to run {label}: {e}")),
         Err(_) => {
-            #[cfg(unix)]
             if let Some(pid) = pid {
-                sigkill_process_group(pid);
+                terminate_process_tree(pid);
             }
             Err(on_timeout())
         }
     }
+}
+
+/// A real PowerShell root/child/grandchild tree for Windows-only process tests.
+///
+/// This lives outside either test module so the direct process primitive and
+/// the governor integration test exercise the same fixture and PID probe. Drop
+/// is failure cleanup only: successful tests first prove every captured PID is
+/// gone through the operation under test, then disarm cleanup.
+#[cfg(all(test, windows))]
+pub(crate) struct WindowsProcessTree {
+    root: std::process::Child,
+    pids: Vec<u32>,
+    _tempdir: tempfile::TempDir,
+    verified_gone: bool,
+}
+
+#[cfg(all(test, windows))]
+impl WindowsProcessTree {
+    pub(crate) fn spawn(label: &str) -> Self {
+        use std::thread::sleep;
+
+        let tempdir = tempfile::tempdir().expect("Windows process-tree tempdir");
+        let child_pidfile = tempdir.path().join("child.pid");
+        let grandchild_pidfile = tempdir.path().join("grandchild.pid");
+        let child_script = tempdir.path().join("child.ps1");
+        let parent_script = tempdir.path().join("parent.ps1");
+
+        std::fs::write(
+            &child_script,
+            format!(
+                "$g = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60'\nSet-Content -LiteralPath '{}' -Value $g.Id\nWait-Process -Id $g.Id\n",
+                grandchild_pidfile.display()
+            ),
+        )
+        .expect("write Windows child script");
+        std::fs::write(
+            &parent_script,
+            format!(
+                "$c = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','{}'\nSet-Content -LiteralPath '{}' -Value $c.Id\nWait-Process -Id $c.Id\n",
+                child_script.display(),
+                child_pidfile.display()
+            ),
+        )
+        .expect("write Windows parent script");
+
+        let root = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&parent_script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn root PowerShell");
+
+        // Establish cleanup ownership before waiting for either descendant to
+        // publish its PID. If setup times out or panics, Drop can already kill
+        // the root with /T and therefore cannot orphan an unrecorded child.
+        let mut tree = Self {
+            pids: vec![root.id()],
+            root,
+            _tempdir: tempdir,
+            verified_gone: false,
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let descendants = loop {
+            if let (Some(child), Some(grandchild)) = (
+                try_read_windows_pid(&child_pidfile),
+                try_read_windows_pid(&grandchild_pidfile),
+            ) && windows_pid_exists(child)
+                && windows_pid_exists(grandchild)
+            {
+                break [child, grandchild];
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{label} did not publish a live child and grandchild within 10s"
+            );
+            sleep(Duration::from_millis(25));
+        };
+
+        tree.pids.extend(descendants);
+        tree.assert_all_running(label);
+        tree
+    }
+
+    pub(crate) fn root_pid(&self) -> u32 {
+        self.pids[0]
+    }
+
+    pub(crate) fn pids(&self) -> [u32; 3] {
+        [self.pids[0], self.pids[1], self.pids[2]]
+    }
+
+    pub(crate) fn assert_all_running(&self, phase: &str) {
+        for (role, pid) in ["root", "child", "grandchild"]
+            .into_iter()
+            .zip(self.pids.iter().copied())
+        {
+            assert!(
+                windows_pid_exists(pid),
+                "{phase}: captured {role} PID {pid} is not running"
+            );
+        }
+    }
+
+    pub(crate) fn assert_all_gone(&mut self, phase: &str) {
+        use std::thread::sleep;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = self.root.try_wait();
+            let live: Vec<_> = ["root", "child", "grandchild"]
+                .into_iter()
+                .zip(self.pids.iter().copied())
+                .filter(|(_, pid)| windows_pid_exists(*pid))
+                .collect();
+            if live.is_empty() {
+                self.verified_gone = true;
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{phase}: Windows process census still live after 5s: {live:?}"
+            );
+            sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+impl Drop for WindowsProcessTree {
+    fn drop(&mut self) {
+        if self.verified_gone {
+            return;
+        }
+
+        // A failing assertion must not leave any known PowerShell descendant on
+        // the shared runner. This cleanup is deliberately not part of the PASS
+        // oracle: assert_all_gone disarms it only after the tested path succeeds.
+        for pid in self.pids.iter().copied().rev() {
+            terminate_process_tree(pid);
+        }
+        let _ = self.root.kill();
+        let _ = self.root.wait();
+    }
+}
+
+#[cfg(all(test, windows))]
+fn try_read_windows_pid(path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+#[cfg(all(test, windows))]
+fn windows_pid_exists(pid: u32) -> bool {
+    let filter = format!("PID eq {pid}");
+    let output = std::process::Command::new("tasklist.exe")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("tasklist must be available on a Windows runner");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .any(|line| line.contains(&format!("\"{pid}\"")))
 }
 
 #[cfg(test)]
@@ -285,6 +515,8 @@ mod tests {
 
         let mut gone = false;
         for _ in 0..100 {
+            // SAFETY: signal 0 is a read-only existence/permission probe, and
+            // `grandchild` came from the process tree created by this test.
             if unsafe { libc::kill(grandchild, 0) } == -1 {
                 let errno = std::io::Error::last_os_error().raw_os_error();
                 if errno == Some(libc::ESRCH) || errno == Some(libc::EPERM) {
@@ -304,6 +536,8 @@ mod tests {
     async fn assert_grandchild_reaped(grandchild: i32) {
         let mut gone = false;
         for _ in 0..60 {
+            // SAFETY: signal 0 is a read-only existence/permission probe, and
+            // `grandchild` came from the process tree created by this test.
             if unsafe { libc::kill(grandchild, 0) } == -1 {
                 let errno = std::io::Error::last_os_error().raw_os_error();
                 if errno == Some(libc::ESRCH) || errno == Some(libc::EPERM) {
@@ -317,5 +551,64 @@ mod tests {
             gone,
             "grandchild {grandchild} survived; group kill did not reach it"
         );
+    }
+
+    /// Real Windows tree proof: root PowerShell -> child PowerShell -> sleeping
+    /// grandchild. `taskkill /T /F` must remove both descendants.
+    #[cfg(windows)]
+    #[test]
+    fn terminate_process_tree_reaps_windows_child_and_grandchild() {
+        let mut tree = WindowsProcessTree::spawn("direct taskkill primitive");
+
+        terminate_process_tree(tree.root_pid());
+
+        tree.assert_all_gone("direct taskkill primitive");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn taskkill_uses_an_absolute_system_path_and_exposes_spawn_failure() {
+        let taskkill = system_taskkill_path();
+        assert!(
+            taskkill.is_absolute(),
+            "taskkill path must not use PATH lookup"
+        );
+        assert_eq!(
+            taskkill.file_name().and_then(|name| name.to_str()),
+            Some("taskkill.exe")
+        );
+
+        let missing = std::path::Path::new(r"C:\prview-missing\taskkill.exe");
+        assert!(
+            taskkill_process_tree_at(missing, u32::MAX).is_err(),
+            "spawn failure must remain observable to the caller"
+        );
+    }
+
+    #[test]
+    fn taskkill_nonzero_status_is_observable_through_production_handler() {
+        #[cfg(unix)]
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 23"])
+            .status()
+            .expect("controlled non-zero status");
+        #[cfg(windows)]
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit 23"])
+            .status()
+            .expect("controlled non-zero status");
+
+        let taskkill = std::path::Path::new("controlled-taskkill.exe");
+        let err = terminate_windows_process_tree_with(taskkill, 4242, |path, pid| {
+            assert_eq!(path, taskkill);
+            assert_eq!(pid, 4242);
+            Ok(status)
+        })
+        .expect_err("non-zero taskkill status must remain observable");
+
+        let message = err.to_string();
+        assert!(message.contains("controlled-taskkill.exe"));
+        assert!(message.contains("process tree 4242"));
+        assert!(message.contains("status"));
     }
 }

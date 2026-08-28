@@ -32,7 +32,8 @@ struct CargoRun {
     /// Directory to run `cargo` in — the reviewed snapshot's cargo root in
     /// `--pr`/`--remote` mode, the local cargo root otherwise.
     cwd: PathBuf,
-    /// Extra child environment (`CARGO_TARGET_DIR`), empty for a local run.
+    /// Extra child environment. Every Cargo invocation receives the canonical
+    /// `CARGO_BUILD_JOBS` cap; snapshot runs also redirect `CARGO_TARGET_DIR`.
     env: Vec<(String, String)>,
     /// Ephemeral snapshot, kept alive until the check finishes.
     _snapshot: Option<crate::git::WorktreeSnapshot>,
@@ -69,7 +70,7 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
     if plan.scan_dir == config.repo_root {
         return Ok(CargoRun {
             cwd: manifest_stays_in_root(local_root)?,
-            env: Vec::new(),
+            env: vec![cargo_jobs_env(config)],
             _snapshot: plan._snapshot,
         });
     }
@@ -106,12 +107,43 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
 
     Ok(CargoRun {
         cwd,
-        env: vec![(
-            "CARGO_TARGET_DIR".to_string(),
-            target_dir.display().to_string(),
-        )],
+        env: vec![
+            cargo_jobs_env(config),
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                target_dir.display().to_string(),
+            ),
+        ],
         _snapshot: plan._snapshot,
     })
+}
+
+fn cargo_jobs_env(config: &Config) -> (String, String) {
+    (
+        "CARGO_BUILD_JOBS".to_string(),
+        config.resource_plan.worker_limit.to_string(),
+    )
+}
+
+/// Exact `cargo test` command surface for the run-wide resource envelope.
+///
+/// Cargo's build-job cap does not constrain libtest's own worker pool. Keep the
+/// optional test filter on Cargo's side of `--`, then cap the harness after it.
+fn cargo_test_args(config: &Config) -> Vec<String> {
+    let mut args = vec![
+        "test".to_string(),
+        "--all-targets".to_string(),
+        "--no-fail-fast".to_string(),
+    ];
+    if let Some(pattern) = &config.tests_pattern {
+        args.push(pattern.clone());
+    }
+    args.extend([
+        "--".to_string(),
+        "--test-threads".to_string(),
+        config.resource_plan.worker_limit.max(1).to_string(),
+    ]);
+    args
 }
 
 /// The directory a cargo check would have run in, given a scan dir that already
@@ -1243,9 +1275,10 @@ impl Check for CargoTestCheck {
         let run = plan_cargo_run(config)?;
         let cwd = run.cwd.as_path();
 
-        let args = &["test", "--all-targets", "--no-fail-fast"];
+        let owned_args = cargo_test_args(config);
+        let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         let output =
-            run_command_with_timeout_and_env("cargo", args, cwd, TEST_TIMEOUT_SECS, &run.env)
+            run_command_with_timeout_and_env("cargo", &args, cwd, TEST_TIMEOUT_SECS, &run.env)
                 .await?;
         let finished_at = Local::now().to_rfc3339();
 
@@ -1269,7 +1302,7 @@ impl Check for CargoTestCheck {
                 ProvenanceBuilder {
                     check: self.name(),
                     cmd: "cargo",
-                    args,
+                    args: &args,
                     cwd,
                     repo_root: &config.repo_root,
                     exit_code: output.status.code(),
@@ -1288,6 +1321,10 @@ impl Check for CargoTestCheck {
 impl Check for RustfmtCheck {
     fn name(&self) -> &str {
         "Rustfmt"
+    }
+
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Light
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
@@ -2027,6 +2064,44 @@ mod tests {
     }
 
     #[test]
+    fn cargo_test_args_cap_safe_libtest_threads_exactly() {
+        let mut config = create_test_config(true, false, true);
+        config.resource_plan.worker_limit = 1;
+
+        assert_eq!(
+            cargo_test_args(&config),
+            vec![
+                "test",
+                "--all-targets",
+                "--no-fail-fast",
+                "--",
+                "--test-threads",
+                "1",
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_test_args_cap_balanced_threads_and_preserve_filter() {
+        let mut config = create_test_config(true, false, true);
+        config.resource_plan.worker_limit = 3;
+        config.tests_pattern = Some("critical path".to_string());
+
+        assert_eq!(
+            cargo_test_args(&config),
+            vec![
+                "test",
+                "--all-targets",
+                "--no-fail-fast",
+                "critical path",
+                "--",
+                "--test-threads",
+                "3",
+            ]
+        );
+    }
+
+    #[test]
     fn test_cargo_geiger_requires_security_full() {
         // Without --security-full geiger is not eligible; it is opt-in and must
         // stay out of the default profile rather than fabricate a caveat.
@@ -2729,10 +2804,16 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         assert_eq!(run.cwd, scan_dir.path());
         assert_eq!(
             run.env,
-            vec![(
-                "CARGO_TARGET_DIR".to_string(),
-                config.cargo_build_cache_dir().display().to_string()
-            )],
+            vec![
+                (
+                    "CARGO_BUILD_JOBS".to_string(),
+                    config.resource_plan.worker_limit.to_string()
+                ),
+                (
+                    "CARGO_TARGET_DIR".to_string(),
+                    config.cargo_build_cache_dir().display().to_string()
+                )
+            ],
             "cargo must build into the shared per-repo cache, not the snapshot",
         );
         let target_dir = config.cargo_build_cache_dir();
@@ -2747,8 +2828,8 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
     }
 
     /// A local review (target == HEAD) is unchanged: the local cargo root, and
-    /// no `CARGO_TARGET_DIR` redirect, so the operator's warm `target/` is used
-    /// exactly as before.
+    /// no `CARGO_TARGET_DIR` redirect, so the operator's warm `target/` is used.
+    /// The descendant job cap still applies.
     #[tokio::test]
     async fn test_cargo_run_local_target_is_unchanged() {
         let repo_root = tempfile::tempdir().expect("repo_root tempdir");
@@ -2762,9 +2843,9 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         let run = plan_cargo_run(&config).expect("plan");
 
         assert_eq!(run.cwd, repo_root.path());
-        assert!(
-            run.env.is_empty(),
-            "a local run must not redirect the build directory",
+        assert_eq!(
+            run.env,
+            vec![("CARGO_BUILD_JOBS".to_string(), "1".to_string())]
         );
     }
 
@@ -3080,16 +3161,14 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
     /// (no `..` in the path), and following it runs cargo on the operator's
     /// unrelated tree while the verdict is cached under the reviewed commit —
     /// the external-root hole, reopened by a target-controlled symlink.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_symlinked_cargo_root_never_escapes_the_snapshot() {
         let outside = tempfile::tempdir().expect("outside tempdir");
         write_crate(outside.path(), true);
         let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
         write_crate(scan_dir.path(), true);
-        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), scan_dir.path().join("backend")).unwrap();
-        #[cfg(not(unix))]
-        return;
 
         let repo_root = tempfile::tempdir().expect("repo_root tempdir");
         write_crate(&repo_root.path().join("backend"), true);

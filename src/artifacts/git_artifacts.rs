@@ -43,15 +43,19 @@ pub(super) fn generate_commit_list(dir: &Path, diffs: &[Diff]) -> Result<()> {
 }
 
 /// Create a `latest` symlink in the parent of `out_dir` pointing to `out_dir`'s basename
+#[cfg(unix)]
 pub(super) fn create_latest_symlink(out_dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        if let (Some(parent), Some(basename)) = (out_dir.parent(), out_dir.file_name()) {
-            let latest_link = parent.join("latest");
-            let _ = fs::remove_file(&latest_link);
-            std::os::unix::fs::symlink(basename, &latest_link)?;
-        }
+    if let (Some(parent), Some(basename)) = (out_dir.parent(), out_dir.file_name()) {
+        let latest_link = parent.join("latest");
+        let _ = fs::remove_file(&latest_link);
+        std::os::unix::fs::symlink(basename, &latest_link)?;
     }
+    Ok(())
+}
+
+/// Windows has no pack-level `latest` alias; keep the caller contract a no-op.
+#[cfg(not(unix))]
+pub(super) fn create_latest_symlink(_out_dir: &Path) -> Result<()> {
     Ok(())
 }
 

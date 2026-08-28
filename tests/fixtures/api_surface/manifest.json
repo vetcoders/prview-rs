@@ -293,6 +293,8 @@
       "cell": "move_relocated",
       "expected_polarity": "positive",
       "expected_delta_kinds": [
+        "added",
+        "removed",
         "relocated"
       ]
     },
@@ -470,6 +472,8 @@
       "cell": "module_scope_changed",
       "expected_polarity": "positive",
       "expected_delta_kinds": [
+        "added",
+        "removed",
         "relocated"
       ]
     },
@@ -477,6 +481,8 @@
       "cell": "module_scope_changed",
       "expected_polarity": "positive",
       "expected_delta_kinds": [
+        "added",
+        "removed",
         "relocated"
       ]
     },
@@ -484,6 +490,8 @@
       "cell": "module_scope_changed",
       "expected_polarity": "positive",
       "expected_delta_kinds": [
+        "added",
+        "removed",
         "relocated"
       ]
     },
@@ -491,6 +499,8 @@
       "cell": "module_scope_changed",
       "expected_polarity": "positive",
       "expected_delta_kinds": [
+        "added",
+        "removed",
         "relocated"
       ]
     },
@@ -520,6 +530,8 @@
       "cell": "module_scope_changed",
       "expected_polarity": "positive",
       "expected_delta_kinds": [
+        "added",
+        "removed",
         "relocated"
       ]
     },

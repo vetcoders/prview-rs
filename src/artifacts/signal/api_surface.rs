@@ -89,6 +89,9 @@ pub enum RustNamespace {
     Type,
     Value,
     Macro,
+    Module,
+    Crate,
+    CargoFeature,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -107,6 +110,9 @@ pub enum RustApiItemKind {
     InherentAssociatedFunction,
     InherentAssociatedConstant,
     Macro,
+    Module,
+    Crate,
+    CargoFeature,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -169,6 +175,8 @@ pub enum RustApiUnknownKind {
     UnresolvedInherentOwner,
     CfgPredicate,
     ResolutionLimit,
+    PathNonUtf8,
+    TraitImplResolution,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +268,18 @@ struct PendingAssoc {
 }
 
 #[derive(Debug, Clone)]
+struct PendingTraitImpl {
+    crate_name: String,
+    trait_module_path: Vec<String>,
+    trait_name: String,
+    owner_module_path: Vec<String>,
+    owner_name: String,
+    cfg_guard: Vec<String>,
+    source_path: String,
+    evidence: String,
+}
+
+#[derive(Debug, Clone)]
 struct ModuleProof {
     crate_name: String,
     module_path: Vec<String>,
@@ -293,6 +313,7 @@ struct SnapshotBuilder<'a> {
     symbols: BTreeMap<SymbolKey, Vec<RawSymbol>>,
     uses: Vec<UseEdge>,
     pending_assoc: Vec<PendingAssoc>,
+    pending_trait_impls: Vec<PendingTraitImpl>,
     module_proofs: Vec<ModuleProof>,
     all_module_aliases: Vec<RustModuleAlias>,
     completed_sources: BTreeMap<(String, String, Vec<String>, Vec<String>), bool>,
@@ -321,6 +342,7 @@ impl<'a> SnapshotBuilder<'a> {
             symbols: BTreeMap::new(),
             uses: Vec::new(),
             pending_assoc: Vec::new(),
+            pending_trait_impls: Vec::new(),
             module_proofs: Vec::new(),
             all_module_aliases: Vec::new(),
             completed_sources: BTreeMap::new(),
@@ -337,9 +359,12 @@ impl<'a> SnapshotBuilder<'a> {
     }
 
     fn build(mut self) -> RustApiSnapshot {
+        self.record_inventory_path_unknowns();
         self.discover_crates();
         self.resolve_reexports();
+        self.resolve_trait_impls();
         self.resolve_inherent_items();
+        self.materialize_public_modules();
         self.crates.sort_by(|left, right| {
             (&left.name, &left.manifest_path, &left.root_path).cmp(&(
                 &right.name,
@@ -465,6 +490,79 @@ impl<'a> SnapshotBuilder<'a> {
             declarations: self.declarations,
             reexports: self.reexports,
             unknowns: self.unknowns,
+        }
+    }
+
+    fn record_inventory_path_unknowns(&mut self) {
+        let paths: Vec<_> = self
+            .inventory
+            .values()
+            .filter(|entry| {
+                entry.kind == super::revision_source::RevisionEntryKind::Unsupported
+                    && entry.path.contains(crate::git::NON_UTF8_GIT_PATH_PREFIX)
+            })
+            .map(|entry| entry.path.clone())
+            .collect();
+        for path in paths {
+            self.unknown(
+                RustApiUnknownKind::PathNonUtf8,
+                None,
+                &[],
+                &path,
+                "Git tree contains a path component that cannot be represented as UTF-8".to_owned(),
+            );
+        }
+    }
+
+    fn materialize_public_modules(&mut self) {
+        let mut modules: Vec<_> = self
+            .modules
+            .iter()
+            .filter(|module| module.externally_reachable && !module.module_path.is_empty())
+            .map(|module| {
+                let (name, parent) = module
+                    .module_path
+                    .split_last()
+                    .expect("non-root module has a final component");
+                (
+                    module.crate_name.clone(),
+                    parent.to_vec(),
+                    name.clone(),
+                    module.cfg_guard.clone(),
+                    module.source_path.clone(),
+                    module.module_path.clone(),
+                )
+            })
+            .collect();
+        modules.extend(self.module_aliases.iter().filter_map(|alias| {
+            let (name, parent) = alias.module_path.split_last()?;
+            Some((
+                alias.crate_name.clone(),
+                parent.to_vec(),
+                name.clone(),
+                alias.cfg_guard.clone(),
+                alias.source_path.clone(),
+                alias.target_module_path.clone(),
+            ))
+        }));
+        for (crate_name, module_path, name, cfg_guard, source_path, origin_module_path) in modules {
+            self.items.push(RustApiItem {
+                key: RustApiItemKey {
+                    crate_name,
+                    module_path,
+                    namespace: RustNamespace::Module,
+                    external_name: name.clone(),
+                },
+                kind: RustApiItemKind::Module,
+                contract: "pub mod __prview_name ;".to_owned(),
+                cfg_guard,
+                source_path,
+                evidence: format!("public module {name}"),
+                provenance: self.provenance.clone(),
+                certainty: RustSourceCertainty::Confirmed,
+                origin_module_path,
+                origin_name: name,
+            });
         }
     }
 
@@ -677,6 +775,19 @@ impl<'a> SnapshotBuilder<'a> {
                     .map(str::to_owned)
                     .unwrap_or_else(|| package_name.replace('-', "_")),
             );
+            let cargo_features = match cargo_feature_contracts(&manifest) {
+                Ok(features) => features,
+                Err(reason) => {
+                    self.unknown(
+                        RustApiUnknownKind::ManifestParse,
+                        Some(&crate_name),
+                        &[],
+                        &manifest_path,
+                        reason,
+                    );
+                    Vec::new()
+                }
+            };
             if !self
                 .inventory
                 .get(&root_path)
@@ -713,6 +824,42 @@ impl<'a> SnapshotBuilder<'a> {
             ) {
                 self.proc_macro_crates.remove(&crate_name);
                 continue;
+            }
+            self.items.push(RustApiItem {
+                key: RustApiItemKey {
+                    crate_name: crate_name.clone(),
+                    module_path: Vec::new(),
+                    namespace: RustNamespace::Crate,
+                    external_name: crate_name.clone(),
+                },
+                kind: RustApiItemKind::Crate,
+                contract: format!("library root={root_path}; proc_macro={proc_macro}"),
+                cfg_guard: Vec::new(),
+                source_path: manifest_path.clone(),
+                evidence: format!("library crate {crate_name} from {manifest_path}"),
+                provenance: self.provenance.clone(),
+                certainty: RustSourceCertainty::Confirmed,
+                origin_module_path: Vec::new(),
+                origin_name: crate_name.clone(),
+            });
+            for (feature_name, feature_contract) in cargo_features {
+                self.items.push(RustApiItem {
+                    key: RustApiItemKey {
+                        crate_name: crate_name.clone(),
+                        module_path: Vec::new(),
+                        namespace: RustNamespace::CargoFeature,
+                        external_name: feature_name.clone(),
+                    },
+                    kind: RustApiItemKind::CargoFeature,
+                    contract: feature_contract.clone(),
+                    cfg_guard: Vec::new(),
+                    source_path: manifest_path.clone(),
+                    evidence: feature_contract,
+                    provenance: self.provenance.clone(),
+                    certainty: RustSourceCertainty::Confirmed,
+                    origin_module_path: Vec::new(),
+                    origin_name: feature_name,
+                });
             }
             self.crates.push(RustCrateSnapshot {
                 name: crate_name,
@@ -1014,9 +1161,14 @@ impl<'a> SnapshotBuilder<'a> {
                         canonical_tokens(item_extern.to_token_stream()),
                     );
                 }
-                Item::Impl(item_impl) => {
-                    self.collect_impl(crate_name, module_path, source_path, &cfg_guard, item_impl)
-                }
+                Item::Impl(item_impl) => self.collect_impl(
+                    crate_name,
+                    module_path,
+                    source_path,
+                    module_reachable,
+                    &cfg_guard,
+                    item_impl,
+                ),
                 Item::ForeignMod(foreign) => {
                     for foreign_item in &foreign.items {
                         let mut foreign_guard = cfg_guard.clone();
@@ -1379,10 +1531,35 @@ impl<'a> SnapshotBuilder<'a> {
         crate_name: &str,
         module_path: &[String],
         source_path: &str,
+        module_reachable: bool,
         cfg_guard: &[String],
         item_impl: &syn::ItemImpl,
     ) {
-        if item_impl.trait_.is_some() {
+        if let Some((_, trait_path, _)) = &item_impl.trait_ {
+            let syn::Type::Path(owner_type) = item_impl.self_ty.as_ref() else {
+                return;
+            };
+            let Some((trait_module_path, trait_name)) = resolve_impl_owner(module_path, trait_path)
+            else {
+                return;
+            };
+            let Some((owner_module_path, owner_name)) =
+                resolve_impl_owner(module_path, &owner_type.path)
+            else {
+                return;
+            };
+            if module_reachable {
+                self.pending_trait_impls.push(PendingTraitImpl {
+                    crate_name: crate_name.to_owned(),
+                    trait_module_path,
+                    trait_name,
+                    owner_module_path,
+                    owner_name,
+                    cfg_guard: cfg_guard.to_vec(),
+                    source_path: source_path.to_owned(),
+                    evidence: normalized_trait_impl_contract(item_impl),
+                });
+            }
             return;
         }
         let syn::Type::Path(type_path) = item_impl.self_ty.as_ref() else {
@@ -2276,6 +2453,35 @@ impl<'a> SnapshotBuilder<'a> {
         blocked
     }
 
+    fn resolve_trait_impls(&mut self) {
+        for pending in self.pending_trait_impls.clone() {
+            let trait_public = self.items.iter().any(|item| {
+                item.kind == RustApiItemKind::Trait
+                    && item.key.crate_name == pending.crate_name
+                    && item.origin_module_path == pending.trait_module_path
+                    && item.origin_name == pending.trait_name
+                    && !guards_proven_disjoint(&item.cfg_guard, &pending.cfg_guard)
+            });
+            let owner_public = self.items.iter().any(|item| {
+                item.key.namespace == RustNamespace::Type
+                    && item.key.crate_name == pending.crate_name
+                    && item.origin_module_path == pending.owner_module_path
+                    && item.origin_name == pending.owner_name
+                    && !guards_proven_disjoint(&item.cfg_guard, &pending.cfg_guard)
+            });
+            if trait_public && owner_public {
+                self.unknown_guarded(
+                    RustApiUnknownKind::TraitImplResolution,
+                    Some(&pending.crate_name),
+                    &pending.owner_module_path,
+                    &pending.source_path,
+                    &pending.cfg_guard,
+                    pending.evidence,
+                );
+            }
+        }
+    }
+
     fn resolve_inherent_items(&mut self) {
         for assoc in self.pending_assoc.clone() {
             let owner_key = SymbolKey {
@@ -2513,22 +2719,46 @@ fn normalized_contract(mut item: Item) -> String {
             trim_signature_punctuation(&mut function.sig);
         }
         Item::Struct(value) => {
-            filter_private_fields(&mut value.fields);
+            let layout_sensitive = has_explicit_repr(&value.attrs);
+            let mut normalizer = SignatureAlphaNormalizer::default();
+            normalizer.push_generics(&value.generics);
+            value.generics = normalizer.fold_generics(value.generics.clone());
+            for field in &mut value.fields {
+                field.ty = normalizer.fold_type(field.ty.clone());
+            }
+            normalizer.pop_scope();
+            filter_private_fields(&mut value.fields, layout_sensitive);
             trim_fields_punctuation(&mut value.fields);
             trim_generics_punctuation(&mut value.generics);
         }
         Item::Union(value) => {
-            value.fields.named = value
-                .fields
-                .named
-                .clone()
-                .into_iter()
-                .filter(|field| is_public(&field.vis))
-                .collect();
+            let layout_sensitive = has_explicit_repr(&value.attrs);
+            let mut fields = Fields::Named(value.fields.clone());
+            let mut normalizer = SignatureAlphaNormalizer::default();
+            normalizer.push_generics(&value.generics);
+            value.generics = normalizer.fold_generics(value.generics.clone());
+            for field in &mut fields {
+                field.ty = normalizer.fold_type(field.ty.clone());
+            }
+            normalizer.pop_scope();
+            filter_private_fields(&mut fields, layout_sensitive);
+            let Fields::Named(fields) = fields else {
+                unreachable!("union fields are named")
+            };
+            value.fields = fields;
             trim_trailing_punct(&mut value.fields.named);
             trim_generics_punctuation(&mut value.generics);
         }
         Item::Enum(value) => {
+            let mut normalizer = SignatureAlphaNormalizer::default();
+            normalizer.push_generics(&value.generics);
+            value.generics = normalizer.fold_generics(value.generics.clone());
+            for variant in &mut value.variants {
+                for field in &mut variant.fields {
+                    field.ty = normalizer.fold_type(field.ty.clone());
+                }
+            }
+            normalizer.pop_scope();
             trim_trailing_punct(&mut value.variants);
             trim_generics_punctuation(&mut value.generics);
             for variant in &mut value.variants {
@@ -2556,7 +2786,14 @@ fn normalized_contract(mut item: Item) -> String {
             }
             normalizer.pop_scope();
         }
-        Item::Type(value) => trim_generics_punctuation(&mut value.generics),
+        Item::Type(value) => {
+            let mut normalizer = SignatureAlphaNormalizer::default();
+            normalizer.push_generics(&value.generics);
+            value.generics = normalizer.fold_generics(value.generics.clone());
+            *value.ty = normalizer.fold_type((*value.ty).clone());
+            normalizer.pop_scope();
+            trim_generics_punctuation(&mut value.generics);
+        }
         _ => {}
     }
     let folded = CanonicalFold.fold_item(item);
@@ -2590,17 +2827,32 @@ fn normalized_macro_contract(item: &syn::ItemMacro) -> String {
     canonical_tokens(item.to_token_stream())
 }
 
-fn filter_private_fields(fields: &mut Fields) {
+fn filter_private_fields(fields: &mut Fields, layout_sensitive: bool) {
     match fields {
         Fields::Named(named) => {
             let had_private = named.named.iter().any(|field| !is_public(&field.vis));
-            named.named = named
-                .named
-                .clone()
-                .into_iter()
-                .filter(|field| is_public(&field.vis))
-                .collect();
-            if had_private {
+            if layout_sensitive {
+                for (index, field) in named.named.iter_mut().enumerate() {
+                    if !is_public(&field.vis) {
+                        field.ident = Some(syn::Ident::new(
+                            &format!("__prview_private_field_{index}"),
+                            field
+                                .ident
+                                .as_ref()
+                                .expect("named field has an identifier")
+                                .span(),
+                        ));
+                    }
+                }
+            } else {
+                named.named = named
+                    .named
+                    .clone()
+                    .into_iter()
+                    .filter(|field| is_public(&field.vis))
+                    .collect();
+            }
+            if had_private && !layout_sensitive {
                 named
                     .named
                     .push(syn::parse_quote!(pub __prview_has_private_fields: ()));
@@ -2612,18 +2864,28 @@ fn filter_private_fields(fields: &mut Fields) {
                 .clone()
                 .into_iter()
                 .enumerate()
-                .filter_map(|(index, mut field)| {
-                    if !is_public(&field.vis) {
-                        return None;
-                    }
-                    let marker: Attribute = syn::parse_quote!(#[prview_tuple_index = #index]);
+                .map(|(index, mut field)| {
+                    let marker: Attribute = if is_public(&field.vis) {
+                        syn::parse_quote!(#[prview_tuple_index = #index])
+                    } else {
+                        if !layout_sensitive {
+                            field.ty = syn::parse_quote!(());
+                        }
+                        syn::parse_quote!(#[prview_tuple_private_index = #index])
+                    };
                     field.attrs.push(marker);
-                    Some(field)
+                    field
                 })
                 .collect();
         }
         Fields::Unit => {}
     }
+}
+
+fn has_explicit_repr(attrs: &[Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|attribute| attribute.path().is_ident("repr"))
 }
 
 fn normalize_item_attrs(item: &mut Item) {
@@ -3000,6 +3262,20 @@ fn normalized_associated_contract(
     canonical_tokens(tokens)
 }
 
+fn normalized_trait_impl_contract(item_impl: &syn::ItemImpl) -> String {
+    let mut item_impl = item_impl.clone();
+    normalize_attrs(&mut item_impl.attrs, true);
+    for item in &mut item_impl.items {
+        if let syn::ImplItem::Fn(function) = item {
+            normalize_attrs(&mut function.attrs, false);
+            function.block = syn::parse_quote!({});
+            alpha_normalize_signature(&mut function.sig);
+            trim_signature_punctuation(&mut function.sig);
+        }
+    }
+    canonical_tokens(CanonicalFold.fold_item_impl(item_impl).to_token_stream())
+}
+
 fn normalized_foreign_contract(foreign: &syn::ItemForeignMod, item: &syn::ForeignItem) -> String {
     let mut attrs = foreign.attrs.clone();
     normalize_attrs(&mut attrs, true);
@@ -3337,6 +3613,35 @@ fn is_live_regular_entry(entry: &RevisionEntry) -> bool {
 
 fn required_string<'a>(table: &'a toml::Table, key: &str) -> Option<&'a str> {
     table.get(key).and_then(toml::Value::as_str)
+}
+
+fn cargo_feature_contracts(manifest: &toml::Value) -> Result<Vec<(String, String)>, String> {
+    let Some(features) = manifest.get("features") else {
+        return Ok(Vec::new());
+    };
+    let Some(features) = features.as_table() else {
+        return Err("features must be a table".to_owned());
+    };
+    let mut contracts = Vec::with_capacity(features.len());
+    for (name, value) in features {
+        let Some(members) = value.as_array() else {
+            return Err(format!("features.{name} must be an array of strings"));
+        };
+        let mut members: Vec<_> = members
+            .iter()
+            .map(|member| {
+                member
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("features.{name} must contain only strings"))
+            })
+            .collect::<Result<_, _>>()?;
+        members.sort();
+        members.dedup();
+        contracts.push((name.clone(), format!("cargo feature {name} = {members:?}")));
+    }
+    contracts.sort();
+    Ok(contracts)
 }
 
 fn validate_package_name(name: &str) -> Result<(), String> {
@@ -5464,7 +5769,8 @@ mod tests {
     #[test]
     fn rust_api_snapshot_r3_reachable_extern_crate_is_typed_unknown() {
         let snapshot = snapshot_rust_api(&source("pub extern crate core;"));
-        assert!(snapshot.items.is_empty(), "{:#?}", snapshot.items);
+        assert_eq!(snapshot.items.len(), 1, "{:#?}", snapshot.items);
+        assert_eq!(snapshot.items[0].kind, RustApiItemKind::Crate);
         assert!(snapshot.unknowns.iter().any(|unknown| {
             unknown.kind == RustApiUnknownKind::UnsupportedExternResolution
                 && unknown.evidence.contains("core")
