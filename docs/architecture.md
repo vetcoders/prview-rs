@@ -1319,8 +1319,12 @@ location, exact evidence, and guards, while continuing to exclude source paths,
 provenance, and private reexport target/origin spelling.
 
 Item identity is `crate + external module path + Rust namespace + NFC external
-name`. Value, type, and macro namespaces are separate. Tuple and unit struct
-constructors also occupy Value; named-field structs remain Type-only.
+name`. Value, type, and macro namespaces are separate. The snapshot also emits
+explicit Module, Crate, and CargoFeature identities: public empty modules,
+library-crate declaration changes, and removed or redefined Cargo features
+therefore cannot disappear merely because no ordinary item changed. These
+container namespaces do not participate in Rust `use`-leaf resolution. Tuple
+and unit struct constructors occupy Value; named-field structs remain Type-only.
 `macro_export` is projected to the crate-root Macro namespace, with docs,
 rustfmt, and lint attributes normalized away. Proc-macro crate exports use their
 external macro/derive names only for public functions declared at crate root;
@@ -1332,7 +1336,10 @@ evidence. Foreign functions/statics inherit the parent ABI, safety, and relevant
 attributes.
 
 Contracts are emitted from normalized `syn` ASTs. Function/default bodies and
-private member types are excluded, while ABI, qualifiers,
+ordinary named private member types are excluded. Tuple-field position and
+privacy remain structural because any private tuple element changes constructor
+callability and arity; explicit `repr(...)` types retain anonymized private field
+types because they participate in the declared layout contract. ABI, qualifiers,
 generics/bounds/where clauses, return types, public fields with structural tuple
 indices, enum variants/discriminants, trait headers and associated items, type
 aliases, public constants/statics, and relevant attributes remain. Inherent
@@ -1348,9 +1355,13 @@ evaluating host configuration.
 
 Function parameter patterns are canonicalized to `_`, and generic, const, and
 lifetime binders are alpha-normalized by declaration order across free, trait,
-inherent, foreign, and higher-ranked function signatures. The mapping is reused
-at every bound occurrence, so renaming a binder is neutral while generic order,
-types, ABI, and lifetime relationships remain part of the contract.
+inherent, foreign, and higher-ranked function signatures as well as public
+structs, unions, enums, and type aliases. The mapping is reused at every bound
+occurrence, so renaming a binder is neutral while generic order, types, ABI, and
+lifetime relationships remain part of the contract. Source-only analysis does
+not pretend to resolve trait selection or coherence: a reachable trait impl is
+retained as `TraitImplResolution` uncertainty with its normalized source
+contract until compiler-backed resolution exists.
 
 #### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
 
@@ -1372,6 +1383,12 @@ existing `#[non_exhaustive]` struct remains an informational `Added` field, and
 a wholly new public struct remains an added item; neither case inherits the
 existing-exhaustive breaking rule.
 
+Enum projection applies the corresponding exhaustiveness policy independently:
+adding variants to an exhaustive public enum changes the parent contract, while
+an otherwise unchanged public `#[non_exhaustive]` enum exposes each new variant
+as informational `Added`. Removing or changing an existing variant, or changing
+the enum header/policy, remains a parent `Changed` fact.
+
 Exact identity is grouped on both sides before any fact is consumed: only a
 `1 ↔ 1` component may become a confirmed change, while wider components are
 consumed as deterministic typed ambiguity, including one-sided duplicate
@@ -1392,6 +1409,13 @@ proofs remain typed unknowns. Finding IDs preserve Rust identifier case and
 serialize the complete semantic identity, including both sides' cfg regions,
 contracts, and typed unknown provenance; legal ambiguous input is data, never
 an assertion failure.
+
+A legal non-UTF-8 Git tree component is represented by a deterministic
+`<git-path-bytes:...>` inventory surrogate and a side-specific `PathNonUtf8`
+unknown. The tree walk skips only descendants whose prefix cannot be represented
+and continues through valid siblings. Unlike an unchanged parser/resolver
+unknown, path uncertainty is deliberately not neutralized across revisions and
+does not contaminate confirmed facts from independently parsed valid paths.
 
 `compare_rust_api_revisions` constructs snapshots only from the exact
 `Diff.base_commit_id` and `Diff.target_commit_id` Git trees. It never reads a

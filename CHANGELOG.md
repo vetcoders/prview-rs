@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Repo-backed Rust API analysis now preserves callable tuple-constructor shape,
+  exhaustive versus `#[non_exhaustive]` enum policy, explicit-repr private
+  layout, public data-type binder semantics, and valid siblings beside legal
+  non-UTF-8 Git paths. Trait impls that need compiler resolution remain typed
+  unknowns instead of silently disappearing.
+- Public modules, library-crate declarations, and Cargo feature contracts now
+  participate in the shared Rust `ApiDelta`, so their removal is projected
+  consistently through human artifacts, JSON, MERGE_GATE, report, CLI, and MCP
+  readers without changing schema 2.3 or existing field names.
 - Ctrl-C is observed in every phase of a run, including the artifact stage. The
   interrupt was watched from the same `select!` as the run itself, which only
   works while the run keeps yielding — `artifacts::generate` is synchronous and
