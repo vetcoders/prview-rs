@@ -2095,6 +2095,23 @@ mod tests {
                     .as_deref()
                     .is_some_and(|reason| reason.contains("impl Marker for Value"))
         }));
+
+        let private_control = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "trait PrivateMarker {}\nstruct PrivateValue;\n",
+                "trait PrivateMarker {}\nstruct PrivateValue;\nimpl PrivateMarker for PrivateValue {}\n",
+            ),
+        ]);
+        assert!(
+            private_control.findings().is_empty(),
+            "an impl whose trait and owner are both private is not public API uncertainty"
+        );
     }
 
     #[test]

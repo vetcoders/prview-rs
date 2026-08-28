@@ -268,6 +268,18 @@ struct PendingAssoc {
 }
 
 #[derive(Debug, Clone)]
+struct PendingTraitImpl {
+    crate_name: String,
+    trait_module_path: Vec<String>,
+    trait_name: String,
+    owner_module_path: Vec<String>,
+    owner_name: String,
+    cfg_guard: Vec<String>,
+    source_path: String,
+    evidence: String,
+}
+
+#[derive(Debug, Clone)]
 struct ModuleProof {
     crate_name: String,
     module_path: Vec<String>,
@@ -301,6 +313,7 @@ struct SnapshotBuilder<'a> {
     symbols: BTreeMap<SymbolKey, Vec<RawSymbol>>,
     uses: Vec<UseEdge>,
     pending_assoc: Vec<PendingAssoc>,
+    pending_trait_impls: Vec<PendingTraitImpl>,
     module_proofs: Vec<ModuleProof>,
     all_module_aliases: Vec<RustModuleAlias>,
     completed_sources: BTreeMap<(String, String, Vec<String>, Vec<String>), bool>,
@@ -329,6 +342,7 @@ impl<'a> SnapshotBuilder<'a> {
             symbols: BTreeMap::new(),
             uses: Vec::new(),
             pending_assoc: Vec::new(),
+            pending_trait_impls: Vec::new(),
             module_proofs: Vec::new(),
             all_module_aliases: Vec::new(),
             completed_sources: BTreeMap::new(),
@@ -348,6 +362,7 @@ impl<'a> SnapshotBuilder<'a> {
         self.record_inventory_path_unknowns();
         self.discover_crates();
         self.resolve_reexports();
+        self.resolve_trait_impls();
         self.resolve_inherent_items();
         self.materialize_public_modules();
         self.crates.sort_by(|left, right| {
@@ -1520,16 +1535,30 @@ impl<'a> SnapshotBuilder<'a> {
         cfg_guard: &[String],
         item_impl: &syn::ItemImpl,
     ) {
-        if item_impl.trait_.is_some() {
+        if let Some((_, trait_path, _)) = &item_impl.trait_ {
+            let syn::Type::Path(owner_type) = item_impl.self_ty.as_ref() else {
+                return;
+            };
+            let Some((trait_module_path, trait_name)) = resolve_impl_owner(module_path, trait_path)
+            else {
+                return;
+            };
+            let Some((owner_module_path, owner_name)) =
+                resolve_impl_owner(module_path, &owner_type.path)
+            else {
+                return;
+            };
             if module_reachable {
-                self.unknown_guarded(
-                    RustApiUnknownKind::TraitImplResolution,
-                    Some(crate_name),
-                    module_path,
-                    source_path,
-                    cfg_guard,
-                    normalized_trait_impl_contract(item_impl),
-                );
+                self.pending_trait_impls.push(PendingTraitImpl {
+                    crate_name: crate_name.to_owned(),
+                    trait_module_path,
+                    trait_name,
+                    owner_module_path,
+                    owner_name,
+                    cfg_guard: cfg_guard.to_vec(),
+                    source_path: source_path.to_owned(),
+                    evidence: normalized_trait_impl_contract(item_impl),
+                });
             }
             return;
         }
@@ -2422,6 +2451,35 @@ impl<'a> SnapshotBuilder<'a> {
         blocked.sort();
         blocked.dedup();
         blocked
+    }
+
+    fn resolve_trait_impls(&mut self) {
+        for pending in self.pending_trait_impls.clone() {
+            let trait_public = self.items.iter().any(|item| {
+                item.kind == RustApiItemKind::Trait
+                    && item.key.crate_name == pending.crate_name
+                    && item.origin_module_path == pending.trait_module_path
+                    && item.origin_name == pending.trait_name
+                    && !guards_proven_disjoint(&item.cfg_guard, &pending.cfg_guard)
+            });
+            let owner_public = self.items.iter().any(|item| {
+                item.key.namespace == RustNamespace::Type
+                    && item.key.crate_name == pending.crate_name
+                    && item.origin_module_path == pending.owner_module_path
+                    && item.origin_name == pending.owner_name
+                    && !guards_proven_disjoint(&item.cfg_guard, &pending.cfg_guard)
+            });
+            if trait_public && owner_public {
+                self.unknown_guarded(
+                    RustApiUnknownKind::TraitImplResolution,
+                    Some(&pending.crate_name),
+                    &pending.owner_module_path,
+                    &pending.source_path,
+                    &pending.cfg_guard,
+                    pending.evidence,
+                );
+            }
+        }
     }
 
     fn resolve_inherent_items(&mut self) {

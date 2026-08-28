@@ -1359,9 +1359,10 @@ inherent, foreign, and higher-ranked function signatures as well as public
 structs, unions, enums, and type aliases. The mapping is reused at every bound
 occurrence, so renaming a binder is neutral while generic order, types, ABI, and
 lifetime relationships remain part of the contract. Source-only analysis does
-not pretend to resolve trait selection or coherence: a reachable trait impl is
-retained as `TraitImplResolution` uncertainty with its normalized source
-contract until compiler-backed resolution exists.
+not pretend to resolve trait selection or coherence: an impl whose trait and
+owner are both externally reachable is retained as `TraitImplResolution`
+uncertainty with its normalized source contract until compiler-backed resolution
+exists; private/private impls do not degrade the public surface.
 
 #### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
 
