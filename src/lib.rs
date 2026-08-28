@@ -217,19 +217,26 @@ impl App {
         self.ensure_not_cancelled()?;
 
         // 6. Run heuristics (loctree-suite)
-        // In remote/remote-only mode, use git snapshots for deterministic analysis.
+        // Any off-HEAD target uses an immutable Git snapshot. `--local-only`
+        // controls ref resolution; it does not make a named local branch equal
+        // to the workspace tree currently checked out.
         // Feed the SAME merge-base range the artifact diff uses (`diff_bases`), not
         // the raw base tips: when the base branch has advanced with unrelated work,
         // snapshotting the tip would compute the regression delta against base-only
         // files the patch excludes, fabricating regressions/caveats. All signals
         // must share one range.
         self.ensure_not_cancelled()?;
-        let heuristics_result = if self.config.remote_mode || self.config.remote_only {
-            self.run_heuristics_with_snapshots(&target, &diff_bases)
-                .await?
-        } else {
-            heuristics::run_all(&self.config, None).await?
-        };
+        let target_is_workspace_head = self
+            .repo
+            .head_commit_id()
+            .is_ok_and(|head| head == target.commit_id);
+        let heuristics_result =
+            if self.config.remote_mode || self.config.remote_only || !target_is_workspace_head {
+                self.run_heuristics_with_snapshots(&target, &diff_bases)
+                    .await?
+            } else {
+                heuristics::run_all(&self.config, None).await?
+            };
         self.ensure_not_cancelled()?;
 
         // 7. Generate artifacts. The ledger is still alive here, and with it the
@@ -1288,5 +1295,50 @@ mod tests {
             reg_mb.base_sha, reg_tip.base_sha,
             "the chosen base ref changes which tree the regression is computed against"
         );
+    }
+
+    #[tokio::test]
+    async fn local_off_head_target_heuristics_use_the_target_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git_run(repo, &["init", "-q", "-b", "main"]);
+        git_run(repo, &["config", "user.email", "t@t.t"]);
+        git_run(repo, &["config", "user.name", "T"]);
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn base() {}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "base"]);
+        let base_sha = rev_parse(repo, "HEAD");
+
+        git_run(repo, &["checkout", "-q", "-b", "review"]);
+        std::fs::write(repo.join("src/lib.rs"), "pub fn reviewed() {}\n").unwrap();
+        git_run(repo, &["add", "."]);
+        git_run(repo, &["commit", "-q", "-m", "review"]);
+        let target_sha = rev_parse(repo, "HEAD");
+        git_run(repo, &["checkout", "-q", "main"]);
+
+        let mut config = test_config();
+        config.repo_root = repo.to_path_buf();
+        config.run_heuristics = true;
+        config.local_only = true;
+        config.remote_mode = false;
+        config.remote_only = false;
+        let app = crate::App::from_config(config).unwrap();
+        let result = app
+            .run_heuristics_with_snapshots(&resolved(&target_sha), &[resolved(&base_sha)])
+            .await
+            .unwrap();
+
+        assert_eq!(result.analysis_sha.as_deref(), Some(target_sha.as_str()));
+        assert!(
+            result.analysis_root.is_some(),
+            "off-HEAD target needs snapshot cwd"
+        );
+        assert_ne!(app.repo.head_commit_id().unwrap(), target_sha);
     }
 }

@@ -299,6 +299,14 @@ struct ModuleVisibilityProof {
     declared_public: bool,
 }
 
+/// Cargo manifests below test/fixture containers describe analysis inputs, not
+/// product crates. Treating them as workspace API makes strings in regression
+/// corpora look like shipped public symbols.
+fn is_test_or_fixture_path(path: &str) -> bool {
+    path.split('/')
+        .any(|component| matches!(component, "tests" | "fixtures"))
+}
+
 struct SnapshotBuilder<'a> {
     source: &'a dyn RevisionFileSource,
     provenance: RevisionProvenance,
@@ -575,6 +583,7 @@ impl<'a> SnapshotBuilder<'a> {
                     .file_name()
                     .and_then(|name| name.to_str())
                     == Some("Cargo.toml")
+                    && !is_test_or_fixture_path(path)
             })
             .map(|(path, _)| path.clone())
             .collect();
@@ -4773,6 +4782,42 @@ mod tests {
             ("src/lib.rs", b"pub fn ignored() {}"),
         ]);
         assert!(snapshot_rust_api(&autolib_false).crates.is_empty());
+
+        let test_and_fixture_manifests = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='product'\nversion='0.0.0'\n",
+            ),
+            ("src/lib.rs", b"pub fn shipped() {}"),
+            (
+                "tests/string-input/Cargo.toml",
+                b"[package]\nname='test_string'\nversion='0.0.0'\n",
+            ),
+            (
+                "tests/string-input/src/lib.rs",
+                b"pub fn false_positive() {}",
+            ),
+            (
+                "fixtures/sample/Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\n",
+            ),
+            ("fixtures/sample/src/lib.rs", b"pub fn false_positive() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&test_and_fixture_manifests);
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|krate| krate.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["product"]
+        );
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .all(|item| item.key.external_name != "false_positive")
+        );
 
         for manifest in [
             "[package]\nversion='0.0.0'\n",

@@ -1511,11 +1511,16 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
         .map(|(name, sha)| json!({ "name": name, "sha": sha }))
         .collect();
 
+    let workspace_head_sha = repo.head_commit_id().ok();
     let provenance = json!({
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "generated_at": chrono::Local::now().to_rfc3339(),
         // Commit whose tree the pack judges.
         "target_sha": resolved_target.commit_id,
+        // Explicit names remove the historical ambiguity of `head_sha` for
+        // current readers. The old aliases remain additive compatibility keys.
+        "reviewed_target_sha": resolved_target.commit_id,
+        "workspace_head_sha": workspace_head_sha,
         // The commit the FIRST patch was really computed against — the merge
         // base when the branches diverged, not the base tip the operator named.
         // Kept for consumers that predate `bases[]`; it is that array's first
@@ -1526,7 +1531,7 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
         "bases": base_rows,
         // Commit checked out locally. Equal to target_sha for an ordinary local
         // review; different when a fetched ref is analysed (`--pr`/`--remote`).
-        "head_sha": repo.head_commit_id().ok(),
+        "head_sha": workspace_head_sha,
         "worktree": {
             // Frozen before checks ran and before any artifact was written
             // (R4-19), so tool output cannot flip a clean scan to "dirty".

@@ -635,6 +635,8 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
 "what did *this pack* judge", once, for a reviewer holding only the artifacts:
 
 - `target_sha` — commit whose tree the pack judges;
+- `reviewed_target_sha` — explicit current name for that reviewed commit;
+  equal to `target_sha` (the latter remains for schema-1.0 readers);
 - `bases[]` — every baseline the pack's patches were generated from, as
   `{name, sha}` in diff order. Each `sha` is the **merge base** taken from its
   diff (`Diff.base_commit_id`), not the tip of the base branch. The two differ
@@ -646,8 +648,11 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   baselines there are and fill the array instead;
 - `base_sha` — the first entry's `sha`, kept for consumers that predate
   `bases[]`. It is derived from that array, so the two cannot disagree;
-- `head_sha` — commit checked out locally (equal to `target_sha` for an ordinary
-  local review, different under `--pr`/`--remote`);
+- `workspace_head_sha` — commit checked out locally. It can differ from the
+  reviewed target for remote and named off-HEAD local reviews;
+- `head_sha` — compatibility alias for `workspace_head_sha`. Schema 1.1 readers
+  must use the explicit pair `reviewed_target_sha` / `workspace_head_sha` and
+  never infer reviewed identity from this legacy key;
 - `worktree.clean` — whether the local tree had uncommitted changes, frozen
   **before** any check ran or artifact was written (R4-19). `null` when the
   status could not be read at all (an unreadable or malformed index): the two

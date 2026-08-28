@@ -2129,7 +2129,7 @@ fn generated_pack_carries_pack_level_provenance() {
     )
     .expect("PROVENANCE.json must be valid JSON");
 
-    assert_eq!(provenance["schema_version"].as_str(), Some("1.0"));
+    assert_eq!(provenance["schema_version"].as_str(), Some("1.1"));
 
     // The pack-level record must agree with RUN.json about what was analysed —
     // two truths about the substrate is exactly the failure mode it prevents.
@@ -2138,9 +2138,17 @@ fn generated_pack_carries_pack_level_provenance() {
     )
     .expect("parse RUN.json");
     assert_eq!(provenance["target_sha"], run["refs"]["target_sha"]);
+    assert_eq!(
+        provenance["reviewed_target_sha"], run["refs"]["target_sha"],
+        "reviewed identity is explicit rather than inferred from workspace HEAD"
+    );
     assert!(
         provenance["head_sha"].is_string(),
         "the locally checked-out commit must be recorded"
+    );
+    assert_eq!(
+        provenance["workspace_head_sha"], provenance["head_sha"],
+        "legacy head_sha stays an alias for the explicitly named workspace HEAD"
     );
     assert!(
         provenance["base_sha"].is_string(),

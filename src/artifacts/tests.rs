@@ -7349,10 +7349,16 @@ fn provenance_json_records_pack_level_substrate() {
 
     let json = write_provenance_fixture(repo_tmp.path(), out.path(), &checks);
 
-    assert_eq!(json["schema_version"], "1.0");
+    assert_eq!(json["schema_version"], "1.1");
     assert_eq!(json["target_sha"], "abc1234abc1234abc1234abc1234abc1234ab");
+    assert_eq!(
+        json["reviewed_target_sha"],
+        "abc1234abc1234abc1234abc1234abc1234ab"
+    );
     assert_eq!(json["base_sha"], "def5678def5678def5678def5678def5678de");
     assert_eq!(json["head_sha"], head);
+    assert_eq!(json["workspace_head_sha"], head);
+    assert_ne!(json["reviewed_target_sha"], json["workspace_head_sha"]);
     assert_eq!(json["worktree"]["clean"], true);
     assert!(
         json["worktree"]["status_digest"]

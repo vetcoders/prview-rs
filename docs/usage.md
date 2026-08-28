@@ -573,7 +573,9 @@ uncertainty while valid sibling files continue to be analyzed.
 #### How to read an artifact pack
 
 - `00_summary/MERGE_GATE.json` is the canonical source of check statuses.
-- `00_summary/PROVENANCE.json` answers *what was judged*: the target/base/head commits, whether the local
+- `00_summary/PROVENANCE.json` answers *what was judged*: `reviewed_target_sha`
+  and `workspace_head_sha` name the reviewed tree and local checkout separately;
+  legacy `target_sha` / `head_sha` remain aliases. It also records the base commits, whether the local
   working tree was clean when the run started (plus a digest fingerprinting what was dirty, content included),
   and, per check, the directory and commit it actually read. `bases[]` names every baseline the pack's patches
   were computed from — the merge base of each diff, not the tip of the base branch — and `base_sha` is its first
