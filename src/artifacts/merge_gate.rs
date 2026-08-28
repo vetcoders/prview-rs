@@ -643,10 +643,7 @@ fn inline_sarif_artifact_state(
     let states = security
         .map(|eval| eval.execution_state)
         .collect::<Vec<_>>();
-    if states
-        .iter()
-        .any(|state| *state == CheckExecutionState::Executed)
-    {
+    if states.contains(&CheckExecutionState::Executed) {
         "scanned_zero"
     } else if states.iter().any(|state| {
         matches!(

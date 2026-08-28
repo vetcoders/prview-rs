@@ -1234,10 +1234,7 @@ fn report_sarif_artifact_state(
         })
         .map(|evaluation| evaluation.execution_state)
         .collect::<Vec<_>>();
-    if states
-        .iter()
-        .any(|state| *state == CheckExecutionState::Executed)
-    {
+    if states.contains(&CheckExecutionState::Executed) {
         "scanned_zero"
     } else if states.iter().any(|state| {
         matches!(
