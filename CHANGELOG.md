@@ -13,6 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Evaluator surfaces now preserve five distinct check states (`executed`,
+  `skipped`, `not_applicable`, `unavailable`, `unknown`) and publish concrete
+  evidence gaps across `MERGE_GATE.json`, `report.json`, `checks-status.json`,
+  `AI_INDEX.md`, and `PR_REVIEW.md`. `quality_pass` is explicitly the outcome
+  of executed checks, not a claim that every configured check ran; optional
+  SARIF distinguishes positive, scanned-zero, unavailable, not-applicable, and
+  not-generated states.
+- `report.json.gate.status` now carries the canonical
+  `PASS`/`CONDITIONAL`/`BLOCK` verdict. It no longer converts every
+  `allow_merge: false` decision to `BLOCK`. Generated `PR_REVIEW.md` is an
+  evidence overview rather than an empty author/reviewer template.
+- Test-change association uses `exact`, `import_backed`, `weak`, and `multiple`
+  states. Weak basename-only and ambiguous matches remain visible but no longer
+  inflate the headline percentage. Rust diff-only public-API analysis remains
+  test-only, and unsafe evidence separates production from test-only findings.
 - Repo-backed Rust API analysis now preserves callable tuple-constructor shape,
   exhaustive versus `#[non_exhaustive]` enum policy, explicit-repr private
   layout, public data-type binder semantics, and valid siblings beside legal

@@ -1,6 +1,7 @@
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use prview::git::git_cmd;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -13,6 +14,13 @@ fn run_git(repo: &Path, args: &[&str]) {
         .status()
         .expect("failed to run git command");
     assert!(status.success(), "git command failed: {:?}", args);
+}
+
+fn sha256_file(path: &Path) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(fs::read(path).expect("read hashed fixture"))
+    )
 }
 
 fn create_fixture_repo() -> TempDir {
@@ -1863,6 +1871,94 @@ fn generated_merge_gate_nulls_inline_findings_path_when_sarif_is_absent() {
         gate["files"]["inline_findings"].is_null(),
         "files.inline_findings should be null when no SARIF file is written"
     );
+
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("report.json")).expect("read report"),
+    )
+    .expect("parse report");
+    assert_eq!(
+        report["gate"]["status"], gate["decision"]["verdict"],
+        "report must not project CONDITIONAL + allow_merge=false to BLOCK"
+    );
+
+    let check_status: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("checks-status.json")).expect("read check status"),
+    )
+    .expect("parse check status");
+    let gate_ids = gate["checks"]
+        .as_array()
+        .expect("gate checks")
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let status_ids = check_status["_checks"]
+        .as_array()
+        .expect("typed check inventory")
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        status_ids, gate_ids,
+        "one canonical check set across JSON surfaces"
+    );
+
+    let ai_index = fs::read_to_string(output_dir.join("AI_INDEX.md")).expect("read AI index");
+    assert!(ai_index.contains("Evidence completeness:"));
+    assert!(ai_index.contains("does not mean every check ran"));
+    let review = fs::read_to_string(output_dir.join("PR_REVIEW.md")).expect("read PR review");
+    assert!(review.starts_with("# Generated Evidence Overview"));
+    assert!(!review.contains("<!-- Describe your changes -->"));
+}
+
+#[test]
+fn pinned_v0_7_fixture_preserves_the_conditional_to_block_contradiction() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packs/v0.7.0");
+    let receipt: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("receipt.json")).expect("read fixture receipt"),
+    )
+    .expect("parse fixture receipt");
+    let gate: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("sanitized/00_summary/MERGE_GATE.json"))
+            .expect("read historical gate"),
+    )
+    .expect("parse historical gate");
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("sanitized/report.json")).expect("read historical report"),
+    )
+    .expect("parse historical report");
+
+    assert_eq!(
+        receipt["generator"]["commit"],
+        "2e11cc6d6e90a606a17d71d0d093a1e2f564bc80"
+    );
+    assert_eq!(
+        receipt["repository"]["base_oid"],
+        "6e4feb2f3da353b47950ee7a3926e4eddba2f6f4"
+    );
+    assert_eq!(
+        receipt["repository"]["head_oid"],
+        "2580ff2892a4900c12bd5cf408ad034e39843a7a"
+    );
+    assert_eq!(gate["decision"]["verdict"], "CONDITIONAL");
+    assert_eq!(gate["decision"]["allow_merge"], false);
+    assert_eq!(report["gate"]["status"], "BLOCK");
+    for relative in [
+        "sanitized/00_summary/MERGE_GATE.json",
+        "sanitized/report.json",
+        "sanitized/checks-status.json",
+    ] {
+        assert_eq!(
+            sha256_file(&root.join(relative)),
+            receipt["sanitized_artifacts"][relative]
+                .as_str()
+                .expect("pinned sanitized hash"),
+            "fixture bytes drifted: {relative}"
+        );
+    }
+    assert!(gate["checks"].as_array().is_some_and(|rows| {
+        rows.iter()
+            .any(|row| row["id"] == "cargo_test" && row["execution_state"] == "skipped")
+    }));
 }
 
 #[test]

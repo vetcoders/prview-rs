@@ -1,0 +1,9 @@
+{
+  "cargo": "passed",
+  "cargo_audit": "skipped (security disabled)",
+  "cargo_test": "skipped (tests disabled)",
+  "clippy": "skipped (lint disabled)",
+  "heuristics_loctree": "skipped (heuristics disabled)",
+  "rustfmt": "skipped (lint disabled)",
+  "semgrep_scan": "passed"
+}

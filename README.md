@@ -80,7 +80,7 @@ prview open
 Every run writes an artifact pack:
 
 - `AI_INDEX.md` — entry point for humans and agents
-- `PR_REVIEW.md` — the unified review narrative
+- `PR_REVIEW.md` — generated evidence overview (not a review attestation)
 - `report.json` — machine-readable output
 - `dashboard.html` — interactive exploration
 - `00_summary/MERGE_GATE.json` — gate automation
@@ -192,7 +192,7 @@ step.
 | File | What it's for |
 |------|---------------|
 | `AI_INDEX.md` | Compact entry point for human/agent review |
-| `PR_REVIEW.md` | Unified review narrative |
+| `PR_REVIEW.md` | Generated evidence overview; no fabricated reviewer checklist |
 | `report.json` | Machine-readable findings |
 | `dashboard.html` | Visual summary of the analysis |
 | `00_summary/MERGE_GATE.json` | Pass/fail gate for automation |
@@ -203,6 +203,8 @@ step.
 | `INLINE_FINDINGS.sarif` | Per-finding annotations (optional) |
 
 The merge decision is a single enum — `PASS`, `CONDITIONAL`, or `BLOCK` — so both humans and automation read one truth. See [`docs/contracts/merge_gate.md`](docs/contracts/merge_gate.md).
+`quality_pass` describes executed quality checks only; evidence completeness and
+merge permission remain separate axes.
 
 ## MCP server
 

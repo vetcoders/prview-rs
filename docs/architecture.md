@@ -727,8 +727,9 @@ contains only checks that produced a `CheckResult`, so `outcome.checks_run` is
 the number of executed (including cache-replayed and runtime-skipped) checks,
 not the number configured. `00_summary/MERGE_GATE.json.checks[]` additionally
 contains checks ruled out before execution, with their policy state and reason.
-The legacy root `checks-status.json` is a compact id-to-status projection of
-that same complete evaluation list. It never reruns eligibility while artifacts
+The root `checks-status.json` retains its legacy id-to-display-string keys and
+adds `_schema_version: "2.0"` plus `_checks[]`, the typed projection of that
+same complete evaluation list used by `MERGE_GATE.json`. It never reruns eligibility while artifacts
 are being written; doing so could report a different reason from the run that
 actually happened. Pre-run skip provenance remains in `PROVENANCE.json` as
 described above.
@@ -1999,7 +2000,8 @@ is not mistaken for the end of the item.
 
 #### signal/coverage.rs — coverage delta computation
 
-Cross-references changed source files with test files to estimate test coverage:
+Cross-references changed source files with changed tests. This is an association
+signal, not executed code coverage:
 
 - `CoverageSignal` struct — canonical single source of truth for all consumers (`dashboard.html`, `MERGE_GATE.json`, `PR_REVIEW.md`, text artifact)
 - `CoverageDelta` struct — legacy wrapper with `from_signal()` conversion
@@ -2008,6 +2010,11 @@ Cross-references changed source files with test files to estimate test coverage:
 - `compute_coverage_signal(diffs, repo_root, repo)` — the canonical computation function
 - `generate_coverage_delta(dir, signal)` — renders `coverage-delta.txt` from a pre-computed signal
 - `format_coverage_pct(Option<u32>)` — the one renderer for the percentage; `None` becomes `not measured`
+
+Associations are typed `exact`, `import_backed`, `weak`, or `multiple`. Only
+exact/import-backed associations and verified inline Rust tests contribute to
+the headline ratio; weak basename matches and ambiguous candidates stay
+visible for review but do not count as covered.
 
 **Unmeasured is not 100%.** `coverage_pct` / `CoverageDelta::pct` are
 `Option<u32>` and are `None` whenever no changed source file was evaluated
@@ -2122,7 +2129,9 @@ even when the `#[cfg(test)]` annotation is outside the patch hunk.
 The writer preserves the legacy top-level JSON fields while embedding the full
 repo-backed Rust `ApiArtifactView` additively. Rust findings are projected only
 for old-reader compatibility; the embedded view is authoritative. Legacy
-analysis receives JS/TS patch sections only.
+analysis receives JS/TS patch sections only. The diff-only Rust generator is
+compiled only for compatibility tests and is not re-exported by the production
+signal facade.
 
 - `PublicSymbol` struct — name, kind (`Fn`, `Struct`, `Enum`, `Trait`, `Type`, `Const`, `Static`),
   file path, and whether it was added or removed
@@ -2148,8 +2157,10 @@ Supported manifests:
 
 #### signal/unsafe_audit.rs — new unsafe blocks + SAFETY comment scan
 
-Scans diff patches for newly introduced `unsafe` blocks and checks whether each one
-is accompanied by a `// SAFETY:` comment explaining the invariant:
+Scans production and test diff patches for newly introduced `unsafe` blocks and
+checks whether each one is accompanied by a `// SAFETY:` comment explaining the invariant.
+Every finding carries `scope: production|test_only`; a test-only-only artifact
+is preserved with a passing check status rather than inheriting production policy severity:
 
 - `UnsafeHit` struct — file path, line number, surrounding context, and `has_safety_comment` flag
 - `audit_unsafe(diffs)` — iterates added lines in all patches, identifies `unsafe {` block

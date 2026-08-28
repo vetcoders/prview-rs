@@ -1,0 +1,34 @@
+{
+  "schema_version": "2.2",
+  "target": "feature/evidence-gap",
+  "bases": ["main"],
+  "checks": [
+    {"id":"cargo","name":"Cargo check","status":"passed","execution_state":"executed","outcome":"passed"},
+    {"id":"semgrep_scan","name":"Semgrep scan","status":"passed","execution_state":"executed","outcome":"passed"},
+    {"id":"heuristics_loctree","name":"heuristics_loctree","status":"skipped","execution_state":"unknown","outcome":"unknown","reason":"Loctree heuristics not available"},
+    {"id":"public_api_diff","name":"public_api_diff","status":"warnings","execution_state":"executed","outcome":"findings_warning"},
+    {"id":"clippy","name":"Clippy","status":"skipped","execution_state":"skipped","outcome":"skipped","reason":"lint disabled"},
+    {"id":"rustfmt","name":"Rustfmt","status":"skipped","execution_state":"skipped","outcome":"skipped","reason":"lint disabled"},
+    {"id":"cargo_test","name":"Cargo test","status":"skipped","execution_state":"skipped","outcome":"skipped","reason":"tests disabled"},
+    {"id":"cargo_audit","name":"Cargo audit","status":"skipped","execution_state":"skipped","outcome":"skipped","reason":"security disabled"}
+  ],
+  "inline_findings": {"file":"30_context/INLINE_FINDINGS.sarif","file_exists":true,"findings_count":1,"status":"warnings"},
+  "decision": {
+    "verdict": "CONDITIONAL",
+    "analysis_status": "degraded",
+    "merge_recommendation": "review_required",
+    "allow_merge": false,
+    "policy_allow_merge": true,
+    "quality_pass": true,
+    "recommended_merge": false,
+    "quality_failures": [],
+    "review_caveats": [
+      "heuristics_loctree skipped: Loctree heuristics not available",
+      "Clippy skipped: lint disabled",
+      "Rustfmt skipped: lint disabled",
+      "Cargo test skipped: tests disabled",
+      "Cargo audit skipped: security disabled"
+    ],
+    "blocking_issues": []
+  }
+}

@@ -271,6 +271,7 @@ use std::time::Duration;
 #[test]
 fn api_delta_no_diff_only_runtime() {
     let artifacts_production = include_str!("mod.rs");
+    let signal_facade = include_str!("signal/mod.rs");
     let cli_production = include_str!("../lib.rs");
     let tui_production = include_str!("../tui/mod.rs");
     assert!(cli_production.contains("prepare_rust_api_delta("));
@@ -281,6 +282,8 @@ fn api_delta_no_diff_only_runtime() {
     assert!(artifacts_production.contains("analyze_js_ts_public_api_diff(&patch_texts)"));
     assert!(artifacts_production.contains("analyze_js_ts_breaking_changes(&patch_texts)"));
     assert!(artifacts_production.contains("analyze_rust_env_requirements(&patch_texts)"));
+    assert!(signal_facade.contains("pub(crate) mod public_api;"));
+    assert!(!signal_facade.contains("pub use public_api::*;"));
     assert!(
         !artifacts_production.contains("generate_public_api_diff(&quality_dir, &patch_texts)"),
         "Rust production must never return to the diff-only PUBLIC_API backend"
@@ -5102,7 +5105,7 @@ fn ai_index_coverage_signal_says_not_measured_for_zero_of_zero() {
     let index = std::fs::read_to_string(out.join("AI_INDEX.md")).expect("AI_INDEX.md");
     assert!(
         index.contains(&format!(
-            "Coverage signal: 0/0 changed code files ({COVERAGE_NOT_MEASURED})"
+            "Strong test-change associations (not executed coverage): 0/0 changed code files ({COVERAGE_NOT_MEASURED})"
         )),
         "0/0 must be labelled not-measured, got:\n{index}"
     );
@@ -5124,7 +5127,9 @@ fn ai_index_coverage_signal_says_not_measured_for_zero_of_zero() {
     generate_ai_index(out, &config, &diffs, &[], &measured).expect("ai index");
     let index = std::fs::read_to_string(out.join("AI_INDEX.md")).expect("AI_INDEX.md");
     assert!(
-        index.contains("Coverage signal: 0/4 changed code files (0%)"),
+        index.contains(
+            "Strong test-change associations (not executed coverage): 0/4 changed code files (0%)"
+        ),
         "0/N must render as 0%, got:\n{index}"
     );
     assert!(!index.contains(COVERAGE_NOT_MEASURED));
@@ -5418,7 +5423,9 @@ fn pr_review_uses_coverage_delta_for_warning_summary() {
     .expect("pr review");
     let content = std::fs::read_to_string(tmp.path().join("PR_REVIEW.md")).expect("read");
 
-    assert!(content.contains("Coverage review signal: 25% heuristic coverage (1/4)"));
+    assert!(content.contains(
+        "Test-change association signal (not executed coverage): 25% strong associations (1/4)"
+    ));
     assert!(
             content.contains(
                 "Rust caveat: coverage heuristic may miss inline `#[cfg(test)]` modules inside changed `.rs` files."

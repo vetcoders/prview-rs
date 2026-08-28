@@ -1,0 +1,32 @@
+{
+  "schema_version": "2.0",
+  "meta": {
+    "tool": {"name":"prview","version":"0.7.0"},
+    "range": {
+      "base":"main",
+      "head":"feature/evidence-gap",
+      "merge_base":"6e4feb2f3da353b47950ee7a3926e4eddba2f6f4"
+    }
+  },
+  "gate": {
+    "verdict":"CONDITIONAL",
+    "analysis_status":"degraded",
+    "merge_recommendation":"review_required",
+    "allow_merge":false,
+    "policy_allow_merge":true,
+    "quality_pass":true,
+    "status":"BLOCK",
+    "summary":"Quality gates passed, but 8 review signals need attention"
+  },
+  "checks_skipped": [
+    {"id":"clippy","name":"Clippy","reason":"lint disabled"},
+    {"id":"rustfmt","name":"Rustfmt","reason":"lint disabled"},
+    {"id":"cargo_test","name":"Cargo test","reason":"tests disabled"},
+    {"id":"cargo_audit","name":"Cargo audit","reason":"security disabled"}
+  ],
+  "quality": {
+    "coverage":{"heuristic_ratio":0.0,"measured":true,"matched":0,"total":1},
+    "sarif":{"findings_count":1,"sarif_path":"30_context/INLINE_FINDINGS.sarif"},
+    "heuristics":{"available":false,"status":"skipped","skip_reason":"heuristics not run"}
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "kind": "interrupted_run",
+  "date": "2026-08-28",
+  "source": "Vista --deep observation from W3-01 operator evidence",
+  "completed_pack": false,
+  "final_verdict_present": false,
+  "known_partial_state": ["cache", "provenance"],
+  "termination": "external",
+  "minimum_observed_runtime_secs": 325,
+  "rule": "must never be selected as current merge evidence"
+}

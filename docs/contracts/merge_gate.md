@@ -58,8 +58,8 @@ Every element of `checks` is one policy evaluation record:
 | `id` | string | Policy check id (`check_id`) |
 | `name` | string | Human-readable check name |
 | `status` | string | `passed` \| `failed` \| `warnings` \| `skipped` \| `error` — lowercase, exactly |
-| `execution_state` | string | `executed` \| `skipped` \| `unavailable` \| `unknown` |
-| `outcome` | string | `passed` \| `findings_failed` \| `findings_warning` \| `system_error` \| `skipped` \| `unavailable` \| `unknown` |
+| `execution_state` | string | `executed` \| `skipped` \| `not_applicable` \| `unavailable` \| `unknown` |
+| `outcome` | string | `passed` \| `findings_failed` \| `findings_warning` \| `system_error` \| `skipped` \| `not_applicable` \| `unavailable` \| `unknown` |
 | `class` | string | `PASS` \| `SKIP` \| `FAIL` \| `INFO` |
 | `severity` | string | `block` \| `warn` \| `ignore` |
 | `policy_conclusion` | string | `satisfied` \| `advisory` \| `blocked` |
@@ -72,7 +72,7 @@ Every element of `checks` is one policy evaluation record:
 | `evidence` | string | `20_quality/<artifact_id>.result.json` for an executed check; otherwise the reason text or `"skipped — no artifact generated"` |
 | `log` | string \| null | `20_quality/<artifact_id>.log` for an executed check, else `null` |
 
-Skipped or unavailable checks carry no executed `CheckResult`, so `duration_secs`
+Skipped, not-applicable, or unavailable checks carry no executed `CheckResult`, so `duration_secs`
 is `0.0`, `cached` is `null`, `log` is `null`, and `evidence` degrades to a
 non-empty placeholder. These are contract-valid placeholders, never `null`
 evidence — the artifact must not fail its own gate on a runner that lacks a tool.
@@ -263,6 +263,7 @@ authoritative axes — `analysis_status` (confidence) and `merge_recommendation`
 | `unclassified_quality_failures` | string[] | Failures with unknown provenance |
 | `quality_failure_details` | object[] | `[{ name, classification, origin }]` — `name` a non-empty check name, `classification` one of `introduced` \| `pre-existing` \| `mixed` \| `unclassified`, `origin` `"failure"` \| `"warning"` (schema 2.2) |
 | `decision_reason` | string | Human-readable reason for the verdict |
+| `evidence_gaps` | object[] | Non-applicable checks are excluded; each skipped, unavailable, or unknown row names `check_id`, `execution_state`, reason, and a concrete `verification_target` |
 | `review_caveats` | string[] | Non-blocking caveats requiring reviewer attention |
 | `blocking_issues` | string[] | Issues that block the merge |
 
@@ -283,6 +284,11 @@ by `derive_decision` (`src/artifacts/verdict.rs`), which calls
 | `BLOCK` | `merge_recommendation == block` |
 | `CONDITIONAL` | `merge_recommendation == review_required`, OR `approve` with degraded/incomplete analysis or failing quality |
 | `PASS` | `merge_recommendation == approve` AND `analysis_status == complete` AND `quality_pass == true` |
+
+`quality_pass` is deliberately narrow: it says the executed quality checks did
+not introduce a failure. It is not evidence that every configured check ran.
+Completeness lives in `analysis_status`, per-check `execution_state`, and
+`evidence_gaps`; merge permission lives in `allow_merge`.
 
 ## Enforcement disposition (schema 2.3)
 

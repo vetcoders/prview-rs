@@ -9,7 +9,7 @@ This pack contains all the analysis output in both human-readable and machine-re
 A typical artifact pack looks like this:
 
 ```
-├── PR_REVIEW.md             # Unified review narrative with risks and recommendations
+├── PR_REVIEW.md             # Generated evidence overview; no review attestation
 ├── report.json              # Full machine-readable report payload on disk
 ├── 00_summary/
 │   ├── RUN.json             # Run metadata + execution mode + check inventory
@@ -28,7 +28,7 @@ A typical artifact pack looks like this:
 ├── 20_quality/
 │   ├── *.result.json         # Per-check machine-readable outputs
 │   ├── *.log                 # Per-check raw logs
-│   ├── coverage-delta.txt    # Source↔test mapping with change status
+│   ├── coverage-delta.txt    # Test-change associations, not executed coverage
 │   ├── PUBLIC_API_DIFF.json  # Compatibility rows + lossless repo-backed Rust API delta
 │   ├── PUBLIC_API_DIFF.md    # Human API summary
 │   ├── BREAKING_CHANGES.json # Same lossless Rust delta used by the merge gate
@@ -44,7 +44,9 @@ A typical artifact pack looks like this:
 
 ## Key Files
 
-1. **`PR_REVIEW.md`**: The main entry point for a human reviewer. It contains a narrative summary of the PR, including structural risks, test coverage gaps, and architectural insights.
+1. **`PR_REVIEW.md`**: A generated evidence overview for a human reviewer. It
+   names structural risks and evidence gaps but never claims that review or
+   manual verification occurred.
 2. **`00_summary/MERGE_GATE.json`**: The canonical source of truth for CI/CD automation. It determines if the PR is safe to merge based on the active `.prview-policy.yml`.
 3. **`dashboard.html`**: A zero-dependency, self-contained HTML dashboard that visualizes the PR metrics, test hotspots, and quality gates.
 4. **`report.json`**: The complete state of the analysis, useful for building custom integrations or training AI models.

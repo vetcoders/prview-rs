@@ -31,7 +31,7 @@ loctree twin counts.
 
 The following sections must be present:
 
-- `## Recommended reading order (agent-friendly)`
+- `## Recommended reading order (human-first)`
 - `## Layout`
 - `## If you need deeper context`
 - `## Packs`
@@ -85,6 +85,10 @@ are recommended and why.
 - The reading order is numbered and prioritized
 - The file stays compact and avoids raw log or JSON dumps
 - `AI_INDEX.md` is navigational, not canonical
+- It names evidence completeness, typed check execution counts, SARIF evidence
+  state, and concrete verification targets when evidence is missing.
+- Its quality line is explicitly an executed-check outcome and never implies
+  that skipped or unavailable checks passed.
 
 ## Non-goals
 

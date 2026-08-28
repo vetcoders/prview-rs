@@ -585,13 +585,25 @@ uncertainty while valid sibling files continue to be analyzed.
   branch tip. Multi-base runs retain the first diff baseline in this scalar
   compatibility field; when no diff exists, it falls back to the first resolved
   base tip as before.
-- `PR_REVIEW.md` is a concise review narrative, not a raw log dump.
+- `PR_REVIEW.md` is a generated evidence overview, not a raw log dump and not
+  an attestation that an agent or human performed review. It contains no blank
+  PR-description/checklist template.
 - `00_summary/FAILURES_SUMMARY.md` summarizes blocking failures and advisories without copying whole JSON files.
 - When `30_context/INLINE_FINDINGS.sarif` exists, it emits findings per location/advisory and is suitable for annotation integrations.
 - In Rust runs, `PR_REVIEW.md` and `FAILURES_SUMMARY.md` can surface dependency paths to vulnerable crates based on `30_context/cargo-tree.txt`.
 - `10_diff/per-commit-diffs/00-SUMMARY.md` carries both the batching and thematic batch labels.
-- `20_quality/coverage-delta.txt` is a heuristic; for Rust it drops DELETED files in favor of disk searches for orphaned tests (raising an `ORPHANED_TEST_DETECTED` flag). Inline `#[cfg(test)]` modules are handled silently, without false alarms.
+- `20_quality/coverage-delta.txt` is a test-change association heuristic, not
+  executed coverage. Only exact/import-backed associations (plus verified
+  inline Rust tests) count in the headline; weak and multiple candidates are
+  listed separately. For Rust it drops DELETED files in favor of disk searches
+  for orphaned tests (raising an `ORPHANED_TEST_DETECTED` flag).
 - In fast `remote-only` runs, heavier diagnostics such as `30_context/tsc-trace.log` or `30_context/tauri-info.log` may be intentionally skipped. Check `RUN.json` for `recommended`/`reason` notes on whether they are worth generating.
+
+`checks-status.json._checks[]`, `MERGE_GATE.json.checks[]`, and
+`report.json.checks_skipped[]` preserve the difference between deliberate skip,
+profile not-applicable, unavailable tool, and unknown execution. A
+`quality_pass: true` beside skipped checks is only executed-check outcome; read
+`analysis_status` and `evidence_gaps` before treating a pack as merge proof.
 
 #### Commit batching
 

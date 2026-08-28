@@ -1,0 +1,49 @@
+{
+  "fixture_schema": "prview-historical-pack-receipt/v1",
+  "generator": {
+    "reported_version": "0.7.0",
+    "requested_tag": "v0.7.0",
+    "tag_available_locally": false,
+    "commit": "2e11cc6d6e90a606a17d71d0d093a1e2f564bc80",
+    "binary_sha256": "611947065d4361ad4e880cce18d7e89ad4c1e1897efd7561baf3f8b56e201358"
+  },
+  "repository": {
+    "kind": "deterministic_tiny_rust_repo",
+    "base_ref": "main",
+    "base_oid": "6e4feb2f3da353b47950ee7a3926e4eddba2f6f4",
+    "head_ref": "feature/evidence-gap",
+    "head_oid": "2580ff2892a4900c12bd5cf408ad034e39843a7a"
+  },
+  "generation": {
+    "mode": "quick remote-only",
+    "command": "prview --quick --remote-only --no-fetch --no-cache --no-zip --no-dashboard --json --output-dir <private> feature/evidence-gap main",
+    "source_pack_file_count": 45,
+    "source_pack_size_kib": 216,
+    "source_pack_manifest_sha256": "bd9680cee0a1d9a497fad7129a735994022360f1d64a0cb154e3ecc48f3f619d"
+  },
+  "immutable_source_artifacts": {
+    "AI_INDEX.md": "d5ec11adf6fa95b5db42b8f4a8a94f9ea7bed8a366d81dd4f3b98aa10ee559dc",
+    "00_summary/MERGE_GATE.json": "d61bdfab91cbe5e9a4ae01a8e6569ff6dfada974ea3a121a1c37b5aaa3991289",
+    "PR_REVIEW.md": "d08fa6ca0611d1d89a33b56a07ab574da3e242f8f3681e55e482fbe1948bd788",
+    "report.json": "aac5df568a96e28d638fc3e416aa7df3492450657fe449b4331eb9924a6c9ffb",
+    "00_summary/PROVENANCE.json": "b357a0c301d692beb6562212dc247015d1c07ee6a1f1b3a762cb150f3df9e46f",
+    "checks-status.json": "5df44b55784161be2a4ac681f5064085a3f35b6dbfe757f011d59b59e4558cc0"
+  },
+  "sanitized_artifacts": {
+    "sanitized/00_summary/MERGE_GATE.json": "725354399fd6890742b57b6a8a3d1aa61f7505ba62f3f749dd9290047776ffb7",
+    "sanitized/report.json": "b575495876ef1cfe0ba3b409f833afbe9ff1fe9383b33121a07f07537d8cde0e",
+    "sanitized/checks-status.json": "5cbdb35b2b8924035abc3262e8a40f3fef0ef983187605c7b2c7a1916834c6ca"
+  },
+  "preserved_legacy_contradiction": {
+    "canonical_verdict": "CONDITIONAL",
+    "allow_merge": false,
+    "report_gate_status": "BLOCK",
+    "quality_pass": true,
+    "analysis_status": "degraded"
+  },
+  "external_source_inputs": [
+    {"id":"transcript-builder-17","state":"missing_on_sztudio","sha256":null},
+    {"id":"transcript-builder-18","state":"missing_on_sztudio","sha256":null},
+    {"id":"pr-27-0.7-pack","state":"missing_on_sztudio","sha256":null}
+  ]
+}

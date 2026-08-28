@@ -221,6 +221,12 @@ The decision surface is normalized so callers read one vocabulary:
 - `allow_merge` — boolean, **derived** conservatively: it is `true` only for a
   clean `PASS`. A permissive flag on disk can never override a block/hold signal.
 
+`quality_pass` is the executed-check quality axis, not evidence completeness.
+For current packs, inspect `analysis_status`, `checks[].execution_state`, and
+`decision.evidence_gaps` in `MERGE_GATE.json`; `not_applicable` is neutral,
+while skipped, unavailable, and unknown checks identify verification still owed.
+The MCP verdict reader remains conservative when those axes contradict.
+
 If the stored gate emits contradictory signals (for example `allow_merge: true`
 alongside a block recommendation, or a clean approval alongside
 `quality_pass: false` — the contract permits `PASS` only when quality passes),
