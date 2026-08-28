@@ -81,7 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      PRVIEW_ACCEPTANCE_DIR: ${{ runner.temp }}/prview-resource-acceptance
+      PRVIEW_ACCEPTANCE_DIR: ${{ github.workspace }}/prview-resource-acceptance
       PRVIEW_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
