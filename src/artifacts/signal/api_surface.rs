@@ -2732,7 +2732,7 @@ fn normalized_contract(mut item: Item) -> String {
             let mut normalizer = SignatureAlphaNormalizer::default();
             normalizer.push_generics(&value.generics);
             value.generics = normalizer.fold_generics(value.generics.clone());
-            value.ty = Box::new(normalizer.fold_type((*value.ty).clone()));
+            *value.ty = normalizer.fold_type((*value.ty).clone());
             normalizer.pop_scope();
             trim_generics_punctuation(&mut value.generics);
         }
