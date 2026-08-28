@@ -307,6 +307,10 @@ fn is_test_or_fixture_path(path: &str) -> bool {
         .any(|component| matches!(component, "tests" | "fixtures"))
 }
 
+fn is_test_only_cfg(cfg_guard: &[String]) -> bool {
+    cfg_guard.iter().any(|guard| guard.trim() == "test")
+}
+
 struct SnapshotBuilder<'a> {
     source: &'a dyn RevisionFileSource,
     provenance: RevisionProvenance,
@@ -373,6 +377,20 @@ impl<'a> SnapshotBuilder<'a> {
         self.resolve_trait_impls();
         self.resolve_inherent_items();
         self.materialize_public_modules();
+        // A symbol gated by an exact `cfg(test)` is not part of the shipped
+        // library API. Compound alternatives such as `any(test, feature =
+        // "dev")` stay: they can still be reachable in a production build.
+        self.modules
+            .retain(|module| !is_test_only_cfg(&module.cfg_guard));
+        self.module_aliases
+            .retain(|alias| !is_test_only_cfg(&alias.cfg_guard));
+        self.items.retain(|item| !is_test_only_cfg(&item.cfg_guard));
+        self.declarations
+            .retain(|declaration| !is_test_only_cfg(&declaration.cfg_guard));
+        self.reexports
+            .retain(|reexport| !is_test_only_cfg(&reexport.cfg_guard));
+        self.unknowns
+            .retain(|unknown| !is_test_only_cfg(&unknown.cfg_guard));
         self.crates.sort_by(|left, right| {
             (&left.name, &left.manifest_path, &left.root_path).cmp(&(
                 &right.name,
@@ -5254,6 +5272,32 @@ mod tests {
                 .cfg_guard
                 .iter()
                 .any(|guard| guard.contains("generated"))
+        );
+    }
+
+    #[test]
+    fn rust_api_snapshot_excludes_only_exact_test_cfg_regions() {
+        let snapshot = snapshot_rust_api(&source(
+            "#[cfg(test)] pub fn test_only() {}\n\
+             #[cfg(test)] thread_local! { static TEST_VALUE: u8 = 0; }\n\
+             #[cfg(any(test, feature = \"dev\"))] pub fn dev_or_test() {}",
+        ));
+
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .all(|item| item.key.external_name != "test_only")
+        );
+        assert!(snapshot.unknowns.iter().all(|unknown| {
+            !unknown.evidence.contains("TEST_VALUE") && !is_test_only_cfg(&unknown.cfg_guard)
+        }));
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .any(|item| item.key.external_name == "dev_or_test"),
+            "a compound cfg alternative can be reachable outside tests"
         );
     }
 

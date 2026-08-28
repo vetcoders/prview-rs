@@ -564,7 +564,10 @@ changed, relocated, and
 visibility-changed Rust facts are breaking; added-only facts are informational.
 Typed unknowns degrade confidence and require review without claiming a
 confirmed removal. Rust identities include ordinary type/value/macro items plus
-public modules, library crates, and Cargo features. Tuple-constructor privacy,
+public modules, library crates, and Cargo features. Manifests below `tests/` or
+`fixtures/`, and symbols guarded by exact `cfg(test)`, are test evidence rather
+than shipped API and are excluded; compound alternatives such as
+`cfg(any(test, feature = "dev"))` remain visible. Tuple-constructor privacy,
 explicit `repr(...)` private layout, and exhaustive-enum variant additions are
 observable changes; additions to an otherwise unchanged `#[non_exhaustive]`
 enum are informational. Legal non-UTF-8 Git paths emit side-specific typed path
