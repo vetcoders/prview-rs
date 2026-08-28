@@ -26,6 +26,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 /// The budget assumed when the machine will not say how many cores it has.
@@ -36,9 +38,102 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 /// large enough to keep a real box busy.
 const FALLBACK_BUDGET: u32 = 4;
 
+/// Operator-selected machine resource policy.
+///
+/// `Safe` is deliberately the default: a review is allowed to be slower, but
+/// it must not make an ordinary developer machine unusable. `Balanced` is an
+/// explicit opt-in and is still bounded by child-worker caps and load
+/// backpressure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceBudget {
+    #[default]
+    Safe,
+    Balanced,
+}
+
+impl ResourceBudget {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Balanced => "balanced",
+        }
+    }
+}
+
+/// The concrete resource envelope selected once for a run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResourcePlan {
+    pub requested: ResourceBudget,
+    pub effective: ResourceBudget,
+    pub logical_cores: u32,
+    pub total_budget: u32,
+    pub heavy_cost: u32,
+    pub worker_limit: u32,
+    pub load_per_core: Option<f64>,
+    pub backpressured: bool,
+}
+
+impl ResourcePlan {
+    /// Detect a conservative plan from the machine at invocation time.
+    #[must_use]
+    pub fn detect(requested: ResourceBudget) -> Self {
+        Self::from_observation(requested, available_budget(), current_load_average())
+    }
+
+    fn from_observation(
+        requested: ResourceBudget,
+        logical_cores: u32,
+        load_average: Option<f64>,
+    ) -> Self {
+        let logical_cores = logical_cores.max(1);
+        let load_per_core = load_average.map(|load| (load / f64::from(logical_cores)).max(0.0));
+        // Unknown load is treated as pressure, not as spare capacity. This is
+        // intentionally conservative on platforms where no cheap load probe is
+        // available.
+        let backpressured = requested == ResourceBudget::Balanced
+            && load_per_core.is_none_or(|ratio| ratio >= 0.75);
+        let effective = if backpressured {
+            ResourceBudget::Safe
+        } else {
+            requested
+        };
+
+        match effective {
+            ResourceBudget::Safe => Self {
+                requested,
+                effective,
+                logical_cores,
+                total_budget: 1,
+                heavy_cost: 1,
+                worker_limit: 1,
+                load_per_core,
+                backpressured,
+            },
+            ResourceBudget::Balanced => {
+                // Keep the envelope bounded even on a large build host: at
+                // most two capped heavy parents, each with at most four
+                // descendants. This is a throughput opt-in, not "use it all".
+                let total_budget = logical_cores.clamp(2, 8);
+                Self {
+                    requested,
+                    effective,
+                    logical_cores,
+                    total_budget,
+                    heavy_cost: heavy_cost_for(total_budget),
+                    worker_limit: logical_cores.div_ceil(2).clamp(1, 4),
+                    load_per_core,
+                    backpressured,
+                }
+            }
+        }
+    }
+}
+
 /// How much of the machine a task is expected to want.
 ///
-/// Deliberately two words and no number. What a weight costs is the governor's
+/// Deliberately semantic rather than numeric. What a weight costs is the governor's
 /// call, because it depends on the budget the governor is working with — a
 /// `Heavy` task on a 16-core box and on a 2-core box are the same DECLARATION
 /// and very different permit counts.
@@ -48,7 +143,11 @@ pub enum Weight {
     /// running several is free.
     Light,
     /// Wants the machine: a compiler, a test suite, a whole-project linter.
+    /// Its descendant pool has an explicit worker cap.
     Heavy,
+    /// A whole-machine tool whose descendant fan-out is unsupported, unknown,
+    /// or not independently capped. It is always serialized.
+    Exclusive,
 }
 
 /// Exit code for a run the operator cancelled.
@@ -109,6 +208,7 @@ pub struct ResourceGovernor {
     semaphore: Arc<Semaphore>,
     total_budget: u32,
     heavy_cost: u32,
+    plan: ResourcePlan,
     /// Live children, keyed by a caller-chosen label. The value is the pid,
     /// which is also the pgid — every child prview spawns leads its own group
     /// (see [`crate::proc::harden`]), so one signal reaches its grandchildren.
@@ -127,15 +227,29 @@ impl Default for ResourceGovernor {
 }
 
 impl ResourceGovernor {
-    /// A governor sized to this machine.
-    ///
-    /// The budget is the core count; a `Heavy` task costs half of it (rounded
-    /// up), so eight cores run at most two heavy tasks at once while still
-    /// admitting light work beside them.
+    /// A governor using the conservative default policy.
     #[must_use]
     pub fn new() -> Self {
-        let total = available_budget();
-        Self::with_budget(total, heavy_cost_for(total))
+        Self::for_resource_budget(ResourceBudget::Safe)
+    }
+
+    /// A governor using the operator-selected resource policy.
+    #[must_use]
+    pub fn for_resource_budget(budget: ResourceBudget) -> Self {
+        Self::from_plan(ResourcePlan::detect(budget))
+    }
+
+    pub(crate) fn from_plan(plan: ResourcePlan) -> Self {
+        let (cancel_tx, _) = watch::channel(false);
+        Self {
+            semaphore: Arc::new(Semaphore::new(plan.total_budget as usize)),
+            total_budget: plan.total_budget,
+            heavy_cost: plan.heavy_cost,
+            plan,
+            inflight: Mutex::new(HashMap::new()),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_tx,
+        }
     }
 
     /// A governor with an explicit budget — for tests, and for the operator knob
@@ -150,15 +264,16 @@ impl ResourceGovernor {
     pub fn with_budget(total_budget: u32, heavy_cost: u32) -> Self {
         let total_budget = total_budget.max(1);
         let heavy_cost = heavy_cost.clamp(1, total_budget);
-        let (cancel_tx, _) = watch::channel(false);
-        Self {
-            semaphore: Arc::new(Semaphore::new(total_budget as usize)),
+        Self::from_plan(ResourcePlan {
+            requested: ResourceBudget::Balanced,
+            effective: ResourceBudget::Balanced,
+            logical_cores: total_budget,
             total_budget,
             heavy_cost,
-            inflight: Mutex::new(HashMap::new()),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            cancel_tx,
-        }
+            worker_limit: total_budget.div_ceil(2).clamp(1, 4),
+            load_per_core: None,
+            backpressured: false,
+        })
     }
 
     /// The whole budget, in permits.
@@ -167,12 +282,25 @@ impl ResourceGovernor {
         self.total_budget
     }
 
+    /// The concrete per-run envelope, including descendant worker cap.
+    #[must_use]
+    pub fn plan(&self) -> ResourcePlan {
+        self.plan
+    }
+
+    /// Worker cap passed to tools with supported descendant-pool controls.
+    #[must_use]
+    pub fn worker_limit(&self) -> u32 {
+        self.plan.worker_limit
+    }
+
     /// What a [`Weight`] costs against this governor's budget.
     #[must_use]
     pub fn cost(&self, weight: Weight) -> u32 {
         match weight {
             Weight::Light => 1,
             Weight::Heavy => self.heavy_cost,
+            Weight::Exclusive => self.total_budget,
         }
     }
 
@@ -222,10 +350,7 @@ impl ResourceGovernor {
         let mut inflight = self.lock_inflight();
         if self.cancelled.load(Ordering::SeqCst) {
             drop(inflight);
-            #[cfg(unix)]
-            crate::proc::sigkill_process_group(pid);
-            #[cfg(not(unix))]
-            let _ = pid;
+            crate::proc::terminate_process_tree(pid);
             return false;
         }
         inflight.insert(key.into(), pid);
@@ -262,10 +387,7 @@ impl ResourceGovernor {
 
         let children = std::mem::take(&mut *self.lock_inflight());
         for pid in children.into_values() {
-            #[cfg(unix)]
-            crate::proc::sigkill_process_group(pid);
-            #[cfg(not(unix))]
-            let _ = pid;
+            crate::proc::terminate_process_tree(pid);
         }
     }
 
@@ -317,6 +439,22 @@ impl ResourceGovernor {
 /// This machine's core count, or [`FALLBACK_BUDGET`] when it will not say.
 fn available_budget() -> u32 {
     std::thread::available_parallelism().map_or(FALLBACK_BUDGET, |cores| cores.get() as u32)
+}
+
+/// One-minute system load where the platform exposes it without starting a
+/// helper process. Unknown load deliberately triggers safe fallback for a
+/// requested balanced plan.
+#[cfg(unix)]
+fn current_load_average() -> Option<f64> {
+    let mut loads = [0.0_f64; 1];
+    // SAFETY: `loads` points to one writable `f64`, and the element count passed
+    // to libc exactly matches that allocation.
+    (unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) } == 1).then_some(loads[0])
+}
+
+#[cfg(not(unix))]
+fn current_load_average() -> Option<f64> {
+    None
 }
 
 /// Half the budget, rounded up, and never zero: on eight cores a `Heavy` task
@@ -498,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_budget_follows_the_core_count() {
+    fn the_default_budget_is_safe_and_balanced_is_bounded() {
         assert_eq!(heavy_cost_for(8), 4, "eight cores run two heavy tasks");
         assert_eq!(heavy_cost_for(4), 2);
         assert_eq!(heavy_cost_for(3), 2, "rounded UP, never below one task");
@@ -506,12 +644,46 @@ mod tests {
         assert_eq!(heavy_cost_for(1), 1, "one core still admits heavy work");
 
         let governor = ResourceGovernor::new();
-        assert_eq!(governor.total_budget(), available_budget());
-        assert_eq!(
-            governor.cost(Weight::Heavy),
-            heavy_cost_for(available_budget())
-        );
+        assert_eq!(governor.total_budget(), 1);
+        assert_eq!(governor.cost(Weight::Heavy), 1);
+        assert_eq!(governor.cost(Weight::Exclusive), 1);
         assert_eq!(governor.cost(Weight::Light), 1);
+
+        let balanced = ResourcePlan::from_observation(ResourceBudget::Balanced, 16, Some(1.0));
+        assert_eq!(balanced.effective, ResourceBudget::Balanced);
+        assert_eq!(balanced.total_budget, 8, "large hosts remain capped");
+        assert_eq!(balanced.heavy_cost, 4, "at most two heavy parents");
+        assert_eq!(balanced.worker_limit, 4, "child pools remain capped");
+
+        let pressured = ResourcePlan::from_observation(ResourceBudget::Balanced, 8, Some(7.0));
+        assert_eq!(pressured.effective, ResourceBudget::Safe);
+        assert!(pressured.backpressured);
+        assert_eq!(pressured.total_budget, 1);
+        assert_eq!(pressured.worker_limit, 1);
+    }
+
+    #[tokio::test]
+    async fn exclusive_work_reserves_the_entire_budget() {
+        let governor = ResourceGovernor::with_budget(8, 4);
+        assert_eq!(governor.cost(Weight::Exclusive), 8);
+        let held = governor
+            .acquire(Weight::Light)
+            .await
+            .expect("light work admitted");
+        let exclusive = tokio::time::timeout(
+            Duration::from_millis(25),
+            governor.acquire(Weight::Exclusive),
+        )
+        .await;
+        assert!(
+            exclusive.is_err(),
+            "exclusive work must wait for every permit"
+        );
+        drop(held);
+        governor
+            .acquire(Weight::Exclusive)
+            .await
+            .expect("exclusive work starts when the machine is free");
     }
 
     /// Both clamps exist to prevent a hang, not to be tidy: a zero budget admits
@@ -726,6 +898,8 @@ mod tests {
 
         let mut gone = false;
         for _ in 0..100 {
+            // SAFETY: signal 0 is a read-only existence/permission probe, and
+            // `grandchild` came from the process tree created by this test.
             if unsafe { libc::kill(grandchild, 0) } == -1 {
                 let errno = std::io::Error::last_os_error().raw_os_error();
                 if errno == Some(libc::ESRCH) || errno == Some(libc::EPERM) {
@@ -793,6 +967,8 @@ mod tests {
         // reaped; anything else would be a live grandchild.
         let mut gone = false;
         for _ in 0..100 {
+            // SAFETY: signal 0 is a read-only existence/permission probe, and
+            // `grandchild` came from the process tree created by this test.
             if unsafe { libc::kill(grandchild, 0) } == -1 {
                 let errno = std::io::Error::last_os_error().raw_os_error();
                 if errno == Some(libc::ESRCH) || errno == Some(libc::EPERM) {

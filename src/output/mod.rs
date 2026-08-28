@@ -1251,6 +1251,34 @@ pub fn print_config(config: &Config, target: &ResolvedRef, bases: &[ResolvedRef]
         plain: format!(" Checks: {}", checks),
         style: ConfigLineStyle::Label("Checks"),
     });
+    let plan = config.resource_plan;
+    let load = plan
+        .load_per_core
+        .map_or_else(|| "unknown".to_string(), |value| format!("{value:.2}/core"));
+    rows.push(ConfigRow::Line {
+        plain: format!(
+            " Resources: {}{} · parents={} · child-workers={} · load={}",
+            plan.effective.as_str(),
+            if plan.requested != plan.effective {
+                " (balanced requested; backpressured)"
+            } else {
+                ""
+            },
+            plan.total_budget,
+            plan.worker_limit,
+            load,
+        ),
+        style: ConfigLineStyle::Label("Resources"),
+    });
+    rows.push(ConfigRow::Line {
+        plain: format!(" Expensive: {}", describe_expensive_steps(config)),
+        style: ConfigLineStyle::Label("Expensive"),
+    });
+    rows.push(ConfigRow::Line {
+        plain: " Schedule: cheap orientation/checks → capped pools → serialized uncapped tools → artifacts"
+            .to_string(),
+        style: ConfigLineStyle::Label("Schedule"),
+    });
     if config.is_fast_remote_only_standard() {
         let note = "fast remote-only preset skips tests and heuristics; use --with-tests, --with-lint, or --deep for a heavier pass";
         rows.push(ConfigRow::Line {
@@ -1325,6 +1353,33 @@ fn describe_enabled_steps(config: &Config) -> String {
     }
 
     steps.join(", ")
+}
+
+fn describe_expensive_steps(config: &Config) -> String {
+    let mut steps = Vec::new();
+    if which::which("semgrep").is_ok() {
+        steps.push("semgrep(capped)");
+    }
+    if config.profile.has_cargo {
+        steps.push("cargo/rustc(capped)");
+    }
+    if config.profile.has_tsconfig {
+        steps.push("tsc(serial)");
+    }
+    if config.profile.has_package_json && config.run_lint {
+        steps.push("eslint(serial)");
+    }
+    if config.profile.has_package_json && config.run_tests {
+        steps.push("vitest(capped)");
+    }
+    if config.profile.runs_python_checks() {
+        steps.push("python gates(serial)");
+    }
+    if steps.is_empty() {
+        "none selected".to_string()
+    } else {
+        steps.join(", ")
+    }
 }
 
 /// Print artifact directory tree based on what actually exists on disk

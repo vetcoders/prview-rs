@@ -63,6 +63,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
 
+  windows-process-tree:
+    name: Windows process-tree cancellation
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Prove forced child and grandchild termination
+        run: cargo test --lib proc::tests::terminate_process_tree_reaps_windows_child_and_grandchild -- --exact
+
   build:
     name: Build Release
     runs-on: ${{ matrix.os }}

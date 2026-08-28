@@ -32,7 +32,8 @@ struct CargoRun {
     /// Directory to run `cargo` in — the reviewed snapshot's cargo root in
     /// `--pr`/`--remote` mode, the local cargo root otherwise.
     cwd: PathBuf,
-    /// Extra child environment (`CARGO_TARGET_DIR`), empty for a local run.
+    /// Extra child environment. Every Cargo invocation receives the canonical
+    /// `CARGO_BUILD_JOBS` cap; snapshot runs also redirect `CARGO_TARGET_DIR`.
     env: Vec<(String, String)>,
     /// Ephemeral snapshot, kept alive until the check finishes.
     _snapshot: Option<crate::git::WorktreeSnapshot>,
@@ -69,7 +70,7 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
     if plan.scan_dir == config.repo_root {
         return Ok(CargoRun {
             cwd: manifest_stays_in_root(local_root)?,
-            env: Vec::new(),
+            env: vec![cargo_jobs_env(config)],
             _snapshot: plan._snapshot,
         });
     }
@@ -106,12 +107,22 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
 
     Ok(CargoRun {
         cwd,
-        env: vec![(
-            "CARGO_TARGET_DIR".to_string(),
-            target_dir.display().to_string(),
-        )],
+        env: vec![
+            cargo_jobs_env(config),
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                target_dir.display().to_string(),
+            ),
+        ],
         _snapshot: plan._snapshot,
     })
+}
+
+fn cargo_jobs_env(config: &Config) -> (String, String) {
+    (
+        "CARGO_BUILD_JOBS".to_string(),
+        config.resource_plan.worker_limit.to_string(),
+    )
 }
 
 /// The directory a cargo check would have run in, given a scan dir that already
@@ -1288,6 +1299,10 @@ impl Check for CargoTestCheck {
 impl Check for RustfmtCheck {
     fn name(&self) -> &str {
         "Rustfmt"
+    }
+
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Light
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
@@ -2729,10 +2744,16 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         assert_eq!(run.cwd, scan_dir.path());
         assert_eq!(
             run.env,
-            vec![(
-                "CARGO_TARGET_DIR".to_string(),
-                config.cargo_build_cache_dir().display().to_string()
-            )],
+            vec![
+                (
+                    "CARGO_BUILD_JOBS".to_string(),
+                    config.resource_plan.worker_limit.to_string()
+                ),
+                (
+                    "CARGO_TARGET_DIR".to_string(),
+                    config.cargo_build_cache_dir().display().to_string()
+                )
+            ],
             "cargo must build into the shared per-repo cache, not the snapshot",
         );
         let target_dir = config.cargo_build_cache_dir();
@@ -2747,8 +2768,8 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
     }
 
     /// A local review (target == HEAD) is unchanged: the local cargo root, and
-    /// no `CARGO_TARGET_DIR` redirect, so the operator's warm `target/` is used
-    /// exactly as before.
+    /// no `CARGO_TARGET_DIR` redirect, so the operator's warm `target/` is used.
+    /// The descendant job cap still applies.
     #[tokio::test]
     async fn test_cargo_run_local_target_is_unchanged() {
         let repo_root = tempfile::tempdir().expect("repo_root tempdir");
@@ -2762,9 +2783,9 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         let run = plan_cargo_run(&config).expect("plan");
 
         assert_eq!(run.cwd, repo_root.path());
-        assert!(
-            run.env.is_empty(),
-            "a local run must not redirect the build directory",
+        assert_eq!(
+            run.env,
+            vec![("CARGO_BUILD_JOBS".to_string(), "1".to_string())]
         );
     }
 

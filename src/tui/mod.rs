@@ -341,7 +341,9 @@ pub async fn run_analysis(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -
     let ledger = crate::ledger::TaskLedger::new();
     // The TUI is its own entry point, so it owns the run's single budget the way
     // `App` does for the CLI.
-    let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::new());
+    let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::from_plan(
+        config.resource_plan,
+    ));
     let (check_results, skipped_checks) =
         crate::checks::run_all_with_events(&config, &ledger, &governor, move |event| {
             let tx = tx_checks.clone();
