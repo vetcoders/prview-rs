@@ -3101,16 +3101,14 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
     /// (no `..` in the path), and following it runs cargo on the operator's
     /// unrelated tree while the verdict is cached under the reviewed commit —
     /// the external-root hole, reopened by a target-controlled symlink.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_symlinked_cargo_root_never_escapes_the_snapshot() {
         let outside = tempfile::tempdir().expect("outside tempdir");
         write_crate(outside.path(), true);
         let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
         write_crate(scan_dir.path(), true);
-        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), scan_dir.path().join("backend")).unwrap();
-        #[cfg(not(unix))]
-        return;
 
         let repo_root = tempfile::tempdir().expect("repo_root tempdir");
         write_crate(&repo_root.path().join("backend"), true);
