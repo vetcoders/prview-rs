@@ -118,6 +118,8 @@ struct ContextCommandTiming {
     artifact: Option<String>,
     status: &'static str,
     duration_secs: f32,
+    /// Exact pre-spawn/wait failure when no artifact can carry stderr.
+    reason: Option<String>,
 }
 
 pub struct GenerateInput<'a> {
@@ -340,6 +342,48 @@ pub(super) fn build_heuristics_check(
     }
 }
 
+/// Cancellation turns the directory into typed incomplete evidence and removes
+/// every success-shaped surface that may have been written before the seam.
+fn ensure_generation_active(
+    governor: &crate::governor::ResourceGovernor,
+    out_dir: &Path,
+    stage: &str,
+) -> Result<()> {
+    if !governor.is_cancelled() {
+        return Ok(());
+    }
+
+    for relative in [
+        "00_summary/MERGE_GATE.json",
+        "00_summary/MERGE_GATE.md",
+        "00_summary/RUN.json",
+        "00_summary/MANIFEST.json",
+        "00_summary/SANITY.json",
+        "report.json",
+        "dashboard.html",
+        "review.html",
+        "PR_REVIEW.md",
+        "REVIEW_SUMMARY.md",
+        "AI_INDEX.md",
+        "artifacts.zip",
+    ] {
+        let _ = fs::remove_file(out_dir.join(relative));
+    }
+
+    let summary_dir = out_dir.join("00_summary");
+    fs::create_dir_all(&summary_dir)?;
+    fs::write(
+        summary_dir.join("INCOMPLETE.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": "1.0",
+            "status": "incomplete",
+            "reason": "cancelled",
+            "stage": stage,
+        }))?,
+    )?;
+    Err(crate::governor::Cancelled.into())
+}
+
 /// Generate all artifacts
 pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let GenerateInput {
@@ -401,6 +445,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     fs::create_dir_all(&quality_dir)?;
     fs::create_dir_all(&context_dir)?;
     fs::create_dir_all(&per_commit_dir)?;
+    ensure_generation_active(governor, &out_dir, "artifact directory setup")?;
 
     // Artifact Pack version marker
     fs::write(summary_dir.join("ARTIFACT_VERSION.txt"), "1.0\n")?;
@@ -414,6 +459,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let t = Instant::now();
     let patch_texts = generate_full_patch(&diff_dir, &repo, diffs)?;
     stage_timings.push(finish_timing(emit_human_stdout, "full.patch", t));
+    ensure_generation_active(governor, &out_dir, "diff generation")?;
 
     // Rust API truth is computed once from the exact revision trees named by
     // each Diff. The same delta feeds both artifact views and every verdict
@@ -446,6 +492,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     if let Some(ghr) = signal::generate_ghost_refs(&context_dir, diffs, &repo)? {
         all_checks.push(ghr);
     }
+    ensure_generation_active(governor, &out_dir, "structural signal generation")?;
 
     // 00_summary/
     let t = Instant::now();
@@ -455,10 +502,12 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     generate_system_meta(&summary_dir)?;
     generate_git_meta(&summary_dir, config, resolved_target, resolved_bases)?;
     stage_timings.push(finish_timing(emit_human_stdout, "00_summary", t));
+    ensure_generation_active(governor, &out_dir, "summary metadata")?;
 
     let t = Instant::now();
     generate_per_commit_diffs(&repo, &per_commit_dir, diffs, emit_human_stdout)?;
     stage_timings.push(finish_timing(emit_human_stdout, "per-commit-diffs", t));
+    ensure_generation_active(governor, &out_dir, "per-commit diffs")?;
 
     // 20_quality/ — per-gate result.json + .log, then aggregate logs
     let t = Instant::now();
@@ -481,11 +530,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let coverage_delta = signal::CoverageDelta::from_signal(&coverage_signal);
     signal::generate_coverage_delta(&quality_dir, &coverage_signal)?;
     stage_timings.push(finish_timing(emit_human_stdout, "20_quality", t));
+    ensure_generation_active(governor, &out_dir, "quality artifacts")?;
 
     // 10_diff/ — per-file diffs for hotspots
     let t = Instant::now();
     signal::generate_per_file_diffs(&diff_dir, &repo, diffs)?;
     stage_timings.push(finish_timing(emit_human_stdout, "per-file-diffs", t));
+    ensure_generation_active(governor, &out_dir, "per-file diffs")?;
 
     // Log signal generator status for human output
     if emit_human_stdout {
@@ -545,6 +596,22 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         eprintln!("Warning: failed scanning tauri commands: {}", e);
     }
     stage_timings.push(finish_timing(emit_human_stdout, "30_context", t));
+    ensure_generation_active(governor, &out_dir, "static context artifacts")?;
+
+    // External context tools finish before any verdict/report surface. A
+    // cancellation here therefore cannot leave a final-shaped pack behind.
+    let t = Instant::now();
+    let context_command_timings = generate_context_artifacts(
+        config,
+        &context_scan_root,
+        ledger,
+        &context_dir,
+        emit_human_stdout,
+        &context_artifacts,
+        governor,
+    )?;
+    stage_timings.push(finish_timing(emit_human_stdout, "context-tools", t));
+    ensure_generation_active(governor, &out_dir, "context tools")?;
 
     // 00_summary/ — merge gate + failures summary
     let t = Instant::now();
@@ -581,6 +648,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         "MERGE_GATE + FAILURES_SUMMARY",
         t,
     ));
+    ensure_generation_active(governor, &out_dir, "merge gate")?;
 
     // Root-level content generators
     let t = Instant::now();
@@ -595,6 +663,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         heuristics,
     )?;
     stage_timings.push(finish_timing(emit_human_stdout, "PR_REVIEW", t));
+    ensure_generation_active(governor, &out_dir, "PR review")?;
 
     // Load base coverage from previous run (if available)
     let prev_coverage = load_previous_coverage(&out_dir);
@@ -748,21 +817,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     } else {
         stage_timings.push(finish_timing(emit_human_stdout, "report.json", t));
     }
-
-    // 30_context/ — profile-specific artifacts (with timeouts, skip duplicates).
-    // Runs against `context_scan_root`, the same reviewed tree the decisions
-    // above were planned from.
-    let t = Instant::now();
-    let context_command_timings = generate_context_artifacts(
-        config,
-        &context_scan_root,
-        ledger,
-        &context_dir,
-        emit_human_stdout,
-        &context_artifacts,
-        governor,
-    )?;
-    stage_timings.push(finish_timing(emit_human_stdout, "context-tools", t));
+    ensure_generation_active(governor, &out_dir, "report and dashboard")?;
 
     // REVIEW_SUMMARY.md + review.html + AI_INDEX.md — consolidated human
     // review, the always-present browser handoff, and the reading-order map
@@ -777,6 +832,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         "REVIEW_SUMMARY + review.html + AI_INDEX",
         t,
     ));
+    ensure_generation_active(governor, &out_dir, "review handoff surfaces")?;
 
     // 00_summary/PROVENANCE.json — pack-level substrate record. Written before
     // RUN.json/MANIFEST so the manifest hashes it like any other pack file.
@@ -793,6 +849,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         worktree_status_digest: worktree_status_digest.as_deref(),
     })?;
     stage_timings.push(finish_timing(emit_human_stdout, "PROVENANCE.json", t));
+    ensure_generation_active(governor, &out_dir, "provenance")?;
 
     // 00_summary/RUN.json — after all generators complete for accurate timing
     let t = Instant::now();
@@ -814,16 +871,19 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         regression: Some(&regression_report),
     })?;
     stage_timings.push(finish_timing(emit_human_stdout, "RUN.json", t));
+    ensure_generation_active(governor, &out_dir, "RUN.json")?;
 
     // 00_summary/MANIFEST.json — runs LAST (hashes all files)
     let t = Instant::now();
     generate_manifest(&out_dir)?;
     stage_timings.push(finish_timing(emit_human_stdout, "MANIFEST.json", t));
+    ensure_generation_active(governor, &out_dir, "MANIFEST.json")?;
 
     // Sanity checks — verify pack integrity after manifest
     let t = Instant::now();
     let sanity = run_sanity_checks(&out_dir)?;
     stage_timings.push(finish_timing(emit_human_stdout, "SANITY checks", t));
+    ensure_generation_active(governor, &out_dir, "SANITY checks")?;
     if emit_human_stdout {
         use colored::Colorize;
         if sanity.valid {
@@ -857,6 +917,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         create_zip(&out_dir, emit_human_stdout)?;
         stage_timings.push(finish_timing(emit_human_stdout, "artifacts.zip", t));
     }
+    ensure_generation_active(governor, &out_dir, "pack publication")?;
 
     // Create `latest` symlink in parent directory
     create_latest_symlink(&out_dir)?;
@@ -919,6 +980,8 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
             eprintln!("  {} Index: {}", "\u{26a0}".yellow(), e);
         }
     }
+
+    ensure_generation_active(governor, &out_dir, "run index publication")?;
 
     if emit_human_stdout {
         use colored::Colorize;
@@ -1573,6 +1636,17 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             "dashboard": config.create_dashboard,
             "cached": config.use_cache,
         },
+        "resources": {
+            "requested_budget": config.resource_plan.requested.as_str(),
+            "effective_budget": config.resource_plan.effective.as_str(),
+            "logical_cores": config.resource_plan.logical_cores,
+            "parent_permits": config.resource_plan.total_budget,
+            "heavy_cost": config.resource_plan.heavy_cost,
+            "child_worker_limit": config.resource_plan.worker_limit,
+            "load_per_core": config.resource_plan.load_per_core,
+            "backpressured": config.resource_plan.backpressured,
+            "schedule": "cheap orientation/checks -> capped pools -> serialized uncapped tools -> artifacts",
+        },
         "runner": {
             "tool": env!("CARGO_PKG_NAME"),
             "version": env!("CARGO_PKG_VERSION"),
@@ -1626,6 +1700,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             "artifact": command.artifact,
             "status": command.status,
             "duration_secs": command.duration_secs,
+            "reason": command.reason,
         })).collect::<Vec<_>>(),
         "ledger": ledger_view(ledger),
     });

@@ -1,6 +1,44 @@
 use super::*;
 
 #[test]
+fn cancellation_marks_pack_incomplete_and_removes_final_surfaces() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let summary = tmp.path().join("00_summary");
+    fs::create_dir_all(&summary).expect("summary dir");
+    for path in [
+        summary.join("MERGE_GATE.json"),
+        summary.join("RUN.json"),
+        summary.join("SANITY.json"),
+        tmp.path().join("report.json"),
+        tmp.path().join("dashboard.html"),
+    ] {
+        fs::write(path, "final-shaped").expect("fixture artifact");
+    }
+    let governor = crate::governor::ResourceGovernor::new();
+    governor.cancel();
+
+    let error = ensure_generation_active(&governor, tmp.path(), "injected stage")
+        .expect_err("cancelled generation must stop");
+    assert!(crate::governor::is_cancellation(&error));
+    for path in [
+        summary.join("MERGE_GATE.json"),
+        summary.join("RUN.json"),
+        summary.join("SANITY.json"),
+        tmp.path().join("report.json"),
+        tmp.path().join("dashboard.html"),
+    ] {
+        assert!(!path.exists(), "{} survived cancellation", path.display());
+    }
+    let incomplete: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(summary.join("INCOMPLETE.json")).expect("incomplete marker"),
+    )
+    .expect("valid incomplete JSON");
+    assert_eq!(incomplete["status"], "incomplete");
+    assert_eq!(incomplete["reason"], "cancelled");
+    assert_eq!(incomplete["stage"], "injected stage");
+}
+
+#[test]
 fn junk_files_excluded_from_zip_and_manifest() {
     use std::fs::File;
 
@@ -1021,6 +1059,15 @@ fn run_json_records_stage_timings() {
         Some("report.json + dashboard")
     );
     assert_eq!(timings[1]["duration_secs"].as_f64(), Some(1.75));
+    assert_eq!(run["resources"]["requested_budget"], "safe");
+    assert_eq!(run["resources"]["effective_budget"], "safe");
+    assert_eq!(run["resources"]["parent_permits"], 1);
+    assert_eq!(run["resources"]["child_worker_limit"], 1);
+    assert!(
+        run["resources"]["schedule"]
+            .as_str()
+            .is_some_and(|schedule| schedule.starts_with("cheap orientation/checks"))
+    );
 }
 
 #[test]
@@ -1105,12 +1152,14 @@ fn run_json_records_context_command_timings() {
             artifact: Some("30_context/cargo-tree.txt".to_string()),
             status: "completed",
             duration_secs: 3.5,
+            reason: None,
         },
         ContextCommandTiming {
             label: "tauri info".to_string(),
             artifact: Some("30_context/tauri-info.log".to_string()),
             status: "timed_out",
             duration_secs: 30.0,
+            reason: Some("exceeded 30s context timeout".to_string()),
         },
     ];
 

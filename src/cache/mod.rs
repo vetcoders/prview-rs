@@ -428,10 +428,14 @@ mod tests {
         cache
             .set("check", "key", "passed", Some("out"), None)
             .unwrap();
-        assert_eq!(
-            cache.get("check", "key").unwrap().age_secs,
-            Some(0),
-            "an entry written just now is zero whole seconds old",
+        let fresh_age = cache
+            .get("check", "key")
+            .unwrap()
+            .age_secs
+            .expect("a fresh entry has an age");
+        assert!(
+            fresh_age <= 2,
+            "mtime and observation may straddle a second boundary, got {fresh_age}s"
         );
 
         backdate(&cache.entry_path("check", "key"), Duration::from_secs(7200));
@@ -439,7 +443,7 @@ mod tests {
         let aged = cache.get("check", "key").unwrap();
         let age = aged.age_secs.expect("an entry on disk has an age");
         assert!(
-            (7200..7260).contains(&age),
+            (7199..7261).contains(&age),
             "an entry backdated two hours replays as two hours old, got {age}s",
         );
         assert_eq!(
@@ -447,6 +451,18 @@ mod tests {
             "reading the age must not disturb the entry itself",
         );
         assert_eq!(aged.output.as_deref(), Some("out"));
+    }
+
+    #[test]
+    fn a_future_dated_cache_entry_has_unknown_age() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("future-entry");
+        fs::write(&path, "entry").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+
+        assert_eq!(entry_age_secs(&path), None);
     }
 
     /// The legacy layout keeps its status file as the entry, so the same mtime

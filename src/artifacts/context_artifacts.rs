@@ -489,6 +489,13 @@ impl ContextCmd {
     }
 }
 
+fn command_identity(cmd: &ContextCmd) -> String {
+    std::iter::once(cmd.cmd.as_str())
+        .chain(cmd.args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Resolve the command for the optional `tauri info` context artifact.
 ///
 /// Prefers a locally-installed tauri binary (a direct exec with no npm consult
@@ -595,7 +602,9 @@ fn record_context_runs(
             // Neither of these delivered an answer about the reviewed tree, so
             // neither is a Run: one never started, the other was stopped.
             "spawn_failed" => TaskState::Skipped {
-                reason: format!("`{}` could not be spawned in the reviewed tree", cmd.cmd),
+                reason: timing.reason.clone().unwrap_or_else(|| {
+                    format!("`{}` could not be spawned in the reviewed tree", cmd.cmd)
+                }),
             },
             "cancelled" => TaskState::Skipped {
                 reason: format!("`{}` did not run: the review was cancelled", cmd.cmd),
@@ -917,9 +926,8 @@ fn plan_context_cmds(
 
 /// What a context command costs the machine, for the run's resource governor.
 ///
-/// The heavy ones are the same class the gates declare `Heavy`, for the same
-/// reason: a project-wide type check, a project-wide lint, a bundler. `tsc
-/// --traceResolution` is the most expensive thing the context stage runs at all.
+/// Commands without a supported descendant cap are `Exclusive`. Metadata-only
+/// commands remain light; Cargo still receives `CARGO_BUILD_JOBS` defensively.
 ///
 /// The rest read metadata and are `Light`: `cargo tree` (and the sbom variant it
 /// shares a binary with) resolve the dependency graph from the lockfile without
@@ -928,7 +936,7 @@ fn plan_context_cmds(
 /// is why the default falls this way.
 fn context_cmd_weight(cmd: &ContextCmd) -> Weight {
     match cmd.label.as_str() {
-        "tsc trace" | "eslint json" | "stylelint json" | "esbuild meta" => Weight::Heavy,
+        "tsc trace" | "eslint json" | "stylelint json" | "esbuild meta" => Weight::Exclusive,
         // "cargo tree", "cargo sbom", "npm sbom", "tauri info"
         _ => Weight::Light,
     }
@@ -987,7 +995,13 @@ fn run_context_cmds_parallel_after_spawn(
 
     let mut running: Vec<RunningCmd> = Vec::new();
     let mut timings = Vec::new();
-    let mut pending: VecDeque<(usize, &ContextCmd)> = cmds.iter().enumerate().collect();
+    let mut scheduled: Vec<(usize, &ContextCmd)> = cmds.iter().enumerate().collect();
+    scheduled.sort_by_key(|(_, cmd)| match context_cmd_weight(cmd) {
+        Weight::Light => 0,
+        Weight::Heavy => 1,
+        Weight::Exclusive => 2,
+    });
+    let mut pending: VecDeque<(usize, &ContextCmd)> = scheduled.into();
     let poll_interval = Duration::from_millis(200);
 
     loop {
@@ -1014,18 +1028,48 @@ fn run_context_cmds_parallel_after_spawn(
             let stderr_path = cmd.out_dir.join(format!(".context-cmd-{idx}.stderr.tmp"));
             let stdout_file = match File::create(&stdout_path) {
                 Ok(file) => file,
-                Err(_) => continue,
+                Err(error) => {
+                    timings.push(ContextCommandTiming {
+                        label: cmd.label.clone(),
+                        artifact: None,
+                        status: "spawn_failed",
+                        duration_secs: 0.0,
+                        reason: Some(format!(
+                            "{}: could not create stdout capture {}: {error}",
+                            command_identity(cmd),
+                            stdout_path.display()
+                        )),
+                    });
+                    continue;
+                }
             };
             let stderr_file = match File::create(&stderr_path) {
                 Ok(file) => file,
-                Err(_) => {
+                Err(error) => {
                     let _ = fs::remove_file(&stdout_path);
+                    timings.push(ContextCommandTiming {
+                        label: cmd.label.clone(),
+                        artifact: None,
+                        status: "spawn_failed",
+                        duration_secs: 0.0,
+                        reason: Some(format!(
+                            "{}: could not create stderr capture {}: {error}",
+                            command_identity(cmd),
+                            stderr_path.display()
+                        )),
+                    });
                     continue;
                 }
             };
 
             let mut command = Command::new(&cmd.cmd);
             command.args(&args).current_dir(&cmd.cwd);
+            if Path::new(&cmd.cmd)
+                .file_name()
+                .is_some_and(|name| name == "cargo" || name == "cargo.exe")
+            {
+                command.env("CARGO_BUILD_JOBS", governor.worker_limit().to_string());
+            }
             // Shared rails: stdin detached, so a context tool can never read the
             // operator's terminal (an interactive prompt with stdout redirected
             // to a file is invisible and steals keystrokes), and its own process
@@ -1038,11 +1082,26 @@ fn run_context_cmds_parallel_after_spawn(
                 .stderr(std::process::Stdio::from(stderr_file))
                 .spawn()
             {
-                Ok(child) => {
+                Ok(mut child) => {
                     let started_at = Instant::now();
                     let registry_key = format!("context:{idx}:{}", cmd.label);
                     after_spawn(child.id());
-                    governor.register_child(registry_key.clone(), child.id());
+                    if !governor.register_child(registry_key.clone(), child.id()) {
+                        let _ = child.wait();
+                        let _ = fs::remove_file(&stdout_path);
+                        let _ = fs::remove_file(&stderr_path);
+                        timings.push(ContextCommandTiming {
+                            label: cmd.label.clone(),
+                            artifact: None,
+                            status: "cancelled",
+                            duration_secs: started_at.elapsed().as_secs_f32(),
+                            reason: Some(format!(
+                                "{} was refused during late registration because the review was cancelled",
+                                command_identity(cmd)
+                            )),
+                        });
+                        continue;
+                    }
                     running.push(RunningCmd {
                         label: cmd.label.clone(),
                         child,
@@ -1057,7 +1116,7 @@ fn run_context_cmds_parallel_after_spawn(
                         done: false,
                     });
                 }
-                Err(_) => {
+                Err(error) => {
                     let _ = fs::remove_file(&stdout_path);
                     let _ = fs::remove_file(&stderr_path);
                     // Command not available: record it instead of skipping
@@ -1067,6 +1126,7 @@ fn run_context_cmds_parallel_after_spawn(
                         artifact: None,
                         status: "spawn_failed",
                         duration_secs: 0.0,
+                        reason: Some(format!("{}: spawn failed: {error}", command_identity(cmd))),
                     });
                 }
             }
@@ -1081,6 +1141,10 @@ fn run_context_cmds_parallel_after_spawn(
                     artifact: None,
                     status: "cancelled",
                     duration_secs: 0.0,
+                    reason: Some(format!(
+                        "{} did not start because the review was cancelled",
+                        command_identity(cmd)
+                    )),
                 });
             }
         }
@@ -1121,14 +1185,14 @@ fn run_context_cmds_parallel_after_spawn(
                             "failed"
                         },
                         duration_secs: r.started_at.elapsed().as_secs_f32(),
+                        reason: None,
                     });
                 }
                 Ok(None) => {
                     if Instant::now() >= r.deadline {
                         // The child leads its own group, so reach the whole tree
                         // — `sh -c 'pnpm exec …'` outlives a kill of the wrapper.
-                        #[cfg(unix)]
-                        crate::proc::sigkill_process_group(r.child.id());
+                        crate::proc::terminate_process_tree(r.child.id());
                         let _ = r.child.kill();
                         let _ = r.child.wait();
                         r.done = true;
@@ -1142,6 +1206,7 @@ fn run_context_cmds_parallel_after_spawn(
                             }),
                             status: "timed_out",
                             duration_secs: r.started_at.elapsed().as_secs_f32(),
+                            reason: Some(format!("exceeded {timeout_secs}s context timeout")),
                         });
                         if emit {
                             use colored::Colorize;
@@ -1166,6 +1231,7 @@ fn run_context_cmds_parallel_after_spawn(
                         }),
                         status: "error",
                         duration_secs: r.started_at.elapsed().as_secs_f32(),
+                        reason: Some("failed to query child exit status".to_string()),
                     });
                 }
             }
@@ -2035,8 +2101,8 @@ mod tests {
         for label in ["tsc trace", "eslint json", "stylelint json", "esbuild meta"] {
             assert_eq!(
                 super::context_cmd_weight(&sleeping_cmd(label, tmp.path(), "0")),
-                Weight::Heavy,
-                "{label} is a project-wide compile/lint/bundle",
+                Weight::Exclusive,
+                "{label} has no portable descendant-worker cap",
             );
         }
         for label in ["cargo tree", "cargo sbom", "npm sbom", "tauri info"] {
@@ -2159,6 +2225,8 @@ mod tests {
         let grandchild: i32 = contents.trim().parse().expect("numeric grandchild pid");
         let mut gone = false;
         for _ in 0..100 {
+            // SAFETY: signal 0 is a read-only existence/permission probe, and
+            // `grandchild` came from the process tree created by this test.
             if unsafe { libc::kill(grandchild, 0) } == -1 {
                 let errno = std::io::Error::last_os_error().raw_os_error();
                 if errno == Some(libc::ESRCH) || errno == Some(libc::EPERM) {
@@ -2229,6 +2297,13 @@ mod tests {
         let governor = ResourceGovernor::new();
         let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor);
         assert_eq!(timings[0].status, "spawn_failed");
+        assert!(
+            timings[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no-such-binary")),
+            "the ledger timing must identify the command that failed"
+        );
         super::record_context_runs(&ledger, tmp.path(), &cmds, &timings);
 
         let entry = &ledger.entries()[0];
@@ -2238,5 +2313,42 @@ mod tests {
             "got {:?}",
             entry.state,
         );
+    }
+
+    /// Capture-file creation is part of spawning a command. If it fails, the
+    /// command must still receive one deterministic ledger/timing row with its
+    /// identity and the filesystem reason.
+    #[test]
+    fn a_context_capture_file_failure_is_ledgered_as_spawn_failed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = tmp.path().join("capture-parent-is-a-file");
+        fs::write(&not_a_dir, "not a directory").expect("fixture file");
+
+        let mut cmd = context_cmd("cargo tree", None, "/bin/echo", tmp.path());
+        cmd.args = vec!["hello".to_string()];
+        cmd.out_dir = not_a_dir;
+        let cmds = vec![cmd];
+        let governor = ResourceGovernor::new();
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor);
+
+        assert_eq!(timings.len(), 1);
+        assert_eq!(timings[0].status, "spawn_failed");
+        let reason = timings[0].reason.as_deref().expect("failure reason");
+        assert!(reason.contains("/bin/echo hello"), "got {reason}");
+        assert!(reason.contains("stdout capture"), "got {reason}");
+
+        let ledger = TaskLedger::new();
+        super::record_context_runs(&ledger, tmp.path(), &cmds, &timings);
+        let entries = ledger.entries();
+        let TaskState::Skipped {
+            reason: ledger_reason,
+        } = &entries[0].state
+        else {
+            panic!(
+                "capture failure must be skipped, got {:?}",
+                entries[0].state
+            );
+        };
+        assert_eq!(ledger_reason, reason);
     }
 }
