@@ -73,8 +73,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
-      - name: Prove forced child and grandchild termination
-        run: cargo test --lib proc::tests::terminate_process_tree_reaps_windows_child_and_grandchild -- --exact
+      - name: Prove governor first-cancel and late-registration trees
+        run: cargo test --lib governor::tests::windows_cancellation_reaps_first_cancel_and_late_registration_trees -- --exact
 
   ordinary-machine-resource-acceptance:
     name: Ordinary-machine bounded deep review

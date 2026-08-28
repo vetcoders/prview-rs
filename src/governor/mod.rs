@@ -823,6 +823,54 @@ mod tests {
         );
     }
 
+    /// Real Windows orchestration proof for both sides of the spawn/register
+    /// race. The late tree exists before the first cancellation pass but is not
+    /// registered until afterwards, so only register_child can reap it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_cancellation_reaps_first_cancel_and_late_registration_trees() {
+        let governor = ResourceGovernor::with_budget(2, 1);
+        let mut first_cancel = crate::proc::WindowsProcessTree::spawn("first cancel tree");
+        let mut late_registration =
+            crate::proc::WindowsProcessTree::spawn("late registration tree");
+        let first_pids = first_cancel.pids();
+        let late_pids = late_registration.pids();
+
+        assert!(
+            governor.register_child("first-cancel-tree", first_cancel.root_pid()),
+            "the first tree must register before cancellation"
+        );
+        assert_eq!(governor.inflight_count(), 1);
+        first_cancel.assert_all_running("before first cancel");
+        late_registration.assert_all_running("before delayed registration");
+
+        // Phase 1: the first cancellation pass drains the registered tree.
+        governor.cancel();
+        assert_eq!(
+            governor.inflight_count(),
+            0,
+            "the first cancel must drain the governor registry"
+        );
+        first_cancel.assert_all_gone("first cancel");
+
+        // Phase 2: the already-running second tree arrives after that drain.
+        assert!(
+            !governor.register_child("late-registration-tree", late_registration.root_pid()),
+            "registration after cancellation must be refused"
+        );
+        assert_eq!(
+            governor.inflight_count(),
+            0,
+            "refused late registration must not repopulate the registry"
+        );
+        late_registration.assert_all_gone("late registration");
+
+        assert_ne!(
+            first_pids, late_pids,
+            "both phases must exercise distinct real process trees"
+        );
+    }
+
     /// Cancelling twice must be safe. Deliberately registers NOTHING: a test
     /// that parks a pid here to watch it be signalled is a test that signals a
     /// process group, and the only pid available to a unit test without spawning

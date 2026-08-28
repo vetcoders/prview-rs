@@ -137,6 +137,171 @@ async fn run_capture_with_timeout_after_spawn(
     }
 }
 
+/// A real PowerShell root/child/grandchild tree for Windows-only process tests.
+///
+/// This lives outside either test module so the direct process primitive and
+/// the governor integration test exercise the same fixture and PID probe. Drop
+/// is failure cleanup only: successful tests first prove every captured PID is
+/// gone through the operation under test, then disarm cleanup.
+#[cfg(all(test, windows))]
+pub(crate) struct WindowsProcessTree {
+    root: std::process::Child,
+    pids: Vec<u32>,
+    _tempdir: tempfile::TempDir,
+    verified_gone: bool,
+}
+
+#[cfg(all(test, windows))]
+impl WindowsProcessTree {
+    pub(crate) fn spawn(label: &str) -> Self {
+        use std::thread::sleep;
+
+        let tempdir = tempfile::tempdir().expect("Windows process-tree tempdir");
+        let child_pidfile = tempdir.path().join("child.pid");
+        let grandchild_pidfile = tempdir.path().join("grandchild.pid");
+        let child_script = tempdir.path().join("child.ps1");
+        let parent_script = tempdir.path().join("parent.ps1");
+
+        std::fs::write(
+            &child_script,
+            format!(
+                "$g = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60'\nSet-Content -LiteralPath '{}' -Value $g.Id\nWait-Process -Id $g.Id\n",
+                grandchild_pidfile.display()
+            ),
+        )
+        .expect("write Windows child script");
+        std::fs::write(
+            &parent_script,
+            format!(
+                "$c = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','{}'\nSet-Content -LiteralPath '{}' -Value $c.Id\nWait-Process -Id $c.Id\n",
+                child_script.display(),
+                child_pidfile.display()
+            ),
+        )
+        .expect("write Windows parent script");
+
+        let root = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&parent_script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn root PowerShell");
+
+        // Establish cleanup ownership before waiting for either descendant to
+        // publish its PID. If setup times out or panics, Drop can already kill
+        // the root with /T and therefore cannot orphan an unrecorded child.
+        let mut tree = Self {
+            pids: vec![root.id()],
+            root,
+            _tempdir: tempdir,
+            verified_gone: false,
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let descendants = loop {
+            if let (Some(child), Some(grandchild)) = (
+                try_read_windows_pid(&child_pidfile),
+                try_read_windows_pid(&grandchild_pidfile),
+            ) && windows_pid_exists(child)
+                && windows_pid_exists(grandchild)
+            {
+                break [child, grandchild];
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{label} did not publish a live child and grandchild within 10s"
+            );
+            sleep(Duration::from_millis(25));
+        };
+
+        tree.pids.extend(descendants);
+        tree.assert_all_running(label);
+        tree
+    }
+
+    pub(crate) fn root_pid(&self) -> u32 {
+        self.pids[0]
+    }
+
+    pub(crate) fn pids(&self) -> [u32; 3] {
+        [self.pids[0], self.pids[1], self.pids[2]]
+    }
+
+    pub(crate) fn assert_all_running(&self, phase: &str) {
+        for (role, pid) in ["root", "child", "grandchild"]
+            .into_iter()
+            .zip(self.pids.iter().copied())
+        {
+            assert!(
+                windows_pid_exists(pid),
+                "{phase}: captured {role} PID {pid} is not running"
+            );
+        }
+    }
+
+    pub(crate) fn assert_all_gone(&mut self, phase: &str) {
+        use std::thread::sleep;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = self.root.try_wait();
+            let live: Vec<_> = ["root", "child", "grandchild"]
+                .into_iter()
+                .zip(self.pids.iter().copied())
+                .filter(|(_, pid)| windows_pid_exists(*pid))
+                .collect();
+            if live.is_empty() {
+                self.verified_gone = true;
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{phase}: Windows process census still live after 5s: {live:?}"
+            );
+            sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+impl Drop for WindowsProcessTree {
+    fn drop(&mut self) {
+        if self.verified_gone {
+            return;
+        }
+
+        // A failing assertion must not leave any known PowerShell descendant on
+        // the shared runner. This cleanup is deliberately not part of the PASS
+        // oracle: assert_all_gone disarms it only after the tested path succeeds.
+        for pid in self.pids.iter().copied().rev() {
+            terminate_process_tree(pid);
+        }
+        let _ = self.root.kill();
+        let _ = self.root.wait();
+    }
+}
+
+#[cfg(all(test, windows))]
+fn try_read_windows_pid(path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+#[cfg(all(test, windows))]
+fn windows_pid_exists(pid: u32) -> bool {
+    let filter = format!("PID eq {pid}");
+    let output = std::process::Command::new("tasklist.exe")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("tasklist must be available on a Windows runner");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .any(|line| line.contains(&format!("\"{pid}\"")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,85 +514,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn terminate_process_tree_reaps_windows_child_and_grandchild() {
-        use std::thread::sleep;
+        let mut tree = WindowsProcessTree::spawn("direct taskkill primitive");
 
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let child_pidfile = tmp.path().join("child.pid");
-        let grandchild_pidfile = tmp.path().join("grandchild.pid");
-        let child_script = tmp.path().join("child.ps1");
-        let parent_script = tmp.path().join("parent.ps1");
+        terminate_process_tree(tree.root_pid());
 
-        std::fs::write(
-            &child_script,
-            format!(
-                "$g = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60'\nSet-Content -LiteralPath '{}' -Value $g.Id\nWait-Process -Id $g.Id\n",
-                grandchild_pidfile.display()
-            ),
-        )
-        .expect("write child script");
-        std::fs::write(
-            &parent_script,
-            format!(
-                "$c = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','{}'\nSet-Content -LiteralPath '{}' -Value $c.Id\nWait-Process -Id $c.Id\n",
-                child_script.display(),
-                child_pidfile.display()
-            ),
-        )
-        .expect("write parent script");
-
-        let mut root = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-File"])
-            .arg(&parent_script)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn root powershell");
-
-        for _ in 0..200 {
-            if child_pidfile.exists() && grandchild_pidfile.exists() {
-                break;
-            }
-            sleep(Duration::from_millis(25));
-        }
-        let child_pid = read_windows_pid(&child_pidfile);
-        let grandchild_pid = read_windows_pid(&grandchild_pidfile);
-
-        terminate_process_tree(root.id());
-        let _ = root.wait();
-
-        for pid in [child_pid, grandchild_pid] {
-            let mut gone = false;
-            for _ in 0..100 {
-                if !windows_pid_exists(pid) {
-                    gone = true;
-                    break;
-                }
-                sleep(Duration::from_millis(25));
-            }
-            assert!(gone, "Windows descendant {pid} survived taskkill /T /F");
-        }
-    }
-
-    #[cfg(windows)]
-    fn read_windows_pid(path: &std::path::Path) -> u32 {
-        std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-            .trim()
-            .parse()
-            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
-    }
-
-    #[cfg(windows)]
-    fn windows_pid_exists(pid: u32) -> bool {
-        let filter = format!("PID eq {pid}");
-        let output = std::process::Command::new("tasklist.exe")
-            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-            .output()
-            .expect("tasklist must be available on a Windows runner");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout
-            .lines()
-            .any(|line| line.contains(&format!("\"{pid}\"")))
+        tree.assert_all_gone("direct taskkill primitive");
     }
 }
