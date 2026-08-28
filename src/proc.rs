@@ -38,6 +38,28 @@ fn taskkill_process_tree_at(
         .status()
 }
 
+#[cfg(any(windows, test))]
+fn terminate_windows_process_tree_with(
+    taskkill: &std::path::Path,
+    pid: u32,
+    executor: impl FnOnce(&std::path::Path, u32) -> std::io::Result<std::process::ExitStatus>,
+) -> std::io::Result<()> {
+    match executor(taskkill, pid) {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(std::io::Error::other(format!(
+            "{} failed to terminate process tree {pid} (status {status})",
+            taskkill.display()
+        ))),
+        Err(err) => Err(std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed to run {} for process tree {pid}: {err}",
+                taskkill.display()
+            ),
+        )),
+    }
+}
+
 /// SIGKILL an entire unix process group by its leader pid.
 ///
 /// The child must have been spawned with `process_group(0)` so `pid` is also
@@ -62,16 +84,10 @@ pub fn terminate_process_tree(pid: u32) {
     #[cfg(windows)]
     {
         let taskkill = system_taskkill_path();
-        match taskkill_process_tree_at(&taskkill, pid) {
-            Ok(status) if status.success() => {}
-            Ok(status) => eprintln!(
-                "prview: {} failed to terminate process tree {pid} (status {status})",
-                taskkill.display()
-            ),
-            Err(err) => eprintln!(
-                "prview: failed to run {} for process tree {pid}: {err}",
-                taskkill.display()
-            ),
+        if let Err(err) =
+            terminate_windows_process_tree_with(&taskkill, pid, taskkill_process_tree_at)
+        {
+            eprintln!("prview: {err}");
         }
     }
 
@@ -567,5 +583,32 @@ mod tests {
             taskkill_process_tree_at(missing, u32::MAX).is_err(),
             "spawn failure must remain observable to the caller"
         );
+    }
+
+    #[test]
+    fn taskkill_nonzero_status_is_observable_through_production_handler() {
+        #[cfg(unix)]
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 23"])
+            .status()
+            .expect("controlled non-zero status");
+        #[cfg(windows)]
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit 23"])
+            .status()
+            .expect("controlled non-zero status");
+
+        let taskkill = std::path::Path::new("controlled-taskkill.exe");
+        let err = terminate_windows_process_tree_with(taskkill, 4242, |path, pid| {
+            assert_eq!(path, taskkill);
+            assert_eq!(pid, 4242);
+            Ok(status)
+        })
+        .expect_err("non-zero taskkill status must remain observable");
+
+        let message = err.to_string();
+        assert!(message.contains("controlled-taskkill.exe"));
+        assert!(message.contains("process tree 4242"));
+        assert!(message.contains("status"));
     }
 }

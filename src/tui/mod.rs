@@ -31,6 +31,11 @@ struct AnalysisTask {
     handle: tokio::task::JoinHandle<Result<()>>,
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_INPUT_EVENTS: std::cell::RefCell<mpsc::UnboundedReceiver<Event>>;
+}
+
 impl AnalysisTask {
     fn spawn(config: Config, tx: mpsc::UnboundedSender<TuiEvent>) -> Self {
         let governor = Arc::new(crate::governor::ResourceGovernor::from_plan(
@@ -107,6 +112,25 @@ fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) 
     Ok(())
 }
 
+async fn next_terminal_event(tick_rate: Duration) -> Result<Option<Event>> {
+    #[cfg(test)]
+    match TEST_INPUT_EVENTS.try_with(|events| events.borrow_mut().try_recv()) {
+        Ok(Ok(event)) => return Ok(Some(event)),
+        Ok(Err(mpsc::error::TryRecvError::Empty)) => {
+            tokio::time::sleep(tick_rate).await;
+            return Ok(None);
+        }
+        Ok(Err(mpsc::error::TryRecvError::Disconnected)) => return Ok(None),
+        Err(_) => {}
+    }
+
+    if event::poll(tick_rate)? {
+        Ok(Some(event::read()?))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Main event loop
 async fn run_event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
@@ -133,9 +157,7 @@ where
         }
 
         // Poll for events with timeout
-        if event::poll(tick_rate)?
-            && let Event::Key(key) = event::read()?
-        {
+        if let Some(Event::Key(key)) = next_terminal_event(tick_rate).await? {
             // Skip key release events
             if key.kind == KeyEventKind::Release {
                 continue;
@@ -557,29 +579,72 @@ mod tests {
 
         let governor = Arc::new(crate::governor::ResourceGovernor::new());
         assert!(governor.register_child("tui-test", root_pid));
+        let oracle_governor = Arc::clone(&governor);
         let wait_governor = Arc::clone(&governor);
+        let (cancel_seen_tx, mut cancel_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut release_tx = Some(release_tx);
         let handle = tokio::spawn(async move {
             wait_governor.cancelled().await;
+            let _ = cancel_seen_tx.send(());
+            release_rx.await.expect("release cancelled analysis join");
             Err(crate::governor::Cancelled.into())
         });
         let mut analysis = Some(AnalysisTask { governor, handle });
         let mut state = TuiState::new(default_config());
         let (tx, mut rx) = mpsc::unbounded_channel();
-
-        keys::handle_key(
-            &mut state,
-            crossterm::event::KeyEvent::new(
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(Event::Key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Char('q'),
                 crossterm::event::KeyModifiers::NONE,
-            ),
-            &tx,
-        )
-        .await
-        .expect("handle quit");
+            )))
+            .expect("inject quit key");
+
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        {
+            let event_loop = TEST_INPUT_EVENTS.scope(
+                std::cell::RefCell::new(input_rx),
+                run_event_loop(&mut terminal, &mut state, &tx, &mut rx, &mut analysis),
+            );
+            tokio::pin!(event_loop);
+
+            tokio::select! {
+                biased;
+                seen = &mut cancel_seen_rx => {
+                    seen.expect("analysis task observed production cancellation");
+                }
+                result = &mut event_loop => {
+                    let cancelled = oracle_governor.is_cancelled();
+                    oracle_governor.cancel();
+                    let _ = release_tx.take().expect("barrier sender").send(());
+                    let _ = child.wait();
+                    if cancelled {
+                        panic!("production event loop returned without awaiting analysis join: {result:?}");
+                    }
+                    panic!("production event loop returned before cancelling analysis: {result:?}");
+                }
+            }
+
+            if let Ok(result) =
+                tokio::time::timeout(Duration::from_millis(100), &mut event_loop).await
+            {
+                oracle_governor.cancel();
+                let _ = release_tx.take().expect("barrier sender").send(());
+                let _ = child.wait();
+                panic!("production event loop returned without awaiting analysis join: {result:?}");
+            }
+
+            release_tx
+                .take()
+                .expect("barrier sender")
+                .send(())
+                .expect("release analysis join");
+            event_loop.await.expect("production event loop quit");
+        }
+
         assert!(state.should_quit);
-        cancel_analysis(&mut analysis)
-            .await
-            .expect("joined cancellation");
         assert!(analysis.is_none());
         let _ = child.wait();
 
@@ -598,10 +663,12 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            rx.try_recv().is_err(),
-            "cancelled analysis must not publish a completion/verdict event"
-        );
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, TuiEvent::AnalysisComplete { .. }),
+                "cancelled analysis must not publish a completion/verdict event"
+            );
+        }
     }
 
     #[test]
