@@ -14,6 +14,15 @@ use std::path::Path;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UnsafeAudit {
     pub findings: Vec<UnsafeFinding>,
+    pub production_count: usize,
+    pub test_only_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsafeScope {
+    Production,
+    TestOnly,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -22,6 +31,7 @@ pub struct UnsafeFinding {
     pub line: usize,
     pub content: String,
     pub has_safety_comment: bool,
+    pub scope: UnsafeScope,
 }
 
 pub fn generate_unsafe_audit(
@@ -33,8 +43,11 @@ pub fn generate_unsafe_audit(
 
     for diff in diffs {
         for file in &diff.files {
-            if matches!(classify_review_file(&file.path), ReviewFileCategory::Code)
-                && file.path.ends_with(".rs")
+            let category = classify_review_file(&file.path);
+            if matches!(
+                category,
+                ReviewFileCategory::Code | ReviewFileCategory::Test
+            ) && file.path.ends_with(".rs")
                 && let Ok(patch) =
                     repo.file_diff(&diff.base_commit_id, &diff.target_commit_id, &file.path)
             {
@@ -47,7 +60,16 @@ pub fn generate_unsafe_audit(
         return Ok(None);
     }
 
-    let audit = UnsafeAudit { findings };
+    let production_count = findings
+        .iter()
+        .filter(|finding| finding.scope == UnsafeScope::Production)
+        .count();
+    let test_only_count = findings.len().saturating_sub(production_count);
+    let audit = UnsafeAudit {
+        findings,
+        production_count,
+        test_only_count,
+    };
 
     fs::create_dir_all(dir)?;
     fs::write(
@@ -59,13 +81,17 @@ pub fn generate_unsafe_audit(
     fs::write(dir.join("UNSAFE_AUDIT.md"), md)?;
 
     let msg = format!(
-        "[⚠️ line heuristic] Found {} new `unsafe` block(s)",
-        audit.findings.len()
+        "[⚠️ line heuristic] Found {} production and {} test-only new `unsafe` block(s)",
+        audit.production_count, audit.test_only_count
     );
 
     Ok(Some(CheckResult {
         name: "unsafe_audit".to_string(),
-        status: CheckStatus::Warnings,
+        status: if audit.production_count > 0 {
+            CheckStatus::Warnings
+        } else {
+            CheckStatus::Passed
+        },
         duration: std::time::Duration::ZERO,
         output: msg,
         cached: false,
@@ -135,6 +161,11 @@ fn scan_for_unsafe(file_path: &str, patch: &str) -> Vec<UnsafeFinding> {
                 line: current_line,
                 content: trimmed.chars().take(120).collect(),
                 has_safety_comment,
+                scope: if matches!(classify_review_file(file_path), ReviewFileCategory::Test) {
+                    UnsafeScope::TestOnly
+                } else {
+                    UnsafeScope::Production
+                },
             });
         } else if !same_line_safety
             && !clears_credit
@@ -178,12 +209,12 @@ fn format_unsafe_audit(audit: &UnsafeAudit) -> String {
     );
     let _ = writeln!(
         md,
-        "Detected {} new `unsafe` block(s) in this PR.\n",
-        audit.findings.len()
+        "Detected {} production and {} test-only new `unsafe` block(s) in this PR. Test-only findings are evidence, not a policy warning.\n",
+        audit.production_count, audit.test_only_count
     );
 
-    let _ = writeln!(md, "| File | Line | Snippet | Safety Comment? |");
-    let _ = writeln!(md, "|------|------|---------|-----------------|");
+    let _ = writeln!(md, "| File | Scope | Line | Snippet | Safety Comment? |");
+    let _ = writeln!(md, "|------|-------|------|---------|-----------------|");
 
     for f in &audit.findings {
         let comment_mark = if f.has_safety_comment {
@@ -193,8 +224,8 @@ fn format_unsafe_audit(audit: &UnsafeAudit) -> String {
         };
         let _ = writeln!(
             md,
-            "| `{}` | `{}` | `{}` | {} |",
-            f.file, f.line, f.content, comment_mark
+            "| `{}` | `{:?}` | `{}` | `{}` | {} |",
+            f.file, f.scope, f.line, f.content, comment_mark
         );
     }
 
@@ -338,6 +369,33 @@ mod tests {
         // Verify output files
         assert!(out_dir.join("UNSAFE_AUDIT.json").exists());
         assert!(out_dir.join("UNSAFE_AUDIT.md").exists());
+    }
+
+    #[test]
+    fn test_only_unsafe_is_preserved_without_escalating_check_status() {
+        let files = &[(
+            "tests/ffi.rs",
+            "#[test]\nfn ffi() {}\n",
+            "#[test]\nfn ffi() { unsafe { call(); } }\n",
+        )];
+        let (tmp, repo, base_id, target_id) = make_test_repo(files);
+        let diff = make_diff_with_ids(
+            base_id,
+            target_id,
+            vec![mock_file_change("tests/ffi.rs", FileStatus::Modified, 1, 1)],
+        );
+
+        let out_dir = tmp.path().join("30_context");
+        let result = generate_unsafe_audit(&out_dir, &[diff], &repo)
+            .unwrap()
+            .expect("test-only unsafe remains visible");
+        assert_eq!(result.status, CheckStatus::Passed);
+        let audit: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out_dir.join("UNSAFE_AUDIT.json")).unwrap())
+                .unwrap();
+        assert_eq!(audit["production_count"], 0);
+        assert_eq!(audit["test_only_count"], 1);
+        assert_eq!(audit["findings"][0]["scope"], "test_only");
     }
 
     #[test]
