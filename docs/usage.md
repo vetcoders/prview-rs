@@ -605,8 +605,11 @@ uncertainty while valid sibling files continue to be analyzed.
 - In fast `remote-only` runs, heavier diagnostics such as `30_context/tsc-trace.log` or `30_context/tauri-info.log` may be intentionally skipped. Check `RUN.json` for `recommended`/`reason` notes on whether they are worth generating.
 
 `checks-status.json._checks[]`, `MERGE_GATE.json.checks[]`, and
-`report.json.checks_skipped[]` preserve the difference between deliberate skip,
-profile not-applicable, unavailable tool, and unknown execution. A
+`report.json.checks[]` enumerate the same canonical check set and preserve the
+difference between deliberate skip, profile not-applicable, unavailable tool,
+and unknown execution. `report.json.checks_skipped[]` remains as a legacy
+additive projection for readers that consumed it before the canonical array
+included pre-run checks. A
 `quality_pass: true` beside skipped checks is only executed-check outcome; read
 `analysis_status` and `evidence_gaps` before treating a pack as merge proof.
 

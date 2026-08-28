@@ -216,6 +216,11 @@ struct CheckEntry {
     id: String,
     name: String,
     status: &'static str,
+    execution_state: crate::policy::engine::CheckExecutionState,
+    outcome: crate::policy::engine::ToolOutcome,
+    policy_conclusion: crate::policy::engine::PolicyConclusion,
+    confidence_impact: crate::policy::engine::AnalysisStatus,
+    merge_impact: crate::policy::engine::MergeRecommendation,
     blocking: bool,
     cached: bool,
     duration_ms: u64,
@@ -778,7 +783,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
     };
 
     // -- checks --
-    let check_entries: Vec<CheckEntry> = checks
+    let mut check_entries: Vec<CheckEntry> = checks
         .iter()
         .map(|c| {
             let gate_entry = ctx.check_gates.iter().find(|g| g.name == c.name);
@@ -786,6 +791,11 @@ fn build_report(input: &ReportInput<'_>) -> Report {
                 .map(|g| g.id.clone())
                 .unwrap_or_else(|| c.name.to_lowercase().replace(' ', "_"));
             let blocking = gate_entry.map(|g| g.blocking).unwrap_or(false);
+            let evaluation = policy_summary
+                .evaluations
+                .iter()
+                .find(|evaluation| evaluation.check_id == id)
+                .expect("every executed report check has a policy evaluation");
 
             let status_str = match c.status {
                 CheckStatus::Passed => "PASS",
@@ -833,6 +843,11 @@ fn build_report(input: &ReportInput<'_>) -> Report {
                 id: id.clone(),
                 name: c.name.clone(),
                 status: status_str,
+                execution_state: evaluation.execution_state,
+                outcome: evaluation.outcome,
+                policy_conclusion: evaluation.conclusion,
+                confidence_impact: evaluation.confidence_impact,
+                merge_impact: evaluation.merge_impact,
                 blocking,
                 cached: c.cached,
                 duration_ms: c.duration.as_millis() as u64,
@@ -857,6 +872,61 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             }
         })
         .collect();
+
+    // `checks[]` is the canonical check inventory, so it must include checks
+    // ruled out before execution as well as checks that spawned. Keep the
+    // legacy `checks_skipped` projection below for additive reader
+    // compatibility, but do not force consumers to union two arrays merely to
+    // learn which evidence is absent.
+    let missing_evaluations = policy_summary
+        .evaluations
+        .iter()
+        .filter(|evaluation| {
+            !check_entries
+                .iter()
+                .any(|entry| entry.id == evaluation.check_id)
+        })
+        .collect::<Vec<_>>();
+    for evaluation in missing_evaluations {
+        let gate_entry = ctx
+            .check_gates
+            .iter()
+            .find(|entry| entry.id == evaluation.check_id);
+        let status = match evaluation.execution_state {
+            crate::policy::engine::CheckExecutionState::Executed => {
+                unreachable!("executed evaluation missing its CheckResult")
+            }
+            crate::policy::engine::CheckExecutionState::Skipped => "SKIP",
+            crate::policy::engine::CheckExecutionState::NotApplicable => "NOT_APPLICABLE",
+            crate::policy::engine::CheckExecutionState::Unavailable => "UNAVAILABLE",
+            crate::policy::engine::CheckExecutionState::Unknown => "UNKNOWN",
+        };
+        check_entries.push(CheckEntry {
+            id: evaluation.check_id.clone(),
+            name: evaluation.name.clone(),
+            status,
+            execution_state: evaluation.execution_state,
+            outcome: evaluation.outcome,
+            policy_conclusion: evaluation.conclusion,
+            confidence_impact: evaluation.confidence_impact,
+            merge_impact: evaluation.merge_impact,
+            blocking: gate_entry.map(|entry| entry.blocking).unwrap_or(false),
+            cached: false,
+            duration_ms: 0,
+            command: None,
+            cwd: None,
+            target_sha: None,
+            tree_state: None,
+            error_excerpt: evaluation.reason.clone(),
+            signatures: None,
+            finding_stats: None,
+            failed_tests: Vec::new(),
+            artifacts: CheckArtifacts {
+                log_path: None,
+                result_json_path: None,
+            },
+        });
+    }
 
     // -- diff --
     let all_files: Vec<_> = diffs.iter().flat_map(|d| &d.files).collect();
@@ -2211,6 +2281,34 @@ test result: FAILED. 0 passed; 1 failed
         assert_eq!(h["skip_reason"].as_str(), Some("heuristics not run"));
         assert!(h.get("total_files").is_none());
         assert!(h.get("dead_exports").is_none());
+    }
+
+    #[test]
+    fn report_canonical_checks_include_pre_run_unavailable_tools() {
+        let mut ctx = skip_as_zero_ctx(coverage_delta(0, 0, None));
+        ctx.skipped_checks.push(crate::checks::SkippedCheck {
+            id: "cargo_audit".to_string(),
+            name: "Cargo audit".to_string(),
+            reason: "cargo-audit is not installed".to_string(),
+        });
+
+        let json = skip_as_zero_report(&ctx, None, false);
+        let checks = json["checks"].as_array().expect("canonical checks array");
+        let cargo_audit = checks
+            .iter()
+            .find(|entry| entry["id"] == "cargo_audit")
+            .expect("pre-run unavailable check remains in canonical inventory");
+
+        assert_eq!(cargo_audit["status"].as_str(), Some("UNAVAILABLE"));
+        assert_eq!(cargo_audit["execution_state"].as_str(), Some("unavailable"));
+        assert_eq!(cargo_audit["outcome"].as_str(), Some("unavailable"));
+        assert!(cargo_audit["artifacts"]["log_path"].is_null());
+        assert!(cargo_audit["target_sha"].is_null());
+        assert_eq!(
+            json["checks_skipped"][0]["id"].as_str(),
+            Some("cargo_audit"),
+            "legacy skipped projection remains additive"
+        );
     }
 
     #[test]

@@ -2210,7 +2210,28 @@ fn generated_pack_carries_pack_level_provenance() {
             .expect("read checks-status.json"),
     )
     .expect("parse checks-status.json");
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("report.json")).expect("read report.json"),
+    )
+    .expect("parse report.json");
     let gate_rows = merge_gate["checks"].as_array().expect("merge-gate checks");
+
+    let mut gate_ids = gate_rows
+        .iter()
+        .map(|row| row["id"].as_str().expect("gate check id"))
+        .collect::<Vec<_>>();
+    let mut report_ids = report["checks"]
+        .as_array()
+        .expect("report checks")
+        .iter()
+        .map(|row| row["id"].as_str().expect("report check id"))
+        .collect::<Vec<_>>();
+    gate_ids.sort_unstable();
+    report_ids.sort_unstable();
+    assert_eq!(
+        report_ids, gate_ids,
+        "report.json and MERGE_GATE.json enumerate one canonical check set"
+    );
 
     for run_check in run_checks {
         let gate_check = gate_rows
