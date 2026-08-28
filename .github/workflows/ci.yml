@@ -66,6 +66,7 @@ jobs:
   windows-process-tree:
     name: Windows process-tree cancellation
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -74,6 +75,51 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Prove forced child and grandchild termination
         run: cargo test --lib proc::tests::terminate_process_tree_reaps_windows_child_and_grandchild -- --exact
+
+  ordinary-machine-resource-acceptance:
+    name: Ordinary-machine bounded deep review
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PRVIEW_ACCEPTANCE_DIR: ${{ runner.temp }}/prview-resource-acceptance
+      PRVIEW_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PRVIEW_SOURCE_SHA }}
+      - name: Initialize failure-shaped receipt
+        run: |
+          python3 tools/bounded_runtime_acceptance.py \
+            --initialize-only \
+            --receipt-dir "$PRVIEW_ACCEPTANCE_DIR" \
+            --source-sha "$PRVIEW_SOURCE_SHA"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: tools/fixtures/bounded-runtime/package-lock.json
+      - name: Build the candidate release binary
+        run: timeout 900 cargo build --release --locked
+      - name: Exercise a real mixed Rust and Vitest deep review
+        run: |
+          python3 tools/bounded_runtime_acceptance.py \
+            --binary "$GITHUB_WORKSPACE/target/release/prview" \
+            --fixture "$GITHUB_WORKSPACE/tools/fixtures/bounded-runtime" \
+            --receipt-dir "$PRVIEW_ACCEPTANCE_DIR" \
+            --source-sha "$PRVIEW_SOURCE_SHA" \
+            --timeout-seconds 1200
+      - name: Upload bounded-runtime receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ordinary-machine-resource-acceptance-${{ env.PRVIEW_SOURCE_SHA }}
+          path: ${{ env.PRVIEW_ACCEPTANCE_DIR }}
+          if-no-files-found: error
+          retention-days: 14
 
   build:
     name: Build Release
