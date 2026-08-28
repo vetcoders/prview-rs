@@ -1782,6 +1782,7 @@ fn merge_gate_validates_when_a_quality_tool_is_missing() {
             "--quiet",
             "--no-zip",
             "--no-heuristics",
+            "--with-security",
             "feature/json-contract",
             "main",
         ])
@@ -1812,6 +1813,18 @@ fn merge_gate_validates_when_a_quality_tool_is_missing() {
             "every check (incl. skipped) needs non-empty evidence: {check}"
         );
     }
+    assert!(
+        gate["decision"]["evidence_gaps"]
+            .as_array()
+            .is_some_and(|gaps| gaps.iter().any(|gap| {
+                gap["execution_state"] == "unavailable"
+                    && gap["verification_target"]
+                        .as_str()
+                        .is_some_and(|target| target.starts_with("execute "))
+            })),
+        "an unavailable tool must become a concrete verification target: {}",
+        gate["decision"]["evidence_gaps"]
+    );
 
     // And the whole artifact must pass its own schema validator.
     let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
@@ -1838,6 +1851,10 @@ fn generated_merge_gate_nulls_inline_findings_path_when_sarif_is_absent() {
     let gate: serde_json::Value = serde_json::from_str(&raw).expect("parse merge gate");
 
     assert_eq!(gate["inline_findings"]["findings_count"].as_u64(), Some(0));
+    assert!(matches!(
+        gate["inline_findings"]["artifact_state"].as_str(),
+        Some("scanned_zero" | "unavailable" | "not_applicable" | "not_generated")
+    ));
     assert!(
         gate["inline_findings"]["file"].is_null(),
         "inline_findings.file should be null when no SARIF file is written"

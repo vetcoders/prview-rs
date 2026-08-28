@@ -2911,6 +2911,14 @@ fn checks_status_lists_disabled_rust_quality_checks_as_skipped() {
         status["heuristics_loctree"].as_str(),
         Some("skipped (heuristics disabled)")
     );
+    assert_eq!(status["_schema_version"], "2.0");
+    assert!(status["_checks"].as_array().is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row["id"] == "cargo_test"
+                && row["execution_state"] == "skipped"
+                && row["outcome"] == "skipped"
+        })
+    }));
 }
 
 #[test]
@@ -2932,6 +2940,39 @@ fn checks_status_includes_geiger_when_security_full() {
 
     // With the full tier opted in, geiger rejoins the status surface.
     assert!(status.get("cargo_geiger").is_some());
+    assert!(status["_checks"].as_array().is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row["id"] == "cargo_geiger"
+                && row["execution_state"] == "unavailable"
+                && row["outcome"] == "unavailable"
+        })
+    }));
+}
+
+#[test]
+fn checks_status_distinguishes_profile_not_applicable_from_skipped() {
+    let config = create_test_config(PolicyConfig::default());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let skipped = [crate::checks::SkippedCheck {
+        id: "pytest".to_string(),
+        name: "pytest".to_string(),
+        reason: "profile rust: not applicable".to_string(),
+    }];
+
+    generate_checks_status_json(tmp.path(), &config, &[], &skipped).expect("checks status");
+    let status: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("checks-status.json"))
+            .expect("read checks status"),
+    )
+    .expect("parse checks status");
+
+    assert!(status["_checks"].as_array().is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row["id"] == "pytest"
+                && row["execution_state"] == "not_applicable"
+                && row["outcome"] == "not_applicable"
+        })
+    }));
 }
 
 #[test]
@@ -3375,7 +3416,7 @@ fn build_review_caveats_include_orphaned_test_candidates() {
             src_path: "src/foo.rs".to_string(),
             test_status: 'M',
             test_path: "tests/foo_test.rs".to_string(),
-            tier: crate::artifacts::signal::CoverageMatchTier::High,
+            tier: crate::artifacts::signal::CoverageMatchTier::Exact,
         }],
     };
 

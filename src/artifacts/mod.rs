@@ -2265,6 +2265,7 @@ fn generate_checks_status_json(
 ) -> Result<()> {
     use serde_json::json;
     let mut status_map = serde_json::Map::new();
+    let mut canonical_checks = Vec::new();
     let policy_summary =
         crate::policy::engine::PolicyEngine::new(config).evaluate_all(checks, skipped_checks);
 
@@ -2280,10 +2281,28 @@ fn generate_checks_status_json(
             };
             format!("skipped ({})", reason)
         } else {
-            evaluation.raw_status
+            evaluation.raw_status.clone()
         };
-        status_map.insert(evaluation.check_id, json!(status));
+        status_map.insert(evaluation.check_id.clone(), json!(status));
+        canonical_checks.push(json!({
+            "id": evaluation.check_id,
+            "name": evaluation.name,
+            "status": evaluation.raw_status,
+            "execution_state": evaluation.execution_state,
+            "outcome": evaluation.outcome,
+            "policy_conclusion": evaluation.conclusion,
+            "confidence_impact": evaluation.confidence_impact,
+            "merge_impact": evaluation.merge_impact,
+            "reason": evaluation.reason,
+        }));
     }
+
+    // Keep the original id -> display-string keys for legacy readers while
+    // publishing the same typed inventory used by MERGE_GATE.json. Consumers
+    // that judge completeness must use `_checks`; the flat strings are display
+    // compatibility only and cannot represent unavailable vs not-applicable.
+    status_map.insert("_schema_version".to_string(), json!("2.0"));
+    status_map.insert("_checks".to_string(), json!(canonical_checks));
 
     fs::write(
         dir.join("checks-status.json"),

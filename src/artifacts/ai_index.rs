@@ -64,7 +64,7 @@ pub(crate) fn generate_ai_index(
     )?;
     writeln!(
         md,
-        "- Coverage signal: {}/{} changed code files ({})",
+        "- Strong test-change associations (not executed coverage): {}/{} changed code files ({})",
         coverage.covered_count,
         coverage.total_source,
         crate::artifacts::signal::format_coverage_pct(coverage.pct)
@@ -80,9 +80,60 @@ pub(crate) fn generate_ai_index(
             .or_else(|| gate["decision"]["reason"].as_str())
             .unwrap_or("no reason recorded");
         let allow = gate["decision"]["allow_merge"].as_bool();
+        let analysis_status = gate["decision"]["analysis_status"]
+            .as_str()
+            .unwrap_or("unknown");
+        let quality_pass = gate["decision"]["quality_pass"].as_bool();
         writeln!(md, "- Gate verdict: `{}` — {}", verdict, reason)?;
+        writeln!(md, "- Evidence completeness: `{}`", analysis_status)?;
+        if let Some(quality_pass) = quality_pass {
+            writeln!(
+                md,
+                "- Executed-check quality outcome: `{}` (does not mean every check ran)",
+                if quality_pass { "pass" } else { "fail" }
+            )?;
+        }
         if let Some(allow) = allow {
             writeln!(md, "- Allow merge: `{}`", allow)?;
+        }
+        if let Some(rows) = gate["checks"].as_array() {
+            let count = |state: &str| {
+                rows.iter()
+                    .filter(|row| row["execution_state"].as_str() == Some(state))
+                    .count()
+            };
+            writeln!(
+                md,
+                "- Check execution: {} executed, {} skipped, {} unavailable, {} not applicable, {} unknown",
+                count("executed"),
+                count("skipped"),
+                count("unavailable"),
+                count("not_applicable"),
+                count("unknown"),
+            )?;
+        }
+        writeln!(
+            md,
+            "- SARIF evidence: `{}`",
+            gate["inline_findings"]["artifact_state"]
+                .as_str()
+                .unwrap_or("legacy_unspecified")
+        )?;
+        if let Some(gaps) = gate["decision"]["evidence_gaps"].as_array()
+            && !gaps.is_empty()
+        {
+            writeln!(md, "\n## Evidence gaps (verification required)\n")?;
+            for gap in gaps {
+                writeln!(
+                    md,
+                    "- `{}` (`{}`): {}",
+                    gap["check_id"].as_str().unwrap_or("unknown"),
+                    gap["execution_state"].as_str().unwrap_or("unknown"),
+                    gap["verification_target"]
+                        .as_str()
+                        .unwrap_or("execute the missing check"),
+                )?;
+            }
         }
     }
     writeln!(md)?;

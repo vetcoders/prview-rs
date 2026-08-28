@@ -99,6 +99,11 @@ struct SkippedCheckEntry {
     id: String,
     name: String,
     reason: String,
+    execution_state: crate::policy::engine::CheckExecutionState,
+    outcome: crate::policy::engine::ToolOutcome,
+    policy_conclusion: crate::policy::engine::PolicyConclusion,
+    confidence_impact: crate::policy::engine::AnalysisStatus,
+    merge_impact: crate::policy::engine::MergeRecommendation,
 }
 
 #[derive(Serialize)]
@@ -166,8 +171,19 @@ struct Gate {
     summary: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     review_caveats: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    evidence_gaps: Vec<EvidenceGap>,
     reasons: Vec<GateReason>,
     source: &'static str,
+}
+
+#[derive(Serialize)]
+struct EvidenceGap {
+    check_id: String,
+    name: String,
+    execution_state: crate::policy::engine::CheckExecutionState,
+    reason: String,
+    verification_target: String,
 }
 
 #[derive(Serialize)]
@@ -545,6 +561,7 @@ struct RiskZoneEntry {
 
 #[derive(Serialize)]
 struct SarifSection {
+    artifact_state: &'static str,
     findings_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     sarif_path: Option<&'static str>,
@@ -626,6 +643,33 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         run_started_at,
         ..
     } = input;
+    let policy_summary =
+        crate::policy::engine::PolicyEngine::new(config).evaluate_all(checks, &ctx.skipped_checks);
+    let evidence_gaps = policy_summary
+        .evaluations
+        .iter()
+        .filter(|evaluation| {
+            matches!(
+                evaluation.execution_state,
+                crate::policy::engine::CheckExecutionState::Skipped
+                    | crate::policy::engine::CheckExecutionState::Unavailable
+                    | crate::policy::engine::CheckExecutionState::Unknown
+            )
+        })
+        .map(|evaluation| EvidenceGap {
+            check_id: evaluation.check_id.clone(),
+            name: evaluation.name.clone(),
+            execution_state: evaluation.execution_state,
+            reason: evaluation
+                .reason
+                .clone()
+                .unwrap_or_else(|| "reason unavailable".to_string()),
+            verification_target: format!(
+                "execute {} successfully for the reviewed target",
+                evaluation.name
+            ),
+        })
+        .collect::<Vec<_>>();
 
     let diff_merge_base = diffs
         .first()
@@ -670,7 +714,10 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         &ctx.blocking_issues,
         review_caveats.clone(),
     );
-    let status = if ctx.allow_merge { "ALLOW" } else { "BLOCK" };
+    // Preserve the canonical three-state verdict. `allow_merge: false` also
+    // accompanies CONDITIONAL, so projecting the permission bit back to
+    // ALLOW/BLOCK would turn every review-required pack into a false BLOCK.
+    let status = ctx.verdict;
     let summary = decision.reason.clone();
 
     let mut reasons: Vec<GateReason> = Vec::new();
@@ -725,6 +772,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         status,
         summary,
         review_caveats,
+        evidence_gaps,
         reasons,
         source: "00_summary/MERGE_GATE.json",
     };
@@ -995,6 +1043,10 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             changed_tests_path: "30_context/changed-tests.txt",
         },
         sarif: SarifSection {
+            artifact_state: report_sarif_artifact_state(
+                ctx.findings.len(),
+                &policy_summary.evaluations,
+            ),
             findings_count: ctx.findings.len(),
             sarif_path: if ctx.findings.is_empty() {
                 None
@@ -1117,10 +1169,21 @@ fn build_report(input: &ReportInput<'_>) -> Report {
     let checks_skipped: Vec<SkippedCheckEntry> = ctx
         .skipped_checks
         .iter()
-        .map(|s| SkippedCheckEntry {
-            id: s.id.clone(),
-            name: s.name.clone(),
-            reason: s.reason.clone(),
+        .filter_map(|skipped| {
+            let evaluation = policy_summary
+                .evaluations
+                .iter()
+                .find(|evaluation| evaluation.name == skipped.name)?;
+            Some(SkippedCheckEntry {
+                id: skipped.id.clone(),
+                name: skipped.name.clone(),
+                reason: skipped.reason.clone(),
+                execution_state: evaluation.execution_state,
+                outcome: evaluation.outcome,
+                policy_conclusion: evaluation.conclusion,
+                confidence_impact: evaluation.confidence_impact,
+                merge_impact: evaluation.merge_impact,
+            })
         })
         .collect();
 
@@ -1149,6 +1212,48 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         regression: input.regression.cloned(),
         artifacts,
         ui_hints,
+    }
+}
+
+fn report_sarif_artifact_state(
+    findings_count: usize,
+    evaluations: &[crate::policy::engine::CheckEvaluation],
+) -> &'static str {
+    use crate::policy::engine::CheckExecutionState;
+
+    if findings_count > 0 {
+        return "positive";
+    }
+    let states = evaluations
+        .iter()
+        .filter(|evaluation| {
+            matches!(
+                evaluation.check_id.as_str(),
+                "semgrep_scan" | "cargo_audit" | "npm_audit" | "pip_audit"
+            )
+        })
+        .map(|evaluation| evaluation.execution_state)
+        .collect::<Vec<_>>();
+    if states
+        .iter()
+        .any(|state| *state == CheckExecutionState::Executed)
+    {
+        "scanned_zero"
+    } else if states.iter().any(|state| {
+        matches!(
+            state,
+            CheckExecutionState::Unavailable | CheckExecutionState::Unknown
+        )
+    }) {
+        "unavailable"
+    } else if !states.is_empty()
+        && states
+            .iter()
+            .all(|state| *state == CheckExecutionState::NotApplicable)
+    {
+        "not_applicable"
+    } else {
+        "not_generated"
     }
 }
 

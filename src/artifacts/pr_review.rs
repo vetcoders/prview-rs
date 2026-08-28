@@ -55,8 +55,12 @@ pub(crate) fn generate_pr_review(
     let mut md = String::new();
 
     // Header
-    writeln!(md, "# PR Review")?;
+    writeln!(md, "# Generated Evidence Overview")?;
     writeln!(md)?;
+    writeln!(
+        md,
+        "> Generated from repository and tool evidence. This is not an attestation that an agent or human reviewed the change."
+    )?;
     writeln!(
         md,
         "> **Branch:** {} | **Base:** {} | **Profile:** {}",
@@ -111,10 +115,24 @@ pub(crate) fn generate_pr_review(
         hotspot_count
     )?;
     if let Some(diff) = diffs.first() {
-        let top_hotspots: Vec<String> = diff
+        let mut hotspot_files = diff
             .files
             .iter()
             .filter(|file| file.additions + file.deletions >= 80)
+            .collect::<Vec<_>>();
+        hotspot_files.sort_by_key(|file| {
+            let category_rank = match classify_review_file(&file.path) {
+                ReviewFileCategory::Code => 0,
+                ReviewFileCategory::Test => 1,
+                _ => 2,
+            };
+            (
+                category_rank,
+                std::cmp::Reverse(file.additions + file.deletions),
+            )
+        });
+        let top_hotspots: Vec<String> = hotspot_files
+            .into_iter()
             .take(3)
             .map(|file| format!("`{}` ({})", file.path, file.additions + file.deletions))
             .collect();
@@ -415,12 +433,12 @@ pub(crate) fn generate_pr_review(
         && pct < 80
     {
         warnings.push(format!(
-            "Coverage review signal: {}% heuristic coverage ({}/{})",
+            "Test-change association signal (not executed coverage): {}% strong associations ({}/{})",
             pct, coverage.covered_count, coverage.total_source
         ));
     } else if code_files > 0 && test_files == 0 {
         warnings.push(format!(
-            "Coverage alert: {} code files changed without test changes",
+            "Association alert: {} code files changed without strongly associated test changes",
             code_files
         ));
     }
@@ -482,56 +500,33 @@ pub(crate) fn generate_pr_review(
         writeln!(md)?;
     }
 
+    if let Ok(raw) = read_to_string_within(dir, Path::new("00_summary/MERGE_GATE.json"))
+        && let Ok(gate) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(gaps) = gate["decision"]["evidence_gaps"].as_array()
+        && !gaps.is_empty()
+    {
+        writeln!(md, "## Evidence Gaps")?;
+        writeln!(md)?;
+        for gap in gaps {
+            writeln!(
+                md,
+                "- `{}` (`{}`): {}",
+                gap["check_id"].as_str().unwrap_or("unknown"),
+                gap["execution_state"].as_str().unwrap_or("unknown"),
+                gap["verification_target"]
+                    .as_str()
+                    .unwrap_or("execute the missing check"),
+            )?;
+        }
+        writeln!(md)?;
+    }
+
     writeln!(md, "---")?;
     writeln!(md)?;
-
-    // PR template
-    writeln!(md, "## PR Template")?;
-    writeln!(md)?;
-    writeln!(md, "_Copy below for GitHub PR description:_")?;
-    writeln!(md)?;
-    writeln!(md, "```markdown")?;
-    writeln!(md, "## Description")?;
-    writeln!(md, "<!-- Describe your changes -->")?;
-    writeln!(md, "## Type of Change")?;
-    writeln!(md, "- [ ] Bug fix")?;
-    writeln!(md, "- [ ] New feature")?;
-    writeln!(md, "- [ ] Breaking change")?;
-    writeln!(md, "- [ ] Refactoring")?;
-    writeln!(md, "## Checklist")?;
-
-    // Auto-check based on check results
-    let has_tsc = checks.iter().any(|c| {
-        c.name.to_lowercase().contains("typescript") || c.name.to_lowercase() == "cargo check"
-    });
-    let tsc_pass = checks.iter().any(|c| {
-        (c.name.to_lowercase().contains("typescript") || c.name.to_lowercase() == "cargo check")
-            && matches!(c.status, crate::checks::CheckStatus::Passed)
-    });
-    let tests_pass = checks.iter().any(|c| {
-        (c.name.to_lowercase().contains("test")
-            || c.name.to_lowercase() == "vitest"
-            || c.name.to_lowercase() == "pytest")
-            && matches!(c.status, crate::checks::CheckStatus::Passed)
-    });
-    let lint_pass = checks.iter().any(|c| {
-        (c.name.to_lowercase().contains("lint")
-            || c.name.to_lowercase() == "clippy"
-            || c.name.to_lowercase() == "ruff")
-            && matches!(c.status, crate::checks::CheckStatus::Passed)
-    });
-
-    let check_mark = |pass: bool| if pass { "x" } else { " " };
-
     writeln!(
         md,
-        "- [{}] Compiles / type-checks",
-        check_mark(tsc_pass || (!has_tsc && checks.is_empty()))
+        "_End of generated evidence. Reviewer conclusions and manual verification are intentionally not fabricated._"
     )?;
-    writeln!(md, "- [{}] Tests pass", check_mark(tests_pass))?;
-    writeln!(md, "- [{}] No lint errors", check_mark(lint_pass))?;
-    writeln!(md, "- [ ] Manually tested")?;
-    writeln!(md, "```")?;
 
     fs::write(dir.join("PR_REVIEW.md"), md)?;
     Ok(())

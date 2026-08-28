@@ -13,6 +13,7 @@ pub enum ToolOutcome {
     FindingsWarning,
     SystemError,
     Skipped,
+    NotApplicable,
     Unavailable,
     Unknown,
 }
@@ -225,6 +226,7 @@ impl MergeRecommendation {
 pub enum CheckExecutionState {
     Executed,
     Skipped,
+    NotApplicable,
     Unavailable,
     Unknown,
 }
@@ -522,6 +524,7 @@ fn semgrep_scan_is_degraded(check_id: &str, result: &CheckResult) -> bool {
 fn skip_outcome_for(execution_state: CheckExecutionState) -> ToolOutcome {
     match execution_state {
         CheckExecutionState::Skipped => ToolOutcome::Skipped,
+        CheckExecutionState::NotApplicable => ToolOutcome::NotApplicable,
         CheckExecutionState::Unavailable => ToolOutcome::Unavailable,
         CheckExecutionState::Unknown => ToolOutcome::Unknown,
         CheckExecutionState::Executed => ToolOutcome::Skipped,
@@ -532,14 +535,15 @@ fn classify_skip_execution_state(reason: &str) -> CheckExecutionState {
     if reason.is_empty() {
         return CheckExecutionState::Unknown;
     }
-    if reason.starts_with("profile")
-        || is_mode_skip_reason(reason)
-        || reason.contains("fast remote-only preset")
-    {
+    if reason.starts_with("profile") {
+        return CheckExecutionState::NotApplicable;
+    }
+    if is_mode_skip_reason(reason) || reason.contains("fast remote-only preset") {
         return CheckExecutionState::Skipped;
     }
     if reason.contains("not installed")
         || reason.contains("not found")
+        || reason.contains("not available")
         || reason.contains("missing")
         || reason.contains("unavailable")
     {
@@ -574,6 +578,9 @@ fn describe_advisory_check(eval: &CheckEvaluation) -> String {
     match eval.execution_state {
         CheckExecutionState::Executed => format!("{} returned {}", eval.name, eval.raw_status),
         CheckExecutionState::Skipped => format!("{} was skipped", eval.name),
+        CheckExecutionState::NotApplicable => {
+            format!("{} was not applicable to this profile", eval.name)
+        }
         CheckExecutionState::Unavailable => format!("{} was unavailable for this run", eval.name),
         CheckExecutionState::Unknown => format!("{} needs manual review", eval.name),
     }
@@ -678,6 +685,18 @@ mod tests {
             classify_skip_execution_state("requires --security-full"),
             CheckExecutionState::Skipped,
             "declared mode skips must not masquerade as unknown tool loss"
+        );
+    }
+
+    #[test]
+    fn profile_exclusion_is_not_applicable_not_a_runtime_skip() {
+        assert_eq!(
+            classify_skip_execution_state("profile rust: not applicable"),
+            CheckExecutionState::NotApplicable
+        );
+        assert_eq!(
+            skip_outcome_for(CheckExecutionState::NotApplicable),
+            ToolOutcome::NotApplicable
         );
     }
 }

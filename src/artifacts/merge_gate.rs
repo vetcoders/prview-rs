@@ -86,6 +86,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     let mut enforcement_disposition =
         EnforcementDisposition::from_evaluations(&outcome.effective_evals);
     let mut gate_checks = Vec::new();
+    let mut evidence_gaps = Vec::new();
     let mut stale_cache_caveats = Vec::new();
 
     let inline_findings_path =
@@ -140,6 +141,21 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
                 .as_ref()
                 .map(|id| format!("20_quality/{}.log", id)),
         }));
+
+        if matches!(
+            eval.execution_state,
+            crate::policy::engine::CheckExecutionState::Skipped
+                | crate::policy::engine::CheckExecutionState::Unavailable
+                | crate::policy::engine::CheckExecutionState::Unknown
+        ) {
+            evidence_gaps.push(json!({
+                "check_id": eval.check_id,
+                "name": eval.name,
+                "execution_state": eval.execution_state,
+                "reason": eval.reason,
+                "verification_target": format!("execute {} successfully for the reviewed target", eval.name),
+            }));
+        }
 
         // A verdict may rest on evidence this run never produced. The row counts
         // as blocking influence when policy ruled it a hard blocker, or when the
@@ -376,6 +392,10 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         "inline_findings": {
             "file": inline_findings_path,
             "file_exists": inline.findings_count > 0,
+            "artifact_state": inline_sarif_artifact_state(
+                inline.findings_count,
+                &policy_summary.evaluations,
+            ),
             "status": inline.status,
             "severity": policy_severity_to_str(inline_severity),
             "blocking": inline_blocking,
@@ -412,6 +432,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
                 "origin": detail.origin.as_str(),
             })).collect::<Vec<_>>(),
             "decision_reason": decision.reason,
+            "evidence_gaps": evidence_gaps,
             "review_caveats": all_review_caveats,
             "blocking_issues": blocking_issues
         },
@@ -455,6 +476,22 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             check["class"].as_str().unwrap_or("unknown"),
             check["blocking"].as_bool().unwrap_or(false),
         );
+    }
+    if let Some(gaps) = gate["decision"]["evidence_gaps"].as_array()
+        && !gaps.is_empty()
+    {
+        md.push_str("\n## Evidence gaps\n\n");
+        for gap in gaps {
+            let _ = writeln!(
+                md,
+                "- `{}` (`{}`): {}",
+                gap["check_id"].as_str().unwrap_or("unknown"),
+                gap["execution_state"].as_str().unwrap_or("unknown"),
+                gap["verification_target"]
+                    .as_str()
+                    .unwrap_or("execute the missing check"),
+            );
+        }
     }
     fs::write(dir.join("MERGE_GATE.md"), md)?;
     Ok(())
@@ -580,8 +617,52 @@ fn describe_policy_advisory(eval: &crate::policy::engine::CheckEvaluation) -> St
     match eval.execution_state {
         CheckExecutionState::Executed => format!("{} returned {}", eval.name, eval.raw_status),
         CheckExecutionState::Skipped => format!("{} was skipped", eval.name),
+        CheckExecutionState::NotApplicable => {
+            format!("{} was not applicable to this profile", eval.name)
+        }
         CheckExecutionState::Unavailable => format!("{} was unavailable for this run", eval.name),
         CheckExecutionState::Unknown => format!("{} needs manual review", eval.name),
+    }
+}
+
+fn inline_sarif_artifact_state(
+    findings_count: usize,
+    evaluations: &[crate::policy::engine::CheckEvaluation],
+) -> &'static str {
+    use crate::policy::engine::CheckExecutionState;
+
+    if findings_count > 0 {
+        return "positive";
+    }
+    let security = evaluations.iter().filter(|eval| {
+        matches!(
+            eval.check_id.as_str(),
+            "semgrep_scan" | "cargo_audit" | "npm_audit" | "pip_audit"
+        )
+    });
+    let states = security
+        .map(|eval| eval.execution_state)
+        .collect::<Vec<_>>();
+    if states
+        .iter()
+        .any(|state| *state == CheckExecutionState::Executed)
+    {
+        "scanned_zero"
+    } else if states.iter().any(|state| {
+        matches!(
+            state,
+            CheckExecutionState::Unavailable | CheckExecutionState::Unknown
+        )
+    }) {
+        "unavailable"
+    } else if !states.is_empty()
+        && states
+            .iter()
+            .all(|state| *state == CheckExecutionState::NotApplicable)
+    {
+        "not_applicable"
+    } else {
+        "not_generated"
     }
 }
 

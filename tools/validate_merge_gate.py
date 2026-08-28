@@ -45,13 +45,20 @@ VALID_QUALITY_FAILURE_CLASSES = {
 # field folds case because its writer has shipped legacy spellings; this one has
 # only ever emitted lowercase.
 VALID_CHECK_STATUSES = {"passed", "failed", "warnings", "skipped", "error"}
-VALID_EXECUTION_STATES = {"executed", "skipped", "unavailable", "unknown"}
+VALID_EXECUTION_STATES = {
+    "executed",
+    "skipped",
+    "not_applicable",
+    "unavailable",
+    "unknown",
+}
 VALID_TOOL_OUTCOMES = {
     "passed",
     "findings_failed",
     "findings_warning",
     "system_error",
     "skipped",
+    "not_applicable",
     "unavailable",
     "unknown",
 }
@@ -568,7 +575,12 @@ def validate(path: Path) -> list[str]:
                     "failed": {"findings_failed"},
                     "warnings": {"findings_warning"},
                     "error": {"system_error"},
-                    "skipped": {"skipped", "unavailable", "unknown"},
+                    "skipped": {
+                        "skipped",
+                        "not_applicable",
+                        "unavailable",
+                        "unknown",
+                    },
                 }
                 execution_outcomes = {
                     "executed": {
@@ -578,6 +590,7 @@ def validate(path: Path) -> list[str]:
                         "system_error",
                     },
                     "skipped": {"skipped"},
+                    "not_applicable": {"not_applicable"},
                     "unavailable": {"unavailable"},
                     "unknown": {"unknown"},
                 }
@@ -794,6 +807,18 @@ def validate(path: Path) -> list[str]:
                     "inline_findings.enforcement_disposition must be one of "
                     f"{sorted(VALID_ENFORCEMENT_DISPOSITIONS)} (schema 2.3)"
                 )
+            artifact_state = inline.get("artifact_state")
+            if artifact_state is not None and artifact_state not in {
+                "positive",
+                "scanned_zero",
+                "unavailable",
+                "not_applicable",
+                "not_generated",
+            }:
+                issues.append(
+                    "inline_findings.artifact_state must be one of positive|scanned_zero|"
+                    "unavailable|not_applicable|not_generated (schema 2.3)"
+                )
             require_non_negative_integer(
                 introduced_count, "inline_findings.introduced_count", issues
             )
@@ -870,6 +895,26 @@ def validate(path: Path) -> list[str]:
             issues.append(f"decision.verdict must be one of {sorted(VALID_VERDICTS)}")
         require_boolean(decision.get("allow_merge"), "decision.allow_merge", issues)
         require_non_empty_string(decision.get("decision_reason"), "decision.decision_reason", issues)
+        evidence_gaps = decision.get("evidence_gaps")
+        if evidence_gaps is not None:
+            if not isinstance(evidence_gaps, list):
+                issues.append("decision.evidence_gaps must be an array")
+            else:
+                for idx, gap in enumerate(evidence_gaps):
+                    ctx = f"decision.evidence_gaps[{idx}]"
+                    if not isinstance(gap, dict):
+                        issues.append(f"{ctx} must be an object")
+                        continue
+                    for field in ("check_id", "name", "verification_target"):
+                        require_non_empty_string(gap.get(field), f"{ctx}.{field}", issues)
+                    if gap.get("execution_state") not in {
+                        "skipped",
+                        "unavailable",
+                        "unknown",
+                    }:
+                        issues.append(
+                            f"{ctx}.execution_state must name a genuine evidence gap"
+                        )
         # allow_merge is a DERIVED field (schema 2.1, PV-03): it is true iff the
         # verdict is a clean PASS, so the contradictory state `allow_merge: true`
         # beside a CONDITIONAL/BLOCK verdict is rejected here as a schema break.
