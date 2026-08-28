@@ -192,6 +192,24 @@ prview feature/x main
 | `--update` | Incremental rerun after new commits, skipping heavy checks unless forced |
 | `--ai-only` | Minimal artifact pack for AI/review flows |
 
+### Resource budget
+
+`prview` defaults to `--resource-budget safe`: at most one whole-machine tool
+runs at a time and supported descendant pools receive one worker. This is the
+recommended setting for ordinary developer machines.
+
+`--resource-budget balanced` is an explicit throughput opt-in. It still admits
+at most two capped heavy parents; Cargo/rustc receive `CARGO_BUILD_JOBS`, Vitest
+receives `--maxWorkers`, and Semgrep receives `--jobs`. Tools without a stable
+portable cap (including tsc and ESLint across supported project versions) remain
+serialized. High current load, or an unavailable load reading, backpressures the
+effective plan to `safe`.
+
+Before checks start, the human preflight prints the requested/effective budget,
+parent and child caps, expensive tools, and the cheap-first execution schedule.
+The envelope is conservative; it does not pretend to predict exact future peak
+memory.
+
 ## Quick cheat sheet
 
 ```bash
@@ -261,6 +279,7 @@ prview --help
 | `--with-security` | Raise the heavy security posture (does not add cargo-geiger or full-tree Semgrep) |
 | `--skip-security` | Skip heavy security checks |
 | `--security-full` | Full security tier: runs full-tree Semgrep and adds cargo-geiger's unsafe scan (slow; off even under `--deep`) |
+| `--resource-budget safe\|balanced` | Select the whole-machine envelope (`safe` is the default; `balanced` is capped and load-aware) |
 
 By default, Semgrep is scoped to the change when prview can resolve a clean git
 baseline: it passes Semgrep `--baseline-commit <merge-base>` so existing
