@@ -590,6 +590,15 @@ unknown instead of being recorded as clean. They surface in
 `00_summary/RUN.json` (`checks[]`), `00_summary/PROVENANCE.json` and
 `report.json` (`checks[]`).
 
+`CargoTestCheck` also guards the snapshot across execution. A check that starts
+on an exact `snapshot` fails if `cargo test` leaves any tracked or untracked
+path behind, and its output names those paths; an unreadable post-test status
+fails closed instead of certifying the tree. Snapshot test runs set
+`PYTHONDONTWRITEBYTECODE=1`, preventing Python helpers launched by Rust tests
+from depositing `__pycache__` in the reviewed checkout. A snapshot that was
+already dirty is still reported as `snapshot-dirty` rather than being compared
+against a clean baseline.
+
 **A check that errors keeps its substrate.** A command that times out or crashes
 returns an error, and that row used to carry no provenance at all — null `cwd`,
 `target_sha` and `tree_state` for exactly the rows a reviewer most needs to

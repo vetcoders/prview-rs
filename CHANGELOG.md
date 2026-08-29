@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Off-HEAD `cargo test` checks now keep Python bytecode out of the reviewed
+  snapshot and fail with named dirty paths if any test mutates a snapshot that
+  started clean. An unreadable post-test status also fails closed, while an
+  already-dirty substrate remains explicitly `snapshot-dirty`.
 - Evaluator surfaces now preserve five distinct check states (`executed`,
   `skipped`, `not_applicable`, `unavailable`, `unknown`) and publish concrete
   evidence gaps across `MERGE_GATE.json`, `report.json`, `checks-status.json`,

@@ -264,17 +264,42 @@ fn canonical(path: &Path) -> std::path::PathBuf {
 /// reporting "clean" there would let provenance certify that the scanned bytes
 /// match the commit precisely when nothing could be verified.
 fn working_tree_is_dirty(repo: &git2::Repository, exempt: &[&str]) -> Option<bool> {
+    working_tree_dirty_paths(repo, exempt).map(|paths| !paths.is_empty())
+}
+
+/// Dirty paths in a linked snapshot of `repo_root`, excluding prview's own
+/// dependency scaffolding. `None` means the directory is not such a snapshot or
+/// its status could not be verified.
+pub(super) fn snapshot_dirty_paths(cwd: &Path, repo_root: &Path) -> Option<Vec<String>> {
+    let repo = git2::Repository::discover(cwd).ok()?;
+    let is_external =
+        crate::paths::normalize_to_repo_relative(&cwd.display().to_string(), repo_root).is_external;
+    if !belongs_to_repo(&repo, repo_root) || !is_external {
+        return None;
+    }
+    working_tree_dirty_paths(&repo, SNAPSHOT_SCAFFOLDING)
+}
+
+/// `git status --porcelain` paths, ignoring `exempt` top-level paths.
+fn working_tree_dirty_paths(repo: &git2::Repository, exempt: &[&str]) -> Option<Vec<String>> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .include_ignored(false)
         .include_unmodified(false);
     let statuses = repo.statuses(Some(&mut opts)).ok()?;
-    Some(statuses.iter().any(|entry| {
-        let path = entry.path().unwrap_or_default();
-        !exempt
-            .iter()
-            .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
-    }))
+    let mut paths: Vec<String> = statuses
+        .iter()
+        .filter_map(|entry| {
+            let path = entry.path().unwrap_or("<non-utf8-path>");
+            (!exempt
+                .iter()
+                .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/"))))
+            .then(|| path.to_string())
+        })
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    Some(paths)
 }
 
 /// Provenance data for a check execution (Artifact Pack v1)
