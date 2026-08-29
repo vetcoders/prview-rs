@@ -365,6 +365,7 @@ impl<'a> SnapshotBuilder<'a> {
         self.resolve_trait_impls();
         self.resolve_inherent_items();
         self.materialize_public_modules();
+        self.attach_public_reexport_origins();
         self.crates.sort_by(|left, right| {
             (&left.name, &left.manifest_path, &left.root_path).cmp(&(
                 &right.name,
@@ -563,6 +564,43 @@ impl<'a> SnapshotBuilder<'a> {
                 origin_module_path,
                 origin_name: name,
             });
+        }
+    }
+
+    fn attach_public_reexport_origins(&mut self) {
+        let public_origins: BTreeSet<_> = self
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.key.crate_name.clone(),
+                    item.key.namespace,
+                    item.key.module_path.clone(),
+                    item.key.external_name.clone(),
+                )
+            })
+            .collect();
+        for item in &mut self.items {
+            let origin_is_distinct = item.origin_module_path != item.key.module_path
+                || item.origin_name != item.key.external_name;
+            let origin_is_public = public_origins.contains(&(
+                item.key.crate_name.clone(),
+                item.key.namespace,
+                item.origin_module_path.clone(),
+                item.origin_name.clone(),
+            ));
+            if origin_is_distinct && origin_is_public {
+                let origin = if item.origin_module_path.is_empty() {
+                    item.origin_name.clone()
+                } else {
+                    format!(
+                        "{}::{}",
+                        item.origin_module_path.join("::"),
+                        item.origin_name
+                    )
+                };
+                item.contract = format!("{}\nreexport-origin:{origin}", item.contract);
+            }
         }
     }
 
@@ -1531,7 +1569,7 @@ impl<'a> SnapshotBuilder<'a> {
         crate_name: &str,
         module_path: &[String],
         source_path: &str,
-        module_reachable: bool,
+        _module_reachable: bool,
         cfg_guard: &[String],
         item_impl: &syn::ItemImpl,
     ) {
@@ -1548,18 +1586,18 @@ impl<'a> SnapshotBuilder<'a> {
             else {
                 return;
             };
-            if module_reachable {
-                self.pending_trait_impls.push(PendingTraitImpl {
-                    crate_name: crate_name.to_owned(),
-                    trait_module_path,
-                    trait_name,
-                    owner_module_path,
-                    owner_name,
-                    cfg_guard: cfg_guard.to_vec(),
-                    source_path: source_path.to_owned(),
-                    evidence: normalized_trait_impl_contract(item_impl),
-                });
-            }
+            // Trait impls are globally usable when the trait and owner are
+            // public, even if the impl lives in a private helper module.
+            self.pending_trait_impls.push(PendingTraitImpl {
+                crate_name: crate_name.to_owned(),
+                trait_module_path,
+                trait_name,
+                owner_module_path,
+                owner_name,
+                cfg_guard: cfg_guard.to_vec(),
+                source_path: source_path.to_owned(),
+                evidence: normalized_trait_impl_contract(item_impl),
+            });
             return;
         }
         let syn::Type::Path(type_path) = item_impl.self_ty.as_ref() else {
@@ -5053,6 +5091,47 @@ mod tests {
         assert_ne!(
             find_item(&old, "Public").origin_name,
             find_item(&new, "Public").origin_name
+        );
+    }
+
+    #[test]
+    fn rust_api_snapshot_public_reexport_retarget_changes_contract() {
+        let old = snapshot_rust_api(&source(
+            "pub mod a { pub struct A; } pub mod b { pub struct B; } pub use a::A as Public;",
+        ));
+        let new = snapshot_rust_api(&source(
+            "pub mod a { pub struct A; } pub mod b { pub struct B; } pub use b::B as Public;",
+        ));
+        assert_ne!(
+            find_item(&old, "Public").contract,
+            find_item(&new, "Public").contract,
+            "retargeting a public reexport between public types must change the compared contract"
+        );
+        assert!(
+            find_item(&old, "Public")
+                .contract
+                .contains("reexport-origin:a::A")
+        );
+        assert!(
+            find_item(&new, "Public")
+                .contract
+                .contains("reexport-origin:b::B")
+        );
+    }
+
+    #[test]
+    fn rust_api_snapshot_private_module_public_trait_impl_is_unknown() {
+        let snapshot = snapshot_rust_api(&source(
+            "pub trait Marker {} pub struct Value; \
+             mod helper { impl crate::Marker for crate::Value {} }",
+        ));
+        assert!(
+            snapshot.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::TraitImplResolution
+                    && unknown.evidence.contains("impl")
+                    && unknown.evidence.contains("Marker")
+            }),
+            "a public trait impl declared in a private module is still globally usable"
         );
     }
 

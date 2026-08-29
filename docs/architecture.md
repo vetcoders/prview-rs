@@ -1316,7 +1316,10 @@ guarded `UnsupportedExternResolution` until external/prelude resolution exists;
 private or unreachable declarations do not create external semantic surface.
 Semantic proof comparison includes the public unknown's kind, crate/module
 location, exact evidence, and guards, while continuing to exclude source paths,
-provenance, and private reexport target/origin spelling.
+provenance, and private reexport target/origin spelling. A public reexport's
+resolved origin is part of the compared contract, so retargeting
+`pub use a::A as Public` to `pub use b::B as Public` when both donors remain
+public is a `Changed` fact.
 
 Item identity is `crate + external module path + Rust namespace + NFC external
 name`. Value, type, and macro namespaces are separate. The snapshot also emits
@@ -1362,7 +1365,10 @@ lifetime relationships remain part of the contract. Source-only analysis does
 not pretend to resolve trait selection or coherence: an impl whose trait and
 owner are both externally reachable is retained as `TraitImplResolution`
 uncertainty with its normalized source contract until compiler-backed resolution
-exists; private/private impls do not degrade the public surface.
+exists, including impls written in a private helper module. Private/private
+impls do not degrade the public surface. Declaring-module reachability does not
+gate collection: Rust makes a public-trait-on-public-type impl globally usable
+regardless of the helper module's visibility.
 
 #### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
 

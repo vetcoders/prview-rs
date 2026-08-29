@@ -2112,6 +2112,69 @@ mod tests {
             private_control.findings().is_empty(),
             "an impl whose trait and owner are both private is not public API uncertainty"
         );
+
+        let private_module = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Marker {}\npub struct Value;\n",
+                "pub trait Marker {}\npub struct Value;\nmod helper { impl crate::Marker for crate::Value {} }\n",
+            ),
+        ]);
+        assert!(private_module.unknown.iter().any(|finding| {
+            finding.identity.name == "TraitImplResolution"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("impl"))
+        }));
+    }
+
+    #[test]
+    fn repository_backed_public_reexport_retarget_is_changed() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub mod a { pub struct A; }\npub mod b { pub struct B; }\npub use a::A as Public;\n",
+                "pub mod a { pub struct A; }\npub mod b { pub struct B; }\npub use b::B as Public;\n",
+            ),
+        ]);
+        assert!(
+            delta
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Public"),
+            "retargeting a public name between two still-public types is a contract change"
+        );
+
+        let private_donor = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod donor { pub struct Old; }\npub use donor::Old as Public;\n",
+                "mod donor { pub struct New; }\npub use donor::New as Public;\n",
+            ),
+        ]);
+        assert!(
+            private_donor
+                .findings()
+                .iter()
+                .all(|finding| finding.identity.name != "Public"),
+            "renaming a private reexport donor is not a public contract change"
+        );
     }
 
     #[test]

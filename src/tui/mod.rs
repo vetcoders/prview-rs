@@ -142,6 +142,20 @@ async fn run_event_loop<B: Backend>(
 where
     B::Error: Send + Sync + 'static,
 {
+    let result = run_event_loop_inner(terminal, state, tx, rx, analysis).await;
+    join_cancelled_analysis(result, analysis).await
+}
+
+async fn run_event_loop_inner<B: Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut TuiState,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+    rx: &mut mpsc::UnboundedReceiver<TuiEvent>,
+    analysis: &mut Option<AnalysisTask>,
+) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     let tick_rate = Duration::from_millis(100);
 
     loop {
@@ -175,7 +189,6 @@ where
                 keys::handle_key(state, key, tx).await?;
             }
             if state.should_quit {
-                cancel_analysis(analysis).await?;
                 break;
             }
         }
@@ -191,7 +204,19 @@ where
         }
     }
 
-    cancel_analysis(analysis).await
+    Ok(())
+}
+
+async fn join_cancelled_analysis(
+    result: Result<()>,
+    analysis: &mut Option<AnalysisTask>,
+) -> Result<()> {
+    let cancel = cancel_analysis(analysis).await;
+    match (result, cancel) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+    }
 }
 
 async fn reap_finished_analysis(
@@ -669,6 +694,32 @@ mod tests {
                 "cancelled analysis must not publish a completion/verdict event"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn event_loop_error_cancels_and_joins_analysis() {
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        let wait_governor = Arc::clone(&governor);
+        let oracle = Arc::clone(&governor);
+        let handle = tokio::spawn(async move {
+            wait_governor.cancelled().await;
+            Err(crate::governor::Cancelled.into())
+        });
+        let mut analysis = Some(AnalysisTask { governor, handle });
+
+        let result =
+            join_cancelled_analysis(Err(anyhow::anyhow!("backend clear failed")), &mut analysis)
+                .await;
+
+        assert!(
+            result.is_err(),
+            "backend errors must still surface after cancellation"
+        );
+        assert!(analysis.is_none(), "error exit must join the analysis task");
+        assert!(
+            oracle.is_cancelled(),
+            "error exit must cancel the analysis governor"
+        );
     }
 
     #[test]

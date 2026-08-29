@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Public trait impls declared in private helper modules are retained as
+  `TraitImplResolution` unknowns instead of disappearing from the delta.
+- Retargeting a public reexport between two still-public types is a compared
+  contract change; private donor renames stay semantically equal.
+- TUI backend errors after analysis has started cancel and join the analysis
+  task instead of detaching Cargo/Node process trees.
+- `cargo test` caps libtest through `RUST_TEST_THREADS` rather than forwarding
+  `--test-threads` after `--`, so `harness = false` custom targets are not
+  passed libtest-only flags.
 - Repo-backed Rust API analysis now preserves callable tuple-constructor shape,
   exhaustive versus `#[non_exhaustive]` enum policy, explicit-repr private
   layout, public data-type binder semantics, and valid siblings beside legal
