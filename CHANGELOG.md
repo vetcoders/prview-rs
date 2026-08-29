@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract change; private donor renames stay semantically equal.
 - TUI backend errors after analysis has started cancel and join the analysis
   task instead of detaching Cargo/Node process trees.
+- The TUI `r` hotkey no longer starts a run from the branch wizard or the
+  help overlay, so `r` can still be typed into the branch filter.
 - `cargo test` caps libtest through `RUST_TEST_THREADS` rather than forwarding
   `--test-threads` after `--`, so `harness = false` custom targets are not
   passed libtest-only flags.

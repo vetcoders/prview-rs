@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 
 use crate::checks::{CheckEvent, CheckResult, CheckStatus as CrateCheckStatus};
 use crate::{App, Config};
-use types::{TuiEvent, TuiState};
+use types::{TuiEvent, TuiState, WizardMode};
 
 struct AnalysisTask {
     governor: Arc<crate::governor::ResourceGovernor>,
@@ -176,10 +176,11 @@ where
             if key.kind == KeyEventKind::Release {
                 continue;
             }
-            // Handle key event
+            // Handle key event. `r` starts a run only in idle normal mode;
+            // wizard filter typing and the help overlay must still reach
+            // `keys::handle_key`.
             if key.code == crossterm::event::KeyCode::Char('r')
-                && !state.running
-                && analysis.is_none()
+                && intercepts_run_hotkey(state, analysis)
             {
                 state.running = true;
                 state.start_time = Some(std::time::Instant::now());
@@ -205,6 +206,13 @@ where
     }
 
     Ok(())
+}
+
+fn intercepts_run_hotkey(state: &TuiState, analysis: &Option<AnalysisTask>) -> bool {
+    state.wizard_mode == WizardMode::None
+        && !state.show_help
+        && !state.running
+        && analysis.is_none()
 }
 
 async fn join_cancelled_analysis(
@@ -694,6 +702,94 @@ mod tests {
                 "cancelled analysis must not publish a completion/verdict event"
             );
         }
+    }
+
+    fn press(code: crossterm::event::KeyCode) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    async fn drive_event_loop(
+        state: &mut TuiState,
+        analysis: &mut Option<AnalysisTask>,
+        keys: impl IntoIterator<Item = Event>,
+    ) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        for key in keys {
+            input_tx.send(key).expect("inject key");
+        }
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let run = TEST_INPUT_EVENTS.scope(
+            std::cell::RefCell::new(input_rx),
+            run_event_loop(&mut terminal, state, &tx, &mut rx, analysis),
+        );
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("event loop timed out")
+            .expect("event loop");
+    }
+
+    #[test]
+    fn run_hotkey_is_not_intercepted_in_wizard_or_help() {
+        let mut state = TuiState::new(default_config());
+        let analysis = None;
+        assert!(intercepts_run_hotkey(&state, &analysis));
+
+        state.wizard_mode = WizardMode::SelectTarget;
+        assert!(!intercepts_run_hotkey(&state, &analysis));
+
+        state.wizard_mode = WizardMode::None;
+        state.show_help = true;
+        assert!(!intercepts_run_hotkey(&state, &analysis));
+    }
+
+    #[tokio::test]
+    async fn r_in_wizard_types_filter_instead_of_starting_analysis() {
+        let mut state = TuiState::new(default_config());
+        state.wizard_mode = WizardMode::SelectTarget;
+        state.branch_selector.local_branches = vec!["release".to_string(), "main".to_string()];
+        let mut analysis = None;
+
+        drive_event_loop(
+            &mut state,
+            &mut analysis,
+            [
+                press(crossterm::event::KeyCode::Char('r')),
+                press(crossterm::event::KeyCode::Esc),
+                press(crossterm::event::KeyCode::Char('q')),
+            ],
+        )
+        .await;
+
+        assert!(analysis.is_none(), "wizard r must not spawn analysis");
+        assert!(!state.running);
+        assert_eq!(state.branch_selector.filter, "r");
+    }
+
+    #[tokio::test]
+    async fn r_in_help_overlay_does_not_start_analysis() {
+        let mut state = TuiState::new(default_config());
+        state.show_help = true;
+        let mut analysis = None;
+
+        drive_event_loop(
+            &mut state,
+            &mut analysis,
+            [
+                press(crossterm::event::KeyCode::Char('r')),
+                press(crossterm::event::KeyCode::Char('q')),
+                press(crossterm::event::KeyCode::Char('q')),
+            ],
+        )
+        .await;
+
+        assert!(analysis.is_none(), "help r must not spawn analysis");
+        assert!(!state.running);
+        assert!(state.should_quit);
     }
 
     #[tokio::test]
