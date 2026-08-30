@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CI and the prview gate run on every pull request, not only those targeting
+  `main`.
+
 ### Fixed
 
 - Public trait impls declared in private helper modules are retained as
