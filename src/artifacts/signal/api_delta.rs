@@ -496,13 +496,14 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
         ));
         return;
     };
-    let exhaustive_field_added = !before_struct.non_exhaustive
-        && after_struct
-            .fields
-            .keys()
-            .any(|name| !before_struct.fields.contains_key(name));
+    let field_added = after_struct
+        .fields
+        .keys()
+        .any(|name| !before_struct.fields.contains_key(name));
+    let exhaustive_field_added = !before_struct.non_exhaustive && field_added;
+    let layout_field_added = before_struct.layout_sensitive && field_added;
     let parent_policy_changed = before_struct.non_exhaustive != after_struct.non_exhaustive;
-    let mut emitted = exhaustive_field_added || parent_policy_changed;
+    let mut emitted = exhaustive_field_added || parent_policy_changed || layout_field_added;
     if emitted {
         delta.changed.push(known_finding(
             ApiDeltaKind::Changed,
@@ -533,7 +534,7 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
             // Existing exhaustive structs are constructed and matched by
             // downstream callers. Their added field is represented by the
             // parent Changed finding above, not by an informational field add.
-            (None, Some(_)) if exhaustive_field_added => continue,
+            (None, Some(_)) if exhaustive_field_added || layout_field_added => continue,
             (None, Some(_)) => ApiDeltaKind::Added,
             (None, None) => unreachable!(),
         };
@@ -600,6 +601,7 @@ fn variant_side(parent: &ApiFactSide, name: &str, contract: &str) -> ApiFactSide
 struct PublicStructContract {
     fields: BTreeMap<String, String>,
     non_exhaustive: bool,
+    layout_sensitive: bool,
 }
 
 fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
@@ -610,6 +612,7 @@ fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
         .attrs
         .iter()
         .any(|attribute| attribute.path().is_ident("non_exhaustive"));
+    let layout_sensitive = item.attrs.iter().any(attr_is_layout_sensitive_repr);
     let syn::Fields::Named(fields) = item.fields else {
         return None;
     };
@@ -636,7 +639,21 @@ fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
             })
             .collect(),
         non_exhaustive,
+        layout_sensitive,
     })
+}
+
+fn attr_is_layout_sensitive_repr(attribute: &syn::Attribute) -> bool {
+    if !attribute.path().is_ident("repr") {
+        return false;
+    }
+    let syn::Meta::List(list) = &attribute.meta else {
+        return false;
+    };
+    list.tokens
+        .to_string()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| matches!(token, "C" | "packed" | "transparent"))
 }
 
 fn field_side(parent: &ApiFactSide, name: &str, contract: &str) -> ApiFactSide {
@@ -1198,6 +1215,12 @@ fn unknown_proofs_match(
         && left.provenance == base.provenance
         && right.provenance == target.provenance
         && same_provenance_class(&left.provenance, &right.provenance)
+        && include_dependent_source_is_proven(left)
+}
+
+fn include_dependent_source_is_proven(unknown: &RustApiUnknown) -> bool {
+    unknown.kind != RustApiUnknownKind::IncludeMacro
+        || !unknown.evidence.contains("included-digest:unresolved")
 }
 
 fn same_provenance_class(left: &RevisionProvenance, right: &RevisionProvenance) -> bool {
@@ -1853,6 +1876,30 @@ mod tests {
         assert!(new_item.added.iter().any(|finding| {
             finding.identity.name == "Options" && finding.identity.module_path.is_empty()
         }));
+
+        let repr_non_exhaustive = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "#[repr(C)] #[non_exhaustive] pub struct Options { pub a: u8 }",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "#[repr(C)] #[non_exhaustive] pub struct Options { pub a: u8, pub b: u8 }",
+                "target",
+            )),
+        );
+        assert!(
+            repr_non_exhaustive.changed.iter().any(|finding| {
+                finding.identity.name == "Options" && finding.identity.module_path.is_empty()
+            }),
+            "repr(C) field addition is an ABI break even when the struct is non_exhaustive"
+        );
+        assert!(
+            !repr_non_exhaustive
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "b"),
+            "the ABI break must not survive only as an informational field add"
+        );
     }
 
     #[test]
@@ -2071,6 +2118,83 @@ mod tests {
                 .iter()
                 .any(|finding| finding.identity.name == "Layout"),
             "repr(C) makes private field layout part of the observable contract"
+        );
+    }
+
+    #[test]
+    fn repository_backed_implicit_optional_features_and_crate_types_are_contracts() {
+        let implicit_feature = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde = { version = '1', optional = true }\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "pub fn stable() {}\n", "pub fn stable() {}\n"),
+        ]);
+        assert!(
+            implicit_feature.removed.iter().any(|finding| {
+                finding.identity.name == "serde" && finding.identity.namespace == "cargo_feature"
+            }),
+            "removing an optional dependency without an explicit [features] table must drop the implicit feature"
+        );
+
+        let crate_type = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\ncrate-type=['rlib']\n",
+            ),
+            ("src/lib.rs", "pub fn stable() {}\n", "pub fn stable() {}\n"),
+        ]);
+        assert!(
+            crate_type.changed.iter().any(|finding| {
+                finding.identity.name == "fixture" && finding.identity.namespace == "crate"
+            }),
+            "cdylib to rlib is a binary-contract change even when public items are unchanged"
+        );
+    }
+
+    #[test]
+    fn repository_backed_include_tracks_dependent_source_bytes() {
+        let unchanged = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "include!(\"api.rs\");\n",
+                "include!(\"api.rs\");\n",
+            ),
+            ("src/api.rs", "pub fn item() {}\n", "pub fn item() {}\n"),
+        ]);
+        assert!(
+            unchanged.unknown.is_empty(),
+            "an unchanged include and unchanged included file neutralize"
+        );
+
+        let included_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "include!(\"api.rs\");\n",
+                "include!(\"api.rs\");\n",
+            ),
+            ("src/api.rs", "pub fn item() {}\n", "pub fn extra() {}\n"),
+        ]);
+        assert!(
+            included_changed.unknown.iter().any(|finding| {
+                finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("IncludeMacro"))
+            }),
+            "changing the included file must keep the include unknown active"
         );
     }
 

@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Optional Cargo dependencies without an explicit `[features]` table are
+  implicit features in the repo-backed API contract, so removing or renaming
+  them is a compared delta.
+- Library `[lib] crate-type` is part of the crate contract; `cdylib`/`staticlib`
+  collapsing to `rlib` is a parent crate `Changed` finding.
+- Adding a field to a `#[repr(C)]` (or packed/transparent) struct is a parent
+  `Changed` ABI break even when the struct is `#[non_exhaustive]`.
+- `include!` / `include_str!` unknowns carry a digest of the included file, so
+  an unchanged invocation no longer hides a breaking edit of the included
+  source.
 - TUI artifact generation uses `governor::blocking_stage`, matching headless
   `App::run`, so a single-worker Tokio runtime can still poll q/Escape and
   cancel while the synchronous pack is being written.

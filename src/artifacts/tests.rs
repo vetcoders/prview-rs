@@ -152,6 +152,51 @@ fn cancellation_injection_stops_every_artifact_generation_seam() {
 }
 
 #[test]
+fn cancellation_at_publication_preserves_existing_latest() {
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let first = output.path().join("first");
+    let governor = crate::governor::ResourceGovernor::new();
+    generate_fixture_pack(repo.path(), &first, &target_sha, &base_sha, &governor)
+        .expect("completed predecessor pack");
+
+    #[cfg(unix)]
+    {
+        let latest = output.path().join("latest");
+        assert_eq!(
+            fs::read_link(&latest).expect("predecessor latest"),
+            first.file_name().expect("first basename")
+        );
+    }
+
+    let second = output.path().join("second");
+    let cancel_governor = crate::governor::ResourceGovernor::new();
+    let probe = generation_seam_test_hook::ProbeGuard::install(Some(
+        ArtifactGenerationSeam::RunIndexPublication,
+    ));
+    generate_fixture_pack(
+        repo.path(),
+        &second,
+        &target_sha,
+        &base_sha,
+        &cancel_governor,
+    )
+    .expect_err("publication seam must stop before advertising the new pack");
+    drop(probe);
+
+    #[cfg(unix)]
+    {
+        let latest = output.path().join("latest");
+        assert_eq!(
+            fs::read_link(&latest).expect("preserved latest"),
+            first.file_name().expect("first basename"),
+            "cancel must not retarget latest at the incomplete pack"
+        );
+    }
+    assert_cancelled_pack_is_not_published(&second, ArtifactGenerationSeam::RunIndexPublication);
+}
+
+#[test]
 fn artifact_generation_registry_is_exact_and_success_path_reaches_every_seam() {
     let expected = ArtifactGenerationSeam::ALL;
     let mut duplicate = expected;

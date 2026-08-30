@@ -794,6 +794,19 @@ impl<'a> SnapshotBuilder<'a> {
                     continue;
                 }
             };
+            let crate_types = match lib_crate_types(lib) {
+                Ok(types) => types,
+                Err(reason) => {
+                    self.unknown(
+                        RustApiUnknownKind::ManifestParse,
+                        None,
+                        &[],
+                        &manifest_path,
+                        reason,
+                    );
+                    continue;
+                }
+            };
             let root_path =
                 match safe_join_repo_path(&manifest_dir, explicit_root.unwrap_or("src/lib.rs")) {
                     Ok(path) => path,
@@ -871,7 +884,9 @@ impl<'a> SnapshotBuilder<'a> {
                     external_name: crate_name.clone(),
                 },
                 kind: RustApiItemKind::Crate,
-                contract: format!("library root={root_path}; proc_macro={proc_macro}"),
+                contract: format!(
+                    "library root={root_path}; proc_macro={proc_macro}; crate_types={crate_types:?}"
+                ),
                 cfg_guard: Vec::new(),
                 source_path: manifest_path.clone(),
                 evidence: format!("library crate {crate_name} from {manifest_path}"),
@@ -1356,13 +1371,18 @@ impl<'a> SnapshotBuilder<'a> {
                         RustApiUnknownKind::MacroGeneratedItems
                     };
                     if item_macro.ident.is_none() || macro_name == "include" {
+                        let mut evidence = canonical_tokens(item_macro.to_token_stream());
+                        if kind == RustApiUnknownKind::IncludeMacro {
+                            evidence.push_str("\nincluded-digest:");
+                            evidence.push_str(&self.include_digest(source_path, item_macro));
+                        }
                         self.unknown_guarded(
                             kind,
                             Some(crate_name),
                             module_path,
                             source_path,
                             &cfg_guard,
-                            canonical_tokens(item_macro.to_token_stream()),
+                            evidence,
                         );
                     }
                 }
@@ -2648,6 +2668,23 @@ impl<'a> SnapshotBuilder<'a> {
         }
     }
 
+    fn include_digest(&self, source_path: &str, item_macro: &syn::ItemMacro) -> String {
+        let Some(relative) = include_literal_path(item_macro) else {
+            return "unresolved".to_owned();
+        };
+        let parent = parent_repo_path(source_path);
+        let Ok(path) = safe_join_repo_path(&parent, &relative) else {
+            return "unresolved".to_owned();
+        };
+        match self.source.read(&path) {
+            Ok(RevisionRead::Bytes(bytes)) => {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(&bytes.bytes))
+            }
+            _ => "unresolved".to_owned(),
+        }
+    }
+
     fn unknown(
         &mut self,
         kind: RustApiUnknownKind,
@@ -3654,32 +3691,112 @@ fn required_string<'a>(table: &'a toml::Table, key: &str) -> Option<&'a str> {
 }
 
 fn cargo_feature_contracts(manifest: &toml::Value) -> Result<Vec<(String, String)>, String> {
-    let Some(features) = manifest.get("features") else {
-        return Ok(Vec::new());
-    };
-    let Some(features) = features.as_table() else {
-        return Err("features must be a table".to_owned());
-    };
-    let mut contracts = Vec::with_capacity(features.len());
-    for (name, value) in features {
-        let Some(members) = value.as_array() else {
-            return Err(format!("features.{name} must be an array of strings"));
+    let mut contracts = BTreeMap::new();
+    let mut suppressed = BTreeSet::new();
+    if let Some(features) = manifest.get("features") {
+        let Some(features) = features.as_table() else {
+            return Err("features must be a table".to_owned());
         };
-        let mut members: Vec<_> = members
-            .iter()
-            .map(|member| {
-                member
-                    .as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| format!("features.{name} must contain only strings"))
-            })
-            .collect::<Result<_, _>>()?;
-        members.sort();
-        members.dedup();
-        contracts.push((name.clone(), format!("cargo feature {name} = {members:?}")));
+        for (name, value) in features {
+            let Some(members) = value.as_array() else {
+                return Err(format!("features.{name} must be an array of strings"));
+            };
+            let mut members: Vec<_> = members
+                .iter()
+                .map(|member| {
+                    member
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("features.{name} must contain only strings"))
+                })
+                .collect::<Result<_, _>>()?;
+            for member in &members {
+                if let Some(rest) = member.strip_prefix("dep:") {
+                    let dep_name = rest.split('/').next().unwrap_or(rest);
+                    suppressed.insert(dep_name.to_owned());
+                }
+            }
+            members.sort();
+            members.dedup();
+            contracts.insert(name.clone(), format!("cargo feature {name} = {members:?}"));
+        }
     }
-    contracts.sort();
-    Ok(contracts)
+    for name in optional_dependency_feature_names(manifest)? {
+        if contracts.contains_key(&name) || suppressed.contains(&name) {
+            continue;
+        }
+        contracts.insert(
+            name.clone(),
+            format!("cargo feature {name} = {:?}", [format!("dep:{name}")]),
+        );
+    }
+    Ok(contracts.into_iter().collect())
+}
+
+fn optional_dependency_feature_names(manifest: &toml::Value) -> Result<Vec<String>, String> {
+    let mut names = BTreeSet::new();
+    collect_optional_dependency_names(manifest.get("dependencies"), &mut names)?;
+    collect_optional_dependency_names(manifest.get("build-dependencies"), &mut names)?;
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        for spec in targets.values() {
+            let Some(table) = spec.as_table() else {
+                continue;
+            };
+            collect_optional_dependency_names(table.get("dependencies"), &mut names)?;
+            collect_optional_dependency_names(table.get("build-dependencies"), &mut names)?;
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+fn collect_optional_dependency_names(
+    deps: Option<&toml::Value>,
+    names: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let Some(deps) = deps else {
+        return Ok(());
+    };
+    let Some(deps) = deps.as_table() else {
+        return Err("dependency table must be a table".to_owned());
+    };
+    for (name, spec) in deps {
+        if let toml::Value::Table(table) = spec
+            && table.get("optional").and_then(toml::Value::as_bool) == Some(true)
+        {
+            names.insert(name.clone());
+        }
+    }
+    Ok(())
+}
+
+fn lib_crate_types(lib: Option<&toml::Table>) -> Result<Vec<String>, String> {
+    let Some(value) = lib.and_then(|table| table.get("crate-type")) else {
+        return Ok(vec!["lib".to_owned()]);
+    };
+    let mut types = match value {
+        toml::Value::String(kind) => vec![kind.clone()],
+        toml::Value::Array(kinds) => kinds
+            .iter()
+            .map(|kind| {
+                kind.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "lib.crate-type must contain only strings".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("lib.crate-type must be a string or array of strings".to_owned()),
+    };
+    types.sort();
+    types.dedup();
+    if types.is_empty() {
+        types.push("lib".to_owned());
+    }
+    Ok(types)
+}
+
+fn include_literal_path(item_macro: &syn::ItemMacro) -> Option<String> {
+    syn::parse2::<syn::LitStr>(item_macro.mac.tokens.clone())
+        .ok()
+        .map(|lit| lit.value())
 }
 
 fn validate_package_name(name: &str) -> Result<(), String> {

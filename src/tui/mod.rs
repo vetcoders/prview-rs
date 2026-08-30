@@ -422,6 +422,9 @@ pub async fn run_analysis(
     let t_start = std::time::Instant::now();
 
     // --- Sync phase: all git2 (non-Send) work happens here ---
+    // `blocking_stage` keeps a one-worker runtime able to poll q/Escape while
+    // this closure occupies the thread; git2 stays on this thread and is
+    // dropped before the first `.await`.
     let (
         config,
         diffs,
@@ -431,7 +434,7 @@ pub async fn run_analysis(
         base_snap,
         worktree_clean,
         worktree_status_digest,
-    ) = {
+    ) = crate::governor::blocking_stage(|| -> Result<_> {
         let app = App::from_config(config)?;
         // Freeze cleanliness before any check runs or artifact is written (R4-19).
         let worktree_clean = app.worktree_clean_at_start;
@@ -462,7 +465,7 @@ pub async fn run_analysis(
 
         let config = app.config.clone();
         // app (with git2::Repository) is dropped here
-        (
+        Ok((
             config,
             diffs,
             target,
@@ -471,8 +474,8 @@ pub async fn run_analysis(
             base_snap,
             worktree_clean,
             worktree_status_digest,
-        )
-    };
+        ))
+    })?;
 
     // --- Async phase: all work below is Send-safe ---
 

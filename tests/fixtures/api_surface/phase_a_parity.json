@@ -2301,7 +2301,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"unknown\",\"name\":\"IncludeMacro\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target snapshot IncludeMacro: include ! (\\\"generated.rs\\\") ;\",\"unknown_source\":{\"side\":\"target\",\"source_path\":\"src/lib.rs\",\"provenance\":\"git_tree:include_macro_unknown/target\"}}",
+          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"unknown\",\"name\":\"IncludeMacro\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target snapshot IncludeMacro: include ! (\\\"generated.rs\\\") ;\\nincluded-digest:unresolved\",\"unknown_source\":{\"side\":\"target\",\"source_path\":\"src/lib.rs\",\"provenance\":\"git_tree:include_macro_unknown/target\"}}",
           "kind": "unknown",
           "identity": {
             "crate_name": "fixture",
@@ -2315,9 +2315,9 @@
           "analysis_source": "repo_backed_rust_api",
           "confidence": "unknown",
           "evidence": [
-            "include ! (\"generated.rs\") ;"
+            "include ! (\"generated.rs\") ;\nincluded-digest:unresolved"
           ],
-          "unknown_reason": "target snapshot IncludeMacro: include ! (\"generated.rs\") ;",
+          "unknown_reason": "target snapshot IncludeMacro: include ! (\"generated.rs\") ;\nincluded-digest:unresolved",
           "unknown_source": {
             "side": "target",
             "source_path": "src/lib.rs",
@@ -2483,7 +2483,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"crate\",\"name\":\"fixture\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"crate\",\"name\":\"fixture\",\"cfg_region\":[]},\"before_contract\":\"library root=src/lib.rs; proc_macro=false\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target counterpart is unprovable in an unknown snapshot region\",\"unknown_source\":null}",
+          "id": "api-delta:{\"kind\":\"unknown\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"crate\",\"name\":\"fixture\",\"cfg_region\":[]},\"before_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"crate\",\"name\":\"fixture\",\"cfg_region\":[]},\"before_contract\":\"library root=src/lib.rs; proc_macro=false; crate_types=[\\\"lib\\\"]\",\"before_declared_public\":true,\"after_identity\":null,\"after_contract\":null,\"after_declared_public\":null,\"unknown_reason\":\"target counterpart is unprovable in an unknown snapshot region\",\"unknown_source\":null}",
           "kind": "unknown",
           "identity": {
             "crate_name": "fixture",
@@ -2500,7 +2500,7 @@
               "name": "fixture",
               "cfg_region": []
             },
-            "contract": "library root=src/lib.rs; proc_macro=false",
+            "contract": "library root=src/lib.rs; proc_macro=false; crate_types=[\"lib\"]",
             "source_path": "Cargo.toml",
             "evidence": "library crate fixture from Cargo.toml",
             "provenance": "git_tree:source_parse_unknown/base",

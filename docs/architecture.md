@@ -1229,15 +1229,19 @@ but are separate from external semantic identity.
 
 Library discovery matches the exact `Cargo.toml` basename. It validates every
 consumed Cargo field (`package.name`, `[lib]`, `lib.name`, `lib.path`,
-`lib.proc-macro`, and `package.autolib`) instead of inventing defaults for an
-invalid schema. Package and explicit library names must also be non-empty valid
-Cargo/crate identifiers; a TOML string alone is not semantic validation. A
-valid virtual workspace is non-crate; an implicit library is
-admitted only when `autolib != false` and its live default `src/lib.rs` can be
-read and parsed. Repository-relative paths are normalized fallibly: absolute,
-prefixed, non-UTF-8, and escaping paths become manifest/source unknowns rather
-than being remapped. Missing, renamed-away, deleted, non-regular, non-UTF-8,
-unreadable, or parse-failed manifests and roots remain typed unknowns.
+`lib.proc-macro`, `lib.crate-type`, and `package.autolib`) instead of inventing
+defaults for an invalid schema. The crate contract includes the normalized
+`crate-type` set (default `["lib"]`). Optional normal/build/target
+dependencies without an explicit `[features]` entry become implicit Cargo
+features unless suppressed through `dep:` references. Package and explicit
+library names must also be non-empty valid Cargo/crate identifiers; a TOML
+string alone is not semantic validation. A valid virtual workspace is
+non-crate; an implicit library is admitted only when `autolib != false` and
+its live default `src/lib.rs` can be read and parsed. Repository-relative
+paths are normalized fallibly: absolute, prefixed, non-UTF-8, and escaping
+paths become manifest/source unknowns rather than being remapped. Missing,
+renamed-away, deleted, non-regular, non-UTF-8, unreadable, or parse-failed
+manifests and roots remain typed unknowns.
 
 Reachability starts at each library root. Ordinary inline modules and
 `mod foo;` files (`foo.rs` or `foo/mod.rs`) are walked as whole syntax trees.
@@ -1316,7 +1320,10 @@ unsupported cfg syntax inherits all already-proved outer guards, emits
 and lint-only `cfg_attr` branches are semantic no-ops; conditional cfg, shape,
 ABI, path, and transforming branches retain their distinct meaning. Globs, true
 cycles, external/prelude paths, `include!`, and unexpanded macro-generated items
-remain typed unknowns. A reachable `pub extern crate` is likewise retained as
+remain typed unknowns. An `include!` / `include_str!` unknown carries a digest
+of the included file when that path is readable; an unresolved or changed
+included source keeps the unknown active instead of treating an identical
+invocation as unchanged. A reachable `pub extern crate` is likewise retained as
 guarded `UnsupportedExternResolution` until external/prelude resolution exists;
 private or unreachable declarations do not create external semantic surface.
 Semantic proof comparison includes the public unknown's kind, crate/module
