@@ -269,4 +269,26 @@ mod tests {
     async fn a_blocking_stage_runs_on_a_multi_thread_runtime() {
         assert_eq!(blocking_stage(|| 1 + 1), 2);
     }
+
+    /// One worker + a synchronous sleep is the TUI/`App::run` edge: without
+    /// `block_in_place` the runtime cannot poll anything else until the stage
+    /// returns, so q/Escape and the interrupt supervisor stay deaf.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocking_stage_keeps_a_single_worker_runtime_responsive() {
+        let pinged = Arc::new(AtomicBool::new(false));
+        let ping_flag = Arc::clone(&pinged);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ping_flag.store(true, Ordering::SeqCst);
+        });
+        tokio::task::yield_now().await;
+
+        blocking_stage(|| {
+            std::thread::sleep(Duration::from_millis(400));
+            assert!(
+                pinged.load(Ordering::SeqCst),
+                "single-worker runtime starved during blocking_stage"
+            );
+        });
+    }
 }

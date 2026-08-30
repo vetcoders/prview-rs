@@ -448,9 +448,11 @@ or, when `PRVIEW_HOME` is unset, to
 `$HOME/.prview/runs/<repo>/<branch>/<run_id>/` in an ordered numbered layout.
 New run ids use a timestamp plus short HEAD suffix, for example
 `20260704-120500-a1b2c3d`; treat the full value as opaque.
-A `latest` symlink points at the most recent run in
+A `latest` symlink points at the most recent **completed** run in
 `$PRVIEW_HOME/runs/<repo>/<branch>/latest` or
 `$HOME/.prview/runs/<repo>/<branch>/latest` when `PRVIEW_HOME` is unset.
+A cancelled run writes `00_summary/INCOMPLETE.json` and does not update
+`latest` or the run index.
 
 ```
 $HOME/.prview/runs/my-repo/feature-x/20260225-185357/

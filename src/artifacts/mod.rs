@@ -995,6 +995,18 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     }
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PackPublication)?;
 
+    // Latest + run-index are irreversible advertisements of a completed pack.
+    // Check cancellation here, before either side effect, so a Ctrl-C that
+    // lands after the zip still cannot publish this directory as `latest` or
+    // append it to the index. `ensure_generation_active` then deletes the
+    // success surfaces and writes INCOMPLETE.json without rolling those
+    // advertisements back — they must not have been written.
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::RunIndexPublication,
+    )?;
+
     // Create `latest` symlink in parent directory
     create_latest_symlink(&out_dir)?;
 
@@ -1056,12 +1068,6 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
             eprintln!("  {} Index: {}", "\u{26a0}".yellow(), e);
         }
     }
-
-    ensure_generation_active(
-        governor,
-        &out_dir,
-        ArtifactGenerationSeam::RunIndexPublication,
-    )?;
 
     if emit_human_stdout {
         use colored::Colorize;

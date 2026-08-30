@@ -525,21 +525,25 @@ pub async fn run_analysis(
         result: heuristics.clone(),
     });
 
-    // Generate artifacts
+    // Generate artifacts. Same `blocking_stage` as headless `App::run`: the
+    // pipeline is synchronous and does not yield, so a single-worker runtime
+    // must keep a thread free to poll the event loop (q/Escape → cancel).
     ensure_analysis_active(&governor)?;
-    let artifacts_dir = crate::artifacts::generate(crate::artifacts::GenerateInput {
-        config: &config,
-        ledger: &ledger,
-        diffs: &diffs,
-        checks: &check_results,
-        heuristics: Some(&heuristics),
-        resolved_target: &target,
-        resolved_bases: &bases,
-        run_start: t_start,
-        skipped_checks,
-        worktree_clean,
-        worktree_status_digest,
-        governor: &governor,
+    let artifacts_dir = crate::governor::blocking_stage(|| {
+        crate::artifacts::generate(crate::artifacts::GenerateInput {
+            config: &config,
+            ledger: &ledger,
+            diffs: &diffs,
+            checks: &check_results,
+            heuristics: Some(&heuristics),
+            resolved_target: &target,
+            resolved_bases: &bases,
+            run_start: t_start,
+            skipped_checks,
+            worktree_clean,
+            worktree_status_digest,
+            governor: &governor,
+        })
     })?;
     ensure_analysis_active(&governor)?;
     let _ = tx.send(TuiEvent::ArtifactsReady {

@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- TUI artifact generation uses `governor::blocking_stage`, matching headless
+  `App::run`, so a single-worker Tokio runtime can still poll q/Escape and
+  cancel while the synchronous pack is being written.
+- A cancelled artifact run no longer publishes `latest` or a run-index row.
+  Those advertisements ran after the `PackPublication` seam and before the
+  final cancellation check, so Ctrl-C in that window could delete the pack's
+  success surfaces while still pointing `latest` and the index at the
+  incomplete directory.
 - Public trait impls declared in private helper modules are retained as
   `TraitImplResolution` unknowns instead of disappearing from the delta.
 - Retargeting a public reexport between two still-public types is a compared

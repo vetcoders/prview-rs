@@ -1067,11 +1067,12 @@ of the longest stage of a review the task was never polled and NEITHER interrupt
 arm could fire — and `tokio::signal::ctrl_c` had by then replaced SIGINT's
 default disposition, so the terminal could not end the process either. Watching
 from a separate task removes the coupling. `governor::blocking_stage` wraps the
-`artifacts::generate` call for the remaining edge, a runtime with a single worker
-thread: it tells tokio the stage is about to block so the supervisor keeps a
-thread to be polled on. The interrupt source is the `Interrupts` trait rather
-than a direct `ctrl_c()` call, so the state machine is testable without raising a
-real signal at the test harness.
+`artifacts::generate` call in both headless `App::run` and TUI `run_analysis`
+for the remaining edge, a runtime with a single worker thread: it tells tokio
+the stage is about to block so the interrupt supervisor (headless) and the
+event loop (TUI q/Escape) keep a thread to be polled on. The interrupt source
+is the `Interrupts` trait rather than a direct `ctrl_c()` call, so the state
+machine is testable without raising a real signal at the test harness.
 
 Cancelling rather than aborting is the whole point: the supervisor could simply
 drop the run future, but returning through the ordinary error path is what lets
@@ -1090,7 +1091,9 @@ now guards every substantial orchestration/artifact seam. External context tools
 finish before merge/report generation. If cancellation reaches artifact
 generation, success-shaped verdict/report/RUN/MANIFEST/SANITY surfaces are
 removed and `00_summary/INCOMPLETE.json` records `status=incomplete`, the reason,
-and the interrupted stage. The run ends in `Cancelled` and exit `130`.
+and the interrupted stage. The `latest` symlink and the run-index row are
+written only after that last cancellation check, so a cancelled pack is never
+advertised as the completed review. The run ends in `Cancelled` and exit `130`.
 
 `--update` needs a gate of its own (`App::reuse_unchanged_run`), because it is
 the one path that returns a report without reaching any of the others: an
@@ -1135,7 +1138,9 @@ arrives as a key event and the TUI owns its own quit path. Its dispatcher is
 nevertheless held to the same contract as the headless one — same
 `presync_python_venv`, same biased `governor.cancelled()` arm — because it was a
 copy that had drifted back into both of the bugs above while still claiming to
-mirror `run_all`.
+mirror `run_all`. Artifact generation on the TUI path uses the same
+`blocking_stage` wrapper as headless, so a single-worker runtime can still
+poll q/Escape while the pack is being written.
 
 **Operator surface.** `--resource-budget safe|balanced` selects the plan; preflight
 prints requested/effective budget, parent permits, child-worker cap, current-load

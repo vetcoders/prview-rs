@@ -66,6 +66,36 @@ fn assert_no_success_surfaces(output_dir: &Path, seam: ArtifactGenerationSeam) {
     }
 }
 
+/// A cancelled pack must not be advertised as the latest completed review
+/// (parent `latest` symlink) or as a row in the run index. Publication is
+/// irreversible; the seam check has to run before those side effects.
+fn assert_cancelled_pack_is_not_published(output_dir: &Path, seam: ArtifactGenerationSeam) {
+    if let Some(parent) = output_dir.parent() {
+        let latest = parent.join("latest");
+        if latest.exists() {
+            let target = fs::read_link(&latest).unwrap_or_default();
+            assert_ne!(
+                target.as_os_str(),
+                output_dir.file_name().unwrap_or_default(),
+                "cancelled pack at {} was published as latest ({})",
+                seam.label(),
+                latest.display()
+            );
+        }
+    }
+
+    let index = crate::config::prview_home().join("index.jsonl");
+    if index.exists() {
+        let hay = fs::read_to_string(&index).unwrap_or_default();
+        let path = output_dir.display().to_string();
+        assert!(
+            !hay.contains(&path),
+            "cancelled pack at {} was registered in the run index: {path}",
+            seam.label()
+        );
+    }
+}
+
 #[test]
 fn cancellation_injection_stops_every_artifact_generation_seam() {
     assert_eq!(ArtifactGenerationSeam::ALL.len(), 19);
@@ -109,6 +139,7 @@ fn cancellation_injection_stops_every_artifact_generation_seam() {
         }
 
         assert_no_success_surfaces(&output_dir, seam);
+        assert_cancelled_pack_is_not_published(&output_dir, seam);
         let incomplete: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(output_dir.join("00_summary/INCOMPLETE.json"))
                 .expect("incomplete marker"),
@@ -156,6 +187,18 @@ fn artifact_generation_registry_is_exact_and_success_path_reaches_every_seam() {
         assert!(
             output_dir.join(relative).exists(),
             "positive control did not publish {relative}"
+        );
+    }
+    #[cfg(unix)]
+    if let Some(parent) = output_dir.parent() {
+        let latest = parent.join("latest");
+        assert!(
+            latest.exists(),
+            "positive control did not publish the latest symlink"
+        );
+        assert_eq!(
+            fs::read_link(&latest).expect("latest symlink"),
+            output_dir.file_name().expect("pack basename")
         );
     }
 }
