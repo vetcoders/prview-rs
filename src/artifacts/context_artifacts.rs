@@ -1013,7 +1013,7 @@ fn run_context_cmds_parallel_after_spawn(
 
     struct RunningCmd {
         label: String,
-        child: std::process::Child,
+        child: Box<dyn process_wrap::std::ChildWrapper>,
         /// The key this child is registered under, so cancellation can reach its
         /// process group. Dropped from the registry the moment it exits: a pid
         /// the governor still believes in is a pid it may signal, and pids are
@@ -1121,16 +1121,16 @@ fn run_context_cmds_parallel_after_spawn(
             // The checks stage has always spawned this way; the context stage
             // not doing so was an omission, not a decision.
             crate::proc::harden_std(&mut command);
-            match command
+            command
                 .stdout(std::process::Stdio::from(stdout_file))
-                .stderr(std::process::Stdio::from(stderr_file))
-                .spawn()
-            {
+                .stderr(std::process::Stdio::from(stderr_file));
+            match crate::proc::spawn_owned_std_child(command) {
                 Ok(mut child) => {
                     let started_at = Instant::now();
                     let registry_key = format!("context:{idx}:{}", cmd.label);
                     after_spawn(child.id());
                     if !governor.register_child(registry_key.clone(), child.id()) {
+                        crate::proc::terminate_owned_std_child(child.as_mut());
                         let _ = child.wait();
                         let _ = fs::remove_file(&stdout_path);
                         let _ = fs::remove_file(&stderr_path);
@@ -1224,6 +1224,13 @@ fn run_context_cmds_parallel_after_spawn(
         for r in running.iter_mut().filter(|r| !r.done) {
             match r.child.try_wait() {
                 Ok(Some(exit)) => {
+                    // A wrapper may exit successfully after starting a
+                    // background descendant. Keep ownership until the whole
+                    // Unix process group / Windows Job Object is empty, then
+                    // unregister the PID. Otherwise the pack can finish while
+                    // a former context command still writes in the background.
+                    crate::proc::terminate_owned_std_child(r.child.as_mut());
+                    let _ = r.child.wait();
                     r.done = true;
                     governor.unregister_child(&r.registry_key);
                     // Collect output
@@ -1253,10 +1260,10 @@ fn run_context_cmds_parallel_after_spawn(
                 }
                 Ok(None) => {
                     if Instant::now() >= r.deadline {
-                        // The child leads its own group, so reach the whole tree
-                        // — `sh -c 'pnpm exec …'` outlives a kill of the wrapper.
-                        crate::proc::terminate_process_tree(r.child.id());
-                        let _ = r.child.kill();
+                        // The child leads its own Unix group or owns a Windows
+                        // Job Object, so reach the whole tree even if a wrapper
+                        // has already handed work to a descendant.
+                        crate::proc::terminate_owned_std_child(r.child.as_mut());
                         let _ = r.child.wait();
                         r.done = true;
                         governor.unregister_child(&r.registry_key);
@@ -1285,6 +1292,8 @@ fn run_context_cmds_parallel_after_spawn(
                     }
                 }
                 Err(_) => {
+                    crate::proc::terminate_owned_std_child(r.child.as_mut());
+                    let _ = r.child.wait();
                     r.done = true;
                     governor.unregister_child(&r.registry_key);
                     timings.push(ContextCommandTiming {
@@ -2388,6 +2397,115 @@ mod tests {
         assert!(gone, "grandchild {grandchild} survived late registration");
         assert_eq!(governor.inflight_count(), 0);
         assert_eq!(timings[0].status, "cancelled");
+    }
+
+    /// A context wrapper that exits 0 may still have left a background process
+    /// in its owned group. Success is not permission to detach that work from
+    /// the review: the descendant must be gone before the timing is finalized.
+    #[cfg(unix)]
+    #[test]
+    fn successful_context_root_exit_reaps_background_descendant() {
+        use std::io::Read;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("successful-context-grandchild.pid");
+        let script = format!("sleep 30 & echo $! > {}", pidfile.display());
+        let cmds = vec![ContextCmd {
+            label: "successful context tree".to_owned(),
+            gate: None,
+            cmd: "sh".to_owned(),
+            args: vec!["-c".to_owned(), script],
+            cwd: tmp.path().to_path_buf(),
+            out_dir: tmp.path().to_path_buf(),
+            out_file: String::new(),
+        }];
+        let governor = ResourceGovernor::new();
+
+        let started = Instant::now();
+        let timings = super::run_context_cmds_parallel(&cmds, 5, false, &governor);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(timings.len(), 1);
+        assert_eq!(timings[0].status, "completed");
+
+        let mut contents = String::new();
+        std::fs::File::open(&pidfile)
+            .expect("context wrapper records its background pid")
+            .read_to_string(&mut contents)
+            .expect("read background pid");
+        let grandchild: i32 = contents.trim().parse().expect("numeric grandchild pid");
+        let mut gone = false;
+        for _ in 0..100 {
+            // SAFETY: signal 0 is a read-only existence probe for the PID this
+            // test's process group created and is responsible for reaping.
+            if unsafe { libc::kill(grandchild, 0) } == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if errno == Some(libc::ESRCH) || errno == Some(libc::EPERM) {
+                    gone = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone, "background context descendant {grandchild} survived");
+        assert_eq!(governor.inflight_count(), 0);
+    }
+
+    /// The synchronous context runner uses the same durable Windows ownership
+    /// contract as async checks: a successful root PID may disappear, but its
+    /// background child remains in the Job Object until prview terminates it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_successful_context_root_exit_reaps_job_descendant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let child_pidfile = tmp.path().join("context-background-child.pid");
+        let child_script = tmp.path().join("context-background-child.ps1");
+        let parent_script = tmp.path().join("context-successful-parent.ps1");
+
+        std::fs::write(&child_script, "Start-Sleep -Seconds 60\n")
+            .expect("write Windows context child script");
+        std::fs::write(
+            &parent_script,
+            format!(
+                "$c = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','{}'\nSet-Content -LiteralPath '{}' -Value $c.Id\nexit 0\n",
+                child_script.display(),
+                child_pidfile.display(),
+            ),
+        )
+        .expect("write Windows context parent script");
+
+        let cmds = vec![ContextCmd {
+            label: "successful Windows context tree".to_owned(),
+            gate: None,
+            cmd: "powershell.exe".to_owned(),
+            args: vec![
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-File".to_owned(),
+                parent_script.display().to_string(),
+            ],
+            cwd: tmp.path().to_path_buf(),
+            out_dir: tmp.path().to_path_buf(),
+            out_file: String::new(),
+        }];
+        let governor = ResourceGovernor::new();
+        let timings = super::run_context_cmds_parallel(&cmds, 10, false, &governor);
+        assert_eq!(timings.len(), 1);
+        assert_eq!(timings[0].status, "completed");
+
+        let child_pid: u32 = std::fs::read_to_string(&child_pidfile)
+            .expect("context parent records child pid")
+            .trim()
+            .parse()
+            .expect("numeric Windows context child pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::proc::windows_pid_exists(child_pid) {
+            assert!(
+                Instant::now() < deadline,
+                "Windows context Job Object descendant {child_pid} survived root exit",
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(governor.inflight_count(), 0);
     }
 
     /// A cancelled run starts nothing further, and says so about what it did

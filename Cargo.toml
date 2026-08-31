@@ -31,6 +31,10 @@ clap_complete = "4"
 # Async runtime
 tokio = { version = "1", features = ["full", "process"] }
 async-trait = "0.1"
+# Own complete external-tool trees on Windows even after the direct wrapper
+# exits; Unix continues to use the explicit process groups configured in
+# `src/proc.rs`.
+process-wrap = { version = "9.1", default-features = false, features = ["std", "tokio1", "job-object", "kill-on-drop"] }
 
 # Git operations
 git2 = "0.20"

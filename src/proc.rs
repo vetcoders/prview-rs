@@ -6,7 +6,9 @@
 //! 2. run under `kill_on_drop`, so a dropped wait-future reaps the direct child,
 //! 3. on unix lead its own process group (`process_group(0)`), so one SIGKILL to
 //!    `-pgid` takes down the WHOLE tree (cargo → rustc → cc, npx → node → tool),
-//!    not just the direct child — `kill_on_drop` alone leaves grandchildren.
+//!    not just the direct child — `kill_on_drop` alone leaves grandchildren,
+//! 4. on Windows own a Job Object, so the tree remains killable after a short-
+//!    lived wrapper exits and its PID can no longer be passed to `taskkill /T`.
 //!
 //! Three call sites (checks, heuristics, mcp) each carried a copy of this logic
 //! plus a copy of the grandchild-kill test; commit 8be898a had to close the hang
@@ -122,6 +124,29 @@ pub fn harden_std(cmd: &mut std::process::Command) {
     }
 }
 
+pub(crate) fn spawn_owned_std_child(
+    cmd: std::process::Command,
+) -> std::io::Result<Box<dyn process_wrap::std::ChildWrapper>> {
+    use process_wrap::std::CommandWrap;
+
+    let mut wrapped = CommandWrap::from(cmd);
+    #[cfg(windows)]
+    wrapped.wrap(process_wrap::std::JobObject);
+    wrapped.spawn()
+}
+
+/// Terminate every process owned by a synchronous child wrapper, including the
+/// descendants of a Windows root process that has already exited.
+pub fn terminate_owned_std_child(child: &mut dyn process_wrap::std::ChildWrapper) {
+    #[cfg(unix)]
+    terminate_process_tree(child.id());
+
+    #[cfg(windows)]
+    if let Err(err) = child.start_kill() {
+        eprintln!("prview: failed to terminate Windows Job Object: {err}");
+    }
+}
+
 /// Spawn a synchronous child, register it with the current run governor if any,
 /// and wait. A cancelled run kills the process group instead of waiting out a
 /// `git fetch` or `git archive | tar`.
@@ -133,13 +158,51 @@ pub fn spawn_wait_governed(
     if crate::governor::current_run_governor().is_some_and(|governor| governor.is_cancelled()) {
         return Err(crate::governor::Cancelled.into());
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn {label}: {e}"))?;
+    let mut child =
+        spawn_owned_std_child(cmd).map_err(|e| anyhow::anyhow!("failed to spawn {label}: {e}"))?;
     let _registration = crate::governor::register_run_child(child.id(), label);
     child
         .wait()
         .map_err(|e| anyhow::anyhow!("failed to wait for {label}: {e}"))
+}
+
+fn spawn_owned_tokio_child(
+    cmd: TokioCommand,
+) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+    use process_wrap::tokio::{CommandWrap, KillOnDrop};
+
+    let mut wrapped = CommandWrap::from(cmd);
+    wrapped.wrap(KillOnDrop);
+    #[cfg(windows)]
+    wrapped.wrap(process_wrap::tokio::JobObject);
+    wrapped.spawn()
+}
+
+async fn wait_for_direct_child_exit(
+    child: &mut dyn process_wrap::tokio::ChildWrapper,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn terminate_owned_tokio_child(
+    child: &mut dyn process_wrap::tokio::ChildWrapper,
+    pid: Option<u32>,
+) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        sigkill_process_group(pid);
+    }
+
+    // On Windows JobObjectChild::start_kill terminates the job even when the
+    // direct root has already exited. On Unix the process-group signal above
+    // owns descendants; start_kill is still useful as direct-child fallback.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 /// Spawn `cmd` under the standard rails with piped output, drain stdout+stderr
@@ -148,9 +211,11 @@ pub fn spawn_wait_governed(
 ///
 /// One deadline covers child wait and pipe drain. On timeout the whole process
 /// tree is terminated, the root is reaped, and both reader tasks are aborted
-/// and awaited before `on_timeout()` is returned. On Unix, a successful wrapper
-/// exit also terminates residual group members before the registration guard is
-/// dropped, so a background descendant cannot keep inherited pipes alive.
+/// and awaited before `on_timeout()` is returned. A successful wrapper exit
+/// also terminates residual group members before the registration guard is
+/// dropped: Unix signals the still-owned process group and Windows terminates
+/// the still-owned Job Object, so a background descendant cannot escape just
+/// because its root PID exited first or keep inherited pipes alive.
 /// `label` names the tool in spawn/wait errors.
 ///
 /// This is the one place a check's external tool is spawned, so it is also where
@@ -183,8 +248,7 @@ async fn run_capture_with_timeout_after_spawn(
     // command timeout into an unbounded output-drain wait.
     let deadline = tokio::time::Instant::now() + timeout;
 
-    let mut child = cmd
-        .spawn()
+    let mut child = spawn_owned_tokio_child(cmd)
         .map_err(|e| anyhow::anyhow!("failed to spawn {label}: {e}"))?;
 
     // Capture the pid (also the pgid, since the child leads its group) BEFORE
@@ -198,8 +262,8 @@ async fn run_capture_with_timeout_after_spawn(
     // and wait-error paths all leave the registry clean without saying so.
     let registration = child.id().and_then(crate::governor::register_active_child);
 
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
+    let stdout_pipe = child.stdout().take();
+    let stderr_pipe = child.stderr().take();
     let mut stdout_task = tokio::spawn(async move {
         let mut buf = Vec::new();
         if let Some(mut pipe) = stdout_pipe {
@@ -215,15 +279,12 @@ async fn run_capture_with_timeout_after_spawn(
         buf
     });
 
-    match tokio::time::timeout_at(deadline, child.wait()).await {
+    // `JobObjectChild::wait` deliberately waits for every descendant. Poll the
+    // direct root instead, so root-exits-first is observed immediately and the
+    // owned job can be terminated rather than consuming the command timeout.
+    match tokio::time::timeout_at(deadline, wait_for_direct_child_exit(child.as_mut())).await {
         Ok(Ok(status)) => {
-            // On Unix the pgid remains owned while any descendant exists even
-            // after the root has been reaped. Kill those stragglers before
-            // dropping registration so inherited pipes close deterministically.
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                sigkill_process_group(pid);
-            }
+            terminate_owned_tokio_child(child.as_mut(), pid).await;
             // The direct child is reaped. Keeping its pid registered while
             // draining buffered output risks signalling a later pid reuse.
             drop(registration);
@@ -250,9 +311,7 @@ async fn run_capture_with_timeout_after_spawn(
             }
         }
         Ok(Err(e)) => {
-            if let Some(pid) = pid {
-                terminate_process_tree(pid);
-            }
+            terminate_owned_tokio_child(child.as_mut(), pid).await;
             drop(registration);
             stdout_task.abort();
             stderr_task.abort();
@@ -261,11 +320,7 @@ async fn run_capture_with_timeout_after_spawn(
             Err(anyhow::anyhow!("failed to run {label}: {e}"))
         }
         Err(_) => {
-            if let Some(pid) = pid {
-                terminate_process_tree(pid);
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            terminate_owned_tokio_child(child.as_mut(), pid).await;
             drop(registration);
             stdout_task.abort();
             stderr_task.abort();
@@ -428,7 +483,7 @@ fn try_read_windows_pid(path: &std::path::Path) -> Option<u32> {
 }
 
 #[cfg(all(test, windows))]
-fn windows_pid_exists(pid: u32) -> bool {
+pub(crate) fn windows_pid_exists(pid: u32) -> bool {
     let filter = format!("PID eq {pid}");
     let output = std::process::Command::new("tasklist.exe")
         .args(["/FI", &filter, "/FO", "CSV", "/NH"])
@@ -546,6 +601,57 @@ mod tests {
             .read_to_string(&mut pid)
             .expect("read background pid");
         assert_grandchild_reaped(pid.trim().parse().expect("background pid")).await;
+    }
+
+    /// Windows has no durable process-group id after the root is reaped. The
+    /// Job Object must therefore remain the ownership handle and terminate a
+    /// descendant that outlives a successful PowerShell wrapper.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_successful_root_exit_reaps_job_descendants() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let child_pidfile = tmp.path().join("background-child.pid");
+        let child_script = tmp.path().join("background-child.ps1");
+        let parent_script = tmp.path().join("successful-parent.ps1");
+
+        std::fs::write(&child_script, "Start-Sleep -Seconds 60\n")
+            .expect("write Windows child script");
+        std::fs::write(
+            &parent_script,
+            format!(
+                "$c = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','{}'\nSet-Content -LiteralPath '{}' -Value $c.Id\nexit 0\n",
+                child_script.display(),
+                child_pidfile.display(),
+            ),
+        )
+        .expect("write Windows parent script");
+
+        let mut cmd = TokioCommand::new("powershell.exe");
+        cmd.args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&parent_script);
+        let output = run_capture_with_timeout(
+            cmd,
+            Duration::from_secs(10),
+            "successful-windows-parent",
+            || anyhow::anyhow!("Windows root-exit cleanup timed out"),
+        )
+        .await
+        .expect("successful Windows root exit must terminate its job descendants");
+        assert!(output.status.success());
+
+        let child_pid: u32 = std::fs::read_to_string(&child_pidfile)
+            .expect("parent records child pid")
+            .trim()
+            .parse()
+            .expect("numeric Windows child pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while super::windows_pid_exists(child_pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Windows Job Object descendant {child_pid} survived root exit",
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     /// Deterministic version of the spawn/register race: cancellation drains

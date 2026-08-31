@@ -75,8 +75,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
-      - name: Prove governor first-cancel and late-registration trees
-        run: cargo test --lib governor::tests::windows_cancellation_reaps_first_cancel_and_late_registration_trees -- --exact
+      - name: Prove cancel and root-exits-first process ownership
+        run: |
+          cargo test --lib governor::tests::windows_cancellation_reaps_first_cancel_and_late_registration_trees -- --exact
+          cargo test --lib proc::tests::windows_successful_root_exit_reaps_job_descendants -- --exact
+          cargo test --lib artifacts::context_artifacts::tests::windows_successful_context_root_exit_reaps_job_descendant -- --exact
 
   ordinary-machine-resource-acceptance:
     name: Ordinary-machine bounded deep review
