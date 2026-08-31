@@ -533,8 +533,11 @@ confirmed removal. Rust identities include ordinary type/value/macro items plus
 public modules, library crates, and Cargo features. Tuple-constructor privacy,
 explicit `repr(...)` private layout, and exhaustive-enum variant additions are
 observable changes; additions to an otherwise unchanged `#[non_exhaustive]`
-enum are informational. Legal non-UTF-8 Git paths emit side-specific typed path
-uncertainty while valid sibling files continue to be analyzed.
+enum are informational unless an ABI-sensitive `repr` makes layout observable.
+Expression-position include macros retain included-byte digests, and
+transforming-attribute unknowns are bound to their annotated input. Legal
+non-UTF-8 Git paths emit side-specific typed path uncertainty while valid sibling
+files continue to be analyzed.
 
 #### How to read an artifact pack
 

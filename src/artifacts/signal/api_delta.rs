@@ -436,6 +436,8 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
         (Some(before_enum), Some(after_enum)) => {
             let additive_non_exhaustive = before_enum.non_exhaustive
                 && after_enum.non_exhaustive
+                && !before_enum.layout_sensitive
+                && !after_enum.layout_sensitive
                 && before_enum.header == after_enum.header
                 && after_enum.variants.len() > before_enum.variants.len()
                 && before_enum
@@ -564,6 +566,7 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
 struct PublicEnumContract {
     variants: BTreeMap<String, String>,
     non_exhaustive: bool,
+    layout_sensitive: bool,
     header: String,
 }
 
@@ -575,6 +578,7 @@ fn public_enum_contract(contract: &str) -> Option<PublicEnumContract> {
         .attrs
         .iter()
         .any(|attribute| attribute.path().is_ident("non_exhaustive"));
+    let layout_sensitive = item.attrs.iter().any(attr_is_layout_sensitive_repr);
     let variants = item
         .variants
         .iter()
@@ -590,6 +594,7 @@ fn public_enum_contract(contract: &str) -> Option<PublicEnumContract> {
     Some(PublicEnumContract {
         variants,
         non_exhaustive,
+        layout_sensitive,
         header: quote::ToTokens::to_token_stream(&header).to_string(),
     })
 }
@@ -2009,6 +2014,28 @@ mod tests {
         assert!(delta.changed.iter().any(|finding| {
             finding.identity.name == "Strict" && finding.identity.namespace == "type"
         }));
+
+        let repr_delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[repr(C)] #[non_exhaustive] pub enum Abi { A(u8) }\n",
+                "#[repr(C)] #[non_exhaustive] pub enum Abi { A(u8), B([u8; 128]) }\n",
+            ),
+        ]);
+        assert!(repr_delta.changed.iter().any(|finding| {
+            finding.identity.name == "Abi" && finding.identity.namespace == "type"
+        }));
+        assert!(
+            !repr_delta.added.iter().any(|finding| {
+                finding.identity.name == "B" && finding.identity.module_path == ["Abi".to_owned()]
+            }),
+            "ABI-sensitive enums stay on the parent Changed path"
+        );
     }
 
     #[test]
@@ -2203,6 +2230,85 @@ mod tests {
                     .is_some_and(|reason| reason.contains("IncludeMacro"))
             }),
             "changing the included file must keep the include unknown active"
+        );
+
+        let expression_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub const N: usize = include!(\"n.rs\");\n",
+                "pub const N: usize = include!(\"n.rs\");\n",
+            ),
+            ("src/n.rs", "1\n", "2\n"),
+        ]);
+        assert!(expression_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "IncludeMacro"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("included-digest"))
+        }));
+
+        let expression_unchanged = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub static BYTES: &[u8] = include_bytes!(\"data.bin\");\n",
+                "pub static BYTES: &[u8] = include_bytes!(\"data.bin\");\n",
+            ),
+            ("src/data.bin", "same\n", "same\n"),
+        ]);
+        assert!(
+            expression_unchanged.unknown.is_empty(),
+            "unchanged expression-position include proof neutralizes"
+        );
+    }
+
+    #[test]
+    fn repository_backed_transforming_attribute_proof_binds_the_input_item() {
+        let changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[derive(Custom)] pub struct Api { pub value: u8 }\n",
+                "#[derive(Custom)] pub struct Api { pub value: u16 }\n",
+            ),
+        ]);
+        assert!(changed.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("input:"))
+        }));
+
+        let unchanged = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[derive(Custom)] pub struct Api { pub value: u8 }\n",
+                "#[derive(Custom)] pub struct Api { pub value: u8 }\n",
+            ),
+        ]);
+        assert!(
+            unchanged.unknown.is_empty(),
+            "an unchanged transformer and unchanged input item neutralize"
         );
     }
 

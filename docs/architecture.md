@@ -1332,12 +1332,14 @@ unsupported cfg syntax inherits all already-proved outer guards, emits
 and lint-only `cfg_attr` branches are semantic no-ops; conditional cfg, shape,
 ABI, path, and transforming branches retain their distinct meaning. Globs, true
 cycles, external/prelude paths, `include!`, and unexpanded macro-generated items
-remain typed unknowns. An `include!` / `include_str!` unknown carries a digest
-of the included file when that path is readable; an unresolved or changed
-included source keeps the unknown active instead of treating an identical
-invocation as unchanged. A reachable `pub extern crate` is likewise retained as
-guarded `UnsupportedExternResolution` until external/prelude resolution exists;
-private or unreachable declarations do not create external semantic surface.
+remain typed unknowns. An `include!` / `include_str!` / `include_bytes!` unknown
+carries a digest of the included file when that path is readable, including
+invocations inside public constant and static expressions; an unresolved or
+changed included source keeps the unknown active instead of treating an
+identical invocation as unchanged. A reachable `pub extern crate` is likewise
+retained as guarded `UnsupportedExternResolution` until external/prelude
+resolution exists; private or unreachable declarations do not create external
+semantic surface.
 Semantic proof comparison includes the public unknown's kind, crate/module
 location, exact evidence, and guards, while continuing to exclude source paths,
 provenance, and private reexport target/origin spelling. A public reexport's
@@ -1358,9 +1360,10 @@ external macro/derive names only for public functions declared at crate root;
 private or nested declarations become precise unknowns. Unresolved transforming
 attributes are checked on modules, impls and associated items, foreign
 blocks/items, macro declarations, and ordinary public projections. They
-suppress every dependent positive claim and emit exact `MacroGeneratedItems`
-evidence. Foreign functions/statics inherit the parent ABI, safety, and relevant
-attributes.
+suppress every dependent positive claim and emit `MacroGeneratedItems` evidence
+bound to the complete annotated input. An unchanged transformer therefore
+cannot neutralize a changed item. Foreign functions/statics inherit the parent
+ABI, safety, and relevant attributes.
 
 Contracts are emitted from normalized `syn` ASTs. Function/default bodies and
 ordinary named private member types are excluded. Tuple-field position and
@@ -1417,8 +1420,10 @@ existing-exhaustive breaking rule.
 Enum projection applies the corresponding exhaustiveness policy independently:
 adding variants to an exhaustive public enum changes the parent contract, while
 an otherwise unchanged public `#[non_exhaustive]` enum exposes each new variant
-as informational `Added`. Removing or changing an existing variant, or changing
-the enum header/policy, remains a parent `Changed` fact.
+as informational `Added`. ABI-sensitive `#[repr(...)]` enums remain on the
+parent `Changed` path even when they are non-exhaustive, because payload growth
+can change size or alignment. Removing or changing an existing variant, or
+changing the enum header/policy, remains a parent `Changed` fact.
 
 Exact identity is grouped on both sides before any fact is consumed: only a
 `1 ↔ 1` component may become a confirmed change, while wider components are

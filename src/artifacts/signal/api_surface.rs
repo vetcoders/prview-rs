@@ -1062,7 +1062,7 @@ impl<'a> SnapshotBuilder<'a> {
                         module_path,
                         source_path,
                         &cfg_guard,
-                        canonical_tokens(attr.to_token_stream()),
+                        bind_transform_evidence(canonical_tokens(attr.to_token_stream()), item),
                     );
                 }
                 continue;
@@ -1077,11 +1077,27 @@ impl<'a> SnapshotBuilder<'a> {
                             module_path,
                             source_path,
                             &cfg_guard,
-                            evidence,
+                            bind_transform_evidence(evidence, item),
                         );
                     }
                     continue;
                 }
+            }
+            for macro_call in expression_include_macros(item) {
+                let evidence = format!(
+                    "item:{}\ninclude:{}\nincluded-digest:{}",
+                    canonical_tokens(item.to_token_stream()),
+                    canonical_tokens(macro_call.to_token_stream()),
+                    self.include_digest(source_path, &macro_call),
+                );
+                self.unknown_guarded(
+                    RustApiUnknownKind::IncludeMacro,
+                    Some(crate_name),
+                    module_path,
+                    source_path,
+                    &cfg_guard,
+                    evidence,
+                );
             }
             match item {
                 Item::Mod(module) => {
@@ -1261,7 +1277,7 @@ impl<'a> SnapshotBuilder<'a> {
                                     module_path,
                                     source_path,
                                     &foreign_guard,
-                                    evidence,
+                                    bind_transform_evidence(evidence, foreign_item),
                                 );
                             }
                             continue;
@@ -1369,7 +1385,10 @@ impl<'a> SnapshotBuilder<'a> {
                         );
                         continue;
                     }
-                    let kind = if macro_name == "include" || macro_name == "include_str" {
+                    let kind = if matches!(
+                        macro_name.as_str(),
+                        "include" | "include_str" | "include_bytes"
+                    ) {
                         RustApiUnknownKind::IncludeMacro
                     } else {
                         RustApiUnknownKind::MacroGeneratedItems
@@ -1378,7 +1397,7 @@ impl<'a> SnapshotBuilder<'a> {
                         let mut evidence = canonical_tokens(item_macro.to_token_stream());
                         if kind == RustApiUnknownKind::IncludeMacro {
                             evidence.push_str("\nincluded-digest:");
-                            evidence.push_str(&self.include_digest(source_path, item_macro));
+                            evidence.push_str(&self.include_digest(source_path, &item_macro.mac));
                         }
                         self.unknown_guarded(
                             kind,
@@ -1693,7 +1712,7 @@ impl<'a> SnapshotBuilder<'a> {
                         module_path,
                         source_path,
                         &associated_cfg,
-                        evidence,
+                        bind_transform_evidence(evidence, item),
                     );
                 }
                 continue;
@@ -2672,8 +2691,8 @@ impl<'a> SnapshotBuilder<'a> {
         }
     }
 
-    fn include_digest(&self, source_path: &str, item_macro: &syn::ItemMacro) -> String {
-        let Some(relative) = include_literal_path(item_macro) else {
+    fn include_digest(&self, source_path: &str, macro_call: &syn::Macro) -> String {
+        let Some(relative) = include_literal_path(macro_call) else {
             return "unresolved".to_owned();
         };
         let parent = parent_repo_path(source_path);
@@ -4045,10 +4064,44 @@ fn lib_crate_types(lib: Option<&toml::Table>) -> Result<Vec<String>, String> {
     Ok(types)
 }
 
-fn include_literal_path(item_macro: &syn::ItemMacro) -> Option<String> {
-    syn::parse2::<syn::LitStr>(item_macro.mac.tokens.clone())
+fn include_literal_path(macro_call: &syn::Macro) -> Option<String> {
+    syn::parse2::<syn::LitStr>(macro_call.tokens.clone())
         .ok()
         .map(|lit| lit.value())
+}
+
+#[derive(Default)]
+struct ExpressionIncludeCollector {
+    macros: Vec<syn::Macro>,
+}
+
+impl Fold for ExpressionIncludeCollector {
+    fn fold_expr_macro(&mut self, expression: syn::ExprMacro) -> syn::ExprMacro {
+        let name = expression
+            .mac
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string());
+        if name
+            .as_deref()
+            .is_some_and(|name| matches!(name, "include" | "include_str" | "include_bytes"))
+        {
+            self.macros.push(expression.mac.clone());
+        }
+        syn::fold::fold_expr_macro(self, expression)
+    }
+}
+
+fn expression_include_macros(item: &Item) -> Vec<syn::Macro> {
+    let expression = match item {
+        Item::Const(value) if is_public(&value.vis) => value.expr.as_ref(),
+        Item::Static(value) if is_public(&value.vis) => value.expr.as_ref(),
+        _ => return Vec::new(),
+    };
+    let mut collector = ExpressionIncludeCollector::default();
+    collector.fold_expr(expression.clone());
+    collector.macros
 }
 
 fn validate_package_name(name: &str) -> Result<(), String> {
@@ -4332,6 +4385,13 @@ fn transforming_attrs(attrs: &[Attribute]) -> impl Iterator<Item = &Attribute> {
             )
         )
     })
+}
+
+fn bind_transform_evidence<T: ToTokens>(evidence: String, input: &T) -> String {
+    format!(
+        "transform:{evidence}\ninput:{}",
+        canonical_tokens(input.to_token_stream())
+    )
 }
 
 fn transforming_cfg_attrs(attrs: &[Attribute]) -> Vec<String> {
