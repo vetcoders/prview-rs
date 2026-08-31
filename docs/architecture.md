@@ -155,6 +155,8 @@ pub struct DetectedProfile {
 Profile detection inspects the **actual source files**, not just the presence of
 manifests:
 - `has_js_source` = `.ts/.tsx/.js/.jsx` files under `src/`
+- root or nested `tsconfig*.json` declares a JS/TS product component, except
+  under fixture, `node_modules`, `target`, `dist`, `build`, or `vendor`
 - `Cargo.toml` → Rust (also checks `src-tauri/`, `*_rs/`)
 - `pyproject.toml` → Python
 - combinations → Mixed

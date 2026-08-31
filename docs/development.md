@@ -57,12 +57,19 @@ is not accepted as Windows cancellation evidence.
 
 The same workflow has an `ubuntu-latest` ordinary-machine acceptance job. It
 builds the release binary and runs `prview --deep --resource-budget safe`
-against `tools/fixtures/bounded-runtime`, a real mixed Rust and Vitest repo. The
-stdlib-only `tools/bounded_runtime_acceptance.py` sampler fails when more than
-one whole-machine tool is active, when a Cargo/rustc, Vitest, or Semgrep pool
+against `tools/fixtures/bounded-runtime`, a real mixed Rust, TypeScript,
+JavaScript, and CSS repo. The fixture installs TSC, ESLint, Stylelint, and
+Vitest; the workflow also installs a pinned real Semgrep scanner. The
+stdlib-only `tools/bounded_runtime_acceptance.py` sampler requires all six tool
+families (Cargo, Vitest, Semgrep, TSC, ESLint, and Stylelint) to appear both in
+the owned process census and in `RUN.json`. It fails when more than one
+whole-machine tool is active, when a Cargo/rustc, Vitest, or Semgrep pool
 exceeds the selected cap, or when the final pack and its resource metadata do
-not agree. The job has an internal 20-minute deadline inside a 45-minute Actions
-timeout, then always uploads a compact JSON receipt plus the captured CLI log.
+not agree. Semgrep RPC coordinators are reported separately from its actual scan
+workers. The receipt also requires a clean source tree whose `HEAD` is the exact
+candidate SHA; a dirty local build cannot masquerade as exact-SHA evidence. The
+job has an internal 20-minute deadline inside a 45-minute Actions timeout, then
+always uploads a compact JSON receipt plus the captured CLI log.
 Only the published job on the exact candidate SHA is platform evidence; a local
 run validates the harness, not the `ubuntu-latest` envelope.
 

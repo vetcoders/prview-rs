@@ -3815,10 +3815,53 @@ fn api_crate_manifests(source: &dyn RevisionFileSource, manifests: &[String]) ->
             packages.push(*path);
         }
     }
-    if workspaces.is_empty() {
-        if manifests.iter().any(|path| path == "Cargo.toml") {
-            return BTreeSet::from(["Cargo.toml".to_owned()]);
+    if manifests.iter().any(|path| path == "Cargo.toml")
+        && !parsed.iter().any(|(path, _)| *path == "Cargo.toml")
+    {
+        // A malformed or non-UTF-8 root manifest is still the repository's
+        // authority. Keep it selected so the snapshot emits its typed unknown
+        // instead of silently falling through to a nested fixture package.
+        return BTreeSet::from(["Cargo.toml".to_owned()]);
+    }
+    if let Some((_, root)) = parsed.iter().find(|(path, _)| *path == "Cargo.toml") {
+        let Some(workspace) = root.get("workspace").and_then(toml::Value::as_table) else {
+            return if root.get("package").is_some() {
+                BTreeSet::from(["Cargo.toml".to_owned()])
+            } else {
+                BTreeSet::new()
+            };
+        };
+
+        let members = toml_string_array(workspace, "members");
+        let exclude = toml_string_array(workspace, "exclude");
+        let mut allowed = BTreeSet::new();
+        if root.get("package").is_some() {
+            // A package declared by the workspace root is always a workspace
+            // member; nested workspaces must not displace it as API authority.
+            allowed.insert("Cargo.toml".to_owned());
         }
+        for package in &packages {
+            if *package == "Cargo.toml" {
+                continue;
+            }
+            let package_dir = parent_manifest_dir(package);
+            let included = members
+                .iter()
+                .any(|pattern| cargo_glob_matches(pattern, &package_dir));
+            let excluded = exclude
+                .iter()
+                .any(|pattern| cargo_glob_matches(pattern, &package_dir));
+            if included && !excluded {
+                allowed.insert((*package).to_owned());
+            }
+        }
+        return allowed;
+    }
+
+    // Compatibility fallback for revision sources rooted below the repository
+    // root (for example a caller-provided single-crate source). A real repo with
+    // Cargo.toml above never reaches this branch.
+    if workspaces.is_empty() {
         return packages.into_iter().map(str::to_owned).collect();
     }
     let mut allowed = BTreeSet::new();
@@ -5165,6 +5208,36 @@ mod tests {
                 .iter()
                 .any(|item| item.key.external_name == "fixture"
                     || item.key.external_name == "bounded")
+        );
+
+        let rooted_with_nested_workspace = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='product'\nversion='0.0.0'\n",
+            ),
+            ("src/lib.rs", b"pub fn product() {}"),
+            (
+                "tests/fixtures/nested/Cargo.toml",
+                b"[workspace]\nmembers=['member']\n",
+            ),
+            (
+                "tests/fixtures/nested/member/Cargo.toml",
+                b"[package]\nname='fixture-member'\nversion='0.0.0'\n",
+            ),
+            (
+                "tests/fixtures/nested/member/src/lib.rs",
+                b"pub fn fixture_member() {}",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&rooted_with_nested_workspace);
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["product"],
+            "a nested fixture workspace must not replace root package authority"
         );
 
         let workspace = MemorySource::new(&[

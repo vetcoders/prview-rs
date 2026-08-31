@@ -104,9 +104,14 @@ jobs:
           node-version: "20"
           cache: npm
           cache-dependency-path: tools/fixtures/bounded-runtime/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the real Semgrep scanner
+        run: python -m pip install --disable-pip-version-check semgrep==1.175.0
       - name: Build the candidate release binary
         run: timeout 900 cargo build --release --locked
-      - name: Exercise a real mixed Rust and Vitest deep review
+      - name: Exercise the full mixed-tool deep review
         run: |
           python3 tools/bounded_runtime_acceptance.py \
             --binary "$GITHUB_WORKSPACE/target/release/prview" \

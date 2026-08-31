@@ -64,12 +64,12 @@ impl super::Repository {
             .context("Failed to capture git archive stdout")?;
 
         let mut tar_cmd = Command::new("tar");
+        crate::proc::harden_std(&mut tar_cmd);
         tar_cmd
             .args(["-x", "-C"])
             .arg(dest)
             .stdin(archive_stdout)
             .stderr(Stdio::null());
-        crate::proc::harden_std(&mut tar_cmd);
         let mut tar = tar_cmd.spawn().context("Failed to run tar")?;
         let _tar_reg = crate::governor::register_run_child(tar.id(), "tar extract");
         let tar_status = tar.wait().context("Failed to wait for tar")?;

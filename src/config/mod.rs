@@ -1143,10 +1143,7 @@ fn detect_profile(
     manifest: Option<&PrviewManifest>,
 ) -> Result<DetectedProfile> {
     let has_package_json = repo_root.join("package.json").exists();
-    let has_tsconfig = repo_root.join("tsconfig.json").exists()
-        || glob::glob(&format!("{}/**/tsconfig*.json", repo_root.display()))
-            .map(|mut g| g.next().is_some())
-            .unwrap_or(false);
+    let has_tsconfig = has_product_tsconfig(repo_root);
     let has_pyproject = repo_root.join("pyproject.toml").exists();
     let has_python_source = detect_python_source(repo_root);
 
@@ -1194,6 +1191,32 @@ fn detect_profile(
         rust_dirs,
         is_workspace,
     })
+}
+
+fn has_product_tsconfig(repo_root: &Path) -> bool {
+    if repo_root.join("tsconfig.json").exists() {
+        return true;
+    }
+
+    glob::glob(&format!("{}/**/tsconfig*.json", repo_root.display()))
+        .map(|paths| {
+            paths.filter_map(Result::ok).any(|path| {
+                let relative = path.strip_prefix(repo_root).unwrap_or(&path);
+                !relative.components().any(|component| {
+                    matches!(
+                        component.as_os_str().to_string_lossy().as_ref(),
+                        "fixture"
+                            | "fixtures"
+                            | "node_modules"
+                            | "target"
+                            | "dist"
+                            | "build"
+                            | "vendor"
+                    )
+                })
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Detect if there are actual JS/TS source files (not just tooling)
@@ -1992,6 +2015,39 @@ mod tests {
             detect_profile(&tmp.path().to_path_buf(), Profile::Auto, None).expect("profile");
         assert_eq!(profile.kind, ProfileKind::Js);
         assert!(profile.has_package_json);
+    }
+
+    #[test]
+    fn test_detect_profile_ignores_fixture_tsconfig_but_keeps_monorepo_tsconfig() {
+        let fixture_repo = tempfile::tempdir().expect("fixture repo");
+        std::fs::write(
+            fixture_repo.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("cargo");
+        let fixture_dir = fixture_repo.path().join("tools/fixtures/mixed");
+        std::fs::create_dir_all(&fixture_dir).expect("fixture dir");
+        std::fs::write(fixture_dir.join("tsconfig.json"), "{}\n").expect("fixture config");
+
+        let profile = detect_profile(&fixture_repo.path().to_path_buf(), Profile::Auto, None)
+            .expect("fixture profile");
+        assert_eq!(profile.kind, ProfileKind::Rust);
+        assert!(!profile.has_tsconfig);
+
+        let monorepo = tempfile::tempdir().expect("monorepo");
+        std::fs::write(
+            monorepo.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("cargo");
+        let app_dir = monorepo.path().join("packages/app");
+        std::fs::create_dir_all(&app_dir).expect("app dir");
+        std::fs::write(app_dir.join("tsconfig.json"), "{}\n").expect("app config");
+
+        let profile =
+            detect_profile(&monorepo.path().to_path_buf(), Profile::Auto, None).expect("profile");
+        assert_eq!(profile.kind, ProfileKind::Mixed);
+        assert!(profile.has_tsconfig);
     }
 
     #[test]

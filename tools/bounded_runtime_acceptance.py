@@ -19,6 +19,14 @@ import time
 from typing import Any
 
 WHOLE_MACHINE_TOOLS = ("cargo", "vitest", "semgrep", "tsc", "eslint", "stylelint")
+REQUIRED_RUN_CHECKS = {
+    "cargo": "cargo",
+    "vitest": "vitest",
+    "semgrep": "semgrep",
+    "tsc": "typescript",
+    "eslint": "eslint",
+    "stylelint": "stylelint",
+}
 
 
 def utc_now() -> str:
@@ -226,6 +234,16 @@ def cap_argument(command: str, flag: str) -> str | None:
     return None
 
 
+def is_semgrep_worker(command: str) -> bool:
+    """Separate scan workers from Semgrep's RPC coordinator processes."""
+    lowered = f" {command.lower()} "
+    return (
+        "semgrep-core" in lowered
+        and " -rpc " not in lowered
+        and not command.startswith("(")
+    )
+
+
 def sample_owned_tree(root_pid: int, census: dict[str, Any]) -> None:
     owned = descendants(process_table(), root_pid)
     tool_by_pid = {
@@ -245,6 +263,7 @@ def sample_owned_tree(root_pid: int, census: dict[str, Any]) -> None:
     rustc = 0
     vitest_workers = 0
     semgrep_workers = 0
+    semgrep_core_processes = 0
     commands: list[str] = []
 
     for pid, (_ppid, state, command) in owned.items():
@@ -261,7 +280,9 @@ def sample_owned_tree(root_pid: int, census: dict[str, Any]) -> None:
         if "tinypool" in command.lower():
             vitest_workers += 1
         if "semgrep-core" in command.lower():
-            semgrep_workers += 1
+            semgrep_core_processes += 1
+            if is_semgrep_worker(command):
+                semgrep_workers += 1
         if tool == "cargo":
             jobs = read_linux_environment(pid).get("CARGO_BUILD_JOBS")
             if jobs:
@@ -286,9 +307,18 @@ def sample_owned_tree(root_pid: int, census: dict[str, Any]) -> None:
     census["max_descendants"]["semgrep_core"] = max(
         census["max_descendants"]["semgrep_core"], semgrep_workers
     )
+    census["max_descendants"]["semgrep_core_processes"] = max(
+        census["max_descendants"]["semgrep_core_processes"], semgrep_core_processes
+    )
 
     parent_labels = [f"{tool}:{pid}" for pid, tool in sorted(tool_roots)]
-    signature = (tuple(parent_labels), rustc, vitest_workers, semgrep_workers)
+    signature = (
+        tuple(parent_labels),
+        rustc,
+        vitest_workers,
+        semgrep_workers,
+        semgrep_core_processes,
+    )
     if signature != census["last_signature"]:
         census["transitions"].append(
             {
@@ -297,7 +327,8 @@ def sample_owned_tree(root_pid: int, census: dict[str, Any]) -> None:
                 "tool_parents": parent_labels,
                 "rustc": rustc,
                 "vitest_workers": vitest_workers,
-                "semgrep_core": semgrep_workers,
+                "semgrep_workers": semgrep_workers,
+                "semgrep_core_processes": semgrep_core_processes,
                 "commands": sorted(set(commands))[:12],
             }
         )
@@ -335,6 +366,34 @@ def read_json(path: pathlib.Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def source_tree_observation(root: pathlib.Path) -> dict[str, Any]:
+    head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return {
+        "root": str(root),
+        "head_sha": head.stdout.strip() if head.returncode == 0 else None,
+        "dirty": bool(status.stdout.strip()) if status.returncode == 0 else None,
+        "git_errors": [
+            message
+            for message in [
+                head.stderr.strip() if head.returncode != 0 else "",
+                status.stderr.strip() if status.returncode != 0 else "",
+            ]
+            if message
+        ],
+    }
 
 
 def add_assertion(violations: list[str], condition: bool, message: str) -> None:
@@ -404,29 +463,23 @@ def evaluate(
         "--deep" in (receipt.get("command") or []),
         "acceptance command is not a --deep review",
     )
-    add_assertion(
-        violations, census["seen_tools"]["cargo"], "no real Cargo process was observed"
-    )
-    add_assertion(
-        violations,
-        census["seen_tools"]["vitest"],
-        "no real Vitest process was observed",
-    )
     check_blob = " ".join(
         str(row.get("name") or "")
         for row in (run or {}).get("checks") or []
         if isinstance(row, dict)
     ).lower()
-    add_assertion(
-        violations,
-        "cargo" in check_blob,
-        "RUN.json checks do not include a Cargo gate",
-    )
-    add_assertion(
-        violations,
-        "vitest" in check_blob,
-        "RUN.json checks do not include a Vitest gate",
-    )
+    for tool in WHOLE_MACHINE_TOOLS:
+        add_assertion(
+            violations,
+            census["seen_tools"][tool],
+            f"no real {tool} process was observed",
+        )
+        check_name = REQUIRED_RUN_CHECKS[tool]
+        add_assertion(
+            violations,
+            check_name in check_blob,
+            f"RUN.json checks do not include the {tool} gate",
+        )
     add_assertion(
         violations,
         census["max_whole_machine_parents"] <= 1,
@@ -459,12 +512,11 @@ def evaluate(
         census["observed_caps"]["vitest_max_workers"] == {"1"},
         "Vitest did not expose --maxWorkers 1",
     )
-    if census["seen_tools"]["semgrep"]:
-        add_assertion(
-            violations,
-            census["observed_caps"]["semgrep_jobs"] == {"1"},
-            "Semgrep did not expose --jobs 1",
-        )
+    add_assertion(
+        violations,
+        census["observed_caps"]["semgrep_jobs"] == {"1"},
+        "Semgrep did not expose --jobs 1",
+    )
     add_assertion(
         violations,
         all(transitions.values()),
@@ -520,7 +572,12 @@ def main() -> int:
         "started_monotonic": time.monotonic(),
         "last_signature": None,
         "max_whole_machine_parents": 0,
-        "max_descendants": {"rustc": 0, "vitest_workers": 0, "semgrep_core": 0},
+        "max_descendants": {
+            "rustc": 0,
+            "vitest_workers": 0,
+            "semgrep_core": 0,
+            "semgrep_core_processes": 0,
+        },
         "seen_tools": {tool: False for tool in WHOLE_MACHINE_TOOLS},
         "observed_caps": {
             "cargo_build_jobs": set(),
@@ -531,10 +588,22 @@ def main() -> int:
     }
 
     try:
+        source_root = pathlib.Path(__file__).resolve().parent.parent
+        receipt["source_tree"] = source_tree_observation(source_root)
         add_assertion(
             receipt["violations"],
             re.fullmatch(r"[0-9a-fA-F]{40}", args.source_sha) is not None,
             "source SHA is not exact",
+        )
+        add_assertion(
+            receipt["violations"],
+            receipt["source_tree"]["head_sha"] == args.source_sha,
+            "source SHA does not match the repository HEAD",
+        )
+        add_assertion(
+            receipt["violations"],
+            receipt["source_tree"]["dirty"] is False,
+            "source repository is dirty",
         )
         add_assertion(
             receipt["violations"],

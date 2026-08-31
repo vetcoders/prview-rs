@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Snapshot extraction preserves the `git archive` stdout pipe after applying
+  hardened subprocess defaults, so `tar` receives the archive instead of an
+  empty stdin and the producer no longer exits through SIGPIPE.
+- Rust API crate discovery anchors workspace authority at the repository-root
+  `Cargo.toml`; a nested fixture workspace can no longer displace a root product
+  package from the census.
+- Nested `tsconfig*.json` files under fixtures or generated/vendor directories
+  no longer turn a Rust repository into a Mixed profile; real monorepo package
+  configs remain product signals.
 - `prview state --tui` no longer starts a review from `r`.
 - Moving a library crate root (`src/lib.rs` → `lib.rs`) is not a public API
   change; the compared crate contract keeps `proc-macro` and `crate-type` only.
@@ -158,6 +167,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The ordinary-machine `--deep` acceptance fixture now runs and requires real
+  Cargo, Vitest, Semgrep, TSC, ESLint, and Stylelint processes. A green receipt
+  can no longer be produced by the narrower Rust-plus-Vitest subset. Its census
+  separates Semgrep RPC coordinators from scan workers, and exact-SHA receipts
+  require a clean source tree at the claimed commit.
 - Quality checks and context commands now run under one machine-wide budget
   (`ResourceGovernor`) instead of each stage picking its own fan-out. Checks
   declare `Light` or `Heavy` via `Check::resource_weight`; unspecified checks
