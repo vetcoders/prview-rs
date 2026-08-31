@@ -130,14 +130,15 @@ Generate a review pack.
 
 **`quick` is synchronous.** It blocks until the pack is written, under a hard
 **120-second budget**. Exceeding the budget kills the whole review process tree
-and returns `run_timeout` with `retry_hint.profile: "deep"`. Success is defined by a finalized pack on disk, not by
-the child's exit code (prview exits non-zero on a `BLOCK` verdict, yet the run is
-a valid completed review). Response:
+and returns `run_timeout` with `retry_hint.profile: "deep"`. Success is defined
+by a finalized pack plus its exact durable run-id/path index row, not by the
+child's exit code (prview exits non-zero on a `BLOCK` verdict, yet the run is a
+valid completed review). Response:
 
-Completion includes durable publication into prview's run index. If the index
+Completion requires durable publication into prview's run index. If the index
 is unreadable or the finished pack cannot be committed to discoverable history,
-the call returns fail-loud `run_failed`; an unindexed directory is never exposed
-as a completed MCP run.
+the call returns fail-loud `storage_corrupt` or `run_failed`; SANITY without the
+matching durable row remains running/stale and is never exposed as completed.
 
 ```json
 {

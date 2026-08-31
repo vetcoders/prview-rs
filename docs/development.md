@@ -80,6 +80,9 @@ It has an internal 20-minute deadline inside a 45-minute Actions timeout, then
 always uploads a compact JSON receipt plus the captured CLI log.
 Only the published job on the exact candidate SHA is platform evidence; a local
 run validates the harness, not the `ubuntu-latest` envelope.
+The mixed fixture intentionally has no Python project, so this receipt does not
+prove uv/PEP 517/pytest-xdist limits; those are covered by the Rust contract
+tests and their real behavior remains part of repository-specific dogfood.
 
 For Rust review flow, a standard `prview` run executes tests by default.
 You disable them only with a lighter preset (`--quick`, `--update`, `--ai-only`)

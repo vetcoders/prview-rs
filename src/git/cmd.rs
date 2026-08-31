@@ -54,13 +54,13 @@ const GIT_ENV_VARS: &[&str] = &[
 ///     .output()?;
 /// ```
 pub fn git_cmd() -> Command {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     let mut cmd = Command::new(
         TEST_GIT_PROGRAM
             .with(|program| program.borrow().clone())
             .unwrap_or_else(|| "git".into()),
     );
-    #[cfg(not(test))]
+    #[cfg(not(all(test, unix)))]
     let mut cmd = Command::new("git");
     for var in GIT_ENV_VARS {
         cmd.env_remove(var);

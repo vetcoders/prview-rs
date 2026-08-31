@@ -205,13 +205,18 @@ portable cap (including tsc and ESLint across supported project versions) remain
 serialized. High current load, or an unavailable load reading, backpressures the
 effective plan to `safe`.
 
-Cold Python environment setup applies the same cap to `UV_CONCURRENT_DOWNLOADS`,
-`UV_CONCURRENT_BUILDS`, `UV_CONCURRENT_INSTALLS`, and `CARGO_BUILD_JOBS` for
-Rust-backed Python packages. Pytest also receives
+Cold Python environment setup and every later `uv run` apply the same cap to
+`UV_CONCURRENT_DOWNLOADS`, `UV_CONCURRENT_BUILDS`,
+`UV_CONCURRENT_INSTALLS`, and `CARGO_BUILD_JOBS` for Rust-backed Python
+packages. Pytest also receives
 `PYTEST_XDIST_AUTO_NUM_WORKERS`; when project or inherited addopts request
 xdist (`-n auto` or explicit `-n N`), a final CLI `-n <limit>` clamps that pool
-to the run plan. If the operator already set a lower positive uv/Cargo value,
-prview preserves that stricter limit. Arbitrary third-party PEP 517 backends can
+to the run plan. Prview passes `-c` for the single highest-precedence pytest
+config inside the reviewed root, or an explicit empty config when none exists,
+and fixes `--rootdir` to that root. Parent-directory pytest options therefore
+cannot change test selection or worker count. If the operator already set a
+lower positive uv/Cargo value, prview preserves that stricter limit. Arbitrary
+third-party PEP 517 backends can
 still own private worker controls that no portable parent setting can infer;
 they remain serialized as one Exclusive parent rather than being claimed as a
 universally capped child pool.

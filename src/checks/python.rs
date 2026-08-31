@@ -95,16 +95,19 @@ pub(super) struct PythonRun {
 pub(super) fn plan_python_run(config: &Config) -> Result<PythonRun> {
     let plan = plan_check_run(config)?;
     metadata_stays_in_project(&plan.scan_dir)?;
-    let env = if plan.scan_dir == config.repo_root {
-        Vec::new()
-    } else {
+    // Every `uv run`, not only the eager pre-sync, may synchronize or build the
+    // environment. Keep all of uv's own pools and Cargo-backed PEP 517 builds
+    // inside the same descendant envelope the run advertises. An operator's
+    // stricter inherited cap still wins (see `uv_concurrency_env_with`).
+    let mut env = super::uv_concurrency_env(config.resource_plan.worker_limit);
+    if plan.scan_dir != config.repo_root {
         let env_dir = config.uv_env_dir_for(&reviewed_env_token(config, &plan.scan_dir));
         mark_and_prune_uv_envs(&config.uv_env_root(), &env_dir);
-        vec![(
+        env.push((
             "UV_PROJECT_ENVIRONMENT".to_string(),
             env_dir.display().to_string(),
-        )]
-    };
+        ));
+    }
     Ok(PythonRun {
         cwd: plan.scan_dir,
         env,
@@ -116,14 +119,43 @@ pub(super) fn plan_python_run(config: &Config) -> Result<PythonRun> {
 ///
 /// `pyproject.toml` is the project itself — ruff, mypy and pytest take their
 /// configuration from it, and uv discovers the project through it. `uv.lock`
-/// pins the dependency set that gets installed and imported.
-const PYTHON_PROJECT_METADATA: &[&str] = &["pyproject.toml", "uv.lock"];
-const PYTEST_CONFIG_FILES: &[&str] = &["pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini"];
+/// pins the dependency set that gets installed and imported. Dedicated pytest
+/// configs are included because the selected one controls collection and worker
+/// count just as directly; none may escape the reviewed tree through a symlink.
+const PYTHON_PROJECT_METADATA: &[&str] = &[
+    "pyproject.toml",
+    "uv.lock",
+    "pytest.toml",
+    ".pytest.toml",
+    "pytest.ini",
+    ".pytest.ini",
+    "tox.ini",
+    "setup.cfg",
+];
+/// Pytest 9's discovery order. The first matching file wins; options are never
+/// merged. Dedicated pytest files match even when empty, while the generic
+/// project files require their pytest section/table.
+const PYTEST_CONFIG_FILES: &[&str] = &[
+    "pytest.toml",
+    ".pytest.toml",
+    "pytest.ini",
+    ".pytest.ini",
+    "pyproject.toml",
+    "tox.ini",
+    "setup.cfg",
+];
+
+#[derive(Debug, PartialEq, Eq)]
+enum PytestConfigMatch {
+    NotMatched,
+    Matched(Option<String>),
+}
 
 fn contains_xdist_worker_option(value: &str) -> bool {
     value.split_whitespace().any(|token| {
         token == "-n"
             || token.strip_prefix("-n").is_some_and(|suffix| {
+                let suffix = suffix.strip_prefix('=').unwrap_or(suffix);
                 !suffix.is_empty()
                     && (suffix.bytes().all(|byte| byte.is_ascii_digit())
                         || matches!(suffix, "auto" | "logical"))
@@ -133,25 +165,47 @@ fn contains_xdist_worker_option(value: &str) -> bool {
     })
 }
 
-fn pytest_config_addopts(name: &str, contents: &str) -> Option<String> {
-    if name == "pyproject.toml" {
-        let value = toml::from_str::<toml::Value>(contents).ok()?;
-        let addopts = value
-            .get("tool")?
-            .get("pytest")?
-            .get("ini_options")?
-            .get("addopts")?;
-        return match addopts {
-            toml::Value::String(value) => Some(value.clone()),
-            toml::Value::Array(values) => Some(
-                values
-                    .iter()
-                    .filter_map(toml::Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ),
-            _ => None,
+fn toml_addopts(value: &toml::Value) -> Option<String> {
+    match value {
+        toml::Value::String(value) => Some(value.clone()),
+        toml::Value::Array(values) => Some(
+            values
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
+fn pytest_config_addopts(name: &str, contents: &str) -> PytestConfigMatch {
+    if matches!(name, "pytest.toml" | ".pytest.toml") {
+        let Ok(document) = toml::from_str::<toml::Value>(contents) else {
+            // Pytest will fail on the malformed dedicated config before it can
+            // start workers. It still wins discovery over lower-priority files.
+            return PytestConfigMatch::Matched(None);
         };
+        let addopts = document
+            .get("pytest")
+            .and_then(|table| table.get("addopts"))
+            .and_then(toml_addopts);
+        return PytestConfigMatch::Matched(addopts);
+    }
+
+    if name == "pyproject.toml" {
+        let Ok(document) = toml::from_str::<toml::Value>(contents) else {
+            return PytestConfigMatch::Matched(None);
+        };
+        let Some(pytest) = document.get("tool").and_then(|tool| tool.get("pytest")) else {
+            return PytestConfigMatch::NotMatched;
+        };
+        let native_addopts = pytest.get("addopts").and_then(toml_addopts);
+        let ini_addopts = pytest
+            .get("ini_options")
+            .and_then(|table| table.get("addopts"))
+            .and_then(toml_addopts);
+        return PytestConfigMatch::Matched(native_addopts.or(ini_addopts));
     }
 
     let wanted_section = if name == "setup.cfg" {
@@ -159,6 +213,8 @@ fn pytest_config_addopts(name: &str, contents: &str) -> Option<String> {
     } else {
         "pytest"
     };
+    let dedicated = matches!(name, "pytest.ini" | ".pytest.ini");
+    let mut saw_pytest_section = false;
     let mut in_pytest = false;
     let mut collecting = false;
     let mut addopts = String::new();
@@ -169,6 +225,7 @@ fn pytest_config_addopts(name: &str, contents: &str) -> Option<String> {
                 break;
             }
             in_pytest = trimmed[1..trimmed.len() - 1].trim() == wanted_section;
+            saw_pytest_section |= in_pytest;
             continue;
         }
         if !in_pytest || trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';')
@@ -183,24 +240,45 @@ fn pytest_config_addopts(name: &str, contents: &str) -> Option<String> {
             }
             break;
         }
-        if let Some((key, value)) = trimmed.split_once('=')
-            && key.trim() == "addopts"
-        {
-            addopts.push_str(value.trim());
-            collecting = true;
+        if let Some(delimiter) = trimmed.find(['=', ':']) {
+            let (key, value) = trimmed.split_at(delimiter);
+            if key.trim() == "addopts" {
+                addopts.push_str(value[1..].trim());
+                collecting = true;
+            }
         }
     }
-    (!addopts.is_empty()).then_some(addopts)
+    if dedicated || saw_pytest_section {
+        PytestConfigMatch::Matched((!addopts.is_empty()).then_some(addopts))
+    } else {
+        PytestConfigMatch::NotMatched
+    }
 }
 
-fn pytest_requests_xdist(root: &Path, inherited_addopts: Option<&str>) -> bool {
-    inherited_addopts.is_some_and(contains_xdist_worker_option)
-        || PYTEST_CONFIG_FILES.iter().any(|name| {
-            std::fs::read_to_string(root.join(name))
-                .ok()
-                .and_then(|contents| pytest_config_addopts(name, &contents))
-                .is_some_and(|addopts| contains_xdist_worker_option(&addopts))
-        })
+fn empty_pytest_config() -> PathBuf {
+    #[cfg(windows)]
+    let path = PathBuf::from("NUL");
+    #[cfg(not(windows))]
+    let path = PathBuf::from("/dev/null");
+    path
+}
+
+fn selected_pytest_config(root: &Path) -> (PathBuf, Option<String>) {
+    for name in PYTEST_CONFIG_FILES {
+        let path = root.join(name);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match pytest_config_addopts(name, &contents) {
+            PytestConfigMatch::NotMatched => {}
+            PytestConfigMatch::Matched(addopts) => return (path, addopts),
+        }
+    }
+
+    // An explicit empty config prevents pytest from walking above the reviewed
+    // tree and inheriting an ambient parent project's addopts. These are the
+    // platform null devices, so no checkout file needs to be created.
+    (empty_pytest_config(), None)
 }
 
 fn bounded_pytest_invocation(
@@ -210,8 +288,17 @@ fn bounded_pytest_invocation(
     inherited_addopts: Option<&str>,
 ) -> (Vec<String>, Vec<(String, String)>) {
     let worker_limit = worker_limit.max(1);
-    let mut args = vec!["-v".to_owned()];
-    if pytest_requests_xdist(root, inherited_addopts) {
+    let (config_path, config_addopts) = selected_pytest_config(root);
+    let mut args = vec![
+        "-v".to_owned(),
+        "-c".to_owned(),
+        config_path.display().to_string(),
+        "--rootdir".to_owned(),
+        root.display().to_string(),
+    ];
+    if inherited_addopts.is_some_and(contains_xdist_worker_option)
+        || config_addopts.is_some_and(|value| contains_xdist_worker_option(&value))
+    {
         // Pytest prepends ini/PYTEST_ADDOPTS before explicit CLI arguments, so
         // this final option clamps both `-n auto` and an explicit `-n N`.
         args.extend(["-n".to_owned(), worker_limit.to_string()]);
@@ -838,18 +925,29 @@ mod tests {
         let run = plan_python_run(&config).expect("plan");
 
         assert_eq!(run.cwd, scan_dir.path());
-        assert_eq!(
-            run.env,
-            vec![(
-                "UV_PROJECT_ENVIRONMENT".to_string(),
-                config
-                    .uv_env_dir_for(&reviewed_env_token(&config, scan_dir.path()))
-                    .display()
-                    .to_string()
-            )],
-            "an off-HEAD python check must sync into a prview-owned environment",
+        let expected_env = config
+            .uv_env_dir_for(&reviewed_env_token(&config, scan_dir.path()))
+            .display()
+            .to_string();
+        assert!(
+            run.env
+                .iter()
+                .any(|(key, value)| { key == "UV_PROJECT_ENVIRONMENT" && value == &expected_env })
         );
-        let env_dir = PathBuf::from(&run.env[0].1);
+        for key in [
+            "UV_CONCURRENT_DOWNLOADS",
+            "UV_CONCURRENT_BUILDS",
+            "UV_CONCURRENT_INSTALLS",
+            "CARGO_BUILD_JOBS",
+        ] {
+            assert!(
+                run.env
+                    .iter()
+                    .any(|(actual, value)| actual == key && value == "1"),
+                "{key} must cap the later uv run, not only pre-sync",
+            );
+        }
+        let env_dir = PathBuf::from(expected_env);
         assert!(
             !env_dir.starts_with(repo_root.path()),
             "the reviewed sync must not reach the operator's checkout (its .venv is symlinked \
@@ -866,7 +964,7 @@ mod tests {
     }
 
     /// uv reads the project metadata, not the directory. A reviewed commit that
-    /// replaces `pyproject.toml` or `uv.lock` with a link to an external file
+    /// replaces project, lock, or pytest config with a link to an external file
     /// makes ruff, mypy and pytest configure themselves — and uv resolve the
     /// dependency set — from a project this review does not describe, while the
     /// verdict is cached under the reviewed commit. Same refusal as the Cargo
@@ -874,7 +972,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn python_metadata_linked_out_of_the_snapshot_is_refused() {
-        for name in ["pyproject.toml", "uv.lock"] {
+        for name in ["pyproject.toml", "uv.lock", "pytest.ini", "pytest.toml"] {
             let repo_root = tempfile::tempdir().expect("repo_root tempdir");
             let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
             let outside = tempfile::tempdir().expect("outside tempdir");
@@ -1034,7 +1132,8 @@ mod tests {
         assert!(!env_dir.exists(), "uv creates the environment, not prview");
     }
 
-    /// A local review is unchanged: the operator's own environment, no override.
+    /// A local review keeps the operator's environment path, while every uv
+    /// child still inherits the run's descendant caps.
     #[test]
     fn python_run_local_target_is_unchanged() {
         let repo_root = tempfile::tempdir().expect("repo_root tempdir");
@@ -1045,9 +1144,12 @@ mod tests {
 
         assert_eq!(run.cwd, repo_root.path());
         assert!(
-            run.env.is_empty(),
-            "a local review must keep using the checkout's own environment",
+            run.env
+                .iter()
+                .all(|(key, value)| key != "UV_PROJECT_ENVIRONMENT" && value == "1"),
+            "a local review keeps its environment path but caps uv descendants",
         );
+        assert_eq!(run.env.len(), 4);
     }
 
     #[test]
@@ -1060,7 +1162,18 @@ mod tests {
         .unwrap();
 
         let (args, env) = bounded_pytest_invocation(root.path(), &[], 1, None);
-        assert_eq!(args, ["-v", "-n", "1"]);
+        assert_eq!(
+            args,
+            [
+                "-v".to_owned(),
+                "-c".to_owned(),
+                root.path().join("pyproject.toml").display().to_string(),
+                "--rootdir".to_owned(),
+                root.path().display().to_string(),
+                "-n".to_owned(),
+                "1".to_owned(),
+            ]
+        );
         assert!(
             env.iter()
                 .any(|(key, value)| { key == "PYTEST_XDIST_AUTO_NUM_WORKERS" && value == "1" })
@@ -1072,7 +1185,7 @@ mod tests {
         )
         .unwrap();
         let (args, _) = bounded_pytest_invocation(root.path(), &[], 2, Some("-n 12"));
-        assert_eq!(args, ["-v", "-n", "2"]);
+        assert_eq!(&args[args.len() - 2..], ["-n", "2"]);
     }
 
     #[test]
@@ -1091,7 +1204,8 @@ mod tests {
 
         let (args, _) = bounded_pytest_invocation(root.path(), &[], 1, None);
 
-        assert_eq!(args, ["-v"]);
+        assert!(!args.iter().any(|arg| arg == "-n"));
+        assert_eq!(args[2], empty_pytest_config().display().to_string());
     }
 
     #[test]
@@ -1105,7 +1219,101 @@ mod tests {
 
         let (args, _) = bounded_pytest_invocation(root.path(), &[], 3, None);
 
-        assert_eq!(args, ["-v", "-n", "3"]);
+        assert_eq!(&args[args.len() - 2..], ["-n", "3"]);
+    }
+
+    #[test]
+    fn pytest_ini_colon_xdist_request_is_clamped() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(
+            root.path().join("pytest.ini"),
+            "[pytest]\naddopts: -q -n 16\n",
+        )
+        .unwrap();
+
+        let (args, _) = bounded_pytest_invocation(root.path(), &[], 2, None);
+
+        assert_eq!(&args[args.len() - 2..], ["-n", "2"]);
+
+        std::fs::write(
+            root.path().join("pytest.ini"),
+            "[pytest]\naddopts: -q -n=12\n",
+        )
+        .unwrap();
+        let (args, _) = bounded_pytest_invocation(root.path(), &[], 1, None);
+        assert_eq!(&args[args.len() - 2..], ["-n", "1"]);
+    }
+
+    #[test]
+    fn pytest_nine_toml_array_and_hidden_ini_are_clamped() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(
+            root.path().join("pytest.toml"),
+            "[pytest]\naddopts = ['-q', '-n', '16']\n",
+        )
+        .unwrap();
+
+        let (args, _) = bounded_pytest_invocation(root.path(), &[], 3, None);
+        assert_eq!(&args[args.len() - 2..], ["-n", "3"]);
+
+        std::fs::remove_file(root.path().join("pytest.toml")).unwrap();
+        std::fs::write(
+            root.path().join(".pytest.ini"),
+            "[pytest]\naddopts = --numprocesses=logical\n",
+        )
+        .unwrap();
+        let (args, _) = bounded_pytest_invocation(root.path(), &[], 1, None);
+        assert_eq!(&args[args.len() - 2..], ["-n", "1"]);
+    }
+
+    #[test]
+    fn pytest_config_precedence_uses_one_selected_source() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[tool.pytest.ini_options]\naddopts = '-n 16'\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("pytest.ini"), "[pytest]\naddopts = -q\n").unwrap();
+
+        let (args, _) = bounded_pytest_invocation(root.path(), &[], 1, None);
+        assert_eq!(
+            args[2],
+            root.path().join("pytest.ini").display().to_string()
+        );
+        assert!(!args.iter().any(|arg| arg == "-n"));
+
+        // A dedicated pytest TOML matches even when empty and wins over INI.
+        std::fs::write(root.path().join("pytest.toml"), "").unwrap();
+        std::fs::write(
+            root.path().join("pytest.ini"),
+            "[pytest]\naddopts = -n 32\n",
+        )
+        .unwrap();
+        let (args, _) = bounded_pytest_invocation(root.path(), &[], 1, None);
+        assert_eq!(
+            args[2],
+            root.path().join("pytest.toml").display().to_string()
+        );
+        assert!(!args.iter().any(|arg| arg == "-n"));
+    }
+
+    #[test]
+    fn pytest_never_inherits_a_parent_projects_config() {
+        let parent = tempfile::tempdir().expect("ambient parent");
+        std::fs::write(
+            parent.path().join("pytest.ini"),
+            "[pytest]\naddopts = -n 64 --ignore=tests\n",
+        )
+        .unwrap();
+        let root = parent.path().join("reviewed");
+        std::fs::create_dir(&root).unwrap();
+
+        let (args, _) = bounded_pytest_invocation(&root, &[], 1, None);
+
+        assert_eq!(args[2], empty_pytest_config().display().to_string());
+        assert_eq!(args[4], root.display().to_string());
+        assert!(!args.iter().any(|arg| arg == "-n"));
     }
 
     #[test]
@@ -1115,7 +1323,9 @@ mod tests {
 
         let (args, env) = bounded_pytest_invocation(root.path(), &base_env, 1, None);
 
-        assert_eq!(args, ["-v"]);
+        assert_eq!(args[0], "-v");
+        assert_eq!(args[1], "-c");
+        assert!(!args.iter().any(|arg| arg == "-n"));
         assert_eq!(
             env,
             [

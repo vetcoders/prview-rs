@@ -928,7 +928,7 @@ async fn presync_python_venv(
     // Exclusive before spawning, and pass the same descendant cap the run
     // advertises to uv's download/build/install pools.
     let _budget = governor.acquire(Weight::Exclusive).await?;
-    let plan = match plan_python_presync(config, governor.worker_limit()) {
+    let plan = match plan_python_presync(config) {
         Ok(plan) => plan,
         Err(error) => {
             if emit {
@@ -992,15 +992,11 @@ async fn presync_python_venv(
 /// Resolve the exact tree and environment the Python checks will consume, then
 /// add uv's bounded descendant pools. Keeping this as one tested plan prevents
 /// the pre-sync and the actual gates from drifting onto different substrates.
-fn plan_python_presync(config: &Config, worker_limit: u32) -> Result<python::PythonRun> {
-    let mut plan = python::plan_python_run(config)?;
-    let mut env = uv_concurrency_env(worker_limit);
-    env.extend(plan.env);
-    plan.env = env;
-    Ok(plan)
+fn plan_python_presync(config: &Config) -> Result<python::PythonRun> {
+    python::plan_python_run(config)
 }
 
-fn uv_concurrency_env(worker_limit: u32) -> Vec<(String, String)> {
+pub(super) fn uv_concurrency_env(worker_limit: u32) -> Vec<(String, String)> {
     uv_concurrency_env_with(worker_limit, |key| std::env::var(key).ok())
 }
 
@@ -2778,7 +2774,7 @@ mod tests {
         config.repo_root = repo.path().to_path_buf();
         config.scan_dir_override = Some(snapshot.path().to_path_buf());
 
-        let plan = plan_python_presync(&config, 1).expect("presync plan");
+        let plan = plan_python_presync(&config).expect("presync plan");
 
         assert_eq!(plan.cwd, snapshot.path());
         assert!(plan.env.iter().any(|(key, value)| {

@@ -144,9 +144,9 @@ pub struct RunningMarker {
     pub base_used: Vec<String>,
 }
 
-/// Deterministic run status. `SANITY.json` present wins (completed) even if a
-/// stale `RUNNING.json` marker was left behind; otherwise liveness is derived
-/// from the marker's pid — a dead pid is `Stale`, never an eternal `running`.
+/// Deterministic run status. Completion requires both finalized pack bytes and
+/// the exact durable index row. Otherwise liveness is derived from the marker's
+/// pid — a dead publisher is `Stale`, never a fake completed run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
     Completed,
@@ -170,16 +170,16 @@ pub fn read_running_marker(run_dir: &Path) -> Option<RunningMarker> {
 
 /// Derive the deterministic lifecycle status of a run directory.
 pub fn run_status(run_dir: &Path) -> RunStatus {
-    // SANITY.json is the completion truth: it is the last GUARANTEED
-    // finalization artifact. Pack generation writes RUN.json FIRST, then
-    // MANIFEST.json, then SANITY.json, then the OPTIONAL artifacts.zip. Keying
-    // completion on RUN.json let a deep run's detached writer be caught
-    // mid-finalization — a poller would see `completed` while MANIFEST/SANITY
-    // (and any zip/symlink/index registration) were still being written, so a
-    // client could consume a partial pack. SANITY.json present proves RUN.json
-    // + MANIFEST.json + SANITY.json are all on disk (PR #12 review). It wins
-    // over any lingering marker.
-    if run_dir.join("00_summary").join("SANITY.json").exists() {
+    // SANITY is necessary but not sufficient: it precedes the transactional
+    // index/latest commit. A lossy read is acceptable only for this lifecycle
+    // hint; every MCP success path separately uses `strict_run_index`.
+    let finalized = run_dir.join("00_summary").join("SANITY.json").exists();
+    let run_id = run_dir.file_name().and_then(|name| name.to_str());
+    let published = RunIndex::load()
+        .entries()
+        .iter()
+        .any(|entry| Some(entry.id.as_str()) == run_id && same_run_path(&entry.path, run_dir));
+    if finalized && published {
         return RunStatus::Completed;
     }
 
@@ -306,54 +306,38 @@ fn same_run_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-/// Scan `runs/<repo>/<branch>/` for an in-flight run matching HEAD that the
-/// index does not know about yet — a deep run is only registered on completion,
-/// so it is invisible to the index-only lookup. Marker-bearing run dirs are
-/// exactly the ones the index misses (completed runs are already registered).
-/// Returns the most recently started match. Mirrors the `state` tool's
-/// `running_run_summary` so `verdict` and `state` agree on "the current run".
-fn find_on_disk_run_for_head(repo_name: &str, branch_key: &str, head: &str) -> Option<ResolvedRun> {
-    let base = crate::config::prview_home()
-        .join("runs")
-        .join(repo_name)
-        .join(branch_key);
-    let mut best: Option<(String, ResolvedRun)> = None;
-    for entry in std::fs::read_dir(&base).ok()?.flatten() {
-        let run_dir = entry.path();
-        if !run_dir.is_dir() {
-            continue;
-        }
-        let Some(marker) = read_running_marker(&run_dir) else {
-            continue;
-        };
-        if !commit_matches(&marker.commit, head) {
-            continue;
-        }
-        let Some(run_id) = run_dir.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let candidate = ResolvedRun {
-            run_dir: run_dir.clone(),
-            run_id: run_id.to_string(),
-            commit: marker.commit.clone(),
-        };
-        let newer = best
-            .as_ref()
-            .map(|(started, _)| marker.started_at > *started)
-            .unwrap_or(true);
-        if newer {
-            best = Some((marker.started_at.clone(), candidate));
-        }
-    }
-    best.map(|(_, run)| run)
+fn strict_run_index() -> Result<RunIndex, ToolError> {
+    RunIndex::load_strict().map_err(|error| {
+        ToolError::new(
+            error_class::STORAGE_CORRUPT,
+            format!("failed to read the durable run index: {error:#}"),
+        )
+    })
+}
+
+/// Require the exact run id/path pair that transactionally commits publication.
+/// SANITY proves the pack files were finalized; only this row proves that the
+/// publication transaction (index + latest) committed as one durable truth.
+pub(crate) fn require_published_run(run_dir: &Path, run_id: &str) -> Result<RunEntry, ToolError> {
+    let index = strict_run_index()?;
+    index
+        .entries()
+        .iter()
+        .find(|entry| entry.id == run_id && same_run_path(&entry.path, run_dir))
+        .cloned()
+        .ok_or_else(|| {
+            ToolError::new(
+                error_class::RUN_FAILED,
+                format!("run {run_id} finalized its pack but did not commit durable publication"),
+            )
+        })
 }
 
 /// Newest LIVE in-flight run for HEAD (by `started_at`).
 ///
 /// Filters to `RunStatus::Running` (a live pid, no completion marker), exactly
 /// what the `state` tool reports as "the current run", so `verdict` and `state`
-/// agree. Unlike [`find_on_disk_run_for_head`], a stale marker or a
-/// completed-but-marker-left run does not qualify here.
+/// agree. A stale marker or a durably completed run does not qualify here.
 fn running_run_for_head(repo_name: &str, branch_key: &str, head: &str) -> Option<ResolvedRun> {
     let base = crate::config::prview_home()
         .join("runs")
@@ -397,8 +381,7 @@ fn running_run_for_head(repo_name: &str, branch_key: &str, head: &str) -> Option
 /// the current run, and `verdict` reports it as `in_progress` (so a poller keeps
 /// polling) instead of stopping early on a stale completed pack from a prior run
 /// on the same HEAD. With no live run, the indexed completed run is returned;
-/// `None` only when neither exists, so the caller can fall back to any
-/// unregistered on-disk run.
+/// `None` only when neither exists.
 fn choose_head_run(
     indexed: Option<ResolvedRun>,
     running: Option<ResolvedRun>,
@@ -414,7 +397,7 @@ fn choose_head_run(
 /// run is a fail-loud `run_not_found` — the agent then calls `run_review`.
 pub fn resolve_run(root: &Path, run_id: Option<&str>) -> Result<ResolvedRun, ToolError> {
     let repo_name = crate::config::repo_name_from_root(root);
-    let index = RunIndex::load();
+    let index = strict_run_index()?;
 
     match run_id {
         Some(id) => {
@@ -486,17 +469,10 @@ pub fn resolve_run(root: &Path, run_id: Option<&str>) -> Result<ResolvedRun, Too
             let running = running_run_for_head(&repo_name, &branch_key, &state.head);
             match choose_head_run(indexed, running) {
                 Some(run) => Ok(run),
-                // Neither an indexed nor a live run matched HEAD. Before failing
-                // loud, scan the on-disk tree for a completed-but-not-yet-registered
-                // run for HEAD — otherwise a client gets a silent "no runs" while
-                // its just-finished pack is not yet in the index.
-                None => match find_on_disk_run_for_head(&repo_name, &branch_key, &state.head) {
-                    Some(run) => Ok(run),
-                    None => Err(ToolError::new(
-                        error_class::RUN_NOT_FOUND,
-                        "no run for current HEAD; call run_review",
-                    )),
-                },
+                None => Err(ToolError::new(
+                    error_class::RUN_NOT_FOUND,
+                    "no run for current HEAD; call run_review",
+                )),
             }
         }
     }
@@ -1576,15 +1552,67 @@ mod tests {
 
     #[test]
     fn run_status_completed_wins_over_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
         let dir = tempfile::tempdir().unwrap();
-        // Both a lingering live marker AND a finalized pack (SANITY.json):
-        // completion wins.
+        // Both a lingering live marker AND a finalized, durably indexed pack:
+        // publication wins.
         write_marker(dir.path(), std::process::id());
         let summary = dir.path().join("00_summary");
         std::fs::create_dir_all(&summary).unwrap();
         std::fs::write(summary.join("RUN.json"), "{}").unwrap();
         std::fs::write(summary.join("SANITY.json"), "{}").unwrap();
+        let run_id = dir.path().file_name().unwrap().to_str().unwrap();
+        let mut published = entry(run_id, "abc1234", "2026-07-01T12:00:00Z");
+        published.path = dir.path().to_path_buf();
+        std::fs::write(
+            home.path().join("index.jsonl"),
+            format!("{}\n", serde_json::to_string(&published).unwrap()),
+        )
+        .unwrap();
         assert_eq!(run_status(dir.path()), RunStatus::Completed);
+    }
+
+    #[test]
+    fn finalized_but_unindexed_pack_is_never_completed() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let dir = tempfile::tempdir().unwrap();
+        let summary = dir.path().join("00_summary");
+        std::fs::create_dir_all(&summary).unwrap();
+        std::fs::write(summary.join("SANITY.json"), "{}").unwrap();
+
+        write_marker(dir.path(), std::process::id());
+        assert_eq!(
+            run_status(dir.path()),
+            RunStatus::Running {
+                pid: std::process::id()
+            }
+        );
+        assert_eq!(
+            require_published_run(dir.path(), "unpublished")
+                .unwrap_err()
+                .class,
+            error_class::RUN_FAILED
+        );
+
+        std::fs::remove_file(running_marker_path(dir.path())).unwrap();
+        write_marker(dir.path(), 2_147_483_646);
+        assert!(matches!(run_status(dir.path()), RunStatus::Stale { .. }));
+    }
+
+    #[test]
+    fn corrupt_index_is_fail_loud_for_mcp_publication_truth() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        std::fs::write(home.path().join("index.jsonl"), "{ not valid json\n").unwrap();
+        let run_dir = home.path().join("runs/demo/main/run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        assert_eq!(
+            require_published_run(&run_dir, "run").unwrap_err().class,
+            error_class::STORAGE_CORRUPT
+        );
     }
 
     #[test]
@@ -1950,7 +1978,7 @@ mod tests {
         let only_running = choose_head_run(None, Some(running)).unwrap();
         assert_eq!(only_running.run_id, "in-flight");
 
-        // Neither → None, so the caller falls back to the on-disk scan.
+        // Neither → None; an unindexed finalized directory is not completion.
         assert!(choose_head_run(None, None).is_none());
     }
 

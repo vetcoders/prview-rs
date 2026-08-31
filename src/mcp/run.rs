@@ -433,21 +433,24 @@ pub async fn start(
                     error_class::RUN_FAILED,
                     format!("failed to wait on prview: {e}"),
                 )),
-                Ok(Ok(_status)) => {
-                    // Success is defined by a finalized pack (SANITY.json, the last
-                    // guaranteed finalization artifact), NOT the exit code: prview
-                    // exits non-zero on a BLOCK verdict yet the run is a valid
-                    // completed review.
+                Ok(Ok(status)) => {
+                    // A BLOCK verdict may exit non-zero and still be a valid
+                    // review. The success oracle is therefore not exit zero,
+                    // but it must be stronger than SANITY: exact durable index
+                    // publication distinguishes a valid BLOCK from an execution
+                    // failure after pack finalization.
                     if read::run_status(&run_dir) != read::RunStatus::Completed {
                         return Err(ToolError::with_extra(
                             error_class::RUN_FAILED,
-                            "prview produced no completed pack",
+                            "prview produced no durably published pack",
                             serde_json::json!({
                                 "run_id": run_id,
+                                "exit_code": status.code(),
                                 "stderr_tail": stderr_tail(&run_dir),
                             }),
                         ));
                     }
+                    read::require_published_run(&run_dir, &run_id)?;
                     // Completed: the child already registered the run; drop the
                     // marker so status readers see a clean completion.
                     let _ = std::fs::remove_file(read::running_marker_path(&run_dir));

@@ -208,10 +208,21 @@ pub fn terminate_and_reap_owned_std_child(child: &mut dyn process_wrap::std::Chi
     } else {
         // Cancellation may have won through the governor milliseconds before
         // this owner reached its own cleanup path. A second group kill can then
-        // report no live group while the direct root is already a waitable
-        // zombie. Never block after an unconfirmed kill, but do reap that
-        // already-exited root when `try_wait` can prove it is safe.
-        let _ = child.try_wait();
+        // report no live group before the direct root becomes waitable. Poll
+        // for a short, finite interval so the owned root cannot remain a zombie
+        // in a long-lived MCP process. The false return still preserves the
+        // distinction between a confirmed tree termination and this best-effort
+        // direct-root reap.
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) => break,
+            }
+        }
         false
     }
 }
@@ -1024,7 +1035,17 @@ mod tests {
             let mut child = command.spawn().expect("spawn hardened timeout tree");
             let root_pid = child.id();
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while !pidfile.exists() {
+            while std::fs::read_to_string(&pidfile)
+                .ok()
+                .filter(|contents| {
+                    let pids = contents
+                        .split_whitespace()
+                        .filter_map(|value| value.parse::<u32>().ok())
+                        .count();
+                    pids == 2
+                })
+                .is_none()
+            {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "timeout fixture never published its process tree"

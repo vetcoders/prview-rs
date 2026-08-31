@@ -465,7 +465,17 @@ async fn cancellation_during_shared_snapshot_cleanup_never_publishes_the_pack() 
         let pids = pids.clone();
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !pids.exists() {
+            while std::fs::read_to_string(&pids)
+                .ok()
+                .filter(|contents| {
+                    contents
+                        .split_whitespace()
+                        .filter_map(|value| value.parse::<u32>().ok())
+                        .count()
+                        == 2
+                })
+                .is_none()
+            {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "snapshot cleanup never spawned its governed git child"

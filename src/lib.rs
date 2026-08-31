@@ -950,7 +950,11 @@ mod tests {
             if self.delivered {
                 std::future::pending::<()>().await;
             }
-            while !self.path.exists() {
+            while std::fs::read_to_string(&self.path)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .is_none()
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             self.delivered = true;

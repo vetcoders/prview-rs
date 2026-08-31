@@ -327,10 +327,15 @@ exists, through that same `plan_python_run()`. Its cwd and
 `UV_PROJECT_ENVIRONMENT` are therefore identical to the later gates; it never
 syncs an off-HEAD dependency set into the operator checkout. uv download/build/
 install pools and Cargo-backed PEP 517 builds inherit the run's child limit.
-Pytest-xdist gets the same limit through its auto-worker environment and a final
-CLI override whenever repo or inherited addopts request xdist. Unknown build
-backends remain one serialized Exclusive parent; the governor does not claim to
-discover every third-party backend's private thread knob.
+The cap remains on every later `uv run`, so an unsuccessful pre-sync cannot
+retry outside the envelope. Pytest is explicitly bound to the one
+highest-precedence config inside the reviewed root (including pytest 9 TOML and
+hidden variants), or to an empty config when the root has none; it never walks
+into an ambient parent project. Pytest-xdist gets the same limit through its
+auto-worker environment and a final CLI override whenever that selected config
+or inherited addopts request xdist. Unknown build backends remain one serialized
+Exclusive parent; the governor does not claim to discover every third-party
+backend's private thread knob.
 
 That environment is per reviewed **commit**, not per repository. `uv run` syncs
 before executing and releases the environment lock while the child command runs,
@@ -1266,9 +1271,11 @@ mirror `run_all`. Artifact generation on the TUI path uses the same
 poll q/Escape while the pack is being written. The initial repository/ref
 preflight is the exception: it runs before raw mode under a temporary Ctrl-C
 signal supervisor, so a slow fetch cannot enter a window where signals are
-disabled but the terminal event reader does not yet exist. A post-stage cancel
-check prevents an interrupt that lands after fetch but before state resolution
-finishes from entering raw mode with an already-cancelled governor.
+disabled but the terminal event reader does not yet exist. The supervisor stays
+alive until raw mode is enabled, then completes an explicit biased handoff that
+consumes any already-pending signal before key events take ownership. Both the
+post-stage and post-handoff checks convert a late interrupt into typed
+cancellation.
 
 **Operator surface.** `--resource-budget safe|balanced` selects the plan; preflight
 prints requested/effective budget, parent permits, child-worker cap, current-load

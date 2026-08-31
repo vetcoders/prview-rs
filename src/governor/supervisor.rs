@@ -74,29 +74,70 @@ pub async fn with_cancellation<T>(
     // The guard stops the supervisor whichever way `work` leaves — a value, an
     // error or a panic — so a task listening for a signal never outlives the run
     // it was listening on behalf of.
-    let _supervisor = Supervisor(tokio::spawn(supervise(Arc::clone(governor), interrupts)));
+    let _supervisor = InterruptSupervisor::start(Arc::clone(governor), interrupts);
     work.await
 }
 
-/// Turn the first interrupt into a cancel and the second into an exit.
-async fn supervise(governor: Arc<ResourceGovernor>, mut interrupts: impl Interrupts) {
-    interrupts.next().await;
+/// A signal owner that can hand responsibility to another input mechanism
+/// without a blind gap. TUI preflight keeps this guard alive until raw mode is
+/// enabled; `stop().await` gives any already-ready signal priority over the
+/// handoff request before confirming that the watcher is gone.
+pub(crate) struct InterruptSupervisor {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl InterruptSupervisor {
+    pub(crate) fn start(governor: Arc<ResourceGovernor>, interrupts: impl Interrupts) -> Self {
+        let (stop, stop_rx) = tokio::sync::oneshot::channel();
+        Self {
+            handle: Some(tokio::spawn(supervise(governor, interrupts, stop_rx))),
+            stop: Some(stop),
+        }
+    }
+
+    pub(crate) async fn stop(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Turn the first interrupt into a cancel and the second into an exit, unless
+/// the caller explicitly completes a responsibility handoff first.
+async fn supervise(
+    governor: Arc<ResourceGovernor>,
+    mut interrupts: impl Interrupts,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) {
+    tokio::select! {
+        biased;
+        _ = interrupts.next() => {}
+        _ = &mut stop => return,
+    }
     eprintln!(
         "\n{} stopping running tools and cleaning up (Ctrl-C again to exit now)",
         "^C".yellow().bold(),
     );
     governor.cancel();
 
-    interrupts.next().await;
+    tokio::select! {
+        biased;
+        _ = interrupts.next() => {}
+        _ = &mut stop => return,
+    }
     eprintln!("{} second interrupt — exiting now", "^C".yellow().bold());
     interrupts.abandon_run();
 }
 
-struct Supervisor(tokio::task::JoinHandle<()>);
-
-impl Drop for Supervisor {
+impl Drop for InterruptSupervisor {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
     }
 }
 

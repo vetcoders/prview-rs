@@ -61,10 +61,18 @@ pub async fn run_tui(config: Config) -> Result<()> {
     // into a signal before the key-event loop exists, leaving both prview and
     // a governed git fetch with nobody able to observe the operator's abort.
     let mut state = TuiState::new(config);
-    initialize_state_supervised(&mut state, crate::governor::CtrlC).await?;
+    let pre_raw_mode = initialize_state_supervised(&mut state, crate::governor::CtrlC).await?;
 
     // Setup terminal
+    pre_raw_mode.ensure_active()?;
     enable_raw_mode()?;
+    // Raw mode now turns ^C into an input event for the TUI loop. Stop the
+    // signal watcher only after that handoff is real; its biased stop protocol
+    // first consumes any signal that was already pending at the boundary.
+    if let Err(error) = pre_raw_mode.handoff().await {
+        let _ = disable_raw_mode();
+        return Err(error);
+    }
     let mut out = stdout();
     if let Err(err) = execute!(out, EnterAlternateScreen) {
         let _ = disable_raw_mode();
@@ -111,13 +119,38 @@ pub async fn run_tui(config: Config) -> Result<()> {
 async fn initialize_state_supervised(
     state: &mut TuiState,
     interrupts: impl crate::governor::Interrupts,
-) -> Result<()> {
+) -> Result<PreRawModeGuard> {
     let governor = Arc::new(crate::governor::ResourceGovernor::from_plan(
         state.config.resource_plan,
     ));
+    let supervisor = crate::governor::InterruptSupervisor::start(Arc::clone(&governor), interrupts);
     let work = async { crate::governor::blocking_stage(|| initialize_state(state)) };
-    let result = crate::governor::with_cancellation(work, &governor, interrupts).await;
-    finish_tui_preflight(result, &governor)
+    let result = crate::governor::with_run_scope(Arc::clone(&governor), work).await;
+    finish_tui_preflight(result, &governor)?;
+    Ok(PreRawModeGuard {
+        governor,
+        supervisor,
+    })
+}
+
+struct PreRawModeGuard {
+    governor: Arc<crate::governor::ResourceGovernor>,
+    supervisor: crate::governor::InterruptSupervisor,
+}
+
+impl PreRawModeGuard {
+    fn ensure_active(&self) -> Result<()> {
+        finish_tui_preflight(Ok(()), &self.governor)
+    }
+
+    async fn handoff(self) -> Result<()> {
+        let Self {
+            governor,
+            supervisor,
+        } = self;
+        supervisor.stop().await;
+        finish_tui_preflight(Ok(()), &governor)
+    }
 }
 
 fn finish_tui_preflight<T>(
@@ -627,6 +660,39 @@ mod tests {
         assert!(crate::governor::is_cancellation(&error), "{error:#}");
     }
 
+    struct ChannelInterrupts(tokio::sync::mpsc::UnboundedReceiver<()>);
+
+    impl crate::governor::Interrupts for ChannelInterrupts {
+        async fn next(&mut self) {
+            if self.0.recv().await.is_none() {
+                std::future::pending::<()>().await;
+            }
+        }
+
+        fn abandon_run(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn signal_ready_at_raw_mode_handoff_is_not_dropped() {
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        let (interrupt_tx, interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let supervisor = crate::governor::InterruptSupervisor::start(
+            Arc::clone(&governor),
+            ChannelInterrupts(interrupt_rx),
+        );
+        interrupt_tx.send(()).unwrap();
+
+        let error = PreRawModeGuard {
+            governor,
+            supervisor,
+        }
+        .handoff()
+        .await
+        .expect_err("a signal already pending at handoff must cancel startup");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+    }
+
     #[cfg(unix)]
     struct InterruptWhenFileExists {
         path: std::path::PathBuf,
@@ -710,10 +776,15 @@ mod tests {
         let mut state = TuiState::new(config);
         let _override = crate::git::override_test_git_program(shim);
         let started = std::time::Instant::now();
-        let error =
-            initialize_state_supervised(&mut state, InterruptWhenFileExists::new(pidfile.clone()))
-                .await
-                .expect_err("Ctrl-C must cancel TUI preflight fetch");
+        let error = match initialize_state_supervised(
+            &mut state,
+            InterruptWhenFileExists::new(pidfile.clone()),
+        )
+        .await
+        {
+            Ok(_) => panic!("Ctrl-C must cancel TUI preflight fetch"),
+            Err(error) => error,
+        };
 
         assert!(crate::governor::is_cancellation(&error), "{error:#}");
         assert!(started.elapsed() < Duration::from_secs(2));

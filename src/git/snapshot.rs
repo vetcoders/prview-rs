@@ -74,13 +74,13 @@ impl super::Repository {
             .current_dir(&self.path)
             .stderr(Stdio::null());
 
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         let mut tar_cmd = Command::new(
             TEST_TAR_PROGRAM
                 .with(|program| program.borrow().clone())
                 .unwrap_or_else(|| "tar".into()),
         );
-        #[cfg(not(test))]
+        #[cfg(not(all(test, unix)))]
         let mut tar_cmd = Command::new("tar");
         tar_cmd.args(["-x", "-C"]).arg(dest).stderr(Stdio::null());
         let (archive_status, tar_status) =

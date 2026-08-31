@@ -19,6 +19,7 @@
 
 mod supervisor;
 
+pub(crate) use supervisor::InterruptSupervisor;
 pub use supervisor::{CtrlC, Interrupts, blocking_stage};
 
 use std::collections::HashMap;

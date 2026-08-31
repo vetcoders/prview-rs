@@ -4,6 +4,7 @@
 //! wire contract from `2026-07-01-prview-mcp-v1-design.md`.
 
 use prview::git::git_cmd;
+use prview::storage::RunEntry;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -141,9 +142,9 @@ fn run_quick_review(repo: &Path, home: &Path) {
 }
 
 /// Plant a synthetic completed run directory (RUN.json + SANITY.json +
-/// MERGE_GATE + optional SARIF) under the standard storage layout, so
-/// `verdict`/`findings` can be exercised without a real review. SANITY.json is
-/// the finalization marker `run_status` keys completion on.
+/// MERGE_GATE + optional SARIF) under the standard storage layout, then publish
+/// its exact id/path in the durable run index. This keeps focused MCP contract
+/// fixtures on the same completion boundary as a real review.
 fn plant_completed_run(
     home: &Path,
     repo_name: &str,
@@ -175,6 +176,29 @@ fn plant_completed_run(
         )
         .unwrap();
     }
+    let entry = RunEntry {
+        id: run_id.to_string(),
+        repo: repo_name.to_string(),
+        branch: branch_key.to_string(),
+        commit: "fixture".to_string(),
+        path: run_dir.clone(),
+        created_at: "2026-01-01T12:00:00Z".to_string(),
+        quality_pass: true,
+        merge_status: "ALLOW".to_string(),
+        policy_mode: "warn".to_string(),
+        checks_passed: 0,
+        checks_failed: 0,
+        files_changed: 0,
+        size_bytes: 0,
+        has_dashboard: false,
+    };
+    let mut index = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.join("index.jsonl"))
+        .expect("open fixture run index");
+    writeln!(index, "{}", serde_json::to_string(&entry).unwrap())
+        .expect("publish fixture run index row");
     run_dir
 }
 
