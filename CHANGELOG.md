@@ -67,6 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single root package). Fixture and tool `Cargo.toml` files are not product API.
 - `impl std::fmt::Display` (and other external/prelude traits) on a public type
   is a `TraitImplResolution` unknown, not a silent no-delta.
+- Unqualified imported trait impls on public types are retained as
+  `TraitImplResolution` unknowns without relying on a hard-coded trait-name
+  allowlist.
 - Private-field type changes on a public struct (for example `u8` → `Rc<()>`,
   which drops `Send`/`Sync`) change the parent contract.
 - TUI/headless `git fetch` and `git archive | tar` register with the run

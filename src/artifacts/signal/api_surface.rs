@@ -2543,6 +2543,13 @@ impl<'a> SnapshotBuilder<'a> {
                     && item.origin_name == pending.trait_name
                     && !guards_proven_disjoint(&item.cfg_guard, &pending.cfg_guard)
             });
+            let trait_declared_locally = self.declarations.iter().any(|declaration| {
+                declaration.kind == RustApiItemKind::Trait
+                    && declaration.key.crate_name == pending.crate_name
+                    && declaration.key.module_path == pending.trait_module_path
+                    && declaration.key.external_name == pending.trait_name
+                    && !guards_proven_disjoint(&declaration.cfg_guard, &pending.cfg_guard)
+            });
             let owner_public = self.items.iter().any(|item| {
                 item.key.namespace == RustNamespace::Type
                     && item.key.crate_name == pending.crate_name
@@ -2550,7 +2557,9 @@ impl<'a> SnapshotBuilder<'a> {
                     && item.origin_name == pending.owner_name
                     && !guards_proven_disjoint(&item.cfg_guard, &pending.cfg_guard)
             });
-            if owner_public && (trait_public || trait_is_external_public(&pending)) {
+            if owner_public
+                && (trait_public || (!trait_declared_locally && trait_is_external_public(&pending)))
+            {
                 self.unknown_guarded(
                     RustApiUnknownKind::TraitImplResolution,
                     Some(&pending.crate_name),
@@ -3920,44 +3929,17 @@ fn api_crate_manifests(source: &dyn RevisionFileSource, manifests: &[String]) ->
 }
 
 fn trait_is_external_public(pending: &PendingTraitImpl) -> bool {
-    const WELL_KNOWN: &[&str] = &[
-        "Display",
-        "Debug",
-        "Clone",
-        "Copy",
-        "Default",
-        "ToString",
-        "PartialEq",
-        "Eq",
-        "PartialOrd",
-        "Ord",
-        "Hash",
-        "Iterator",
-        "IntoIterator",
-        "From",
-        "Into",
-        "TryFrom",
-        "TryInto",
-        "FromStr",
-        "AsRef",
-        "AsMut",
-        "Deref",
-        "DerefMut",
-        "Drop",
-        "Error",
-        "Send",
-        "Sync",
-        "Unpin",
-        "Future",
-        "FromIterator",
-    ];
     let first = pending.trait_module_path.first().map(String::as_str);
     match first {
         Some("std" | "core" | "alloc") => true,
         Some("crate" | "self" | "super") => false,
         Some(segment) if segment == pending.crate_name => false,
         Some(_) => true,
-        None => WELL_KNOWN.contains(&pending.trait_name.as_str()),
+        // An unqualified trait may have entered scope through `use`, including
+        // an external crate import. Source-only analysis cannot resolve that
+        // binding safely, so retain the impl as typed uncertainty instead of
+        // maintaining a necessarily incomplete allowlist of trait names.
+        None => true,
     }
 }
 

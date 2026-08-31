@@ -1395,7 +1395,10 @@ uncertainty with its normalized source contract until compiler-backed resolution
 exists, including impls written in a private helper module. Private/private
 impls do not degrade the public surface. Declaring-module reachability does not
 gate collection: Rust makes a public-trait-on-public-type impl globally usable
-regardless of the helper module's visibility.
+regardless of the helper module's visibility. An unqualified unresolved trait
+path is retained conservatively because it may have entered scope through an
+external `use`; the backend does not guess externality from a trait-name
+allowlist.
 
 #### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
 

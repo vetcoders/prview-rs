@@ -2441,6 +2441,50 @@ mod tests {
     }
 
     #[test]
+    fn repository_backed_unqualified_imported_trait_impl_is_typed_unknown() {
+        let removed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "use serde::Serialize;\npub struct Value;\nimpl Serialize for Value {}\n",
+                "use serde::Serialize;\npub struct Value;\n",
+            ),
+        ]);
+        assert!(
+            removed.unknown.iter().any(|finding| {
+                finding.identity.name == "TraitImplResolution"
+                    && finding
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("Serialize"))
+            }),
+            "an unqualified imported trait impl must not disappear: {:?}",
+            removed.findings()
+        );
+
+        let local_private_control = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "trait Internal {}\npub struct Value;\nimpl Internal for Value {}\n",
+                "trait Internal {}\npub struct Value;\n",
+            ),
+        ]);
+        assert!(
+            local_private_control.findings().is_empty(),
+            "a proven local private trait does not degrade public API"
+        );
+    }
+
+    #[test]
     fn repository_backed_private_field_auto_trait_change_is_parent_changed() {
         let delta = repository_delta(&[
             (

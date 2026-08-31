@@ -537,7 +537,8 @@ enum are informational unless an ABI-sensitive `repr` makes layout observable.
 Expression-position include macros retain included-byte digests, and
 transforming-attribute unknowns are bound to their annotated input. Legal
 non-UTF-8 Git paths emit side-specific typed path uncertainty while valid sibling
-files continue to be analyzed.
+files continue to be analyzed. Unqualified imported trait impls on public owners
+remain typed uncertainty until compiler-backed name resolution exists.
 
 #### How to read an artifact pack
 
