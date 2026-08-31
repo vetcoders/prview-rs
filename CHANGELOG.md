@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows check and context-command trees are owned by Job Objects, so a
+  successful wrapper cannot orphan descendants by exiting before prview reaps
+  it; the `windows-latest` job proves both root-exits-first paths.
+- Primitive integer enum representations (`repr(u8)` through `repr(isize)`) are
+  ABI-sensitive in Rust API deltas, including non-exhaustive variant additions.
+- Unparseable and non-UTF-8 rootless Cargo manifests fail crate discovery closed
+  as `WorkspaceDiscovery` uncertainty instead of letting a parseable fixture
+  become the product authority.
+- Inherited, `pub(crate)`, and `pub(super)` fields share one external-private
+  Rust API visibility while their types and tuple positions remain observable.
+- `uv sync` preserves an operator's stricter inherited `UV_CONCURRENT_*` caps
+  instead of raising them to the prview worker limit.
 - Snapshot extraction preserves the `git archive` stdout pipe after applying
   hardened subprocess defaults, so `tar` receives the archive instead of an
   empty stdin and the producer no longer exits through SIGPIPE.
@@ -35,8 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A finished context-command child is unregistered before its output is read.
 - A check-dispatcher board row is finished by the queued check name, and an
   exhausted future stream with leftover rows is an error instead of a hang.
-- Timeout waits keep the child handle until after process-tree termination, so
-  Windows `kill_on_drop` cannot reap the root before `taskkill /T`.
+- Timeout waits keep durable tree ownership until after process-tree
+  termination, including after a Windows root PID has already exited.
 - Optional Cargo dependencies without an explicit `[features]` table are
   implicit features in the repo-backed API contract, so removing or renaming
   them is a compared delta.
@@ -49,8 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged invocation no longer hides a breaking edit of the included source.
 - Transforming-attribute uncertainty is bound to the complete annotated input;
   an unchanged derive/attribute can no longer neutralize a changed public item.
-- Adding a variant to an ABI-sensitive `#[repr(...)] #[non_exhaustive]` enum is
-  a parent `Changed` fact rather than an informational addition.
+- Adding a variant to an ABI-sensitive `#[repr(...)] #[non_exhaustive]` enum —
+  including primitive integer reprs — is a parent `Changed` fact rather than an
+  informational addition.
 - TUI artifact generation uses `governor::blocking_stage`, matching headless
   `App::run`, so a single-worker Tokio runtime can still poll q/Escape and
   cancel while the synchronous pack is being written.

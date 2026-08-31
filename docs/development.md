@@ -364,8 +364,10 @@ cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 The Windows build above is only a compile check. Claimed Windows cancellation
-support depends on the real `windows-latest` process-tree test, which exercises
-`taskkill /T /F` and verifies both child PIDs disappear.
+support depends on the real `windows-latest` process-tree job. It exercises
+`taskkill /T /F` for governor cancellation and Job Object ownership for async
+checks and synchronous context wrappers whose root exits before a descendant;
+all captured descendant PIDs must disappear.
 
 Cancellation is deliberately immediate: Unix sends `SIGKILL` to the owned
 process group and Windows force-terminates the owned tree. A killed Cargo/rustc

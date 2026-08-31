@@ -205,6 +205,10 @@ portable cap (including tsc and ESLint across supported project versions) remain
 serialized. High current load, or an unavailable load reading, backpressures the
 effective plan to `safe`.
 
+Cold Python environment setup applies the same cap to `UV_CONCURRENT_DOWNLOADS`,
+`UV_CONCURRENT_BUILDS`, and `UV_CONCURRENT_INSTALLS`. If the operator already
+set a lower positive value, prview preserves that stricter limit.
+
 Before checks start, the human preflight prints the requested/effective budget,
 parent and child caps, expensive tools, and the cheap-first execution schedule.
 The envelope is conservative; it does not pretend to predict exact future peak
@@ -535,10 +539,12 @@ visibility-changed Rust facts are breaking; added-only facts are informational.
 Typed unknowns degrade confidence and require review without claiming a
 confirmed removal. Rust identities include ordinary type/value/macro items plus
 public modules, library crates, and Cargo features. Tuple-constructor privacy,
-ABI-sensitive `repr(C)`/`repr(packed)`/`repr(transparent)` private layout, and
-exhaustive-enum variant additions are observable changes. `repr(Rust)` private
-field order is not, although private field types remain observable through auto
-traits. Additions to an otherwise unchanged `#[non_exhaustive]` enum, and named
+ABI-sensitive `repr(C)`/`repr(packed)`/`repr(transparent)` private layout,
+primitive integer enum reprs, and exhaustive-enum variant additions are
+observable changes. `repr(Rust)` private field order is not, although private
+field types remain observable through auto traits; inherited and restricted
+field visibility are equivalent to an external caller. Additions to an
+otherwise unchanged `#[non_exhaustive]` enum, and named
 fields added to a variant-level `#[non_exhaustive]` variant, are informational
 unless an ABI-sensitive repr makes layout observable.
 Expression-position include macros retain included-byte digests, and
@@ -547,8 +553,11 @@ non-UTF-8 Git paths emit side-specific typed path uncertainty while valid siblin
 files continue to be analyzed; their collision-free internal identity cannot be
 forged by a literal UTF-8 surrogate filename. Multiple independent workspace
 authorities in a rootless revision source emit `WorkspaceDiscovery` uncertainty
-instead of unioning product and fixture crates. Unqualified imported trait impls on public owners
-remain typed uncertainty until compiler-backed name resolution exists.
+instead of unioning product and fixture crates. An unreadable, malformed, or
+non-UTF-8 rootless manifest is also an unresolved authority and cannot be
+discarded in favour of a parseable sibling. Unqualified imported trait impls on
+public owners remain typed uncertainty until compiler-backed name resolution
+exists.
 
 #### How to read an artifact pack
 

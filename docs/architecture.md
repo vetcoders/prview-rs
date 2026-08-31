@@ -1004,15 +1004,21 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
   same registry lock: a process spawned after the drain is refused (`false`) and
   its process group is killed immediately instead of being inserted too late.
   Callers must `unregister_child` on exit for the same pid-reuse reason.
+- **A spawned tree remains owned after its root exits.** Unix retains the
+  process-group identity; Windows check and context runners attach the child to
+  a Job Object before it starts. A success-shaped wrapper therefore cannot
+  orphan background work by making its root PID unavailable to `taskkill`.
 - **The command deadline includes output drain.** Async children are reaped,
-  residual Unix process-group members are terminated, and the registry guard is
-  dropped before buffered stdout/stderr are drained. Reader tasks share the
+  residual Unix process-group or Windows Job Object members are terminated, and
+  the registry guard is dropped before buffered stdout/stderr are drained. Reader tasks share the
   command's original deadline and are aborted *and awaited* on every terminal
   error, so a background descendant holding a pipe cannot turn a bounded check
   into an unbounded join.
 
-Zero new dependencies: the budget is `tokio::sync::Semaphore::acquire_many_owned`
-and the signal is `tokio::sync::watch`, both already in the graph.
+The budget remains `tokio::sync::Semaphore::acquire_many_owned` and the signal
+remains `tokio::sync::watch`. Durable Windows ownership promotes `process-wrap`,
+already present transitively through Loctree, to an explicit dependency so its
+Job Object contract cannot disappear with an unrelated dependency change.
 
 #### Who acquires, and in what order
 
@@ -1133,10 +1139,11 @@ so `cancel` cannot cut it short — followed by a HEAD with no new commits used 
 hand back the *previous* run's pack, and `main` computed an ACCEPT or a BLOCK
 from that. Reusing a pack is still reporting a verdict.
 
-Every child that can be reached this way must be registered, and every child
-prview spawns leads its own process group (`proc::harden` for the async checks,
-`proc::harden_std` for the synchronous context commands) so one signal reaches
-`cargo → rustc → cc` and `sh → pnpm → tool`. Checks register through the
+Every child that can be reached this way must be registered. Unix children lead
+their own process group (`proc::harden` for async checks and `proc::harden_std`
+for synchronous context commands); Windows check and context children belong to
+a Job Object. One owned-tree operation therefore reaches `cargo → rustc → cc`
+and `sh → pnpm → tool`, even when the wrapper exits first. Checks register through the
 `with_child_scope` task-local rather than an argument: the governor is known at
 the dispatcher, the pid at the single spawn point five frames below it behind
 `Check::run(&self, config)`, and a trait method cannot grow a parameter without
@@ -1392,7 +1399,8 @@ cannot neutralize a changed item. Foreign functions/statics inherit the parent
 ABI, safety, and relevant attributes.
 
 Contracts are emitted from normalized `syn` ASTs. Function/default bodies and
-ordinary named private member names/order are excluded. Their anonymized type
+ordinary named private member names/order are excluded. Inherited and restricted
+field visibility are normalized to the same external-private form. Their anonymized type
 multiset remains observable because a private type can change public auto traits
 such as `Send`/`Sync`; only ABI-sensitive `repr(C)`, `repr(packed)`, and
 `repr(transparent)` retain declaration order as layout. `repr(Rust)` follows the
@@ -1453,9 +1461,10 @@ existing-exhaustive breaking rule.
 Enum projection applies the corresponding exhaustiveness policy independently:
 adding variants to an exhaustive public enum changes the parent contract, while
 an otherwise unchanged public `#[non_exhaustive]` enum exposes each new variant
-as informational `Added`. ABI-sensitive `#[repr(...)]` enums remain on the
-parent `Changed` path even when they are non-exhaustive, because payload growth
-can change size or alignment. Adding a named field to an existing variant-level
+as informational `Added`. ABI-sensitive `#[repr(...)]` enums, including
+primitive integer reprs from `u8` through `isize`, remain on the parent `Changed`
+path even when they are non-exhaustive, because payload growth can change size
+or alignment. Adding a named field to an existing variant-level
 `#[non_exhaustive]` variant is likewise informational: downstream callers cannot
 construct it and must match with `..`. Exhaustive variants, tuple variants,
 field removals/type changes, and enum header/policy changes stay on the
@@ -1499,8 +1508,10 @@ Cargo workspace `members`/`exclude` when a workspace exists, and otherwise only
 the repository-root package — nested fixture and tool manifests are not product
 API. A revision source intentionally rooted below the repository may expose one
 package or one workspace authority. Multiple rootless packages/workspaces are
-not silently unioned: they emit side-specific `WorkspaceDiscovery` uncertainty
-and no confirmed product-crate surface until an authority is explicit.
+not silently unioned, and an unreadable, malformed, or non-UTF-8 rootless
+manifest is itself an unresolved authority: both cases emit side-specific
+`WorkspaceDiscovery` uncertainty and no confirmed product-crate surface until
+an authority is explicit.
 Private-field types stay in the parent contract (auto-trait effects such as
 replacing `u8` with `Rc<()>`), and implementations of external/prelude traits on
 a public type are typed `TraitImplResolution` unknowns. Duplicate exact base/target
