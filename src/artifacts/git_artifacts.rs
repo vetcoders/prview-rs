@@ -1035,6 +1035,7 @@ mod latest_tests {
     #[test]
     fn recovery_refuses_a_journal_whose_pack_identity_disagrees() {
         let root = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(root.path().to_path_buf());
         let out_dir = root.path().join("run");
         fs::create_dir_all(out_dir.join("00_summary")).unwrap();
         fs::write(
