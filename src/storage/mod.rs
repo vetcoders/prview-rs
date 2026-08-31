@@ -72,6 +72,10 @@ fn lock_path() -> PathBuf {
     prview_home().join("index.jsonl.lock")
 }
 
+fn prune_trash_path() -> PathBuf {
+    prview_home().join("prune-trash")
+}
+
 fn resolve_explicit_index_path(path: &Path) -> Result<PathBuf> {
     let parent = path.parent().ok_or_else(|| {
         anyhow!(
@@ -1095,33 +1099,61 @@ fn register_and_prune_with_policy(
     if abort() {
         bail!("publication aborted before the run index was committed");
     }
+    cleanup_committed_prunes(&abort)?;
 
     let mut index = RunIndex::load();
     let previous = index.clone();
+    let current_entry = entry.clone();
     index.append(entry);
     let pruned = index.prune(policy, out_dir);
     let pruned_count = pruned.len();
 
-    // Persist the index before deleting anything. A cancel here still leaves
-    // the on-disk index and every historical run directory untouched.
+    // A deletion cannot be rolled back. Move each predecessor atomically into
+    // private prune-trash first; cancellation before the index commit restores
+    // every move, so a cancelled publication cannot destroy historical proof.
     if abort() {
         bail!("publication aborted before the run index was committed");
     }
-    index.save()?;
+    let staged = match stage_pruned_paths(&pruned, &abort) {
+        Ok(staged) => staged,
+        Err(error) if !abort() => {
+            // A custom --output-dir may be on another filesystem, where an
+            // atomic rename into PRVIEW_HOME is impossible. Keep every old row
+            // and publish the new one without retention rather than falling
+            // back to non-transactional copy/delete or losing index truth.
+            eprintln!(
+                "prview: retention skipped; could not stage old runs transactionally: {error:#}"
+            );
+            let mut unpruned = previous.clone();
+            unpruned.append(current_entry);
+            if abort() {
+                bail!("publication aborted before the run index was committed");
+            }
+            unpruned.save()?;
+            if abort() {
+                previous.save()?;
+                bail!("publication aborted before the run index was committed");
+            }
+            return Ok(0);
+        }
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = index.save() {
+        rollback_staged_prunes(&staged)?;
+        return Err(error);
+    }
 
-    // After the rename the new row is visible. Roll the file back before
-    // deleting older evidence, so a cancel cannot advertise an incomplete
-    // pack or destroy predecessors it did not mean to keep.
+    // After the index rename the new row is visible. Roll both the file and the
+    // reversible directory moves back if cancellation won the final race.
     if abort() {
         previous.save()?;
+        rollback_staged_prunes(&staged)?;
         bail!("publication aborted before the run index was committed");
     }
 
-    for path in &pruned {
-        if path.is_dir() {
-            let _ = fs::remove_dir_all(path);
-        }
-    }
+    // The committed tombstones are physically removed at the beginning of the
+    // next registration, before that run mutates its index. This keeps the
+    // long recursive deletion outside the current publication transaction.
 
     if emit_human_stdout && pruned_count > 0 {
         use colored::Colorize;
@@ -1134,6 +1166,123 @@ fn register_and_prune_with_policy(
     }
 
     Ok(pruned_count)
+}
+
+#[derive(Debug)]
+struct StagedPrune {
+    original: PathBuf,
+    tombstone: PathBuf,
+}
+
+fn stage_pruned_paths(pruned: &[PathBuf], abort: &impl Fn() -> bool) -> Result<Vec<StagedPrune>> {
+    let candidates: Vec<_> = pruned.iter().filter(|path| path.is_dir()).collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let trash = prune_trash_path();
+    fs::create_dir_all(&trash)
+        .with_context(|| format!("Failed to create prune trash {}", trash.display()))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut staged = Vec::new();
+    for (index, original) in candidates.into_iter().enumerate() {
+        let tombstone = trash.join(format!("prune-{}-{nonce}-{index}", std::process::id()));
+        if let Err(error) = fs::rename(original, &tombstone) {
+            rollback_staged_prunes(&staged)?;
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to stage retained run {} as {}",
+                    original.display(),
+                    tombstone.display()
+                )
+            });
+        }
+        staged.push(StagedPrune {
+            original: original.clone(),
+            tombstone,
+        });
+        if abort() {
+            rollback_staged_prunes(&staged)?;
+            bail!("publication aborted before the run index was committed");
+        }
+    }
+    Ok(staged)
+}
+
+fn rollback_staged_prunes(staged: &[StagedPrune]) -> Result<()> {
+    for prune in staged.iter().rev() {
+        if prune.tombstone.exists() {
+            fs::rename(&prune.tombstone, &prune.original).with_context(|| {
+                format!(
+                    "Failed to restore retained run {} from {}",
+                    prune.original.display(),
+                    prune.tombstone.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_committed_prunes(abort: &impl Fn() -> bool) -> Result<()> {
+    let trash = prune_trash_path();
+    let entries = match fs::read_dir(&trash) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read prune trash {}", trash.display()));
+        }
+    };
+    for entry in entries {
+        if abort() {
+            bail!("publication aborted while cleaning committed retention tombstones");
+        }
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            remove_dir_all_cancellable(&path, abort)?;
+        } else {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove prune tombstone {}", path.display()))?;
+        }
+    }
+    if abort() {
+        bail!("publication aborted while cleaning committed retention tombstones");
+    }
+    match fs::remove_dir(&trash) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("Failed to remove empty prune trash"),
+    }
+    Ok(())
+}
+
+fn remove_dir_all_cancellable(path: &Path, abort: &impl Fn() -> bool) -> Result<()> {
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("Failed to read prune tombstone {}", path.display()))?
+    {
+        if abort() {
+            bail!("publication aborted while cleaning committed retention tombstones");
+        }
+        let entry = entry?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            remove_dir_all_cancellable(&child, abort)?;
+        } else {
+            fs::remove_file(&child).with_context(|| {
+                format!("Failed to remove prune tombstone file {}", child.display())
+            })?;
+        }
+    }
+    if abort() {
+        bail!("publication aborted while cleaning committed retention tombstones");
+    }
+    fs::remove_dir(path)
+        .with_context(|| format!("Failed to remove prune tombstone {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1709,7 +1858,7 @@ mod tests {
                 second,
                 false,
                 &tight_branch_policy(),
-                abort_on_check(3),
+                abort_on_check(4),
             )
             .expect_err("abort after save");
 
@@ -1726,6 +1875,49 @@ mod tests {
             assert!(
                 first_dir.is_dir(),
                 "predecessor evidence must not be deleted after a rolled-back save"
+            );
+        });
+    }
+
+    /// Cancellation after the predecessor has been staged but before the
+    /// index save restores its original path and leaves no prune tombstone.
+    #[test]
+    fn register_abort_during_prune_staging_restores_predecessor() {
+        with_prview_home(|home| {
+            let first = live_entry(home, "first");
+            let first_dir = first.path.clone();
+            super::register_and_prune_with_policy(
+                &first_dir,
+                first,
+                false,
+                &tight_branch_policy(),
+                abort_on_check(usize::MAX),
+            )
+            .expect("predecessor published");
+
+            let second = live_entry(home, "second");
+            let second_dir = second.path.clone();
+            super::register_and_prune_with_policy(
+                &second_dir,
+                second,
+                false,
+                &tight_branch_policy(),
+                abort_on_check(3),
+            )
+            .expect_err("abort after staging");
+
+            let ids: Vec<String> = RunIndex::load()
+                .entries()
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect();
+            assert_eq!(ids, vec!["first".to_owned()]);
+            assert!(first_dir.is_dir(), "staged predecessor must be restored");
+            assert!(second_dir.is_dir());
+            let trash = super::prune_trash_path();
+            assert!(
+                !trash.is_dir() || fs::read_dir(trash).unwrap().next().is_none(),
+                "rollback leaves no committed prune tombstone"
             );
         });
     }
@@ -1766,6 +1958,50 @@ mod tests {
                 "retention prune runs only after a committed index save"
             );
             assert!(second_dir.is_dir());
+            assert!(
+                super::prune_trash_path().is_dir(),
+                "physical deletion is deferred as a committed tombstone"
+            );
+
+            let third = live_entry(home, "third");
+            let third_dir = third.path.clone();
+            super::register_and_prune_with_policy(
+                &third_dir,
+                third,
+                false,
+                &RetentionPolicy {
+                    max_runs_per_branch: 10,
+                    max_runs_per_repo: 200,
+                    max_total_bytes: u64::MAX,
+                },
+                abort_on_check(usize::MAX),
+            )
+            .expect("next registration cleans committed tombstones");
+            assert!(
+                !super::prune_trash_path().exists(),
+                "committed tombstones are removed before the next index mutation"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_prune_cleanup_unlinks_symlink_without_following_target() {
+        use std::os::unix::fs::symlink;
+
+        with_prview_home(|home| {
+            let protected = home.join("protected");
+            fs::create_dir_all(&protected).unwrap();
+            fs::write(protected.join("evidence.txt"), "keep").unwrap();
+
+            let trash = super::prune_trash_path();
+            fs::create_dir_all(&trash).unwrap();
+            symlink(&protected, trash.join("prune-link")).unwrap();
+
+            super::cleanup_committed_prunes(&abort_on_check(usize::MAX))
+                .expect("cleanup unlinks tombstone symlink");
+            assert!(protected.join("evidence.txt").is_file());
+            assert!(!trash.exists());
         });
     }
 

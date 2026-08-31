@@ -60,9 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   success surfaces while still pointing `latest` and the index at the
   incomplete directory. If cancel is observed after `latest` is written, the
   previous completed alias is restored before the incomplete marker is left.
-  `register_and_prune` no longer deletes historical runs before the index
-  commit: a cancel mid-function rolls the index file back and leaves older
-  evidence on disk.
+  `register_and_prune` atomically stages retention candidates in private
+  prune-trash before the index commit: a cancel mid-transaction restores every
+  directory and the prior index. Physical deletion is deferred to the next
+  registration, before that run mutates its own index, and is cooperatively
+  cancellable.
+  If a custom output filesystem cannot be staged atomically, retention is
+  skipped with a warning while the new row and all predecessor rows are kept.
 - Repo-backed crate discovery follows workspace `members`/`exclude` (or the
   single root package). Fixture and tool `Cargo.toml` files are not product API.
 - `impl std::fmt::Display` (and other external/prelude traits) on a public type

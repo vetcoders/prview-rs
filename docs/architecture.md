@@ -1103,8 +1103,15 @@ and the interrupted stage. The `latest` symlink and the run-index row are
 written only after that last cancellation check. If Ctrl-C lands after `latest`
 is retargeted, the previous alias is restored. The index append itself is
 abortable: the file is saved only while the run is still active, rolled back if
-cancel arrives before older run directories are deleted, and prune of historical
-evidence runs only after that check. The run ends in `Cancelled` and exit `130`.
+cancel arrives before commit, and retention candidates are first moved
+atomically into `$PRVIEW_HOME/prune-trash`. A cancelled transaction restores
+those moves and the previous index. Committed tombstones are physically deleted
+at the start of the next registration, before that run mutates its index, using
+a cooperatively cancellable directory walk. This removes recursive deletion
+from the current publication's irreversible window. The run ends in `Cancelled`
+and exit `130`. If a custom output path cannot be renamed into prune-trash
+atomically (for example across filesystems), registration keeps the new and old
+index rows, emits a retention warning, and performs no destructive fallback.
 
 `--update` needs a gate of its own (`App::reuse_unchanged_run`), because it is
 the one path that returns a report without reaching any of the others: an

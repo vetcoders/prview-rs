@@ -455,7 +455,11 @@ A cancelled run writes `00_summary/INCOMPLETE.json` and does not update
 `latest` or the run index. If cancellation is observed after `latest` has
 already been retargeted, the previous completed run is restored. A cancel
 during index registration rolls the index file back and does not prune older
-runs.
+runs. Retention candidates are staged atomically in
+`$PRVIEW_HOME/prune-trash`; physical cleanup occurs before the next index
+registration and may therefore lag one completed run. If a custom output path
+cannot be staged atomically, prview keeps every index row and skips that prune
+with a warning.
 
 ```
 $HOME/.prview/runs/my-repo/feature-x/20260225-185357/
