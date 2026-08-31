@@ -79,8 +79,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field reorder under the default/`repr(Rust)` layout does not.
 - TUI/headless `git fetch` and `git archive | tar` register with the run
   governor, so q/Escape/Ctrl-C can stop the sync phase.
+- Raw-mode TUI Control-C is handled before wizard/panel routing, and async
+  command deadlines now include bounded stdout/stderr drain with reader-task
+  cleanup after the child is reaped.
+- Cold `uv sync` takes the run's Exclusive budget and inherits the configured
+  download/build/install concurrency cap.
 - Context commands share one stage timeout instead of minting a fresh deadline
   per Exclusive spawn.
+- A context command that reaches that deadline while still queued remains
+  `skipped` in the ledger instead of being claimed as a zero-duration run.
 - Same-run context dedup is `reused`, not `cached` with a null age. A live
   gate that already produced the signal is reuse; only a stored replay stays
   `cached` with the original entry's age. `RUN.json` `ledger.schema` is `2`.

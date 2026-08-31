@@ -612,10 +612,11 @@ pub(super) fn generate_context_artifacts(
 /// the entry is written.
 ///
 /// Timings join back to their command by label, which is unique within a plan.
-/// A command that never started (`spawn_failed`) is a `Skipped`, not a `Run` of
-/// zero seconds: nothing read the tree, and a zero-duration run would claim
-/// otherwise. A command that started and then failed, timed out or errored IS a
-/// run — the tool read the tree and the run paid for it.
+/// A command that never started (spawn failure, cancellation, or shared deadline
+/// while still queued) is a `Skipped`, not a `Run` of zero seconds: nothing read
+/// the tree, and a zero-duration run would claim otherwise. A command that
+/// started and then failed, timed out or errored IS a run — the tool read the
+/// tree and the run paid for it.
 fn record_context_runs(
     ledger: &TaskLedger,
     repo_root: &Path,
@@ -626,20 +627,29 @@ fn record_context_runs(
         let Some(cmd) = cmds.iter().find(|cmd| cmd.label == timing.label) else {
             continue;
         };
-        let state = match timing.status {
-            // Neither of these delivered an answer about the reviewed tree, so
-            // neither is a Run: one never started, the other was stopped.
-            "spawn_failed" => TaskState::Skipped {
-                reason: timing.reason.clone().unwrap_or_else(|| {
-                    format!("`{}` could not be spawned in the reviewed tree", cmd.cmd)
-                }),
-            },
-            "cancelled" => TaskState::Skipped {
-                reason: format!("`{}` did not run: the review was cancelled", cmd.cmd),
-            },
-            _ => TaskState::Run {
-                duration: std::time::Duration::from_secs_f32(timing.duration_secs),
-            },
+        let state = if !timing.started {
+            TaskState::Skipped {
+                reason: timing
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| format!("`{}` did not start in the reviewed tree", cmd.cmd)),
+            }
+        } else {
+            match timing.status {
+                // Neither of these delivered an answer about the reviewed tree, so
+                // neither is a Run: one never started, the other was stopped.
+                "spawn_failed" => TaskState::Skipped {
+                    reason: timing.reason.clone().unwrap_or_else(|| {
+                        format!("`{}` could not be spawned in the reviewed tree", cmd.cmd)
+                    }),
+                },
+                "cancelled" => TaskState::Skipped {
+                    reason: format!("`{}` did not run: the review was cancelled", cmd.cmd),
+                },
+                _ => TaskState::Run {
+                    duration: std::time::Duration::from_secs_f32(timing.duration_secs),
+                },
+            }
         };
         ledger.record(TaskEntry {
             // The command's own cwd, not the scan root: a cargo context command
@@ -1065,6 +1075,7 @@ fn run_context_cmds_parallel_after_spawn(
                         label: cmd.label.clone(),
                         artifact: None,
                         status: "spawn_failed",
+                        started: false,
                         duration_secs: 0.0,
                         reason: Some(format!(
                             "{}: could not create stdout capture {}: {error}",
@@ -1083,6 +1094,7 @@ fn run_context_cmds_parallel_after_spawn(
                         label: cmd.label.clone(),
                         artifact: None,
                         status: "spawn_failed",
+                        started: false,
                         duration_secs: 0.0,
                         reason: Some(format!(
                             "{}: could not create stderr capture {}: {error}",
@@ -1126,6 +1138,7 @@ fn run_context_cmds_parallel_after_spawn(
                             label: cmd.label.clone(),
                             artifact: None,
                             status: "cancelled",
+                            started: true,
                             duration_secs: started_at.elapsed().as_secs_f32(),
                             reason: Some(format!(
                                 "{} was refused during late registration because the review was cancelled",
@@ -1157,6 +1170,7 @@ fn run_context_cmds_parallel_after_spawn(
                         label: cmd.label.clone(),
                         artifact: None,
                         status: "spawn_failed",
+                        started: false,
                         duration_secs: 0.0,
                         reason: Some(format!("{}: spawn failed: {error}", command_identity(cmd))),
                     });
@@ -1172,6 +1186,7 @@ fn run_context_cmds_parallel_after_spawn(
                     label: cmd.label.clone(),
                     artifact: None,
                     status: "cancelled",
+                    started: false,
                     duration_secs: 0.0,
                     reason: Some(format!(
                         "{} did not start because the review was cancelled",
@@ -1185,6 +1200,7 @@ fn run_context_cmds_parallel_after_spawn(
                     label: cmd.label.clone(),
                     artifact: None,
                     status: "timed_out",
+                    started: false,
                     duration_secs: 0.0,
                     reason: Some(format!(
                         "{} did not start because the shared context-stage timeout elapsed",
@@ -1230,6 +1246,7 @@ fn run_context_cmds_parallel_after_spawn(
                         } else {
                             "failed"
                         },
+                        started: true,
                         duration_secs: r.started_at.elapsed().as_secs_f32(),
                         reason: None,
                     });
@@ -1252,6 +1269,7 @@ fn run_context_cmds_parallel_after_spawn(
                                     .to_string()
                             }),
                             status: "timed_out",
+                            started: true,
                             duration_secs: r.started_at.elapsed().as_secs_f32(),
                             reason: Some(format!("exceeded {timeout_secs}s context timeout")),
                         });
@@ -1278,6 +1296,7 @@ fn run_context_cmds_parallel_after_spawn(
                                 .to_string()
                         }),
                         status: "error",
+                        started: true,
                         duration_secs: r.started_at.elapsed().as_secs_f32(),
                         reason: Some("failed to query child exit status".to_string()),
                     });
@@ -2245,6 +2264,31 @@ mod tests {
             timings.iter().all(|t| t.status == "timed_out"),
             "got {:?}",
             timings.iter().map(|t| t.status).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            timings.iter().filter(|timing| timing.started).count(),
+            1,
+            "only the admitted command executed; the second expired in queue"
+        );
+
+        let ledger = TaskLedger::new();
+        super::record_context_runs(&ledger, tmp.path(), &cmds, &timings);
+        assert_eq!(
+            ledger
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry.state, TaskState::Run { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            ledger
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry.state, TaskState::Skipped { .. }))
+                .count(),
+            1,
+            "a stage deadline reached before spawn is skipped, not executed"
         );
     }
 

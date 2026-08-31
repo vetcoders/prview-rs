@@ -867,6 +867,12 @@ consumer that ignores `ledger` cannot tell the section exists. That is why the
 pack's `schema_version` does not move (the precedent `CheckProvenance` set) and
 why the view versions itself instead.
 
+The context runtime also retains an internal admission fact. Two commands may
+both display `timed_out` in the stable `context_commands[]` contract, but only
+the one that actually spawned becomes ledger lifecycle `run`; a command whose
+shared stage deadline expired while it was still queued becomes `skipped` with
+the explicit pre-spawn reason.
+
 #### One tool, one execution per run
 
 The artifact stage reads the entries back through `TaskLedger::lookup_tool`,
@@ -997,6 +1003,12 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
   same registry lock: a process spawned after the drain is refused (`false`) and
   its process group is killed immediately instead of being inserted too late.
   Callers must `unregister_child` on exit for the same pid-reuse reason.
+- **The command deadline includes output drain.** Async children are reaped,
+  residual Unix process-group members are terminated, and the registry guard is
+  dropped before buffered stdout/stderr are drained. Reader tasks share the
+  command's original deadline and are aborted *and awaited* on every terminal
+  error, so a background descendant holding a pipe cannot turn a bounded check
+  into an unbounded join.
 
 Zero new dependencies: the budget is `tokio::sync::Semaphore::acquire_many_owned`
 and the signal is `tokio::sync::watch`, both already in the graph.
@@ -1147,12 +1159,15 @@ is idle ends it too.
 pre-step was not, and outside a scope `register_active_child` is a no-op, so
 `cancel()` had no pid to signal: a Ctrl-C during a cold venv build printed
 "stopping running tools" and then waited out the full timeout with `uv` still
-running. It is scoped now, and refuses to start on an already-cancelled run. The
+running. It is scoped now, takes an `Exclusive` permit, passes the run's worker
+limit to uv's download/build/install pools, and refuses to start on an
+already-cancelled run. The
 heuristics stage needs no scope — it spawns no processes; loctree runs in-process
 behind `spawn_blocking`.
 
 `--tui` is deliberately NOT wrapped: it puts the terminal in raw mode, so Ctrl-C
-arrives as a key event and the TUI owns its own quit path. Its dispatcher is
+arrives as a Control-C key event and the TUI routes it through the same
+cancel-and-join path as q/Escape before wizard or panel handling. Its dispatcher is
 nevertheless held to the same contract as the headless one — same
 `presync_python_venv`, same biased `governor.cancelled()` arm — because it was a
 copy that had drifted back into both of the bugs above while still claiming to

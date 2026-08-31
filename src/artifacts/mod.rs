@@ -117,6 +117,9 @@ struct ContextCommandTiming {
     label: String,
     artifact: Option<String>,
     status: &'static str,
+    /// Runtime truth used by the ledger. Kept internal so the established
+    /// `context_commands[]` wire contract does not grow a second lifecycle.
+    started: bool,
     duration_secs: f32,
     /// Exact pre-spawn/wait failure when no artifact can carry stderr.
     reason: Option<String>,

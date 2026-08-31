@@ -4,7 +4,7 @@
 
 use crate::cache::Cache;
 use crate::config::{Config, ProfileKind};
-use crate::governor::{Cancelled, ResourceGovernor};
+use crate::governor::{Cancelled, ResourceGovernor, Weight};
 use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -919,6 +919,12 @@ async fn presync_python_venv(
         return Err(Cancelled);
     }
 
+    // A cold environment may compile several source distributions. Admit it as
+    // Exclusive before spawning, and pass the same descendant cap the run
+    // advertises to uv's download/build/install pools.
+    let _budget = governor.acquire(Weight::Exclusive).await?;
+    let uv_env = uv_concurrency_env(governor.worker_limit());
+
     if emit {
         print!("  {} Syncing Python venv...", "●".blue());
         let _ = std::io::stdout().flush();
@@ -927,11 +933,12 @@ async fn presync_python_venv(
     let outcome = crate::governor::with_child_scope(
         Arc::clone(governor),
         "uv sync",
-        run_command_with_timeout(
+        run_command_with_timeout_and_env(
             "uv",
             &["sync", "--quiet"],
             &config.repo_root,
             CHECK_TIMEOUT_SECS,
+            &uv_env,
         ),
     )
     .await;
@@ -967,6 +974,18 @@ async fn presync_python_venv(
         return Err(Cancelled);
     }
     Ok(())
+}
+
+fn uv_concurrency_env(worker_limit: u32) -> Vec<(String, String)> {
+    let limit = worker_limit.max(1).to_string();
+    [
+        "UV_CONCURRENT_DOWNLOADS",
+        "UV_CONCURRENT_BUILDS",
+        "UV_CONCURRENT_INSTALLS",
+    ]
+    .into_iter()
+    .map(|key| (key.to_owned(), limit.clone()))
+    .collect()
 }
 
 /// Callback type for check events (used by TUI)
@@ -2706,6 +2725,41 @@ mod tests {
             Err(Cancelled),
             "a cancelled run must not begin building a venv it will never use",
         );
+    }
+
+    #[test]
+    fn uv_sync_inherits_the_run_descendant_cap() {
+        assert_eq!(
+            uv_concurrency_env(2),
+            vec![
+                ("UV_CONCURRENT_DOWNLOADS".to_string(), "2".to_string()),
+                ("UV_CONCURRENT_BUILDS".to_string(), "2".to_string()),
+                ("UV_CONCURRENT_INSTALLS".to_string(), "2".to_string()),
+            ]
+        );
+        assert!(
+            uv_concurrency_env(0).iter().all(|(_, value)| value == "1"),
+            "invalid zero plans still produce uv's required non-zero cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_venv_build_does_not_spawn_while_exclusive_budget_is_held() {
+        let config = rust_config(true, true, true);
+        let governor = Arc::new(ResourceGovernor::with_budget(1, 1));
+        let _held = governor
+            .acquire(Weight::Exclusive)
+            .await
+            .expect("hold the only permit");
+        let waiting = presync_python_venv(&config, &governor, false);
+        tokio::pin!(waiting);
+
+        tokio::select! {
+            result = &mut waiting => panic!("uv presync bypassed admission: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        governor.cancel();
+        assert_eq!(waiting.await, Err(Cancelled));
     }
 
     #[test]

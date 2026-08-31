@@ -146,12 +146,12 @@ pub fn spawn_wait_governed(
 /// concurrently (a high-output child cannot deadlock on a full pipe buffer),
 /// and enforce `timeout`.
 ///
-/// On timeout the wait-future is dropped (so `kill_on_drop` reaps the direct
-/// child) and, on unix, the whole process group is SIGKILLed so grandchildren
-/// die too; the returned error is `on_timeout()`. The child handle is kept until
-/// after that tree kill, so `kill_on_drop` cannot reap the root first and leave
-/// Windows grandchildren orphaned. `label` names the tool in the spawn/wait
-/// error messages.
+/// One deadline covers child wait and pipe drain. On timeout the whole process
+/// tree is terminated, the root is reaped, and both reader tasks are aborted
+/// and awaited before `on_timeout()` is returned. On Unix, a successful wrapper
+/// exit also terminates residual group members before the registration guard is
+/// dropped, so a background descendant cannot keep inherited pipes alive.
+/// `label` names the tool in spawn/wait errors.
 ///
 /// This is the one place a check's external tool is spawned, so it is also where
 /// the pid is handed to the run's resource governor
@@ -178,6 +178,11 @@ async fn run_capture_with_timeout_after_spawn(
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    // One deadline owns the complete command lifecycle. A child that exits
+    // while a descendant keeps an inherited pipe open must not turn a 5-minute
+    // command timeout into an unbounded output-drain wait.
+    let deadline = tokio::time::Instant::now() + timeout;
+
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {label}: {e}"))?;
@@ -191,18 +196,18 @@ async fn run_capture_with_timeout_after_spawn(
 
     // Held for the whole wait: dropping it unregisters, so the success, timeout
     // and wait-error paths all leave the registry clean without saying so.
-    let _registration = child.id().and_then(crate::governor::register_active_child);
+    let registration = child.id().and_then(crate::governor::register_active_child);
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let stdout_task = tokio::spawn(async move {
+    let mut stdout_task = tokio::spawn(async move {
         let mut buf = Vec::new();
         if let Some(mut pipe) = stdout_pipe {
             let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
         }
         buf
     });
-    let stderr_task = tokio::spawn(async move {
+    let mut stderr_task = tokio::spawn(async move {
         let mut buf = Vec::new();
         if let Some(mut pipe) = stderr_pipe {
             let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
@@ -210,19 +215,49 @@ async fn run_capture_with_timeout_after_spawn(
         buf
     });
 
-    match tokio::time::timeout(timeout, child.wait()).await {
+    match tokio::time::timeout_at(deadline, child.wait()).await {
         Ok(Ok(status)) => {
-            let stdout = stdout_task.await.unwrap_or_else(|_| Vec::new());
-            let stderr = stderr_task.await.unwrap_or_else(|_| Vec::new());
-            Ok(std::process::Output {
-                status,
-                stdout,
-                stderr,
+            // On Unix the pgid remains owned while any descendant exists even
+            // after the root has been reaped. Kill those stragglers before
+            // dropping registration so inherited pipes close deterministically.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                sigkill_process_group(pid);
+            }
+            // The direct child is reaped. Keeping its pid registered while
+            // draining buffered output risks signalling a later pid reuse.
+            drop(registration);
+
+            let drained = tokio::time::timeout_at(deadline, async {
+                let stdout = (&mut stdout_task).await.unwrap_or_else(|_| Vec::new());
+                let stderr = (&mut stderr_task).await.unwrap_or_else(|_| Vec::new());
+                (stdout, stderr)
             })
+            .await;
+            match drained {
+                Ok((stdout, stderr)) => Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                }),
+                Err(_) => {
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                    Err(on_timeout())
+                }
+            }
         }
         Ok(Err(e)) => {
+            if let Some(pid) = pid {
+                terminate_process_tree(pid);
+            }
+            drop(registration);
             stdout_task.abort();
             stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
             Err(anyhow::anyhow!("failed to run {label}: {e}"))
         }
         Err(_) => {
@@ -231,8 +266,11 @@ async fn run_capture_with_timeout_after_spawn(
             }
             let _ = child.kill().await;
             let _ = child.wait().await;
+            drop(registration);
             stdout_task.abort();
             stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
             Err(on_timeout())
         }
     }
@@ -476,6 +514,38 @@ mod tests {
         let grandchild: i32 = s.trim().parse().expect("grandchild pid");
 
         assert_grandchild_reaped(grandchild).await;
+    }
+
+    /// A wrapper can exit successfully while a background descendant keeps its
+    /// inherited stdout/stderr pipes open. The command deadline owns that drain
+    /// too, and the descendant must not survive a success-shaped root exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_root_exit_reaps_pipe_holding_descendants() {
+        use std::io::Read;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("background.pid");
+        let script = format!("sleep 30 & echo $! > {}", pidfile.display());
+        let mut cmd = TokioCommand::new("sh");
+        cmd.arg("-c").arg(script);
+
+        let started = std::time::Instant::now();
+        let output =
+            run_capture_with_timeout(cmd, Duration::from_secs(2), "background-pipe-tree", || {
+                anyhow::anyhow!("background pipe drain timed out")
+            })
+            .await
+            .expect("successful root exit must close descendant-held pipes");
+        assert!(output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let mut pid = String::new();
+        std::fs::File::open(&pidfile)
+            .expect("shell records background pid before exit")
+            .read_to_string(&mut pid)
+            .expect("read background pid");
+        assert_grandchild_reaped(pid.trim().parse().expect("background pid")).await;
     }
 
     /// Deterministic version of the spawn/register race: cancellation drains

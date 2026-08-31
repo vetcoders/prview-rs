@@ -12,6 +12,14 @@ pub async fn handle_key(
     key: KeyEvent,
     _tx: &mpsc::UnboundedSender<TuiEvent>,
 ) -> Result<()> {
+    // Raw terminal mode delivers Ctrl-C as a key event rather than a SIGINT.
+    // It must outrank wizard/help/panel routing: otherwise a running analysis
+    // keeps Cargo/Node alive and the `c` may even be typed into a branch filter.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        state.should_quit = true;
+        return Ok(());
+    }
+
     // Wizard mode takes priority
     if state.wizard_mode != WizardMode::None {
         handle_wizard_keys(state, key);
@@ -717,6 +725,20 @@ mod tests {
             .await
             .unwrap();
         assert!(state.should_quit);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_quits_before_wizard_or_panel_routing() {
+        let config = create_test_config();
+        let mut state = TuiState::new(config);
+        state.start_target_wizard();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        handle_key(&mut state, ctrl_c, &tx).await.unwrap();
+
+        assert!(state.should_quit);
+        assert!(state.branch_selector.filter.is_empty());
     }
 
     #[tokio::test]

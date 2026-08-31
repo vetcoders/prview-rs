@@ -591,7 +591,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn tui_quit_cancels_joins_and_reaps_a_real_process_tree() {
+    async fn tui_ctrl_c_cancels_joins_and_reaps_a_real_process_tree() {
         use std::io::Read;
         use std::os::unix::process::CommandExt;
 
@@ -637,8 +637,8 @@ mod tests {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         input_tx
             .send(Event::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('q'),
-                crossterm::event::KeyModifiers::NONE,
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL,
             )))
             .expect("inject quit key");
 
