@@ -98,7 +98,7 @@ fn assert_cancelled_pack_is_not_published(output_dir: &Path, seam: ArtifactGener
 
 #[test]
 fn cancellation_injection_stops_every_artifact_generation_seam() {
-    assert_eq!(ArtifactGenerationSeam::ALL.len(), 19);
+    assert_eq!(ArtifactGenerationSeam::ALL.len(), 21);
     let unique_labels: std::collections::HashSet<_> = ArtifactGenerationSeam::ALL
         .iter()
         .map(|seam| seam.label())
@@ -197,14 +197,60 @@ fn cancellation_at_publication_preserves_existing_latest() {
 }
 
 #[test]
+fn cancellation_after_latest_symlink_restores_predecessor() {
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let first = output.path().join("first");
+    let governor = crate::governor::ResourceGovernor::new();
+    generate_fixture_pack(repo.path(), &first, &target_sha, &base_sha, &governor)
+        .expect("completed predecessor pack");
+
+    #[cfg(unix)]
+    {
+        let latest = output.path().join("latest");
+        assert_eq!(
+            fs::read_link(&latest).expect("predecessor latest"),
+            first.file_name().expect("first basename")
+        );
+    }
+
+    let second = output.path().join("second");
+    let cancel_governor = crate::governor::ResourceGovernor::new();
+    let probe = generation_seam_test_hook::ProbeGuard::install(Some(
+        ArtifactGenerationSeam::LatestAdvertisement,
+    ));
+    generate_fixture_pack(
+        repo.path(),
+        &second,
+        &target_sha,
+        &base_sha,
+        &cancel_governor,
+    )
+    .expect_err("latest advertisement seam must restore the predecessor alias");
+    drop(probe);
+
+    #[cfg(unix)]
+    {
+        let latest = output.path().join("latest");
+        assert_eq!(
+            fs::read_link(&latest).expect("restored latest"),
+            first.file_name().expect("first basename"),
+            "cancel after writing latest must restore the predecessor, not leave the incomplete pack advertised"
+        );
+    }
+    assert_cancelled_pack_is_not_published(&second, ArtifactGenerationSeam::LatestAdvertisement);
+}
+
+#[test]
 fn artifact_generation_registry_is_exact_and_success_path_reaches_every_seam() {
     let expected = ArtifactGenerationSeam::ALL;
+    let last = expected.len() - 1;
     let mut duplicate = expected;
-    duplicate[18] = duplicate[17];
+    duplicate[last] = duplicate[last - 1];
     let mut reordered = expected;
     reordered.swap(8, 9);
     assert_ne!(
-        &expected[..18],
+        &expected[..last],
         expected.as_slice(),
         "missing seam accepted"
     );
@@ -1459,6 +1505,13 @@ fn run_json_records_the_task_ledger() {
     );
     record(
         "ESLint",
+        TaskKind::ContextArtifact,
+        TaskState::Reused {
+            origin: substrate.clone(),
+        },
+    );
+    record(
+        "ESLint",
         TaskKind::Check,
         TaskState::Skipped {
             reason: "fast remote-only preset".to_string(),
@@ -1498,10 +1551,10 @@ fn run_json_records_the_task_ledger() {
         Some("1.0"),
         "an additive view must not move the pack's schema version",
     );
-    assert_eq!(run["ledger"]["schema"].as_u64(), Some(1));
+    assert_eq!(run["ledger"]["schema"].as_u64(), Some(2));
 
     let entries = run["ledger"]["entries"].as_array().expect("ledger entries");
-    assert_eq!(entries.len(), 4);
+    assert_eq!(entries.len(), 5);
 
     assert_eq!(entries[0]["tool"].as_str(), Some("tsc"));
     assert_eq!(entries[0]["kind"].as_str(), Some("check"));
@@ -1529,18 +1582,101 @@ fn run_json_records_the_task_ledger() {
     );
 
     assert_eq!(entries[2]["tool"].as_str(), Some("eslint"));
-    assert_eq!(entries[2]["lifecycle"].as_str(), Some("skipped"));
+    assert_eq!(entries[2]["kind"].as_str(), Some("context_artifact"));
+    assert_eq!(entries[2]["lifecycle"].as_str(), Some("reused"));
     assert_eq!(
-        entries[2]["reason"].as_str(),
+        entries[2]["origin"],
+        serde_json::json!({"target_sha": "abc1234", "tree_state": "snapshot"}),
+        "reuse names the live gate's substrate, not a stored cache entry",
+    );
+    assert!(entries[2].get("cache_age_secs").is_none());
+    assert!(entries[2].get("reason").is_none());
+
+    assert_eq!(entries[3]["tool"].as_str(), Some("eslint"));
+    assert_eq!(entries[3]["lifecycle"].as_str(), Some("skipped"));
+    assert_eq!(
+        entries[3]["reason"].as_str(),
         Some("fast remote-only preset")
     );
 
     assert_eq!(
-        entries[3]["tool"].as_str(),
+        entries[4]["tool"].as_str(),
         Some("cargo_tree"),
         "a command with no gate counterpart is slugged from its own label",
     );
-    assert_eq!(entries[3]["lifecycle"].as_str(), Some("not_applicable"));
+    assert_eq!(entries[4]["lifecycle"].as_str(), Some("not_applicable"));
+}
+
+/// The ledger already records queued_at vs started_at; the wire view must
+/// keep that gap so a slow tool is distinguishable from a long resource wait.
+#[test]
+fn run_json_emits_queue_wait_when_admission_lagged() {
+    use crate::checks::TreeState;
+    use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
+
+    let config = create_test_config(PolicyConfig::default());
+    let resolved_target = ResolvedRef {
+        name: "feature/queue-wait".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let resolved_bases = vec![ResolvedRef {
+        name: "origin/main".to_string(),
+        commit_id: "def5678def5678def5678def5678def5678de".to_string(),
+        is_remote: true,
+    }];
+    let substrate = SubstrateKey {
+        target_sha: Some("abc1234".to_string()),
+        tree_state: Some(TreeState::Snapshot),
+    };
+    let started = std::time::Instant::now();
+    let queued = started
+        .checked_sub(Duration::from_secs(12))
+        .expect("monotonic clock can subtract 12s");
+    let ledger = TaskLedger::new();
+    ledger.record(TaskEntry {
+        key: TaskKey::new("Clippy", substrate),
+        kind: TaskKind::Check,
+        state: TaskState::Run {
+            duration: Duration::from_secs(3),
+        },
+        queued_at: Some(queued),
+        started_at: Some(started),
+    });
+
+    let summary_dir = tempfile::tempdir().expect("summary tempdir");
+    generate_run_json_test!(
+        summary_dir.path(),
+        summary_dir.path(),
+        &config,
+        &[],
+        None,
+        &resolved_target,
+        &resolved_bases,
+        ("2026-03-08T12:00:00Z", 1.5),
+        &[],
+        &[],
+        &[],
+        None,
+        &ledger,
+    )
+    .expect("run json");
+
+    let raw = std::fs::read_to_string(summary_dir.path().join("RUN.json")).expect("read run json");
+    let run: serde_json::Value = serde_json::from_str(&raw).expect("parse run json");
+    let entries = run["ledger"]["entries"].as_array().expect("ledger entries");
+    assert_eq!(entries.len(), 1);
+    let wait = entries[0]["queue_wait_secs"]
+        .as_f64()
+        .expect("queue wait is serialized");
+    assert!(
+        (wait - 12.0).abs() < 0.05,
+        "queue wait is started_at − queued_at in seconds, got {wait}"
+    );
+    assert!(
+        entries[0].get("queued_at").is_none() && entries[0].get("started_at").is_none(),
+        "absolute Instants are not part of the wire contract"
+    );
 }
 
 /// A skip is decided before the run can know which tree it will read. By the
@@ -1632,7 +1768,7 @@ fn run_json_ledger_view_is_always_present() {
 
     let raw = std::fs::read_to_string(summary_dir.path().join("RUN.json")).expect("read run json");
     let run: serde_json::Value = serde_json::from_str(&raw).expect("parse run json");
-    assert_eq!(run["ledger"]["schema"].as_u64(), Some(1));
+    assert_eq!(run["ledger"]["schema"].as_u64(), Some(2));
     assert_eq!(
         run["ledger"]["entries"].as_array().map(Vec::len),
         Some(0),

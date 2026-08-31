@@ -2275,6 +2275,47 @@ mod tests {
     }
 
     #[test]
+    fn repository_backed_trait_impl_binder_rename_is_not_unknown_delta() {
+        let renamed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Marker<T> {}\npub struct Wrapper<T>(pub T);\nimpl<T> Marker<T> for Wrapper<T> {}\n",
+                "pub trait Marker<T> {}\npub struct Wrapper<T>(pub T);\nimpl<U> Marker<U> for Wrapper<U> {}\n",
+            ),
+        ]);
+        assert!(
+            renamed.findings().is_empty(),
+            "renaming an impl-level binder is caller-equivalent, got {:?}",
+            renamed.findings()
+        );
+
+        let retargeted = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Marker<T> {}\npub struct Wrapper<T>(pub T);\nimpl Marker<u8> for Wrapper<u8> {}\n",
+                "pub trait Marker<T> {}\npub struct Wrapper<T>(pub T);\nimpl Marker<u16> for Wrapper<u16> {}\n",
+            ),
+        ]);
+        assert!(
+            retargeted
+                .unknown
+                .iter()
+                .any(|finding| { finding.identity.name == "TraitImplResolution" }),
+            "changing the impl's observable type arguments must keep TraitImplResolution active"
+        );
+    }
+
+    #[test]
     fn repository_backed_public_reexport_retarget_is_changed() {
         let delta = repository_delta(&[
             (

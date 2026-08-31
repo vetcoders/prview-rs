@@ -3340,14 +3340,37 @@ fn normalized_associated_contract(
 fn normalized_trait_impl_contract(item_impl: &syn::ItemImpl) -> String {
     let mut item_impl = item_impl.clone();
     normalize_attrs(&mut item_impl.attrs, true);
+    let mut normalizer = SignatureAlphaNormalizer::default();
+    normalizer.push_generics(&item_impl.generics);
+    item_impl.generics = normalizer.fold_generics(item_impl.generics);
+    trim_generics_punctuation(&mut item_impl.generics);
+    item_impl.self_ty = Box::new(normalizer.fold_type(*item_impl.self_ty));
+    if let Some((not, trait_path, for_token)) = item_impl.trait_.take() {
+        item_impl.trait_ = Some((not, normalizer.fold_path(trait_path), for_token));
+    }
     for item in &mut item_impl.items {
-        if let syn::ImplItem::Fn(function) = item {
-            normalize_attrs(&mut function.attrs, false);
-            function.block = syn::parse_quote!({});
-            alpha_normalize_signature(&mut function.sig);
-            trim_signature_punctuation(&mut function.sig);
+        match item {
+            syn::ImplItem::Fn(function) => {
+                normalize_attrs(&mut function.attrs, false);
+                function.block = syn::parse_quote!({});
+                normalizer.normalize_signature(&mut function.sig);
+                trim_signature_punctuation(&mut function.sig);
+            }
+            syn::ImplItem::Const(value) => {
+                normalize_attrs(&mut value.attrs, false);
+                value.ty = normalizer.fold_type(value.ty.clone());
+            }
+            syn::ImplItem::Type(alias) => {
+                normalize_attrs(&mut alias.attrs, false);
+                alias.generics = normalizer.fold_generics(alias.generics.clone());
+                trim_generics_punctuation(&mut alias.generics);
+                alias.ty = normalizer.fold_type(alias.ty.clone());
+            }
+            syn::ImplItem::Macro(value) => normalize_attrs(&mut value.attrs, false),
+            _ => {}
         }
     }
+    normalizer.pop_scope();
     canonical_tokens(CanonicalFold.fold_item_impl(item_impl).to_token_stream())
 }
 

@@ -59,6 +59,45 @@ pub(super) fn create_latest_symlink(_out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Basename currently advertised by the parent `latest` symlink, if any.
+#[cfg(unix)]
+pub(super) fn peek_latest_target(out_dir: &Path) -> Option<std::ffi::OsString> {
+    let parent = out_dir.parent()?;
+    fs::read_link(parent.join("latest"))
+        .ok()
+        .map(|target| target.into_os_string())
+}
+
+#[cfg(not(unix))]
+pub(super) fn peek_latest_target(_out_dir: &Path) -> Option<std::ffi::OsString> {
+    None
+}
+
+/// Put `latest` back to `previous`, or remove it when this run created the alias.
+#[cfg(unix)]
+pub(super) fn restore_latest_symlink(
+    out_dir: &Path,
+    previous: Option<&std::ffi::OsStr>,
+) -> Result<()> {
+    let Some(parent) = out_dir.parent() else {
+        return Ok(());
+    };
+    let latest_link = parent.join("latest");
+    let _ = fs::remove_file(&latest_link);
+    if let Some(name) = previous {
+        std::os::unix::fs::symlink(name, &latest_link)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(super) fn restore_latest_symlink(
+    _out_dir: &Path,
+    _previous: Option<&std::ffi::OsStr>,
+) -> Result<()> {
+    Ok(())
+}
+
 /// Generate changed-tests.txt listing test files touched by this diff
 pub(super) fn generate_changed_tests(diffs: &[Diff], dir: &Path) -> Result<()> {
     let mut test_files: Vec<String> = Vec::new();

@@ -24,11 +24,16 @@ fn context_substrate(check_name: &str, scan_root: &Path, repo_root: &Path) -> Su
 
 /// What the checks stage already resolved for a tool the context stage is about
 /// to run itself.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum GateCoverage {
-    /// A gate for this tool executed, or replayed a stored result, on this
-    /// substrate. The signal exists; running the tool again buys nothing.
-    Covered { origin: SubstrateKey },
+    /// A gate for this tool executed in this run on this substrate.
+    CoveredLive { origin: SubstrateKey },
+    /// A gate for this tool replayed a stored result. `origin` is the tree the
+    /// ORIGINAL execution read; `cache_age_secs` is how old that entry was.
+    CoveredCached {
+        origin: SubstrateKey,
+        cache_age_secs: Option<u64>,
+    },
     /// A gate for this tool was configured and deliberately ruled out — a preset
     /// that excludes it, a disabled flag, a tool the environment lacks. The
     /// missing signal is a decision, not a gap.
@@ -36,6 +41,26 @@ enum GateCoverage {
     /// This run holds no gate for the tool at all, so nothing was decided about
     /// it and the context artifact is the only place its signal can come from.
     Uncovered,
+}
+
+impl GateCoverage {
+    fn is_covered(&self) -> bool {
+        matches!(self, Self::CoveredLive { .. } | Self::CoveredCached { .. })
+    }
+
+    fn into_context_state(self) -> Option<TaskState> {
+        match self {
+            Self::CoveredLive { origin } => Some(TaskState::Reused { origin }),
+            Self::CoveredCached {
+                origin,
+                cache_age_secs,
+            } => Some(TaskState::Cached {
+                cache_age_secs,
+                origin,
+            }),
+            Self::RuledOut { .. } | Self::Uncovered => None,
+        }
+    }
 }
 
 fn gate_coverage(ledger: &TaskLedger, check_name: &str, substrate: &SubstrateKey) -> GateCoverage {
@@ -46,10 +71,17 @@ fn gate_coverage(ledger: &TaskLedger, check_name: &str, substrate: &SubstrateKey
         // A gate that executed paid the cost already, whatever it concluded:
         // a failing or erroring run is still a run, and repeating it here would
         // buy the same answer twice.
-        TaskState::Run { .. } => GateCoverage::Covered {
+        TaskState::Run { .. } => GateCoverage::CoveredLive {
             origin: entry.key.substrate,
         },
-        TaskState::Cached { origin, .. } => GateCoverage::Covered { origin },
+        TaskState::Reused { origin } => GateCoverage::CoveredLive { origin },
+        TaskState::Cached {
+            origin,
+            cache_age_secs,
+        } => GateCoverage::CoveredCached {
+            origin,
+            cache_age_secs,
+        },
         TaskState::Skipped { reason } | TaskState::NotApplicable { reason } => {
             GateCoverage::RuledOut { reason }
         }
@@ -85,23 +117,27 @@ fn plan_context_tool(
     substrate: &SubstrateKey,
     runnable: bool,
 ) -> ContextToolPlan {
-    let state = match gate_coverage(ledger, check_name, substrate) {
-        GateCoverage::Covered { origin } => TaskState::Cached {
-            cache_age_secs: None,
-            origin,
-        },
-        GateCoverage::RuledOut { reason } if runnable => TaskState::Skipped { reason },
-        GateCoverage::RuledOut { reason } => TaskState::NotApplicable { reason },
-        GateCoverage::Uncovered if runnable => return ContextToolPlan::Run,
-        GateCoverage::Uncovered => TaskState::NotApplicable {
-            reason: format!(
-                "no {check_name} gate in this run and no runnable tool in the reviewed tree"
-            ),
-        },
+    let coverage = gate_coverage(ledger, check_name, substrate);
+    let state = if let Some(state) = coverage.clone().into_context_state() {
+        state
+    } else {
+        match coverage {
+            GateCoverage::RuledOut { reason } if runnable => TaskState::Skipped { reason },
+            GateCoverage::RuledOut { reason } => TaskState::NotApplicable { reason },
+            GateCoverage::Uncovered if runnable => return ContextToolPlan::Run,
+            GateCoverage::Uncovered => TaskState::NotApplicable {
+                reason: format!(
+                    "no {check_name} gate in this run and no runnable tool in the reviewed tree"
+                ),
+            },
+            GateCoverage::CoveredLive { .. } | GateCoverage::CoveredCached { .. } => {
+                unreachable!("covered coverage always has a context state")
+            }
+        }
     };
 
     let reason = match &state {
-        TaskState::Cached { .. } => {
+        TaskState::Cached { .. } | TaskState::Reused { .. } => {
             format!("the {check_name} gate already produced this signal for the reviewed tree")
         }
         TaskState::Skipped { reason } | TaskState::NotApplicable { reason } => reason.clone(),
@@ -194,18 +230,10 @@ pub(super) fn plan_tsc_trace_artifact(
         // buys something the first did not.
         let substrate = context_substrate("TypeScript", scan_root, &config.repo_root);
         if resolution_failure.is_none()
-            && let GateCoverage::Covered { origin } =
-                gate_coverage(ledger, "TypeScript", &substrate)
+            && let Some(state) =
+                gate_coverage(ledger, "TypeScript", &substrate).into_context_state()
         {
-            record_context_decision(
-                ledger,
-                "TypeScript",
-                &substrate,
-                TaskState::Cached {
-                    cache_age_secs: None,
-                    origin,
-                },
-            );
+            record_context_decision(ledger, "TypeScript", &substrate, state);
             return ContextArtifactDecision {
                 key: "tsc_trace",
                 path: "30_context/tsc-trace.log",
@@ -866,14 +894,13 @@ fn plan_context_cmds(
         // results come from the gate or not at all. There is no command to plan
         // and so no decision to record — only a note when the gate did not
         // deliver them.
-        if !matches!(
-            gate_coverage(
-                ledger,
-                "Vitest",
-                &context_substrate("Vitest", &scan_root, &config.repo_root),
-            ),
-            GateCoverage::Covered { .. }
-        ) {
+        if !gate_coverage(
+            ledger,
+            "Vitest",
+            &context_substrate("Vitest", &scan_root, &config.repo_root),
+        )
+        .is_covered()
+        {
             announce_skip(
                 emit_human_stdout,
                 "vitest-report.json",
@@ -1658,11 +1685,45 @@ mod tests {
         let entry = context_entry(&ledger, "ESLint", repo.path());
         assert_eq!(
             entry.state,
+            TaskState::Reused { origin: substrate },
+            "same-run coverage is reuse, not a cache replay",
+        );
+    }
+
+    /// A cache replay is still a replay: the context row must keep `cached` and
+    /// the age of the stored entry, not pretend the same-run gate just ran.
+    #[test]
+    fn a_gate_that_replayed_cache_stays_cached() {
+        let (repo, _target) = js_repo_with_off_head_target();
+        let config = js_config(repo.path());
+        let ctx = tempfile::tempdir().expect("context dir");
+
+        let origin = SubstrateKey {
+            target_sha: Some("older".to_string()),
+            tree_state: Some(crate::checks::TreeState::LocalDirty),
+        };
+        let substrate = context_substrate("ESLint", repo.path(), repo.path());
+        let ledger = TaskLedger::new();
+        record_gate(
+            &ledger,
+            "ESLint",
+            substrate,
             TaskState::Cached {
-                cache_age_secs: None,
-                origin: substrate,
+                cache_age_secs: Some(42),
+                origin: origin.clone(),
             },
-            "the artifact replays the gate's execution, and names whose",
+        );
+
+        let cmds = plan(&config, repo.path(), &ledger, ctx.path());
+        assert!(!planned(&cmds, "eslint json"));
+        let entry = context_entry(&ledger, "ESLint", repo.path());
+        assert_eq!(
+            entry.state,
+            TaskState::Cached {
+                cache_age_secs: Some(42),
+                origin,
+            },
+            "a stored replay stays cached, with the original entry's age",
         );
     }
 
@@ -1778,11 +1839,8 @@ mod tests {
         let entry = context_entry(&ledger, "TypeScript", repo.path());
         assert_eq!(
             entry.state,
-            TaskState::Cached {
-                cache_age_secs: None,
-                origin: substrate,
-            },
-            "the deduped artifact must name the execution it stands on",
+            TaskState::Reused { origin: substrate },
+            "the deduped artifact must name the live gate it stands on",
         );
     }
 

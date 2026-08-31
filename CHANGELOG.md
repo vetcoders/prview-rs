@@ -45,7 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Those advertisements ran after the `PackPublication` seam and before the
   final cancellation check, so Ctrl-C in that window could delete the pack's
   success surfaces while still pointing `latest` and the index at the
-  incomplete directory.
+  incomplete directory. If cancel is observed after `latest` is written, the
+  previous completed alias is restored before the incomplete marker is left.
+- Same-run context dedup is `reused`, not `cached` with a null age. A live
+  gate that already produced the signal is reuse; only a stored replay stays
+  `cached` with the original entry's age. `RUN.json` `ledger.schema` is `2`.
+- `RUN.json` ledger rows emit `queue_wait_secs` when a check waited on the
+  resource budget before admission, so a slow tool is not confused with queue
+  pressure.
+- Public trait-impl evidence alpha-normalizes impl-level generic binders, so
+  renaming `impl<T> Trait for Wrapper<T>` to `impl<U> Trait for Wrapper<U>`
+  is not a review-required unknown delta.
 - Public trait impls declared in private helper modules are retained as
   `TraitImplResolution` unknowns instead of disappearing from the delta.
 - Retargeting a public reexport between two still-public types is a compared
@@ -137,17 +147,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Quality checks and context commands now run under one machine-wide budget
   (`ResourceGovernor`) instead of each stage picking its own fan-out. Checks
-  declare `Light` or `Heavy` via `Check::resource_weight`; the compilers,
-  whole-project linters and test runners (the cargo family, TypeScript, Vitest,
-  ESLint, Semgrep) are `Heavy` and cost half the budget each, so a mixed
-  Rust+JS profile no longer starts four toolchains that each size their worker
-  pool to the whole machine. Unspecified checks default to `Exclusive`; those
-  tools opt into `Heavy` only after their descendant pool has a tested cap.
-  The cargo `target/` write lock is unchanged and is always taken before the
-  budget. Context commands (`tsc --traceResolution`, `eslint`, `stylelint`,
-  `esbuild`) draw on the same budget and now lead their own process groups
-  like the checks always have. `--resource-budget safe|balanced` selects the
-  plan; the default is `safe`.
+  declare `Light` or `Heavy` via `Check::resource_weight`; unspecified checks
+  stay `Exclusive`. Rustfmt is `Light`. The Cargo family, Vitest, and Semgrep
+  are `Heavy` and cost half the budget each, so a mixed Rust+JS profile no
+  longer starts four toolchains that each size their worker pool to the whole
+  machine. TypeScript, ESLint, Stylelint, and Python gates stay `Exclusive`
+  until their descendant pools have a tested cap. The cargo `target/` write
+  lock is unchanged and is always taken before the budget. Context commands
+  (`tsc --traceResolution`, `eslint`, `stylelint`, `esbuild`) draw on the same
+  budget and now lead their own process groups like the checks always have.
+  `--resource-budget safe|balanced` selects the plan: `safe` is the default
+  (one expensive tool and one child worker); `balanced` is the capped opt-in.
 
 - Progress output tells queued work from running work. The stage line reads
   `Running: X (12s) · Queued: Y, Z` instead of naming every runnable check as

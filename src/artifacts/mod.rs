@@ -391,6 +391,8 @@ artifact_generation_seams! {
     SanityChecks => "SANITY checks",
     PackPublication => "pack publication",
     RunIndexPublication => "run index publication",
+    LatestAdvertisement => "latest advertisement",
+    IndexCommit => "run index commit",
 }
 
 const CANCELLED_GENERATION_SUCCESS_SURFACES: [&str; 12] = [
@@ -996,19 +998,33 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PackPublication)?;
 
     // Latest + run-index are irreversible advertisements of a completed pack.
-    // Check cancellation here, before either side effect, so a Ctrl-C that
-    // lands after the zip still cannot publish this directory as `latest` or
-    // append it to the index. `ensure_generation_active` then deletes the
-    // success surfaces and writes INCOMPLETE.json without rolling those
-    // advertisements back — they must not have been written.
+    // Check cancellation before the first of those side effects, again after
+    // `latest` is written (so a Ctrl-C in that window can restore the previous
+    // alias), and again immediately before the index append. The index itself
+    // is not rolled back if cancel lands inside `register_and_prune`.
     ensure_generation_active(
         governor,
         &out_dir,
         ArtifactGenerationSeam::RunIndexPublication,
     )?;
 
-    // Create `latest` symlink in parent directory
+    let previous_latest = peek_latest_target(&out_dir);
     create_latest_symlink(&out_dir)?;
+    if let Err(error) = ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::LatestAdvertisement,
+    ) {
+        restore_latest_symlink(&out_dir, previous_latest.as_deref())?;
+        return Err(error);
+    }
+
+    if let Err(error) =
+        ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)
+    {
+        restore_latest_symlink(&out_dir, previous_latest.as_deref())?;
+        return Err(error);
+    }
 
     // Register run in index and prune old runs
     {
@@ -1564,7 +1580,7 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
 /// precedent `CheckProvenance` set in `checks/mod.rs`). Its own counter is what
 /// lets the view's shape evolve, and be recognised, without renegotiating the
 /// pack contract.
-const LEDGER_SCHEMA: u32 = 1;
+const LEDGER_SCHEMA: u32 = 2;
 
 /// The run's task ledger, as it appears in `RUN.json`.
 ///
@@ -1575,8 +1591,10 @@ const LEDGER_SCHEMA: u32 = 1;
 ///
 /// Each lifecycle carries only the evidence it actually has: a `run` its
 /// duration, a `cached` the age of the entry it replayed and the substrate of
-/// the ORIGINAL execution, a `skipped` / `not_applicable` its reason. Nothing is
-/// filled in with a plausible-looking value where the run holds none.
+/// the ORIGINAL execution, a `reused` the substrate of the same-run gate, a
+/// `skipped` / `not_applicable` its reason. Queue wait is emitted only when
+/// both timestamps exist. Nothing is filled in with a plausible-looking value
+/// where the run holds none.
 fn ledger_view(ledger: &TaskLedger) -> serde_json::Value {
     use crate::ledger::TaskState;
     use serde_json::json;
@@ -1598,6 +1616,13 @@ fn ledger_view(ledger: &TaskLedger) -> serde_json::Value {
                 "lifecycle": entry.state.lifecycle(),
                 "substrate": substrate(&entry.key.substrate),
             });
+            if let (Some(queued_at), Some(started_at)) = (entry.queued_at, entry.started_at) {
+                row["queue_wait_secs"] = json!(
+                    started_at
+                        .saturating_duration_since(queued_at)
+                        .as_secs_f32()
+                );
+            }
             match &entry.state {
                 TaskState::Run { duration } => {
                     row["duration_secs"] = json!(duration.as_secs_f32());
@@ -1607,6 +1632,9 @@ fn ledger_view(ledger: &TaskLedger) -> serde_json::Value {
                     origin,
                 } => {
                     row["cache_age_secs"] = json!(cache_age_secs);
+                    row["origin"] = substrate(origin);
+                }
+                TaskState::Reused { origin } => {
                     row["origin"] = substrate(origin);
                 }
                 TaskState::Skipped { reason } | TaskState::NotApplicable { reason } => {

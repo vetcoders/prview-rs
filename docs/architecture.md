@@ -849,12 +849,15 @@ there is no per-command alias table.
 #### The `ledger` view in RUN.json
 
 `RUN.json` carries the entries as an additive `ledger` object: `schema` (its own
-counter, currently `1`) and `entries[]`, one row per task with `tool`, `kind`
-(`check` / `context_artifact`), `lifecycle` (`run` / `cached` / `skipped` /
-`not_applicable`) and `substrate` (`target_sha` + the same `tree_state` strings
-`checks[].tree_state` uses). Each lifecycle adds only the evidence it has:
-`duration_secs` for a run, `cache_age_secs` + `origin` for a replay, `reason` for
-a ruled-out task.
+counter, currently `2`) and `entries[]`, one row per task with `tool`, `kind`
+(`check` / `context_artifact`), `lifecycle` (`run` / `cached` / `reused` /
+`skipped` / `not_applicable`) and `substrate` (`target_sha` + the same
+`tree_state` strings `checks[].tree_state` uses). Each lifecycle adds only the
+evidence it has: `duration_secs` for a run, `cache_age_secs` + `origin` for a
+replay, `origin` for a same-run reuse, `reason` for a ruled-out task.
+`queue_wait_secs` is emitted when both `queued_at` and `started_at` exist — the
+gap between entering the budget queue and admission — so a slow tool is not
+confused with a long resource wait.
 
 Everything the pack already reported — `checks[].cached`, `context_artifacts[]`,
 `context_commands[]`, the top-level `schema_version` — is untouched, so a
@@ -876,10 +879,12 @@ spent 23 s linting the whole tree by itself (`PRV-CONTEXT-WORK-DEDUP`).
 The ledger holds the missing half — what was
 deliberately ruled out and why — so the decision moved there:
 
-- a gate that **ran or replayed a cache** covers the artifact, which is recorded
-  as `Cached` naming the substrate that execution read. A gate that ran and
-  *failed* still covers it: the tool read the tree and reported, and a second run
-  buys the same answer at the same price;
+- a gate that **ran** covers the artifact, recorded as `Reused` naming the
+  substrate that live execution read. A gate that **replayed a cache** covers it
+  as `Cached`, with the stored entry's age and the substrate of the ORIGINAL
+  execution. A gate that ran and *failed* still covers it as `Reused`: the tool
+  read the tree and reported, and a second run buys the same answer at the same
+  price;
 - a gate that was **ruled out** leaves the artifact unproduced, recorded with the
   gate's own reason — `Skipped` when the reviewed tree could run the tool anyway
   (this run chose not to), `NotApplicable` when it could not (no switch would
@@ -1092,8 +1097,9 @@ finish before merge/report generation. If cancellation reaches artifact
 generation, success-shaped verdict/report/RUN/MANIFEST/SANITY surfaces are
 removed and `00_summary/INCOMPLETE.json` records `status=incomplete`, the reason,
 and the interrupted stage. The `latest` symlink and the run-index row are
-written only after that last cancellation check, so a cancelled pack is never
-advertised as the completed review. The run ends in `Cancelled` and exit `130`.
+written only after that last cancellation check. If Ctrl-C lands after `latest`
+is retargeted and before the index append, the previous alias is restored and
+the incomplete pack is not advertised. The run ends in `Cancelled` and exit `130`.
 
 `--update` needs a gate of its own (`App::reuse_unchanged_run`), because it is
 the one path that returns a report without reaching any of the others: an

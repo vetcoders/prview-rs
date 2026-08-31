@@ -452,7 +452,8 @@ A `latest` symlink points at the most recent **completed** run in
 `$PRVIEW_HOME/runs/<repo>/<branch>/latest` or
 `$HOME/.prview/runs/<repo>/<branch>/latest` when `PRVIEW_HOME` is unset.
 A cancelled run writes `00_summary/INCOMPLETE.json` and does not update
-`latest` or the run index.
+`latest` or the run index. If cancellation is observed after `latest` has
+already been retargeted, the previous completed run is restored.
 
 ```
 $HOME/.prview/runs/my-repo/feature-x/20260225-185357/

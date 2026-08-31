@@ -94,6 +94,10 @@ pub enum TaskState {
         cache_age_secs: Option<u64>,
         origin: SubstrateKey,
     },
+    /// The same-run gate already produced this signal, so the context stage did
+    /// not spawn the tool again. `origin` is the substrate that live execution
+    /// read. This is not a cache replay: nothing was read back from disk.
+    Reused { origin: SubstrateKey },
     /// The task was applicable but ruled out for this run (disabled gate,
     /// missing tool, unreachable root).
     Skipped { reason: String },
@@ -108,6 +112,7 @@ impl TaskState {
         match self {
             Self::Run { .. } => "run",
             Self::Cached { .. } => "cached",
+            Self::Reused { .. } => "reused",
             Self::Skipped { .. } => "skipped",
             Self::NotApplicable { .. } => "not_applicable",
         }
@@ -508,6 +513,9 @@ mod tests {
                 cache_age_secs: Some(42),
                 origin: substrate("abc"),
             },
+            TaskState::Reused {
+                origin: substrate("abc"),
+            },
             TaskState::Skipped {
                 reason: "lint disabled".to_string(),
             },
@@ -729,6 +737,13 @@ mod tests {
             }
             .lifecycle(),
             "cached"
+        );
+        assert_eq!(
+            TaskState::Reused {
+                origin: SubstrateKey::default()
+            }
+            .lifecycle(),
+            "reused"
         );
         assert_eq!(
             TaskState::Skipped {
