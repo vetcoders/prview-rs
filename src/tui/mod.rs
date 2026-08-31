@@ -209,7 +209,8 @@ where
 }
 
 fn intercepts_run_hotkey(state: &TuiState, analysis: &Option<AnalysisTask>) -> bool {
-    state.wizard_mode == WizardMode::None
+    state.can_run_analysis
+        && state.wizard_mode == WizardMode::None
         && !state.show_help
         && !state.running
         && analysis.is_none()
@@ -752,6 +753,57 @@ mod tests {
         state.wizard_mode = WizardMode::None;
         state.show_help = true;
         assert!(!intercepts_run_hotkey(&state, &analysis));
+    }
+
+    #[test]
+    fn run_hotkey_is_not_intercepted_in_state_view() {
+        let state = TuiState::new_state_view(
+            default_config(),
+            crate::state::RepoState {
+                repo: "fixture".to_string(),
+                branch: "main".to_string(),
+                head: "abc1234".to_string(),
+                files_changed: 0,
+                insertions: 0,
+                deletions: 0,
+                untracked_files: 0,
+                hot_files: Vec::new(),
+            },
+        );
+        let analysis = None;
+        assert!(!intercepts_run_hotkey(&state, &analysis));
+    }
+
+    #[tokio::test]
+    async fn r_in_state_view_does_not_start_analysis() {
+        let mut state = TuiState::new_state_view(
+            default_config(),
+            crate::state::RepoState {
+                repo: "fixture".to_string(),
+                branch: "main".to_string(),
+                head: "abc1234".to_string(),
+                files_changed: 0,
+                insertions: 0,
+                deletions: 0,
+                untracked_files: 0,
+                hot_files: Vec::new(),
+            },
+        );
+        let mut analysis = None;
+
+        drive_event_loop(
+            &mut state,
+            &mut analysis,
+            [
+                press(crossterm::event::KeyCode::Char('r')),
+                press(crossterm::event::KeyCode::Char('q')),
+            ],
+        )
+        .await;
+
+        assert!(analysis.is_none(), "state-view r must not spawn analysis");
+        assert!(!state.running);
+        assert!(state.should_quit);
     }
 
     #[tokio::test]

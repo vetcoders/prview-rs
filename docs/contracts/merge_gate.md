@@ -23,6 +23,7 @@ document disagree, the code is the contract and this document is the bug.
 | `stale_cache_caveats` | object[] | Advisory, additive: blocking rows whose evidence was replayed from an old cache (see below) |
 | `decision` | object | The merge decision (see below) |
 | `files` | object | Artifact-root-relative paths (see below) |
+| `rust_api_delta` | object \| null | Additive lossless Rust API delta; `null` on non-Rust runs (see below) |
 
 ### `policy`
 

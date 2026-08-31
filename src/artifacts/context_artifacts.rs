@@ -1164,6 +1164,7 @@ fn run_context_cmds_parallel_after_spawn(
             match r.child.try_wait() {
                 Ok(Some(exit)) => {
                     r.done = true;
+                    governor.unregister_child(&r.registry_key);
                     // Collect output
                     collect_cmd_output(&r.stdout_path, &r.stderr_path, &r.out_dir, &r.out_file);
                     timings.push(ContextCommandTiming {
@@ -1196,6 +1197,7 @@ fn run_context_cmds_parallel_after_spawn(
                         let _ = r.child.kill();
                         let _ = r.child.wait();
                         r.done = true;
+                        governor.unregister_child(&r.registry_key);
                         timings.push(ContextCommandTiming {
                             label: r.label.clone(),
                             artifact: (!r.out_file.is_empty()).then(|| {
@@ -1221,6 +1223,7 @@ fn run_context_cmds_parallel_after_spawn(
                 }
                 Err(_) => {
                     r.done = true;
+                    governor.unregister_child(&r.registry_key);
                     timings.push(ContextCommandTiming {
                         label: r.label.clone(),
                         artifact: (!r.out_file.is_empty()).then(|| {

@@ -128,8 +128,10 @@ pub fn harden_std(cmd: &mut std::process::Command) {
 ///
 /// On timeout the wait-future is dropped (so `kill_on_drop` reaps the direct
 /// child) and, on unix, the whole process group is SIGKILLed so grandchildren
-/// die too; the returned error is `on_timeout()`. `label` names the tool in the
-/// spawn/wait error messages.
+/// die too; the returned error is `on_timeout()`. The child handle is kept until
+/// after that tree kill, so `kill_on_drop` cannot reap the root first and leave
+/// Windows grandchildren orphaned. `label` names the tool in the spawn/wait
+/// error messages.
 ///
 /// This is the one place a check's external tool is spawned, so it is also where
 /// the pid is handed to the run's resource governor
@@ -156,12 +158,13 @@ async fn run_capture_with_timeout_after_spawn(
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {label}: {e}"))?;
 
     // Capture the pid (also the pgid, since the child leads its group) BEFORE
-    // the handle moves into wait_with_output(); needed to signal the group.
+    // waiting; needed to signal the group. Keep the handle until after that
+    // signal so `kill_on_drop` cannot reap the root first.
     let pid = child.id();
 
     after_spawn(child.id());
@@ -170,12 +173,46 @@ async fn run_capture_with_timeout_after_spawn(
     // and wait-error paths all leave the registry clean without saying so.
     let _registration = child.id().and_then(crate::governor::register_active_child);
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(result) => result.map_err(|e| anyhow::anyhow!("failed to run {label}: {e}")),
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
+        }
+        buf
+    });
+
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            let stdout = stdout_task.await.unwrap_or_else(|_| Vec::new());
+            let stderr = stderr_task.await.unwrap_or_else(|_| Vec::new());
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+        Ok(Err(e)) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            Err(anyhow::anyhow!("failed to run {label}: {e}"))
+        }
         Err(_) => {
             if let Some(pid) = pid {
                 terminate_process_tree(pid);
             }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
             Err(on_timeout())
         }
     }

@@ -884,12 +884,12 @@ impl<'a> SnapshotBuilder<'a> {
                     external_name: crate_name.clone(),
                 },
                 kind: RustApiItemKind::Crate,
-                contract: format!(
-                    "library root={root_path}; proc_macro={proc_macro}; crate_types={crate_types:?}"
-                ),
+                contract: format!("library proc_macro={proc_macro}; crate_types={crate_types:?}"),
                 cfg_guard: Vec::new(),
                 source_path: manifest_path.clone(),
-                evidence: format!("library crate {crate_name} from {manifest_path}"),
+                evidence: format!(
+                    "library crate {crate_name} from {manifest_path}; root={root_path}"
+                ),
                 provenance: self.provenance.clone(),
                 certainty: RustSourceCertainty::Confirmed,
                 origin_module_path: Vec::new(),

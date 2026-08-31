@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `prview state --tui` no longer starts a review from `r`.
+- Moving a library crate root (`src/lib.rs` → `lib.rs`) is not a public API
+  change; the compared crate contract keeps `proc-macro` and `crate-type` only.
+- Cache hits take content and mtime from one open file handle, so a concurrent
+  replacement cannot pair one entry's bytes with another's age.
+- A finished context-command child is unregistered before its output is read.
+- A check-dispatcher board row is finished by the queued check name, and an
+  exhausted future stream with leftover rows is an error instead of a hang.
+- Timeout waits keep the child handle until after process-tree termination, so
+  Windows `kill_on_drop` cannot reap the root before `taskkill /T`.
 - Optional Cargo dependencies without an explicit `[features]` table are
   implicit features in the repo-backed API contract, so removing or renaming
   them is a compared delta.
@@ -131,11 +141,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole-project linters and test runners (the cargo family, TypeScript, Vitest,
   ESLint, Semgrep) are `Heavy` and cost half the budget each, so a mixed
   Rust+JS profile no longer starts four toolchains that each size their worker
-  pool to the whole machine. The cargo `target/` write lock is unchanged and is
-  always taken before the budget. Context commands (`tsc --traceResolution`,
-  `eslint`, `stylelint`, `esbuild`) draw on the same budget and now lead their
-  own process groups like the checks always have. The budget is
-  `available_parallelism()` and is not yet configurable.
+  pool to the whole machine. Unspecified checks default to `Exclusive`; those
+  tools opt into `Heavy` only after their descendant pool has a tested cap.
+  The cargo `target/` write lock is unchanged and is always taken before the
+  budget. Context commands (`tsc --traceResolution`, `eslint`, `stylelint`,
+  `esbuild`) draw on the same budget and now lead their own process groups
+  like the checks always have. `--resource-budget safe|balanced` selects the
+  plan; the default is `safe`.
 
 - Progress output tells queued work from running work. The stage line reads
   `Running: X (12s) · Queued: Y, Z` instead of naming every runnable check as

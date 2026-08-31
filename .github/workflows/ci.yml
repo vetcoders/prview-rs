@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Toolchain pinned to match local dev (1.94.x). The earlier 1.92.0 pin

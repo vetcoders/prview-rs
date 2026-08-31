@@ -1164,7 +1164,7 @@ The core artifact generator. Builds the numbered directory layout
 - `10_diff/`: `full.patch`, `per-commit-diffs/` (batching + thematic labels), `per-file-diffs/` (hotspots)
 - `20_quality/`: per-check `*.result.json` + `*.log`, `full-checks.log`, `checks-errors.log`, `coverage-delta.txt`, `PUBLIC_API_DIFF.json/md`, `BREAKING_CHANGES.json/md`
 - `30_context/`: optional `INLINE_FINDINGS.sarif`, `changed-tests.txt`, profile-specific (`cargo-tree`, `tsc-trace`, `eslint`, `vitest`)
-- `latest` symlink in the parent dir
+- `latest` symlink in the parent dir (completed runs only)
 
 #### Stale-cache caveats (`MERGE_GATE.json.stale_cache_caveats`)
 
@@ -1231,7 +1231,8 @@ Library discovery matches the exact `Cargo.toml` basename. It validates every
 consumed Cargo field (`package.name`, `[lib]`, `lib.name`, `lib.path`,
 `lib.proc-macro`, `lib.crate-type`, and `package.autolib`) instead of inventing
 defaults for an invalid schema. The crate contract includes the normalized
-`crate-type` set (default `["lib"]`). Optional normal/build/target
+`crate-type` set (default `["lib"]`) and `proc-macro`; the library root path
+stays in evidence/provenance, not in the compared contract. Optional normal/build/target
 dependencies without an explicit `[features]` entry become implicit Cargo
 features unless suppressed through `dep:` references. Package and explicit
 library names must also be non-empty valid Cargo/crate identifiers; a TOML

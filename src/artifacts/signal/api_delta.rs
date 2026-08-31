@@ -2152,6 +2152,22 @@ mod tests {
             }),
             "cdylib to rlib is a binary-contract change even when public items are unchanged"
         );
+
+        let root_move = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='lib.rs'\n",
+            ),
+            ("src/lib.rs", "pub fn stable() {}\n", "pub fn stable() {}\n"),
+            ("lib.rs", "pub fn stable() {}\n", "pub fn stable() {}\n"),
+        ]);
+        assert!(
+            !root_move.changed.iter().any(|finding| {
+                finding.identity.name == "fixture" && finding.identity.namespace == "crate"
+            }),
+            "an internal library-root move is not a caller-observable crate contract change"
+        );
     }
 
     #[test]

@@ -760,18 +760,18 @@ async fn run_all_checks(
                 let governor = Arc::clone(governor);
                 let board = Arc::clone(&board);
                 let queued_at = std::time::Instant::now();
+                let queued_name = check.name().to_string();
                 async move {
                     let (started_at, _admission) =
                         admit_check(check.as_ref(), &cargo_lock, &governor, &board).await?;
-                    let name = check.name().to_string();
                     let result = crate::governor::with_child_scope(
                         governor,
-                        &name,
+                        &queued_name,
                         execute_live_check(check, config.as_ref(), cache.as_ref()),
                     )
                     .await;
                     record_executed_check(&result, ledger, queued_at, started_at);
-                    Ok::<CheckResult, Cancelled>(result)
+                    Ok::<_, Cancelled>((queued_name, result))
                 }
             })
             .collect();
@@ -792,9 +792,18 @@ async fn run_all_checks(
             tokio::select! {
                 biased;
 
-                Some(result) = futs.next() => {
-                    let result = result?;
-                    lock_board(&board).finish(&result.name);
+                outcome = futs.next() => {
+                    let Some(outcome) = outcome else {
+                        if !lock_board(&board).is_empty() {
+                            anyhow::bail!(
+                                "check dispatcher exhausted with pending board rows: {:?}",
+                                lock_board(&board).names_where(false)
+                            );
+                        }
+                        break;
+                    };
+                    let (queued_name, result) = outcome?;
+                    lock_board(&board).finish(&queued_name);
 
                     if emit {
                         // Clear the progress line and print the result
@@ -1122,19 +1131,21 @@ where
                 let governor = Arc::clone(governor);
                 let board = Arc::clone(&board);
                 let queued_at = std::time::Instant::now();
+                let queued_name = check.name().to_string();
                 async move {
                     let (started_at, _admission) =
                         admit_check(check.as_ref(), &cargo_lock, &governor, &board).await?;
-                    let name = check.name().to_string();
-                    on_event(CheckEvent::Running { name: name.clone() });
+                    on_event(CheckEvent::Running {
+                        name: queued_name.clone(),
+                    });
                     let result = crate::governor::with_child_scope(
                         governor,
-                        &name,
+                        &queued_name,
                         execute_live_check(check, config.as_ref(), cache.as_ref()),
                     )
                     .await;
                     record_executed_check(&result, ledger, queued_at, started_at);
-                    Ok::<CheckResult, Cancelled>(result)
+                    Ok::<_, Cancelled>((queued_name, result))
                 }
             })
             .collect();
@@ -1150,9 +1161,18 @@ where
             tokio::select! {
                 biased;
 
-                Some(result) = futs.next() => {
-                    let result = result?;
-                    lock_board(&board).finish(&result.name);
+                outcome = futs.next() => {
+                    let Some(outcome) = outcome else {
+                        if !lock_board(&board).is_empty() {
+                            anyhow::bail!(
+                                "check dispatcher exhausted with pending board rows: {:?}",
+                                lock_board(&board).names_where(false)
+                            );
+                        }
+                        break;
+                    };
+                    let (queued_name, result) = outcome?;
+                    lock_board(&board).finish(&queued_name);
                     on_event(CheckEvent::Completed {
                         result: Box::new(result.clone()),
                     });
@@ -4151,6 +4171,53 @@ test result: ok. 2 passed; 0 failed
         assert!(matches!(result, Err(Cancelled)));
         assert_eq!(lock_board(&board).names_where(false), vec!["Cargo test"]);
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_finishes_board_rows_by_queued_name() {
+        use async_trait::async_trait;
+
+        struct Mismatch;
+
+        #[async_trait]
+        impl Check for Mismatch {
+            fn name(&self) -> &str {
+                "Queued"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                Ok(CheckResult {
+                    name: "Different".to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_millis(1),
+                    output: "ok".to_string(),
+                    cached: false,
+                    provenance: None,
+                })
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), true);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::new());
+        let (results, skipped) = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_all_checks(vec![Box::new(Mismatch)], cache, &config, &ledger, &governor),
+        )
+        .await
+        .expect("mismatched result names must not hang the dispatcher")
+        .expect("run_all_checks");
+
+        assert!(skipped.is_empty());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Different");
     }
 
     /// The slow notice is about work, not about waiting. A check parked on the

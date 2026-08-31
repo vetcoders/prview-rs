@@ -21,9 +21,10 @@ paths, or SARIF path discovery. Pass/fail still comes from the process exit code
 Exit `130` (128 + SIGINT) is deliberately outside the verdict codes: a cancelled
 run produced no verdict, so reporting `0`, `1` or `2` would claim it did. The
 contract is absolute — once cancellation is requested, the run ends there, even
-if the stage that was interrupted had already written part of a pack. CI never
-sees it, since nothing sends the process an interrupt; a local hook should treat
-it exactly like `3`.
+if the stage that was interrupted had already written part of a pack. Ordinary
+GitHub-hosted jobs almost never see it, because nothing in the workflow sends
+SIGINT; a runner or workflow cancel still can. A local hook should treat it
+exactly like `3`.
 
 Exit `3` covers every way the run can end without a trustworthy verdict — the
 review failing to execute, and the pack's `00_summary/MERGE_GATE.json` being

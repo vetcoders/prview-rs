@@ -6,6 +6,7 @@ use crate::Config;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Legacy sidecar holding the check's captured output, next to its status entry.
@@ -73,8 +74,13 @@ impl Cache {
 
         let cache_dir = self.dir.join(check_name);
         let entry_path = cache_dir.join(key);
-        let raw = fs::read_to_string(&entry_path).ok()?;
-        let age_secs = entry_age_secs(&entry_path);
+        // One open handle for bytes and mtime: a rename between `read_to_string`
+        // and a later `stat` of the same path would otherwise pair one entry's
+        // contents with another entry's age.
+        let mut file = fs::File::open(&entry_path).ok()?;
+        let mut raw = String::new();
+        file.read_to_string(&mut raw).ok()?;
+        let age_secs = file.metadata().ok().and_then(|meta| age_from_mtime(&meta));
 
         // An entry written by this prview is one self-contained JSON document.
         if let Ok(entry) = serde_json::from_str::<CacheEntry>(&raw) {
@@ -205,7 +211,7 @@ pub struct CachedResult {
     /// existed, or for a check that produced no provenance.
     pub provenance: Option<String>,
     /// How long ago this entry was published, in whole seconds — see
-    /// [`entry_age_secs`]. `None` when the age cannot be established.
+    /// [`age_from_mtime`]. `None` when the age cannot be established.
     pub age_secs: Option<u64>,
 }
 
@@ -240,8 +246,13 @@ pub(crate) fn backdate(path: &Path, by: std::time::Duration) {
 /// a filesystem that does not report mtime, or a timestamp in the future (a
 /// clock that moved backwards, a copied tree). A replay of unknown age is a fact
 /// a reviewer can act on; a fabricated zero is not.
+#[cfg(test)]
 fn entry_age_secs(path: &Path) -> Option<u64> {
-    let modified = fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
+    age_from_mtime(&fs::metadata(path).ok()?)
+}
+
+fn age_from_mtime(meta: &fs::Metadata) -> Option<u64> {
+    let modified = meta.modified().ok()?;
     Some(
         std::time::SystemTime::now()
             .duration_since(modified)
