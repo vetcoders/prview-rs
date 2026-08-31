@@ -68,7 +68,9 @@ exceeds the selected cap, or when the final pack and its resource metadata do
 not agree. Semgrep RPC coordinators are reported separately from its actual scan
 workers. The receipt also requires a clean source tree whose `HEAD` is the exact
 candidate SHA; a dirty local build cannot masquerade as exact-SHA evidence. The
-job has an internal 20-minute deadline inside a 45-minute Actions timeout, then
+job keeps its failure-shaped receipt under the runner's temporary directory so
+initializing that evidence cannot dirty the checkout it is about to validate.
+It has an internal 20-minute deadline inside a 45-minute Actions timeout, then
 always uploads a compact JSON receipt plus the captured CLI log.
 Only the published job on the exact candidate SHA is platform evidence; a local
 run validates the harness, not the `ubuntu-latest` envelope.

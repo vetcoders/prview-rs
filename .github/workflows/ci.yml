@@ -83,13 +83,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      PRVIEW_ACCEPTANCE_DIR: ${{ github.workspace }}/prview-resource-acceptance
       PRVIEW_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.PRVIEW_SOURCE_SHA }}
       - name: Initialize failure-shaped receipt
+        env:
+          PRVIEW_ACCEPTANCE_DIR: ${{ runner.temp }}/prview-resource-acceptance
         run: |
           python3 tools/bounded_runtime_acceptance.py \
             --initialize-only \
@@ -112,6 +113,8 @@ jobs:
       - name: Build the candidate release binary
         run: timeout 900 cargo build --release --locked
       - name: Exercise the full mixed-tool deep review
+        env:
+          PRVIEW_ACCEPTANCE_DIR: ${{ runner.temp }}/prview-resource-acceptance
         run: |
           python3 tools/bounded_runtime_acceptance.py \
             --binary "$GITHUB_WORKSPACE/target/release/prview" \
@@ -124,7 +127,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ordinary-machine-resource-acceptance-${{ env.PRVIEW_SOURCE_SHA }}
-          path: ${{ env.PRVIEW_ACCEPTANCE_DIR }}
+          path: ${{ runner.temp }}/prview-resource-acceptance
           if-no-files-found: error
           retention-days: 14
 
