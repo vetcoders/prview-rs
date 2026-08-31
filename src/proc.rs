@@ -122,6 +122,26 @@ pub fn harden_std(cmd: &mut std::process::Command) {
     }
 }
 
+/// Spawn a synchronous child, register it with the current run governor if any,
+/// and wait. A cancelled run kills the process group instead of waiting out a
+/// `git fetch` or `git archive | tar`.
+pub fn spawn_wait_governed(
+    mut cmd: std::process::Command,
+    label: &str,
+) -> anyhow::Result<std::process::ExitStatus> {
+    harden_std(&mut cmd);
+    if crate::governor::current_run_governor().is_some_and(|governor| governor.is_cancelled()) {
+        return Err(crate::governor::Cancelled.into());
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn {label}: {e}"))?;
+    let _registration = crate::governor::register_run_child(child.id(), label);
+    child
+        .wait()
+        .map_err(|e| anyhow::anyhow!("failed to wait for {label}: {e}"))
+}
+
 /// Spawn `cmd` under the standard rails with piped output, drain stdout+stderr
 /// concurrently (a high-output child cannot deadlock on a full pipe buffer),
 /// and enforce `timeout`.
@@ -512,6 +532,37 @@ mod tests {
             !output.status.success(),
             "the cancelled process group must not report a successful command",
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_wait_governed_is_killed_when_the_run_cancels() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        let canceller = Arc::clone(&governor);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            canceller.cancel();
+        });
+        let started = Instant::now();
+        let status = crate::governor::with_run_scope(Arc::clone(&governor), async {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            spawn_wait_governed(cmd, "sleep")
+        })
+        .await
+        .expect("spawned sleep must be reaped, not hang");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancelled git-shaped std child must not wait out its command"
+        );
+        assert!(
+            !status.success(),
+            "a cancelled sleep must not exit 0, got {status:?}"
+        );
+        assert_eq!(governor.inflight_count(), 0);
     }
 
     /// Direct primitive test: `sigkill_process_group` reaps a grandchild through

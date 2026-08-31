@@ -616,23 +616,15 @@ fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
     let syn::Fields::Named(fields) = item.fields else {
         return None;
     };
-    if fields.named.iter().any(|field| {
-        field
-            .ident
-            .as_ref()
-            .is_some_and(|name| name.to_string().starts_with("__prview_private_field_"))
-    }) {
-        // A repr-sensitive private layout delta belongs to the parent type.
-        // Do not leak synthetic private field identities into public artifacts.
-        return None;
-    }
     Some(PublicStructContract {
         fields: fields
             .named
             .into_iter()
             .filter_map(|field| {
                 let name = field.ident.as_ref()?.to_string();
-                if name == "__prview_has_private_fields" {
+                if name.starts_with("__prview_private_field_")
+                    || name == "__prview_has_private_fields"
+                {
                     return None;
                 }
                 Some((name, quote::ToTokens::to_token_stream(&field).to_string()))
@@ -2312,6 +2304,57 @@ mod tests {
                 .iter()
                 .any(|finding| { finding.identity.name == "TraitImplResolution" }),
             "changing the impl's observable type arguments must keep TraitImplResolution active"
+        );
+    }
+
+    #[test]
+    fn repository_backed_std_display_impl_is_typed_unknown() {
+        let added = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Value;\n",
+                "pub struct Value;\nimpl std::fmt::Display for Value {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, \"v\") }\n}\n",
+            ),
+        ]);
+        assert!(
+            added.unknown.iter().any(|finding| {
+                finding.identity.name == "TraitImplResolution"
+                    && finding
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("Display"))
+            }),
+            "adding Display for a public type must be TraitImplResolution, got {:?}",
+            added.findings()
+        );
+    }
+
+    #[test]
+    fn repository_backed_private_field_auto_trait_change_is_parent_changed() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Holder { inner: u8 }\n",
+                "pub struct Holder { inner: std::rc::Rc<()> }\n",
+            ),
+        ]);
+        assert!(
+            delta
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Holder"),
+            "replacing a private Send field with Rc must change the parent contract, got {:?}",
+            delta.findings()
         );
     }
 

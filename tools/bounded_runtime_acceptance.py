@@ -400,12 +400,32 @@ def evaluate(
     )
     add_assertion(violations, cap == 1, "safe child worker cap is not one")
     add_assertion(
+        violations,
+        "--deep" in (receipt.get("command") or []),
+        "acceptance command is not a --deep review",
+    )
+    add_assertion(
         violations, census["seen_tools"]["cargo"], "no real Cargo process was observed"
     )
     add_assertion(
         violations,
         census["seen_tools"]["vitest"],
         "no real Vitest process was observed",
+    )
+    check_blob = " ".join(
+        str(row.get("name") or "")
+        for row in (run or {}).get("checks") or []
+        if isinstance(row, dict)
+    ).lower()
+    add_assertion(
+        violations,
+        "cargo" in check_blob,
+        "RUN.json checks do not include a Cargo gate",
+    )
+    add_assertion(
+        violations,
+        "vitest" in check_blob,
+        "RUN.json checks do not include a Vitest gate",
     )
     add_assertion(
         violations,

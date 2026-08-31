@@ -616,7 +616,11 @@ impl<'a> SnapshotBuilder<'a> {
             })
             .map(|(path, _)| path.clone())
             .collect();
+        let allowed = api_crate_manifests(self.source, &manifests);
         for manifest_path in manifests {
+            if !allowed.contains(&manifest_path) {
+                continue;
+            }
             if !self
                 .inventory
                 .get(&manifest_path)
@@ -2527,7 +2531,7 @@ impl<'a> SnapshotBuilder<'a> {
                     && item.origin_name == pending.owner_name
                     && !guards_proven_disjoint(&item.cfg_guard, &pending.cfg_guard)
             });
-            if trait_public && owner_public {
+            if owner_public && (trait_public || trait_is_external_public(&pending)) {
                 self.unknown_guarded(
                     RustApiUnknownKind::TraitImplResolution,
                     Some(&pending.crate_name),
@@ -2902,35 +2906,20 @@ fn normalized_macro_contract(item: &syn::ItemMacro) -> String {
     canonical_tokens(item.to_token_stream())
 }
 
-fn filter_private_fields(fields: &mut Fields, layout_sensitive: bool) {
+fn filter_private_fields(fields: &mut Fields, _layout_sensitive: bool) {
     match fields {
         Fields::Named(named) => {
-            let had_private = named.named.iter().any(|field| !is_public(&field.vis));
-            if layout_sensitive {
-                for (index, field) in named.named.iter_mut().enumerate() {
-                    if !is_public(&field.vis) {
-                        field.ident = Some(syn::Ident::new(
-                            &format!("__prview_private_field_{index}"),
-                            field
-                                .ident
-                                .as_ref()
-                                .expect("named field has an identifier")
-                                .span(),
-                        ));
-                    }
+            for (index, field) in named.named.iter_mut().enumerate() {
+                if !is_public(&field.vis) {
+                    field.ident = Some(syn::Ident::new(
+                        &format!("__prview_private_field_{index}"),
+                        field
+                            .ident
+                            .as_ref()
+                            .expect("named field has an identifier")
+                            .span(),
+                    ));
                 }
-            } else {
-                named.named = named
-                    .named
-                    .clone()
-                    .into_iter()
-                    .filter(|field| is_public(&field.vis))
-                    .collect();
-            }
-            if had_private && !layout_sensitive {
-                named
-                    .named
-                    .push(syn::parse_quote!(pub __prview_has_private_fields: ()));
             }
         }
         Fields::Unnamed(unnamed) => {
@@ -2943,9 +2932,6 @@ fn filter_private_fields(fields: &mut Fields, layout_sensitive: bool) {
                     let marker: Attribute = if is_public(&field.vis) {
                         syn::parse_quote!(#[prview_tuple_index = #index])
                     } else {
-                        if !layout_sensitive {
-                            field.ty = syn::parse_quote!(());
-                        }
                         syn::parse_quote!(#[prview_tuple_private_index = #index])
                     };
                     field.attrs.push(marker);
@@ -3711,6 +3697,206 @@ fn is_live_regular_entry(entry: &RevisionEntry) -> bool {
 
 fn required_string<'a>(table: &'a toml::Table, key: &str) -> Option<&'a str> {
     table.get(key).and_then(toml::Value::as_str)
+}
+
+fn peek_manifest_toml(source: &dyn RevisionFileSource, path: &str) -> Option<toml::Value> {
+    let RevisionRead::Bytes(bytes) = source.read(path).ok()? else {
+        return None;
+    };
+    if bytes.content_kind != RevisionContentKind::Utf8Text {
+        return None;
+    }
+    let text = String::from_utf8(bytes.bytes).ok()?;
+    toml::from_str(&text).ok()
+}
+
+fn toml_string_array(table: &toml::Table, key: &str) -> Vec<String> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn parent_manifest_dir(manifest_path: &str) -> String {
+    Path::new(manifest_path)
+        .parent()
+        .and_then(|parent| parent.to_str())
+        .unwrap_or("")
+        .replace('\\', "/")
+}
+
+fn cargo_glob_matches(pattern: &str, path: &str) -> bool {
+    fn parts(value: &str) -> Vec<&str> {
+        if value.is_empty() || value == "." {
+            Vec::new()
+        } else {
+            value
+                .split('/')
+                .filter(|part| !part.is_empty() && *part != ".")
+                .collect()
+        }
+    }
+    fn component_match(pattern: &str, value: &str) -> bool {
+        let mut p = pattern.chars().peekable();
+        let mut v = value.chars().peekable();
+        while let Some(pc) = p.next() {
+            match pc {
+                '*' => {
+                    if p.peek().is_none() {
+                        return true;
+                    }
+                    let rest: String = p.collect();
+                    let remaining: String = v.collect();
+                    for i in 0..=remaining.len() {
+                        if remaining.is_char_boundary(i) && component_match(&rest, &remaining[i..])
+                        {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                '?' => {
+                    if v.next().is_none() {
+                        return false;
+                    }
+                }
+                other => {
+                    if v.next() != Some(other) {
+                        return false;
+                    }
+                }
+            }
+        }
+        v.next().is_none()
+    }
+    fn match_parts(pattern: &[&str], path: &[&str]) -> bool {
+        match (pattern.split_first(), path.split_first()) {
+            (None, None) => true,
+            (Some((&"**", rest)), _) => {
+                rest.is_empty()
+                    || match_parts(rest, path)
+                    || (!path.is_empty() && match_parts(pattern, &path[1..]))
+            }
+            (Some((pat, rest)), Some((seg, prest))) => {
+                component_match(pat, seg) && match_parts(rest, prest)
+            }
+            _ => false,
+        }
+    }
+    match_parts(&parts(pattern), &parts(path))
+}
+
+/// Product crates are workspace members (minus `exclude`), or the root package
+/// of a non-workspace repo. Nested fixture/tool packages are not API surface.
+fn api_crate_manifests(source: &dyn RevisionFileSource, manifests: &[String]) -> BTreeSet<String> {
+    let parsed: Vec<(&str, toml::Value)> = manifests
+        .iter()
+        .filter_map(|path| peek_manifest_toml(source, path).map(|value| (path.as_str(), value)))
+        .collect();
+    let mut workspaces = Vec::new();
+    let mut packages = Vec::new();
+    for (path, manifest) in &parsed {
+        let dir = parent_manifest_dir(path);
+        if let Some(workspace) = manifest.get("workspace").and_then(toml::Value::as_table) {
+            let members = toml_string_array(workspace, "members");
+            let exclude = toml_string_array(workspace, "exclude");
+            workspaces.push((
+                dir.clone(),
+                members,
+                exclude,
+                manifest.get("package").is_some(),
+            ));
+        }
+        if manifest.get("package").is_some() {
+            packages.push(*path);
+        }
+    }
+    if workspaces.is_empty() {
+        if manifests.iter().any(|path| path == "Cargo.toml") {
+            return BTreeSet::from(["Cargo.toml".to_owned()]);
+        }
+        return packages.into_iter().map(str::to_owned).collect();
+    }
+    let mut allowed = BTreeSet::new();
+    for (dir, members, exclude, has_package) in &workspaces {
+        let member_patterns = if members.is_empty() {
+            if *has_package {
+                vec![".".to_owned()]
+            } else {
+                Vec::new()
+            }
+        } else {
+            members.clone()
+        };
+        for package in &packages {
+            let package_dir = parent_manifest_dir(package);
+            let relative = if dir.is_empty() {
+                package_dir
+            } else if package_dir == *dir {
+                String::new()
+            } else if let Some(rest) = package_dir.strip_prefix(&format!("{dir}/")) {
+                rest.to_owned()
+            } else {
+                continue;
+            };
+            let included = member_patterns
+                .iter()
+                .any(|pattern| cargo_glob_matches(pattern, &relative));
+            let excluded = exclude
+                .iter()
+                .any(|pattern| cargo_glob_matches(pattern, &relative));
+            if included && !excluded {
+                allowed.insert((*package).to_owned());
+            }
+        }
+    }
+    allowed
+}
+
+fn trait_is_external_public(pending: &PendingTraitImpl) -> bool {
+    const WELL_KNOWN: &[&str] = &[
+        "Display",
+        "Debug",
+        "Clone",
+        "Copy",
+        "Default",
+        "ToString",
+        "PartialEq",
+        "Eq",
+        "PartialOrd",
+        "Ord",
+        "Hash",
+        "Iterator",
+        "IntoIterator",
+        "From",
+        "Into",
+        "TryFrom",
+        "TryInto",
+        "FromStr",
+        "AsRef",
+        "AsMut",
+        "Deref",
+        "DerefMut",
+        "Drop",
+        "Error",
+        "Send",
+        "Sync",
+        "Unpin",
+        "Future",
+        "FromIterator",
+    ];
+    let first = pending.trait_module_path.first().map(String::as_str);
+    match first {
+        Some("std" | "core" | "alloc") => true,
+        Some("crate" | "self" | "super") => false,
+        Some(segment) if segment == pending.crate_name => false,
+        Some(_) => true,
+        None => WELL_KNOWN.contains(&pending.trait_name.as_str()),
+    }
 }
 
 fn cargo_feature_contracts(manifest: &toml::Value) -> Result<Vec<(String, String)>, String> {
@@ -4552,7 +4738,10 @@ mod tests {
             .iter()
             .find(|item| item.key.external_name == "Public")
             .unwrap();
-        assert_eq!(public_before.contract, public_private_only.contract);
+        assert_ne!(
+            public_before.contract, public_private_only.contract,
+            "private field types stay in the parent contract so auto-trait effects are visible"
+        );
     }
 
     #[test]
@@ -4933,6 +5122,81 @@ mod tests {
         let snapshot = snapshot_rust_api(&explicit);
         assert_eq!(snapshot.crates[0].name, "public_name");
         assert_eq!(snapshot.crates[0].root_path, "nested/source/root.rs");
+
+        let rooted = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='product'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", b"pub fn product() {}"),
+            (
+                "tests/fixtures/sample/Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("tests/fixtures/sample/src/lib.rs", b"pub fn fixture() {}"),
+            (
+                "tools/fixtures/bounded-runtime/Cargo.toml",
+                b"[package]\nname='bounded'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "tools/fixtures/bounded-runtime/src/lib.rs",
+                b"pub fn bounded() {}",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&rooted);
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["product"],
+            "fixture and tool packages are not product API crates"
+        );
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .any(|item| item.key.external_name == "product")
+        );
+        assert!(
+            !snapshot
+                .items
+                .iter()
+                .any(|item| item.key.external_name == "fixture"
+                    || item.key.external_name == "bounded")
+        );
+
+        let workspace = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[workspace]\nmembers=['crates/*']\nexclude=['crates/skip']\n",
+            ),
+            (
+                "crates/api/Cargo.toml",
+                b"[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("crates/api/src/lib.rs", b"pub fn api() {}"),
+            (
+                "crates/skip/Cargo.toml",
+                b"[package]\nname='skip'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("crates/skip/src/lib.rs", b"pub fn skip() {}"),
+            (
+                "tools/scratch/Cargo.toml",
+                b"[package]\nname='scratch'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("tools/scratch/src/lib.rs", b"pub fn scratch() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&workspace);
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["api"]
+        );
 
         let unicode = MemorySource::new(&[
             (

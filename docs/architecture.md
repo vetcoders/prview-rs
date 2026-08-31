@@ -1012,7 +1012,8 @@ and the signal is `tokio::sync::watch`, both already in the graph.
   pipeline with a poll loop and has nothing to `.await` on. The weight comes from
   `context_cmd_weight`: `tsc trace`, `eslint json`, `stylelint json` and
   `esbuild meta` are `Exclusive`; the metadata readers (`cargo tree`, `cargo sbom`,
-  `npm sbom`, `tauri info`) are `Light`.
+  `npm sbom`, `tauri info`) are `Light`. The context-stage timeout is one
+  deadline for the whole batch, not a fresh clock per admitted command.
 - **The cargo `target/` lock stays.** It is a correctness lock — one writer per
   `target/` — and the budget is not that. A check that takes both takes them in
   ONE order: **cargo lock first, then budget**. Waiting for that lock races the
@@ -1447,7 +1448,12 @@ does not contaminate confirmed facts from independently parsed valid paths.
 
 `compare_rust_api_revisions` constructs snapshots only from the exact
 `Diff.base_commit_id` and `Diff.target_commit_id` Git trees. It never reads a
-checkout, working-tree overlay, or patch fallback. Duplicate exact base/target
+checkout, working-tree overlay, or patch fallback. Crate discovery follows
+Cargo workspace `members`/`exclude` when a workspace exists, and otherwise only
+the repository-root package — nested fixture and tool manifests are not product
+API. Private-field types stay in the parent contract (auto-trait effects such as
+replacing `u8` with `Rc<()>`), and implementations of external/prelude traits on
+a public type are typed `TraitImplResolution` unknowns. Duplicate exact base/target
 OID pairs are coalesced in stable first-seen order before either snapshot is
 built; distinct multi-base comparisons each retain their own revision evidence
 and comparison-qualified finding ID.

@@ -50,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `register_and_prune` no longer deletes historical runs before the index
   commit: a cancel mid-function rolls the index file back and leaves older
   evidence on disk.
+- Repo-backed crate discovery follows workspace `members`/`exclude` (or the
+  single root package). Fixture and tool `Cargo.toml` files are not product API.
+- `impl std::fmt::Display` (and other external/prelude traits) on a public type
+  is a `TraitImplResolution` unknown, not a silent no-delta.
+- Private-field type changes on a public struct (for example `u8` → `Rc<()>`,
+  which drops `Send`/`Sync`) change the parent contract.
+- TUI/headless `git fetch` and `git archive | tar` register with the run
+  governor, so q/Escape/Ctrl-C can stop the sync phase.
+- Context commands share one stage timeout instead of minting a fresh deadline
+  per Exclusive spawn.
 - Same-run context dedup is `reused`, not `cached` with a null age. A live
   gate that already produced the signal is reuse; only a stored replay stays
   `cached` with the original entry's age. `RUN.json` `ledger.schema` is `2`.

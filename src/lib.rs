@@ -739,13 +739,13 @@ impl App {
     ///
     /// This is the one early return in [`App::run`] that reaches `main` with a
     /// report without passing a single `ensure_not_cancelled` — every other gate
-    /// sits after the checks stage. `prepare_refs` runs a `git fetch` that is not
-    /// a registered child of the governor, so `cancel` cannot kill it; a Ctrl-C
-    /// during that fetch on a repo with no new commits printed "^C stopping..."
-    /// and then reused the previous pack, and `main` computed an ACCEPT or a
-    /// BLOCK from it. The gate below is what makes the contract hold here too: a
-    /// run in which cancellation was requested never ends in a verdict, not even
-    /// one it is only quoting from last time.
+    /// sits after the checks stage. `prepare_refs` now registers `git fetch`
+    /// with the run governor so cancel can stop it, but a Ctrl-C that lands
+    /// after fetch already returned on a repo with no new commits used to print
+    /// "^C stopping..." and then reuse the previous pack, and `main` computed an
+    /// ACCEPT or a BLOCK from it. The gate below is what makes the contract hold
+    /// here too: a run in which cancellation was requested never ends in a
+    /// verdict, not even one it is only quoting from last time.
     ///
     /// Split out of `run` so the seam can be driven with a fabricated previous
     /// run: `find_previous_run` resolves through `PRVIEW_HOME`, and a library
@@ -1154,12 +1154,11 @@ mod tests {
 
     /// `--update` is the one path that returns a report without running a
     /// single stage, and so the one that reached `main` with a verdict while
-    /// the operator was pressing Ctrl-C. The interrupt lands during
-    /// `prepare_refs` — a `git fetch` the governor holds no pid for, so `cancel`
-    /// cannot cut it short — and on a HEAD with no new commits the run then
-    /// handed back the previous pack, from which `main` computed an ACCEPT or a
-    /// BLOCK. The pack itself is fine; claiming a verdict for a cancelled run
-    /// from it is not.
+    /// the operator was pressing Ctrl-C. Even after `git fetch` is registered
+    /// with the governor, a cancel that lands after fetch already returned on a
+    /// HEAD with no new commits used to hand back the previous pack, from which
+    /// `main` computed an ACCEPT or a BLOCK. The pack itself is fine; claiming a
+    /// verdict for a cancelled run from it is not.
     ///
     /// Driven at the seam with a fabricated previous run: `find_previous_run`
     /// resolves through `PRVIEW_HOME`, which a library test sharing a process

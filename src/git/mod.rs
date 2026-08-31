@@ -178,10 +178,11 @@ impl Repository {
             return Ok(());
         }
 
-        let fetch_origin = git_cmd()
+        let mut fetch_origin = git_cmd();
+        fetch_origin
             .args(["fetch", "--quiet", "--prune", "origin"])
-            .current_dir(&self.path)
-            .status()
+            .current_dir(&self.path);
+        let fetch_origin = crate::proc::spawn_wait_governed(fetch_origin, "git fetch origin")
             .context("Failed to run git fetch origin")?;
 
         if !fetch_origin.success() {
@@ -190,11 +191,13 @@ impl Repository {
 
         if let Some(pr_number) = config.pr_number {
             let pr_ref = format!("pull/{pr_number}/head:refs/remotes/origin/pr/{pr_number}");
-            let fetch_pr = git_cmd()
+            let mut fetch_pr = git_cmd();
+            fetch_pr
                 .args(["fetch", "--quiet", "origin", &pr_ref])
-                .current_dir(&self.path)
-                .status()
-                .with_context(|| format!("Failed to fetch PR ref for #{pr_number}"))?;
+                .current_dir(&self.path);
+            let fetch_pr =
+                crate::proc::spawn_wait_governed(fetch_pr, &format!("git fetch PR #{pr_number}"))
+                    .with_context(|| format!("Failed to fetch PR ref for #{pr_number}"))?;
 
             if !fetch_pr.success() {
                 anyhow::bail!("git fetch PR ref failed with status {}", fetch_pr);

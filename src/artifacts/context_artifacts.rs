@@ -972,8 +972,9 @@ fn context_cmd_weight(cmd: &ContextCmd) -> Weight {
 /// Spawn context commands under the run's budget and poll them with a shared
 /// timeout.
 ///
-/// Each command gets `timeout_secs` from its own spawn time. Results are written
-/// to the specified output files. Commands that exceed the timeout are killed.
+/// `timeout_secs` is one deadline for the whole stage, computed before admission.
+/// Commands still queued when it expires are timed out without a fresh per-command
+/// clock. Results are written to the specified output files.
 ///
 /// "In parallel" now means "as parallel as the machine allows": a command waits
 /// for its share of the governor's budget before it is spawned, so the context
@@ -1030,6 +1031,7 @@ fn run_context_cmds_parallel_after_spawn(
     });
     let mut pending: VecDeque<(usize, &ContextCmd)> = scheduled.into();
     let poll_interval = Duration::from_millis(200);
+    let stage_deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
     loop {
         // Admit as many queued commands as the budget currently allows, in plan
@@ -1043,6 +1045,9 @@ fn run_context_cmds_parallel_after_spawn(
             // and it is the one that stops the loop instead of waiting for a
             // budget that is never coming back.
             if governor.is_cancelled() {
+                break;
+            }
+            if Instant::now() >= stage_deadline {
                 break;
             }
             let Some(budget) = governor.try_acquire(context_cmd_weight(cmd)) else {
@@ -1135,7 +1140,7 @@ fn run_context_cmds_parallel_after_spawn(
                         registry_key,
                         budget: Some(budget),
                         started_at,
-                        deadline: started_at + Duration::from_secs(timeout_secs),
+                        deadline: stage_deadline,
                         out_dir: cmd.out_dir.clone(),
                         out_file: cmd.out_file.clone(),
                         stdout_path,
@@ -1170,6 +1175,19 @@ fn run_context_cmds_parallel_after_spawn(
                     duration_secs: 0.0,
                     reason: Some(format!(
                         "{} did not start because the review was cancelled",
+                        command_identity(cmd)
+                    )),
+                });
+            }
+        } else if Instant::now() >= stage_deadline {
+            for (_, cmd) in pending.drain(..) {
+                timings.push(ContextCommandTiming {
+                    label: cmd.label.clone(),
+                    artifact: None,
+                    status: "timed_out",
+                    duration_secs: 0.0,
+                    reason: Some(format!(
+                        "{} did not start because the shared context-stage timeout elapsed",
                         command_identity(cmd)
                     )),
                 });
@@ -2202,6 +2220,31 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(750),
             "three serialised 0.3s commands cannot finish in {elapsed:?}",
+        );
+    }
+
+    /// Exclusive admission used to mint a fresh deadline per spawn, so N hanging
+    /// commands took N timeouts. The stage clock is shared.
+    #[test]
+    fn hanging_context_commands_share_one_stage_timeout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cmds: Vec<ContextCmd> = ["tsc trace", "eslint json"]
+            .into_iter()
+            .map(|label| sleeping_cmd(label, tmp.path(), "30"))
+            .collect();
+        let governor = ResourceGovernor::with_budget(2, 1);
+        let started = Instant::now();
+        let timings = super::run_context_cmds_parallel(&cmds, 1, false, &governor);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1800),
+            "two exclusive hangs must share one 1s stage timeout, took {elapsed:?}"
+        );
+        assert_eq!(timings.len(), 2);
+        assert!(
+            timings.iter().all(|t| t.status == "timed_out"),
+            "got {:?}",
+            timings.iter().map(|t| t.status).collect::<Vec<_>>(),
         );
     }
 

@@ -564,6 +564,21 @@ where
         .await
 }
 
+/// Register `pid` with the run-wide governor, if this task is inside a run.
+///
+/// Unlike [`register_active_child`], this does not need a per-check
+/// [`with_child_scope`]. Synchronous git fetch/archive/tar children live in the
+/// run scope established by [`with_cancellation`] / TUI `with_run_scope`, and
+/// that is enough for Ctrl-C to reach them.
+#[must_use]
+pub fn register_run_child(pid: u32, label: &str) -> Option<ChildRegistration> {
+    let governor = current_run_governor()?;
+    let key = format!("run:{label}#{}", CHILD_SEQ.fetch_add(1, Ordering::Relaxed));
+    governor
+        .register_child(key.clone(), pid)
+        .then(|| ChildRegistration { governor, key })
+}
+
 /// Register `pid` with the governor of the enclosing [`with_child_scope`], if any.
 ///
 /// The returned guard unregisters on drop, so the success, timeout and spawn-error
