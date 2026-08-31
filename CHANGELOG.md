@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   success surfaces while still pointing `latest` and the index at the
   incomplete directory. If cancel is observed after `latest` is written, the
   previous completed alias is restored before the incomplete marker is left.
+  `register_and_prune` no longer deletes historical runs before the index
+  commit: a cancel mid-function rolls the index file back and leaves older
+  evidence on disk.
 - Same-run context dedup is `reused`, not `cached` with a null age. A live
   gate that already produced the signal is reuse; only a stored replay stays
   `cached` with the original entry's age. `RUN.json` `ledger.schema` is `2`.

@@ -997,11 +997,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     }
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PackPublication)?;
 
-    // Latest + run-index are irreversible advertisements of a completed pack.
-    // Check cancellation before the first of those side effects, again after
+    // Latest + run-index are advertisements of a completed pack. Check
+    // cancellation before the first of those side effects, again after
     // `latest` is written (so a Ctrl-C in that window can restore the previous
-    // alias), and again immediately before the index append. The index itself
-    // is not rolled back if cancel lands inside `register_and_prune`.
+    // alias), and again immediately before the index append. `register_and_prune`
+    // itself is abortable: it saves the index only if still active, rolls that
+    // save back if cancel lands before prune, and deletes older evidence only
+    // after that last check.
     ensure_generation_active(
         governor,
         &out_dir,
@@ -1077,11 +1079,18 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
                 .sum(),
             has_dashboard: out_dir.join("dashboard.html").exists(),
         };
-        if let Err(e) = storage::register_and_prune(&out_dir, entry, emit_human_stdout)
-            && emit_human_stdout
-        {
-            use colored::Colorize;
-            eprintln!("  {} Index: {}", "\u{26a0}".yellow(), e);
+        if let Err(e) = storage::register_and_prune(&out_dir, entry, emit_human_stdout, || {
+            governor.is_cancelled()
+        }) {
+            if governor.is_cancelled() {
+                restore_latest_symlink(&out_dir, previous_latest.as_deref())?;
+                ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)?;
+                unreachable!("a cancelled governor fails the index seam");
+            }
+            if emit_human_stdout {
+                use colored::Colorize;
+                eprintln!("  {} Index: {}", "\u{26a0}".yellow(), e);
+            }
         }
     }
 

@@ -59,6 +59,7 @@ impl Default for RetentionPolicy {
 // RunIndex
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct RunIndex {
     entries: Vec<RunEntry>,
 }
@@ -1072,22 +1073,55 @@ pub fn register_and_prune(
     out_dir: &Path,
     entry: RunEntry,
     emit_human_stdout: bool,
+    abort: impl Fn() -> bool,
+) -> Result<usize> {
+    register_and_prune_with_policy(
+        out_dir,
+        entry,
+        emit_human_stdout,
+        &RetentionPolicy::default(),
+        abort,
+    )
+}
+
+fn register_and_prune_with_policy(
+    out_dir: &Path,
+    entry: RunEntry,
+    emit_human_stdout: bool,
+    policy: &RetentionPolicy,
+    abort: impl Fn() -> bool,
 ) -> Result<usize> {
     let _lock = acquire_lock()?;
-    let mut index = RunIndex::load();
-    index.append(entry);
+    if abort() {
+        bail!("publication aborted before the run index was committed");
+    }
 
-    let pruned = index.prune(&RetentionPolicy::default(), out_dir);
+    let mut index = RunIndex::load();
+    let previous = index.clone();
+    index.append(entry);
+    let pruned = index.prune(policy, out_dir);
     let pruned_count = pruned.len();
 
-    // Delete pruned directories
+    // Persist the index before deleting anything. A cancel here still leaves
+    // the on-disk index and every historical run directory untouched.
+    if abort() {
+        bail!("publication aborted before the run index was committed");
+    }
+    index.save()?;
+
+    // After the rename the new row is visible. Roll the file back before
+    // deleting older evidence, so a cancel cannot advertise an incomplete
+    // pack or destroy predecessors it did not mean to keep.
+    if abort() {
+        previous.save()?;
+        bail!("publication aborted before the run index was committed");
+    }
+
     for path in &pruned {
         if path.is_dir() {
             let _ = fs::remove_dir_all(path);
         }
     }
-
-    index.save()?;
 
     if emit_human_stdout && pruned_count > 0 {
         use colored::Colorize;
@@ -1589,6 +1623,150 @@ mod tests {
         let mut e = make_entry(id, "myrepo", "main", 100);
         e.path = home.join("runs/myrepo/main").join(id);
         e
+    }
+
+    fn tight_branch_policy() -> RetentionPolicy {
+        RetentionPolicy {
+            max_runs_per_branch: 1,
+            max_runs_per_repo: 200,
+            max_total_bytes: 5 * 1024 * 1024 * 1024,
+        }
+    }
+
+    fn abort_on_check(n: usize) -> impl Fn() -> bool {
+        let hits = std::sync::atomic::AtomicUsize::new(0);
+        move || hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= n
+    }
+
+    /// Cancel before the index rename must leave historical runs on disk and
+    /// omit the new row — prune is not allowed to race the abort.
+    #[test]
+    fn register_abort_before_save_keeps_predecessor_evidence() {
+        with_prview_home(|home| {
+            let first = live_entry(home, "first");
+            let first_dir = first.path.clone();
+            super::register_and_prune_with_policy(
+                &first_dir,
+                first,
+                false,
+                &tight_branch_policy(),
+                abort_on_check(usize::MAX),
+            )
+            .expect("predecessor published");
+
+            let second = live_entry(home, "second");
+            let second_dir = second.path.clone();
+            let err = super::register_and_prune_with_policy(
+                &second_dir,
+                second,
+                false,
+                &tight_branch_policy(),
+                abort_on_check(2),
+            )
+            .expect_err("abort before save");
+            assert!(
+                err.to_string().contains("publication aborted"),
+                "got {err:#}"
+            );
+
+            let ids: Vec<String> = RunIndex::load()
+                .entries()
+                .iter()
+                .map(|e| e.id.clone())
+                .collect();
+            assert_eq!(ids, vec!["first".to_string()]);
+            assert!(
+                first_dir.is_dir(),
+                "predecessor directory must survive an abort before save"
+            );
+            assert!(
+                second_dir.is_dir(),
+                "the unpublished pack directory is not deleted by index abort"
+            );
+        });
+    }
+
+    /// Cancel after the index rename, before prune, must restore the previous
+    /// index and keep the predecessor directory.
+    #[test]
+    fn register_abort_after_save_rolls_index_back_without_pruning() {
+        with_prview_home(|home| {
+            let first = live_entry(home, "first");
+            let first_dir = first.path.clone();
+            super::register_and_prune_with_policy(
+                &first_dir,
+                first,
+                false,
+                &tight_branch_policy(),
+                abort_on_check(usize::MAX),
+            )
+            .expect("predecessor published");
+
+            let second = live_entry(home, "second");
+            let second_dir = second.path.clone();
+            super::register_and_prune_with_policy(
+                &second_dir,
+                second,
+                false,
+                &tight_branch_policy(),
+                abort_on_check(3),
+            )
+            .expect_err("abort after save");
+
+            let ids: Vec<String> = RunIndex::load()
+                .entries()
+                .iter()
+                .map(|e| e.id.clone())
+                .collect();
+            assert_eq!(
+                ids,
+                vec!["first".to_string()],
+                "rolled-back index must not advertise the cancelled pack: {ids:?}"
+            );
+            assert!(
+                first_dir.is_dir(),
+                "predecessor evidence must not be deleted after a rolled-back save"
+            );
+        });
+    }
+
+    #[test]
+    fn register_success_prunes_after_commit() {
+        with_prview_home(|home| {
+            let first = live_entry(home, "first");
+            let first_dir = first.path.clone();
+            super::register_and_prune_with_policy(
+                &first_dir,
+                first,
+                false,
+                &tight_branch_policy(),
+                abort_on_check(usize::MAX),
+            )
+            .expect("predecessor published");
+
+            let second = live_entry(home, "second");
+            let second_dir = second.path.clone();
+            super::register_and_prune_with_policy(
+                &second_dir,
+                second,
+                false,
+                &tight_branch_policy(),
+                abort_on_check(usize::MAX),
+            )
+            .expect("successor published");
+
+            let ids: Vec<String> = RunIndex::load()
+                .entries()
+                .iter()
+                .map(|e| e.id.clone())
+                .collect();
+            assert_eq!(ids, vec!["second".to_string()]);
+            assert!(
+                !first_dir.is_dir(),
+                "retention prune runs only after a committed index save"
+            );
+            assert!(second_dir.is_dir());
+        });
     }
 
     #[test]

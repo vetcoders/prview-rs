@@ -1098,8 +1098,10 @@ generation, success-shaped verdict/report/RUN/MANIFEST/SANITY surfaces are
 removed and `00_summary/INCOMPLETE.json` records `status=incomplete`, the reason,
 and the interrupted stage. The `latest` symlink and the run-index row are
 written only after that last cancellation check. If Ctrl-C lands after `latest`
-is retargeted and before the index append, the previous alias is restored and
-the incomplete pack is not advertised. The run ends in `Cancelled` and exit `130`.
+is retargeted, the previous alias is restored. The index append itself is
+abortable: the file is saved only while the run is still active, rolled back if
+cancel arrives before older run directories are deleted, and prune of historical
+evidence runs only after that check. The run ends in `Cancelled` and exit `130`.
 
 `--update` needs a gate of its own (`App::reuse_unchanged_run`), because it is
 the one path that returns a report without reaching any of the others: an
