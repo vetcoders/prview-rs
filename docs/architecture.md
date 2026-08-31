@@ -706,9 +706,10 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   (`check_id_from_name`): a skipped gate is `tsc`, `cargo` or `tests`, never the
   slug of its display name, so a consumer can pair the skip with the gate it
   belongs to. `REPORT.json.checks_skipped[]` carries the same id. The
-  synthetic `heuristics_loctree` row is included: Loctree runs in-process rather
-  than as a subprocess (`command` is `loctree (in-process)`), but it still reads
-  a tree — the `git archive` extraction of the target commit in snapshot mode,
+  synthetic `heuristics_loctree` row is included: Loctree cache creation runs in
+  a private governed worker (`command` is `prview loctree worker (internal)`),
+  while snapshot interpretation stays in-process. It reads a tree — the `git
+  archive` extraction of the target commit in snapshot mode,
   or `repo_root` when no snapshot could be made — and a gating signal whose
   substrate is unstated is unauditable.
 
@@ -1162,8 +1163,11 @@ pre-step was not, and outside a scope `register_active_child` is a no-op, so
 running. It is scoped now, takes an `Exclusive` permit, passes the run's worker
 limit to uv's download/build/install pools, and refuses to start on an
 already-cancelled run. The
-heuristics stage needs no scope — it spawns no processes; loctree runs in-process
-behind `spawn_blocking`.
+Loctree cache creation is the exception: the synchronous third-party scan runs
+in a private current-executable worker under its own child scope. Cancelling the
+review therefore kills the scan process itself; it never relies on aborting an
+already-started `spawn_blocking` closure. Snapshot interpretation remains
+in-process and cooperatively checks cancellation.
 
 `--tui` is deliberately NOT wrapped: it puts the terminal in raw mode, so Ctrl-C
 arrives as a Control-C key event and the TUI routes it through the same

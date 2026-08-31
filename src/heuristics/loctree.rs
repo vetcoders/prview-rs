@@ -1,4 +1,4 @@
-//! Loctree-suite integration (direct library usage)
+//! Loctree-suite integration (governed worker scan + library analysis)
 //!
 //! Uses loctree as a library for comprehensive code analysis:
 //! - Dead code / unused exports detection
@@ -9,7 +9,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-#[cfg(test)]
 use std::sync::Arc;
 
 // Import loctree library directly
@@ -17,6 +16,19 @@ use loctree::analyzer::twins::detect_exact_twins;
 use loctree::analyzer::{cycles, dead_parrots, twins};
 use loctree::args::ParsedArgs;
 use loctree::snapshot::{Snapshot, project_cache_dir};
+
+pub const LOCTREE_WORKER_ROOT_ENV: &str = "PRVIEW_INTERNAL_LOCTREE_WORKER_ROOT";
+const LOCTREE_WORKER_TIMEOUT_SECS: u64 = 300;
+
+/// Private current-executable worker entrypoint.
+///
+/// Loctree's synchronous library scan cannot observe prview's cancellation
+/// token; a governed process boundary is the hard-stop contract.
+pub fn run_loctree_worker(root: &Path) -> Result<()> {
+    let roots = vec![root.to_path_buf()];
+    loctree::snapshot::run_init(&roots, &ParsedArgs::default())
+        .context("Failed to run loctree worker scan")
+}
 
 /// Loctree-suite analysis results
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -109,7 +121,7 @@ fn is_valid_dead_export_symbol(symbol: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-/// Run loctree analysis using the library directly (no subprocess!)
+/// Run loctree analysis, using a governed worker for cache creation.
 pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
     let governor = crate::governor::current_run_governor();
     ensure_not_cancelled(governor.as_deref())?;
@@ -122,7 +134,7 @@ pub async fn run_loctree(root: &Path) -> Result<LoctreeAnalysis> {
     // branch in `run_all` and keeps the zeroed summary out of regression deltas
     // (a failed scan would otherwise read as a real +N/-N change against the
     // other side).
-    let snapshot = match load_or_create_snapshot(root, governor.as_deref()).await {
+    let snapshot = match load_or_create_snapshot(root, governor.clone()).await {
         Ok(s) => s,
         Err(e) => {
             return Err(e.context("loctree analysis unavailable (snapshot load/create failed)"));
@@ -276,9 +288,9 @@ fn schema_major_minor(version: &str) -> &str {
 /// stale data from older loctree versions producing false positives.
 async fn load_or_create_snapshot(
     root: &std::path::Path,
-    governor: Option<&crate::governor::ResourceGovernor>,
+    governor: Option<Arc<crate::governor::ResourceGovernor>>,
 ) -> Result<Snapshot> {
-    ensure_not_cancelled(governor)?;
+    ensure_not_cancelled(governor.as_deref())?;
     let expected = loctree::snapshot::SNAPSHOT_SCHEMA_VERSION;
 
     // Try loading existing snapshot first
@@ -291,7 +303,7 @@ async fn load_or_create_snapshot(
             // on staleness. is_stale() returns false for non-git dirs (extracted
             // base/target snapshots), so remote-mode scans are unaffected.
             if !snapshot.is_stale(root) {
-                ensure_not_cancelled(governor)?;
+                ensure_not_cancelled(governor.as_deref())?;
                 return Ok(snapshot);
             }
             eprintln!("  [loctree] Snapshot stale (HEAD moved or worktree dirty), re-scanning");
@@ -303,33 +315,8 @@ async fn load_or_create_snapshot(
         }
     }
 
-    // Create new snapshot by scanning
-    let roots = vec![root.to_path_buf()];
-    let parsed = ParsedArgs::default();
-
-    let roots_clone = roots.clone();
-    let parsed_clone = parsed.clone();
-    let mut scan = tokio::task::spawn_blocking(move || {
-        loctree::snapshot::run_init(&roots_clone, &parsed_clone)
-    });
-    let scan_result = if let Some(governor) = governor {
-        tokio::select! {
-            biased;
-            _ = governor.cancelled() => {
-                // This prevents a queued blocking scan from starting. Tokio
-                // cannot preempt one already inside third-party synchronous
-                // code, but the run stops awaiting it and can never publish a
-                // success-shaped heuristics result or final review pack.
-                scan.abort();
-                return Err(crate::governor::Cancelled.into());
-            }
-            result = &mut scan => result?,
-        }
-    } else {
-        scan.await?
-    };
-    scan_result.context("Failed to run loctree scan")?;
-    ensure_not_cancelled(governor)?;
+    create_snapshot(root, governor.clone()).await?;
+    ensure_not_cancelled(governor.as_deref())?;
 
     // Load from the exact cache path where run_init() saves (not Snapshot::load()
     // which may still pick up a legacy .loctree/ snapshot before the new cache entry).
@@ -339,8 +326,60 @@ async fn load_or_create_snapshot(
         .with_context(|| format!("Failed to read snapshot from {}", snapshot_path.display()))?;
     let snapshot: Snapshot =
         serde_json::from_str(&content).context("Failed to parse freshly created snapshot")?;
-    ensure_not_cancelled(governor)?;
+    ensure_not_cancelled(governor.as_deref())?;
     Ok(snapshot)
+}
+
+#[cfg(not(test))]
+async fn create_snapshot(
+    root: &Path,
+    governor: Option<Arc<crate::governor::ResourceGovernor>>,
+) -> Result<()> {
+    let executable = std::env::current_exe().context("resolve prview loctree worker executable")?;
+    let mut command = tokio::process::Command::new(executable);
+    command.env(LOCTREE_WORKER_ROOT_ENV, root);
+    let output = run_worker_command(command, governor).await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "loctree worker failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+async fn create_snapshot(
+    root: &Path,
+    _governor: Option<Arc<crate::governor::ResourceGovernor>>,
+) -> Result<()> {
+    // A libtest executable cannot enter `src/main.rs`'s private worker mode.
+    // Functional snapshot tests stay in-process; the governed process boundary
+    // is covered separately by `worker_process_is_killed_on_cancel`.
+    let roots = vec![root.to_path_buf()];
+    let parsed = ParsedArgs::default();
+    tokio::task::spawn_blocking(move || loctree::snapshot::run_init(&roots, &parsed))
+        .await?
+        .context("Failed to run loctree scan")
+}
+
+async fn run_worker_command(
+    command: tokio::process::Command,
+    governor: Option<Arc<crate::governor::ResourceGovernor>>,
+) -> Result<std::process::Output> {
+    let run = crate::proc::run_capture_with_timeout(
+        command,
+        std::time::Duration::from_secs(LOCTREE_WORKER_TIMEOUT_SECS),
+        "loctree worker",
+        || anyhow::anyhow!("loctree worker timed out after {LOCTREE_WORKER_TIMEOUT_SECS}s"),
+    );
+    let output = if let Some(governor) = governor.as_ref() {
+        crate::governor::with_child_scope(Arc::clone(governor), "Loctree", run).await
+    } else {
+        run.await
+    }?;
+    ensure_not_cancelled(governor.as_deref())?;
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -393,36 +432,62 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancellation_stops_a_long_snapshot_without_a_success_result() {
-        let repo = tempfile::tempdir().expect("scan root");
-        for index in 0..4_000 {
-            std::fs::write(
-                repo.path().join(format!("module_{index}.ts")),
-                format!("export const value_{index} = {index};\n"),
-            )
-            .expect("write scan fixture");
+    async fn worker_process_is_killed_on_cancel() {
+        use std::io::Read;
+
+        let temp = tempfile::tempdir().expect("worker fixture");
+        let pidfile = temp.path().join("worker.pid");
+        let late_marker = temp.path().join("late-write");
+        let script = format!(
+            "echo $$ > {}; sleep 30; echo late > {}",
+            pidfile.display(),
+            late_marker.display()
+        );
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(script);
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        let worker_governor = Arc::clone(&governor);
+        let worker =
+            tokio::spawn(async move { run_worker_command(command, Some(worker_governor)).await });
+
+        let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !pidfile.exists() {
+            assert!(
+                std::time::Instant::now() < start_deadline,
+                "worker never entered its synchronous body"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let governor = Arc::new(crate::governor::ResourceGovernor::new());
-        let run_governor = Arc::clone(&governor);
-        let root = repo.path().to_path_buf();
-        let scan = tokio::spawn(async move {
-            crate::governor::with_run_scope(run_governor, async move { run_loctree(&root).await })
-                .await
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let cancelled_at = std::time::Instant::now();
         governor.cancel();
-        let result = tokio::time::timeout(std::time::Duration::from_millis(500), scan)
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), worker)
             .await
-            .expect("loctree call must stop promptly after cancellation")
-            .expect("scan task must not panic")
-            .expect_err("a cancelled scan must not return LoctreeAnalysis");
+            .expect("worker must stop promptly after cancellation")
+            .expect("worker task must not panic")
+            .expect_err("a cancelled worker must not return success");
 
         assert!(crate::governor::is_cancellation(&result));
         assert!(cancelled_at.elapsed() < std::time::Duration::from_millis(500));
+        assert!(
+            !late_marker.exists(),
+            "cancelled worker wrote after its kill"
+        );
+
+        let mut pid = String::new();
+        std::fs::File::open(&pidfile)
+            .expect("worker pidfile")
+            .read_to_string(&mut pid)
+            .expect("read worker pid");
+        let pid: i32 = pid.trim().parse().expect("worker pid");
+        // SAFETY: signal 0 only probes the pid published by this test worker.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[test]

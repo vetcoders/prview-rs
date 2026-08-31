@@ -6,7 +6,10 @@
 
 mod loctree;
 
-pub use loctree::{CycleInfo, DeadExport, DeadParrot, LoctreeAnalysis, TwinsAnalysis, run_loctree};
+pub use loctree::{
+    CycleInfo, DeadExport, DeadParrot, LOCTREE_WORKER_ROOT_ENV, LoctreeAnalysis, TwinsAnalysis,
+    run_loctree, run_loctree_worker,
+};
 
 use crate::Config;
 use anyhow::Result;

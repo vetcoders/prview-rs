@@ -261,8 +261,9 @@ fn heuristics_provenance(
     };
 
     Some(crate::checks::CheckProvenance {
-        // Loctree runs in-process as a library, so there is no argv to record.
-        command: "loctree (in-process)".to_string(),
+        // Cache creation crosses a private governed worker boundary; the
+        // remaining snapshot analysis stays in the parent process.
+        command: "prview loctree worker (internal)".to_string(),
         tool_version: None,
         cwd,
         target_sha: substrate.target_sha,

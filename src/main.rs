@@ -59,6 +59,13 @@ fn display_error(err: &anyhow::Error) {
 }
 
 async fn run() -> Result<()> {
+    // Loctree's library scan is synchronous and cannot be cooperatively
+    // cancelled once entered. The parent review launches this private mode as
+    // a governed child process so Ctrl-C can terminate the scan itself.
+    if let Some(root) = std::env::var_os(prview::heuristics::LOCTREE_WORKER_ROOT_ENV) {
+        return prview::heuristics::run_loctree_worker(Path::new(&root));
+    }
+
     let cli = Cli::parse();
 
     // Force-disable ANSI color for --no-color / --ci before anything prints.

@@ -85,6 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Raw-mode TUI Control-C is handled before wizard/panel routing, and async
   command deadlines now include bounded stdout/stderr drain with reader-task
   cleanup after the child is reaped.
+- Loctree cache creation runs in a private governed worker, so cancelling TUI or
+  headless analysis terminates the synchronous scan instead of merely dropping
+  the awaiting `spawn_blocking` handle.
 - Cold `uv sync` takes the run's Exclusive budget and inherits the configured
   download/build/install concurrency cap.
 - Context commands share one stage timeout instead of minting a fresh deadline
