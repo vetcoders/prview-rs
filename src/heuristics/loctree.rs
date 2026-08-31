@@ -18,6 +18,7 @@ use loctree::args::ParsedArgs;
 use loctree::snapshot::{Snapshot, project_cache_dir};
 
 pub const LOCTREE_WORKER_ROOT_ENV: &str = "PRVIEW_INTERNAL_LOCTREE_WORKER_ROOT";
+#[cfg(any(not(test), unix))]
 const LOCTREE_WORKER_TIMEOUT_SECS: u64 = 300;
 
 /// Private current-executable worker entrypoint.
@@ -363,6 +364,7 @@ async fn create_snapshot(
         .context("Failed to run loctree scan")
 }
 
+#[cfg(any(not(test), unix))]
 async fn run_worker_command(
     command: tokio::process::Command,
     governor: Option<Arc<crate::governor::ResourceGovernor>>,

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub struct WorktreeSnapshot {
     pub repo_root: PathBuf,
     pub worktree_path: PathBuf,
+    registered: bool,
     // Owns the enclosing temp dir; dropped after the worktree is deregistered so
     // the directory removal is the backstop for the `git worktree remove` call.
     _tmp: tempfile::TempDir,
@@ -20,19 +21,55 @@ pub struct WorktreeSnapshot {
 
 impl Drop for WorktreeSnapshot {
     fn drop(&mut self) {
-        // Deregister the worktree from the main repo, then prune bookkeeping.
-        // `--force` is required because the checkout is detached. Errors are
-        // swallowed: cleanup must be best-effort and never panic in a
-        // destructor (the temp-dir removal is the backstop).
-        let _ = git_cmd()
+        // Last-resort cleanup is still owned by the run governor. If the run is
+        // already cancelled, `cleanup` returns immediately without spawning;
+        // TempDir removes the files and a later `git worktree prune` can remove
+        // the stale administrative record. A destructor must never resurrect a
+        // cancelled run with an unbounded raw child.
+        let _ = self.cleanup();
+    }
+}
+
+impl WorktreeSnapshot {
+    /// Deregister this snapshot with owned, cancellable git subprocesses.
+    pub fn cleanup(&mut self) -> Result<()> {
+        if !self.registered {
+            return Ok(());
+        }
+        let mut remove = git_cmd();
+        remove
             .args(["worktree", "remove", "--force"])
             .arg(&self.worktree_path)
-            .current_dir(&self.repo_root)
-            .output();
-        let _ = git_cmd()
+            .current_dir(&self.repo_root);
+        let output = crate::proc::output_governed_with_timeout(
+            remove,
+            "git worktree remove",
+            std::time::Duration::from_secs(60),
+        )?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git worktree remove failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        self.registered = false;
+
+        let mut prune = git_cmd();
+        prune
             .args(["worktree", "prune"])
-            .current_dir(&self.repo_root)
-            .output();
+            .current_dir(&self.repo_root);
+        let output = crate::proc::output_governed_with_timeout(
+            prune,
+            "git worktree prune",
+            std::time::Duration::from_secs(60),
+        )?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git worktree prune failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -43,12 +80,17 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
     // subdirectory of the temp dir rather than the (already-created) temp root.
     let worktree_path = tmp.path().join("snapshot");
 
-    let output = git_cmd()
+    let mut command = git_cmd();
+    command
         .args(["worktree", "add", "--detach", "--force"])
         .arg(&worktree_path)
         .arg(commit)
-        .current_dir(repo_root)
-        .output()?;
+        .current_dir(repo_root);
+    let output = crate::proc::output_governed_with_timeout(
+        command,
+        "git worktree add",
+        std::time::Duration::from_secs(60),
+    )?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -71,6 +113,7 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
     Ok(WorktreeSnapshot {
         repo_root: repo_root.to_path_buf(),
         worktree_path,
+        registered: true,
         _tmp: tmp,
     })
 }

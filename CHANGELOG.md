@@ -18,14 +18,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MCP Quick and Deep reserve their output path through a private one-shot nonce
+  before launching the child, then adopt only that fresh control-only directory.
+  Public `--output-dir` remains immutable and cannot reuse an existing pack;
+  `--watch` rejects a fixed explicit output path because every iteration needs a
+  distinct pack. Mutable MCP liveness/log files remain readable beside the pack
+  but are excluded from its manifest and ZIP.
+- Retention authority rejects every Windows reparse point, including junctions
+  and mount points that are not reported as symlinks. Pre-rename validation,
+  transaction recovery, every intermediate identity component, and recursive
+  cleanup all use the same owned-file/directory predicate and never traverse an
+  external target. Identity and manifest files on Unix must also own their inode
+  rather than be hard links.
 - Windows check and context-command trees are owned by Job Objects, so a
   successful wrapper cannot orphan descendants by exiting before prview reaps
-  it; the `windows-latest` job proves both root-exits-first paths.
+  it. Synchronous Git/pipeline/context cleanup uses the live Job Object first
+  and `taskkill` only as a fallback; a dual termination failure returns from
+  cancellation instead of entering an unbounded wait. The `windows-latest` job
+  proves cancel and root-exits-first paths.
 - Primitive integer enum representations (`repr(u8)` through `repr(isize)`) are
   ABI-sensitive in Rust API deltas, including non-exhaustive variant additions.
 - Unparseable and non-UTF-8 rootless Cargo manifests fail crate discovery closed
   as `WorkspaceDiscovery` uncertainty instead of letting a parseable fixture
   become the product authority.
+- Parseable Cargo manifests that define neither `[package]` nor `[workspace]`
+  are invalid authorities rather than invisible files. A root manifest emits
+  typed manifest uncertainty, a rootless candidate prevents sibling selection,
+  and a manifest cannot combine `[workspace]` with `package.workspace`.
 - Inherited, `pub(crate)`, and `pub(super)` fields share one external-private
   Rust API visibility while their types and tuple positions remain observable.
 - `uv sync` preserves an operator's stricter inherited `UV_CONCURRENT_*` caps
@@ -80,6 +99,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancellable.
   If a custom output filesystem cannot be staged atomically, retention is
   skipped with a warning while the new row and all predecessor rows are kept.
+  `latest` and `index.jsonl` are one globally serialized, restart-recoverable
+  publication: a durable journal reconciles crashes at either boundary.
+  During migration, the **index critical section** remains mutually exclusive
+  with pre-0.8 create-new sentinels. This cannot serialize the whole legacy
+  publication: a pre-0.8 binary retargets `latest` before it attempts that
+  sentinel. Operators must therefore drain and exclude every pre-0.8 publisher
+  before the 0.8 cutover; only 0.8-to-0.8 publication is end-to-end
+  transactional. A stale legacy sentinel fails closed and requires explicit
+  operator removal after old publishers are ruled out. Lock and journal paths
+  refuse links that could redirect truncation, and journal writes use owned
+  unique temp files.
 - Repo-backed crate discovery follows workspace `members`/`exclude` (or the
   single root package). Fixture and tool `Cargo.toml` files are not product API.
 - Multiple independent workspaces without a root `Cargo.toml` now fail closed
@@ -92,9 +122,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allowlist.
 - Private-field type changes on a public struct (for example `u8` → `Rc<()>`,
   which drops `Send`/`Sync`) change the parent contract, while a pure private
-  field reorder under the default/`repr(Rust)` layout does not.
+  field reorder under the default/`repr(Rust)` layout does not. An informational
+  field addition to a non-exhaustive struct cannot mask a simultaneous repr,
+  generic, attribute, or private-field change; public fields are identified by
+  visibility rather than collision-prone synthetic names.
+- Public signatures that depend on transitive non-public local types or their
+  local trait impls now emit guard-aware `PrivateTypeDependency` uncertainty
+  instead of overclaiming a compiler-derived breaking fact. Private imports,
+  module aliases, and unreachable-module reexports participate in that closure.
+- A root package that declares `package.workspace` is resolved through that
+  workspace's complete member authority instead of being treated as an
+  isolated package; missing, invalid, or incomplete workspace membership fails
+  closed as `WorkspaceDiscovery` uncertainty.
 - TUI/headless `git fetch` and `git archive | tar` register with the run
-  governor, so q/Escape/Ctrl-C can stop the sync phase.
+  governor, so q/Escape/Ctrl-C can stop the sync phase. Headless provenance,
+  target/base snapshot creation, watch-mode Git state probes, and TUI preflight
+  also run only after an interrupt supervisor is active; TUI preflight happens
+  before raw terminal mode.
 - Raw-mode TUI Control-C is handled before wizard/panel routing, and async
   command deadlines now include bounded stdout/stderr drain with reader-task
   cleanup after the child is reaped.
@@ -214,7 +258,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cargo, Vitest, Semgrep, TSC, ESLint, and Stylelint processes. A green receipt
   can no longer be produced by the narrower Rust-plus-Vitest subset. Its census
   separates Semgrep RPC coordinators from scan workers, and exact-SHA receipts
-  require a clean source tree at the claimed commit.
+  require a clean source tree at the claimed commit. The harness deliberately
+  omits `--resource-budget`, so it proves the bare `--deep` CLI default itself
+  resolves to the safe one-parent/one-child plan.
+- Rust trait-impl unknown evidence resolves top-level trait/owner aliases
+  (including reference, pointer, slice, and array owners) to guarded nominal
+  pairs and compares ordinary associated items independently of source order.
+  Declaring scope remains fail-closed for relative names; aliases used only in
+  generic arguments remain typed uncertainty until compiler-backed resolution.
+- Alias-resolution exhaustion is structural, never paired away as an equal
+  partial proof, and cannot be spoofed by matching diagnostic text.
+- Retention recovery validates a staged payload's RUN identity before any move
+  or deletion. Missing, invalid, or mismatched transaction metadata preserves
+  evidence without blocking later publication, while I/O failures after
+  mutation still abort. An unconfirmed previous-index rollback keeps the outer
+  durable journal for the next lock owner. Relative custom output paths become
+  absolute before publication, and a custom path must be newly claimed for one
+  immutable pack rather than reused by multiple history rows. Unix/macOS parent-directory fsync defines the
+  power-loss ordering; other platforms do not claim that durability tier.
 - Quality checks and context commands now run under one machine-wide budget
   (`ResourceGovernor`) instead of each stage picking its own fan-out. Checks
   declare `Light` or `Heavy` via `Check::resource_weight`; unspecified checks

@@ -2,6 +2,33 @@
 
 use super::*;
 
+#[cfg(unix)]
+use anyhow::Context;
+#[cfg(unix)]
+use serde::{Deserialize, Serialize};
+
+/// Durable intent for the only cross-file part of run publication.
+///
+/// `index.jsonl` and the per-branch `latest` symlink cannot be replaced in one
+/// filesystem operation. This record lets the next publisher reconcile an
+/// interrupted process to the persisted index while holding the same global
+/// publication lock.
+#[cfg(unix)]
+#[derive(Debug, Serialize, Deserialize)]
+struct LatestPublicationRecord {
+    schema: u8,
+    out_dir: Vec<u8>,
+    previous_target: Option<Vec<u8>>,
+}
+
+#[cfg(unix)]
+pub(crate) struct LatestPublication {
+    record: LatestPublicationRecord,
+}
+
+#[cfg(not(unix))]
+pub(crate) struct LatestPublication;
+
 pub(super) fn generate_file_status(dir: &Path, diffs: &[Diff]) -> Result<()> {
     let mut content = String::new();
 
@@ -42,59 +69,424 @@ pub(super) fn generate_commit_list(dir: &Path, diffs: &[Diff]) -> Result<()> {
     Ok(())
 }
 
-/// Create a `latest` symlink in the parent of `out_dir` pointing to `out_dir`'s basename
-#[cfg(unix)]
-pub(super) fn create_latest_symlink(out_dir: &Path) -> Result<()> {
+/// Create `latest` and return the target it replaced in the same critical section.
+#[cfg(all(test, unix))]
+fn create_latest_symlink(out_dir: &Path) -> Result<Option<std::ffi::OsString>> {
     if let (Some(parent), Some(basename)) = (out_dir.parent(), out_dir.file_name()) {
-        let latest_link = parent.join("latest");
-        let _ = fs::remove_file(&latest_link);
-        std::os::unix::fs::symlink(basename, &latest_link)?;
+        return with_latest_lock(parent, || {
+            let previous = match fs::read_link(parent.join("latest")) {
+                Ok(target) => Some(target.into_os_string()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            replace_latest_target(parent, basename)?;
+            Ok(previous)
+        });
     }
-    Ok(())
-}
-
-/// Windows has no pack-level `latest` alias; keep the caller contract a no-op.
-#[cfg(not(unix))]
-pub(super) fn create_latest_symlink(_out_dir: &Path) -> Result<()> {
-    Ok(())
-}
-
-/// Basename currently advertised by the parent `latest` symlink, if any.
-#[cfg(unix)]
-pub(super) fn peek_latest_target(out_dir: &Path) -> Option<std::ffi::OsString> {
-    let parent = out_dir.parent()?;
-    fs::read_link(parent.join("latest"))
-        .ok()
-        .map(|target| target.into_os_string())
-}
-
-#[cfg(not(unix))]
-pub(super) fn peek_latest_target(_out_dir: &Path) -> Option<std::ffi::OsString> {
-    None
+    Ok(None)
 }
 
 /// Put `latest` back to `previous`, or remove it when this run created the alias.
-#[cfg(unix)]
-pub(super) fn restore_latest_symlink(
-    out_dir: &Path,
-    previous: Option<&std::ffi::OsStr>,
-) -> Result<()> {
-    let Some(parent) = out_dir.parent() else {
+#[cfg(all(test, unix))]
+fn restore_latest_symlink(out_dir: &Path, previous: Option<&std::ffi::OsStr>) -> Result<()> {
+    let (Some(parent), Some(our_target)) = (out_dir.parent(), out_dir.file_name()) else {
         return Ok(());
     };
+    with_latest_lock(parent, || {
+        restore_latest_target_unlocked(parent, our_target, previous)
+    })
+}
+
+#[cfg(unix)]
+fn restore_latest_target_unlocked(
+    parent: &Path,
+    our_target: &std::ffi::OsStr,
+    previous: Option<&std::ffi::OsStr>,
+) -> Result<()> {
     let latest_link = parent.join("latest");
-    let _ = fs::remove_file(&latest_link);
+    let current = match fs::read_link(&latest_link) {
+        Ok(current) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if current.as_os_str() != our_target {
+        return Ok(());
+    }
     if let Some(name) = previous {
-        std::os::unix::fs::symlink(name, &latest_link)?;
+        replace_latest_target(parent, name)
+    } else {
+        fs::remove_file(latest_link)?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("Failed to sync latest directory {}", parent.display()))?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn latest_publication_record_path() -> PathBuf {
+    crate::config::prview_home().join("publication-transaction.json")
+}
+
+#[cfg(unix)]
+fn capture_native_path(path: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn restore_native_path(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
+}
+
+#[cfg(unix)]
+fn validate_latest_target_name(target: &std::ffi::OsStr) -> Result<()> {
+    let mut components = Path::new(target).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) if name != "latest" => Ok(()),
+        _ => anyhow::bail!(
+            "latest target must be one local pack directory name, got {:?}",
+            target
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn validate_recovery_pack_identity(out_dir: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(out_dir).with_context(|| {
+        format!(
+            "Publication transaction points to missing pack {}",
+            out_dir.display()
+        )
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "Publication transaction pack is not an owned directory: {}",
+            out_dir.display()
+        );
+    }
+    let run_path = out_dir.join("00_summary").join("RUN.json");
+    let run: serde_json::Value =
+        serde_json::from_slice(&fs::read(&run_path).with_context(|| {
+            format!(
+                "Publication transaction pack has no readable identity {}",
+                run_path.display()
+            )
+        })?)
+        .with_context(|| format!("Invalid publication pack identity {}", run_path.display()))?;
+    let Some(recorded_root) = run
+        .get("artifacts_root")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+    else {
+        anyhow::bail!(
+            "Publication pack identity has no artifacts_root: {}",
+            run_path.display()
+        );
+    };
+    let same_path = recorded_root == out_dir
+        || (fs::canonicalize(&recorded_root).ok() == fs::canonicalize(out_dir).ok()
+            && fs::canonicalize(out_dir).is_ok());
+    if !same_path {
+        anyhow::bail!(
+            "Publication transaction path {} does not match pack identity {}",
+            out_dir.display(),
+            recorded_root.display()
+        );
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-pub(super) fn restore_latest_symlink(
-    _out_dir: &Path,
-    _previous: Option<&std::ffi::OsStr>,
+#[cfg(unix)]
+fn write_latest_publication_record(record: &LatestPublicationRecord) -> Result<()> {
+    let path = latest_publication_record_path();
+    write_latest_publication_record_at(&path, record)
+}
+
+#[cfg(unix)]
+fn write_latest_publication_record_at(path: &Path, record: &LatestPublicationRecord) -> Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("publication transaction has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let (temp, mut file) = crate::storage::create_owned_temp_file(parent, "publication-journal")?;
+    let write_result = (|| -> Result<()> {
+        serde_json::to_writer(&mut file, record)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = crate::storage::atomic_replace_file(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn clear_latest_publication_record() -> Result<()> {
+    let path = latest_publication_record_path();
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                let _ = File::open(parent).and_then(|directory| directory.sync_all());
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Preserve an invalid crash journal as evidence without letting it permanently
+/// deny every later publication. The destination is an owned create-new file,
+/// so the rename cannot overwrite an operator file even if names collide.
+#[cfg(unix)]
+fn quarantine_invalid_latest_publication_record(
+    path: &Path,
+    reason: &anyhow::Error,
+) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("publication transaction has no parent"))?;
+    let (quarantine, placeholder) =
+        crate::storage::create_owned_temp_file(parent, "publication-transaction.invalid")?;
+    drop(placeholder);
+    if let Err(error) = fs::rename(path, &quarantine) {
+        let _ = fs::remove_file(&quarantine);
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to quarantine invalid publication transaction {}",
+                path.display()
+            )
+        });
+    }
+    if let Ok(directory) = File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    eprintln!(
+        "prview: preserved invalid publication journal as {} and will continue: {reason:#}",
+        quarantine.display()
+    );
+    Ok(quarantine)
+}
+
+/// Reconcile a hard-crashed publication to the durable index.
+///
+/// The index is the canonical ordered publication ledger. If it contains a
+/// later run for the same branch directory, that run wins; otherwise the saved
+/// predecessor is restored only while the interrupted run still owns `latest`.
+#[cfg(unix)]
+pub(crate) fn recover_latest_publication(
+    _publication: &crate::storage::RunPublicationLock,
 ) -> Result<()> {
+    let path = latest_publication_record_path();
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let recovery = (|| -> Result<()> {
+        let record: LatestPublicationRecord = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Invalid publication transaction {}", path.display()))?;
+        reconcile_latest_publication_record(&record, true)
+    })();
+    match recovery {
+        Ok(()) => clear_latest_publication_record(),
+        Err(error) => {
+            quarantine_invalid_latest_publication_record(&path, &error)?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reconcile_latest_publication_record(
+    record: &LatestPublicationRecord,
+    validate_persisted_identity: bool,
+) -> Result<()> {
+    if record.schema != 1 {
+        anyhow::bail!(
+            "Unsupported latest publication transaction schema {}",
+            record.schema
+        );
+    }
+    let out_dir = restore_native_path(record.out_dir.clone());
+    if validate_persisted_identity {
+        validate_recovery_pack_identity(&out_dir)?;
+    }
+    let Some(parent) = out_dir.parent() else {
+        return Ok(());
+    };
+    let indexed_target = crate::storage::RunIndex::load()
+        .entries()
+        .iter()
+        .rev()
+        .filter(|entry| entry.path.parent() == Some(parent))
+        .find_map(|entry| {
+            // A syntactically valid index row is not current filesystem truth:
+            // retention, an operator, or a crash can leave a stale path, and a
+            // same-parent directory can be substituted independently. Recovery
+            // may advertise only a live owned pack whose RUN identity agrees.
+            if validate_recovery_pack_identity(&entry.path).is_ok() {
+                entry.path.file_name().map(std::ffi::OsStr::to_owned)
+            } else {
+                None
+            }
+        });
+
+    if let Some(target) = indexed_target {
+        replace_latest_target(parent, &target)
+    } else {
+        let previous = record
+            .previous_target
+            .clone()
+            .map(restore_native_path)
+            .map(PathBuf::into_os_string);
+        if let Some(previous) = previous.as_deref() {
+            validate_latest_target_name(previous)?;
+        }
+        let Some(our_target) = out_dir.file_name() else {
+            return Ok(());
+        };
+        restore_latest_target_unlocked(parent, our_target, previous.as_deref())
+    }
+}
+
+/// Publish this run's alias after first durably recording how to recover it.
+#[cfg(unix)]
+pub(crate) fn begin_latest_publication(
+    publication: &crate::storage::RunPublicationLock,
+    out_dir: &Path,
+) -> Result<LatestPublication> {
+    recover_latest_publication(publication)?;
+    let (Some(parent), Some(target)) = (out_dir.parent(), out_dir.file_name()) else {
+        return Ok(LatestPublication {
+            record: LatestPublicationRecord {
+                schema: 1,
+                out_dir: capture_native_path(out_dir.as_os_str()),
+                previous_target: None,
+            },
+        });
+    };
+    let previous_target = match fs::read_link(parent.join("latest")) {
+        Ok(previous) => {
+            validate_latest_target_name(previous.as_os_str())?;
+            Some(capture_native_path(previous.as_os_str()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let record = LatestPublicationRecord {
+        schema: 1,
+        out_dir: capture_native_path(out_dir.as_os_str()),
+        previous_target,
+    };
+    write_latest_publication_record(&record)?;
+    // Keep the journal on every alias-publication error. The rename may already
+    // have succeeded and only its parent fsync failed; clearing intent in that
+    // state would make a power-loss rollback unrecoverable. A later publisher
+    // reconciles both pre-rename and post-rename failures idempotently.
+    replace_latest_target(parent, target)?;
+    Ok(LatestPublication { record })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn begin_latest_publication(
+    _publication: &crate::storage::RunPublicationLock,
+    _out_dir: &Path,
+) -> Result<LatestPublication> {
+    Ok(LatestPublication)
+}
+
+/// Complete a successful publication. Failure to remove the journal is safe:
+/// the next publisher will idempotently reconcile it to the committed index.
+#[cfg(unix)]
+pub(crate) fn finish_latest_publication(_transaction: &LatestPublication) -> Result<()> {
+    clear_latest_publication_record()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn finish_latest_publication(_transaction: &LatestPublication) -> Result<()> {
+    Ok(())
+}
+
+/// Resolve an aborted or failed publication from the index while the shared
+/// lock is still held, then clear its durable intent.
+#[cfg(unix)]
+pub(crate) fn rollback_latest_publication(transaction: &LatestPublication) -> Result<()> {
+    // This record was built in this process from the live output path. Pack
+    // identity validation is for a journal read back after a crash; applying it
+    // here can prevent the cancellation rollback it is meant to protect.
+    reconcile_latest_publication_record(&transaction.record, false)?;
+    clear_latest_publication_record()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn rollback_latest_publication(_transaction: &LatestPublication) -> Result<()> {
+    Ok(())
+}
+
+/// Serialize standalone alias helpers. Production publication holds the
+/// stronger global RunPublicationLock and performs cancellation rollback as a
+/// short uninterruptible consistency operation.
+#[cfg(all(test, unix))]
+fn with_latest_lock<T>(parent: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock_path = parent.join(".latest.lock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match crate::storage::acquire_lock_at(&lock_path) {
+            Ok(_guard) => return operation(),
+            Err(error)
+                if error
+                    .to_string()
+                    .starts_with("Index lock held by another live process")
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Replace `latest` with one atomic rename, so readers never observe the gap
+/// produced by remove-then-symlink and concurrent publishers have a total order.
+#[cfg(unix)]
+fn replace_latest_target(parent: &Path, target: &std::ffi::OsStr) -> Result<()> {
+    validate_latest_target_name(target)?;
+    let latest_link = parent.join("latest");
+    match fs::symlink_metadata(&latest_link) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {}
+        Ok(_) => anyhow::bail!(
+            "Refusing to replace non-symlink latest entry {}",
+            latest_link.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staged = parent.join(format!(".latest.{}.{nonce}", std::process::id()));
+    std::os::unix::fs::symlink(target, &staged)?;
+    if let Err(error) = fs::rename(&staged, &latest_link) {
+        let _ = fs::remove_file(&staged);
+        return Err(error.into());
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("Failed to sync latest directory {}", parent.display()))?;
     Ok(())
 }
 
@@ -573,4 +965,299 @@ pub(super) fn generate_full_patch(
 
     fs::write(dir.join("full.patch"), content)?;
     Ok(patch_texts)
+}
+
+#[cfg(all(test, unix))]
+mod latest_tests {
+    use super::*;
+
+    fn run_entry(path: &Path, id: &str) -> crate::storage::RunEntry {
+        crate::storage::RunEntry {
+            id: id.to_owned(),
+            repo: "repo".to_owned(),
+            branch: "main".to_owned(),
+            commit: id.to_owned(),
+            path: path.to_path_buf(),
+            created_at: format!("2026-08-31T00:00:0{id}Z"),
+            quality_pass: true,
+            merge_status: "ALLOW".to_owned(),
+            policy_mode: "warn".to_owned(),
+            checks_passed: 1,
+            checks_failed: 0,
+            files_changed: 1,
+            size_bytes: 1,
+            has_dashboard: false,
+        }
+    }
+
+    fn write_pack_identity(path: &Path) {
+        fs::create_dir_all(path.join("00_summary")).unwrap();
+        fs::write(
+            path.join("00_summary/RUN.json"),
+            serde_json::json!({"artifacts_root": path}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn latest_publication_refuses_to_overwrite_a_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let latest = root.path().join("latest");
+        fs::write(&latest, "operator-owned").unwrap();
+
+        let error = replace_latest_target(root.path(), std::ffi::OsStr::new("run"))
+            .expect_err("a regular latest file is outside the symlink protocol");
+
+        assert!(error.to_string().contains("non-symlink"));
+        assert_eq!(fs::read_to_string(latest).unwrap(), "operator-owned");
+    }
+
+    #[test]
+    fn recovery_refuses_a_journal_whose_pack_identity_disagrees() {
+        let root = tempfile::tempdir().unwrap();
+        let out_dir = root.path().join("run");
+        fs::create_dir_all(out_dir.join("00_summary")).unwrap();
+        fs::write(
+            out_dir.join("00_summary/RUN.json"),
+            serde_json::json!({"artifacts_root": root.path().join("different")}).to_string(),
+        )
+        .unwrap();
+        fs::write(root.path().join("latest"), "operator-owned").unwrap();
+        let record = LatestPublicationRecord {
+            schema: 1,
+            out_dir: capture_native_path(out_dir.as_os_str()),
+            previous_target: None,
+        };
+
+        let error = reconcile_latest_publication_record(&record, true)
+            .expect_err("tampered journal identity must fail closed");
+
+        assert!(error.to_string().contains("does not match pack identity"));
+        assert_eq!(
+            fs::read_to_string(root.path().join("latest")).unwrap(),
+            "operator-owned"
+        );
+    }
+
+    #[test]
+    fn recovery_quarantines_a_missing_pack_journal_and_allows_the_next_publication() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let branch = home.path().join("runs/repo/main");
+        let first = branch.join("first");
+        write_pack_identity(&first);
+        symlink("first", branch.join("latest")).unwrap();
+
+        let missing = branch.join("missing");
+        let stale = LatestPublicationRecord {
+            schema: 1,
+            out_dir: capture_native_path(missing.as_os_str()),
+            previous_target: Some(capture_native_path(std::ffi::OsStr::new("first"))),
+        };
+        write_latest_publication_record(&stale).unwrap();
+
+        let publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+        recover_latest_publication(&publication).unwrap();
+        assert_eq!(
+            fs::read_link(branch.join("latest")).unwrap(),
+            PathBuf::from("first")
+        );
+        assert!(!latest_publication_record_path().exists());
+        assert!(fs::read_dir(home.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("publication-transaction.invalid")
+        }));
+
+        let next = branch.join("next");
+        write_pack_identity(&next);
+        let transaction = begin_latest_publication(&publication, &next)
+            .expect("quarantined stale state must not deny a new publication");
+        assert_eq!(
+            fs::read_link(branch.join("latest")).unwrap(),
+            PathBuf::from("next")
+        );
+        finish_latest_publication(&transaction).unwrap();
+    }
+
+    #[test]
+    fn unconfirmed_index_rollback_keeps_journal_for_next_owner_recovery() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let branch = home.path().join("runs/repo/main");
+        let first = branch.join("first");
+        let second = branch.join("second");
+        write_pack_identity(&first);
+        write_pack_identity(&second);
+
+        let publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+        let first_transaction = begin_latest_publication(&publication, &first).unwrap();
+        crate::storage::register_and_prune_locked(
+            &publication,
+            &first,
+            run_entry(&first, "1"),
+            false,
+            || false,
+        )
+        .unwrap();
+        finish_latest_publication(&first_transaction).unwrap();
+
+        let _second_transaction = begin_latest_publication(&publication, &second).unwrap();
+        let error = crate::storage::register_and_prune_locked(
+            &publication,
+            &second,
+            run_entry(&second, "2"),
+            false,
+            || {
+                let new_index_is_visible = crate::storage::RunIndex::load()
+                    .latest("repo", "main")
+                    .is_some_and(|entry| entry.id == "2");
+                if new_index_is_visible {
+                    crate::storage::arm_test_index_save_failure();
+                    true
+                } else {
+                    false
+                }
+            },
+        )
+        .expect_err("the previous index restore is injected to fail");
+        assert!(crate::storage::is_unconfirmed_publication_rollback(&error));
+        assert!(latest_publication_record_path().is_file());
+        drop(publication);
+
+        let next_owner = crate::storage::acquire_publication_lock(|| false).unwrap();
+        recover_latest_publication(&next_owner).unwrap();
+        assert_eq!(
+            fs::read_link(branch.join("latest")).unwrap(),
+            PathBuf::from("second")
+        );
+        assert_eq!(
+            crate::storage::RunIndex::load()
+                .latest("repo", "main")
+                .unwrap()
+                .id,
+            "2"
+        );
+        assert!(!latest_publication_record_path().exists());
+    }
+
+    #[test]
+    fn publication_journal_ignores_a_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let protected = root.path().join("protected.txt");
+        fs::write(&protected, "do-not-touch").unwrap();
+        symlink(
+            &protected,
+            root.path().join("publication-transaction.json.tmp"),
+        )
+        .unwrap();
+        let destination = root.path().join("publication-transaction.json");
+        let record = LatestPublicationRecord {
+            schema: 1,
+            out_dir: capture_native_path(root.path().join("run").as_os_str()),
+            previous_target: None,
+        };
+
+        write_latest_publication_record_at(&destination, &record).unwrap();
+
+        assert_eq!(fs::read_to_string(&protected).unwrap(), "do-not-touch");
+        let written: LatestPublicationRecord =
+            serde_json::from_slice(&fs::read(destination).unwrap()).unwrap();
+        assert_eq!(written.schema, 1);
+    }
+
+    #[test]
+    fn rollback_does_not_overwrite_a_newer_latest_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let predecessor = root.path().join("predecessor");
+        let cancelled = root.path().join("cancelled");
+        let newer = root.path().join("newer");
+        for path in [&predecessor, &cancelled, &newer] {
+            fs::create_dir(path).unwrap();
+        }
+
+        create_latest_symlink(&predecessor).unwrap();
+        let previous = create_latest_symlink(&cancelled).unwrap().unwrap();
+        create_latest_symlink(&newer).unwrap();
+
+        restore_latest_symlink(&cancelled, Some(previous.as_os_str())).unwrap();
+
+        assert_eq!(
+            fs::read_link(root.path().join("latest")).unwrap(),
+            PathBuf::from("newer"),
+            "a cancelled older publisher must not roll back a newer run"
+        );
+    }
+
+    #[test]
+    fn rollback_restores_predecessor_only_while_latest_is_owned() {
+        let root = tempfile::tempdir().unwrap();
+        let predecessor = root.path().join("predecessor");
+        let cancelled = root.path().join("cancelled");
+        fs::create_dir(&predecessor).unwrap();
+        fs::create_dir(&cancelled).unwrap();
+
+        create_latest_symlink(&predecessor).unwrap();
+        let previous = create_latest_symlink(&cancelled).unwrap().unwrap();
+        restore_latest_symlink(&cancelled, Some(previous.as_os_str())).unwrap();
+
+        assert_eq!(
+            fs::read_link(root.path().join("latest")).unwrap(),
+            PathBuf::from("predecessor")
+        );
+    }
+
+    #[test]
+    fn rollback_uses_the_immediate_serialized_predecessor() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let completed = root.path().join("completed");
+        let cancelled = root.path().join("cancelled");
+        for path in [&original, &completed, &cancelled] {
+            fs::create_dir(path).unwrap();
+        }
+
+        create_latest_symlink(&original).unwrap();
+        create_latest_symlink(&completed).unwrap();
+        let previous = create_latest_symlink(&cancelled).unwrap().unwrap();
+        restore_latest_symlink(&cancelled, Some(previous.as_os_str())).unwrap();
+
+        assert_eq!(
+            fs::read_link(root.path().join("latest")).unwrap(),
+            PathBuf::from("completed"),
+            "a cancelled publisher restores the run immediately before it, not an older peek"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_rollback_is_immediate_and_restores_the_predecessor() {
+        let root = tempfile::tempdir().unwrap();
+        let predecessor = root.path().join("predecessor");
+        let cancelled = root.path().join("cancelled");
+        fs::create_dir(&predecessor).unwrap();
+        fs::create_dir(&cancelled).unwrap();
+        create_latest_symlink(&predecessor).unwrap();
+        let previous = create_latest_symlink(&cancelled).unwrap().unwrap();
+        let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::new());
+        governor.cancel();
+
+        let started = std::time::Instant::now();
+        crate::governor::with_run_scope(std::sync::Arc::clone(&governor), async {
+            restore_latest_symlink(&cancelled, Some(previous.as_os_str()))
+        })
+        .await
+        .expect("consistency rollback ignores the already-cancelled governor");
+
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert_eq!(
+            fs::read_link(root.path().join("latest")).unwrap(),
+            PathBuf::from("predecessor")
+        );
+    }
 }

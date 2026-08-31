@@ -7,6 +7,20 @@ fn generate_fixture_pack(
     base_sha: &str,
     governor: &crate::governor::ResourceGovernor,
 ) -> Result<PathBuf> {
+    let ledger = crate::ledger::TaskLedger::new();
+    generate_fixture_pack_with_ledger(
+        repo_root, output_dir, target_sha, base_sha, governor, &ledger,
+    )
+}
+
+fn generate_fixture_pack_with_ledger(
+    repo_root: &Path,
+    output_dir: &Path,
+    target_sha: &str,
+    base_sha: &str,
+    governor: &crate::governor::ResourceGovernor,
+    ledger: &crate::ledger::TaskLedger,
+) -> Result<PathBuf> {
     let mut config = test_config_builder()
         .repo_root(repo_root)
         .target(Some("feature"))
@@ -26,7 +40,6 @@ fn generate_fixture_pack(
     config.quiet = true;
     config.output_dir = Some(output_dir.to_path_buf());
 
-    let ledger = crate::ledger::TaskLedger::new();
     let resolved_target = ResolvedRef {
         name: "feature".to_string(),
         commit_id: target_sha.to_string(),
@@ -40,7 +53,7 @@ fn generate_fixture_pack(
 
     generate(GenerateInput {
         config: &config,
-        ledger: &ledger,
+        ledger,
         diffs: &[],
         checks: &[],
         heuristics: None,
@@ -98,7 +111,10 @@ fn assert_cancelled_pack_is_not_published(output_dir: &Path, seam: ArtifactGener
 
 #[test]
 fn cancellation_injection_stops_every_artifact_generation_seam() {
-    assert_eq!(ArtifactGenerationSeam::ALL.len(), 21);
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    assert_eq!(ArtifactGenerationSeam::ALL.len(), 22);
     let unique_labels: std::collections::HashSet<_> = ArtifactGenerationSeam::ALL
         .iter()
         .map(|seam| seam.label())
@@ -153,6 +169,9 @@ fn cancellation_injection_stops_every_artifact_generation_seam() {
 
 #[test]
 fn cancellation_at_publication_preserves_existing_latest() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
     let (repo, base_sha, target_sha) = init_advanced_base_fixture();
     let output = tempfile::tempdir().expect("output tempdir");
     let first = output.path().join("first");
@@ -197,7 +216,141 @@ fn cancellation_at_publication_preserves_existing_latest() {
 }
 
 #[test]
+fn explicit_output_dir_is_one_immutable_pack_path() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let pack = output.path().join("pack");
+    let governor = crate::governor::ResourceGovernor::new();
+
+    generate_fixture_pack(repo.path(), &pack, &target_sha, &base_sha, &governor)
+        .expect("first explicit pack claims the path");
+    let first_identity = fs::read_to_string(pack.join("00_summary/RUN.json")).unwrap();
+    let error = generate_fixture_pack(repo.path(), &pack, &target_sha, &base_sha, &governor)
+        .expect_err("a second run cannot overwrite one historical pack path");
+
+    assert!(
+        error.to_string().contains("must name a new directory"),
+        "got {error:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(pack.join("00_summary/RUN.json")).unwrap(),
+        first_identity,
+        "the rejected rerun must not mix stale and new artifact files"
+    );
+    assert_eq!(
+        crate::storage::RunIndex::load().entries().len(),
+        1,
+        "one immutable output path owns one history row"
+    );
+}
+
+#[test]
+fn mcp_output_reservation_is_strict_and_single_use() {
+    let tmp = tempfile::tempdir().expect("output root");
+    let pack = tmp.path().join("pack");
+    fs::create_dir(&pack).expect("exclusive MCP allocation");
+    reserve_mcp_output_dir(&pack, "correct-nonce").expect("reservation");
+    fs::write(pack.join("run.log"), "launcher output").expect("allowed log");
+    fs::write(pack.join("run.stderr.log"), "").expect("allowed stderr");
+
+    claim_explicit_output_dir_with_reservation(&pack, Some("correct-nonce"))
+        .expect("matching reservation claims the fresh directory");
+    assert!(
+        !pack.join(MCP_OUTPUT_RESERVATION_FILE).exists(),
+        "the one-shot reservation is consumed"
+    );
+    claim_explicit_output_dir_with_reservation(&pack, Some("correct-nonce"))
+        .expect_err("the same reserved path cannot be claimed twice");
+
+    let wrong_nonce = tmp.path().join("wrong-nonce");
+    fs::create_dir(&wrong_nonce).unwrap();
+    reserve_mcp_output_dir(&wrong_nonce, "real").unwrap();
+    claim_explicit_output_dir_with_reservation(&wrong_nonce, Some("forged"))
+        .expect_err("a wrong nonce cannot adopt the directory");
+    assert!(
+        wrong_nonce.join(MCP_OUTPUT_RESERVATION_FILE).exists(),
+        "a failed claim does not consume the real reservation"
+    );
+
+    let contaminated = tmp.path().join("contaminated");
+    fs::create_dir(&contaminated).unwrap();
+    reserve_mcp_output_dir(&contaminated, "nonce").unwrap();
+    fs::write(contaminated.join("stale-artifact.json"), "{}").unwrap();
+    claim_explicit_output_dir_with_reservation(&contaminated, Some("nonce"))
+        .expect_err("unexpected content prevents stale-pack adoption");
+
+    let missing = tmp.path().join("missing");
+    fs::create_dir(&missing).unwrap();
+    claim_explicit_output_dir_with_reservation(&missing, Some("nonce"))
+        .expect_err("a nonce without its create-new sentinel proves nothing");
+}
+
+#[test]
+fn cancellation_while_waiting_for_publication_lock_finalizes_the_pack_as_incomplete() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let first = output.path().join("first");
+    let first_governor = crate::governor::ResourceGovernor::new();
+    generate_fixture_pack(repo.path(), &first, &target_sha, &base_sha, &first_governor)
+        .expect("completed predecessor pack");
+
+    let held_publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+    let governor = Arc::new(crate::governor::ResourceGovernor::new());
+    let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+    let _waiting = crate::storage::PublicationLockWaitGuard::install(waiting_tx);
+    let canceller = {
+        let governor = Arc::clone(&governor);
+        std::thread::spawn(move || {
+            waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("run never reached the busy publication lock");
+            governor.cancel();
+        })
+    };
+    let second = output.path().join("second");
+    let error = generate_fixture_pack(
+        repo.path(),
+        &second,
+        &target_sha,
+        &base_sha,
+        governor.as_ref(),
+    )
+    .expect_err("a run waiting for the publication lock must observe cancellation");
+    canceller.join().unwrap();
+    drop(held_publication);
+
+    assert!(crate::governor::is_cancellation(&error), "{error:#}");
+    assert_no_success_surfaces(&second, ArtifactGenerationSeam::RunIndexPublication);
+    assert_cancelled_pack_is_not_published(&second, ArtifactGenerationSeam::RunIndexPublication);
+    let incomplete: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(second.join("00_summary/INCOMPLETE.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        incomplete["stage"],
+        ArtifactGenerationSeam::RunIndexPublication.label()
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read_link(output.path().join("latest")).unwrap(),
+        PathBuf::from("first")
+    );
+}
+
+#[test]
 fn cancellation_after_latest_symlink_restores_predecessor() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
     let (repo, base_sha, target_sha) = init_advanced_base_fixture();
     let output = tempfile::tempdir().expect("output tempdir");
     let first = output.path().join("first");
@@ -241,8 +394,131 @@ fn cancellation_after_latest_symlink_restores_predecessor() {
     assert_cancelled_pack_is_not_published(&second, ArtifactGenerationSeam::LatestAdvertisement);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_during_shared_snapshot_cleanup_never_publishes_the_pack() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let first = output.path().join("first");
+    let first_governor = crate::governor::ResourceGovernor::new();
+    generate_fixture_pack(repo.path(), &first, &target_sha, &base_sha, &first_governor)
+        .expect("completed predecessor pack");
+
+    let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target_sha)
+        .expect("shared target snapshot");
+    let ledger = crate::ledger::TaskLedger::new();
+    ledger.set_shared_snapshot(Some(snapshot));
+
+    let pids = output.path().join("cleanup.pids");
+    let shim = output.path().join("blocking-git");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = remove ]; then\n  sleep 30 &\n  printf '%s %s\\n' \"$$\" \"$!\" > '{}'\n  wait\nfi\nexec git \"$@\"\n",
+            pids.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+
+    let governor = Arc::new(crate::governor::ResourceGovernor::new());
+    let canceller = {
+        let governor = Arc::clone(&governor);
+        let pids = pids.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !pids.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "snapshot cleanup never spawned its governed git child"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            governor.cancel();
+        })
+    };
+    let _git = crate::git::override_test_git_program(shim);
+    let second = output.path().join("second");
+    let result = crate::governor::with_run_scope(Arc::clone(&governor), async {
+        crate::governor::blocking_stage(|| {
+            generate_fixture_pack_with_ledger(
+                repo.path(),
+                &second,
+                &target_sha,
+                &base_sha,
+                governor.as_ref(),
+                &ledger,
+            )
+        })
+    })
+    .await;
+    canceller.join().unwrap();
+
+    let error = result.expect_err("cancelled cleanup must abort before publication");
+    assert!(crate::governor::is_cancellation(&error), "{error:#}");
+    assert_eq!(
+        fs::read_link(output.path().join("latest")).unwrap(),
+        PathBuf::from("first")
+    );
+    assert_cancelled_pack_is_not_published(&second, ArtifactGenerationSeam::SharedSnapshotCleanup);
+    let incomplete: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(second.join("00_summary/INCOMPLETE.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        incomplete["stage"],
+        ArtifactGenerationSeam::SharedSnapshotCleanup.label()
+    );
+
+    let recorded = fs::read_to_string(&pids).unwrap();
+    for (position, pid) in recorded
+        .split_whitespace()
+        .map(|pid| pid.parse::<i32>().unwrap())
+        .enumerate()
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 only probes PIDs created and recorded by this test.
+            if unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let state = std::process::Command::new("ps")
+                    .args([
+                        "-o",
+                        "pid=,ppid=,pgid=,stat=,command=",
+                        "-p",
+                        &pid.to_string(),
+                    ])
+                    .output()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                    .unwrap_or_else(|error| format!("ps failed: {error}"));
+                panic!(
+                    "snapshot cleanup process {position} (pid {pid}) survived cancellation; test pid {}; state: {state}",
+                    std::process::id()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 #[test]
 fn artifact_generation_registry_is_exact_and_success_path_reaches_every_seam() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
     let expected = ArtifactGenerationSeam::ALL;
     let last = expected.len() - 1;
     let mut duplicate = expected;
@@ -295,6 +571,47 @@ fn artifact_generation_registry_is_exact_and_success_path_reaches_every_seam() {
 }
 
 #[test]
+fn cancellation_after_durable_publication_commit_does_not_relabel_the_run() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let output_dir = output.path().join("pack");
+    let governor = crate::governor::ResourceGovernor::new();
+    let _commit = publication_commit_test_hook::CommitGuard::install();
+
+    let generated =
+        generate_fixture_pack(repo.path(), &output_dir, &target_sha, &base_sha, &governor)
+            .expect("a signal after the durable commit cannot cancel the completed run");
+
+    assert_eq!(generated, output_dir);
+    assert!(
+        governor.is_cancelled(),
+        "the probe must deliver the late cancel"
+    );
+    assert!(!output_dir.join("00_summary/INCOMPLETE.json").exists());
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        assert!(
+            output_dir.join(relative).exists(),
+            "completed publication lost {relative} after its commit point"
+        );
+    }
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read_link(output.path().join("latest")).unwrap(),
+        PathBuf::from("pack")
+    );
+    assert!(
+        crate::storage::RunIndex::load()
+            .entries()
+            .iter()
+            .any(|entry| entry.path == output_dir),
+        "durably committed pack must remain indexed"
+    );
+}
+
+#[test]
 fn junk_files_excluded_from_zip_and_manifest() {
     use std::fs::File;
 
@@ -310,6 +627,11 @@ fn junk_files_excluded_from_zip_and_manifest() {
     fs::write(out.join(".DS_Store"), b"junk").expect("root .DS_Store");
     fs::write(summary.join(".DS_Store"), b"junk").expect("nested .DS_Store");
     fs::write(out.join("Thumbs.db"), b"junk").expect("Thumbs.db");
+    // Mutable MCP control files are useful beside the live pack but are not
+    // immutable payload: stdout can still grow after MANIFEST generation.
+    for control in ["RUNNING.json", "run.log", "run.stderr.log"] {
+        fs::write(out.join(control), b"mutable control").expect("MCP control file");
+    }
 
     generate_manifest(out).expect("generate_manifest");
     // SANITY.json is written after the manifest in production and must ride
@@ -343,6 +665,12 @@ fn junk_files_excluded_from_zip_and_manifest() {
         !manifest_paths.iter().any(|p| is_junk(p)),
         "MANIFEST.json must not list OS junk, got {manifest_paths:?}"
     );
+    assert!(
+        !manifest_paths
+            .iter()
+            .any(|path| MCP_CONTROL_FILES.contains(path)),
+        "MANIFEST.json must not hash mutable MCP control files: {manifest_paths:?}"
+    );
 
     // The shipped ZIP must contain RUN.json and no junk.
     let mut zip = zip::ZipArchive::new(File::open(out.join("artifacts.zip")).expect("open zip"))
@@ -357,6 +685,12 @@ fn junk_files_excluded_from_zip_and_manifest() {
     assert!(
         !zip_names.iter().any(|n| is_junk(n)),
         "artifacts.zip must not ship OS junk, got {zip_names:?}"
+    );
+    assert!(
+        !zip_names
+            .iter()
+            .any(|name| MCP_CONTROL_FILES.contains(&name.as_str())),
+        "artifacts.zip must not ship mutable MCP control files: {zip_names:?}"
     );
     // The shipped pack must be self-validating: RUN.json (source of truth),
     // MANIFEST.json (integrity) and SANITY.json (verdict) all ride along.

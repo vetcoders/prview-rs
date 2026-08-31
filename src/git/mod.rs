@@ -4,9 +4,13 @@
 
 pub mod cmd;
 pub use cmd::git_cmd;
+#[cfg(test)]
+pub(crate) use cmd::override_test_git_program;
 
 mod snapshot;
 pub use snapshot::AnalysisSnapshot;
+#[cfg(test)]
+pub(crate) use snapshot::override_test_tar_program;
 
 mod worktree;
 pub use worktree::{WorktreeSnapshot, create_worktree_snapshot};

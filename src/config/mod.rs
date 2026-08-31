@@ -15,6 +15,41 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_GH_PROGRAM: std::cell::RefCell<Option<std::ffi::OsString>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub struct TestGhOverride(Option<std::ffi::OsString>);
+
+#[cfg(test)]
+impl Drop for TestGhOverride {
+    fn drop(&mut self) {
+        TEST_GH_PROGRAM.with(|program| *program.borrow_mut() = self.0.take());
+    }
+}
+
+#[cfg(test)]
+pub fn override_test_gh_program(program: impl Into<std::ffi::OsString>) -> TestGhOverride {
+    let previous = TEST_GH_PROGRAM.with(|slot| slot.borrow_mut().replace(program.into()));
+    TestGhOverride(previous)
+}
+
+fn gh_cmd() -> Command {
+    #[cfg(test)]
+    let command = Command::new(
+        TEST_GH_PROGRAM
+            .with(|program| program.borrow().clone())
+            .unwrap_or_else(|| "gh".into()),
+    );
+    #[cfg(not(test))]
+    let command = Command::new("gh");
+    command
+}
+
 /// Runtime configuration derived from CLI and environment
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -462,6 +497,10 @@ impl TestConfigBuilder {
 ///
 /// Priority: `PRVIEW_HOME` env > `~/.prview`
 pub fn prview_home() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_PRVIEW_HOME.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
     std::env::var("PRVIEW_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -469,6 +508,34 @@ pub fn prview_home() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join(".prview")
         })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PRVIEW_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Thread-scoped PRVIEW_HOME override for tests that exercise the real global
+/// publication/index code. Unlike mutating the process environment, this cannot
+/// leak a failed fixture journal into the operator's actual `~/.prview`.
+#[cfg(test)]
+pub(crate) struct TestPrviewHomeGuard {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for TestPrviewHomeGuard {
+    fn drop(&mut self) {
+        TEST_PRVIEW_HOME.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn override_test_prview_home(path: impl Into<PathBuf>) -> TestPrviewHomeGuard {
+    let previous = TEST_PRVIEW_HOME.with(|slot| slot.borrow_mut().replace(path.into()));
+    TestPrviewHomeGuard { previous }
 }
 
 fn current_run_stamp() -> String {
@@ -934,14 +1001,14 @@ impl Config {
     /// exclusive repo-global id before writing.
     pub fn allocate_artifacts_dir(&self) -> Result<PathBuf> {
         if let Some(ref dir) = self.output_dir {
-            return Ok(dir.clone());
+            return absolute_output_dir(dir);
         }
         self.allocate_artifacts_dir_with_stamp(&current_run_stamp())
     }
 
     pub(crate) fn allocate_artifacts_dir_for_commit(&self, commit: &str) -> Result<PathBuf> {
         if let Some(ref dir) = self.output_dir {
-            return Ok(dir.clone());
+            return absolute_output_dir(dir);
         }
         self.allocate_artifacts_dir_in_home_with_stamp_and_commit(
             &prview_home(),
@@ -1048,6 +1115,15 @@ impl Config {
     pub fn uv_env_dir_for(&self, substrate: &str) -> PathBuf {
         self.uv_env_root().join(substrate)
     }
+}
+
+fn absolute_output_dir(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()
+        .context("Failed to resolve the current directory for --output-dir")?
+        .join(path))
 }
 
 /// Find git repository root from current directory
@@ -1420,12 +1496,14 @@ struct PrInfo {
 /// Fetch PR branch names (head and base) from GitHub using gh CLI
 fn fetch_pr_info(pr_number: u64, gh_repo: Option<&str>) -> Result<PrInfo> {
     // Check if gh is available
-    if Command::new("gh")
-        .arg("--version")
-        .current_dir(std::env::temp_dir())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .is_err()
+    let mut version = gh_cmd();
+    version.arg("--version").current_dir(std::env::temp_dir());
+    if crate::proc::output_governed_with_timeout(
+        version,
+        "gh version startup probe",
+        std::time::Duration::from_secs(10),
+    )
+    .is_err()
     {
         bail!("gh CLI is not installed (required for --pr mode)");
     }
@@ -1436,17 +1514,21 @@ fn fetch_pr_info(pr_number: u64, gh_repo: Option<&str>) -> Result<PrInfo> {
     // /tmp prevents gh from detecting a git context.
     if let Some(repo) = gh_repo {
         let endpoint = format!("repos/{}/pulls/{}", repo, pr_number);
-        let output = Command::new("gh")
+        let mut command = gh_cmd();
+        command
             .args([
                 "api",
                 &endpoint,
                 "--jq",
                 "[.head.ref, .base.ref, .head.sha, .base.sha, .html_url] | @tsv",
             ])
-            .current_dir(std::env::temp_dir())
-            .stdin(std::process::Stdio::null())
-            .output()
-            .context("Failed to execute gh api")?;
+            .current_dir(std::env::temp_dir());
+        let output = crate::proc::output_governed_with_timeout(
+            command,
+            "gh api PR startup",
+            std::time::Duration::from_secs(30),
+        )
+        .context("Failed to execute gh api")?;
 
         if output.status.success() {
             let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1476,12 +1558,14 @@ fn fetch_pr_info(pr_number: u64, gh_repo: Option<&str>) -> Result<PrInfo> {
         args.push(repo.to_string());
     }
 
-    let output = Command::new("gh")
-        .args(&args)
-        .current_dir(std::env::temp_dir())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .context("Failed to execute gh pr view")?;
+    let mut command = gh_cmd();
+    command.args(&args).current_dir(std::env::temp_dir());
+    let output = crate::proc::output_governed_with_timeout(
+        command,
+        "gh pr view startup",
+        std::time::Duration::from_secs(30),
+    )
+    .context("Failed to execute gh pr view")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1580,6 +1664,89 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[cfg(unix)]
+    struct InterruptWhenFileExists {
+        path: PathBuf,
+        delivered: bool,
+    }
+
+    #[cfg(unix)]
+    impl crate::governor::Interrupts for InterruptWhenFileExists {
+        async fn next(&mut self) {
+            if self.delivered {
+                std::future::pending::<()>().await;
+            }
+            while !self.path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            self.delivered = true;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_gone(pid: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            // SAFETY: signal 0 only probes a PID created by this test.
+            let exists = unsafe { libc::kill(pid, 0) } == 0;
+            if !exists && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "startup gh process {pid} survived cancellation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn pr_lookup_is_supervised_and_reaps_its_process_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("startup fixture");
+        let pidfile = temp.path().join("gh-tree.pid");
+        let shim = temp.path().join("blocking-gh");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nsleep 30 &\nprintf '%s %s\\n' \"$$\" \"$!\" > '{}'\nwait\n",
+                pidfile.display()
+            ),
+        )
+        .expect("write gh shim");
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&shim, permissions).expect("make gh shim executable");
+
+        let cli = Cli::parse_from(["prview", "--pr", "27", "--gh-repo", "vetcoders/prview-rs"]);
+        let program = shim.clone();
+        let error = crate::governor::supervise_startup_stage(
+            move || {
+                let _override = override_test_gh_program(program);
+                Config::from_cli(&cli)
+            },
+            InterruptWhenFileExists {
+                path: pidfile.clone(),
+                delivered: false,
+            },
+        )
+        .await
+        .expect_err("Ctrl-C must cancel PR lookup before the review App exists");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+        let pids = std::fs::read_to_string(&pidfile).expect("gh shim records its tree");
+        let pids = pids
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().expect("numeric pid"))
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2);
+        for pid in pids {
+            assert_process_gone(pid).await;
+        }
+    }
 
     fn init_git_repo_with_branch(branch: &str) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
@@ -2201,6 +2368,24 @@ mod tests {
 
         // --output-dir takes priority
         assert_eq!(config.artifacts_dir(), PathBuf::from("/tmp/custom-output"));
+    }
+
+    #[test]
+    fn allocated_relative_output_dir_becomes_restart_stable_absolute_path() {
+        let mut config = make_test_config("/tmp/myrepo", Some("feature/test"));
+        config.output_dir = Some(PathBuf::from("relative/custom-output"));
+
+        let allocated = config
+            .allocate_artifacts_dir_for_commit("abc1234")
+            .expect("relative custom output resolves from the invocation cwd");
+
+        assert!(allocated.is_absolute());
+        assert_eq!(
+            allocated,
+            std::env::current_dir()
+                .unwrap()
+                .join("relative/custom-output")
+        );
     }
 
     #[test]

@@ -880,20 +880,10 @@ mod tests {
             envs.push(dir);
         }
 
-        // Another live prview is mid-sweep: our own pid is unquestionably alive,
-        // so the lock cannot be mistaken for an abandoned one.
-        std::fs::write(
-            root.path().join(UV_PRUNE_LOCK),
-            format!(
-                "{}:{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ),
-        )
-        .unwrap();
+        // Another live prview is mid-sweep. Ownership is the OS lock on the
+        // open handle; file contents are diagnostic metadata only.
+        let _held = crate::storage::acquire_lock_at(&root.path().join(UV_PRUNE_LOCK))
+            .expect("fixture owns the prune lock");
 
         mark_and_prune_uv_envs(root.path(), &envs[0]);
 

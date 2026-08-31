@@ -322,6 +322,21 @@ impl TaskLedger {
             .unwrap_or_else(|e| e.into_inner()) = snapshot;
     }
 
+    /// Explicitly clean the shared snapshot while the run scope and its
+    /// cancellation registry are still alive. Drop remains a best-effort
+    /// backstop for early-return paths, not the normal lifecycle.
+    pub fn cleanup_shared_snapshot(&self) -> anyhow::Result<()> {
+        let snapshot = self
+            .shared_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(mut snapshot) = snapshot {
+            snapshot.cleanup()?;
+        }
+        Ok(())
+    }
+
     /// The directory the shared snapshot was materialised into, if there is one.
     #[must_use]
     pub fn scan_dir(&self) -> Option<PathBuf> {

@@ -214,6 +214,11 @@ parent and child caps, expensive tools, and the cheap-first execution schedule.
 The envelope is conservative; it does not pretend to predict exact future peak
 memory.
 
+This envelope covers review generation and its check/context subprocesses. The
+explicit mutating `prview fix` command still invokes formatter/fixer toolchains
+synchronously and is not yet governed by `--resource-budget`; do not treat the
+review envelope as a product-wide cap for that separate command.
+
 ## Quick cheat sheet
 
 ```bash
@@ -452,18 +457,60 @@ or, when `PRVIEW_HOME` is unset, to
 `$HOME/.prview/runs/<repo>/<branch>/<run_id>/` in an ordered numbered layout.
 New run ids use a timestamp plus short HEAD suffix, for example
 `20260704-120500-a1b2c3d`; treat the full value as opaque.
-A `latest` symlink points at the most recent **completed** run in
+On Unix, a `latest` symlink points at the most recent **completed** run in
 `$PRVIEW_HOME/runs/<repo>/<branch>/latest` or
 `$HOME/.prview/runs/<repo>/<branch>/latest` when `PRVIEW_HOME` is unset.
-A cancelled run writes `00_summary/INCOMPLETE.json` and does not update
-`latest` or the run index. If cancellation is observed after `latest` has
+A cancellation observed before the durable publication commit writes
+`00_summary/INCOMPLETE.json` and does not update `latest` or the run index. If
+cancellation is observed after `latest` has
 already been retargeted, the previous completed run is restored. A cancel
 during index registration rolls the index file back and does not prune older
-runs. Retention candidates are staged atomically in
+runs. Once both advertisements cross the durable commit point, the run is
+completed; a signal arriving after that point does not retroactively relabel the
+published verdict as cancelled. Unix publishers serialize `latest` and
+`index.jsonl` as one transaction, and a durable publication journal reconciles either side after a
+process crash **when all publishers are 0.8 or newer**. A journal whose pack is
+missing, malformed, or has a mismatched `RUN.json` identity is never trusted to
+retarget `latest`: prview preserves it as a uniquely named
+`publication-transaction.invalid.*` quarantine file and permits the next clean
+publication instead of permanently denying every later run. The compatibility lock
+serializes the index critical section with pre-0.8 binaries, but it cannot
+serialize their earlier `latest` update. Before installing or starting 0.8,
+drain and exclude every pre-0.8 publisher that shares `PRVIEW_HOME`; concurrent
+mixed-version publication is unsupported. If prview reports a **stale legacy
+index lock**, first establish that no pre-0.8 publisher is still running, then
+remove exactly the reported legacy sentinel; prview deliberately does not take
+it over automatically. Retention
+candidates are staged atomically in
 `$PRVIEW_HOME/prune-trash`; physical cleanup occurs before the next index
 registration and may therefore lag one completed run. If a custom output path
 cannot be staged atomically, prview keeps every index row and skips that prune
-with a warning.
+with a warning. Recovery validates a staged payload's owned regular
+`00_summary/RUN.json` identity against the manifest before moving or deleting
+it; missing, invalid, or mismatched transaction metadata leaves a payload
+preserved in prune-trash without blocking a clean publication. An I/O failure
+after recovery begins still aborts publication. If restoration of the previous
+index cannot be confirmed, prview leaves the outer publication journal intact
+and fails the run so the next lock owner can reconcile durable state. Relative
+`--output-dir` values are converted to absolute paths before pack creation, so
+restart recovery is independent of a later process's working directory. An
+explicit output path must not already exist: it is atomically claimed for one
+immutable pack and cannot be reused for a later run. This prevents stale files
+and multiple history rows from pretending that one mutable directory contains
+several historical packs. `--watch` therefore cannot be combined with an
+explicit `--output-dir`: watch mode emits a separate immutable pack for every
+iteration through the default unique allocator. MCP keeps the same invariant
+through a private, one-shot reservation that only its child process can claim;
+ordinary CLI callers cannot adopt an existing directory.
+On Windows, every reparse-point directory or file (including junctions and
+mount points, not only symlinks) is treated as linked storage. Retention refuses
+such an index path and never recursively traverses it during cleanup. These
+path checks prevent accidental or state-at-rest link traversal; the retention
+store is not a security boundary against a same-user attacker concurrently
+swapping directory entries between validation and rename/read.
+Parent-directory fsync supplies the stated rename ordering on Unix/macOS. Other
+platforms retain atomic/process-crash recovery but do not claim the same
+power-loss durability for directory entries.
 
 ```
 $HOME/.prview/runs/my-repo/feature-x/20260225-185357/
@@ -546,18 +593,39 @@ field types remain observable through auto traits; inherited and restricted
 field visibility are equivalent to an external caller. Additions to an
 otherwise unchanged `#[non_exhaustive]` enum, and named
 fields added to a variant-level `#[non_exhaustive]` variant, are informational
-unless an ABI-sensitive repr makes layout observable.
+unless an ABI-sensitive repr makes layout observable. That informational rule
+applies only when the rest of the struct contract is unchanged: a simultaneous
+repr, generic, attribute, or private-field semantic change retains a parent
+`Changed` finding.
+Direct private-field types remain in that confirmed parent contract. When a
+public item instead reaches a transitive non-public local type, private alias,
+or local trait implementation whose compiler-derived effect cannot be proven
+from source, prview emits guard-aware `PrivateTypeDependency` uncertainty. It
+does not promote that evidence to a confirmed breaking change.
 Expression-position include macros retain included-byte digests, and
 transforming-attribute unknowns are bound to their annotated input. Legal
+non-include macro invocation token bodies remain opaque to source-level binder
+normalization and are not compiler-backed semantic proof. Legal
 non-UTF-8 Git paths emit side-specific typed path uncertainty while valid sibling
 files continue to be analyzed; their collision-free internal identity cannot be
 forged by a literal UTF-8 surrogate filename. Multiple independent workspace
 authorities in a rootless revision source emit `WorkspaceDiscovery` uncertainty
 instead of unioning product and fixture crates. An unreadable, malformed, or
 non-UTF-8 rootless manifest is also an unresolved authority and cannot be
-discarded in favour of a parseable sibling. Unqualified imported trait impls on
-public owners remain typed uncertainty until compiler-backed name resolution
-exists.
+discarded in favour of a parseable sibling. The same fail-closed rule applies to
+a parseable `Cargo.toml` that defines neither `[package]` nor `[workspace]`;
+`[workspace]` and `package.workspace` cannot coexist in one manifest.
+When a root package points at another workspace with `package.workspace`, that
+workspace's full member authority is used; unreadable, invalid, incomplete, or
+non-reciprocal membership remains `WorkspaceDiscovery` uncertainty.
+Unqualified imported trait impls on public owners remain typed uncertainty
+until compiler-backed name resolution exists. Trait/owner alias spelling is
+canonicalized at the resolved nominal pair, including reference, pointer,
+slice, and array owners, and ordinary impl members are compared as an unordered
+set. Declaring scope intentionally remains part of the proof because relative
+paths inside an impl can change meaning when it moves modules. Aliases used only
+inside generic arguments can therefore still produce a conservative warning;
+they are not neutralized without compiler-backed name resolution.
 
 #### How to read an artifact pack
 

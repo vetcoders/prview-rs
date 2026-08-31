@@ -757,9 +757,10 @@ facts and parsing, but not an accidentally conflated enforcement mode.
 The worktree state is frozen **per run**, and a `--watch` iteration is a run:
 each iteration re-reads the working tree before its checks, so the pack it emits
 describes the tree that iteration analysed rather than the tree as it looked
-when the watcher started. (With an in-repo `--output-dir` this means later
-iterations legitimately report *dirty* — they can see the previous iteration's
-artifacts. The default output root is `~/.prview/runs`, outside the repo.)
+when the watcher started. Watch mode uses the default unique allocator for each
+immutable iteration pack; combining `--watch` with one explicit `--output-dir`
+is rejected instead of reusing or overwriting that path. The default output
+root is `~/.prview/runs`, outside the repo.
 
 The file is purely additive: no other pack file changed shape for it. It is
 hashed by `MANIFEST.json` like any other artifact and listed in the sanity
@@ -996,8 +997,12 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
   `select!` on, and it starts at the current state so a late subscriber is not
   left waiting for a change that already happened.
 - **`cancel()` force-terminates each registered process tree.** Unix uses
-  immediate `SIGKILL` on the child's process group; Windows uses the native
-  `taskkill /T /F` tree operation and has a Windows-runner child+grandchild test.
+  immediate `SIGKILL` on the child's process group. Windows children are
+  attached to Job Objects before execution; synchronous wrappers terminate the
+  live Job Object and use native `taskkill /T /F` only as a fallback. If both
+  mechanisms fail, cancellation returns without an unbounded `wait()` rather
+  than turning a kill failure into a hung CLI. Windows-runner tests cover
+  child+grandchild, root-exits-first, and cancellation paths.
   It is idempotent in the strong sense: the registry is DRAINED, so a
   second cancel signals nothing — a pid whose process died in between may by then
   belong to another program. Registration checks cancellation while holding that
@@ -1070,7 +1075,7 @@ governor::with_cancellation(work, governor, CtrlC)
       │   governor.cancel()
       │        ├─► semaphore.close()  ── refuses newcomers AND tasks already waiting
       │        ├─► watch::send(true)  ── wakes the dispatcher's select! arm
-      │        └─► kill process tree  ── SIGKILL -pgid (Unix) / taskkill /T /F (Windows)
+      │        └─► kill process tree  ── SIGKILL -pgid (Unix) / Job Object + taskkill fallback (Windows)
       │        │  second interrupt
       │        ▼
       │   Interrupts::abandon_run()   ── exit(130) without waiting for the unwind
@@ -1118,11 +1123,20 @@ now guards every substantial orchestration/artifact seam. External context tools
 finish before merge/report generation. If cancellation reaches artifact
 generation, success-shaped verdict/report/RUN/MANIFEST/SANITY surfaces are
 removed and `00_summary/INCOMPLETE.json` records `status=incomplete`, the reason,
-and the interrupted stage. The `latest` symlink and the run-index row are
-written only after that last cancellation check. If Ctrl-C lands after `latest`
-is retargeted, the previous alias is restored. The index append itself is
-abortable: the file is saved only while the run is still active, rolled back if
-cancel arrives before commit, and retention candidates are first moved
+and the interrupted stage. The `latest` symlink and the run-index row are one
+publication transaction under a global lock, not two best-effort writes. Before
+retargeting `latest`, prview fsyncs a durable recovery journal containing the
+predecessor; the next publisher reconciles a crash from the committed index and
+clears the journal. Invalid journal state is quarantined without mutating the
+advertised alias, so stale or tampered recovery evidence cannot deny all future
+publications. The shared review worktree is explicitly removed before either
+advertisement; cancellation during that governed cleanup therefore produces an
+incomplete, unpublished pack rather than exit 130 after a published verdict.
+A cancellation that wins after the alias swap performs a
+short, uninterruptible consistency rollback while it still owns that lock. The
+index append itself is abortable: the file is saved only while the run is still
+active, rolled back if cancel arrives before commit, and retention candidates
+are first moved
 atomically into `$PRVIEW_HOME/prune-trash`. A cancelled transaction restores
 those moves and the previous index. Committed tombstones are physically deleted
 at the start of the next registration, before that run mutates its index, using
@@ -1131,13 +1145,55 @@ from the current publication's irreversible window. The run ends in `Cancelled`
 and exit `130`. If a custom output path cannot be renamed into prune-trash
 atomically (for example across filesystems), registration keeps the new and old
 index rows, emits a retention warning, and performs no destructive fallback.
+The durable index/retention marker completion is the explicit commit boundary:
+after it succeeds, caller layers return the completed report even if a signal
+arrives before they render it. Treating that late signal as cancellation would
+claim "no verdict" while `latest` and the index already expose one.
+
+The publication lock uses a persistent v2 kernel lock plus the legacy
+create-new pathname understood by pre-0.8 binaries. Together they exclude old
+and new publishers from the **index critical section**, but not from the whole
+publication: pre-0.8 binaries retarget `latest` before attempting the legacy
+lock. A 0.8 rollout must therefore use a quiescent cutover that drains and
+excludes every pre-0.8 publisher sharing `PRVIEW_HOME`; only 0.8-to-0.8
+publication has the end-to-end transaction described above. A live legacy
+owner blocks normally; a stale legacy sentinel fails
+closed and is never rewritten automatically because an old process could have
+observed it before pausing. An operator may remove that exact sentinel only
+after ruling out old publishers. Lock opens reject symlinks/reparse points and,
+on Unix, shared hardlink inodes; journal/index/prune manifests are published via
+owned unique temp files and atomic rename.
+The prune manifest is not path authority by itself: before recovery moves or
+deletes a payload, the payload root, its `00_summary` directory, and its
+`RUN.json` must each be owned non-link components, and RUN must identify the
+same artifacts root. Windows rejects every reparse point (including junctions
+and mount points); authority files on Unix reject shared hardlink inodes.
+Recursive
+cleanup unlinks a nested reparse entry itself and never traverses its target. A
+missing, invalid, or mismatched manifest/payload pair is
+preserved fail-closed without denying the next publisher; an I/O failure after
+recovery mutation begins still aborts publication. Rollback attempts the
+predecessor moves and previous index independently. If the previous-index write
+cannot be confirmed, the outer publication journal remains durable and the run
+fails for restart reconciliation. Relative custom output paths are made
+absolute before pack creation, so a later cwd cannot retarget recovery. The
+final custom path is claimed with one create-directory operation and must not
+already exist; one immutable path therefore maps to one pack and one index row.
+MCP reserves that path before spawn through a create-new nonce sentinel; only
+the child holding the nonce may consume the control-only directory once. These
+metadata checks cover accidental and state-at-rest link traversal, not a
+same-user adversary racing directory replacement between check and use.
+Directory fsync makes the rename/manifest/index ordering a power-loss contract
+on Unix (including macOS). The non-Unix implementation does not claim equivalent
+directory-entry power-loss durability.
 
 `--update` needs a gate of its own (`App::reuse_unchanged_run`), because it is
 the one path that returns a report without reaching any of the others: an
-interrupt during `prepare_refs` — a `git fetch` that is not a registered child,
-so `cancel` cannot cut it short — followed by a HEAD with no new commits used to
+interrupt during `prepare_refs` followed by a HEAD with no new commits used to
 hand back the *previous* run's pack, and `main` computed an ACCEPT or a BLOCK
-from that. Reusing a pack is still reporting a verdict.
+from that. Reusing a pack is still reporting a verdict. Ref preparation is now
+inside the run scope and its Git child is registered, so cancellation can stop
+the fetch rather than merely rejecting the eventual reuse.
 
 Every child that can be reached this way must be registered. Unix children lead
 their own process group (`proc::harden` for async checks and `proc::harden_std`
@@ -1161,7 +1217,9 @@ cheerful "Regenerated artifacts", until the operator interrupted a second time
 and took the cleanup with them. A cancellation is now propagated out of the
 iteration, and both watch loops (the filesystem watcher and the polling fallback)
 carry a biased `governor.cancelled()` arm so a cancel arriving while the watcher
-is idle ends it too.
+is idle ends it too. Each iteration captures provenance under the same
+supervised synchronous stage, and its `rev-parse`/`status`/`diff` probes use
+owned governed subprocesses rather than raw `Command::output` waits.
 
 **Everything long the run spawns must be in a child scope.** The `uv sync`
 pre-step was not, and outside a scope `register_active_child` is a no-op, so
@@ -1176,7 +1234,8 @@ review therefore kills the scan process itself; it never relies on aborting an
 already-started `spawn_blocking` closure. Snapshot interpretation remains
 in-process and cooperatively checks cancellation.
 
-`--tui` is deliberately NOT wrapped: it puts the terminal in raw mode, so Ctrl-C
+`--tui` analysis is deliberately NOT wrapped by the headless signal supervisor:
+once the terminal is in raw mode, Ctrl-C
 arrives as a Control-C key event and the TUI routes it through the same
 cancel-and-join path as q/Escape before wizard or panel handling. Its dispatcher is
 nevertheless held to the same contract as the headless one — same
@@ -1184,7 +1243,10 @@ nevertheless held to the same contract as the headless one — same
 copy that had drifted back into both of the bugs above while still claiming to
 mirror `run_all`. Artifact generation on the TUI path uses the same
 `blocking_stage` wrapper as headless, so a single-worker runtime can still
-poll q/Escape while the pack is being written.
+poll q/Escape while the pack is being written. The initial repository/ref
+preflight is the exception: it runs before raw mode under a temporary Ctrl-C
+signal supervisor, so a slow fetch cannot enter a window where signals are
+disabled but the terminal event reader does not yet exist.
 
 **Operator surface.** `--resource-budget safe|balanced` selects the plan; preflight
 prints requested/effective budget, parent permits, child-worker cap, current-load
@@ -1426,7 +1488,10 @@ inherent, foreign, and higher-ranked function signatures as well as public
 structs, unions, enums, type aliases, and associated trait const/type members.
 The mapping is reused at every bound, type, and default occurrence, so renaming
 a binder is neutral while generic order, types, ABI, and lifetime relationships
-remain part of the contract. Source-only analysis does
+remain part of the contract. Opaque macro invocation token bodies are not Rust
+AST to `syn`; binder references that exist only inside those tokens remain a
+source-parser limitation and are not presented as compiler-backed truth.
+Source-only analysis does
 not pretend to resolve trait selection or coherence: an impl whose trait and
 owner are both externally reachable is retained as `TraitImplResolution`
 uncertainty with its normalized source contract until compiler-backed resolution
@@ -1437,6 +1502,16 @@ regardless of the helper module's visibility. An unqualified unresolved trait
 path is retained conservatively because it may have entered scope through an
 external `use`; the backend does not guess externality from a trait-name
 allowlist.
+Trait and owner aliases are reduced to canonical guarded nominal pairs before
+evidence is compared. Top-level alias spelling and reference/pointer/slice/
+array owner wrappers are canonicalized, and ordinary fn/const/type impl members
+form an order-independent set. The declaring module and source remain part of
+the proof because relative associated types and generic arguments resolve in
+that scope. Moving an otherwise identical impl can therefore remain a
+conservative unknown, and aliases nested only inside generic arguments are not
+claimed equivalent until compiler-backed resolution exists. Finite alias
+resolution exhaustion is a structural non-neutralizable proof state rather
+than a diagnostic-text heuristic.
 
 #### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
 
@@ -1456,7 +1531,13 @@ existing exhaustive struct is a `Changed` parent contract because downstream
 struct literals and exhaustive patterns stop compiling. The same field on an
 existing `#[non_exhaustive]` struct remains an informational `Added` field, and
 a wholly new public struct remains an added item; neither case inherits the
-existing-exhaustive breaking rule.
+existing-exhaustive breaking rule. That exception is proven by subtracting only
+the added public field and comparing the complete parent remainder: attrs,
+generics, repr policy, and normalized private-field semantics must still match.
+A simultaneous parent/private change therefore retains `Changed`. Public fields
+are selected by external visibility, not by the legal identifier prefix used in
+the internal private-field projection, so a user field named
+`__prview_private_field_*` cannot disappear from the field map.
 
 Enum projection applies the corresponding exhaustiveness policy independently:
 adding variants to an exhaustive public enum changes the parent contract, while
@@ -1475,8 +1556,9 @@ Exact identity is grouped on both sides before any fact is consumed: only a
 consumed as deterministic typed ambiguity, including one-sided duplicate
 components before the final add/remove pass. Cfg-region changes are paired only
 when the guards may overlap. The comparison reuses the snapshot resolver's
-single conservative disjointness proof (currently Unix versus Windows), so
-different feature guards remain potentially co-active. One shared pair-certainty
+conservative disjointness proofs for Unix versus Windows and for a direct cfg
+atom versus its direct `not(atom)` negation. Other different feature guards
+remain potentially co-active. One shared pair-certainty
 check tests both identities and both source paths against the unknown regions
 from both revisions before any exact, cfg, relocation, or visibility fact can
 be confirmed. A glob, include, source-parse, or other relevant unknown therefore
@@ -1509,12 +1591,22 @@ the repository-root package — nested fixture and tool manifests are not produc
 API. A revision source intentionally rooted below the repository may expose one
 package or one workspace authority. Multiple rootless packages/workspaces are
 not silently unioned, and an unreadable, malformed, or non-UTF-8 rootless
-manifest is itself an unresolved authority: both cases emit side-specific
-`WorkspaceDiscovery` uncertainty and no confirmed product-crate surface until
-an authority is explicit.
+manifest is itself an unresolved authority. A parseable manifest with neither a
+top-level `[package]` nor `[workspace]` is invalid in the same way, rather than
+being discarded as though it did not exist; a manifest that combines
+`[workspace]` with `package.workspace` is also rejected. These cases emit
+side-specific `WorkspaceDiscovery` and/or `ManifestParse` uncertainty and no
+false confirmed product authority.
 Private-field types stay in the parent contract (auto-trait effects such as
 replacing `u8` with `Rc<()>`), and implementations of external/prelude traits on
-a public type are typed `TraitImplResolution` unknowns. Duplicate exact base/target
+a public type are typed `TraitImplResolution` unknowns. A transitive non-public
+local type, private import/module alias, or local impl reached from public API
+emits guard-aware `PrivateTypeDependency` uncertainty because its auto-trait,
+layout, or inference consequence requires compiler resolution. A root package
+that declares `package.workspace` is enumerated through that workspace's full
+member authority; missing, invalid, incomplete, or non-reciprocal membership
+emits `WorkspaceDiscovery` rather than certifying an isolated root package.
+Duplicate exact base/target
 OID pairs are coalesced in stable first-seen order before either snapshot is
 built; distinct multi-base comparisons each retain their own revision evidence
 and comparison-qualified finding ID.

@@ -178,6 +178,7 @@ pub enum RustApiUnknownKind {
     ResolutionLimit,
     PathNonUtf8,
     TraitImplResolution,
+    PrivateTypeDependency,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +189,7 @@ pub struct RustApiUnknown {
     pub source_path: String,
     pub cfg_guard: Vec<String>,
     pub evidence: String,
+    pub resolution_exhausted: bool,
     pub provenance: RevisionProvenance,
 }
 
@@ -271,13 +273,43 @@ struct PendingAssoc {
 #[derive(Debug, Clone)]
 struct PendingTraitImpl {
     crate_name: String,
+    declaring_module_path: Vec<String>,
     trait_module_path: Vec<String>,
     trait_name: String,
     owner_module_path: Vec<String>,
     owner_name: String,
+    owner_path_resolved: bool,
     cfg_guard: Vec<String>,
     source_path: String,
     evidence: String,
+    semantic_evidence: String,
+}
+
+type PrivateTypeKey = (String, Vec<String>, String);
+type PrivateModuleAliasKey = (String, Vec<String>);
+type GuardedPrivateModuleTarget = (Vec<String>, Vec<String>);
+type GuardedPrivateTypeTarget = (PrivateTypeKey, Vec<String>);
+
+#[derive(Debug, Clone)]
+struct GuardedImplEvidence {
+    raw_contract: String,
+    semantic_evidence: String,
+    cfg_guard: Vec<String>,
+    declaring_module_path: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GuardedPrivateTypeKey {
+    key: PrivateTypeKey,
+    cfg_guard: Vec<String>,
+}
+
+#[derive(Debug)]
+struct PrivateAliasResolution {
+    states: BTreeSet<GuardedPrivateTypeKey>,
+    terminals: BTreeSet<GuardedPrivateTypeKey>,
+    exhausted: bool,
+    exhaustion_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +345,7 @@ struct SnapshotBuilder<'a> {
     unknowns: Vec<RustApiUnknown>,
     symbols: BTreeMap<SymbolKey, Vec<RawSymbol>>,
     uses: Vec<UseEdge>,
+    private_uses: Vec<UseEdge>,
     pending_assoc: Vec<PendingAssoc>,
     pending_trait_impls: Vec<PendingTraitImpl>,
     module_proofs: Vec<ModuleProof>,
@@ -342,6 +375,7 @@ impl<'a> SnapshotBuilder<'a> {
             unknowns: Vec::new(),
             symbols: BTreeMap::new(),
             uses: Vec::new(),
+            private_uses: Vec::new(),
             pending_assoc: Vec::new(),
             pending_trait_impls: Vec::new(),
             module_proofs: Vec::new(),
@@ -367,6 +401,7 @@ impl<'a> SnapshotBuilder<'a> {
         self.resolve_inherent_items();
         self.materialize_public_modules();
         self.attach_public_reexport_origins();
+        self.record_private_type_dependencies();
         self.crates.sort_by(|left, right| {
             (&left.name, &left.manifest_path, &left.root_path).cmp(&(
                 &right.name,
@@ -495,6 +530,328 @@ impl<'a> SnapshotBuilder<'a> {
         }
     }
 
+    /// A local type that is not itself externally reachable can still affect a
+    /// public signature's layout, auto traits, inference and trait bounds. A
+    /// source parser cannot prove the compiler-derived consequence, so retain
+    /// a typed unknown whose evidence fingerprints the transitive declarations
+    /// and local trait impls instead of claiming a confirmed breaking change.
+    fn record_private_type_dependencies(&mut self) {
+        use sha2::{Digest, Sha256};
+
+        let mut public_origins: BTreeMap<PrivateTypeKey, Vec<Vec<String>>> = BTreeMap::new();
+        for item in self
+            .items
+            .iter()
+            .filter(|item| item.key.namespace == RustNamespace::Type)
+        {
+            public_origins
+                .entry((
+                    item.key.crate_name.clone(),
+                    item.origin_module_path.clone(),
+                    item.origin_name.clone(),
+                ))
+                .or_default()
+                .push(item.cfg_guard.clone());
+        }
+        let mut declarations: BTreeMap<PrivateTypeKey, Vec<RustApiDeclaration>> = BTreeMap::new();
+        for declaration in self.declarations.iter().filter(|declaration| {
+            if declaration.key.namespace != RustNamespace::Type {
+                return false;
+            }
+            let key = (
+                declaration.key.crate_name.clone(),
+                declaration.key.module_path.clone(),
+                declaration.key.external_name.clone(),
+            );
+            // Possible overlap is not proof that the public origin covers this
+            // declaration's whole cfg region. In particular, the conservative
+            // guard solver cannot prove arbitrary `all(...)`/`not(all(...))`
+            // complements; dropping the private declaration in that case loses
+            // its layout/auto-trait uncertainty and can manufacture a green API
+            // delta. Exclude it only when the declaration guard itself implies
+            // an observed public lineage (all predicates of that public guard
+            // are present here). Otherwise retain the typed unknown.
+            !public_origins.get(&key).is_some_and(|guards| {
+                guards.iter().any(|public_guard| {
+                    guard_lineage_contains(&declaration.cfg_guard, public_guard)
+                })
+            })
+        }) {
+            declarations
+                .entry((
+                    declaration.key.crate_name.clone(),
+                    declaration.key.module_path.clone(),
+                    declaration.key.external_name.clone(),
+                ))
+                .or_default()
+                .push(declaration.clone());
+        }
+
+        let (private_aliases, private_module_aliases) =
+            private_alias_graph(&self.private_uses, &self.declarations);
+
+        let mut implementation_evidence: BTreeMap<PrivateTypeKey, Vec<GuardedImplEvidence>> =
+            BTreeMap::new();
+        let mut alias_resolution_unknowns = Vec::new();
+        for pending in self
+            .pending_trait_impls
+            .iter()
+            .filter(|pending| pending.owner_path_resolved)
+        {
+            let initial_key = (
+                pending.crate_name.clone(),
+                pending.owner_module_path.clone(),
+                pending.owner_name.clone(),
+            );
+            let trait_resolution = resolve_private_type_alias_keys(
+                (
+                    pending.crate_name.clone(),
+                    pending.trait_module_path.clone(),
+                    pending.trait_name.clone(),
+                ),
+                &pending.cfg_guard,
+                &private_aliases,
+                &private_module_aliases,
+            );
+            let trait_targets = if trait_resolution.terminals.is_empty() {
+                &trait_resolution.states
+            } else {
+                &trait_resolution.terminals
+            };
+            let mut trait_evidence = trait_targets
+                .iter()
+                .map(|state| guarded_private_type_evidence("resolved-trait", state))
+                .collect::<Vec<_>>();
+            if let Some(digest) = &trait_resolution.exhaustion_digest {
+                trait_evidence.push(format!("trait-alias-resolution-exhausted:{digest}"));
+            }
+            trait_evidence.sort();
+            trait_evidence.dedup();
+            let owner_resolution = resolve_private_type_alias_keys(
+                initial_key,
+                &pending.cfg_guard,
+                &private_aliases,
+                &private_module_aliases,
+            );
+            if owner_resolution.exhausted {
+                alias_resolution_unknowns.push(RustApiUnknown {
+                    kind: RustApiUnknownKind::PrivateTypeDependency,
+                    crate_name: Some(pending.crate_name.clone()),
+                    module_path: pending.owner_module_path.clone(),
+                    source_path: pending.source_path.clone(),
+                    cfg_guard: pending.cfg_guard.clone(),
+                    evidence: format!(
+                        "private owner alias resolution exceeded its finite graph bound for {} ({})",
+                        pending.owner_name,
+                        owner_resolution
+                            .exhaustion_digest
+                            .as_deref()
+                            .unwrap_or("missing-exhaustion-digest")
+                    ),
+                    resolution_exhausted: true,
+                    provenance: self.provenance.clone(),
+                });
+            }
+            for owner in owner_resolution.states {
+                let has_overlapping_declaration =
+                    declarations.get(&owner.key).is_some_and(|candidates| {
+                        candidates.iter().any(|declaration| {
+                            !guards_proven_disjoint(&declaration.cfg_guard, &owner.cfg_guard)
+                        })
+                    });
+                if has_overlapping_declaration {
+                    let resolved_impl_evidence = format!(
+                        "{}\n{}\n{}",
+                        pending.semantic_evidence,
+                        guarded_private_type_evidence("resolved-owner", &owner),
+                        trait_evidence.join("\n--\n")
+                    );
+                    implementation_evidence.entry(owner.key).or_default().push(
+                        GuardedImplEvidence {
+                            raw_contract: pending.evidence.clone(),
+                            semantic_evidence: resolved_impl_evidence,
+                            cfg_guard: owner.cfg_guard,
+                            declaring_module_path: pending.declaring_module_path.clone(),
+                        },
+                    );
+                }
+            }
+        }
+
+        let mut dependency_unknowns = Vec::new();
+        for item in &self.items {
+            let raw_roots = if let Ok(parsed) = syn::parse_str::<Item>(&item.contract) {
+                LocalTypeDependencyCollector::collect_item_types(
+                    &item.key.crate_name,
+                    &item.origin_module_path,
+                    &parsed,
+                )
+            } else if let Ok(parsed) = syn::parse_str::<syn::ItemImpl>(&item.contract) {
+                LocalTypeDependencyCollector::collect_impl_types(
+                    &item.key.crate_name,
+                    &item.origin_module_path,
+                    &parsed,
+                )
+            } else {
+                BTreeSet::new()
+            };
+            if raw_roots.is_empty() {
+                continue;
+            }
+
+            let initial_guard = combined_guards(&item.cfg_guard, &[]);
+            let mut roots: BTreeSet<GuardedPrivateTypeKey> = raw_roots
+                .into_iter()
+                .map(|key| GuardedPrivateTypeKey {
+                    key,
+                    cfg_guard: initial_guard.clone(),
+                })
+                .collect();
+
+            let mut visited = BTreeSet::new();
+            let mut closure = Vec::new();
+            let mut alias_resolution_exhausted = false;
+            while let Some(state) = roots.pop_first() {
+                if !visited.insert(state.clone()) {
+                    continue;
+                }
+                let alias_resolution = resolve_private_type_alias_keys(
+                    state.key.clone(),
+                    &state.cfg_guard,
+                    &private_aliases,
+                    &private_module_aliases,
+                );
+                alias_resolution_exhausted |= alias_resolution.exhausted;
+                if let Some(digest) = &alias_resolution.exhaustion_digest {
+                    closure.push(format!("alias-resolution-exhausted:{digest}"));
+                }
+                for terminal in &alias_resolution.terminals {
+                    if terminal == &state {
+                        continue;
+                    }
+                    let has_local_declaration =
+                        declarations.get(&terminal.key).is_some_and(|candidates| {
+                            candidates.iter().any(|declaration| {
+                                !guards_proven_disjoint(&declaration.cfg_guard, &terminal.cfg_guard)
+                            })
+                        });
+                    let has_local_impl =
+                        implementation_evidence
+                            .get(&terminal.key)
+                            .is_some_and(|impls| {
+                                impls.iter().any(|implementation| {
+                                    !guards_proven_disjoint(
+                                        &implementation.cfg_guard,
+                                        &terminal.cfg_guard,
+                                    )
+                                })
+                            });
+                    if !has_local_declaration && !has_local_impl {
+                        closure.push(format!(
+                            "alias-target:{}::{:?}::{}\neffective-cfg:{:?}",
+                            terminal.key.0, terminal.key.1, terminal.key.2, terminal.cfg_guard
+                        ));
+                    }
+                }
+                roots.extend(
+                    alias_resolution
+                        .states
+                        .into_iter()
+                        .filter(|alias| alias != &state),
+                );
+                if let Some(impls) = implementation_evidence.get(&state.key) {
+                    for implementation in impls.iter().filter(|implementation| {
+                        !guards_proven_disjoint(&implementation.cfg_guard, &state.cfg_guard)
+                    }) {
+                        let effective_guard =
+                            combined_guards(&state.cfg_guard, &implementation.cfg_guard);
+                        closure.push(format!(
+                            "impl-cfg:{effective_guard:?}\n{}",
+                            implementation.semantic_evidence
+                        ));
+                        if let Ok(parsed) =
+                            syn::parse_str::<syn::ItemImpl>(&implementation.raw_contract)
+                        {
+                            roots.extend(
+                                LocalTypeDependencyCollector::collect_impl_types(
+                                    &state.key.0,
+                                    &implementation.declaring_module_path,
+                                    &parsed,
+                                )
+                                .into_iter()
+                                .map(|key| GuardedPrivateTypeKey {
+                                    key,
+                                    cfg_guard: effective_guard.clone(),
+                                }),
+                            );
+                        }
+                    }
+                }
+                for declaration in
+                    declarations
+                        .get(&state.key)
+                        .into_iter()
+                        .flatten()
+                        .filter(|declaration| {
+                            !guards_proven_disjoint(&declaration.cfg_guard, &state.cfg_guard)
+                        })
+                {
+                    let effective_guard = combined_guards(&state.cfg_guard, &declaration.cfg_guard);
+                    closure.push(format!(
+                        "declaration:{}::{:?}::{}\neffective-cfg:{:?}\n{}",
+                        state.key.0,
+                        state.key.1,
+                        state.key.2,
+                        effective_guard,
+                        declaration.contract
+                    ));
+                    if let Ok(parsed) = syn::parse_str::<Item>(&declaration.contract) {
+                        roots.extend(
+                            LocalTypeDependencyCollector::collect_item_types(
+                                &state.key.0,
+                                &state.key.1,
+                                &parsed,
+                            )
+                            .into_iter()
+                            .map(|key| GuardedPrivateTypeKey {
+                                key,
+                                cfg_guard: effective_guard.clone(),
+                            }),
+                        );
+                    }
+                }
+            }
+            if closure.is_empty() && !alias_resolution_exhausted {
+                continue;
+            }
+            closure.sort();
+            closure.dedup();
+            let digest = format!("sha256:{:x}", Sha256::digest(closure.join("\n--\n")));
+            dependency_unknowns.push(RustApiUnknown {
+                kind: RustApiUnknownKind::PrivateTypeDependency,
+                crate_name: Some(item.key.crate_name.clone()),
+                module_path: item.key.module_path.clone(),
+                source_path: item.source_path.clone(),
+                cfg_guard: item.cfg_guard.clone(),
+                evidence: if alias_resolution_exhausted {
+                    format!(
+                        "public {:?} {} has non-public local type semantics whose alias resolution exceeded its finite graph bound ({digest})",
+                        item.kind, item.key.external_name
+                    )
+                } else {
+                    format!(
+                        "public {:?} {} depends on non-public local type semantics ({digest})",
+                        item.kind, item.key.external_name
+                    )
+                },
+                resolution_exhausted: alias_resolution_exhausted,
+                provenance: self.provenance.clone(),
+            });
+        }
+        self.unknowns.extend(alias_resolution_unknowns);
+        self.unknowns.extend(dependency_unknowns);
+    }
+
     fn record_inventory_path_unknowns(&mut self) {
         let paths: Vec<_> = self
             .inventory
@@ -606,6 +963,7 @@ impl<'a> SnapshotBuilder<'a> {
     }
 
     fn discover_crates(&mut self) {
+        let inventory_dirs = live_inventory_directories(&self.inventory);
         let manifests: Vec<_> = self
             .inventory
             .iter()
@@ -617,7 +975,8 @@ impl<'a> SnapshotBuilder<'a> {
             })
             .map(|(path, _)| path.clone())
             .collect();
-        let (allowed, workspace_ambiguity) = api_crate_manifests(self.source, &manifests);
+        let (allowed, workspace_ambiguity) =
+            api_crate_manifests(self.source, &manifests, &inventory_dirs);
         if let Some(evidence) = workspace_ambiguity {
             self.unknown(
                 RustApiUnknownKind::WorkspaceDiscovery,
@@ -1220,17 +1579,25 @@ impl<'a> SnapshotBuilder<'a> {
                         );
                     }
                 }
-                Item::Use(item_use) if is_public(&item_use.vis) => {
+                Item::Use(item_use) => {
                     let mut leaves = Vec::new();
                     flatten_use_tree(&item_use.tree, Vec::new(), &mut leaves);
-                    self.uses.push(UseEdge {
+                    let edge = UseEdge {
                         crate_name: crate_name.to_owned(),
                         module_path: module_path.to_vec(),
                         module_reachable,
                         cfg_guard,
                         source_path: source_path.to_owned(),
                         leaves,
-                    });
+                    };
+                    if is_public(&item_use.vis) {
+                        self.uses.push(edge.clone());
+                        if !module_reachable {
+                            self.private_uses.push(edge);
+                        }
+                    } else {
+                        self.private_uses.push(edge);
+                    }
                 }
                 Item::ExternCrate(item_extern)
                     if module_reachable && is_public(&item_extern.vis) =>
@@ -1627,29 +1994,33 @@ impl<'a> SnapshotBuilder<'a> {
         item_impl: &syn::ItemImpl,
     ) {
         if let Some((_, trait_path, _)) = &item_impl.trait_ {
-            let syn::Type::Path(owner_type) = item_impl.self_ty.as_ref() else {
-                return;
-            };
             let Some((trait_module_path, trait_name)) = resolve_impl_owner(module_path, trait_path)
             else {
                 return;
             };
-            let Some((owner_module_path, owner_name)) =
-                resolve_impl_owner(module_path, &owner_type.path)
-            else {
-                return;
-            };
+            let (owner_module_path, owner_name, owner_path_resolved) =
+                match resolve_impl_self_owner(module_path, item_impl.self_ty.as_ref()) {
+                    Some((module_path, name)) => (module_path, name, true),
+                    None => (
+                        Vec::new(),
+                        canonical_tokens(item_impl.self_ty.to_token_stream()),
+                        false,
+                    ),
+                };
             // Trait impls are globally usable when the trait and owner are
             // public, even if the impl lives in a private helper module.
             self.pending_trait_impls.push(PendingTraitImpl {
                 crate_name: crate_name.to_owned(),
+                declaring_module_path: module_path.to_vec(),
                 trait_module_path,
                 trait_name,
                 owner_module_path,
                 owner_name,
+                owner_path_resolved,
                 cfg_guard: cfg_guard.to_vec(),
                 source_path: source_path.to_owned(),
                 evidence: normalized_trait_impl_contract(item_impl),
+                semantic_evidence: normalized_trait_impl_semantic_contract(item_impl),
             });
             return;
         }
@@ -2545,38 +2916,175 @@ impl<'a> SnapshotBuilder<'a> {
     }
 
     fn resolve_trait_impls(&mut self) {
+        let (private_aliases, private_module_aliases) =
+            private_alias_graph(&self.private_uses, &self.declarations);
         for pending in self.pending_trait_impls.clone() {
-            let trait_public = self.items.iter().any(|item| {
-                item.kind == RustApiItemKind::Trait
-                    && item.key.crate_name == pending.crate_name
-                    && item.origin_module_path == pending.trait_module_path
-                    && item.origin_name == pending.trait_name
-                    && !guards_proven_disjoint(&item.cfg_guard, &pending.cfg_guard)
+            let initial_trait_key = (
+                pending.crate_name.clone(),
+                pending.trait_module_path.clone(),
+                pending.trait_name.clone(),
+            );
+            let trait_resolution = resolve_private_type_alias_keys(
+                initial_trait_key.clone(),
+                &pending.cfg_guard,
+                &private_aliases,
+                &private_module_aliases,
+            );
+            let mut trait_candidates = Vec::new();
+            for state in &trait_resolution.states {
+                for item in self.items.iter().filter(|item| {
+                    item.kind == RustApiItemKind::Trait
+                        && item.key.crate_name == pending.crate_name
+                        && state.key
+                            == (
+                                pending.crate_name.clone(),
+                                item.origin_module_path.clone(),
+                                item.origin_name.clone(),
+                            )
+                        && !guards_proven_disjoint(&item.cfg_guard, &state.cfg_guard)
+                }) {
+                    trait_candidates.push(GuardedPrivateTypeKey {
+                        key: state.key.clone(),
+                        cfg_guard: combined_guards(&state.cfg_guard, &item.cfg_guard),
+                    });
+                }
+
+                let is_initial_alias =
+                    trait_resolution.states.len() > 1 && state.key == initial_trait_key;
+                let has_overlapping_local_declaration =
+                    self.declarations.iter().any(|declaration| {
+                        declaration.kind == RustApiItemKind::Trait
+                            && declaration.key.crate_name == state.key.0
+                            && declaration.key.module_path == state.key.1
+                            && declaration.key.external_name == state.key.2
+                            && !guards_proven_disjoint(&declaration.cfg_guard, &state.cfg_guard)
+                    });
+                if !is_initial_alias
+                    && !has_overlapping_local_declaration
+                    && impl_path_is_external_public(&pending.crate_name, &state.key.1)
+                {
+                    trait_candidates.push(state.clone());
+                }
+            }
+            let owner_resolution = pending.owner_path_resolved.then(|| {
+                resolve_private_type_alias_keys(
+                    (
+                        pending.crate_name.clone(),
+                        pending.owner_module_path.clone(),
+                        pending.owner_name.clone(),
+                    ),
+                    &pending.cfg_guard,
+                    &private_aliases,
+                    &private_module_aliases,
+                )
             });
-            let trait_declared_locally = self.declarations.iter().any(|declaration| {
-                declaration.kind == RustApiItemKind::Trait
-                    && declaration.key.crate_name == pending.crate_name
-                    && declaration.key.module_path == pending.trait_module_path
-                    && declaration.key.external_name == pending.trait_name
-                    && !guards_proven_disjoint(&declaration.cfg_guard, &pending.cfg_guard)
-            });
-            let owner_public = self.items.iter().any(|item| {
-                item.key.namespace == RustNamespace::Type
-                    && item.key.crate_name == pending.crate_name
-                    && item.origin_module_path == pending.owner_module_path
-                    && item.origin_name == pending.owner_name
-                    && !guards_proven_disjoint(&item.cfg_guard, &pending.cfg_guard)
-            });
-            if owner_public
-                && (trait_public || (!trait_declared_locally && trait_is_external_public(&pending)))
-            {
-                self.unknown_guarded(
+            let initial_owner_key = (
+                pending.crate_name.clone(),
+                pending.owner_module_path.clone(),
+                pending.owner_name.clone(),
+            );
+            let mut owner_candidates = Vec::new();
+            if let Some(resolution) = &owner_resolution {
+                for state in &resolution.states {
+                    for item in self.items.iter().filter(|item| {
+                        item.key.namespace == RustNamespace::Type
+                            && item.key.crate_name == pending.crate_name
+                            && state.key
+                                == (
+                                    pending.crate_name.clone(),
+                                    item.origin_module_path.clone(),
+                                    item.origin_name.clone(),
+                                )
+                            && !guards_proven_disjoint(&item.cfg_guard, &state.cfg_guard)
+                    }) {
+                        owner_candidates.push(GuardedPrivateTypeKey {
+                            key: state.key.clone(),
+                            cfg_guard: combined_guards(&state.cfg_guard, &item.cfg_guard),
+                        });
+                    }
+
+                    let is_initial_alias =
+                        resolution.states.len() > 1 && state.key == initial_owner_key;
+                    let has_overlapping_local_declaration =
+                        self.declarations.iter().any(|declaration| {
+                            declaration.key.namespace == RustNamespace::Type
+                                && declaration.key.crate_name == state.key.0
+                                && declaration.key.module_path == state.key.1
+                                && declaration.key.external_name == state.key.2
+                                && !guards_proven_disjoint(&declaration.cfg_guard, &state.cfg_guard)
+                        });
+                    if !is_initial_alias
+                        && !has_overlapping_local_declaration
+                        && impl_path_is_external_public(&pending.crate_name, &state.key.1)
+                    {
+                        owner_candidates.push(state.clone());
+                    }
+                }
+            } else {
+                // Non-path owners such as `&Public` cannot be resolved to one
+                // nominal key, but remain observable whenever the trait is.
+                owner_candidates.push(GuardedPrivateTypeKey {
+                    key: initial_owner_key,
+                    cfg_guard: combined_guards(&pending.cfg_guard, &[]),
+                });
+            }
+            trait_candidates.sort();
+            trait_candidates.dedup();
+            owner_candidates.sort();
+            owner_candidates.dedup();
+            let mut observable_pairs = trait_candidates
+                .iter()
+                .flat_map(|trait_state| {
+                    owner_candidates
+                        .iter()
+                        .filter(|owner_state| {
+                            !guards_proven_disjoint(&trait_state.cfg_guard, &owner_state.cfg_guard)
+                        })
+                        .map(|owner_state| {
+                            format!(
+                                "{}\n{}\nimpl-cfg:{:?}",
+                                guarded_private_type_evidence("resolved-trait", trait_state),
+                                guarded_private_type_evidence("resolved-owner", owner_state),
+                                combined_guards(&trait_state.cfg_guard, &owner_state.cfg_guard,)
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            observable_pairs.sort();
+            observable_pairs.dedup();
+            let has_observable_region = !observable_pairs.is_empty();
+            let trait_resolution_exhausted = trait_resolution.exhausted;
+            let owner_resolution_exhausted = owner_resolution
+                .as_ref()
+                .is_some_and(|resolution| resolution.exhausted);
+            if trait_resolution_exhausted || owner_resolution_exhausted || has_observable_region {
+                self.unknown_guarded_with_resolution_state(
                     RustApiUnknownKind::TraitImplResolution,
                     Some(&pending.crate_name),
-                    &pending.owner_module_path,
+                    &pending.declaring_module_path,
                     &pending.source_path,
                     &pending.cfg_guard,
-                    pending.evidence,
+                    trait_resolution_exhausted || owner_resolution_exhausted,
+                    if trait_resolution_exhausted || owner_resolution_exhausted {
+                        format!(
+                            "private trait/owner alias resolution exceeded its finite graph bound: {}\ntrait-resolution:{}\nowner-resolution:{}",
+                            pending.semantic_evidence,
+                            trait_resolution
+                                .exhaustion_digest
+                                .as_deref()
+                                .unwrap_or("complete"),
+                            owner_resolution
+                                .as_ref()
+                                .and_then(|resolution| resolution.exhaustion_digest.as_deref())
+                                .unwrap_or("complete")
+                        )
+                    } else {
+                        format!(
+                            "{}\nresolved-observable-impls:\n{}",
+                            pending.semantic_evidence,
+                            observable_pairs.join("\n--\n")
+                        )
+                    },
                 );
             }
         }
@@ -2747,6 +3255,28 @@ impl<'a> SnapshotBuilder<'a> {
         cfg_guard: &[String],
         evidence: String,
     ) {
+        self.unknown_guarded_with_resolution_state(
+            kind,
+            crate_name,
+            module_path,
+            source_path,
+            cfg_guard,
+            false,
+            evidence,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unknown_guarded_with_resolution_state(
+        &mut self,
+        kind: RustApiUnknownKind,
+        crate_name: Option<&str>,
+        module_path: &[String],
+        source_path: &str,
+        cfg_guard: &[String],
+        resolution_exhausted: bool,
+        evidence: String,
+    ) {
         self.unknowns.push(RustApiUnknown {
             kind,
             crate_name: crate_name.map(str::to_owned),
@@ -2754,6 +3284,7 @@ impl<'a> SnapshotBuilder<'a> {
             source_path: source_path.to_owned(),
             cfg_guard: cfg_guard.to_vec(),
             evidence,
+            resolution_exhausted,
             provenance: self.provenance.clone(),
         });
     }
@@ -2829,6 +3360,7 @@ fn ordinary_item_contract(
 
 fn normalized_contract(mut item: Item) -> String {
     normalize_item_attrs(&mut item);
+    let free_identifiers = FreeIdentifierCollector::item(&item);
     match &mut item {
         Item::Fn(function) => {
             *function.block = syn::parse_quote!({});
@@ -2837,7 +3369,7 @@ fn normalized_contract(mut item: Item) -> String {
         }
         Item::Struct(value) => {
             let layout_sensitive = has_layout_sensitive_repr(&value.attrs);
-            let mut normalizer = SignatureAlphaNormalizer::default();
+            let mut normalizer = SignatureAlphaNormalizer::with_occupied(free_identifiers.clone());
             normalizer.push_generics(&value.generics);
             value.generics = normalizer.fold_generics(value.generics.clone());
             for field in &mut value.fields {
@@ -2851,7 +3383,7 @@ fn normalized_contract(mut item: Item) -> String {
         Item::Union(value) => {
             let layout_sensitive = has_layout_sensitive_repr(&value.attrs);
             let mut fields = Fields::Named(value.fields.clone());
-            let mut normalizer = SignatureAlphaNormalizer::default();
+            let mut normalizer = SignatureAlphaNormalizer::with_occupied(free_identifiers.clone());
             normalizer.push_generics(&value.generics);
             value.generics = normalizer.fold_generics(value.generics.clone());
             for field in &mut fields {
@@ -2867,7 +3399,7 @@ fn normalized_contract(mut item: Item) -> String {
             trim_generics_punctuation(&mut value.generics);
         }
         Item::Enum(value) => {
-            let mut normalizer = SignatureAlphaNormalizer::default();
+            let mut normalizer = SignatureAlphaNormalizer::with_occupied(free_identifiers.clone());
             normalizer.push_generics(&value.generics);
             value.generics = normalizer.fold_generics(value.generics.clone());
             for variant in &mut value.variants {
@@ -2883,7 +3415,7 @@ fn normalized_contract(mut item: Item) -> String {
             }
         }
         Item::Trait(value) => {
-            let mut normalizer = SignatureAlphaNormalizer::default();
+            let mut normalizer = SignatureAlphaNormalizer::with_occupied(free_identifiers.clone());
             normalizer.push_generics(&value.generics);
             value.generics = normalizer.fold_generics(value.generics.clone());
             value.supertraits = value
@@ -2932,7 +3464,7 @@ fn normalized_contract(mut item: Item) -> String {
             normalizer.pop_scope();
         }
         Item::Type(value) => {
-            let mut normalizer = SignatureAlphaNormalizer::default();
+            let mut normalizer = SignatureAlphaNormalizer::with_occupied(free_identifiers);
             normalizer.push_generics(&value.generics);
             value.generics = normalizer.fold_generics(value.generics.clone());
             *value.ty = normalizer.fold_type((*value.ty).clone());
@@ -3053,18 +3585,56 @@ fn filter_private_fields(fields: &mut Fields, layout_sensitive: bool) {
 }
 
 fn has_layout_sensitive_repr(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|attribute| {
-        if !attribute.path().is_ident("repr") {
-            return false;
-        }
-        let syn::Meta::List(list) = &attribute.meta else {
+    attrs
+        .iter()
+        .any(|attribute| meta_contains_layout_sensitive_repr(&attribute.meta))
+}
+
+fn meta_contains_layout_sensitive_repr(meta: &Meta) -> bool {
+    if meta.path().is_ident("repr") {
+        let Meta::List(list) = meta else {
             return false;
         };
-        list.tokens
+        return list
+            .tokens
             .to_string()
             .split(|character: char| !character.is_ascii_alphanumeric())
-            .any(|token| matches!(token, "C" | "packed" | "transparent"))
-    })
+            .any(|token| {
+                matches!(
+                    token,
+                    "C" | "packed"
+                        | "transparent"
+                        | "align"
+                        | "simd"
+                        | "u8"
+                        | "u16"
+                        | "u32"
+                        | "u64"
+                        | "u128"
+                        | "usize"
+                        | "i8"
+                        | "i16"
+                        | "i32"
+                        | "i64"
+                        | "i128"
+                        | "isize"
+                )
+            });
+    }
+    if !meta.path().is_ident("cfg_attr") {
+        return false;
+    }
+    let Meta::List(list) = meta else {
+        return false;
+    };
+    let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+    let Ok(parts) = parser.parse2(list.tokens.clone()) else {
+        return false;
+    };
+    parts
+        .iter()
+        .skip(1)
+        .any(meta_contains_layout_sensitive_repr)
 }
 
 fn normalize_item_attrs(item: &mut Item) {
@@ -3124,7 +3694,9 @@ fn normalize_attrs(attrs: &mut Vec<Attribute>, drop_cfg: bool) {
         if matches!(
             name.as_deref(),
             Some("doc" | "rustfmt" | "allow" | "warn" | "deny" | "forbid" | "expect")
-        ) || (drop_cfg && matches!(name.as_deref(), Some("cfg" | "cfg_attr")))
+        ) || (drop_cfg
+            && matches!(name.as_deref(), Some("cfg" | "cfg_attr"))
+            && !meta_contains_layout_sensitive_repr(&attr.meta))
         {
             return false;
         }
@@ -3158,7 +3730,296 @@ fn trim_signature_punctuation(signature: &mut syn::Signature) {
 }
 
 fn alpha_normalize_signature(signature: &mut syn::Signature) {
-    SignatureAlphaNormalizer::default().normalize_signature(signature);
+    SignatureAlphaNormalizer::with_occupied(FreeIdentifierCollector::signature(signature))
+        .normalize_signature(signature);
+}
+
+#[derive(Default)]
+struct FreeIdentifierCollector {
+    ident_scopes: Vec<BTreeSet<String>>,
+    lifetime_scopes: Vec<BTreeSet<String>>,
+    identifiers: BTreeSet<String>,
+}
+
+impl FreeIdentifierCollector {
+    fn signature(signature: &syn::Signature) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        collector.walk_signature(signature);
+        collector.identifiers
+    }
+
+    fn item(item: &Item) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        collector.walk_item(item);
+        collector.identifiers
+    }
+
+    fn item_impl(item: &syn::ItemImpl) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        collector.walk_impl(item);
+        collector.identifiers
+    }
+
+    fn impl_header_and_item(item_impl: &syn::ItemImpl, item: &syn::ImplItem) -> BTreeSet<String> {
+        let mut collector = Self::default();
+        collector.push_generics(&item_impl.generics);
+        collector.fold_generics(item_impl.generics.clone());
+        collector.fold_type((*item_impl.self_ty).clone());
+        if let Some((_, path, _)) = &item_impl.trait_ {
+            collector.fold_path(path.clone());
+        }
+        collector.walk_impl_item(item);
+        collector.pop_scope();
+        collector.identifiers
+    }
+
+    fn push_generics(&mut self, generics: &syn::Generics) {
+        let mut idents = BTreeSet::new();
+        let mut lifetimes = BTreeSet::new();
+        for parameter in &generics.params {
+            match parameter {
+                syn::GenericParam::Lifetime(parameter) => {
+                    lifetimes.insert(parameter.lifetime.to_string());
+                }
+                syn::GenericParam::Type(parameter) => {
+                    idents.insert(normalize_identifier(parameter.ident.to_string()));
+                }
+                syn::GenericParam::Const(parameter) => {
+                    idents.insert(normalize_identifier(parameter.ident.to_string()));
+                }
+            }
+        }
+        self.ident_scopes.push(idents);
+        self.lifetime_scopes.push(lifetimes);
+    }
+
+    fn push_params(&mut self, params: &[syn::GenericParam]) {
+        let generics = syn::Generics {
+            params: params.iter().cloned().collect(),
+            ..syn::Generics::default()
+        };
+        self.push_generics(&generics);
+    }
+
+    fn pop_scope(&mut self) {
+        self.ident_scopes.pop();
+        self.lifetime_scopes.pop();
+    }
+
+    fn ident_is_bound(&self, identifier: &str) -> bool {
+        self.ident_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(identifier))
+    }
+
+    fn lifetime_is_bound(&self, lifetime: &str) -> bool {
+        self.lifetime_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(lifetime))
+    }
+
+    fn walk_signature(&mut self, signature: &syn::Signature) {
+        self.push_generics(&signature.generics);
+        self.fold_generics(signature.generics.clone());
+        for argument in &signature.inputs {
+            match argument {
+                syn::FnArg::Receiver(receiver) => {
+                    self.fold_receiver(receiver.clone());
+                }
+                syn::FnArg::Typed(argument) => {
+                    self.fold_type((*argument.ty).clone());
+                }
+            }
+        }
+        self.fold_return_type(signature.output.clone());
+        self.pop_scope();
+    }
+
+    fn walk_item(&mut self, item: &Item) {
+        match item {
+            Item::Fn(function) => self.walk_signature(&function.sig),
+            Item::Struct(value) => {
+                self.push_generics(&value.generics);
+                self.fold_generics(value.generics.clone());
+                for field in &value.fields {
+                    self.fold_type(field.ty.clone());
+                }
+                self.pop_scope();
+            }
+            Item::Union(value) => {
+                self.push_generics(&value.generics);
+                self.fold_generics(value.generics.clone());
+                for field in &value.fields.named {
+                    self.fold_type(field.ty.clone());
+                }
+                self.pop_scope();
+            }
+            Item::Enum(value) => {
+                self.push_generics(&value.generics);
+                self.fold_generics(value.generics.clone());
+                for variant in &value.variants {
+                    for field in &variant.fields {
+                        self.fold_type(field.ty.clone());
+                    }
+                    if let Some((_, expression)) = &variant.discriminant {
+                        self.fold_expr(expression.clone());
+                    }
+                }
+                self.pop_scope();
+            }
+            Item::Trait(value) => {
+                self.push_generics(&value.generics);
+                self.fold_generics(value.generics.clone());
+                for bound in &value.supertraits {
+                    self.fold_type_param_bound(bound.clone());
+                }
+                for item in &value.items {
+                    match item {
+                        syn::TraitItem::Fn(function) => self.walk_signature(&function.sig),
+                        syn::TraitItem::Const(value) => {
+                            self.fold_type(value.ty.clone());
+                            if let Some((_, default)) = &value.default {
+                                self.fold_expr(default.clone());
+                            }
+                        }
+                        syn::TraitItem::Type(value) => {
+                            self.push_generics(&value.generics);
+                            self.fold_generics(value.generics.clone());
+                            for bound in &value.bounds {
+                                self.fold_type_param_bound(bound.clone());
+                            }
+                            if let Some((_, default)) = &value.default {
+                                self.fold_type(default.clone());
+                            }
+                            self.pop_scope();
+                        }
+                        _ => {}
+                    }
+                }
+                self.pop_scope();
+            }
+            Item::Type(value) => {
+                self.push_generics(&value.generics);
+                self.fold_generics(value.generics.clone());
+                self.fold_type((*value.ty).clone());
+                self.pop_scope();
+            }
+            Item::Const(value) => {
+                self.fold_type((*value.ty).clone());
+                self.fold_expr((*value.expr).clone());
+            }
+            Item::Static(value) => {
+                self.fold_type((*value.ty).clone());
+                self.fold_expr((*value.expr).clone());
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_impl(&mut self, item: &syn::ItemImpl) {
+        self.push_generics(&item.generics);
+        self.fold_generics(item.generics.clone());
+        self.fold_type((*item.self_ty).clone());
+        if let Some((_, path, _)) = &item.trait_ {
+            self.fold_path(path.clone());
+        }
+        for item in &item.items {
+            self.walk_impl_item(item);
+        }
+        self.pop_scope();
+    }
+
+    fn walk_impl_item(&mut self, item: &syn::ImplItem) {
+        match item {
+            syn::ImplItem::Fn(function) => self.walk_signature(&function.sig),
+            syn::ImplItem::Const(value) => {
+                self.fold_type(value.ty.clone());
+                self.fold_expr(value.expr.clone());
+            }
+            syn::ImplItem::Type(value) => {
+                self.push_generics(&value.generics);
+                self.fold_generics(value.generics.clone());
+                self.fold_type(value.ty.clone());
+                self.pop_scope();
+            }
+            _ => {}
+        }
+    }
+
+    fn fold_path_idents(&mut self, path: syn::Path, fold_head: bool) -> syn::Path {
+        for (index, segment) in path.segments.iter().enumerate() {
+            let identifier = normalize_identifier(segment.ident.to_string());
+            if index == 0 && fold_head && path.leading_colon.is_none() {
+                if !self.ident_is_bound(&identifier) {
+                    self.identifiers.insert(identifier);
+                }
+            } else {
+                self.identifiers.insert(identifier);
+            }
+            self.fold_path_arguments(segment.arguments.clone());
+        }
+        path
+    }
+}
+
+impl Fold for FreeIdentifierCollector {
+    fn fold_ident(&mut self, ident: syn::Ident) -> syn::Ident {
+        let identifier = normalize_identifier(ident.to_string());
+        if !self.ident_is_bound(&identifier) {
+            self.identifiers.insert(identifier);
+        }
+        ident
+    }
+
+    fn fold_lifetime(&mut self, lifetime: syn::Lifetime) -> syn::Lifetime {
+        if !self.lifetime_is_bound(&lifetime.to_string()) {
+            self.identifiers.insert(lifetime.ident.to_string());
+        }
+        lifetime
+    }
+
+    fn fold_path(&mut self, path: syn::Path) -> syn::Path {
+        self.fold_path_idents(path, true)
+    }
+
+    fn fold_type_path(&mut self, type_path: syn::TypePath) -> syn::TypePath {
+        let qualified = type_path.qself.is_some();
+        syn::TypePath {
+            qself: type_path.qself.map(|qself| self.fold_qself(qself)),
+            path: self.fold_path_idents(type_path.path, !qualified),
+        }
+    }
+
+    fn fold_type_bare_fn(&mut self, bare_fn: syn::TypeBareFn) -> syn::TypeBareFn {
+        let has_binders = bare_fn.lifetimes.is_some();
+        if let Some(lifetimes) = &bare_fn.lifetimes {
+            self.push_params(&lifetimes.lifetimes.iter().cloned().collect::<Vec<_>>());
+        }
+        let folded = syn::fold::fold_type_bare_fn(self, bare_fn);
+        if has_binders {
+            self.pop_scope();
+        }
+        folded
+    }
+
+    fn fold_trait_bound(&mut self, bound: syn::TraitBound) -> syn::TraitBound {
+        let has_binders = bound.lifetimes.is_some();
+        if let Some(lifetimes) = &bound.lifetimes {
+            self.push_params(&lifetimes.lifetimes.iter().cloned().collect::<Vec<_>>());
+        }
+        let folded = syn::fold::fold_trait_bound(self, bound);
+        if has_binders {
+            self.pop_scope();
+        }
+        folded
+    }
+
+    fn fold_bare_fn_arg(&mut self, mut argument: syn::BareFnArg) -> syn::BareFnArg {
+        argument.name = None;
+        syn::fold::fold_bare_fn_arg(self, argument)
+    }
 }
 
 /// Canonicalize names that bind only inside a public signature while retaining
@@ -3167,12 +4028,62 @@ fn alpha_normalize_signature(signature: &mut syn::Signature) {
 struct SignatureAlphaNormalizer {
     ident_scopes: Vec<BTreeMap<String, syn::Ident>>,
     lifetime_scopes: Vec<BTreeMap<String, syn::Lifetime>>,
-    next_type: usize,
-    next_const: usize,
-    next_lifetime: usize,
+    occupied_identifiers: BTreeSet<String>,
 }
 
 impl SignatureAlphaNormalizer {
+    fn with_occupied(occupied_identifiers: BTreeSet<String>) -> Self {
+        Self {
+            occupied_identifiers,
+            ..Self::default()
+        }
+    }
+
+    fn fresh_type_identifier(
+        &mut self,
+        depth: usize,
+        index: usize,
+        span: proc_macro2::Span,
+    ) -> syn::Ident {
+        for salt in 0usize.. {
+            let candidate = format!("__PrviewT{depth}_{index}_{salt}");
+            if self.occupied_identifiers.insert(candidate.clone()) {
+                return syn::Ident::new(&candidate, span);
+            }
+        }
+        unreachable!()
+    }
+
+    fn fresh_const_identifier(
+        &mut self,
+        depth: usize,
+        index: usize,
+        span: proc_macro2::Span,
+    ) -> syn::Ident {
+        for salt in 0usize.. {
+            let candidate = format!("__PRVIEW_C{depth}_{index}_{salt}");
+            if self.occupied_identifiers.insert(candidate.clone()) {
+                return syn::Ident::new(&candidate, span);
+            }
+        }
+        unreachable!()
+    }
+
+    fn fresh_lifetime(
+        &mut self,
+        depth: usize,
+        index: usize,
+        span: proc_macro2::Span,
+    ) -> syn::Lifetime {
+        for salt in 0usize.. {
+            let candidate = format!("__prview_l{depth}_{index}_{salt}");
+            if self.occupied_identifiers.insert(candidate.clone()) {
+                return syn::Lifetime::new(&format!("'{candidate}"), span);
+            }
+        }
+        unreachable!()
+    }
+
     fn normalize_signature(&mut self, signature: &mut syn::Signature) {
         self.push_generics(&signature.generics);
         signature.generics = self.fold_generics(signature.generics.clone());
@@ -3199,30 +4110,22 @@ impl SignatureAlphaNormalizer {
     fn push_params(&mut self, params: &[syn::GenericParam]) {
         let mut idents = BTreeMap::new();
         let mut lifetimes = BTreeMap::new();
-        for parameter in params {
+        let depth = self.ident_scopes.len();
+        for (index, parameter) in params.iter().enumerate() {
             match parameter {
                 syn::GenericParam::Lifetime(parameter) => {
-                    let replacement = syn::Lifetime::new(
-                        &format!("'__prview_l{}", self.next_lifetime),
-                        parameter.lifetime.ident.span(),
-                    );
-                    self.next_lifetime += 1;
+                    let replacement =
+                        self.fresh_lifetime(depth, index, parameter.lifetime.ident.span());
                     lifetimes.insert(parameter.lifetime.to_string(), replacement);
                 }
                 syn::GenericParam::Type(parameter) => {
-                    let replacement = syn::Ident::new(
-                        &format!("__PrviewT{}", self.next_type),
-                        parameter.ident.span(),
-                    );
-                    self.next_type += 1;
+                    let replacement =
+                        self.fresh_type_identifier(depth, index, parameter.ident.span());
                     idents.insert(parameter.ident.to_string(), replacement);
                 }
                 syn::GenericParam::Const(parameter) => {
-                    let replacement = syn::Ident::new(
-                        &format!("__PRVIEW_C{}", self.next_const),
-                        parameter.ident.span(),
-                    );
-                    self.next_const += 1;
+                    let replacement =
+                        self.fresh_const_identifier(depth, index, parameter.ident.span());
                     idents.insert(parameter.ident.to_string(), replacement);
                 }
             }
@@ -3232,8 +4135,17 @@ impl SignatureAlphaNormalizer {
     }
 
     fn pop_scope(&mut self) {
-        self.ident_scopes.pop();
-        self.lifetime_scopes.pop();
+        if let Some(scope) = self.ident_scopes.pop() {
+            for replacement in scope.into_values() {
+                self.occupied_identifiers.remove(&replacement.to_string());
+            }
+        }
+        if let Some(scope) = self.lifetime_scopes.pop() {
+            for replacement in scope.into_values() {
+                self.occupied_identifiers
+                    .remove(&replacement.ident.to_string());
+            }
+        }
     }
 
     fn fold_path_idents(&mut self, mut path: syn::Path, fold_head: bool) -> syn::Path {
@@ -3380,6 +4292,18 @@ fn trim_trailing_punct<T, P>(values: &mut Punctuated<T, P>) {
 
 struct CanonicalFold;
 
+fn sort_semantic_set<T, P>(values: &mut Punctuated<T, P>)
+where
+    T: ToTokens,
+    P: Default,
+{
+    let mut items: Vec<_> = std::mem::replace(values, Punctuated::new())
+        .into_iter()
+        .collect();
+    items.sort_by_key(|item| canonical_tokens(item.to_token_stream()));
+    *values = items.into_iter().collect();
+}
+
 impl Fold for CanonicalFold {
     fn fold_ident(&mut self, ident: syn::Ident) -> syn::Ident {
         let text = ident.to_string();
@@ -3394,6 +4318,77 @@ impl Fold for CanonicalFold {
     fn fold_lit_str(&mut self, literal: syn::LitStr) -> syn::LitStr {
         syn::LitStr::new(&literal.value(), literal.span())
     }
+
+    fn fold_generics(&mut self, generics: syn::Generics) -> syn::Generics {
+        let mut generics = syn::fold::fold_generics(self, generics);
+        if let Some(where_clause) = &mut generics.where_clause {
+            sort_semantic_set(&mut where_clause.predicates);
+        }
+        generics
+    }
+
+    fn fold_type_param(&mut self, parameter: syn::TypeParam) -> syn::TypeParam {
+        let mut parameter = syn::fold::fold_type_param(self, parameter);
+        sort_semantic_set(&mut parameter.bounds);
+        parameter
+    }
+
+    fn fold_lifetime_param(&mut self, parameter: syn::LifetimeParam) -> syn::LifetimeParam {
+        let mut parameter = syn::fold::fold_lifetime_param(self, parameter);
+        sort_semantic_set(&mut parameter.bounds);
+        parameter
+    }
+
+    fn fold_predicate_type(&mut self, predicate: syn::PredicateType) -> syn::PredicateType {
+        let mut predicate = syn::fold::fold_predicate_type(self, predicate);
+        sort_semantic_set(&mut predicate.bounds);
+        predicate
+    }
+
+    fn fold_predicate_lifetime(
+        &mut self,
+        predicate: syn::PredicateLifetime,
+    ) -> syn::PredicateLifetime {
+        let mut predicate = syn::fold::fold_predicate_lifetime(self, predicate);
+        sort_semantic_set(&mut predicate.bounds);
+        predicate
+    }
+
+    fn fold_constraint(&mut self, constraint: syn::Constraint) -> syn::Constraint {
+        let mut constraint = syn::fold::fold_constraint(self, constraint);
+        sort_semantic_set(&mut constraint.bounds);
+        constraint
+    }
+
+    fn fold_item_trait(&mut self, item: syn::ItemTrait) -> syn::ItemTrait {
+        let mut item = syn::fold::fold_item_trait(self, item);
+        sort_semantic_set(&mut item.supertraits);
+        item
+    }
+
+    fn fold_item_trait_alias(&mut self, item: syn::ItemTraitAlias) -> syn::ItemTraitAlias {
+        let mut item = syn::fold::fold_item_trait_alias(self, item);
+        sort_semantic_set(&mut item.bounds);
+        item
+    }
+
+    fn fold_trait_item_type(&mut self, item: syn::TraitItemType) -> syn::TraitItemType {
+        let mut item = syn::fold::fold_trait_item_type(self, item);
+        sort_semantic_set(&mut item.bounds);
+        item
+    }
+
+    fn fold_type_impl_trait(&mut self, ty: syn::TypeImplTrait) -> syn::TypeImplTrait {
+        let mut ty = syn::fold::fold_type_impl_trait(self, ty);
+        sort_semantic_set(&mut ty.bounds);
+        ty
+    }
+
+    fn fold_type_trait_object(&mut self, ty: syn::TypeTraitObject) -> syn::TypeTraitObject {
+        let mut ty = syn::fold::fold_type_trait_object(self, ty);
+        sort_semantic_set(&mut ty.bounds);
+        ty
+    }
 }
 
 fn normalized_associated_contract(
@@ -3405,7 +4400,8 @@ fn normalized_associated_contract(
     normalize_attrs(&mut impl_attrs, true);
     let defaultness = &item_impl.defaultness;
     let unsafety = &item_impl.unsafety;
-    let mut normalizer = SignatureAlphaNormalizer::default();
+    let occupied = FreeIdentifierCollector::impl_header_and_item(item_impl, item);
+    let mut normalizer = SignatureAlphaNormalizer::with_occupied(occupied);
     normalizer.push_generics(&item_impl.generics);
     let mut generics = normalizer.fold_generics(item_impl.generics.clone());
     trim_generics_punctuation(&mut generics);
@@ -3431,20 +4427,28 @@ fn normalized_associated_contract(
         }
         syn::ImplItem::Const(mut value) => {
             normalize_attrs(&mut value.attrs, false);
+            value.ty = normalizer.fold_type(value.ty);
+            value.expr = normalizer.fold_expr(value.expr);
             value.to_token_stream()
         }
         _ => return String::new(),
     };
     normalizer.pop_scope();
-    let tokens =
-        quote!(#(#impl_attrs)* #defaultness #unsafety impl #generics #self_ty { #item_tokens });
-    canonical_tokens(tokens)
+    let (impl_generics, _, where_clause) = generics.split_for_impl();
+    let tokens = quote!(
+        #(#impl_attrs)* #defaultness #unsafety
+        impl #impl_generics #self_ty #where_clause { #item_tokens }
+    );
+    let normalized: syn::ItemImpl =
+        syn::parse2(tokens).expect("normalized associated-item contract remains valid Rust");
+    canonical_tokens(CanonicalFold.fold_item_impl(normalized).to_token_stream())
 }
 
-fn normalized_trait_impl_contract(item_impl: &syn::ItemImpl) -> String {
+fn normalized_trait_impl_item(item_impl: &syn::ItemImpl) -> syn::ItemImpl {
     let mut item_impl = item_impl.clone();
     normalize_attrs(&mut item_impl.attrs, true);
-    let mut normalizer = SignatureAlphaNormalizer::default();
+    let occupied = FreeIdentifierCollector::item_impl(&item_impl);
+    let mut normalizer = SignatureAlphaNormalizer::with_occupied(occupied);
     normalizer.push_generics(&item_impl.generics);
     item_impl.generics = normalizer.fold_generics(item_impl.generics);
     trim_generics_punctuation(&mut item_impl.generics);
@@ -3463,19 +4467,83 @@ fn normalized_trait_impl_contract(item_impl: &syn::ItemImpl) -> String {
             syn::ImplItem::Const(value) => {
                 normalize_attrs(&mut value.attrs, false);
                 value.ty = normalizer.fold_type(value.ty.clone());
+                value.expr = normalizer.fold_expr(value.expr.clone());
             }
             syn::ImplItem::Type(alias) => {
                 normalize_attrs(&mut alias.attrs, false);
+                normalizer.push_generics(&alias.generics);
                 alias.generics = normalizer.fold_generics(alias.generics.clone());
                 trim_generics_punctuation(&mut alias.generics);
                 alias.ty = normalizer.fold_type(alias.ty.clone());
+                normalizer.pop_scope();
             }
             syn::ImplItem::Macro(value) => normalize_attrs(&mut value.attrs, false),
             _ => {}
         }
     }
+    // Ordinary trait impl members are an unordered semantic set. Macro and
+    // verbatim items stay in source order because their expansion semantics
+    // are opaque to this parser and must remain fail-closed.
+    if item_impl.items.iter().all(|item| {
+        matches!(
+            item,
+            syn::ImplItem::Fn(_) | syn::ImplItem::Const(_) | syn::ImplItem::Type(_)
+        )
+    }) {
+        item_impl
+            .items
+            .sort_by_cached_key(|item| canonical_tokens(item.to_token_stream()));
+    }
     normalizer.pop_scope();
-    canonical_tokens(CanonicalFold.fold_item_impl(item_impl).to_token_stream())
+    CanonicalFold.fold_item_impl(item_impl)
+}
+
+fn normalized_trait_impl_contract(item_impl: &syn::ItemImpl) -> String {
+    canonical_tokens(normalized_trait_impl_item(item_impl).to_token_stream())
+}
+
+/// Normalizes an impl's caller-observable body while removing only the
+/// spelling of the top-level trait and owner paths. Their canonical resolved
+/// identities (including effective cfg regions) are appended separately by
+/// the alias resolver. Path arguments remain here because changing them can
+/// change which impl exists.
+fn normalized_trait_impl_semantic_contract(item_impl: &syn::ItemImpl) -> String {
+    let mut item_impl = normalized_trait_impl_item(item_impl);
+    if let Some((not, mut trait_path, for_token)) = item_impl.trait_.take() {
+        if let Some(last) = trait_path.segments.last().cloned() {
+            let mut replacement = last;
+            replacement.ident = syn::Ident::new("__prview_trait", replacement.ident.span());
+            trait_path.leading_colon = None;
+            trait_path.segments.clear();
+            trait_path.segments.push(replacement);
+        }
+        item_impl.trait_ = Some((not, trait_path, for_token));
+    }
+    hide_impl_owner_path(item_impl.self_ty.as_mut());
+    canonical_tokens(item_impl.to_token_stream())
+}
+
+fn hide_impl_owner_path(ty: &mut syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => {
+            let Some(last) = type_path.path.segments.last().cloned() else {
+                return false;
+            };
+            let mut replacement = last;
+            replacement.ident = syn::Ident::new("__prview_owner", replacement.ident.span());
+            type_path.path.leading_colon = None;
+            type_path.path.segments.clear();
+            type_path.path.segments.push(replacement);
+            true
+        }
+        syn::Type::Reference(reference) => hide_impl_owner_path(&mut reference.elem),
+        syn::Type::Ptr(pointer) => hide_impl_owner_path(&mut pointer.elem),
+        syn::Type::Slice(slice) => hide_impl_owner_path(&mut slice.elem),
+        syn::Type::Array(array) => hide_impl_owner_path(&mut array.elem),
+        syn::Type::Paren(paren) => hide_impl_owner_path(&mut paren.elem),
+        syn::Type::Group(group) => hide_impl_owner_path(&mut group.elem),
+        _ => false,
+    }
 }
 
 fn normalized_foreign_contract(foreign: &syn::ItemForeignMod, item: &syn::ForeignItem) -> String {
@@ -3828,14 +4896,21 @@ fn peek_manifest_toml(source: &dyn RevisionFileSource, path: &str) -> Option<tom
     toml::from_str(&text).ok()
 }
 
-fn toml_string_array(table: &toml::Table, key: &str) -> Vec<String> {
-    table
-        .get(key)
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(toml::Value::as_str)
-        .map(str::to_owned)
+fn toml_string_array(table: &toml::Table, key: &str) -> Result<Vec<String>, String> {
+    let Some(value) = table.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("workspace.{key} must be an array of strings"));
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("workspace.{key} must contain only strings"))
+        })
         .collect()
 }
 
@@ -3847,65 +4922,775 @@ fn parent_manifest_dir(manifest_path: &str) -> String {
         .replace('\\', "/")
 }
 
+fn normalize_cargo_relative_path(value: &str) -> Result<String, String> {
+    let windows_prefix = value.len() >= 2
+        && value.as_bytes()[1] == b':'
+        && value.as_bytes()[0].is_ascii_alphabetic();
+    let path = Path::new(value);
+    if path.is_absolute() || value.starts_with('\\') || windows_prefix {
+        return Err(format!(
+            "invalid Cargo workspace path {value:?}: absolute paths are unsupported"
+        ));
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return Err(format!(
+                        "invalid Cargo workspace path {value:?}: non-UTF-8 component"
+                    ));
+                };
+                parts.push(part.to_owned());
+            }
+            std::path::Component::ParentDir => {
+                if parts.last().is_some_and(|part| part != "..") {
+                    parts.pop();
+                } else {
+                    parts.push("..".to_owned());
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!(
+                    "invalid Cargo workspace path {value:?}: absolute paths are unsupported"
+                ));
+            }
+        }
+    }
+    Ok(if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    })
+}
+
 fn cargo_glob_matches(pattern: &str, path: &str) -> bool {
-    fn parts(value: &str) -> Vec<&str> {
-        if value.is_empty() || value == "." {
-            Vec::new()
+    let Ok(pattern) = normalize_cargo_relative_path(pattern) else {
+        return false;
+    };
+    let Ok(path) = normalize_cargo_relative_path(path) else {
+        return false;
+    };
+    glob::Pattern::new(&pattern).is_ok_and(|pattern| {
+        pattern.matches_path_with(
+            Path::new(&path),
+            glob::MatchOptions {
+                require_literal_separator: true,
+                ..glob::MatchOptions::new()
+            },
+        )
+    })
+}
+
+fn cargo_pattern_has_meta(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '['])
+}
+
+fn cargo_path_prefix(prefix: &str, path: &str) -> bool {
+    let (Ok(prefix), Ok(path)) = (
+        normalize_cargo_relative_path(prefix),
+        normalize_cargo_relative_path(path),
+    ) else {
+        return false;
+    };
+    Path::new(&path).starts_with(Path::new(&prefix))
+}
+
+/// Cargo expands `workspace.members` as glob patterns, but applies `exclude`
+/// as lexical path prefixes. An explicitly named member wins over an exclude
+/// prefix; a member admitted only by a glob does not.
+fn cargo_workspace_path_is_excluded(
+    relative: &str,
+    members: &[String],
+    exclude: &[String],
+) -> bool {
+    let excluded = exclude
+        .iter()
+        .any(|prefix| cargo_path_prefix(prefix, relative));
+    let explicitly_named = members
+        .iter()
+        .any(|member| cargo_path_prefix(member, relative));
+    excluded && !explicitly_named
+}
+
+fn cargo_workspace_member_is_selected(
+    relative: &str,
+    members: &[String],
+    exclude: &[String],
+) -> bool {
+    members
+        .iter()
+        .any(|pattern| cargo_glob_matches(pattern, relative))
+        && !cargo_workspace_path_is_excluded(relative, members, exclude)
+}
+
+fn manifest_dependency_refs(
+    manifest: &toml::Value,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+    fn collect(
+        value: Option<&toml::Value>,
+        context: &str,
+        paths: &mut BTreeSet<String>,
+        inherited: &mut BTreeSet<String>,
+    ) -> Result<(), String> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let Some(table) = value.as_table() else {
+            return Err(format!("{context} must be a dependency table"));
+        };
+        for (name, dependency) in table {
+            if dependency.is_str() {
+                continue;
+            }
+            let Some(dependency) = dependency.as_table() else {
+                return Err(format!("{context}.{name} must be a string or table"));
+            };
+            let path = match dependency.get("path") {
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| format!("{context}.{name}.path must be a string"))?,
+                ),
+                None => None,
+            };
+            let from_workspace = match dependency.get("workspace") {
+                Some(value) => {
+                    if value.as_bool() != Some(true) {
+                        return Err(format!("{context}.{name}.workspace must be true"));
+                    }
+                    true
+                }
+                None => false,
+            };
+            if path.is_some() && from_workspace {
+                return Err(format!(
+                    "{context}.{name} cannot declare both path and workspace=true"
+                ));
+            }
+            if let Some(path) = path {
+                paths.insert(path.to_owned());
+            } else if from_workspace {
+                inherited.insert(name.to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    let mut paths = BTreeSet::new();
+    let mut inherited = BTreeSet::new();
+    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        collect(manifest.get(key), key, &mut paths, &mut inherited)?;
+    }
+    if let Some(targets) = manifest.get("target") {
+        let Some(targets) = targets.as_table() else {
+            return Err("target must be a table".to_owned());
+        };
+        for (target_name, target) in targets {
+            let Some(target) = target.as_table() else {
+                return Err(format!("target.{target_name} must be a table"));
+            };
+            for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                collect(
+                    target.get(key),
+                    &format!("target.{target_name}.{key}"),
+                    &mut paths,
+                    &mut inherited,
+                )?;
+            }
+        }
+    }
+    Ok((paths, inherited))
+}
+
+fn workspace_dependency_paths(
+    workspace_manifest: &toml::Value,
+) -> Result<BTreeMap<String, Option<String>>, String> {
+    let Some(workspace) = workspace_manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(dependencies) = workspace.get("dependencies") else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(dependencies) = dependencies.as_table() else {
+        return Err("workspace.dependencies must be a table".to_owned());
+    };
+    dependencies
+        .iter()
+        .map(|(name, dependency)| {
+            if dependency.is_str() {
+                return Ok((name.clone(), None));
+            }
+            let Some(dependency) = dependency.as_table() else {
+                return Err(format!(
+                    "workspace.dependencies.{name} must be a string or table"
+                ));
+            };
+            let path = match dependency.get("path") {
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| {
+                            format!("workspace.dependencies.{name}.path must be a string")
+                        })?
+                        .to_owned(),
+                ),
+                None => None,
+            };
+            Ok((name.clone(), path))
+        })
+        .collect()
+}
+
+fn workspace_relative_dir(workspace_dir: &str, package_dir: &str) -> Option<String> {
+    if workspace_dir.is_empty() {
+        Some(package_dir.to_owned())
+    } else if package_dir == workspace_dir {
+        Some(String::new())
+    } else {
+        package_dir
+            .strip_prefix(&format!("{workspace_dir}/"))
+            .map(str::to_owned)
+    }
+}
+
+fn repo_relative_dir(base_dir: &str, target_dir: &str) -> String {
+    let base: Vec<_> = base_dir
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let target: Vec<_> = target_dir
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let common = base
+        .iter()
+        .zip(&target)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = vec![".."; base.len() - common];
+    relative.extend_from_slice(&target[common..]);
+    if relative.is_empty() {
+        ".".to_owned()
+    } else {
+        relative.join("/")
+    }
+}
+
+fn live_inventory_directories(inventory: &BTreeMap<String, RevisionEntry>) -> BTreeSet<String> {
+    let mut directories = BTreeSet::new();
+    for (path, entry) in inventory {
+        let live = matches!(
+            entry.state,
+            super::revision_source::RevisionEntryState::Present
+                | super::revision_source::RevisionEntryState::Added
+                | super::revision_source::RevisionEntryState::RenamedFrom { .. }
+        );
+        if !live || entry.kind == super::revision_source::RevisionEntryKind::Tree {
+            continue;
+        }
+        let mut parent = Path::new(path).parent();
+        while let Some(directory_path) = parent {
+            let Some(directory) = directory_path.to_str() else {
+                break;
+            };
+            let directory = directory.replace('\\', "/");
+            if directory.is_empty() {
+                break;
+            }
+            directories.insert(directory);
+            parent = directory_path.parent();
+        }
+        if matches!(
+            entry.kind,
+            super::revision_source::RevisionEntryKind::Gitlink
+                | super::revision_source::RevisionEntryKind::Symlink
+        ) {
+            directories.insert(path.clone());
+        }
+    }
+    directories
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CargoMembershipSource {
+    ExplicitMember,
+    PathDependency,
+}
+
+fn package_belongs_to_workspace(
+    manifest_path: &str,
+    manifest: &toml::Value,
+    workspace_dir: &str,
+    parsed: &[(&str, toml::Value)],
+    source: CargoMembershipSource,
+) -> Result<bool, String> {
+    let Some(package) = manifest.get("package").and_then(toml::Value::as_table) else {
+        return Err("path dependency manifest has no valid package table".to_owned());
+    };
+    let manifest_dir = parent_manifest_dir(manifest_path);
+    let owns_workspace = match manifest.get("workspace") {
+        Some(workspace) if workspace.as_table().is_some() => true,
+        Some(_) => return Err("workspace must be a table".to_owned()),
+        None => false,
+    };
+    if owns_workspace && package.contains_key("workspace") {
+        return Err("package cannot define both [workspace] and package.workspace".to_owned());
+    }
+    if owns_workspace {
+        return Ok(manifest_dir == workspace_dir);
+    }
+    if let Some(workspace) = package.get("workspace") {
+        let Some(workspace) = workspace.as_str() else {
+            return Err("package.workspace must be a string".to_owned());
+        };
+        let declared_workspace = safe_join_repo_path(&manifest_dir, workspace)
+            .map_err(|error| format!("package.workspace cannot be resolved: {error}"))?;
+        let declared_manifest = safe_join_repo_path(&declared_workspace, "Cargo.toml")
+            .map_err(|error| format!("package.workspace has no valid Cargo.toml: {error}"))?;
+        let authority = parsed
+            .iter()
+            .find(|(path, _)| *path == declared_manifest)
+            .map(|(_, manifest)| manifest)
+            .ok_or_else(|| {
+                format!("package.workspace points to unavailable {declared_manifest}")
+            })?;
+        if authority
+            .get("workspace")
+            .and_then(toml::Value::as_table)
+            .is_none()
+        {
+            return Err(format!(
+                "package.workspace target {declared_manifest} has no valid workspace table"
+            ));
+        }
+        return Ok(declared_workspace == workspace_dir);
+    }
+
+    if matches!(source, CargoMembershipSource::PathDependency)
+        && workspace_relative_dir(workspace_dir, &manifest_dir).is_some()
+    {
+        return Ok(true);
+    }
+
+    let nearest_workspace = parsed
+        .iter()
+        .filter(|(path, manifest)| {
+            manifest.get("workspace").is_some()
+                && workspace_relative_dir(&parent_manifest_dir(path), &manifest_dir).is_some()
+        })
+        .max_by_key(|(path, _)| parent_manifest_dir(path).len());
+    match nearest_workspace {
+        Some((path, manifest)) => {
+            if manifest
+                .get("workspace")
+                .and_then(toml::Value::as_table)
+                .is_none()
+            {
+                return Err(format!(
+                    "nearest workspace authority {path} has no valid workspace table"
+                ));
+            }
+            Ok(parent_manifest_dir(path) == workspace_dir)
+        }
+        None if matches!(source, CargoMembershipSource::PathDependency) => Ok(false),
+        None => Err(format!(
+            "{manifest_path} is outside workspace {workspace_dir:?} and declares no resolvable workspace authority"
+        )),
+    }
+}
+
+fn rootless_package_is_proven_non_competing(
+    manifest_path: &str,
+    manifest: &toml::Value,
+    workspace_dir: &str,
+    exclude: &[String],
+    parsed: &[(&str, toml::Value)],
+) -> bool {
+    let package_dir = parent_manifest_dir(manifest_path);
+    if let Some(relative) = workspace_relative_dir(workspace_dir, &package_dir) {
+        // A package physically below the selected workspace is a nested
+        // fixture/tool unless Cargo selected it through members or a path
+        // dependency. An explicit exclude is the stronger form of the same
+        // proof. Neither is a second rootless authority.
+        return !relative.is_empty()
+            || exclude
+                .iter()
+                .any(|prefix| cargo_path_prefix(prefix, &relative));
+    }
+    matches!(
+        package_belongs_to_workspace(
+            manifest_path,
+            manifest,
+            workspace_dir,
+            parsed,
+            CargoMembershipSource::ExplicitMember,
+        ),
+        Ok(false)
+    )
+}
+
+fn validate_declared_package_workspace(
+    manifest_path: &str,
+    manifest: &toml::Value,
+    parsed: &[(&str, toml::Value)],
+) -> Result<(), String> {
+    let Some(package) = manifest.get("package").and_then(toml::Value::as_table) else {
+        return Err("manifest has no valid package table".to_owned());
+    };
+    let Some(workspace) = package.get("workspace") else {
+        return Ok(());
+    };
+    let Some(workspace) = workspace.as_str() else {
+        return Err("package.workspace must be a string".to_owned());
+    };
+    let package_dir = parent_manifest_dir(manifest_path);
+    let workspace_dir = safe_join_repo_path(&package_dir, workspace)
+        .map_err(|error| format!("package.workspace cannot be resolved: {error}"))?;
+    let workspace_manifest_path = safe_join_repo_path(&workspace_dir, "Cargo.toml")
+        .map_err(|error| format!("package.workspace has no valid Cargo.toml path: {error}"))?;
+    let workspace_manifest = parsed
+        .iter()
+        .find(|(path, _)| *path == workspace_manifest_path)
+        .map(|(_, manifest)| manifest)
+        .ok_or_else(|| {
+            format!("package.workspace points to unavailable {workspace_manifest_path}")
+        })?;
+    let workspace_table = workspace_manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            format!(
+                "package.workspace target {workspace_manifest_path} has no valid workspace table"
+            )
+        })?;
+    let members = toml_string_array(workspace_table, "members")?;
+    let exclude = toml_string_array(workspace_table, "exclude")?;
+    for member in &members {
+        let normalized = normalize_cargo_relative_path(member)?;
+        glob::Pattern::new(&normalized).map_err(|error| {
+            format!("workspace.members contains invalid glob {member:?}: {error}")
+        })?;
+    }
+    for excluded in &exclude {
+        normalize_cargo_relative_path(excluded)?;
+    }
+    Ok(())
+}
+
+fn include_unavailable_explicit_members(
+    manifests: &[String],
+    inventory_dirs: &BTreeSet<String>,
+    unresolved: &[&str],
+    workspace_dir: &str,
+    members: &[String],
+    exclude: &[String],
+    allowed: &mut BTreeSet<String>,
+) -> BTreeSet<String> {
+    let manifest_paths: BTreeSet<_> = manifests.iter().map(String::as_str).collect();
+    let mut errors = BTreeSet::new();
+
+    for manifest_path in unresolved {
+        let package_dir = parent_manifest_dir(manifest_path);
+        let relative = repo_relative_dir(workspace_dir, &package_dir);
+        if cargo_workspace_member_is_selected(&relative, members, exclude) {
+            allowed.insert((*manifest_path).to_owned());
+            errors.insert(format!(
+                "{manifest_path}: explicit workspace member manifest is unreadable or invalid"
+            ));
+        }
+    }
+
+    for member in members
+        .iter()
+        .filter(|member| !cargo_pattern_has_meta(member))
+    {
+        let Ok(member_dir) = safe_join_repo_path(workspace_dir, member) else {
+            errors.insert(format!(
+                "workspace member {member} resolves outside the repository"
+            ));
+            continue;
+        };
+        let relative = repo_relative_dir(workspace_dir, &member_dir);
+        if cargo_workspace_path_is_excluded(&relative, members, exclude) {
+            continue;
+        }
+        let Ok(manifest_path) = safe_join_repo_path(&member_dir, "Cargo.toml") else {
+            errors.insert(format!(
+                "workspace member {member} has an invalid manifest path"
+            ));
+            continue;
+        };
+        if !manifest_paths.contains(manifest_path.as_str()) {
+            errors.insert(format!("workspace member {member} has no {manifest_path}"));
+        }
+    }
+
+    for member in members
+        .iter()
+        .filter(|member| cargo_pattern_has_meta(member))
+    {
+        let matched_directory = inventory_dirs.iter().any(|directory| {
+            let relative = repo_relative_dir(workspace_dir, directory);
+            cargo_glob_matches(member, &relative)
+        });
+        if !matched_directory {
+            errors.insert(format!(
+                "workspace member glob {member} matched no repository directory"
+            ));
+        }
+    }
+
+    for directory in inventory_dirs {
+        let relative = repo_relative_dir(workspace_dir, directory);
+        let matched_glob = members.iter().any(|pattern| {
+            cargo_pattern_has_meta(pattern) && cargo_glob_matches(pattern, &relative)
+        });
+        if !matched_glob || cargo_workspace_path_is_excluded(&relative, members, exclude) {
+            continue;
+        }
+        let Ok(manifest_path) = safe_join_repo_path(directory, "Cargo.toml") else {
+            continue;
+        };
+        if !manifest_paths.contains(manifest_path.as_str()) {
+            errors.insert(format!(
+                "workspace member glob matched existing directory {relative} without {manifest_path}"
+            ));
+        }
+    }
+
+    errors
+}
+
+fn include_implicit_path_dependency_members(
+    manifests: &[String],
+    parsed: &[(&str, toml::Value)],
+    workspace_manifest: &toml::Value,
+    workspace_dir: &str,
+    members: &[String],
+    exclude: &[String],
+    allowed: &mut BTreeSet<String>,
+) -> BTreeSet<String> {
+    let manifest_paths: BTreeSet<_> = manifests.iter().map(String::as_str).collect();
+    let mut errors = BTreeSet::new();
+    let workspace_dependencies = match workspace_dependency_paths(workspace_manifest) {
+        Ok(dependencies) => dependencies,
+        Err(error) => {
+            errors.insert(error);
+            BTreeMap::new()
+        }
+    };
+
+    loop {
+        let mut discovered = BTreeSet::new();
+        for manifest_path in allowed.iter() {
+            let Some((_, manifest)) = parsed
+                .iter()
+                .find(|(path, _)| *path == manifest_path.as_str())
+            else {
+                continue;
+            };
+            let manifest_dir = parent_manifest_dir(manifest_path);
+            let (direct_paths, inherited) = match manifest_dependency_refs(manifest) {
+                Ok(dependencies) => dependencies,
+                Err(error) => {
+                    errors.insert(format!("{manifest_path}: {error}"));
+                    continue;
+                }
+            };
+            let mut dependency_paths: Vec<_> = direct_paths
+                .into_iter()
+                .map(|path| (manifest_dir.clone(), path, "path dependency".to_owned()))
+                .collect();
+            for name in inherited {
+                match workspace_dependencies.get(&name) {
+                    Some(Some(path)) => dependency_paths.push((
+                        workspace_dir.to_owned(),
+                        path.clone(),
+                        format!("workspace dependency {name}"),
+                    )),
+                    Some(None) => {}
+                    None => {
+                        errors.insert(format!(
+                            "{manifest_path}: inherited workspace dependency {name} is not declared"
+                        ));
+                    }
+                }
+            }
+            for (base_dir, dependency_path, dependency_kind) in dependency_paths {
+                let Ok(dependency_dir) = safe_join_repo_path(&base_dir, &dependency_path) else {
+                    // A path dependency outside the repository cannot be a
+                    // member of this repository-backed workspace snapshot.
+                    continue;
+                };
+                if workspace_relative_dir(workspace_dir, &dependency_dir).is_some_and(|relative| {
+                    cargo_workspace_path_is_excluded(&relative, members, exclude)
+                }) {
+                    continue;
+                }
+                let Ok(dependency_manifest) = safe_join_repo_path(&dependency_dir, "Cargo.toml")
+                else {
+                    continue;
+                };
+                if !manifest_paths.contains(dependency_manifest.as_str()) {
+                    errors.insert(format!(
+                        "{manifest_path}: {dependency_kind} {dependency_path} has no {dependency_manifest}"
+                    ));
+                    continue;
+                }
+                let Some((_, dependency)) = parsed
+                    .iter()
+                    .find(|(path, _)| *path == dependency_manifest.as_str())
+                else {
+                    discovered.insert(dependency_manifest.clone());
+                    errors.insert(format!(
+                        "{manifest_path}: {dependency_kind} {dependency_path} points to unreadable or invalid {dependency_manifest}"
+                    ));
+                    continue;
+                };
+                let dependency_inside_workspace =
+                    workspace_relative_dir(workspace_dir, &dependency_dir).is_some();
+                match package_belongs_to_workspace(
+                    &dependency_manifest,
+                    dependency,
+                    workspace_dir,
+                    parsed,
+                    CargoMembershipSource::PathDependency,
+                ) {
+                    Ok(true) => {
+                        discovered.insert(dependency_manifest);
+                    }
+                    Ok(false) if dependency_inside_workspace => {
+                        errors.insert(format!(
+                            "{manifest_path}: {dependency_kind} {dependency_path} points to {dependency_manifest}, which declares a different package.workspace"
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        errors.insert(format!("{dependency_manifest}: {error}"));
+                    }
+                }
+            }
+        }
+        let previous_len = allowed.len();
+        allowed.extend(discovered);
+        if allowed.len() == previous_len {
+            break;
+        }
+    }
+    errors
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_workspace_authority(
+    manifests: &[String],
+    inventory_dirs: &BTreeSet<String>,
+    parsed: &[(&str, toml::Value)],
+    packages: &[&str],
+    unresolved_authorities: &[&str],
+    workspace_path: &str,
+    workspace_dir: &str,
+    members: &[String],
+    exclude: &[String],
+    has_package: bool,
+    workspace_errors: &BTreeSet<String>,
+    label: &str,
+) -> (BTreeSet<String>, Option<String>) {
+    if !workspace_errors.is_empty() {
+        return (
+            BTreeSet::new(),
+            Some(format!(
+                "{label} {workspace_path} is invalid: {}",
+                workspace_errors
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )),
+        );
+    }
+    let member_patterns = if members.is_empty() {
+        if has_package {
+            vec![".".to_owned()]
         } else {
-            value
-                .split('/')
-                .filter(|part| !part.is_empty() && *part != ".")
-                .collect()
+            Vec::new()
         }
+    } else {
+        members.to_vec()
+    };
+    let mut allowed = BTreeSet::new();
+    if has_package {
+        allowed.insert(workspace_path.to_owned());
     }
-    fn component_match(pattern: &str, value: &str) -> bool {
-        let mut p = pattern.chars().peekable();
-        let mut v = value.chars().peekable();
-        while let Some(pc) = p.next() {
-            match pc {
-                '*' => {
-                    if p.peek().is_none() {
-                        return true;
-                    }
-                    let rest: String = p.collect();
-                    let remaining: String = v.collect();
-                    for i in 0..=remaining.len() {
-                        if remaining.is_char_boundary(i) && component_match(&rest, &remaining[i..])
-                        {
-                            return true;
-                        }
-                    }
-                    return false;
+    let mut discovery_errors = BTreeSet::new();
+    for package in packages {
+        let package_dir = parent_manifest_dir(package);
+        let relative = repo_relative_dir(workspace_dir, &package_dir);
+        if cargo_workspace_member_is_selected(&relative, &member_patterns, exclude) {
+            let package_manifest = parsed
+                .iter()
+                .find(|(path, _)| path == package)
+                .map(|(_, manifest)| manifest)
+                .expect("package path came from parsed manifests");
+            match package_belongs_to_workspace(
+                package,
+                package_manifest,
+                workspace_dir,
+                parsed,
+                CargoMembershipSource::ExplicitMember,
+            ) {
+                Ok(true) => {
+                    allowed.insert((*package).to_owned());
                 }
-                '?' => {
-                    if v.next().is_none() {
-                        return false;
-                    }
+                Ok(false) => {
+                    discovery_errors.insert(format!(
+                        "{package}: explicit member is owned by another workspace authority"
+                    ));
                 }
-                other => {
-                    if v.next() != Some(other) {
-                        return false;
-                    }
+                Err(error) => {
+                    discovery_errors.insert(format!("{package}: {error}"));
                 }
             }
         }
-        v.next().is_none()
     }
-    fn match_parts(pattern: &[&str], path: &[&str]) -> bool {
-        match (pattern.split_first(), path.split_first()) {
-            (None, None) => true,
-            (Some((&"**", rest)), _) => {
-                rest.is_empty()
-                    || match_parts(rest, path)
-                    || (!path.is_empty() && match_parts(pattern, &path[1..]))
-            }
-            (Some((pat, rest)), Some((seg, prest))) => {
-                component_match(pat, seg) && match_parts(rest, prest)
-            }
-            _ => false,
-        }
-    }
-    match_parts(&parts(pattern), &parts(path))
+    discovery_errors.extend(include_unavailable_explicit_members(
+        manifests,
+        inventory_dirs,
+        unresolved_authorities,
+        workspace_dir,
+        &member_patterns,
+        exclude,
+        &mut allowed,
+    ));
+    let workspace_manifest = parsed
+        .iter()
+        .find(|(path, _)| *path == workspace_path)
+        .map(|(_, manifest)| manifest)
+        .expect("workspace path came from parsed manifests");
+    discovery_errors.extend(include_implicit_path_dependency_members(
+        manifests,
+        parsed,
+        workspace_manifest,
+        workspace_dir,
+        &member_patterns,
+        exclude,
+        &mut allowed,
+    ));
+    let evidence = (!discovery_errors.is_empty()).then(|| {
+        format!(
+            "{label} is incomplete: {}",
+            discovery_errors
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    });
+    (allowed, evidence)
 }
 
 /// Product crates are workspace members (minus `exclude`), or the root package
@@ -3913,6 +5698,7 @@ fn cargo_glob_matches(pattern: &str, path: &str) -> bool {
 fn api_crate_manifests(
     source: &dyn RevisionFileSource,
     manifests: &[String],
+    inventory_dirs: &BTreeSet<String>,
 ) -> (BTreeSet<String>, Option<String>) {
     let mut parsed = Vec::new();
     let mut unresolved = Vec::new();
@@ -3924,22 +5710,81 @@ fn api_crate_manifests(
     }
     let mut workspaces = Vec::new();
     let mut packages = Vec::new();
+    let mut semantically_invalid = Vec::new();
     for (path, manifest) in &parsed {
         let dir = parent_manifest_dir(path);
-        if let Some(workspace) = manifest.get("workspace").and_then(toml::Value::as_table) {
-            let members = toml_string_array(workspace, "members");
-            let exclude = toml_string_array(workspace, "exclude");
+        if let Some(workspace_value) = manifest.get("workspace") {
+            let mut errors = BTreeSet::new();
+            if manifest
+                .get("package")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|package| package.contains_key("workspace"))
+            {
+                errors.insert(
+                    "package.workspace cannot be specified in a manifest that defines [workspace]"
+                        .to_owned(),
+                );
+            }
+            let (members, exclude) = if let Some(workspace) = workspace_value.as_table() {
+                let members = match toml_string_array(workspace, "members") {
+                    Ok(members) => members,
+                    Err(error) => {
+                        errors.insert(error);
+                        Vec::new()
+                    }
+                };
+                let exclude = match toml_string_array(workspace, "exclude") {
+                    Ok(exclude) => exclude,
+                    Err(error) => {
+                        errors.insert(error);
+                        Vec::new()
+                    }
+                };
+                for member in &members {
+                    match normalize_cargo_relative_path(member) {
+                        Ok(member) => {
+                            if let Err(error) = glob::Pattern::new(&member) {
+                                errors.insert(format!(
+                                    "workspace.members contains invalid glob {member:?}: {error}"
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            errors.insert(error);
+                        }
+                    }
+                }
+                for excluded in &exclude {
+                    if let Err(error) = normalize_cargo_relative_path(excluded) {
+                        errors.insert(error);
+                    }
+                }
+                (members, exclude)
+            } else {
+                errors.insert("workspace must be a table".to_owned());
+                (Vec::new(), Vec::new())
+            };
             workspaces.push((
-                dir.clone(),
+                *path,
+                dir,
                 members,
                 exclude,
                 manifest.get("package").is_some(),
+                errors,
             ));
         }
         if manifest.get("package").is_some() {
             packages.push(*path);
         }
+        if manifest.get("package").is_none() && manifest.get("workspace").is_none() {
+            semantically_invalid.push(*path);
+        }
     }
+    let unresolved_authorities = unresolved
+        .iter()
+        .copied()
+        .chain(semantically_invalid.iter().copied())
+        .collect::<Vec<_>>();
     if manifests.iter().any(|path| path == "Cargo.toml")
         && !parsed.iter().any(|(path, _)| *path == "Cargo.toml")
     {
@@ -3949,49 +5794,176 @@ fn api_crate_manifests(
         return (BTreeSet::from(["Cargo.toml".to_owned()]), None);
     }
     if let Some((_, root)) = parsed.iter().find(|(path, _)| *path == "Cargo.toml") {
-        let Some(workspace) = root.get("workspace").and_then(toml::Value::as_table) else {
+        if root.get("workspace").is_none() {
             return if root.get("package").is_some() {
-                (BTreeSet::from(["Cargo.toml".to_owned()]), None)
+                let declared_workspace = root
+                    .get("package")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|package| package.get("workspace"));
+                if declared_workspace.is_none() {
+                    (BTreeSet::from(["Cargo.toml".to_owned()]), None)
+                } else if let Err(error) =
+                    validate_declared_package_workspace("Cargo.toml", root, &parsed)
+                {
+                    (
+                        BTreeSet::from(["Cargo.toml".to_owned()]),
+                        Some(format!(
+                            "root package workspace authority is invalid: {error}"
+                        )),
+                    )
+                } else {
+                    let workspace = declared_workspace
+                        .and_then(toml::Value::as_str)
+                        .expect("validated package.workspace is a string");
+                    let workspace_dir = safe_join_repo_path("", workspace)
+                        .expect("validated package.workspace is repository-local");
+                    let workspace_path = safe_join_repo_path(&workspace_dir, "Cargo.toml")
+                        .expect("validated package.workspace has a Cargo.toml path");
+                    let Some((_, _, members, exclude, has_package, workspace_errors)) = workspaces
+                        .iter()
+                        .find(|(path, _, _, _, _, _)| *path == workspace_path)
+                    else {
+                        return (
+                            BTreeSet::from(["Cargo.toml".to_owned()]),
+                            Some(format!(
+                                "root package workspace authority {workspace_path} was not classified as a workspace"
+                            )),
+                        );
+                    };
+                    let (allowed, evidence) = select_workspace_authority(
+                        manifests,
+                        inventory_dirs,
+                        &parsed,
+                        &packages,
+                        &unresolved_authorities,
+                        &workspace_path,
+                        &workspace_dir,
+                        members,
+                        exclude,
+                        *has_package,
+                        workspace_errors,
+                        "declared root package workspace discovery",
+                    );
+                    if allowed.contains("Cargo.toml") {
+                        (allowed, evidence)
+                    } else {
+                        let missing = format!(
+                            "declared root package workspace {workspace_path} does not select Cargo.toml as a member"
+                        );
+                        let evidence = Some(match evidence {
+                            Some(existing) => format!("{existing}; {missing}"),
+                            None => missing,
+                        });
+                        (allowed, evidence)
+                    }
+                }
             } else {
-                (BTreeSet::new(), None)
+                // A parseable root manifest that is not a package or a
+                // workspace is still the repository authority. Keep it
+                // selected so discover_crates emits ManifestParse instead of
+                // certifying an empty surface or falling through to fixtures.
+                (BTreeSet::from(["Cargo.toml".to_owned()]), None)
             };
-        };
+        }
 
-        let members = toml_string_array(workspace, "members");
-        let exclude = toml_string_array(workspace, "exclude");
+        let (_, _, members, exclude, _, workspace_errors) = workspaces
+            .iter()
+            .find(|(path, _, _, _, _, _)| *path == "Cargo.toml")
+            .expect("root workspace candidate was recorded");
         let mut allowed = BTreeSet::new();
         if root.get("package").is_some() {
             // A package declared by the workspace root is always a workspace
             // member; nested workspaces must not displace it as API authority.
             allowed.insert("Cargo.toml".to_owned());
         }
+        if !workspace_errors.is_empty() {
+            return (
+                allowed,
+                Some(format!(
+                    "root workspace authority is invalid: {}",
+                    workspace_errors
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )),
+            );
+        }
+        let mut discovery_errors = BTreeSet::new();
         for package in &packages {
             if *package == "Cargo.toml" {
                 continue;
             }
             let package_dir = parent_manifest_dir(package);
-            let included = members
-                .iter()
-                .any(|pattern| cargo_glob_matches(pattern, &package_dir));
-            let excluded = exclude
-                .iter()
-                .any(|pattern| cargo_glob_matches(pattern, &package_dir));
-            if included && !excluded {
-                allowed.insert((*package).to_owned());
+            let relative = repo_relative_dir("", &package_dir);
+            if cargo_workspace_member_is_selected(&relative, members, exclude) {
+                let package_manifest = parsed
+                    .iter()
+                    .find(|(path, _)| path == package)
+                    .map(|(_, manifest)| manifest)
+                    .expect("package path came from parsed manifests");
+                match package_belongs_to_workspace(
+                    package,
+                    package_manifest,
+                    "",
+                    &parsed,
+                    CargoMembershipSource::ExplicitMember,
+                ) {
+                    Ok(true) => {
+                        allowed.insert((*package).to_owned());
+                    }
+                    Ok(false) => {
+                        discovery_errors.insert(format!(
+                            "{package}: explicit member is owned by another workspace authority"
+                        ));
+                    }
+                    Err(error) => {
+                        discovery_errors.insert(format!("{package}: {error}"));
+                    }
+                }
             }
         }
-        return (allowed, None);
+        discovery_errors.extend(include_unavailable_explicit_members(
+            manifests,
+            inventory_dirs,
+            &unresolved_authorities,
+            "",
+            members,
+            exclude,
+            &mut allowed,
+        ));
+        discovery_errors.extend(include_implicit_path_dependency_members(
+            manifests,
+            &parsed,
+            root,
+            "",
+            members,
+            exclude,
+            &mut allowed,
+        ));
+        let evidence = (!discovery_errors.is_empty()).then(|| {
+            format!(
+                "root workspace discovery is incomplete: {}",
+                discovery_errors
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        return (allowed, evidence);
     }
 
-    if !unresolved.is_empty() {
+    if !unresolved_authorities.is_empty() {
         // Without a root Cargo.toml, every discovered manifest is a candidate
-        // authority. A malformed, unreadable, or non-UTF-8 candidate cannot be
-        // discarded in favour of whichever fixture happens to parse.
+        // authority. A malformed, unreadable, non-UTF-8, or parseable but
+        // semantically invalid candidate cannot be discarded in favour of
+        // whichever fixture happens to parse.
         return (
             BTreeSet::new(),
             Some(format!(
-                "rootless workspace authority cannot be established because manifests could not be parsed: {}",
-                unresolved.join(", ")
+                "rootless workspace authority cannot be established because manifests are unreadable or invalid: {}",
+                unresolved_authorities.join(", ")
             )),
         );
     }
@@ -4001,7 +5973,18 @@ fn api_crate_manifests(
     // Cargo.toml above never reaches this branch.
     if workspaces.is_empty() {
         return if packages.len() <= 1 {
-            (packages.into_iter().map(str::to_owned).collect(), None)
+            let evidence = packages.first().and_then(|manifest_path| {
+                parsed
+                    .iter()
+                    .find(|(path, _)| path == manifest_path)
+                    .and_then(|(_, manifest)| {
+                        validate_declared_package_workspace(manifest_path, manifest, &parsed).err()
+                    })
+                    .map(|error| {
+                        format!("rootless package workspace authority is invalid: {error}")
+                    })
+            });
+            (packages.into_iter().map(str::to_owned).collect(), evidence)
         } else {
             (
                 BTreeSet::new(),
@@ -4019,59 +6002,338 @@ fn api_crate_manifests(
                 "multiple workspace authorities without a root Cargo.toml: {}",
                 workspaces
                     .iter()
-                    .map(|(dir, _, _, _)| if dir.is_empty() { "." } else { dir.as_str() })
+                    .map(|(_, dir, _, _, _, _)| { if dir.is_empty() { "." } else { dir.as_str() } })
                     .collect::<Vec<_>>()
                     .join(", ")
             )),
         );
     }
-    let mut allowed = BTreeSet::new();
-    for (dir, members, exclude, has_package) in &workspaces {
-        let member_patterns = if members.is_empty() {
-            if *has_package {
-                vec![".".to_owned()]
-            } else {
-                Vec::new()
-            }
-        } else {
-            members.clone()
-        };
-        for package in &packages {
-            let package_dir = parent_manifest_dir(package);
-            let relative = if dir.is_empty() {
-                package_dir
-            } else if package_dir == *dir {
-                String::new()
-            } else if let Some(rest) = package_dir.strip_prefix(&format!("{dir}/")) {
-                rest.to_owned()
-            } else {
+    let (workspace_path, dir, members, exclude, has_package, workspace_errors) = &workspaces[0];
+    let (allowed, evidence) = select_workspace_authority(
+        manifests,
+        inventory_dirs,
+        &parsed,
+        &packages,
+        &unresolved_authorities,
+        workspace_path,
+        dir,
+        members,
+        exclude,
+        *has_package,
+        workspace_errors,
+        "rootless workspace discovery",
+    );
+    let competing = packages
+        .iter()
+        .filter(|package| !allowed.contains(**package))
+        .filter(|package| {
+            let manifest = parsed
+                .iter()
+                .find(|(path, _)| path == *package)
+                .map(|(_, manifest)| manifest)
+                .expect("package path came from parsed manifests");
+            !rootless_package_is_proven_non_competing(package, manifest, dir, exclude, &parsed)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if competing.is_empty() {
+        (allowed, evidence)
+    } else {
+        let conflict = format!(
+            "rootless workspace authority {workspace_path} competes with unowned package manifests: {}",
+            competing.join(", ")
+        );
+        (
+            BTreeSet::new(),
+            Some(match evidence {
+                Some(existing) => format!("{existing}; {conflict}"),
+                None => conflict,
+            }),
+        )
+    }
+}
+
+fn private_alias_graph(
+    private_uses: &[UseEdge],
+    declarations: &[RustApiDeclaration],
+) -> (
+    BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
+    BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
+) {
+    let mut private_aliases: BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>> =
+        BTreeMap::new();
+    let mut private_module_aliases: BTreeMap<
+        PrivateModuleAliasKey,
+        Vec<GuardedPrivateModuleTarget>,
+    > = BTreeMap::new();
+
+    for edge in private_uses {
+        for leaf in &edge.leaves {
+            if leaf.glob {
+                for target_module in use_candidate_paths(&edge.module_path, &leaf.segments) {
+                    for declaration in declarations.iter().filter(|declaration| {
+                        declaration.key.crate_name == edge.crate_name
+                            && declaration.key.module_path.starts_with(&target_module)
+                    }) {
+                        let suffix = &declaration.key.module_path[target_module.len()..];
+                        let mut source_module = edge.module_path.clone();
+                        source_module.extend_from_slice(suffix);
+                        private_aliases
+                            .entry((
+                                edge.crate_name.clone(),
+                                source_module,
+                                declaration.key.external_name.clone(),
+                            ))
+                            .or_default()
+                            .push((
+                                (
+                                    edge.crate_name.clone(),
+                                    declaration.key.module_path.clone(),
+                                    declaration.key.external_name.clone(),
+                                ),
+                                edge.cfg_guard.clone(),
+                            ));
+                    }
+                }
                 continue;
-            };
-            let included = member_patterns
-                .iter()
-                .any(|pattern| cargo_glob_matches(pattern, &relative));
-            let excluded = exclude
-                .iter()
-                .any(|pattern| cargo_glob_matches(pattern, &relative));
-            if included && !excluded {
-                allowed.insert((*package).to_owned());
+            }
+
+            let alias_name = normalize_identifier(&leaf.alias);
+            for path in use_candidate_paths(&edge.module_path, &leaf.segments) {
+                let Some((target_name, target_module)) = path.split_last() else {
+                    continue;
+                };
+                private_aliases
+                    .entry((
+                        edge.crate_name.clone(),
+                        edge.module_path.clone(),
+                        alias_name.clone(),
+                    ))
+                    .or_default()
+                    .push((
+                        (
+                            edge.crate_name.clone(),
+                            target_module.to_vec(),
+                            normalize_identifier(target_name),
+                        ),
+                        edge.cfg_guard.clone(),
+                    ));
+
+                let mut alias_path = edge.module_path.clone();
+                alias_path.push(alias_name.clone());
+                private_module_aliases
+                    .entry((edge.crate_name.clone(), alias_path))
+                    .or_default()
+                    .push((path, edge.cfg_guard.clone()));
             }
         }
     }
-    (allowed, None)
+
+    for declaration in declarations
+        .iter()
+        .filter(|declaration| declaration.kind == RustApiItemKind::TypeAlias)
+    {
+        let Ok(Item::Type(alias)) = syn::parse_str::<Item>(&declaration.contract) else {
+            continue;
+        };
+        let Some((target_module, target_name)) =
+            resolve_impl_self_owner(&declaration.key.module_path, alias.ty.as_ref())
+        else {
+            continue;
+        };
+        let alias_key = (
+            declaration.key.crate_name.clone(),
+            declaration.key.module_path.clone(),
+            declaration.key.external_name.clone(),
+        );
+        private_aliases.entry(alias_key).or_default().push((
+            (
+                declaration.key.crate_name.clone(),
+                target_module,
+                target_name,
+            ),
+            declaration.cfg_guard.clone(),
+        ));
+    }
+
+    for targets in private_aliases.values_mut() {
+        targets.sort();
+        targets.dedup();
+    }
+    for targets in private_module_aliases.values_mut() {
+        targets.sort();
+        targets.dedup();
+    }
+    (private_aliases, private_module_aliases)
 }
 
-fn trait_is_external_public(pending: &PendingTraitImpl) -> bool {
-    let first = pending.trait_module_path.first().map(String::as_str);
+fn resolve_private_type_alias_keys(
+    initial: PrivateTypeKey,
+    guard: &[String],
+    private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
+    private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
+) -> PrivateAliasResolution {
+    let node_count = private_aliases
+        .len()
+        .saturating_add(private_module_aliases.len())
+        .saturating_add(1);
+    let edge_count = private_aliases
+        .values()
+        .map(Vec::len)
+        .chain(private_module_aliases.values().map(Vec::len))
+        .sum::<usize>();
+    // Guarded states can legitimately revisit one nominal key under distinct
+    // cfg regions. Size the finite bound from both nodes and guarded edges;
+    // cycles still dedupe the complete (key, effective guard) state.
+    let budget = node_count
+        .saturating_add(edge_count)
+        .saturating_mul(8)
+        .clamp(64, 16_384);
+    let base_depth = private_aliases
+        .keys()
+        .map(|key| key.1.len())
+        .chain(
+            private_aliases
+                .values()
+                .flatten()
+                .map(|(key, _)| key.1.len()),
+        )
+        .chain(private_module_aliases.keys().map(|(_, path)| path.len()))
+        .chain(
+            private_module_aliases
+                .values()
+                .flatten()
+                .map(|(path, _)| path.len()),
+        )
+        .max()
+        .unwrap_or(0);
+    let max_depth = base_depth
+        .saturating_add(private_module_aliases.len().min(256))
+        .saturating_add(2);
+
+    let initial_state = GuardedPrivateTypeKey {
+        key: initial,
+        cfg_guard: combined_guards(guard, &[]),
+    };
+    let mut resolved = BTreeSet::new();
+    let mut terminals = BTreeSet::new();
+    let mut pending = BTreeSet::from([initial_state.clone()]);
+    let mut exhausted = false;
+    let mut visited = 0usize;
+    while let Some(state) = pending.pop_first() {
+        if !resolved.insert(state.clone()) {
+            continue;
+        }
+        visited = visited.saturating_add(1);
+        if visited > budget {
+            exhausted = true;
+            break;
+        }
+        let mut successors = BTreeSet::new();
+        if let Some(targets) = private_aliases.get(&state.key) {
+            for (target, target_guard) in targets
+                .iter()
+                .filter(|(_, target_guard)| !guards_proven_disjoint(target_guard, &state.cfg_guard))
+            {
+                if target.1.len() <= max_depth {
+                    successors.insert(GuardedPrivateTypeKey {
+                        key: target.clone(),
+                        cfg_guard: combined_guards(&state.cfg_guard, target_guard),
+                    });
+                } else {
+                    exhausted = true;
+                }
+            }
+        }
+        for ((crate_name, alias_path), targets) in private_module_aliases {
+            if crate_name != &state.key.0 || !state.key.1.starts_with(alias_path) {
+                continue;
+            }
+            let suffix = &state.key.1[alias_path.len()..];
+            for (target_path, target_guard) in targets
+                .iter()
+                .filter(|(_, target_guard)| !guards_proven_disjoint(target_guard, &state.cfg_guard))
+            {
+                let mut module_path = target_path.clone();
+                module_path.extend_from_slice(suffix);
+                if module_path.len() <= max_depth {
+                    successors.insert(GuardedPrivateTypeKey {
+                        key: (state.key.0.clone(), module_path, state.key.2.clone()),
+                        cfg_guard: combined_guards(&state.cfg_guard, target_guard),
+                    });
+                } else {
+                    exhausted = true;
+                }
+            }
+        }
+        if successors.is_empty() {
+            terminals.insert(state);
+        } else {
+            pending.extend(successors);
+        }
+    }
+    if !pending.is_empty() {
+        exhausted = true;
+    }
+    let exhaustion_digest = exhausted.then(|| {
+        private_alias_graph_digest(&initial_state, private_aliases, private_module_aliases)
+    });
+    PrivateAliasResolution {
+        states: resolved,
+        terminals,
+        exhausted,
+        exhaustion_digest,
+    }
+}
+
+fn guarded_private_type_evidence(label: &str, state: &GuardedPrivateTypeKey) -> String {
+    format!(
+        "{label}:{}::{:?}::{}\neffective-cfg:{:?}",
+        state.key.0, state.key.1, state.key.2, state.cfg_guard
+    )
+}
+
+fn private_alias_graph_digest(
+    initial: &GuardedPrivateTypeKey,
+    private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
+    private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut rows = vec![guarded_private_type_evidence("initial", initial)];
+    for (source, targets) in private_aliases {
+        for (target, guard) in targets {
+            rows.push(format!(
+                "type-edge:{source:?}->{target:?}\ncfg:{:?}",
+                combined_guards(guard, &[])
+            ));
+        }
+    }
+    for (source, targets) in private_module_aliases {
+        for (target, guard) in targets {
+            rows.push(format!(
+                "module-edge:{source:?}->{target:?}\ncfg:{:?}",
+                combined_guards(guard, &[])
+            ));
+        }
+    }
+    rows.sort();
+    rows.dedup();
+    format!("sha256:{:x}", Sha256::digest(rows.join("\n--\n")))
+}
+
+fn impl_path_is_external_public(crate_name: &str, module_path: &[String]) -> bool {
+    let first = module_path.first().map(String::as_str);
     match first {
         Some("std" | "core" | "alloc") => true,
         Some("crate" | "self" | "super") => false,
-        Some(segment) if segment == pending.crate_name => false,
+        Some(segment) if segment == crate_name => false,
         Some(_) => true,
-        // An unqualified trait may have entered scope through `use`, including
+        // An unqualified path may have entered scope through `use`, including
         // an external crate import. Source-only analysis cannot resolve that
-        // binding safely, so retain the impl as typed uncertainty instead of
-        // maintaining a necessarily incomplete allowlist of trait names.
+        // binding safely. Callers use local declarations first, then retain the
+        // unresolved impl as typed uncertainty rather than maintaining an
+        // incomplete allowlist of external names.
         None => true,
     }
 }
@@ -4271,6 +6533,56 @@ fn optional_bool(table: Option<&toml::Table>, key: &str) -> Result<Option<bool>,
         .ok_or_else(|| format!("lib.{key} must be a boolean"))
 }
 
+struct LocalTypeDependencyCollector {
+    crate_name: String,
+    module_path: Vec<String>,
+    dependencies: BTreeSet<(String, Vec<String>, String)>,
+}
+
+impl LocalTypeDependencyCollector {
+    fn new(crate_name: &str, module_path: &[String]) -> Self {
+        Self {
+            crate_name: crate_name.to_owned(),
+            module_path: module_path.to_vec(),
+            dependencies: BTreeSet::new(),
+        }
+    }
+
+    fn collect_item_types(
+        crate_name: &str,
+        module_path: &[String],
+        item: &Item,
+    ) -> BTreeSet<(String, Vec<String>, String)> {
+        let mut collector = Self::new(crate_name, module_path);
+        collector.fold_item(item.clone());
+        collector.dependencies
+    }
+
+    fn collect_impl_types(
+        crate_name: &str,
+        module_path: &[String],
+        item: &syn::ItemImpl,
+    ) -> BTreeSet<(String, Vec<String>, String)> {
+        let mut collector = Self::new(crate_name, module_path);
+        collector.fold_item_impl(item.clone());
+        collector.dependencies
+    }
+
+    fn record_path(&mut self, path: &syn::Path) {
+        if let Some((module_path, name)) = resolve_impl_owner(&self.module_path, path) {
+            self.dependencies
+                .insert((self.crate_name.clone(), module_path, name));
+        }
+    }
+}
+
+impl Fold for LocalTypeDependencyCollector {
+    fn fold_path(&mut self, path: syn::Path) -> syn::Path {
+        self.record_path(&path);
+        syn::fold::fold_path(self, path)
+    }
+}
+
 fn resolve_impl_owner(current: &[String], path: &syn::Path) -> Option<(Vec<String>, String)> {
     let segments: Vec<_> = path
         .segments
@@ -4294,6 +6606,19 @@ fn resolve_impl_owner(current: &[String], path: &syn::Path) -> Option<(Vec<Strin
         None => {}
     }
     Some((module_path, name.clone()))
+}
+
+fn resolve_impl_self_owner(current: &[String], ty: &syn::Type) -> Option<(Vec<String>, String)> {
+    match ty {
+        syn::Type::Path(path) if path.qself.is_none() => resolve_impl_owner(current, &path.path),
+        syn::Type::Reference(reference) => resolve_impl_self_owner(current, &reference.elem),
+        syn::Type::Ptr(pointer) => resolve_impl_self_owner(current, &pointer.elem),
+        syn::Type::Slice(slice) => resolve_impl_self_owner(current, &slice.elem),
+        syn::Type::Array(array) => resolve_impl_self_owner(current, &array.elem),
+        syn::Type::Paren(paren) => resolve_impl_self_owner(current, &paren.elem),
+        syn::Type::Group(group) => resolve_impl_self_owner(current, &group.elem),
+        _ => None,
+    }
 }
 
 fn raw_symbol_semantic_eq(left: &RawSymbol, right: &RawSymbol) -> bool {
@@ -4420,7 +6745,21 @@ pub(super) fn guards_proven_disjoint(left: &[String], right: &[String]) -> bool 
             Some(ProvenTargetFamily::Windows),
             Some(ProvenTargetFamily::Unix)
         )
-    )
+    ) || left.iter().any(|left_guard| {
+        right.iter().any(|right_guard| {
+            direct_cfg_negation(left_guard).is_some_and(|atom| atom == right_guard)
+                || direct_cfg_negation(right_guard).is_some_and(|atom| atom == left_guard)
+        })
+    })
+}
+
+fn direct_cfg_negation(predicate: &str) -> Option<&str> {
+    let atom = predicate.strip_prefix("not(")?.strip_suffix(')')?;
+    (!atom.starts_with("all(")
+        && !atom.starts_with("any(")
+        && !atom.starts_with("not(")
+        && !atom.contains(','))
+    .then_some(atom)
 }
 
 fn proven_target_family(guards: &[String]) -> Option<ProvenTargetFamily> {
@@ -5291,6 +7630,18 @@ mod tests {
             find_item(&left, "Public::value").contract,
             find_item(&right, "Public::value").contract
         );
+
+        let send = snapshot_rust_api(&source(
+            "pub struct Public<T>(pub T); impl<T> Public<T> where T: Send { pub fn value(&self) {} }",
+        ));
+        let sync = snapshot_rust_api(&source(
+            "pub struct Public<T>(pub T); impl<T> Public<T> where T: Sync { pub fn value(&self) {} }",
+        ));
+        assert_ne!(
+            find_item(&send, "Public::value").contract,
+            find_item(&sync, "Public::value").contract,
+            "the impl where-clause controls associated-item availability"
+        );
     }
 
     #[test]
@@ -5645,6 +7996,754 @@ mod tests {
     }
 
     #[test]
+    fn rust_api_snapshot_includes_implicit_path_dependency_workspace_members() {
+        let workspace = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[workspace]\nmembers=['crates/app']\nexclude=['crates/excluded']\n",
+            ),
+            (
+                "crates/app/Cargo.toml",
+                b"[package]\nname='app'\nversion='0.0.0'\n[dependencies]\nimplicit={path='../implicit'}\nexcluded={path='../excluded'}\n",
+            ),
+            ("crates/app/src/lib.rs", b"pub fn app() {}"),
+            (
+                "crates/implicit/Cargo.toml",
+                b"[package]\nname='implicit'\nversion='0.0.0'\n[build-dependencies]\nleaf={path='../leaf'}\n",
+            ),
+            ("crates/implicit/src/lib.rs", b"pub fn implicit() {}"),
+            (
+                "crates/leaf/Cargo.toml",
+                b"[package]\nname='leaf'\nversion='0.0.0'\n",
+            ),
+            ("crates/leaf/src/lib.rs", b"pub fn leaf() {}"),
+            (
+                "crates/excluded/Cargo.toml",
+                b"[package]\nname='excluded'\nversion='0.0.0'\n",
+            ),
+            ("crates/excluded/src/lib.rs", b"pub fn excluded() {}"),
+            (
+                "tools/unrelated/Cargo.toml",
+                b"[package]\nname='unrelated'\nversion='0.0.0'\n",
+            ),
+            ("tools/unrelated/src/lib.rs", b"pub fn unrelated() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&workspace);
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app", "implicit", "leaf"],
+            "Cargo path dependencies inside the workspace become members transitively, while exclude and unrelated packages remain out"
+        );
+    }
+
+    #[test]
+    fn rust_api_workspace_discovery_matches_cargo_globs_and_exclude_precedence() {
+        let bracket_glob = MemorySource::new(&[
+            ("Cargo.toml", b"[workspace]\nmembers=['crates/[ab]*']\n"),
+            (
+                "crates/apple/Cargo.toml",
+                b"[package]\nname='apple'\nversion='0.0.0'\n",
+            ),
+            ("crates/apple/src/lib.rs", b"pub fn apple() {}"),
+            (
+                "crates/banana/Cargo.toml",
+                b"[package]\nname='banana'\nversion='0.0.0'\n",
+            ),
+            ("crates/banana/src/lib.rs", b"pub fn banana() {}"),
+            (
+                "crates/cherry/Cargo.toml",
+                b"[package]\nname='cherry'\nversion='0.0.0'\n",
+            ),
+            ("crates/cherry/src/lib.rs", b"pub fn cherry() {}"),
+        ]);
+        assert_eq!(
+            snapshot_rust_api(&bracket_glob)
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["apple", "banana"],
+            "workspace member matching must use Cargo's glob grammar, including bracket classes"
+        );
+
+        let explicit_override = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[workspace]\nmembers=['crates/app']\nexclude=['crates']\n",
+            ),
+            (
+                "crates/app/Cargo.toml",
+                b"[package]\nname='app'\nversion='0.0.0'\n",
+            ),
+            ("crates/app/src/lib.rs", b"pub fn app() {}"),
+        ]);
+        assert_eq!(
+            snapshot_rust_api(&explicit_override)
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app"],
+            "an explicitly named Cargo member wins over an exclude path prefix"
+        );
+
+        let invalid =
+            MemorySource::new(&[("Cargo.toml", b"[workspace]\nmembers=['crates/[broken']\n")]);
+        assert!(snapshot_rust_api(&invalid).unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown.evidence.contains("invalid glob")
+        }));
+
+        let zero_matches =
+            MemorySource::new(&[("Cargo.toml", b"[workspace]\nmembers=['crates/missing*']\n")]);
+        assert!(
+            snapshot_rust_api(&zero_matches)
+                .unknowns
+                .iter()
+                .any(|unknown| {
+                    unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                        && unknown.evidence.contains("matched no repository directory")
+                }),
+            "a valid Cargo member glob with zero matches must fail closed"
+        );
+
+        assert!(cargo_path_prefix("crates/app", "crates/app/tool"));
+        assert!(!cargo_path_prefix("crates/app", "crates/application"));
+        assert!(cargo_glob_matches("crates/*", "crates/app"));
+        assert!(
+            !cargo_glob_matches("crates/*", "crates/group/app"),
+            "Cargo's single-star member glob cannot cross a path separator"
+        );
+        assert!(cargo_glob_matches("crates/**", "crates/group/app"));
+        assert!(cargo_glob_matches("../shared", "../shared"));
+    }
+
+    #[test]
+    fn rust_api_workspace_rejects_explicit_member_owned_by_nested_workspace() {
+        let snapshot = snapshot_rust_api(&MemorySource::new(&[
+            ("Cargo.toml", b"[workspace]\nmembers=['nested/member']\n"),
+            ("nested/Cargo.toml", b"[workspace]\nmembers=['member']\n"),
+            (
+                "nested/member/Cargo.toml",
+                b"[package]\nname='member'\nversion='0.0.0'\n",
+            ),
+            ("nested/member/src/lib.rs", b"pub fn member() {}"),
+        ]));
+        assert!(snapshot.crates.is_empty());
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown.evidence.contains("nested/member/Cargo.toml")
+                && unknown
+                    .evidence
+                    .contains("explicit member is owned by another workspace authority")
+        }));
+    }
+
+    #[test]
+    fn rust_api_snapshot_includes_inherited_workspace_path_dependencies() {
+        let workspace = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[workspace]\nmembers=['crates/app']\n[workspace.dependencies]\nimplicit={path='crates/implicit'}\n",
+            ),
+            (
+                "crates/app/Cargo.toml",
+                b"[package]\nname='app'\nversion='0.0.0'\n[target.'cfg(unix)'.dev-dependencies]\nimplicit={workspace=true}\n",
+            ),
+            ("crates/app/src/lib.rs", b"pub fn app() {}"),
+            (
+                "crates/implicit/Cargo.toml",
+                b"[package]\nname='implicit'\nversion='0.0.0'\n",
+            ),
+            ("crates/implicit/src/lib.rs", b"pub fn implicit() {}"),
+        ]);
+        let workspace_snapshot = snapshot_rust_api(&workspace);
+        assert_eq!(
+            workspace_snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app", "implicit"]
+        );
+    }
+
+    #[test]
+    fn rust_api_snapshot_rootless_package_workspace_keeps_its_root_package() {
+        let workspace = MemorySource::new(&[
+            (
+                "backend/Cargo.toml",
+                b"[package]\nname='backend-root'\nversion='0.0.0'\n[workspace]\nmembers=['member']\n",
+            ),
+            ("backend/src/lib.rs", b"pub fn root() {}"),
+            (
+                "backend/member/Cargo.toml",
+                b"[package]\nname='member'\nversion='0.0.0'\n",
+            ),
+            ("backend/member/src/lib.rs", b"pub fn member() {}"),
+        ]);
+        assert_eq!(
+            snapshot_rust_api(&workspace)
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["backend_root", "member"]
+        );
+    }
+
+    #[test]
+    fn rust_api_snapshot_rootless_workspace_can_own_an_explicit_sibling_member() {
+        let workspace = MemorySource::new(&[
+            (
+                "backend/Cargo.toml",
+                b"[workspace]\nmembers=['../shared']\n",
+            ),
+            (
+                "shared/Cargo.toml",
+                b"[package]\nname='shared'\nversion='0.0.0'\nworkspace='../backend'\n",
+            ),
+            ("shared/src/lib.rs", b"pub fn shared() {}"),
+        ]);
+        assert_eq!(
+            snapshot_rust_api(&workspace)
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared"]
+        );
+    }
+
+    #[test]
+    fn rust_api_snapshot_rootless_workspace_rejects_nonreciprocal_sibling_member() {
+        let snapshot = snapshot_rust_api(&MemorySource::new(&[
+            (
+                "backend/Cargo.toml",
+                b"[workspace]\nmembers=['../shared']\n",
+            ),
+            (
+                "shared/Cargo.toml",
+                b"[package]\nname='shared'\nversion='0.0.0'\n",
+            ),
+            ("shared/src/lib.rs", b"pub fn shared() {}"),
+        ]));
+        assert!(snapshot.crates.is_empty());
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown.evidence.contains("shared/Cargo.toml")
+                && unknown.evidence.contains("outside workspace")
+        }));
+    }
+
+    #[test]
+    fn rust_api_snapshot_rootless_workspace_rejects_unowned_sibling_package() {
+        let snapshot = snapshot_rust_api(&MemorySource::new(&[
+            ("backend/Cargo.toml", b"[workspace]\nmembers=[]\n"),
+            (
+                "fixture/Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\n",
+            ),
+            ("fixture/src/lib.rs", b"pub fn fixture() {}"),
+        ]));
+        assert!(
+            snapshot.crates.is_empty(),
+            "competing rootless authorities must not certify either API surface"
+        );
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown.evidence.contains("backend/Cargo.toml")
+                && unknown.evidence.contains("fixture/Cargo.toml")
+                && unknown.evidence.contains("competes")
+        }));
+    }
+
+    #[test]
+    fn rust_api_snapshot_respects_package_workspace_override() {
+        let workspace = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[workspace]\nmembers=['crates/app']\n",
+            ),
+            (
+                "crates/app/Cargo.toml",
+                b"[package]\nname='app'\nversion='0.0.0'\n[dependencies]\nowned={path='../owned'}\nforeign={path='../foreign'}\n",
+            ),
+            ("crates/app/src/lib.rs", b"pub fn app() {}"),
+            (
+                "crates/owned/Cargo.toml",
+                b"[package]\nname='owned'\nversion='0.0.0'\nworkspace='../..'\n",
+            ),
+            ("crates/owned/src/lib.rs", b"pub fn owned() {}"),
+            (
+                "crates/foreign/Cargo.toml",
+                b"[package]\nname='foreign'\nversion='0.0.0'\nworkspace='../../other-workspace'\n",
+            ),
+            ("crates/foreign/src/lib.rs", b"pub fn foreign() {}"),
+            (
+                "other-workspace/Cargo.toml",
+                b"[workspace]\nmembers=['../crates/foreign']\n",
+            ),
+        ]);
+        let workspace_snapshot = snapshot_rust_api(&workspace);
+        assert_eq!(
+            workspace_snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app", "owned"]
+        );
+        assert!(workspace_snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown.evidence.contains("crates/foreign/Cargo.toml")
+                && unknown.evidence.contains("different package.workspace")
+        }));
+    }
+
+    #[test]
+    fn rust_api_snapshot_validates_declared_package_workspace_authority() {
+        for source in [
+            MemorySource::new(&[
+                (
+                    "Cargo.toml",
+                    b"[package]\nname='root'\nversion='0.0.0'\nworkspace='missing'\n",
+                ),
+                ("src/lib.rs", b"pub fn root() {}"),
+            ]),
+            MemorySource::new(&[
+                (
+                    "Cargo.toml",
+                    b"[package]\nname='root'\nversion='0.0.0'\nworkspace='authority'\n",
+                ),
+                ("src/lib.rs", b"pub fn root() {}"),
+                (
+                    "authority/Cargo.toml",
+                    b"[package]\nname='not-a-workspace'\nversion='0.0.0'\n",
+                ),
+            ]),
+            MemorySource::new(&[
+                (
+                    "backend/Cargo.toml",
+                    b"[package]\nname='backend'\nversion='0.0.0'\nworkspace='missing'\n",
+                ),
+                ("backend/src/lib.rs", b"pub fn backend() {}"),
+            ]),
+            MemorySource::new(&[
+                (
+                    "Cargo.toml",
+                    b"[package]\nname='root'\nversion='0.0.0'\nworkspace='authority'\n",
+                ),
+                ("src/lib.rs", b"pub fn root() {}"),
+                (
+                    "authority/Cargo.toml",
+                    b"[workspace]\nmembers=['..', 'missing*']\n",
+                ),
+            ]),
+            MemorySource::new(&[
+                (
+                    "Cargo.toml",
+                    b"[package]\nname='root'\nversion='0.0.0'\nworkspace='authority'\n",
+                ),
+                ("src/lib.rs", b"pub fn root() {}"),
+                (
+                    "authority/Cargo.toml",
+                    b"[package]\nname='invalid-authority'\nversion='0.0.0'\nworkspace='.'\n[workspace]\nmembers=['..']\n",
+                ),
+            ]),
+        ] {
+            let snapshot = snapshot_rust_api(&source);
+            assert!(snapshot.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                    && unknown.evidence.contains("workspace")
+            }));
+        }
+
+        let valid = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='root'\nversion='0.0.0'\nworkspace='authority'\n",
+            ),
+            ("src/lib.rs", b"pub fn root() {}"),
+            ("authority/Cargo.toml", b"[workspace]\nmembers=['..']\n"),
+        ]);
+        let snapshot = snapshot_rust_api(&valid);
+        assert!(
+            !snapshot
+                .unknowns
+                .iter()
+                .any(|unknown| unknown.kind == RustApiUnknownKind::WorkspaceDiscovery),
+            "a readable reciprocal package.workspace authority remains confirmed"
+        );
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
+        );
+
+        let implicit = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='root'\nversion='0.0.0'\nworkspace='authority'\n",
+            ),
+            ("src/lib.rs", b"pub fn root() {}"),
+            ("authority/Cargo.toml", b"[workspace]\nmembers=['host']\n"),
+            (
+                "authority/host/Cargo.toml",
+                b"[package]\nname='host'\nversion='0.0.0'\n[dependencies]\nroot={path='../..'}\n",
+            ),
+            ("authority/host/src/lib.rs", b"pub fn host() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&implicit);
+        assert!(
+            !snapshot
+                .unknowns
+                .iter()
+                .any(|unknown| unknown.kind == RustApiUnknownKind::WorkspaceDiscovery),
+            "a root package reached through an implicit path member belongs to its declared workspace"
+        );
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["host", "root"]
+        );
+
+        let unowned = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='root'\nversion='0.0.0'\nworkspace='authority'\n",
+            ),
+            ("src/lib.rs", b"pub fn root() {}"),
+            ("authority/Cargo.toml", b"[workspace]\nmembers=['host']\n"),
+            (
+                "authority/host/Cargo.toml",
+                b"[package]\nname='host'\nversion='0.0.0'\n",
+            ),
+            ("authority/host/src/lib.rs", b"pub fn host() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&unowned);
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown
+                    .evidence
+                    .contains("does not select Cargo.toml as a member")
+        }));
+        assert!(
+            snapshot
+                .crates
+                .iter()
+                .all(|crate_snap| crate_snap.name != "root"),
+            "a structurally valid but unowned package must not be certified as a workspace member"
+        );
+
+        let foreign_dependency = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='root'\nversion='0.0.0'\nworkspace='authority'\n",
+            ),
+            ("src/lib.rs", b"pub fn root() {}"),
+            (
+                "authority/Cargo.toml",
+                b"[workspace]\nmembers=['host']\n",
+            ),
+            (
+                "authority/host/Cargo.toml",
+                b"[package]\nname='host'\nversion='0.0.0'\n[dependencies]\nroot={path='../..'}\nforeign={path='../../foreign'}\n",
+            ),
+            ("authority/host/src/lib.rs", b"pub fn host() {}"),
+            (
+                "foreign/Cargo.toml",
+                b"[package]\nname='foreign'\nversion='0.0.0'\n[workspace]\nmembers=[]\n",
+            ),
+            ("foreign/src/lib.rs", b"pub fn foreign() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&foreign_dependency);
+        assert!(
+            !snapshot
+                .unknowns
+                .iter()
+                .any(|unknown| unknown.kind == RustApiUnknownKind::WorkspaceDiscovery),
+            "an outside path dependency with its own proven workspace authority is foreign, not an invalid member"
+        );
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["host", "root"]
+        );
+
+        let no_authority_dependency = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='root'\nversion='0.0.0'\nworkspace='authority'\n",
+            ),
+            ("src/lib.rs", b"pub fn root() {}"),
+            (
+                "authority/Cargo.toml",
+                b"[workspace]\nmembers=['host']\n",
+            ),
+            (
+                "authority/host/Cargo.toml",
+                b"[package]\nname='host'\nversion='0.0.0'\n[dependencies]\nroot={path='../..'}\nunknown={path='../../unknown'}\n",
+            ),
+            ("authority/host/src/lib.rs", b"pub fn host() {}"),
+            (
+                "unknown/Cargo.toml",
+                b"[package]\nname='unknown'\nversion='0.0.0'\n",
+            ),
+            ("unknown/src/lib.rs", b"pub fn unknown() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&no_authority_dependency);
+        assert!(
+            !snapshot
+                .unknowns
+                .iter()
+                .any(|unknown| unknown.kind == RustApiUnknownKind::WorkspaceDiscovery),
+            "Cargo treats an outside path dependency with no workspace root as foreign"
+        );
+        assert!(
+            snapshot
+                .crates
+                .iter()
+                .all(|crate_snap| crate_snap.name != "unknown")
+        );
+
+        let contradictory_dependency = MemorySource::new(&[
+            ("Cargo.toml", b"[workspace]\nmembers=['app']\n"),
+            (
+                "app/Cargo.toml",
+                b"[package]\nname='app'\nversion='0.0.0'\n[dependencies]\nbad={path='../bad'}\n",
+            ),
+            ("app/src/lib.rs", b"pub fn app() {}"),
+            (
+                "bad/Cargo.toml",
+                b"[package]\nname='bad'\nversion='0.0.0'\nworkspace='..'\n[workspace]\nmembers=[]\n",
+            ),
+            ("bad/src/lib.rs", b"pub fn bad() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&contradictory_dependency);
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown.evidence.contains("bad/Cargo.toml")
+                && unknown
+                    .evidence
+                    .contains("both [workspace] and package.workspace")
+        }));
+        assert!(
+            snapshot
+                .crates
+                .iter()
+                .all(|crate_snap| crate_snap.name != "bad"),
+            "a Cargo-invalid path dependency must never enter the certified crate set"
+        );
+    }
+
+    #[test]
+    fn rust_api_snapshot_rejects_malformed_workspace_member_lists() {
+        for (manifest, expected) in [
+            ("[workspace]\nmembers='crates/*'\n", "workspace.members"),
+            (
+                "[workspace]\nmembers=['crates/app']\nexclude=['crates/skip', 1]\n",
+                "workspace.exclude",
+            ),
+        ] {
+            let source = MemorySource::new(&[
+                ("Cargo.toml", manifest.as_bytes()),
+                (
+                    "crates/app/Cargo.toml",
+                    b"[package]\nname='app'\nversion='0.0.0'\n",
+                ),
+                ("crates/app/src/lib.rs", b"pub fn app() {}"),
+            ]);
+            let snapshot = snapshot_rust_api(&source);
+            assert!(snapshot.crates.is_empty());
+            assert!(snapshot.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                    && unknown.evidence.contains(expected)
+            }));
+        }
+    }
+
+    #[test]
+    fn rust_api_snapshot_fails_closed_for_semantically_invalid_authorities() {
+        let rooted = snapshot_rust_api(&MemorySource::new(&[(
+            "Cargo.toml",
+            b"[dependencies]\nserde='1'\n",
+        )]));
+        assert!(rooted.crates.is_empty());
+        assert!(rooted.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::ManifestParse
+                && unknown.source_path == "Cargo.toml"
+                && unknown.evidence.contains("neither a package table")
+        }));
+
+        let rootless = snapshot_rust_api(&MemorySource::new(&[
+            ("broken/Cargo.toml", b"[dependencies]\nserde='1'\n"),
+            (
+                "fixture/Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\n",
+            ),
+            ("fixture/src/lib.rs", b"pub fn fixture() {}"),
+        ]));
+        assert!(
+            rootless.crates.is_empty(),
+            "a parseable invalid authority must not select a valid sibling"
+        );
+        assert!(rootless.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown.evidence.contains("broken/Cargo.toml")
+                && unknown.evidence.contains("unreadable or invalid")
+        }));
+
+        for source in [
+            MemorySource::new(&[
+                (
+                    "Cargo.toml",
+                    b"[package]\nname='root'\nversion='0.0.0'\nworkspace='.'\n[workspace]\nmembers=[]\n",
+                ),
+                ("src/lib.rs", b"pub fn root() {}"),
+            ]),
+            MemorySource::new(&[
+                (
+                    "backend/Cargo.toml",
+                    b"[package]\nname='root'\nversion='0.0.0'\nworkspace='.'\n[workspace]\nmembers=[]\n",
+                ),
+                ("backend/src/lib.rs", b"pub fn root() {}"),
+            ]),
+        ] {
+            let snapshot = snapshot_rust_api(&source);
+            assert!(snapshot.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                    && unknown
+                        .evidence
+                        .contains("package.workspace cannot be specified")
+            }));
+        }
+    }
+
+    #[test]
+    fn rust_api_snapshot_fails_closed_for_unavailable_explicit_members() {
+        let workspace = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[workspace]\nmembers=['crates/broken', 'crates/missing']\n",
+            ),
+            ("crates/broken/Cargo.toml", b"[package\n"),
+        ]);
+        let snapshot = snapshot_rust_api(&workspace);
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown.evidence.contains("crates/broken/Cargo.toml")
+                && unknown.evidence.contains("crates/missing/Cargo.toml")
+        }));
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::ManifestParse
+                && unknown.source_path == "crates/broken/Cargo.toml"
+        }));
+    }
+
+    #[test]
+    fn rust_api_snapshot_fails_closed_for_globbed_member_directory_without_manifest() {
+        let workspace = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[workspace]\nmembers=['crates/*']\nexclude=['crates/excluded']\n",
+            ),
+            (
+                "crates/good/Cargo.toml",
+                b"[package]\nname='good'\nversion='0.0.0'\n",
+            ),
+            ("crates/good/src/lib.rs", b"pub fn good() {}"),
+            ("crates/missing/src/lib.rs", b"pub fn missing() {}"),
+            ("crates/excluded/src/lib.rs", b"pub fn excluded() {}"),
+            ("docs/guide/README.md", b"not a workspace member"),
+        ]);
+        let snapshot = snapshot_rust_api(&workspace);
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["good"]
+        );
+        let discovery = snapshot
+            .unknowns
+            .iter()
+            .find(|unknown| unknown.kind == RustApiUnknownKind::WorkspaceDiscovery)
+            .expect("globbed package-like directory without Cargo.toml must fail closed");
+        assert!(discovery.evidence.contains("crates/missing/Cargo.toml"));
+        assert!(!discovery.evidence.contains("crates/excluded"));
+        assert!(!discovery.evidence.contains("docs/guide"));
+    }
+
+    #[test]
+    fn rust_api_snapshot_rootless_workspace_detects_globbed_member_without_manifest() {
+        let workspace = MemorySource::new(&[
+            ("backend/Cargo.toml", b"[workspace]\nmembers=['crates/*']\n"),
+            (
+                "backend/crates/good/Cargo.toml",
+                b"[package]\nname='good'\nversion='0.0.0'\nworkspace='../..'\n",
+            ),
+            ("backend/crates/good/src/lib.rs", b"pub fn good() {}"),
+            ("backend/crates/missing/src/lib.rs", b"pub fn missing() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&workspace);
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["good"]
+        );
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown
+                    .evidence
+                    .contains("backend/crates/missing/Cargo.toml")
+        }));
+    }
+
+    #[test]
+    fn rust_api_snapshot_fails_closed_for_unavailable_path_dependency_manifests() {
+        let workspace = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[workspace]\nmembers=['crates/app']\n",
+            ),
+            (
+                "crates/app/Cargo.toml",
+                b"[package]\nname='app'\nversion='0.0.0'\n[dependencies]\nmissing={path='../missing'}\nbroken={path='../broken'}\n",
+            ),
+            ("crates/app/src/lib.rs", b"pub fn app() {}"),
+            ("crates/broken/Cargo.toml", b"[package\n"),
+        ]);
+        let snapshot = snapshot_rust_api(&workspace);
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown.evidence.contains("crates/missing/Cargo.toml")
+                && unknown.evidence.contains("crates/broken/Cargo.toml")
+        }));
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::ManifestParse
+                && unknown.source_path == "crates/broken/Cargo.toml"
+        }));
+    }
+
+    #[test]
     fn rust_api_snapshot_paths_are_fallible_and_source_backed() {
         for path in ["../outside.rs", "/absolute.rs"] {
             let manifest =
@@ -5939,6 +9038,312 @@ mod tests {
                     && unknown.evidence.contains("Marker")
             }),
             "a public trait impl declared in a private module is still globally usable"
+        );
+    }
+
+    #[test]
+    fn private_alias_resolution_retains_cfg_target_pairs_and_accumulates_guards() {
+        let hidden = ("fixture".to_owned(), Vec::new(), "Hidden".to_owned());
+        let a = (
+            "fixture".to_owned(),
+            vec!["a".to_owned()],
+            "Item".to_owned(),
+        );
+        let b = (
+            "fixture".to_owned(),
+            vec!["b".to_owned()],
+            "Item".to_owned(),
+        );
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            hidden.clone(),
+            vec![
+                (a.clone(), vec!["unix".to_owned()]),
+                (b.clone(), vec!["windows".to_owned()]),
+            ],
+        );
+        let resolved =
+            resolve_private_type_alias_keys(hidden.clone(), &[], &aliases, &BTreeMap::new());
+        assert!(resolved.states.contains(&GuardedPrivateTypeKey {
+            key: a.clone(),
+            cfg_guard: vec!["unix".to_owned()],
+        }));
+        assert!(resolved.states.contains(&GuardedPrivateTypeKey {
+            key: b.clone(),
+            cfg_guard: vec!["windows".to_owned()],
+        }));
+
+        let mid = ("fixture".to_owned(), Vec::new(), "Mid".to_owned());
+        aliases.clear();
+        aliases.insert(
+            hidden.clone(),
+            vec![(mid.clone(), vec!["feature = \"x\"".to_owned()])],
+        );
+        aliases.insert(
+            mid,
+            vec![(a.clone(), vec!["not(feature = \"x\")".to_owned()])],
+        );
+        let impossible = resolve_private_type_alias_keys(hidden, &[], &aliases, &BTreeMap::new());
+        assert!(
+            impossible.states.iter().all(|state| state.key != a),
+            "a later alias edge must be checked against the accumulated path guard"
+        );
+        assert!(!impossible.exhausted);
+
+        let growing_initial = (
+            "fixture".to_owned(),
+            vec!["a".to_owned()],
+            "Item".to_owned(),
+        );
+        let growing = |segment: &str| {
+            BTreeMap::from([(
+                ("fixture".to_owned(), vec!["a".to_owned()]),
+                vec![(vec!["a".to_owned(), segment.to_owned()], Vec::new())],
+            )])
+        };
+        let left = resolve_private_type_alias_keys(
+            growing_initial.clone(),
+            &[],
+            &BTreeMap::new(),
+            &growing("b"),
+        );
+        let right =
+            resolve_private_type_alias_keys(growing_initial, &[], &BTreeMap::new(), &growing("c"));
+        assert!(left.exhausted && right.exhausted);
+        assert_ne!(
+            left.exhaustion_digest, right.exhaustion_digest,
+            "different exhausted alias graphs need different fail-closed evidence"
+        );
+    }
+
+    fn private_dependency_evidence(snapshot: &RustApiSnapshot, public_name: &str) -> String {
+        snapshot
+            .unknowns
+            .iter()
+            .find(|unknown| {
+                unknown.kind == RustApiUnknownKind::PrivateTypeDependency
+                    && unknown.evidence.contains(public_name)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing private dependency evidence for {public_name}: {:#?}",
+                    snapshot.unknowns
+                )
+            })
+            .evidence
+            .clone()
+    }
+
+    #[test]
+    fn private_dependency_digest_preserves_cfg_alias_target_correlation() {
+        let prefix = "mod a { pub struct Item; } mod b { pub struct Item; } ";
+        let base = snapshot_rust_api(&source(&format!(
+            "{prefix} #[cfg(unix)] use a::Item as Hidden; \
+             #[cfg(windows)] use b::Item as Hidden; \
+             pub fn make() -> Hidden {{ todo!() }}"
+        )));
+        let swapped = snapshot_rust_api(&source(&format!(
+            "{prefix} #[cfg(unix)] use b::Item as Hidden; \
+             #[cfg(windows)] use a::Item as Hidden; \
+             pub fn make() -> Hidden {{ todo!() }}"
+        )));
+        let reordered = snapshot_rust_api(&source(&format!(
+            "{prefix} #[cfg(windows)] use b::Item as Hidden; \
+             #[cfg(unix)] use a::Item as Hidden; \
+             pub fn make() -> Hidden {{ todo!() }}"
+        )));
+
+        let base_evidence = private_dependency_evidence(&base, "make");
+        assert_ne!(
+            base_evidence,
+            private_dependency_evidence(&swapped, "make"),
+            "swapping cfg-selected alias targets changes private type semantics"
+        );
+        assert_eq!(
+            base_evidence,
+            private_dependency_evidence(&reordered, "make"),
+            "source order must not change canonical private dependency evidence"
+        );
+    }
+
+    #[test]
+    fn private_dependency_fingerprints_unresolved_external_alias_targets() {
+        let dep_a = snapshot_rust_api(&source(
+            "use dep_a::Type as Hidden; pub fn make() -> Hidden { todo!() }",
+        ));
+        let dep_b = snapshot_rust_api(&source(
+            "use dep_b::Type as Hidden; pub fn make() -> Hidden { todo!() }",
+        ));
+        assert_ne!(
+            private_dependency_evidence(&dep_a, "make"),
+            private_dependency_evidence(&dep_b, "make"),
+            "a private alias retarget must not disappear when neither external terminal has a local declaration"
+        );
+    }
+
+    #[test]
+    fn private_impl_evidence_preserves_cfg_selected_owner_region() {
+        let base = snapshot_rust_api(&source(
+            "mod a { pub struct Item; } mod b { pub struct Item; } trait Local {} \
+             #[cfg(unix)] use a::Item as Owner; \
+             #[cfg(windows)] use b::Item as Owner; \
+             impl Local for Owner {} \
+             pub fn expose_a() -> a::Item { todo!() }",
+        ));
+        let swapped = snapshot_rust_api(&source(
+            "mod a { pub struct Item; } mod b { pub struct Item; } trait Local {} \
+             #[cfg(unix)] use b::Item as Owner; \
+             #[cfg(windows)] use a::Item as Owner; \
+             impl Local for Owner {} \
+             pub fn expose_a() -> a::Item { todo!() }",
+        ));
+        assert_ne!(
+            private_dependency_evidence(&base, "expose_a"),
+            private_dependency_evidence(&swapped, "expose_a"),
+            "impl evidence must keep the effective cfg region of its canonical owner"
+        );
+    }
+
+    #[test]
+    fn trait_impl_visibility_requires_one_overlapping_cfg_region() {
+        let snapshot = snapshot_rust_api(&source(
+            "#[cfg(unix)] pub trait Marker {} \
+             #[cfg(windows)] trait Marker {} \
+             #[cfg(windows)] pub struct Value; \
+             #[cfg(unix)] struct Value; \
+             impl Marker for Value {}",
+        ));
+        assert!(
+            snapshot
+                .unknowns
+                .iter()
+                .all(|unknown| unknown.kind != RustApiUnknownKind::TraitImplResolution),
+            "a public trait and public owner in disjoint cfg regions are not one observable impl: {:#?}",
+            snapshot.unknowns
+        );
+    }
+
+    #[test]
+    fn private_dependency_digest_is_alias_spelling_independent() {
+        let alias = snapshot_rust_api(&source(
+            "mod model { pub struct Hidden; } use model::Hidden as Alias; \
+             trait Local {} impl Local for Alias {} pub fn make() -> Alias { Alias }",
+        ));
+        let canonical = snapshot_rust_api(&source(
+            "mod model { pub struct Hidden; } use model::Hidden as Alias; \
+             trait Local {} impl Local for Alias {} \
+             pub fn make() -> model::Hidden { model::Hidden }",
+        ));
+        let evidence = |snapshot: &RustApiSnapshot| {
+            snapshot
+                .unknowns
+                .iter()
+                .filter(|unknown| unknown.kind == RustApiUnknownKind::PrivateTypeDependency)
+                .map(|unknown| unknown.evidence.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            evidence(&alias),
+            evidence(&canonical),
+            "one impl reached through an alias and its canonical owner must contribute once"
+        );
+    }
+
+    #[test]
+    fn private_dependency_follows_private_type_aliases_and_use_aliases() {
+        let snapshot = snapshot_rust_api(&source(
+            "mod model { pub struct Hidden; pub trait Local {} } \
+             type TypeAlias = model::Hidden; \
+             use model::{Hidden as UseAlias, Local as TraitAlias}; \
+             impl TraitAlias for TypeAlias {} \
+             pub fn make() -> UseAlias { model::Hidden }",
+        ));
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::PrivateTypeDependency
+                && unknown.evidence.contains("non-public local type semantics")
+        }));
+        assert!(
+            !snapshot.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::TraitImplResolution
+                    && !unknown.evidence.contains("finite graph bound")
+            }),
+            "wholly local trait and owner aliases must not be mistaken for external impls"
+        );
+    }
+
+    #[test]
+    fn private_dependency_glob_alias_resolves_without_path_growth() {
+        let snapshot = snapshot_rust_api(&source(
+            "mod model { pub struct Hidden; } use model::*; \
+             trait Local {} impl Local for Hidden {} \
+             pub fn make() -> model::Hidden { model::Hidden }",
+        ));
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::PrivateTypeDependency
+                && unknown.evidence.contains("non-public local type semantics")
+        }));
+        assert!(
+            snapshot
+                .unknowns
+                .iter()
+                .all(|unknown| !unknown.evidence.contains("finite graph bound"))
+        );
+    }
+
+    #[test]
+    fn private_alias_path_growth_is_bounded_and_fails_closed() {
+        let snapshot = snapshot_rust_api(&source(
+            "mod a { pub mod b { pub struct T; } } use a::b as a; \
+             trait Local {} impl Local for a::T {}",
+        ));
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            matches!(
+                unknown.kind,
+                RustApiUnknownKind::PrivateTypeDependency | RustApiUnknownKind::TraitImplResolution
+            ) && unknown.evidence.contains("finite graph bound")
+        }));
+    }
+
+    #[test]
+    fn private_dependency_proves_direct_cfg_atom_negation() {
+        let snapshot = snapshot_rust_api(&source(
+            "#[cfg(feature = \"public\")] pub struct Hidden(u8); \
+             #[cfg(not(feature = \"public\"))] struct Hidden(u16); \
+             #[cfg(not(feature = \"public\"))] pub fn make() -> Hidden { Hidden(0) }",
+        ));
+        assert!(guards_proven_disjoint(
+            &["feature = \"public\"".to_owned()],
+            &["not(feature = \"public\")".to_owned()]
+        ));
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::PrivateTypeDependency
+                && unknown.cfg_guard == ["not(feature = \"public\")"]
+        }));
+    }
+
+    #[test]
+    fn private_dependency_keeps_unproven_composite_cfg_complement() {
+        let public_guard = vec!["all(unix, feature = \"x\")".to_owned()];
+        let private_source_guard = vec!["not(all(unix, feature = \"x\"))".to_owned()];
+        assert!(
+            !guards_proven_disjoint(&public_guard, &private_source_guard),
+            "the bounded solver deliberately does not prove nested boolean complements"
+        );
+
+        let snapshot = snapshot_rust_api(&source(
+            "#[cfg(all(unix, feature = \"x\"))] pub struct Hidden(u8); \
+             #[cfg(not(all(unix, feature = \"x\")))] struct Hidden(std::rc::Rc<()>); \
+             #[cfg(not(all(unix, feature = \"x\")))] \
+             pub struct Api { pub field: Hidden }",
+        ));
+        assert!(
+            snapshot.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::PrivateTypeDependency
+                    && unknown.cfg_guard == ["not(all(feature = \"x\",unix))"]
+                    && unknown.evidence.contains("non-public local type semantics")
+            }),
+            "unknowns: {:#?}",
+            snapshot.unknowns
         );
     }
 

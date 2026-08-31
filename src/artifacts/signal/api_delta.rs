@@ -542,9 +542,14 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
         .keys()
         .any(|name| !before_struct.fields.contains_key(name));
     let exhaustive_field_added = !before_struct.non_exhaustive && field_added;
-    let layout_field_added = before_struct.layout_sensitive && field_added;
+    let layout_field_added =
+        (before_struct.layout_sensitive || after_struct.layout_sensitive) && field_added;
     let parent_policy_changed = before_struct.non_exhaustive != after_struct.non_exhaustive;
-    let mut emitted = exhaustive_field_added || parent_policy_changed || layout_field_added;
+    let parent_contract_changed = before_struct.parent_contract != after_struct.parent_contract;
+    let mut emitted = exhaustive_field_added
+        || parent_policy_changed
+        || layout_field_added
+        || parent_contract_changed;
     if emitted {
         delta.changed.push(known_finding(
             ApiDeltaKind::Changed,
@@ -720,6 +725,11 @@ struct PublicStructContract {
     fields: BTreeMap<String, String>,
     non_exhaustive: bool,
     layout_sensitive: bool,
+    /// The complete parent contract after removing only externally public
+    /// fields. It retains attrs, generics and normalized private-field
+    /// semantics, so an informational non-exhaustive field addition cannot
+    /// mask an unrelated parent change.
+    parent_contract: String,
 }
 
 fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
@@ -731,57 +741,102 @@ fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
         .iter()
         .any(|attribute| attribute.path().is_ident("non_exhaustive"));
     let layout_sensitive = item.attrs.iter().any(attr_is_layout_sensitive_repr);
-    let syn::Fields::Named(fields) = item.fields else {
+    let syn::Fields::Named(fields) = &item.fields else {
         return None;
     };
+    let public_fields = fields
+        .named
+        .iter()
+        .filter(|field| matches!(field.vis, syn::Visibility::Public(_)))
+        .filter_map(|field| {
+            Some((
+                field.ident.as_ref()?.to_string(),
+                quote::ToTokens::to_token_stream(field).to_string(),
+            ))
+        })
+        .collect();
+
+    let mut parent = item.clone();
+    let syn::Fields::Named(parent_fields) = &mut parent.fields else {
+        unreachable!("named struct clone remains named");
+    };
+    let mut private_index = 0usize;
+    parent_fields.named = parent_fields
+        .named
+        .clone()
+        .into_iter()
+        .filter_map(|mut field| {
+            if matches!(field.vis, syn::Visibility::Public(_)) {
+                return None;
+            }
+            if let Some(ident) = &mut field.ident {
+                *ident = syn::Ident::new(
+                    &format!("__prview_parent_private_field_{private_index}"),
+                    ident.span(),
+                );
+            }
+            private_index += 1;
+            Some(field)
+        })
+        .collect();
     Some(PublicStructContract {
-        fields: fields
-            .named
-            .into_iter()
-            .filter_map(|field| {
-                let name = field.ident.as_ref()?.to_string();
-                if name.starts_with("__prview_private_field_")
-                    || name == "__prview_has_private_fields"
-                {
-                    return None;
-                }
-                Some((name, quote::ToTokens::to_token_stream(&field).to_string()))
-            })
-            .collect(),
+        fields: public_fields,
         non_exhaustive,
         layout_sensitive,
+        parent_contract: quote::ToTokens::to_token_stream(&parent).to_string(),
     })
 }
 
 fn attr_is_layout_sensitive_repr(attribute: &syn::Attribute) -> bool {
-    if !attribute.path().is_ident("repr") {
-        return false;
+    fn meta_contains_layout_sensitive_repr(meta: &syn::Meta) -> bool {
+        if meta.path().is_ident("repr") {
+            let syn::Meta::List(list) = meta else {
+                return false;
+            };
+            return list
+                .tokens
+                .to_string()
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .any(|token| {
+                    matches!(
+                        token,
+                        "C" | "packed"
+                            | "transparent"
+                            | "align"
+                            | "simd"
+                            | "u8"
+                            | "u16"
+                            | "u32"
+                            | "u64"
+                            | "u128"
+                            | "usize"
+                            | "i8"
+                            | "i16"
+                            | "i32"
+                            | "i64"
+                            | "i128"
+                            | "isize"
+                    )
+                });
+        }
+        if !meta.path().is_ident("cfg_attr") {
+            return false;
+        }
+        let syn::Meta::List(list) = meta else {
+            return false;
+        };
+        let Ok(parts) = list.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            return false;
+        };
+        parts
+            .iter()
+            .skip(1)
+            .any(meta_contains_layout_sensitive_repr)
     }
-    let syn::Meta::List(list) = &attribute.meta else {
-        return false;
-    };
-    list.tokens
-        .to_string()
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|token| {
-            matches!(
-                token,
-                "C" | "packed"
-                    | "transparent"
-                    | "u8"
-                    | "u16"
-                    | "u32"
-                    | "u64"
-                    | "u128"
-                    | "usize"
-                    | "i8"
-                    | "i16"
-                    | "i32"
-                    | "i64"
-                    | "i128"
-                    | "isize"
-            )
-        })
+
+    meta_contains_layout_sensitive_repr(&attribute.meta)
 }
 
 fn field_side(parent: &ApiFactSide, name: &str, contract: &str) -> ApiFactSide {
@@ -1273,7 +1328,9 @@ fn region_is_unknown(unknowns: &[RustApiUnknown], identity: &ApiIdentity) -> boo
     unknowns.iter().any(|unknown| {
         !matches!(
             unknown.kind,
-            RustApiUnknownKind::PathNonUtf8 | RustApiUnknownKind::TraitImplResolution
+            RustApiUnknownKind::PathNonUtf8
+                | RustApiUnknownKind::TraitImplResolution
+                | RustApiUnknownKind::PrivateTypeDependency
         ) && unknown
             .crate_name
             .as_ref()
@@ -1333,6 +1390,12 @@ fn unknown_proofs_match(
         left.kind,
         RustApiUnknownKind::PathNonUtf8 | RustApiUnknownKind::WorkspaceDiscovery
     )
+        // A finite resolver stopped before it could inspect the complete
+        // semantic substrate. Equality of the partial graph proof therefore
+        // cannot prove equality of declarations or impls beyond the frontier.
+        // Keep both sides visible instead of manufacturing a green delta.
+        && !alias_resolution_exhausted(left)
+        && !alias_resolution_exhausted(right)
         && left.kind == right.kind
         && left.crate_name == right.crate_name
         && left.module_path == right.module_path
@@ -1347,6 +1410,13 @@ fn unknown_proofs_match(
         && right.provenance == target.provenance
         && same_provenance_class(&left.provenance, &right.provenance)
         && include_dependent_source_is_proven(left)
+}
+
+fn alias_resolution_exhausted(unknown: &RustApiUnknown) -> bool {
+    matches!(
+        unknown.kind,
+        RustApiUnknownKind::TraitImplResolution | RustApiUnknownKind::PrivateTypeDependency
+    ) && unknown.resolution_exhausted
 }
 
 fn include_dependent_source_is_proven(unknown: &RustApiUnknown) -> bool {
@@ -2053,6 +2123,62 @@ mod tests {
     }
 
     #[test]
+    fn non_exhaustive_field_addition_cannot_mask_parent_contract_changes() {
+        for (label, base, target) in [
+            (
+                "repr transition",
+                "#[non_exhaustive] pub struct Options<T> { pub a: T }",
+                "#[repr(C)] #[non_exhaustive] pub struct Options<T> { pub a: T, pub b: T }",
+            ),
+            (
+                "generic bound",
+                "#[non_exhaustive] pub struct Options<T> { pub a: T }",
+                "#[non_exhaustive] pub struct Options<T: Clone> { pub a: T, pub b: T }",
+            ),
+            (
+                "private auto-trait input",
+                "#[non_exhaustive] pub struct Options { pub a: u8, hidden: u8 }",
+                "#[non_exhaustive] pub struct Options { pub a: u8, pub b: u8, hidden: std::rc::Rc<()> }",
+            ),
+        ] {
+            let delta = compare_rust_api(
+                &snapshot_rust_api(&MemorySource::source(base, "base")),
+                &snapshot_rust_api(&MemorySource::source(target, "target")),
+            );
+            assert!(
+                delta.changed.iter().any(|finding| {
+                    finding.identity.name == "Options" && finding.identity.module_path.is_empty()
+                }),
+                "{label} must retain a parent Changed finding: {:?}",
+                delta.findings()
+            );
+        }
+    }
+
+    #[test]
+    fn legal_public_private_marker_name_remains_a_public_field() {
+        let delta = compare_rust_api(
+            &snapshot_rust_api(&MemorySource::source(
+                "#[non_exhaustive] pub struct Options { pub a: u8, hidden: bool }",
+                "base",
+            )),
+            &snapshot_rust_api(&MemorySource::source(
+                "#[non_exhaustive] pub struct Options { pub a: u8, pub __prview_private_field_2: u8, hidden: bool }",
+                "target",
+            )),
+        );
+        assert!(
+            delta.changed.is_empty(),
+            "a pure non-exhaustive public field addition remains informational: {:?}",
+            delta.findings()
+        );
+        assert!(delta.added.iter().any(|finding| {
+            finding.identity.name == "__prview_private_field_2"
+                && finding.identity.module_path == ["Options".to_owned()]
+        }));
+    }
+
+    #[test]
     fn repository_backed_t1_t3_contracts_are_non_vacuous() {
         let delta = repository_delta(&[
             (
@@ -2212,6 +2338,33 @@ mod tests {
             "primitive integer repr enums stay on the parent Changed path"
         );
 
+        for repr in ["C", "u8"] {
+            let before = format!(
+                "#[cfg_attr(feature = \"ffi\", repr({repr}))] #[non_exhaustive] pub enum ConditionalAbi {{ A(u8) }}\n"
+            );
+            let after = format!(
+                "#[cfg_attr(feature = \"ffi\", repr({repr}))] #[non_exhaustive] pub enum ConditionalAbi {{ A(u8), B([u8; 128]) }}\n"
+            );
+            let conditional_repr_delta = repository_delta(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("src/lib.rs", &before, &after),
+            ]);
+            assert!(conditional_repr_delta.changed.iter().any(|finding| {
+                finding.identity.name == "ConditionalAbi" && finding.identity.namespace == "type"
+            }));
+            assert!(
+                !conditional_repr_delta.added.iter().any(|finding| {
+                    finding.identity.name == "B"
+                        && finding.identity.module_path == ["ConditionalAbi".to_owned()]
+                }),
+                "cfg_attr repr({repr}) must keep the ABI-sensitive enum on the parent Changed path"
+            );
+        }
+
         let repr_rust_delta = repository_delta(&[
             (
                 "Cargo.toml",
@@ -2228,6 +2381,25 @@ mod tests {
             finding.identity.name == "B" && finding.identity.module_path == ["Flexible".to_owned()]
         }));
         assert!(!repr_rust_delta.changed.iter().any(|finding| {
+            finding.identity.name == "Flexible" && finding.identity.namespace == "type"
+        }));
+
+        let conditional_repr_rust_delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg_attr(feature = \"ffi\", repr(Rust))] #[non_exhaustive] pub enum Flexible { A }\n",
+                "#[cfg_attr(feature = \"ffi\", repr(Rust))] #[non_exhaustive] pub enum Flexible { A, B }\n",
+            ),
+        ]);
+        assert!(conditional_repr_rust_delta.added.iter().any(|finding| {
+            finding.identity.name == "B" && finding.identity.module_path == ["Flexible".to_owned()]
+        }));
+        assert!(!conditional_repr_rust_delta.changed.iter().any(|finding| {
             finding.identity.name == "Flexible" && finding.identity.namespace == "type"
         }));
     }
@@ -2450,6 +2622,143 @@ mod tests {
                 .any(|finding| finding.identity.name == "Layout"),
             "repr(C) makes private field layout part of the observable contract"
         );
+
+        let conditional_repr_layout = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg_attr(feature = \"ffi\", repr(C))] pub struct Layout { pub tag: u8, hidden: u8 }\n",
+                "#[cfg_attr(feature = \"ffi\", repr(C))] pub struct Layout { pub tag: u8, hidden: u16 }\n",
+            ),
+        ]);
+        assert!(
+            conditional_repr_layout
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Layout"),
+            "conditional repr(C) must preserve private ABI layout in the contract"
+        );
+    }
+
+    #[test]
+    fn alpha_normalization_never_collides_with_public_identifiers() {
+        let swapped = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct __PrviewT0_0_0; pub fn f<T>(x: T, y: __PrviewT0_0_0) {}\n",
+                "pub struct __PrviewT0_0_0; pub fn f<T>(x: __PrviewT0_0_0, y: T) {}\n",
+            ),
+        ]);
+        assert!(
+            swapped
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "f"),
+            "a real public type must not collapse into a synthetic binder: {:?}",
+            swapped.findings()
+        );
+
+        let raw_swapped = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct r#__PrviewT0_0_0; pub fn f<T>(x: T, y: r#__PrviewT0_0_0) {}\n",
+                "pub struct r#__PrviewT0_0_0; pub fn f<T>(x: r#__PrviewT0_0_0, y: T) {}\n",
+            ),
+        ]);
+        assert!(
+            raw_swapped
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "f"),
+            "a raw public identifier must reserve the same semantic name as its canonical spelling: {:?}",
+            raw_swapped.findings()
+        );
+
+        for (base, target) in [
+            (
+                "pub fn f<T>(__PrviewT0_0_0: T) {}\n",
+                "pub fn f<U>(other: U) {}\n",
+            ),
+            (
+                "pub fn f<__PrviewT0_0_0>(x: __PrviewT0_0_0) {}\n",
+                "pub fn f<T>(x: T) {}\n",
+            ),
+            (
+                "pub struct __PrviewT0_0_0; pub fn f<T>(x: T, y: __PrviewT0_0_0) {}\n",
+                "pub struct __PrviewT0_0_0; pub fn f<U>(x: U, y: __PrviewT0_0_0) {}\n",
+            ),
+            (
+                "pub fn f<T>(callback: for<'a> fn(&'a T) -> &'a T) where T: for<'b> Fn(&'b u8) + for<'c> Fn(&'c u16) {}\n",
+                "pub fn f<U>(callback: for<'value> fn(&'value U) -> &'value U) where U: for<'right> Fn(&'right u16) + for<'left> Fn(&'left u8) {}\n",
+            ),
+            (
+                "pub const __PRVIEW_C0_0_0: usize = 1; pub fn f<const N: usize>(value: [u8; const { __PRVIEW_C0_0_0 + N }]) {}\n",
+                "pub const __PRVIEW_C0_0_0: usize = 1; pub fn f<const M: usize>(value: [u8; const { __PRVIEW_C0_0_0 + M }]) {}\n",
+            ),
+            (
+                "pub struct Api<T>(T); impl<T> Api<T> { pub const N: usize = core::mem::size_of::<T>(); }\n",
+                "pub struct Api<U>(U); impl<U> Api<U> { pub const N: usize = core::mem::size_of::<U>(); }\n",
+            ),
+            (
+                "pub trait Trait<T> { type Out<U>; } pub struct Api; impl<T> Trait<T> for Api { type Out<U> = (T, U); }\n",
+                "pub trait Trait<W> { type Out<X>; } pub struct Api; impl<W> Trait<W> for Api { type Out<X> = (W, X); }\n",
+            ),
+        ] {
+            let renamed = repository_delta(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("src/lib.rs", base, target),
+            ]);
+            assert!(
+                renamed.findings().is_empty(),
+                "fresh synthetic names must preserve alpha equivalence: {:?}",
+                renamed.findings()
+            );
+        }
+
+        let sibling_change = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Api<T>(T); pub struct Left; pub struct Right; impl<T> Api<T> { pub fn keep(value: T) {} pub fn sibling(value: Left) {} }\n",
+                "pub struct Api<U>(U); pub struct Left; pub struct Right; impl<U> Api<U> { pub fn keep(value: U) {} pub fn sibling(value: Right) {} }\n",
+            ),
+        ]);
+        let sibling_findings = sibling_change.findings();
+        assert!(
+            sibling_findings
+                .iter()
+                .any(|finding| finding.identity.name.ends_with("::sibling")),
+            "the sibling method change must remain observable: {sibling_findings:?}"
+        );
+        assert!(
+            !sibling_findings
+                .iter()
+                .any(|finding| finding.identity.name.ends_with("::keep")),
+            "an unrelated associated-item identifier must not perturb an existing member contract: {:?}",
+            sibling_findings
+        );
     }
 
     #[test]
@@ -2640,10 +2949,13 @@ mod tests {
         ]);
         assert!(delta.unknown.iter().any(|finding| {
             finding.identity.name == "TraitImplResolution"
-                && finding
-                    .unknown_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("impl Marker for Value"))
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("resolved-observable-impls:")
+                        && reason.contains("resolved-trait:")
+                        && reason.contains("Marker")
+                        && reason.contains("resolved-owner:")
+                        && reason.contains("Value")
+                })
         }));
 
         let private_control = repository_delta(&[
@@ -2726,6 +3038,166 @@ mod tests {
     }
 
     #[test]
+    fn repository_backed_trait_impl_alias_retargets_change_canonical_evidence() {
+        for (base, target, reason) in [
+            (
+                "pub trait A {} pub trait B {} pub struct Value; \
+                 use A as TraitAlias; impl TraitAlias for Value {}\n",
+                "pub trait A {} pub trait B {} pub struct Value; \
+                 use B as TraitAlias; impl TraitAlias for Value {}\n",
+                "trait alias retarget",
+            ),
+            (
+                "pub trait Marker {} pub struct X; pub struct Y; \
+                 use X as Owner; impl Marker for Owner {}\n",
+                "pub trait Marker {} pub struct X; pub struct Y; \
+                 use Y as Owner; impl Marker for Owner {}\n",
+                "owner alias retarget",
+            ),
+            (
+                "pub trait A {} pub trait B {} pub struct Value; \
+                 #[cfg(unix)] use A as TraitAlias; \
+                 #[cfg(windows)] use B as TraitAlias; \
+                 impl TraitAlias for Value {}\n",
+                "pub trait A {} pub trait B {} pub struct Value; \
+                 #[cfg(unix)] use B as TraitAlias; \
+                 #[cfg(windows)] use A as TraitAlias; \
+                 impl TraitAlias for Value {}\n",
+                "cfg-selected trait alias swap",
+            ),
+        ] {
+            let delta = repository_delta(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("src/lib.rs", base, target),
+            ]);
+            assert!(
+                delta
+                    .unknown
+                    .iter()
+                    .any(|finding| finding.identity.name == "TraitImplResolution"),
+                "{reason} must alter the resolved impl proof: {:?}",
+                delta.findings()
+            );
+        }
+    }
+
+    #[test]
+    fn repository_backed_trait_impl_alias_spelling_is_semantically_stable() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Marker {} mod model { pub struct Hidden; } \
+                 use model::Hidden as Alias; pub use model::Hidden as PublicHidden; \
+                 impl Marker for Alias {}\n",
+                "pub trait Marker {} mod model { pub struct Hidden; } \
+                 use model::Hidden as Alias; pub use model::Hidden as PublicHidden; \
+                 impl Marker for model::Hidden {}\n",
+            ),
+        ]);
+        assert!(
+            delta.findings().is_empty(),
+            "alias and canonical owner spellings describe the same observable impl: {:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn repository_backed_trait_impl_wrapped_owner_spelling_is_semantically_stable() {
+        for (alias_owner, canonical_owner) in [
+            ("&Alias", "&model::Hidden"),
+            ("*const Alias", "*const model::Hidden"),
+            ("[Alias]", "[model::Hidden]"),
+            ("[Alias; 1]", "[model::Hidden; 1]"),
+        ] {
+            let base = format!(
+                "pub trait Marker {{}} mod model {{ pub struct Hidden; }} \
+                 use model::Hidden as Alias; pub use model::Hidden as PublicHidden; \
+                 impl Marker for {alias_owner} {{}}\n"
+            );
+            let target = format!(
+                "pub trait Marker {{}} mod model {{ pub struct Hidden; }} \
+                 use model::Hidden as Alias; pub use model::Hidden as PublicHidden; \
+                 impl Marker for {canonical_owner} {{}}\n"
+            );
+            let delta = repository_delta(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("src/lib.rs", &base, &target),
+            ]);
+            assert!(
+                delta.findings().is_empty(),
+                "wrapped owner alias and canonical spelling must match ({alias_owner}): {:?}",
+                delta.findings()
+            );
+        }
+    }
+
+    #[test]
+    fn repository_backed_trait_impl_item_order_is_semantically_stable() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Marker { type Out; const N: usize; fn value() -> u8; } \
+                 pub struct Value; impl Marker for Value { \
+                 type Out = u8; const N: usize = 1; fn value() -> u8 { 1 } }\n",
+                "pub trait Marker { type Out; const N: usize; fn value() -> u8; } \
+                 pub struct Value; impl Marker for Value { \
+                 fn value() -> u8 { 1 } const N: usize = 1; type Out = u8; }\n",
+            ),
+        ]);
+        assert!(
+            delta.findings().is_empty(),
+            "reordering ordinary associated impl items must not change evidence: {:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn repository_backed_trait_impl_relative_type_move_stays_fail_closed() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Marker { type Out; } pub struct Value; \
+                 pub mod a { pub struct Local; impl crate::Marker for crate::Value { type Out = Local; } } \
+                 pub mod b { pub struct Local; }\n",
+                "pub trait Marker { type Out; } pub struct Value; \
+                 pub mod a { pub struct Local; } \
+                 pub mod b { pub struct Local; impl crate::Marker for crate::Value { type Out = Local; } }\n",
+            ),
+        ]);
+        assert!(
+            delta
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "TraitImplResolution"),
+            "declaring scope must remain in the proof until relative names are compiler-resolved: {:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
     fn repository_backed_std_display_impl_is_typed_unknown() {
         let added = repository_delta(&[
             (
@@ -2749,6 +3221,165 @@ mod tests {
             }),
             "adding Display for a public type must be TraitImplResolution, got {:?}",
             added.findings()
+        );
+    }
+
+    #[test]
+    fn repository_backed_public_local_trait_impl_for_external_owner_is_typed_unknown() {
+        let removed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Extension {}\nimpl Extension for std::string::String {}\n",
+                "pub trait Extension {}\n",
+            ),
+        ]);
+        assert!(
+            removed.unknown.iter().any(|finding| {
+                finding.identity.name == "TraitImplResolution"
+                    && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("Extension") && reason.contains("String")
+                    })
+            }),
+            "a public local trait impl for an external owner must not disappear: {:?}",
+            removed.findings()
+        );
+
+        let private_control = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "trait Internal {}\nimpl Internal for std::string::String {}\n",
+                "trait Internal {}\n",
+            ),
+        ]);
+        assert!(
+            private_control.findings().is_empty(),
+            "a private local trait impl does not expose API even when its owner is external"
+        );
+    }
+
+    #[test]
+    fn repository_backed_public_trait_impl_for_reference_owner_is_typed_unknown() {
+        let removed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Extension {}\npub struct Public;\nimpl Extension for &Public {}\n",
+                "pub trait Extension {}\npub struct Public;\n",
+            ),
+        ]);
+        assert!(
+            removed.unknown.iter().any(|finding| {
+                finding.identity.name == "TraitImplResolution"
+                    && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("Extension") && reason.contains("Public")
+                    })
+            }),
+            "a public trait impl for a non-path owner must not disappear: {:?}",
+            removed.findings()
+        );
+
+        let private_control = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "trait Internal {}\npub struct Public;\nimpl Internal for &Public {}\n",
+                "trait Internal {}\npub struct Public;\n",
+            ),
+        ]);
+        assert!(private_control.findings().is_empty());
+
+        let private_owner_control = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Extension {}\nstruct Private;\nimpl Extension for &Private {}\n",
+                "pub trait Extension {}\nstruct Private;\n",
+            ),
+        ]);
+        assert!(
+            private_owner_control.findings().is_empty(),
+            "a public trait impl for a private referenced owner is not public API"
+        );
+    }
+
+    #[test]
+    fn repository_backed_generic_bound_order_is_semantic_noop() {
+        let reordered = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn call<T: Send + Sync, U>() where U: Clone + Copy, T: 'static {}\n",
+                "pub fn call<T: Sync + Send, U>() where T: 'static, U: Copy + Clone {}\n",
+            ),
+        ]);
+        assert!(
+            reordered.findings().is_empty(),
+            "reordering equivalent generic bounds and where predicates is not an API change: {:?}",
+            reordered.findings()
+        );
+
+        let associated_reordered = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Public;\nimpl Public { pub fn call<T: Send + Sync, U>() where U: Clone + Copy, T: 'static {} }\n",
+                "pub struct Public;\nimpl Public { pub fn call<T: Sync + Send, U>() where T: 'static, U: Copy + Clone {} }\n",
+            ),
+        ]);
+        assert!(
+            associated_reordered.findings().is_empty(),
+            "associated-item contracts must also ignore bound ordering: {:?}",
+            associated_reordered.findings()
+        );
+
+        let changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn call<T: Send + Sync>() {}\n",
+                "pub fn call<T: Send + Unpin>() {}\n",
+            ),
+        ]);
+        assert!(
+            changed
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "call"),
+            "changing one bound must remain observable"
         );
     }
 
@@ -2817,6 +3448,283 @@ mod tests {
                 .any(|finding| finding.identity.name == "Holder"),
             "replacing a private Send field with Rc must change the parent contract, got {:?}",
             delta.findings()
+        );
+    }
+
+    #[test]
+    fn repository_backed_transitive_private_type_change_is_typed_unknown() {
+        for (base, target, public_name, reason) in [
+            (
+                "struct Hidden(u8); pub struct Holder { inner: Hidden }\n",
+                "struct Hidden(std::rc::Rc<()>); pub struct Holder { inner: Hidden }\n",
+                "Holder",
+                "a private local type can change the public parent's auto traits",
+            ),
+            (
+                "struct Leaf(u8); struct Hidden(Leaf); #[repr(C)] pub struct Holder { inner: Hidden }\n",
+                "struct Leaf(u16); struct Hidden(Leaf); #[repr(C)] pub struct Holder { inner: Hidden }\n",
+                "Holder",
+                "a transitive private local type can change repr(C) layout",
+            ),
+            (
+                "mod model { pub struct Hidden(u8); } use model::Hidden; pub enum Public { Value(Hidden) }\n",
+                "mod model { pub struct Hidden(std::rc::Rc<()>); } use model::Hidden; pub enum Public { Value(Hidden) }\n",
+                "Public",
+                "a private import and private module can hide an enum payload's auto-trait change",
+            ),
+            (
+                "struct Hidden; unsafe impl Send for Hidden {} pub fn make() -> Hidden { Hidden }\n",
+                "struct Hidden; pub fn make() -> Hidden { Hidden }\n",
+                "make",
+                "a local trait impl can change a private return type's compiler-derived semantics",
+            ),
+            (
+                "mod model { pub struct Hidden; } use model::Hidden as Alias; unsafe impl Send for Alias {} pub fn make() -> model::Hidden { model::Hidden }\n",
+                "mod model { pub struct Hidden; } use model::Hidden as Alias; pub fn make() -> model::Hidden { model::Hidden }\n",
+                "make",
+                "trait impl evidence indexed under a private alias must reach the canonical owner",
+            ),
+            (
+                "mod model { pub struct Hidden; } use model as alias; unsafe impl Send for alias::Hidden {} pub fn make() -> model::Hidden { model::Hidden }\n",
+                "mod model { pub struct Hidden; } use model as alias; pub fn make() -> model::Hidden { model::Hidden }\n",
+                "make",
+                "trait impl evidence indexed through a private module alias must reach the canonical owner",
+            ),
+            (
+                "mod model { pub struct Hidden; } mod helper { struct Leaf(u8); trait Local { type Out; } impl Local for crate::model::Hidden { type Out = Leaf; } } use model::Hidden; pub fn make() -> Hidden { Hidden }\n",
+                "mod model { pub struct Hidden; } mod helper { struct Leaf(std::rc::Rc<()>); trait Local { type Out; } impl Local for crate::model::Hidden { type Out = Leaf; } } use model::Hidden; pub fn make() -> Hidden { Hidden }\n",
+                "make",
+                "private types used only by a cross-module local impl must resolve from the impl declaration module",
+            ),
+            (
+                "mod model { pub struct Hidden(u8); } mod helper { pub use crate::model::Hidden as Alias; } pub struct Holder { inner: helper::Alias }\n",
+                "mod model { pub struct Hidden(std::rc::Rc<()>); } mod helper { pub use crate::model::Hidden as Alias; } pub struct Holder { inner: helper::Alias }\n",
+                "Holder",
+                "a public use inside an unreachable module is still a private type alias",
+            ),
+            (
+                "mod model { pub struct Hidden(u8); } use model as alias; pub struct Holder { inner: alias::Hidden }\n",
+                "mod model { pub struct Hidden(std::rc::Rc<()>); } use model as alias; pub struct Holder { inner: alias::Hidden }\n",
+                "Holder",
+                "a private module-prefix alias must resolve the dependent type",
+            ),
+            (
+                "#[cfg(unix)] pub struct Hidden(u8); #[cfg(windows)] struct Hidden(u8); #[cfg(windows)] pub fn make() -> Hidden { Hidden(0) }\n",
+                "#[cfg(unix)] pub struct Hidden(u8); #[cfg(windows)] struct Hidden(std::rc::Rc<()>); #[cfg(windows)] pub fn make() -> Hidden { Hidden(std::rc::Rc::new(())) }\n",
+                "make",
+                "a cfg-disjoint public origin must not hide a private dependent declaration",
+            ),
+            (
+                "#[cfg(feature = \"public\")] pub struct Hidden(u8); #[cfg(not(feature = \"public\"))] struct Hidden(u8); #[cfg(not(feature = \"public\"))] pub fn make() -> Hidden { Hidden(0) }\n",
+                "#[cfg(feature = \"public\")] pub struct Hidden(u8); #[cfg(not(feature = \"public\"))] struct Hidden(std::rc::Rc<()>); #[cfg(not(feature = \"public\"))] pub fn make() -> Hidden { Hidden(std::rc::Rc::new(())) }\n",
+                "make",
+                "a direct cfg atom and its negation are disjoint private/public origins",
+            ),
+            (
+                "struct Hidden; type Alias = Hidden; unsafe impl Send for Alias {} pub fn make() -> Hidden { Hidden }\n",
+                "struct Hidden; type Alias = Hidden; pub fn make() -> Hidden { Hidden }\n",
+                "make",
+                "trait impl evidence reached through a private type alias must fingerprint the nominal owner",
+            ),
+        ] {
+            let delta = repository_delta(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("src/lib.rs", base, target),
+            ]);
+            assert!(
+                delta.unknown.iter().any(|finding| {
+                    finding.identity.name == "PrivateTypeDependency"
+                        && finding
+                            .unknown_reason
+                            .as_deref()
+                            .is_some_and(|reason| reason.contains(public_name))
+                }),
+                "{reason} must remain a typed unknown until compiler-backed semantics exist; got {:?}",
+                delta.findings()
+            );
+            assert!(
+                !delta
+                    .changed
+                    .iter()
+                    .any(|finding| finding.identity.name == public_name),
+                "private compiler-derived semantics must not be misclassified as confirmed"
+            );
+        }
+
+        let unrelated_change = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "struct Hidden(u8); pub struct Holder { inner: Hidden } pub fn f(value: u8) {}\n",
+                "struct Hidden(u8); pub struct Holder { inner: Hidden } pub fn f(value: u16) {}\n",
+            ),
+        ]);
+        assert!(
+            unrelated_change
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "f"),
+            "an unchanged private dependency must not contaminate unrelated known API changes: {:?}",
+            unrelated_change.findings()
+        );
+        assert!(unrelated_change.unknown.is_empty());
+
+        let cfg_disjoint_impl = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "struct Hidden; #[cfg(unix)] pub fn make() -> Hidden { Hidden } #[cfg(windows)] unsafe impl Send for Hidden {}\n",
+                "struct Hidden; #[cfg(unix)] pub fn make() -> Hidden { Hidden }\n",
+            ),
+        ]);
+        assert!(
+            cfg_disjoint_impl.findings().is_empty(),
+            "a cfg-disjoint private impl must not contaminate another target family: {:?}",
+            cfg_disjoint_impl.findings()
+        );
+    }
+
+    #[test]
+    fn repository_backed_private_alias_cfg_target_swap_stays_typed_unknown() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod a { pub struct Item; } mod b { pub struct Item; } \
+                 #[cfg(unix)] use a::Item as Hidden; \
+                 #[cfg(windows)] use b::Item as Hidden; \
+                 pub fn make() -> Hidden { todo!() }\n",
+                "mod a { pub struct Item; } mod b { pub struct Item; } \
+                 #[cfg(unix)] use b::Item as Hidden; \
+                 #[cfg(windows)] use a::Item as Hidden; \
+                 pub fn make() -> Hidden { todo!() }\n",
+            ),
+        ]);
+        let private_dependency_rows = delta
+            .unknown
+            .iter()
+            .filter(|finding| {
+                finding.identity.name == "PrivateTypeDependency"
+                    && finding
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("make"))
+            })
+            .count();
+        assert_eq!(
+            private_dependency_rows,
+            2,
+            "base and target cfg mappings must remain unmatched typed proofs: {:?}",
+            delta.findings()
+        );
+        assert!(
+            !delta
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "make"),
+            "source-only private semantics must not be promoted to a confirmed change"
+        );
+    }
+
+    #[test]
+    fn repository_backed_private_impl_alias_spelling_is_semantically_stable() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod model { pub struct Hidden; } use model::Hidden as Alias; \
+                 trait Local {} impl Local for Alias {} \
+                 pub fn make() -> model::Hidden { model::Hidden }\n",
+                "mod model { pub struct Hidden; } use model::Hidden as Alias; \
+                 trait Local {} impl Local for model::Hidden {} \
+                 pub fn make() -> model::Hidden { model::Hidden }\n",
+            ),
+        ]);
+        assert!(
+            delta.findings().is_empty(),
+            "impl owner spelling must not change private dependency evidence: {:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn repository_backed_exhausted_alias_graphs_keep_distinct_evidence() {
+        let delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod a { pub mod b { pub struct Item; } pub mod c { pub struct Item; } } \
+                 use a::b as a; trait Local {} impl Local for a::Item {}\n",
+                "mod a { pub mod b { pub struct Item; } pub mod c { pub struct Item; } } \
+                 use a::c as a; trait Local {} impl Local for a::Item {}\n",
+            ),
+        ]);
+        assert!(
+            delta.unknown.iter().any(|finding| {
+                matches!(
+                    finding.identity.name.as_str(),
+                    "PrivateTypeDependency" | "TraitImplResolution"
+                ) && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("finite graph bound"))
+            }),
+            "different finite-budget failures must not neutralize: {:?}",
+            delta.findings()
+        );
+    }
+
+    #[test]
+    fn identical_exhausted_alias_proofs_never_match() {
+        let base = snapshot_rust_api(&MemorySource::source("", "base"));
+        let target = snapshot_rust_api(&MemorySource::source("", "target"));
+        let make_unknown = |provenance: RevisionProvenance, exhausted: bool| RustApiUnknown {
+            kind: RustApiUnknownKind::PrivateTypeDependency,
+            crate_name: Some("fixture".to_owned()),
+            module_path: vec![],
+            source_path: "src/lib.rs".to_owned(),
+            cfg_guard: vec![],
+            evidence: "same proof; literal: alias resolution exceeded its finite graph bound"
+                .to_owned(),
+            resolution_exhausted: exhausted,
+            provenance,
+        };
+        let left = make_unknown(base.provenance.clone(), true);
+        let right = make_unknown(target.provenance.clone(), true);
+        assert!(
+            !unknown_proofs_match(&base, &left, &target, &right),
+            "an exhausted partial proof never establishes semantic equality"
+        );
+
+        let left_literal_only = make_unknown(base.provenance.clone(), false);
+        let right_literal_only = make_unknown(target.provenance.clone(), false);
+        assert!(
+            unknown_proofs_match(&base, &left_literal_only, &target, &right_literal_only),
+            "evidence text alone must not masquerade as structural exhaustion"
         );
     }
 

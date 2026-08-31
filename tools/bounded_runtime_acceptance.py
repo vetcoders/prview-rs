@@ -463,6 +463,11 @@ def evaluate(
         "--deep" in (receipt.get("command") or []),
         "acceptance command is not a --deep review",
     )
+    add_assertion(
+        violations,
+        "--resource-budget" not in (receipt.get("command") or []),
+        "acceptance command overrides the CLI default resource budget",
+    )
     check_blob = " ".join(
         str(row.get("name") or "")
         for row in (run or {}).get("checks") or []
@@ -624,8 +629,6 @@ def main() -> int:
             command = [
                 str(args.binary.resolve()),
                 "--deep",
-                "--resource-budget",
-                "safe",
                 "--no-cache",
                 "--no-fetch",
                 "--local-only",

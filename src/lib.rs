@@ -35,21 +35,29 @@ pub use config::Config;
 use anyhow::Result;
 use std::time::Instant;
 
+/// Run a synchronous headless phase without starving the interrupt supervisor.
+///
+/// `App` owns a non-`Send` libgit2 repository, so ref resolution and diff
+/// generation cannot simply be moved into `spawn_blocking`. `block_in_place`
+/// gives Tokio another worker while keeping that repository on this task's
+/// thread. Cancellation wins over a command/libgit2 error from the interrupted
+/// phase so the CLI reports exit 130 rather than an execution failure.
+fn run_headless_sync_stage<T>(
+    governor: &std::sync::Arc<governor::ResourceGovernor>,
+    stage: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let result = governor::blocking_stage(stage);
+    if governor.is_cancelled() {
+        return Err(governor::Cancelled.into());
+    }
+    result
+}
+
 /// Main application context holding all state
 pub struct App {
     pub config: Config,
     pub repo: git::Repository,
     pub(crate) start_time: Instant,
-    /// Working-tree cleanliness captured at construction — before ref refresh,
-    /// checks, or artifact writes touch the tree (R4-19). Frozen so the
-    /// pre-existing downgrade judges the scanned source state, not tool output
-    /// (an in-repo `--output-dir` or an untracked check cache) that appears
-    /// later in the run. `None` when the status could not be read at all.
-    pub(crate) worktree_clean_at_start: Option<bool>,
-    /// Fingerprint of what was uncommitted at that same moment, from the same
-    /// status read. Recorded in `00_summary/PROVENANCE.json` so a reviewer can
-    /// tell two dirty runs apart instead of only knowing "dirty".
-    pub(crate) worktree_status_digest_at_start: Option<String>,
     /// The ONE machine-wide budget for this run, and the registry of the
     /// children it spawned.
     ///
@@ -80,9 +88,6 @@ impl App {
     /// Create new App instance from Config
     pub fn from_config(config: Config) -> Result<Self> {
         let repo = git::Repository::open(&config.repo_root)?;
-        // Freeze cleanliness now — before any check runs or artifact is written
-        // (R4-19).
-        let worktree = artifacts::capture_worktree_provenance(&config.repo_root);
         let governor =
             std::sync::Arc::new(governor::ResourceGovernor::from_plan(config.resource_plan));
 
@@ -90,8 +95,6 @@ impl App {
             config,
             repo,
             start_time: Instant::now(),
-            worktree_clean_at_start: worktree.clean,
-            worktree_status_digest_at_start: worktree.status_digest,
             governor,
         })
     }
@@ -143,18 +146,30 @@ impl App {
             println!();
         }
 
-        // 1. Refresh refs when remote/default fetch behavior is enabled
-        self.ensure_not_cancelled()?;
-        self.repo.prepare_refs(&self.config)?;
-        self.ensure_not_cancelled()?;
+        // 1-2. Refresh and resolve refs. These operations are synchronous and
+        // libgit2-backed; on a one-worker runtime they must yield the worker to
+        // the separately spawned Ctrl-C supervisor just like the TUI sync phase.
+        let (worktree, target, bases) = run_headless_sync_stage(&self.governor, || {
+            self.ensure_not_cancelled()?;
+            // Capture source provenance only after the run-wide Ctrl-C scope is
+            // installed. `git2::statuses` can block on a large worktree, and
+            // doing it in `from_config` starved a one-worker runtime before its
+            // interrupt supervisor had ever been polled. This remains the first
+            // tree read of the run, before ref refresh, checks, or artifacts.
+            let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
+            self.ensure_not_cancelled()?;
+            self.repo.prepare_refs(&self.config)?;
+            self.ensure_not_cancelled()?;
 
-        // 2. Resolve target and base refs
-        let target = self.repo.resolve_target(&self.config)?;
-        let bases = if self.config.current_only {
-            Vec::new()
-        } else {
-            self.repo.resolve_bases(&self.config)?
-        };
+            let target = self.repo.resolve_target(&self.config)?;
+            let bases = if self.config.current_only {
+                Vec::new()
+            } else {
+                self.repo.resolve_bases(&self.config)?
+            };
+            self.ensure_not_cancelled()?;
+            Ok((worktree, target, bases))
+        })?;
         self.ensure_not_cancelled()?;
 
         if emit_human_stdout {
@@ -172,12 +187,15 @@ impl App {
         }
 
         // 4. Generate diffs
-        let diff_bases = self
-            .repo
-            .resolve_diff_bases(&target, &bases, self.config.quiet);
-        let diffs = self
-            .repo
-            .generate_diffs(&target, &diff_bases, self.config.quiet)?;
+        let (diff_bases, diffs) = run_headless_sync_stage(&self.governor, || {
+            let diff_bases = self
+                .repo
+                .resolve_diff_bases(&target, &bases, self.config.quiet);
+            let diffs = self
+                .repo
+                .generate_diffs(&target, &diff_bases, self.config.quiet)?;
+            Ok((diff_bases, diffs))
+        })?;
         self.ensure_not_cancelled()?;
 
         // 5. Run checks (reduced set in update mode).
@@ -245,15 +263,15 @@ impl App {
                 resolved_bases: &bases,
                 run_start: self.start_time,
                 skipped_checks,
-                worktree_clean: self.worktree_clean_at_start,
-                worktree_status_digest: self.worktree_status_digest_at_start.clone(),
+                worktree_clean: worktree.clean,
+                worktree_status_digest: worktree.status_digest.clone(),
                 governor: &self.governor,
             })
         })?;
-        // A cancel DURING the artifact stage leaves a pack whose context
-        // commands are all recorded `cancelled`. It is a partial pack, not a
-        // review, so the run must not go on to summarise it as one.
-        self.ensure_not_cancelled()?;
+        // `generate` owns the publication commit boundary. Before that point a
+        // cancel returns Err with INCOMPLETE and no advertisement; after the
+        // durable latest+index commit the run is completed and a late signal
+        // must not retroactively relabel its published verdict as cancelled.
 
         // 8. Build report
         let report = output::Report {
@@ -295,7 +313,10 @@ impl App {
         let config = self.config.clone();
 
         // 1. Create target snapshot (required — fallback to cwd on failure)
-        let target_snap = match self.repo.create_snapshot(&target.commit_id) {
+        let target_snap = match run_headless_sync_stage(&self.governor, || {
+            self.ensure_not_cancelled()?;
+            self.repo.create_snapshot(&target.commit_id)
+        }) {
             Ok(snap) => {
                 if emit {
                     println!(
@@ -307,6 +328,7 @@ impl App {
                 }
                 Some(snap)
             }
+            Err(e) if governor::is_cancellation(&e) => return Err(e),
             Err(e) => {
                 if emit {
                     eprintln!(
@@ -333,7 +355,10 @@ impl App {
         if should_compute_snapshot_regression(&self.config)
             && let Some(base) = bases.first()
         {
-            match self.repo.create_snapshot(&base.commit_id) {
+            match run_headless_sync_stage(&self.governor, || {
+                self.ensure_not_cancelled()?;
+                self.repo.create_snapshot(&base.commit_id)
+            }) {
                 Ok(base_snap) => {
                     if emit {
                         println!(
@@ -397,6 +422,7 @@ impl App {
                     }
                     // base_snap dropped here → auto-cleanup
                 }
+                Err(e) if governor::is_cancellation(&e) => return Err(e),
                 Err(e) => {
                     if emit {
                         eprintln!(
@@ -514,6 +540,10 @@ impl App {
 
     /// Quick run for watch mode (skip heavy checks)
     async fn run_quick(&self) -> Result<output::Report> {
+        self.run_quick_with_sync_probe(|| {}).await
+    }
+
+    async fn run_quick_with_sync_probe(&self, sync_probe: impl FnOnce()) -> Result<output::Report> {
         let run_started_at = Instant::now();
         // `--watch` reuses one governor across every iteration, and closing it is
         // one-way, so a cancelled watcher must not start another pack.
@@ -523,19 +553,26 @@ impl App {
         // the watcher started — by definition not the tree that just changed.
         // Each iteration is its own run and freezes its own worktree state, at
         // the start of that run and before this pack is written.
-        let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
-        let target = self.repo.resolve_target(&self.config)?;
-        let bases = if self.config.current_only {
-            Vec::new()
-        } else {
-            self.repo.resolve_bases(&self.config)?
-        };
-        let diff_bases = self
-            .repo
-            .resolve_diff_bases(&target, &bases, self.config.quiet);
-        let diffs = self
-            .repo
-            .generate_diffs(&target, &diff_bases, self.config.quiet)?;
+        let (worktree, target, bases, diffs) = run_headless_sync_stage(&self.governor, || {
+            sync_probe();
+            self.ensure_not_cancelled()?;
+            let worktree = artifacts::capture_worktree_provenance(&self.config.repo_root);
+            let target = self.repo.resolve_target(&self.config)?;
+            let bases = if self.config.current_only {
+                Vec::new()
+            } else {
+                self.repo.resolve_bases(&self.config)?
+            };
+            self.ensure_not_cancelled()?;
+            let diff_bases = self
+                .repo
+                .resolve_diff_bases(&target, &bases, self.config.quiet);
+            let diffs = self
+                .repo
+                .generate_diffs(&target, &diff_bases, self.config.quiet)?;
+            self.ensure_not_cancelled()?;
+            Ok((worktree, target, bases, diffs))
+        })?;
 
         // Skip checks and heuristics in quick mode. No checks run, so no shared
         // snapshot is ever materialised: an empty ledger is the honest input,
@@ -558,8 +595,6 @@ impl App {
                 governor: &self.governor,
             })
         })?;
-        self.ensure_not_cancelled()?;
-
         Ok(output::Report {
             target: target.name.clone(),
             bases: bases.iter().map(|b| b.name.clone()).collect(),
@@ -575,20 +610,23 @@ impl App {
     fn get_repo_state_hash(&self) -> Result<String> {
         use crate::git::git_cmd;
 
-        let head = git_cmd()
+        let mut head_cmd = git_cmd();
+        head_cmd
             .args(["rev-parse", "HEAD"])
-            .current_dir(&self.config.repo_root)
-            .output()?;
+            .current_dir(&self.config.repo_root);
+        let head = crate::proc::output_governed(head_cmd, "git watch rev-parse")?;
 
-        let status = git_cmd()
+        let mut status_cmd = git_cmd();
+        status_cmd
             .args(["status", "--porcelain"])
-            .current_dir(&self.config.repo_root)
-            .output()?;
+            .current_dir(&self.config.repo_root);
+        let status = crate::proc::output_governed(status_cmd, "git watch status")?;
 
-        let diff = git_cmd()
+        let mut diff_cmd = git_cmd();
+        diff_cmd
             .args(["diff", "--no-ext-diff", "--stat"])
-            .current_dir(&self.config.repo_root)
-            .output()?;
+            .current_dir(&self.config.repo_root);
+        let diff = crate::proc::output_governed(diff_cmd, "git watch diff")?;
 
         let head_str = String::from_utf8_lossy(&head.stdout);
         let status_str = String::from_utf8_lossy(&status.stdout);
@@ -614,7 +652,10 @@ impl App {
         // and reading the repo state for it would only delay saying so.
         self.ensure_not_cancelled()?;
 
-        let current_hash = self.get_repo_state_hash()?;
+        let current_hash = run_headless_sync_stage(&self.governor, || {
+            self.ensure_not_cancelled()?;
+            self.get_repo_state_hash()
+        })?;
         if current_hash == *last_hash {
             return Ok(());
         }
@@ -645,7 +686,14 @@ impl App {
             }
         }
 
-        *last_hash = self.get_repo_state_hash().unwrap_or(current_hash);
+        *last_hash = match run_headless_sync_stage(&self.governor, || {
+            self.ensure_not_cancelled()?;
+            self.get_repo_state_hash()
+        }) {
+            Ok(hash) => hash,
+            Err(error) if governor::is_cancellation(&error) => return Err(error),
+            Err(_) => current_hash,
+        };
 
         if emit_human_stdout {
             println!("\n{} Waiting for changes...", "ℹ".blue());
@@ -880,6 +928,76 @@ mod tests {
     use notify::event::{AccessKind, CreateKind, EventAttributes};
     use std::path::PathBuf;
 
+    #[cfg(unix)]
+    struct InterruptWhenFileExists {
+        path: PathBuf,
+        delivered: bool,
+    }
+
+    #[cfg(unix)]
+    impl InterruptWhenFileExists {
+        fn new(path: PathBuf) -> Self {
+            Self {
+                path,
+                delivered: false,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl crate::governor::Interrupts for InterruptWhenFileExists {
+        async fn next(&mut self) {
+            if self.delivered {
+                std::future::pending::<()>().await;
+            }
+            while !self.path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            self.delivered = true;
+        }
+    }
+
+    #[cfg(unix)]
+    fn blocking_script(dir: &std::path::Path, name: &str, pidfile: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nsleep 30\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    async fn assert_recorded_process_gone(pidfile: &std::path::Path) {
+        let pid: i32 = std::fs::read_to_string(pidfile)
+            .expect("blocking child records its pid before interrupt")
+            .trim()
+            .parse()
+            .expect("recorded pid is numeric");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            // SAFETY: kill(pid, 0) is an existence probe; no signal is sent.
+            let exists = unsafe { libc::kill(pid, 0) } == 0;
+            if !exists {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "governed child {pid} survived cancellation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     #[test]
     fn snapshot_regression_is_disabled_for_standard_mode() {
         let mut config = test_config();
@@ -1003,18 +1121,15 @@ mod tests {
         config.repo_root = repo.to_path_buf();
         config.target = Some("feature".to_string());
         config.bases = vec!["main".to_string()];
-        config.output_dir = Some(out.path().to_path_buf());
+        config.output_dir = Some(out.path().join("pack"));
         config.run_heuristics = false;
         config.quiet = true;
         config.create_zip = false;
 
-        // The App is built while the tree is clean — as a watcher's is.
+        // The watcher starts while the tree is clean.
+        let watcher_start = crate::artifacts::capture_worktree_provenance(repo);
+        assert_eq!(watcher_start.clean, Some(true), "fixture starts clean");
         let app = crate::App::from_config(config).unwrap();
-        assert_eq!(
-            app.worktree_clean_at_start,
-            Some(true),
-            "fixture starts clean"
-        );
 
         // A watched edit lands, then the iteration runs.
         std::fs::write(
@@ -1037,7 +1152,7 @@ mod tests {
         );
         assert_ne!(
             provenance["worktree"]["status_digest"].as_str(),
-            app.worktree_status_digest_at_start.as_deref(),
+            watcher_start.status_digest.as_deref(),
             "a re-frozen digest must differ from the watcher's start-of-process one",
         );
     }
@@ -1061,12 +1176,184 @@ mod tests {
         config.repo_root = repo.to_path_buf();
         config.target = Some("feature".to_string());
         config.bases = vec!["main".to_string()];
-        config.output_dir = Some(out.to_path_buf());
+        config.output_dir = Some(out.join("pack"));
         config.run_heuristics = false;
         config.do_fetch = false;
         config.quiet = true;
         config.create_zip = false;
         config
+    }
+
+    /// A one-worker production runtime used to enter synchronous ref/diff work
+    /// before the separately spawned interrupt task had a chance to install or
+    /// poll its handler. The headless sync wrapper must free that only worker
+    /// and turn the interrupt into the run's typed cancellation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn headless_sync_work_keeps_the_interrupt_supervisor_live() {
+        use crate::governor::{Interrupts, ResourceGovernor};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use tokio::sync::mpsc;
+
+        struct OneInterrupt(mpsc::UnboundedReceiver<()>);
+
+        impl Interrupts for OneInterrupt {
+            async fn next(&mut self) {
+                if self.0.recv().await.is_none() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+
+        let governor = Arc::new(ResourceGovernor::new());
+        let run_governor = Arc::clone(&governor);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let started = Instant::now();
+
+        let work = async move {
+            tx.send(()).expect("interrupt receiver remains live");
+            super::run_headless_sync_stage(&run_governor, || -> anyhow::Result<()> {
+                assert!(
+                    crate::governor::current_run_governor().is_some(),
+                    "blocking headless sync must retain run scope for git child registration"
+                );
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !run_governor.is_cancelled() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if run_governor.is_cancelled() {
+                    Err(crate::governor::Cancelled.into())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "interrupt supervisor was starved by headless sync work"
+                    ))
+                }
+            })
+        };
+
+        let error = crate::governor::with_cancellation(work, &governor, OneInterrupt(rx))
+            .await
+            .expect_err("the interrupted sync phase returns no result");
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "interrupt was not observed promptly: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn watch_quick_sync_phase_keeps_the_interrupt_supervisor_live() {
+        use crate::governor::Interrupts;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use tokio::sync::mpsc;
+
+        struct OneInterrupt(mpsc::UnboundedReceiver<()>);
+
+        impl Interrupts for OneInterrupt {
+            async fn next(&mut self) {
+                if self.0.recv().await.is_none() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let app = crate::App::from_config(reviewable_repo(repo.path(), out.path())).unwrap();
+        let governor = app.governor();
+        let probe_governor = Arc::clone(&governor);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let started = Instant::now();
+
+        let work = app.run_quick_with_sync_probe(move || {
+            tx.send(()).expect("watch interrupt receiver remains live");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !probe_governor.is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let error = crate::governor::with_cancellation(work, &governor, OneInterrupt(rx))
+            .await
+            .expect_err("cancelled watch sync phase produces no quick pack");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            std::fs::read_dir(out.path()).unwrap().next().is_none(),
+            "watch cancellation before diff resolution must publish no pack"
+        );
+    }
+
+    /// The watch hash used raw `Command::output` calls. Wrapping the containing
+    /// closure in `blocking_stage` kept the Ctrl-C task pollable, but the actual
+    /// git process was neither registered nor cancellable, so the closure still
+    /// waited for git. Exercise the production hash path with a blocking git
+    /// executable, not a synthetic sleep probe.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn watch_state_hash_cancels_its_real_git_child() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let app = crate::App::from_config(reviewable_repo(repo.path(), out.path())).unwrap();
+        let governor = app.governor();
+        let pidfile = repo.path().join("watch-git.pid");
+        let shim = blocking_script(repo.path(), "blocking-git", &pidfile);
+        let run_governor = std::sync::Arc::clone(&governor);
+        let started = std::time::Instant::now();
+
+        let work = async move {
+            super::run_headless_sync_stage(&run_governor, || {
+                let _override = crate::git::override_test_git_program(shim);
+                app.get_repo_state_hash()
+            })
+        };
+        let error = crate::governor::with_cancellation(
+            work,
+            &governor,
+            InterruptWhenFileExists::new(pidfile.clone()),
+        )
+        .await
+        .expect_err("interrupt must cancel the git-backed state hash");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(governor.inflight_count(), 0);
+        assert_recorded_process_gone(&pidfile).await;
+    }
+
+    /// Snapshot creation is a synchronous `git archive | tar` pipeline. On a
+    /// one-worker runtime it must both leave the interrupt supervisor runnable
+    /// and register the real pipeline children for termination.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn snapshot_pipeline_cancels_from_the_real_heuristics_call_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = reviewable_repo(repo.path(), out.path());
+        config.run_heuristics = true;
+        let target_sha = rev_parse(repo.path(), "feature");
+        let app = crate::App::from_config(config).unwrap();
+        let governor = app.governor();
+        let pidfile = repo.path().join("snapshot-tar.pid");
+        let shim = blocking_script(repo.path(), "blocking-tar", &pidfile);
+        let _override = crate::git::override_test_tar_program(shim);
+        let target = resolved(&target_sha);
+        let started = std::time::Instant::now();
+
+        let error = crate::governor::with_cancellation(
+            app.run_heuristics_with_snapshots(&target, &[]),
+            &governor,
+            InterruptWhenFileExists::new(pidfile.clone()),
+        )
+        .await
+        .expect_err("interrupt must cancel the real snapshot pipeline");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(governor.inflight_count(), 0);
+        assert_recorded_process_gone(&pidfile).await;
     }
 
     /// The contract behind exit 130, pinned end to end: a run in which

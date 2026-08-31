@@ -386,9 +386,11 @@ pub(super) fn generate_inline_findings(
             let audit_findings = parse_cargo_audit_findings(&check.output);
             let current_advisories = cargo_audit_report_advisory_keys(&check.output);
             let cargo_lock_changed = cargo_audit_lock_changed(repo, diffs, cargo_root);
-            let base_audit_cache = (cargo_lock_changed && current_advisories.is_some())
-                .then(|| get_base_cargo_audit_findings(repo, diffs, cargo_root))
-                .flatten();
+            let base_audit_cache = if cargo_lock_changed && current_advisories.is_some() {
+                get_base_cargo_audit_findings(repo, diffs, cargo_root)?
+            } else {
+                None
+            };
             let baseline = cargo_audit_baseline_counts(
                 current_advisories.as_ref(),
                 cargo_lock_changed,

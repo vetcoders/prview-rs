@@ -9,6 +9,29 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_TAR_PROGRAM: std::cell::RefCell<Option<std::ffi::OsString>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) struct TestTarOverride(Option<std::ffi::OsString>);
+
+#[cfg(test)]
+impl Drop for TestTarOverride {
+    fn drop(&mut self) {
+        TEST_TAR_PROGRAM.with(|program| *program.borrow_mut() = self.0.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn override_test_tar_program(program: impl Into<std::ffi::OsString>) -> TestTarOverride {
+    let previous = TEST_TAR_PROGRAM.with(|slot| slot.borrow_mut().replace(program.into()));
+    TestTarOverride(previous)
+}
+
 /// A temporary snapshot of a git tree at a specific commit.
 /// Auto-cleaned on drop via `tempfile::TempDir`.
 pub struct AnalysisSnapshot {
@@ -49,32 +72,19 @@ impl super::Repository {
         archive_cmd
             .args(["archive", sha])
             .current_dir(&self.path)
-            .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        crate::proc::harden_std(&mut archive_cmd);
-        if crate::governor::current_run_governor().is_some_and(|governor| governor.is_cancelled()) {
-            return Err(crate::governor::Cancelled.into());
-        }
-        let mut archive = archive_cmd.spawn().context("Failed to spawn git archive")?;
-        let _archive_reg = crate::governor::register_run_child(archive.id(), "git archive");
 
-        let archive_stdout = archive
-            .stdout
-            .take()
-            .context("Failed to capture git archive stdout")?;
-
+        #[cfg(test)]
+        let mut tar_cmd = Command::new(
+            TEST_TAR_PROGRAM
+                .with(|program| program.borrow().clone())
+                .unwrap_or_else(|| "tar".into()),
+        );
+        #[cfg(not(test))]
         let mut tar_cmd = Command::new("tar");
-        crate::proc::harden_std(&mut tar_cmd);
-        tar_cmd
-            .args(["-x", "-C"])
-            .arg(dest)
-            .stdin(archive_stdout)
-            .stderr(Stdio::null());
-        let mut tar = tar_cmd.spawn().context("Failed to run tar")?;
-        let _tar_reg = crate::governor::register_run_child(tar.id(), "tar extract");
-        let tar_status = tar.wait().context("Failed to wait for tar")?;
-
-        let archive_status = archive.wait().context("Failed to wait for git archive")?;
+        tar_cmd.args(["-x", "-C"]).arg(dest).stderr(Stdio::null());
+        let (archive_status, tar_status) =
+            crate::proc::run_pipeline_governed(archive_cmd, tar_cmd, "git archive", "tar extract")?;
 
         if !archive_status.success() {
             anyhow::bail!(

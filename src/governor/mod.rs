@@ -505,6 +505,29 @@ pub async fn with_cancellation<T>(
     .await
 }
 
+/// Supervise synchronous startup work before an [`App`](crate::App) exists.
+///
+/// PR metadata lookup and config discovery can spawn governed children, but the
+/// run-specific governor is not available until config construction finishes.
+/// This temporary run scope closes that bootstrap gap and converts a startup
+/// interrupt into the same typed cancellation as the main review.
+pub async fn supervise_startup_stage<T>(
+    stage: impl FnOnce() -> anyhow::Result<T>,
+    interrupts: impl Interrupts,
+) -> anyhow::Result<T> {
+    let governor = Arc::new(ResourceGovernor::new());
+    let run_governor = Arc::clone(&governor);
+    let work = async move {
+        let result = blocking_stage(stage);
+        if run_governor.is_cancelled() {
+            Err(Cancelled.into())
+        } else {
+            result
+        }
+    };
+    with_cancellation(work, &governor, interrupts).await
+}
+
 tokio::task_local! {
     /// The governor the currently-running task's children belong to.
     ///

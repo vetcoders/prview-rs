@@ -56,6 +56,13 @@ impl AnalysisTask {
 
 /// Run the TUI application
 pub async fn run_tui(config: Config) -> Result<()> {
+    // Preflight can fetch and resolve refs. Do it before raw mode, but under a
+    // real Ctrl-C supervisor: otherwise the terminal stops translating ^C
+    // into a signal before the key-event loop exists, leaving both prview and
+    // a governed git fetch with nobody able to observe the operator's abort.
+    let mut state = TuiState::new(config);
+    initialize_state_supervised(&mut state, crate::governor::CtrlC).await?;
+
     // Setup terminal
     enable_raw_mode()?;
     let mut out = stdout();
@@ -79,10 +86,6 @@ pub async fn run_tui(config: Config) -> Result<()> {
     }
 
     let run_result = async {
-        // Create app state and initialize
-        let mut state = TuiState::new(config);
-        initialize_state(&mut state)?;
-
         // Create event channel. Unbounded so a burst of check events can never
         // fill a fixed buffer and drop a CheckCompleted, which would leave a
         // check stuck rendering as "running" forever.
@@ -103,6 +106,17 @@ pub async fn run_tui(config: Config) -> Result<()> {
             "{run_err}; terminal cleanup failed: {cleanup_err}"
         )),
     }
+}
+
+async fn initialize_state_supervised(
+    state: &mut TuiState,
+    interrupts: impl crate::governor::Interrupts,
+) -> Result<()> {
+    let governor = Arc::new(crate::governor::ResourceGovernor::from_plan(
+        state.config.resource_plan,
+    ));
+    let work = async { crate::governor::blocking_stage(|| initialize_state(state)) };
+    crate::governor::with_cancellation(work, &governor, interrupts).await
 }
 
 fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
@@ -438,8 +452,11 @@ pub async fn run_analysis(
     ) = crate::governor::blocking_stage(|| -> Result<_> {
         let app = App::from_config(config)?;
         // Freeze cleanliness before any check runs or artifact is written (R4-19).
-        let worktree_clean = app.worktree_clean_at_start;
-        let worktree_status_digest = app.worktree_status_digest_at_start.clone();
+        // This closure runs inside the TUI run scope and blocking_stage, so the
+        // event loop can cancel even while libgit2 scans a large worktree.
+        let worktree = crate::artifacts::capture_worktree_provenance(&app.config.repo_root);
+        let worktree_clean = worktree.clean;
+        let worktree_status_digest = worktree.status_digest;
         app.repo.prepare_refs(&app.config)?;
         let target = app.repo.resolve_target(&app.config)?;
         let bases = app.repo.resolve_bases(&app.config)?;
@@ -549,7 +566,6 @@ pub async fn run_analysis(
             governor: &governor,
         })
     })?;
-    ensure_analysis_active(&governor)?;
     let _ = tx.send(TuiEvent::ArtifactsReady {
         dir: artifacts_dir.clone(),
     });
@@ -566,7 +582,6 @@ pub async fn run_analysis(
         unchanged: false,
     };
 
-    ensure_analysis_active(&governor)?;
     let _ = tx.send(TuiEvent::AnalysisComplete { report });
 
     Ok(())
@@ -587,6 +602,107 @@ mod tests {
 
     fn default_config() -> Config {
         test_config()
+    }
+
+    #[cfg(unix)]
+    struct InterruptWhenFileExists {
+        path: std::path::PathBuf,
+        delivered: bool,
+    }
+
+    #[cfg(unix)]
+    impl InterruptWhenFileExists {
+        fn new(path: std::path::PathBuf) -> Self {
+            Self {
+                path,
+                delivered: false,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl crate::governor::Interrupts for InterruptWhenFileExists {
+        async fn next(&mut self) {
+            if self.delivered {
+                std::future::pending::<()>().await;
+            }
+            while !self.path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            self.delivered = true;
+        }
+    }
+
+    /// Before raw mode owns Ctrl-C as a key, TUI preflight has to own it as a
+    /// signal. This drives the real initialize_state -> prepare_refs -> git
+    /// fetch path with a blocking git executable and proves it is registered,
+    /// cancelled, reaped, and returned as typed cancellation.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tui_preflight_ctrl_c_cancels_a_real_git_fetch_before_raw_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(repo.path().join("README.md"), "fixture\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["remote", "add", "origin", "."]);
+
+        let pidfile = repo.path().join("tui-preflight-git.pid");
+        let shim = repo.path().join("blocking-git");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nsleep 30\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&shim, permissions).unwrap();
+
+        let mut config = default_config();
+        config.repo_root = repo.path().to_path_buf();
+        config.do_fetch = true;
+        let mut state = TuiState::new(config);
+        let _override = crate::git::override_test_git_program(shim);
+        let started = std::time::Instant::now();
+        let error =
+            initialize_state_supervised(&mut state, InterruptWhenFileExists::new(pidfile.clone()))
+                .await
+                .expect_err("Ctrl-C must cancel TUI preflight fetch");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal 0 probes the child PID without sending a signal.
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "TUI preflight git child {pid} survived cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[cfg(unix)]

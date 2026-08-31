@@ -67,11 +67,17 @@ fn terminate_windows_process_tree_with(
 /// The child must have been spawned with `process_group(0)` so `pid` is also
 /// the pgid; signalling `-pid` then reaches the wrapper AND its grandchildren.
 #[cfg(unix)]
-pub fn sigkill_process_group(pid: u32) {
-    // SAFETY: plain kill(2) syscall; ESRCH (already gone) / EPERM are ignored.
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
+pub fn sigkill_process_group(pid: u32) -> bool {
+    // SAFETY: plain kill(2) syscall against the process group created by
+    // `harden[_std]`. ESRCH means the group is already gone; every other errno
+    // (especially EPERM) means tree termination was not confirmed.
+    let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    unix_group_kill_succeeded(result, std::io::Error::last_os_error().raw_os_error())
+}
+
+#[cfg(unix)]
+fn unix_group_kill_succeeded(result: i32, errno: Option<i32>) -> bool {
+    result == 0 || (result == -1 && errno == Some(libc::ESRCH))
 }
 
 /// Terminate the full process tree led by `pid` on every supported platform.
@@ -79,22 +85,47 @@ pub fn sigkill_process_group(pid: u32) {
 /// Unix children lead their own process group, so one negative-pgid SIGKILL is
 /// sufficient. Windows has no inherited Unix-style process group contract;
 /// the built-in `taskkill /T /F` primitive walks and force-terminates the tree.
-pub fn terminate_process_tree(pid: u32) {
+pub fn terminate_process_tree(pid: u32) -> bool {
     #[cfg(unix)]
-    sigkill_process_group(pid);
+    {
+        sigkill_process_group(pid)
+    }
 
     #[cfg(windows)]
     {
         let taskkill = system_taskkill_path();
-        if let Err(err) =
-            terminate_windows_process_tree_with(&taskkill, pid, taskkill_process_tree_at)
-        {
-            eprintln!("prview: {err}");
+        match terminate_windows_process_tree_with(&taskkill, pid, taskkill_process_tree_at) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("prview: {err}");
+                false
+            }
         }
     }
 
     #[cfg(not(any(unix, windows)))]
-    compile_error!("prview process-tree cancellation is unsupported on this platform");
+    {
+        compile_error!("prview process-tree cancellation is unsupported on this platform");
+        false
+    }
+}
+
+/// Terminate a hardened Tokio child tree and reap its direct root within a
+/// finite budget. Group/tree termination and direct-root reaping are separate
+/// obligations: killing the group can leave the direct child as a zombie in a
+/// long-lived MCP process unless `wait()` is still driven afterwards.
+pub async fn terminate_and_reap_tokio_child(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    reap_timeout: Duration,
+) -> bool {
+    let tree_terminated = pid.is_some_and(terminate_process_tree);
+    let direct_kill_started = child.start_kill().is_ok();
+    let root_reaped = matches!(
+        tokio::time::timeout(reap_timeout, child.wait()).await,
+        Ok(Ok(_))
+    );
+    (tree_terminated || direct_kill_started) && root_reaped
 }
 
 /// Apply the standard rails to `cmd`: detached stdin, `kill_on_drop`, and (unix)
@@ -137,14 +168,245 @@ pub(crate) fn spawn_owned_std_child(
 
 /// Terminate every process owned by a synchronous child wrapper, including the
 /// descendants of a Windows root process that has already exited.
-pub fn terminate_owned_std_child(child: &mut dyn process_wrap::std::ChildWrapper) {
+pub fn terminate_owned_std_child(child: &mut dyn process_wrap::std::ChildWrapper) -> bool {
     #[cfg(unix)]
-    terminate_process_tree(child.id());
+    {
+        terminate_process_tree(child.id())
+    }
 
     #[cfg(windows)]
-    if let Err(err) = child.start_kill() {
-        eprintln!("prview: failed to terminate Windows Job Object: {err}");
+    {
+        match child.start_kill() {
+            Ok(()) => true,
+            Err(job_error) => {
+                let taskkill = system_taskkill_path();
+                match terminate_windows_process_tree_with(
+                    &taskkill,
+                    child.id(),
+                    taskkill_process_tree_at,
+                ) {
+                    Ok(()) => true,
+                    Err(fallback_error) => {
+                        eprintln!(
+                            "prview: failed to terminate Windows Job Object ({job_error}); fallback also failed: {fallback_error}"
+                        );
+                        false
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Terminate and reap a synchronous owned child without waiting forever after
+/// both Windows termination mechanisms failed. Returning after that rare dual
+/// failure may leave an OS-owned process to finish naturally, but it preserves
+/// the operator's cancellation contract instead of hanging inside `wait()`.
+pub fn terminate_and_reap_owned_std_child(child: &mut dyn process_wrap::std::ChildWrapper) -> bool {
+    if terminate_owned_std_child(child) {
+        child.wait().is_ok()
+    } else {
+        // Cancellation may have won through the governor milliseconds before
+        // this owner reached its own cleanup path. A second group kill can then
+        // report no live group while the direct root is already a waitable
+        // zombie. Never block after an unconfirmed kill, but do reap that
+        // already-exited root when `try_wait` can prove it is safe.
+        let _ = child.try_wait();
+        false
+    }
+}
+
+/// Run a synchronous command with captured output under the run governor.
+///
+/// Unlike `Command::output`, this registers the process tree before waiting and
+/// observes run cancellation while the direct root is alive. Reader threads
+/// drain both pipes concurrently so stderr cannot deadlock a command whose
+/// stdout is also full.
+pub fn output_governed(
+    cmd: std::process::Command,
+    label: &str,
+) -> anyhow::Result<std::process::Output> {
+    output_governed_inner(cmd, label, None, None)
+}
+
+/// Governed captured output with an absolute lifecycle deadline.
+pub fn output_governed_with_timeout(
+    cmd: std::process::Command,
+    label: &str,
+    timeout: Duration,
+) -> anyhow::Result<std::process::Output> {
+    output_governed_inner(cmd, label, None, Some(timeout))
+}
+
+/// Captured governed output with a finite byte payload written to child stdin.
+///
+/// The writer runs beside both pipe readers, so a command that produces output
+/// before consuming its input cannot deadlock the parent. Cancellation closes
+/// the owned process tree and all three pipes before any thread is joined.
+pub fn output_governed_with_input(
+    cmd: std::process::Command,
+    label: &str,
+    input: &[u8],
+) -> anyhow::Result<std::process::Output> {
+    output_governed_inner(cmd, label, Some(input.to_vec()), None)
+}
+
+/// Governed captured output with stdin and one deadline for input, execution,
+/// process-tree cleanup and output drain.
+pub fn output_governed_with_input_timeout(
+    cmd: std::process::Command,
+    label: &str,
+    input: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<std::process::Output> {
+    output_governed_inner(cmd, label, Some(input.to_vec()), Some(timeout))
+}
+
+fn output_governed_inner(
+    mut cmd: std::process::Command,
+    label: &str,
+    input: Option<Vec<u8>>,
+    timeout: Option<Duration>,
+) -> anyhow::Result<std::process::Output> {
+    use std::io::{Read, Write};
+
+    harden_std(&mut cmd);
+    if input.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    }
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let governor = crate::governor::current_run_governor();
+    if governor
+        .as_ref()
+        .is_some_and(|governor| governor.is_cancelled())
+    {
+        return Err(crate::governor::Cancelled.into());
+    }
+
+    let mut child =
+        spawn_owned_std_child(cmd).map_err(|e| anyhow::anyhow!("failed to spawn {label}: {e}"))?;
+    let mut registration = crate::governor::register_run_child(child.id(), label);
+    if governor.is_some() && registration.is_none() {
+        terminate_and_reap_owned_std_child(child.as_mut());
+        return Err(crate::governor::Cancelled.into());
+    }
+    let pipes = (child.stdout().take(), child.stderr().take());
+    let (Some(stdout), Some(stderr)) = pipes else {
+        terminate_and_reap_owned_std_child(child.as_mut());
+        drop(registration.take());
+        return Err(anyhow::anyhow!(
+            "failed to capture both stdout and stderr for {label}"
+        ));
+    };
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut pipe = stdout;
+        pipe.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut pipe = stderr;
+        pipe.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let mut stdin_writer = match input {
+        Some(input) => {
+            let Some(mut stdin) = child.stdin().take() else {
+                terminate_and_reap_owned_std_child(child.as_mut());
+                drop(registration.take());
+                return Err(anyhow::anyhow!("failed to pipe stdin for {label}"));
+            };
+            Some(std::thread::spawn(move || stdin.write_all(&input)))
+        }
+        None => None,
+    };
+
+    let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
+    enum StopReason {
+        Completed(std::process::ExitStatus),
+        Cancelled,
+        TimedOut,
+    }
+    let reason = loop {
+        if governor
+            .as_ref()
+            .is_some_and(|governor| governor.is_cancelled())
+        {
+            if terminate_and_reap_owned_std_child(child.as_mut()) {
+                drop(registration.take());
+                // Successful tree termination closes the inherited pipes, so
+                // the reader threads below can be joined deterministically.
+                break StopReason::Cancelled;
+            }
+            // Both Windows termination mechanisms failed. Do not turn that
+            // exceptional cleanup failure into an unbounded join/wait; dropping
+            // JoinHandle detaches the readers and preserves prompt exit 130.
+            drop(stdout_reader);
+            drop(stderr_reader);
+            drop(stdin_writer.take());
+            drop(registration.take());
+            return Err(crate::governor::Cancelled.into());
+        }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            if terminate_and_reap_owned_std_child(child.as_mut()) {
+                drop(registration.take());
+                break StopReason::TimedOut;
+            }
+            drop(stdout_reader);
+            drop(stderr_reader);
+            drop(stdin_writer.take());
+            drop(registration.take());
+            return Err(anyhow::anyhow!(
+                "{label} timed out and its process tree could not be terminated"
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The direct wrapper can exit before a descendant. Tear down
+                // the still-owned group/job before joining pipe readers.
+                if !terminate_owned_std_child(child.as_mut()) {
+                    drop(stdout_reader);
+                    drop(stderr_reader);
+                    drop(stdin_writer.take());
+                    drop(registration.take());
+                    return Err(anyhow::anyhow!(
+                        "failed to terminate descendants of completed {label}"
+                    ));
+                }
+                let _ = child.wait();
+                drop(registration.take());
+                break StopReason::Completed(status);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                terminate_and_reap_owned_std_child(child.as_mut());
+                drop(registration.take());
+                return Err(anyhow::anyhow!("failed to wait for {label}: {error}"));
+            }
+        }
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("{label} stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("{label} stderr reader panicked"))??;
+    if let Some(stdin_writer) = stdin_writer {
+        stdin_writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("{label} stdin writer panicked"))??;
+    }
+    let status = match reason {
+        StopReason::Completed(status) => status,
+        StopReason::Cancelled => return Err(crate::governor::Cancelled.into()),
+        StopReason::TimedOut => return Err(anyhow::anyhow!("{label} timed out")),
+    };
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Spawn a synchronous child, register it with the current run governor if any,
@@ -155,15 +417,168 @@ pub fn spawn_wait_governed(
     label: &str,
 ) -> anyhow::Result<std::process::ExitStatus> {
     harden_std(&mut cmd);
-    if crate::governor::current_run_governor().is_some_and(|governor| governor.is_cancelled()) {
+    let governor = crate::governor::current_run_governor();
+    if governor
+        .as_ref()
+        .is_some_and(|governor| governor.is_cancelled())
+    {
         return Err(crate::governor::Cancelled.into());
     }
     let mut child =
         spawn_owned_std_child(cmd).map_err(|e| anyhow::anyhow!("failed to spawn {label}: {e}"))?;
-    let _registration = crate::governor::register_run_child(child.id(), label);
-    child
-        .wait()
-        .map_err(|e| anyhow::anyhow!("failed to wait for {label}: {e}"))
+    let registration = crate::governor::register_run_child(child.id(), label);
+    if governor.is_some() && registration.is_none() {
+        // Cancellation won the spawn/register race. `register_child` attempted
+        // PID-tree cleanup; the owned wrapper is the authoritative Windows
+        // fallback when that direct root already exited.
+        terminate_and_reap_owned_std_child(child.as_mut());
+        return Err(crate::governor::Cancelled.into());
+    }
+    let status = loop {
+        if governor
+            .as_ref()
+            .is_some_and(|governor| governor.is_cancelled())
+        {
+            terminate_and_reap_owned_std_child(child.as_mut());
+            return Err(crate::governor::Cancelled.into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                terminate_and_reap_owned_std_child(child.as_mut());
+                return Err(anyhow::anyhow!("failed to wait for {label}: {error}"));
+            }
+        }
+    };
+    // `JobObjectChild::wait` waits for the whole Windows job. Polling the root
+    // above lets us detect root-exits-first, then terminate the still-owned job
+    // before that wait; Unix applies the equivalent process-group cleanup.
+    if !terminate_and_reap_owned_std_child(child.as_mut()) {
+        return Err(anyhow::anyhow!(
+            "failed to terminate descendants of completed {label}"
+        ));
+    }
+    Ok(status)
+}
+
+/// Run a synchronous producer → consumer pipeline under the same owned-process
+/// contract as individual governed commands. Both direct roots are polled so a
+/// Windows Job Object can be terminated when a wrapper exits before one of its
+/// descendants; waiting on the job itself at that point would hang forever.
+pub fn run_pipeline_governed(
+    mut producer_cmd: std::process::Command,
+    mut consumer_cmd: std::process::Command,
+    producer_label: &str,
+    consumer_label: &str,
+) -> anyhow::Result<(std::process::ExitStatus, std::process::ExitStatus)> {
+    harden_std(&mut producer_cmd);
+    harden_std(&mut consumer_cmd);
+    let governor = crate::governor::current_run_governor();
+    if governor
+        .as_ref()
+        .is_some_and(|governor| governor.is_cancelled())
+    {
+        return Err(crate::governor::Cancelled.into());
+    }
+
+    producer_cmd.stdout(std::process::Stdio::piped());
+    let mut producer = spawn_owned_std_child(producer_cmd)
+        .map_err(|error| anyhow::anyhow!("failed to spawn {producer_label}: {error}"))?;
+    let mut producer_registration =
+        crate::governor::register_run_child(producer.id(), producer_label);
+    if governor.is_some() && producer_registration.is_none() {
+        terminate_and_reap_owned_std_child(producer.as_mut());
+        return Err(crate::governor::Cancelled.into());
+    }
+    let producer_stdout = match producer.stdout().take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_and_reap_owned_std_child(producer.as_mut());
+            return Err(anyhow::anyhow!("failed to capture {producer_label} stdout"));
+        }
+    };
+
+    consumer_cmd.stdin(producer_stdout);
+    let mut consumer = match spawn_owned_std_child(consumer_cmd) {
+        Ok(consumer) => consumer,
+        Err(error) => {
+            terminate_and_reap_owned_std_child(producer.as_mut());
+            return Err(anyhow::anyhow!("failed to spawn {consumer_label}: {error}"));
+        }
+    };
+    let mut consumer_registration =
+        crate::governor::register_run_child(consumer.id(), consumer_label);
+    if governor.is_some() && consumer_registration.is_none() {
+        terminate_and_reap_owned_std_child(producer.as_mut());
+        terminate_and_reap_owned_std_child(consumer.as_mut());
+        return Err(crate::governor::Cancelled.into());
+    }
+    let mut producer_status = None;
+    let mut consumer_status = None;
+
+    while producer_status.is_none() || consumer_status.is_none() {
+        if governor
+            .as_ref()
+            .is_some_and(|governor| governor.is_cancelled())
+        {
+            terminate_and_reap_owned_std_child(producer.as_mut());
+            terminate_and_reap_owned_std_child(consumer.as_mut());
+            return Err(crate::governor::Cancelled.into());
+        }
+
+        if producer_status.is_none() {
+            match producer.try_wait() {
+                Ok(Some(status)) => {
+                    if !terminate_and_reap_owned_std_child(producer.as_mut()) {
+                        terminate_and_reap_owned_std_child(consumer.as_mut());
+                        return Err(anyhow::anyhow!(
+                            "failed to terminate descendants of completed {producer_label}"
+                        ));
+                    }
+                    drop(producer_registration.take());
+                    producer_status = Some(status);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    terminate_and_reap_owned_std_child(producer.as_mut());
+                    terminate_and_reap_owned_std_child(consumer.as_mut());
+                    return Err(anyhow::anyhow!(
+                        "failed to wait for {producer_label}: {error}"
+                    ));
+                }
+            }
+        }
+
+        if consumer_status.is_none() {
+            match consumer.try_wait() {
+                Ok(Some(status)) => {
+                    if !terminate_and_reap_owned_std_child(consumer.as_mut()) {
+                        terminate_and_reap_owned_std_child(producer.as_mut());
+                        return Err(anyhow::anyhow!(
+                            "failed to terminate descendants of completed {consumer_label}"
+                        ));
+                    }
+                    drop(consumer_registration.take());
+                    consumer_status = Some(status);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    terminate_and_reap_owned_std_child(producer.as_mut());
+                    terminate_and_reap_owned_std_child(consumer.as_mut());
+                    return Err(anyhow::anyhow!(
+                        "failed to wait for {consumer_label}: {error}"
+                    ));
+                }
+            }
+        }
+
+        if producer_status.is_none() || consumer_status.is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    Ok((producer_status.unwrap(), consumer_status.unwrap()))
 }
 
 fn spawn_owned_tokio_child(
@@ -192,17 +607,54 @@ async fn wait_for_direct_child_exit(
 async fn terminate_owned_tokio_child(
     child: &mut dyn process_wrap::tokio::ChildWrapper,
     pid: Option<u32>,
-) {
+) -> bool {
     #[cfg(unix)]
-    if let Some(pid) = pid {
-        sigkill_process_group(pid);
-    }
+    let group_terminated = pid.is_some_and(sigkill_process_group);
 
     // On Windows JobObjectChild::start_kill terminates the job even when the
-    // direct root has already exited. On Unix the process-group signal above
-    // owns descendants; start_kill is still useful as direct-child fallback.
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+    // direct root has already exited. If that owned primitive fails while the
+    // root is still live, taskkill remains a best-effort fallback. On Unix the
+    // process-group signal above owns descendants; start_kill is still useful
+    // as direct-child fallback.
+    #[cfg(windows)]
+    let terminated = match child.start_kill() {
+        Ok(()) => true,
+        Err(job_error) => match pid {
+            Some(pid) => {
+                let taskkill = system_taskkill_path();
+                match terminate_windows_process_tree_with(&taskkill, pid, taskkill_process_tree_at)
+                {
+                    Ok(()) => true,
+                    Err(fallback_error) => {
+                        eprintln!(
+                            "prview: failed to terminate Windows Job Object ({job_error}); fallback also failed: {fallback_error}"
+                        );
+                        false
+                    }
+                }
+            }
+            None => {
+                eprintln!("prview: failed to terminate Windows Job Object: {job_error}");
+                false
+            }
+        },
+    };
+    #[cfg(windows)]
+    if terminated {
+        let _ = child.wait().await;
+    }
+    #[cfg(windows)]
+    return terminated;
+    #[cfg(not(windows))]
+    {
+        let direct_terminated = child.start_kill().is_ok();
+        let _ = child.wait().await;
+        if pid.is_some() {
+            group_terminated
+        } else {
+            direct_terminated
+        }
+    }
 }
 
 /// Spawn `cmd` under the standard rails with piped output, drain stdout+stderr
@@ -284,7 +736,16 @@ async fn run_capture_with_timeout_after_spawn(
     // owned job can be terminated rather than consuming the command timeout.
     match tokio::time::timeout_at(deadline, wait_for_direct_child_exit(child.as_mut())).await {
         Ok(Ok(status)) => {
-            terminate_owned_tokio_child(child.as_mut(), pid).await;
+            if !terminate_owned_tokio_child(child.as_mut(), pid).await {
+                drop(registration);
+                stdout_task.abort();
+                stderr_task.abort();
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(anyhow::anyhow!(
+                    "failed to terminate descendants of completed {label}"
+                ));
+            }
             // The direct child is reaped. Keeping its pid registered while
             // draining buffered output risks signalling a later pid reuse.
             drop(registration);
@@ -311,22 +772,34 @@ async fn run_capture_with_timeout_after_spawn(
             }
         }
         Ok(Err(e)) => {
-            terminate_owned_tokio_child(child.as_mut(), pid).await;
+            let tree_reaped = terminate_owned_tokio_child(child.as_mut(), pid).await;
             drop(registration);
             stdout_task.abort();
             stderr_task.abort();
             let _ = stdout_task.await;
             let _ = stderr_task.await;
+            if !tree_reaped {
+                return Err(anyhow::anyhow!(
+                    "failed to run {label}: {e}; owned process tree could not be terminated"
+                ));
+            }
             Err(anyhow::anyhow!("failed to run {label}: {e}"))
         }
         Err(_) => {
-            terminate_owned_tokio_child(child.as_mut(), pid).await;
+            let tree_reaped = terminate_owned_tokio_child(child.as_mut(), pid).await;
             drop(registration);
             stdout_task.abort();
             stderr_task.abort();
             let _ = stdout_task.await;
             let _ = stderr_task.await;
-            Err(on_timeout())
+            let timeout_error = on_timeout();
+            if tree_reaped {
+                Err(timeout_error)
+            } else {
+                Err(timeout_error.context(format!(
+                    "{label} timed out and its owned process tree could not be terminated"
+                )))
+            }
         }
     }
 }
@@ -508,6 +981,124 @@ pub(crate) fn read_published_unix_pid(path: &std::path::Path) -> Option<i32> {
 mod tests {
     use super::*;
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn governed_sync_output_writes_stdin_without_deadlock() {
+        #[cfg(unix)]
+        let command = std::process::Command::new("cat");
+        #[cfg(windows)]
+        let command = {
+            let mut command = std::process::Command::new("findstr.exe");
+            command.arg("^");
+            command
+        };
+        let output = output_governed_with_input_timeout(
+            command,
+            "sync stdin echo",
+            b"payload\n",
+            Duration::from_secs(2),
+        )
+        .expect("the platform stdin echo should consume governed stdin");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            "payload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_tokio_tree_termination_reaps_each_direct_root() {
+        for iteration in 0..2 {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let pidfile = tmp.path().join(format!("mcp-timeout-{iteration}.pids"));
+            let mut command = TokioCommand::new("sh");
+            command.args([
+                "-c",
+                &format!(
+                    "sleep 30 & printf '%s %s\\n' \"$$\" \"$!\" > '{}'; wait",
+                    pidfile.display()
+                ),
+            ]);
+            harden(&mut command);
+            let mut child = command.spawn().expect("spawn hardened timeout tree");
+            let root_pid = child.id();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !pidfile.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timeout fixture never published its process tree"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            assert!(
+                terminate_and_reap_tokio_child(&mut child, root_pid, Duration::from_secs(2)).await,
+                "timeout cleanup must terminate the tree and reap its root"
+            );
+            let recorded = std::fs::read_to_string(&pidfile).unwrap();
+            for pid in recorded
+                .split_whitespace()
+                .map(|pid| pid.parse::<i32>().unwrap())
+            {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    // SAFETY: signal 0 only probes a PID created by this fixture.
+                    if unsafe { libc::kill(pid, 0) } == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "MCP-style timeout process {pid} survived cleanup"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn governed_sync_output_deadline_reaps_process_group() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("governed-sync-grandchild.pid");
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!("sleep 30 & echo $! > {} ; wait", pidfile.display()),
+        ]);
+        let error =
+            output_governed_with_timeout(command, "sync timeout tree", Duration::from_millis(500))
+                .expect_err("long-lived tree must hit the sync deadline");
+        assert!(error.to_string().contains("timed out"));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let grandchild = loop {
+            if let Some(pid) = read_published_unix_pid(&pidfile) {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never published its grandchild pid"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        loop {
+            // SAFETY: signal 0 only probes the test-owned pid recorded above.
+            let exists = unsafe { libc::kill(grandchild, 0) } == 0;
+            if !exists && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild {grandchild} survived the governed sync timeout"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[tokio::test]
     async fn run_capture_with_timeout_returns_output_on_success() {
         let mut cmd = TokioCommand::new("echo");
@@ -554,27 +1145,39 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_capture_with_timeout_kills_process_group() {
-        use std::io::Read;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicI32, Ordering};
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let pidfile = tmp.path().join("grandchild.pid");
         let script = format!("sleep 30 & echo $! > {} ; wait", pidfile.display());
+        let published_pid = Arc::new(AtomicI32::new(0));
+        let captured_pid = Arc::clone(&published_pid);
+        let captured_pidfile = pidfile.clone();
 
         let mut cmd = TokioCommand::new("sh");
         cmd.arg("-c").arg(&script);
-        let err = run_capture_with_timeout(cmd, Duration::from_secs(1), "sh-tree", || {
-            anyhow::anyhow!("sh-tree timed out")
-        })
+        let err = run_capture_with_timeout_after_spawn(
+            cmd,
+            Duration::from_secs(3),
+            "sh-tree",
+            || anyhow::anyhow!("sh-tree timed out"),
+            move |_| {
+                for _ in 0..200 {
+                    if let Some(pid) = read_published_unix_pid(&captured_pidfile) {
+                        captured_pid.store(pid, Ordering::Release);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            },
+        )
         .await
-        .expect_err("sh tree with a 1s budget must time out");
+        .expect_err("sh tree with a 3s budget must time out");
         assert!(err.to_string().contains("sh-tree timed out"));
 
-        let mut s = String::new();
-        std::fs::File::open(&pidfile)
-            .expect("sh should have recorded the grandchild pid")
-            .read_to_string(&mut s)
-            .expect("read pidfile");
-        let grandchild: i32 = s.trim().parse().expect("grandchild pid");
+        let grandchild = published_pid.load(Ordering::Acquire);
+        assert_ne!(grandchild, 0, "sh should publish a complete grandchild pid");
 
         assert_grandchild_reaped(grandchild).await;
     }
@@ -718,6 +1321,148 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn sync_successful_root_exit_reaps_process_group_descendants() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("sync-background.pid");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &format!("sleep 30 & echo $! > {}", pidfile.display())]);
+
+        let started = std::time::Instant::now();
+        let status = spawn_wait_governed(cmd, "sync-background-tree")
+            .expect("successful root exit must not wait for its descendant");
+        assert!(status.success());
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let descendant: i32 = std::fs::read_to_string(&pidfile)
+            .expect("root records descendant pid")
+            .trim()
+            .parse()
+            .expect("numeric descendant pid");
+        assert_grandchild_reaped(descendant).await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sync_root_exit_reaps_job_descendants() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let child_pidfile = tmp.path().join("sync-background-child.pid");
+        let child_script = tmp.path().join("sync-background-child.ps1");
+        let parent_script = tmp.path().join("sync-successful-parent.ps1");
+        std::fs::write(&child_script, "Start-Sleep -Seconds 60\n")
+            .expect("write Windows child script");
+        std::fs::write(
+            &parent_script,
+            format!(
+                "$c = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','{}'\nSet-Content -LiteralPath '{}' -Value $c.Id\nexit 0\n",
+                child_script.display(),
+                child_pidfile.display(),
+            ),
+        )
+        .expect("write Windows parent script");
+
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&parent_script);
+        let status = spawn_wait_governed(cmd, "sync-successful-windows-parent")
+            .expect("sync root exit must terminate its job descendants");
+        assert!(status.success());
+
+        let child_pid: u32 = std::fs::read_to_string(&child_pidfile)
+            .expect("parent records child pid")
+            .trim()
+            .parse()
+            .expect("numeric Windows child pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while super::windows_pid_exists(child_pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Windows Job Object descendant {child_pid} survived sync root exit",
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn governed_pipeline_reaps_a_root_exits_first_producer_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("pipeline-background.pid");
+        let mut producer = std::process::Command::new("sh");
+        producer.args([
+            "-c",
+            &format!("sleep 30 & echo $! > {}; printf payload", pidfile.display()),
+        ]);
+        let mut consumer = std::process::Command::new("cat");
+        consumer.stdout(std::process::Stdio::null());
+
+        let (producer_status, consumer_status) =
+            run_pipeline_governed(producer, consumer, "producer", "consumer")
+                .expect("pipeline roots finish without descendant hang");
+        assert!(producer_status.success());
+        assert!(consumer_status.success());
+        let descendant: i32 = std::fs::read_to_string(&pidfile)
+            .expect("producer records descendant pid")
+            .trim()
+            .parse()
+            .expect("numeric descendant pid");
+        assert_grandchild_reaped(descendant).await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_governed_pipeline_reaps_root_exits_first_descendants() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let child_pidfile = tmp.path().join("pipeline-background-child.pid");
+        let child_script = tmp.path().join("pipeline-background-child.ps1");
+        let producer_script = tmp.path().join("pipeline-producer.ps1");
+        std::fs::write(&child_script, "Start-Sleep -Seconds 60\n")
+            .expect("write Windows child script");
+        std::fs::write(
+            &producer_script,
+            format!(
+                "$c = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','{}'\nSet-Content -LiteralPath '{}' -Value $c.Id\nWrite-Output payload\nexit 0\n",
+                child_script.display(),
+                child_pidfile.display(),
+            ),
+        )
+        .expect("write Windows producer script");
+
+        let mut producer = std::process::Command::new("powershell.exe");
+        producer
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&producer_script);
+        let mut consumer = std::process::Command::new("powershell.exe");
+        consumer
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$input | Out-Null",
+            ])
+            .stdout(std::process::Stdio::null());
+
+        let (producer_status, consumer_status) =
+            run_pipeline_governed(producer, consumer, "producer", "consumer")
+                .expect("Windows pipeline roots finish without descendant hang");
+        assert!(producer_status.success());
+        assert!(consumer_status.success());
+        let child_pid: u32 = std::fs::read_to_string(&child_pidfile)
+            .expect("producer records child pid")
+            .trim()
+            .parse()
+            .expect("numeric Windows child pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while super::windows_pid_exists(child_pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Windows pipeline descendant {child_pid} survived producer root exit",
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn spawn_wait_governed_is_killed_when_the_run_cancels() {
         use std::sync::Arc;
         use std::time::Instant;
@@ -729,21 +1474,18 @@ mod tests {
             canceller.cancel();
         });
         let started = Instant::now();
-        let status = crate::governor::with_run_scope(Arc::clone(&governor), async {
+        let error = crate::governor::with_run_scope(Arc::clone(&governor), async {
             let mut cmd = std::process::Command::new("sleep");
             cmd.arg("30");
             spawn_wait_governed(cmd, "sleep")
         })
         .await
-        .expect("spawned sleep must be reaped, not hang");
+        .expect_err("cancelled governed child returns typed cancellation");
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "cancelled git-shaped std child must not wait out its command"
         );
-        assert!(
-            !status.success(),
-            "a cancelled sleep must not exit 0, got {status:?}"
-        );
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
         assert_eq!(governor.inflight_count(), 0);
     }
 
@@ -780,7 +1522,7 @@ mod tests {
         }
         let grandchild = grandchild.expect("sh should record the grandchild pid");
 
-        sigkill_process_group(leader);
+        assert!(sigkill_process_group(leader));
         let _ = child.wait();
 
         let mut gone = false;
@@ -789,7 +1531,7 @@ mod tests {
             // `grandchild` came from the process tree created by this test.
             if unsafe { libc::kill(grandchild, 0) } == -1 {
                 let errno = std::io::Error::last_os_error().raw_os_error();
-                if errno == Some(libc::ESRCH) || errno == Some(libc::EPERM) {
+                if errno == Some(libc::ESRCH) {
                     gone = true;
                     break;
                 }
@@ -799,9 +1541,17 @@ mod tests {
         assert!(gone, "grandchild {grandchild} survived the group kill");
     }
 
-    /// Poll until `grandchild` is no longer a signalable live process of ours.
-    /// Tolerate ESRCH (gone) or EPERM (pid reused / sandbox signal limits) —
-    /// both mean it is reaped (CLAUDE.md #14 signal flake class).
+    #[cfg(unix)]
+    #[test]
+    fn unix_group_kill_only_confirms_success_or_absence() {
+        assert!(unix_group_kill_succeeded(0, None));
+        assert!(unix_group_kill_succeeded(-1, Some(libc::ESRCH)));
+        assert!(!unix_group_kill_succeeded(-1, Some(libc::EPERM)));
+        assert!(!unix_group_kill_succeeded(-1, Some(libc::EINVAL)));
+    }
+
+    /// Poll until `grandchild` no longer exists. EPERM is not absence: treating
+    /// a permission failure as reaped would let a live orphan satisfy the test.
     #[cfg(unix)]
     async fn assert_grandchild_reaped(grandchild: i32) {
         let mut gone = false;
@@ -810,7 +1560,7 @@ mod tests {
             // `grandchild` came from the process tree created by this test.
             if unsafe { libc::kill(grandchild, 0) } == -1 {
                 let errno = std::io::Error::last_os_error().raw_os_error();
-                if errno == Some(libc::ESRCH) || errno == Some(libc::EPERM) {
+                if errno == Some(libc::ESRCH) {
                     gone = true;
                     break;
                 }

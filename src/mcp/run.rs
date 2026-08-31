@@ -294,6 +294,21 @@ fn stdio_files(run_dir: &Path) -> Result<(File, File), ToolError> {
     Ok((out, err))
 }
 
+fn reserve_output_dir(run_dir: &Path, run_id: &str) -> Result<String, ToolError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let nonce = format!("{run_id}:{}:{now}", std::process::id());
+    crate::artifacts::reserve_mcp_output_dir(run_dir, &nonce).map_err(|error| {
+        ToolError::new(
+            error_class::RUN_FAILED,
+            format!("failed to reserve MCP pack path: {error:#}"),
+        )
+    })?;
+    Ok(nonce)
+}
+
 fn stderr_tail(run_dir: &Path) -> String {
     let text = std::fs::read_to_string(run_dir.join("run.stderr.log")).unwrap_or_default();
     let tail: Vec<&str> = text.lines().rev().take(20).collect();
@@ -312,8 +327,8 @@ pub async fn start(
 
     // mcp-3/TOCTOU: the R2b "one active run" rule was a check-then-act — two
     // concurrent starts could both see no active run and both proceed. Serialize
-    // activation for this repo branch behind an O_EXCL lock file (reusing the
-    // storage lock's atomic create-new + stale/PID-recycling handling). Held for
+    // activation for this repo branch behind the storage layer's OS file lock.
+    // The handle is released by the kernel even if the owner process dies. Held for
     // the whole quick run and until a deep run's marker is on disk, so the
     // window between "check" and "marker visible to `active_run`" is closed.
     let _activation = match crate::storage::acquire_lock_at(&branch_activation_lock_path(
@@ -333,6 +348,7 @@ pub async fn start(
 
     let commit = crate::config::short_head(repo);
     let (run_dir, run_id) = allocate_run_dir(&repo_name, &branch_key, &commit)?;
+    let output_reservation = reserve_output_dir(&run_dir, &run_id)?;
     let (out_file, err_file) = stdio_files(&run_dir)?;
     let selection = select_bases(repo, base.as_deref());
 
@@ -350,6 +366,10 @@ pub async fn start(
             })?);
             cmd.current_dir(repo)
                 .args(&args)
+                .env(
+                    crate::artifacts::MCP_OUTPUT_RESERVATION_ENV,
+                    &output_reservation,
+                )
                 .stdout(std::process::Stdio::from(out_file))
                 .stderr(std::process::Stdio::from(err_file));
             // Shared rails: detached stdin, kill_on_drop, and (unix) own process
@@ -383,10 +403,17 @@ pub async fn start(
                 Err(_) => {
                     // Kill the whole group first so the check-tool grandchildren
                     // die, then reap the direct child.
-                    if let Some(pid) = child_pid {
-                        crate::proc::terminate_process_tree(pid);
+                    let reaped = crate::proc::terminate_and_reap_tokio_child(
+                        &mut child,
+                        child_pid,
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                    if !reaped {
+                        eprintln!(
+                            "prview MCP: quick timeout could not confirm process-tree termination and direct-root reap"
+                        );
                     }
-                    let _ = child.start_kill();
                     Err(ToolError::with_extra(
                         error_class::RUN_TIMEOUT,
                         "quick review exceeded the configured budget; retry with profile=deep",
@@ -431,7 +458,7 @@ pub async fn start(
             }
         }
         Profile::Deep => {
-            let pid = spawn_detached(repo, &args, out_file, err_file)?;
+            let pid = spawn_detached(repo, &args, &output_reservation, out_file, err_file)?;
             write_marker(
                 &run_dir,
                 &read::RunningMarker {
@@ -461,6 +488,7 @@ pub async fn start(
 fn spawn_detached(
     repo: &Path,
     args: &[String],
+    output_reservation: &str,
     out_file: File,
     err_file: File,
 ) -> Result<u32, ToolError> {
@@ -469,6 +497,10 @@ fn spawn_detached(
     })?);
     cmd.current_dir(repo)
         .args(args)
+        .env(
+            crate::artifacts::MCP_OUTPUT_RESERVATION_ENV,
+            output_reservation,
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(out_file))
         .stderr(std::process::Stdio::from(err_file));

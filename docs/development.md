@@ -56,7 +56,8 @@ PowerShell child+grandchild census on `windows-latest`; cross-compilation alone
 is not accepted as Windows cancellation evidence.
 
 The same workflow has an `ubuntu-latest` ordinary-machine acceptance job. It
-builds the release binary and runs `prview --deep --resource-budget safe`
+builds the release binary and runs bare `prview --deep` (with fixture/output
+arguments, but deliberately without `--resource-budget`)
 against `tools/fixtures/bounded-runtime`, a real mixed Rust, TypeScript,
 JavaScript, and CSS repo. The fixture installs TSC, ESLint, Stylelint, and
 Vitest; the workflow also installs a pinned real Semgrep scanner. The
@@ -65,7 +66,9 @@ families (Cargo, Vitest, Semgrep, TSC, ESLint, and Stylelint) to appear both in
 the owned process census and in `RUN.json`. It fails when more than one
 whole-machine tool is active, when a Cargo/rustc, Vitest, or Semgrep pool
 exceeds the selected cap, or when the final pack and its resource metadata do
-not agree. Semgrep RPC coordinators are reported separately from its actual scan
+not agree. This proves the CLI default itself resolves to the one-parent,
+one-child `safe` envelope; an explicit selector cannot hide default-wiring
+drift. Semgrep RPC coordinators are reported separately from its actual scan
 workers. The receipt also requires a clean source tree whose `HEAD` is the exact
 candidate SHA; a dirty local build cannot masquerade as exact-SHA evidence. The
 job keeps its failure-shaped receipt under the runner's temporary directory so

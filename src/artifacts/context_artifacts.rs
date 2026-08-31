@@ -597,7 +597,7 @@ pub(super) fn generate_context_artifacts(
 
     // Run all commands in parallel with a shared timeout
     let timings =
-        run_context_cmds_parallel(&cmds, CONTEXT_GEN_TIMEOUT_SECS, emit_human_stdout, governor);
+        run_context_cmds_parallel(&cmds, CONTEXT_GEN_TIMEOUT_SECS, emit_human_stdout, governor)?;
     record_context_runs(ledger, &config.repo_root, &cmds, &timings);
     Ok(timings)
 }
@@ -997,7 +997,7 @@ pub(super) fn run_context_cmds_parallel(
     timeout_secs: u64,
     emit: bool,
     governor: &ResourceGovernor,
-) -> Vec<ContextCommandTiming> {
+) -> Result<Vec<ContextCommandTiming>> {
     run_context_cmds_parallel_after_spawn(cmds, timeout_secs, emit, governor, |_| {})
 }
 
@@ -1007,7 +1007,7 @@ fn run_context_cmds_parallel_after_spawn(
     emit: bool,
     governor: &ResourceGovernor,
     mut after_spawn: impl FnMut(u32),
-) -> Vec<ContextCommandTiming> {
+) -> Result<Vec<ContextCommandTiming>> {
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -1130,8 +1130,8 @@ fn run_context_cmds_parallel_after_spawn(
                     let registry_key = format!("context:{idx}:{}", cmd.label);
                     after_spawn(child.id());
                     if !governor.register_child(registry_key.clone(), child.id()) {
-                        crate::proc::terminate_owned_std_child(child.as_mut());
-                        let _ = child.wait();
+                        let tree_reaped =
+                            crate::proc::terminate_and_reap_owned_std_child(child.as_mut());
                         let _ = fs::remove_file(&stdout_path);
                         let _ = fs::remove_file(&stderr_path);
                         timings.push(ContextCommandTiming {
@@ -1140,10 +1140,17 @@ fn run_context_cmds_parallel_after_spawn(
                             status: "cancelled",
                             started: true,
                             duration_secs: started_at.elapsed().as_secs_f32(),
-                            reason: Some(format!(
-                                "{} was refused during late registration because the review was cancelled",
-                                command_identity(cmd)
-                            )),
+                            reason: Some(if tree_reaped {
+                                format!(
+                                    "{} was refused during late registration and terminated because the review was cancelled",
+                                    command_identity(cmd)
+                                )
+                            } else {
+                                format!(
+                                    "{} was refused during late registration, but process-tree termination could not be confirmed",
+                                    command_identity(cmd)
+                                )
+                            }),
                         });
                         continue;
                     }
@@ -1194,6 +1201,31 @@ fn run_context_cmds_parallel_after_spawn(
                     )),
                 });
             }
+            // PID-based cancellation is only the first line of defence on
+            // Windows: if a short-lived root exited before taskkill walked its
+            // descendants, the owned Job Object is the authority that remains.
+            // Clean every live wrapper immediately instead of waiting for the
+            // shared stage deadline before reaching the ordinary timeout arm.
+            for r in running.iter_mut().filter(|r| !r.done) {
+                let tree_reaped = crate::proc::terminate_and_reap_owned_std_child(r.child.as_mut());
+                governor.unregister_child(&r.registry_key);
+                let _ = fs::remove_file(&r.stdout_path);
+                let _ = fs::remove_file(&r.stderr_path);
+                r.done = true;
+                timings.push(ContextCommandTiming {
+                    label: r.label.clone(),
+                    artifact: None,
+                    status: "cancelled",
+                    started: true,
+                    duration_secs: r.started_at.elapsed().as_secs_f32(),
+                    reason: Some(if tree_reaped {
+                        "terminated because the review was cancelled".to_string()
+                    } else {
+                        "review cancellation requested, but process-tree termination could not be confirmed"
+                            .to_string()
+                    }),
+                });
+            }
         } else if Instant::now() >= stage_deadline {
             for (_, cmd) in pending.drain(..) {
                 timings.push(ContextCommandTiming {
@@ -1221,6 +1253,7 @@ fn run_context_cmds_parallel_after_spawn(
         }
 
         // Poll everything that is running
+        let mut fatal_ownership_error = None;
         for r in running.iter_mut().filter(|r| !r.done) {
             match r.child.try_wait() {
                 Ok(Some(exit)) => {
@@ -1229,10 +1262,30 @@ fn run_context_cmds_parallel_after_spawn(
                     // Unix process group / Windows Job Object is empty, then
                     // unregister the PID. Otherwise the pack can finish while
                     // a former context command still writes in the background.
-                    crate::proc::terminate_owned_std_child(r.child.as_mut());
-                    let _ = r.child.wait();
+                    let tree_reaped =
+                        crate::proc::terminate_and_reap_owned_std_child(r.child.as_mut());
                     r.done = true;
                     governor.unregister_child(&r.registry_key);
+                    if !tree_reaped {
+                        let _ = fs::remove_file(&r.stdout_path);
+                        let _ = fs::remove_file(&r.stderr_path);
+                        timings.push(ContextCommandTiming {
+                            label: r.label.clone(),
+                            artifact: None,
+                            status: "error",
+                            started: true,
+                            duration_secs: r.started_at.elapsed().as_secs_f32(),
+                            reason: Some(
+                                "direct wrapper exited but its owned process tree could not be terminated"
+                                    .to_owned(),
+                            ),
+                        });
+                        fatal_ownership_error = Some(format!(
+                            "{} direct wrapper exited but its owned process tree could not be terminated",
+                            r.label
+                        ));
+                        break;
+                    }
                     // Collect output
                     collect_cmd_output(&r.stdout_path, &r.stderr_path, &r.out_dir, &r.out_file);
                     timings.push(ContextCommandTiming {
@@ -1263,18 +1316,33 @@ fn run_context_cmds_parallel_after_spawn(
                         // The child leads its own Unix group or owns a Windows
                         // Job Object, so reach the whole tree even if a wrapper
                         // has already handed work to a descendant.
-                        crate::proc::terminate_owned_std_child(r.child.as_mut());
-                        let _ = r.child.wait();
+                        let tree_reaped =
+                            crate::proc::terminate_and_reap_owned_std_child(r.child.as_mut());
                         r.done = true;
                         governor.unregister_child(&r.registry_key);
+                        let _ = fs::remove_file(&r.stdout_path);
+                        let _ = fs::remove_file(&r.stderr_path);
+                        if !tree_reaped {
+                            timings.push(ContextCommandTiming {
+                                label: r.label.clone(),
+                                artifact: None,
+                                status: "error",
+                                started: true,
+                                duration_secs: r.started_at.elapsed().as_secs_f32(),
+                                reason: Some(
+                                    "context timeout elapsed but the owned process tree could not be terminated"
+                                        .to_owned(),
+                                ),
+                            });
+                            fatal_ownership_error = Some(format!(
+                                "{} timed out but its owned process tree could not be terminated",
+                                r.label
+                            ));
+                            break;
+                        }
                         timings.push(ContextCommandTiming {
                             label: r.label.clone(),
-                            artifact: (!r.out_file.is_empty()).then(|| {
-                                Path::new("30_context")
-                                    .join(&r.out_file)
-                                    .display()
-                                    .to_string()
-                            }),
+                            artifact: None,
                             status: "timed_out",
                             started: true,
                             duration_secs: r.started_at.elapsed().as_secs_f32(),
@@ -1291,26 +1359,51 @@ fn run_context_cmds_parallel_after_spawn(
                         }
                     }
                 }
-                Err(_) => {
-                    crate::proc::terminate_owned_std_child(r.child.as_mut());
-                    let _ = r.child.wait();
+                Err(error) => {
+                    let tree_reaped =
+                        crate::proc::terminate_and_reap_owned_std_child(r.child.as_mut());
                     r.done = true;
                     governor.unregister_child(&r.registry_key);
+                    let _ = fs::remove_file(&r.stdout_path);
+                    let _ = fs::remove_file(&r.stderr_path);
+                    if !tree_reaped {
+                        timings.push(ContextCommandTiming {
+                            label: r.label.clone(),
+                            artifact: None,
+                            status: "error",
+                            started: true,
+                            duration_secs: r.started_at.elapsed().as_secs_f32(),
+                            reason: Some(format!(
+                                "failed to query child exit status ({error}) and the owned process tree could not be terminated"
+                            )),
+                        });
+                        fatal_ownership_error = Some(format!(
+                            "{} exit status failed and its owned process tree could not be terminated",
+                            r.label
+                        ));
+                        break;
+                    }
                     timings.push(ContextCommandTiming {
                         label: r.label.clone(),
-                        artifact: (!r.out_file.is_empty()).then(|| {
-                            Path::new("30_context")
-                                .join(&r.out_file)
-                                .display()
-                                .to_string()
-                        }),
+                        artifact: None,
                         status: "error",
                         started: true,
                         duration_secs: r.started_at.elapsed().as_secs_f32(),
-                        reason: Some("failed to query child exit status".to_string()),
+                        reason: Some(format!("failed to query child exit status: {error}")),
                     });
                 }
             }
+        }
+
+        if let Some(error) = fatal_ownership_error {
+            for running in running.iter_mut().filter(|running| !running.done) {
+                crate::proc::terminate_and_reap_owned_std_child(running.child.as_mut());
+                governor.unregister_child(&running.registry_key);
+                let _ = fs::remove_file(&running.stdout_path);
+                let _ = fs::remove_file(&running.stderr_path);
+                running.done = true;
+            }
+            return Err(anyhow::anyhow!(error));
         }
 
         // A finished command gives its permit and its registry slot back before
@@ -1333,7 +1426,7 @@ fn run_context_cmds_parallel_after_spawn(
     }
 
     timings.sort_by(|a, b| b.duration_secs.total_cmp(&a.duration_secs));
-    timings
+    Ok(timings)
 }
 
 /// Collect stdout+stderr from completed command temp files and write to artifact file.
@@ -2166,7 +2259,8 @@ mod tests {
 
         let ledger = TaskLedger::new();
         let governor = ResourceGovernor::new();
-        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor);
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor)
+            .expect("context commands");
         super::record_context_runs(&ledger, tmp.path(), &cmds, &timings);
 
         let entries = ledger.entries();
@@ -2236,7 +2330,8 @@ mod tests {
         // Heavy costs the whole budget, so exactly one command runs at a time.
         let governor = ResourceGovernor::with_budget(2, 2);
         let started = Instant::now();
-        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor);
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor)
+            .expect("context commands");
         let elapsed = started.elapsed();
 
         assert_eq!(timings.len(), 3, "every command still runs and reports");
@@ -2262,7 +2357,8 @@ mod tests {
             .collect();
         let governor = ResourceGovernor::with_budget(2, 1);
         let started = Instant::now();
-        let timings = super::run_context_cmds_parallel(&cmds, 1, false, &governor);
+        let timings =
+            super::run_context_cmds_parallel(&cmds, 1, false, &governor).expect("context commands");
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_millis(1800),
@@ -2327,7 +2423,10 @@ mod tests {
                 "a spawned context command must be reachable by cancel"
             );
 
-            let timings = runner.join().expect("runner must not panic");
+            let timings = runner
+                .join()
+                .expect("runner must not panic")
+                .expect("context commands");
             assert_eq!(timings.len(), 1);
         });
 
@@ -2373,7 +2472,8 @@ mod tests {
                     "child must publish its complete grandchild pid"
                 );
                 governor.cancel();
-            });
+            })
+            .expect("cancelled context commands still return timings");
 
         let grandchild = crate::proc::read_published_unix_pid(&pidfile)
             .expect("complete numeric grandchild pid");
@@ -2419,7 +2519,8 @@ mod tests {
         let governor = ResourceGovernor::new();
 
         let started = Instant::now();
-        let timings = super::run_context_cmds_parallel(&cmds, 5, false, &governor);
+        let timings =
+            super::run_context_cmds_parallel(&cmds, 5, false, &governor).expect("context commands");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(timings.len(), 1);
         assert_eq!(timings[0].status, "completed");
@@ -2485,7 +2586,8 @@ mod tests {
             out_file: String::new(),
         }];
         let governor = ResourceGovernor::new();
-        let timings = super::run_context_cmds_parallel(&cmds, 10, false, &governor);
+        let timings = super::run_context_cmds_parallel(&cmds, 10, false, &governor)
+            .expect("context commands");
         assert_eq!(timings.len(), 1);
         assert_eq!(timings[0].status, "completed");
 
@@ -2520,7 +2622,8 @@ mod tests {
         governor.cancel();
 
         let started = Instant::now();
-        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor);
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor)
+            .expect("context commands");
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "a cancelled stage must not wait out a budget that is never coming back",
@@ -2558,7 +2661,8 @@ mod tests {
 
         let ledger = TaskLedger::new();
         let governor = ResourceGovernor::new();
-        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor);
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor)
+            .expect("context commands");
         assert_eq!(timings[0].status, "spawn_failed");
         assert!(
             timings[0]
@@ -2592,7 +2696,8 @@ mod tests {
         cmd.out_dir = not_a_dir;
         let cmds = vec![cmd];
         let governor = ResourceGovernor::new();
-        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor);
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor)
+            .expect("context commands");
 
         assert_eq!(timings.len(), 1);
         assert_eq!(timings[0].status, "spawn_failed");

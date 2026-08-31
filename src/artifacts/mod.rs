@@ -10,7 +10,7 @@ pub use signal::{api_delta, api_surface, revision_source};
 
 mod context_artifacts;
 mod findings;
-mod git_artifacts;
+pub(crate) mod git_artifacts;
 mod merge_gate;
 mod sanity;
 
@@ -56,7 +56,7 @@ use crate::paths::{read_dir_within, read_to_string_within, read_within};
 use crate::policy::{GateClass, PolicySeverity};
 use crate::regression;
 use crate::regression::tests::is_test_file;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use signal::{
     BreakingFinding, BreakingKind, CoverageDelta, ReviewFileCategory, classify_review_file,
 };
@@ -73,6 +73,14 @@ const CONTEXT_GEN_TIMEOUT_SECS: u64 = 30;
 
 /// Maximum commits for per-commit diffs (avoid huge PRs)
 const MAX_COMMITS_FOR_PER_COMMIT_DIFFS: usize = 50;
+
+/// Private one-shot hand-off used by the MCP launcher. The public CLI still
+/// requires `--output-dir` to name a path that does not exist; MCP alone must
+/// reserve the eventual pack directory first so it can expose liveness and
+/// capture subprocess logs before the child starts generating artifacts.
+pub(crate) const MCP_OUTPUT_RESERVATION_ENV: &str = "PRVIEW_INTERNAL_MCP_OUTPUT_RESERVATION";
+const MCP_OUTPUT_RESERVATION_FILE: &str = ".prview-mcp-output-reservation";
+const MCP_CONTROL_FILES: [&str; 3] = ["RUNNING.json", "run.log", "run.stderr.log"];
 
 /// Maximum size for tsc-trace.log before truncation
 const MAX_TSC_TRACE_BYTES: usize = 500_000;
@@ -393,6 +401,7 @@ artifact_generation_seams! {
     RunJson => "RUN.json",
     ManifestJson => "MANIFEST.json",
     SanityChecks => "SANITY checks",
+    SharedSnapshotCleanup => "shared snapshot cleanup",
     PackPublication => "pack publication",
     RunIndexPublication => "run index publication",
     LatestAdvertisement => "latest advertisement",
@@ -490,7 +499,16 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
 
     let emit_human_stdout = !config.json && !config.quiet;
     let out_dir = config.allocate_artifacts_dir_for_commit(&resolved_target.commit_id)?;
-    fs::create_dir_all(&out_dir)?;
+    if config.output_dir.is_some() {
+        if let Some(parent) = out_dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        claim_explicit_output_dir(&out_dir)?;
+    } else {
+        // The default allocator already claimed a unique directory; this is
+        // idempotent only for that internally owned path.
+        fs::create_dir_all(&out_dir)?;
+    }
 
     // Open repository once for all generators
     let repo = Repository::open(&config.repo_root)?;
@@ -999,38 +1017,41 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         create_zip(&out_dir, emit_human_stdout)?;
         stage_timings.push(finish_timing(emit_human_stdout, "artifacts.zip", t));
     }
+
+    // The shared snapshot is required through the last context/pack read, but it
+    // must be gone before this run becomes discoverable as completed. Cleanup
+    // owns cancellable `git worktree remove/prune` children; publishing first
+    // would let Ctrl-C return 130 after `latest` and the index already exposed a
+    // verdict. Drop is only the early-return backstop.
+    if let Err(error) = ledger.cleanup_shared_snapshot() {
+        if governor.is_cancelled() {
+            ensure_generation_active(
+                governor,
+                &out_dir,
+                ArtifactGenerationSeam::SharedSnapshotCleanup,
+            )?;
+            unreachable!("a cancelled governor fails the snapshot cleanup seam");
+        }
+        return Err(error.context("failed to clean the shared review snapshot before publication"));
+    }
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::SharedSnapshotCleanup,
+    )?;
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PackPublication)?;
 
-    // Latest + run-index are advertisements of a completed pack. Check
-    // cancellation before the first of those side effects, again after
-    // `latest` is written (so a Ctrl-C in that window can restore the previous
-    // alias), and again immediately before the index append. `register_and_prune`
-    // itself is abortable: it saves the index only if still active, rolls that
-    // save back if cancel lands before prune, and deletes older evidence only
-    // after that last check.
+    // Latest + run-index are one publication transaction. Check cancellation
+    // before assembling its index row, then hold the shared publication lock
+    // across the durable latest journal, alias swap, index append, and prune.
+    // This gives concurrent successful runs one total order and gives the next
+    // publisher enough durable intent to reconcile a hard crash between the two
+    // filesystem advertisements.
     ensure_generation_active(
         governor,
         &out_dir,
         ArtifactGenerationSeam::RunIndexPublication,
     )?;
-
-    let previous_latest = peek_latest_target(&out_dir);
-    create_latest_symlink(&out_dir)?;
-    if let Err(error) = ensure_generation_active(
-        governor,
-        &out_dir,
-        ArtifactGenerationSeam::LatestAdvertisement,
-    ) {
-        restore_latest_symlink(&out_dir, previous_latest.as_deref())?;
-        return Err(error);
-    }
-
-    if let Err(error) =
-        ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)
-    {
-        restore_latest_symlink(&out_dir, previous_latest.as_deref())?;
-        return Err(error);
-    }
 
     // Register run in index and prune old runs
     {
@@ -1083,11 +1104,57 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
                 .sum(),
             has_dashboard: out_dir.join("dashboard.html").exists(),
         };
-        if let Err(e) = storage::register_and_prune(&out_dir, entry, emit_human_stdout, || {
-            governor.is_cancelled()
-        }) {
+
+        let publication = match storage::acquire_publication_lock(|| governor.is_cancelled()) {
+            Ok(publication) => publication,
+            Err(error) if crate::governor::is_cancellation(&error) => {
+                ensure_generation_active(
+                    governor,
+                    &out_dir,
+                    ArtifactGenerationSeam::RunIndexPublication,
+                )?;
+                unreachable!("a cancelled governor fails the publication seam");
+            }
+            Err(error) => return Err(error),
+        };
+        let latest_transaction = begin_latest_publication(&publication, &out_dir)?;
+        if let Err(error) = ensure_generation_active(
+            governor,
+            &out_dir,
+            ArtifactGenerationSeam::LatestAdvertisement,
+        ) {
+            rollback_latest_publication(&latest_transaction)?;
+            return Err(error);
+        }
+
+        if let Err(error) =
+            ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)
+        {
+            rollback_latest_publication(&latest_transaction)?;
+            return Err(error);
+        }
+
+        if let Err(e) = storage::register_and_prune_locked(
+            &publication,
+            &out_dir,
+            entry,
+            emit_human_stdout,
+            || governor.is_cancelled(),
+        ) {
+            if storage::is_unconfirmed_publication_rollback(&e) {
+                // The durable index may contain either side of the attempted
+                // rollback. Keep the publication journal intact so the next
+                // lock owner can reconcile `latest` from the persisted index.
+                return Err(e.context(
+                    "run publication failed with an unconfirmed index rollback; durable recovery journal retained",
+                ));
+            }
+            if let Err(rollback_error) = rollback_latest_publication(&latest_transaction) {
+                return Err(anyhow::anyhow!(
+                    "run publication failed ({e:#}) and its durable alias/index reconciliation also failed ({rollback_error:#})"
+                ));
+            }
             if governor.is_cancelled() {
-                restore_latest_symlink(&out_dir, previous_latest.as_deref())?;
                 ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)?;
                 unreachable!("a cancelled governor fails the index seam");
             }
@@ -1095,7 +1162,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
                 use colored::Colorize;
                 eprintln!("  {} Index: {}", "\u{26a0}".yellow(), e);
             }
+        } else if let Err(error) = finish_latest_publication(&latest_transaction) {
+            // Index and alias are already consistent. Keep the journal for the
+            // next publisher, which will reconcile it idempotently.
+            eprintln!("prview: publication committed; durable journal cleanup deferred: {error:#}");
         }
+        #[cfg(test)]
+        publication_commit_test_hook::observe_and_maybe_cancel(governor);
     }
 
     if emit_human_stdout {
@@ -1108,6 +1181,97 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     }
 
     Ok(out_dir)
+}
+
+/// Plant a one-shot reservation in the fresh directory exclusively allocated
+/// by the MCP layer. A failed spawn leaves the directory reserved and visible
+/// as a failed run; it is never silently recycled as another historical pack.
+pub(crate) fn reserve_mcp_output_dir(out_dir: &Path, nonce: &str) -> Result<()> {
+    use std::io::Write;
+
+    let reservation = out_dir.join(MCP_OUTPUT_RESERVATION_FILE);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&reservation)
+        .with_context(|| {
+            format!(
+                "failed to reserve MCP output directory {}",
+                out_dir.display()
+            )
+        })?;
+    file.write_all(nonce.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Claim one explicit pack path. Existing directories are rejected unless the
+/// current process holds the exact, unconsumed MCP reservation and the
+/// directory contains only the launcher's known control files. Removing the
+/// create-new sentinel is the single-use claim: a second consumer cannot adopt
+/// the same directory even if it inherited the nonce.
+fn claim_explicit_output_dir(out_dir: &Path) -> Result<()> {
+    let reservation = std::env::var(MCP_OUTPUT_RESERVATION_ENV).ok();
+    claim_explicit_output_dir_with_reservation(out_dir, reservation.as_deref())
+}
+
+fn claim_explicit_output_dir_with_reservation(
+    out_dir: &Path,
+    expected_nonce: Option<&str>,
+) -> Result<()> {
+    match fs::create_dir(out_dir) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to create immutable --output-dir {}",
+                    out_dir.display()
+                )
+            });
+        }
+    }
+
+    let fail = || {
+        anyhow::anyhow!(
+            "--output-dir must name a new directory for one immutable pack: {}",
+            out_dir.display()
+        )
+    };
+    let expected_nonce = expected_nonce.ok_or_else(fail)?;
+    let reservation = out_dir.join(MCP_OUTPUT_RESERVATION_FILE);
+    let metadata = fs::symlink_metadata(&reservation).map_err(|_| fail())?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(fail());
+    }
+    let actual_nonce = fs::read_to_string(&reservation).map_err(|_| fail())?;
+    if actual_nonce != expected_nonce {
+        return Err(fail());
+    }
+
+    for entry in fs::read_dir(out_dir).map_err(|_| fail())? {
+        let entry = entry.map_err(|_| fail())?;
+        let name = entry.file_name();
+        let allowed = name == std::ffi::OsStr::new(MCP_OUTPUT_RESERVATION_FILE)
+            || MCP_CONTROL_FILES
+                .iter()
+                .any(|candidate| name == std::ffi::OsStr::new(candidate));
+        if !allowed {
+            return Err(fail());
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| fail())?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(fail());
+        }
+    }
+
+    fs::remove_file(&reservation).with_context(|| {
+        format!(
+            "failed to consume MCP output reservation for {}",
+            out_dir.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn generate_consistency_check(summary_dir: &Path, out_dir: &Path, diffs: &[Diff]) -> Result<()> {
@@ -1846,41 +2010,49 @@ fn generate_system_meta(dir: &Path) -> Result<()> {
         std::env::consts::ARCH
     ));
 
-    if let Ok(hostname) = std::env::var("HOSTNAME")
+    let mut hostname = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
-        .or_else(|_| {
-            Command::new("hostname")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        })
-    {
+        .ok();
+    if hostname.is_none() {
+        hostname = governed_optional_output(Command::new("hostname"), "system metadata hostname")?
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    }
+    if let Some(hostname) = hostname {
         content.push_str(&format!("hostname: {}\n", hostname));
     }
 
     content.push_str(&format!("prview_version: {}\n", env!("CARGO_PKG_VERSION")));
 
-    if let Ok(output) = Command::new("rustc").arg("--version").output() {
+    let mut command = Command::new("rustc");
+    command.arg("--version");
+    if let Some(output) = governed_optional_output(command, "system metadata rustc version")? {
         content.push_str(&format!(
             "rustc: {}\n",
             String::from_utf8_lossy(&output.stdout).trim()
         ));
     }
 
-    if let Ok(output) = Command::new("cargo").arg("--version").output() {
+    let mut command = Command::new("cargo");
+    command.arg("--version");
+    if let Some(output) = governed_optional_output(command, "system metadata cargo version")? {
         content.push_str(&format!(
             "cargo: {}\n",
             String::from_utf8_lossy(&output.stdout).trim()
         ));
     }
 
-    if let Ok(output) = Command::new("node").arg("--version").output() {
+    let mut command = Command::new("node");
+    command.arg("--version");
+    if let Some(output) = governed_optional_output(command, "system metadata node version")? {
         content.push_str(&format!(
             "node: {}\n",
             String::from_utf8_lossy(&output.stdout).trim()
         ));
     }
 
-    if let Ok(output) = Command::new("pnpm").arg("--version").output() {
+    let mut command = Command::new("pnpm");
+    command.arg("--version");
+    if let Some(output) = governed_optional_output(command, "system metadata pnpm version")? {
         content.push_str(&format!(
             "pnpm: {}\n",
             String::from_utf8_lossy(&output.stdout).trim()
@@ -1906,11 +2078,11 @@ fn generate_git_meta(
     let mut content = String::new();
 
     // Remote URL
-    if let Ok(output) = git_cmd()
+    let mut command = git_cmd();
+    command
         .args(["config", "--get", "remote.origin.url"])
-        .current_dir(&config.repo_root)
-        .output()
-    {
+        .current_dir(&config.repo_root);
+    if let Some(output) = governed_optional_output(command, "git metadata remote origin")? {
         content.push_str(&format!(
             "remote_url: {}\n",
             String::from_utf8_lossy(&output.stdout).trim()
@@ -1944,6 +2116,18 @@ fn generate_git_meta(
 
     fs::write(dir.join("git_meta.txt"), content)?;
     Ok(())
+}
+
+fn governed_optional_output(command: Command, label: &str) -> Result<Option<std::process::Output>> {
+    match crate::proc::output_governed_with_timeout(
+        command,
+        label,
+        std::time::Duration::from_secs(10),
+    ) {
+        Ok(output) => Ok(Some(output)),
+        Err(error) if crate::governor::is_cancellation(&error) => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 fn collect_quick_wins(config: &Config, checks: &[CheckResult], exact_twins: usize) -> Vec<String> {
@@ -2139,6 +2323,22 @@ fn is_packaging_junk(path: &Path) -> bool {
     )
 }
 
+/// MCP liveness and launcher logs live beside the pack for operational
+/// readback, but they are not immutable artifact payload. In particular,
+/// stdout/stderr can still be appended after MANIFEST generation, so hashing or
+/// zipping them would make an otherwise valid pack self-inconsistent.
+fn is_mcp_control_file(relative: &Path) -> bool {
+    relative
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty())
+        && relative.file_name().is_some_and(|name| {
+            name == std::ffi::OsStr::new(MCP_OUTPUT_RESERVATION_FILE)
+                || MCP_CONTROL_FILES
+                    .iter()
+                    .any(|candidate| name == std::ffi::OsStr::new(candidate))
+        })
+}
+
 fn generate_manifest(out_dir: &Path) -> Result<()> {
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -2156,12 +2356,14 @@ fn generate_manifest(out_dir: &Path) -> Result<()> {
         let rel_str = rel.to_string_lossy().to_string();
 
         // Skip the manifest itself and the ZIP envelope (path-separator
-        // agnostic), plus OS packaging junk. The manifest hashes every shipped
-        // pack file except itself and the archive that wraps them; SANITY.json
-        // is written after this step, so it is not covered here.
+        // agnostic), plus OS packaging junk and mutable MCP control files. The
+        // manifest hashes every immutable shipped pack file except itself and
+        // the archive that wraps them; SANITY.json is written after this step,
+        // so it is not covered here.
         if rel.file_name() == Some(std::ffi::OsStr::new("MANIFEST.json"))
             || rel_str.ends_with(".zip")
             || is_packaging_junk(path)
+            || is_mcp_control_file(rel)
         {
             continue;
         }
@@ -2229,7 +2431,7 @@ fn create_zip(dir: &Path, emit_human_stdout: bool) -> Result<()> {
         if path.is_file() {
             let name = path.strip_prefix(dir).unwrap_or(path);
             // Don't ship OS packaging junk to reviewers.
-            if is_packaging_junk(name) {
+            if is_packaging_junk(name) || is_mcp_control_file(name) {
                 continue;
             }
             zip.start_file(name.to_string_lossy(), options)?;
@@ -2401,6 +2603,41 @@ mod generation_seam_test_hook {
                 if state.cancel_at == Some(seam) {
                     governor.cancel();
                 }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod publication_commit_test_hook {
+    use crate::governor::ResourceGovernor;
+    use std::cell::Cell;
+
+    thread_local! {
+        static CANCEL_AFTER_COMMIT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) struct CommitGuard;
+
+    impl CommitGuard {
+        pub(super) fn install() -> Self {
+            CANCEL_AFTER_COMMIT.with(|enabled| {
+                assert!(!enabled.replace(true), "nested publication commit probe");
+            });
+            Self
+        }
+    }
+
+    impl Drop for CommitGuard {
+        fn drop(&mut self) {
+            CANCEL_AFTER_COMMIT.with(|enabled| enabled.set(false));
+        }
+    }
+
+    pub(super) fn observe_and_maybe_cancel(governor: &ResourceGovernor) {
+        CANCEL_AFTER_COMMIT.with(|enabled| {
+            if enabled.get() {
+                governor.cancel();
             }
         });
     }

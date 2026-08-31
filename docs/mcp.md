@@ -200,6 +200,16 @@ Poll [`verdict`](#verdict) with that `run_id` until `status` is `completed`.
 **One active run per repo branch.** A second `run_review` while one is in flight
 returns `storage_locked` with an `active_run_id` and a `retry_after_ms` hint.
 
+The launcher exclusively reserves the future pack directory before spawning so
+`RUNNING.json` and the two process logs are observable immediately. The child
+can adopt that directory only once with the matching private nonce and only
+while it contains the reservation plus those three control files. This is not
+an exception to the public `--output-dir` contract: ordinary CLI calls still
+require a nonexistent path. `RUNNING.json`, `run.log`, and `run.stderr.log`
+remain readable beside the live pack but are mutable MCP control state, so they
+are deliberately excluded from the immutable `MANIFEST.json` and
+`artifacts.zip` payload.
+
 ### `verdict`
 
 The single decision truth for a run. Default: the latest run for the current

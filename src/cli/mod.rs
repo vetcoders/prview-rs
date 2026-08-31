@@ -162,7 +162,7 @@ pub struct Cli {
     pub update: bool,
 
     /// Watch mode: monitor file changes and regenerate artifacts automatically [experimental]
-    #[arg(long)]
+    #[arg(long, conflicts_with = "output_dir")]
     pub watch: bool,
 
     // === Fetch control ===
@@ -258,7 +258,7 @@ pub struct Cli {
     pub tui: bool,
 
     /// Override the artifacts output directory (default: ~/.prview/runs/<repo>/<branch>/<run_id>/)
-    #[arg(long = "output-dir", value_name = "PATH")]
+    #[arg(long = "output-dir", value_name = "PATH", conflicts_with = "watch")]
     pub output_dir: Option<PathBuf>,
 
     /// Print shell alias setup instructions and exit
@@ -657,6 +657,15 @@ mod tests {
         let balanced =
             Cli::try_parse_from(["prview", "--resource-budget", "balanced"]).expect("balanced CLI");
         assert_eq!(balanced.resource_budget, ResourceBudget::Balanced);
+    }
+
+    #[test]
+    fn watch_rejects_one_fixed_immutable_output_path() {
+        let error = Cli::try_parse_from(["prview", "--watch", "--output-dir", "review-pack"])
+            .expect_err("watch needs a fresh default run path for every iteration");
+        let rendered = error.to_string();
+        assert!(rendered.contains("--watch"), "got: {rendered}");
+        assert!(rendered.contains("--output-dir"), "got: {rendered}");
     }
 
     #[test]

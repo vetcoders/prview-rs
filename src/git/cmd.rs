@@ -7,6 +7,29 @@
 
 use std::process::Command;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_GIT_PROGRAM: std::cell::RefCell<Option<std::ffi::OsString>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) struct TestGitOverride(Option<std::ffi::OsString>);
+
+#[cfg(test)]
+impl Drop for TestGitOverride {
+    fn drop(&mut self) {
+        TEST_GIT_PROGRAM.with(|program| *program.borrow_mut() = self.0.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn override_test_git_program(program: impl Into<std::ffi::OsString>) -> TestGitOverride {
+    let previous = TEST_GIT_PROGRAM.with(|slot| slot.borrow_mut().replace(program.into()));
+    TestGitOverride(previous)
+}
+
 /// Environment variables that leak parent repo context into child git processes.
 const GIT_ENV_VARS: &[&str] = &[
     "GIT_DIR",
@@ -31,6 +54,13 @@ const GIT_ENV_VARS: &[&str] = &[
 ///     .output()?;
 /// ```
 pub fn git_cmd() -> Command {
+    #[cfg(test)]
+    let mut cmd = Command::new(
+        TEST_GIT_PROGRAM
+            .with(|program| program.borrow().clone())
+            .unwrap_or_else(|| "git".into()),
+    );
+    #[cfg(not(test))]
     let mut cmd = Command::new("git");
     for var in GIT_ENV_VARS {
         cmd.env_remove(var);

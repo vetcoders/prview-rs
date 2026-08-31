@@ -3,7 +3,7 @@ use clap::Parser;
 use colored::Colorize;
 use prview::cli::{GateArgs, McpArgs};
 use prview::git::git_cmd;
-use prview::governor::{CtrlC, is_cancellation, with_cancellation};
+use prview::governor::{CtrlC, is_cancellation, supervise_startup_stage, with_cancellation};
 use prview::{App, Cli, CliCommand, Config, OpenArgs, RunsArgs, ScopeArgs, StateArgs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -93,9 +93,13 @@ async fn run() -> Result<()> {
                 }
             },
             CliCommand::State(args) => {
-                run_state_command(Config::from_cli(&cli).ok().as_ref(), args).await
+                let config = optional_supervised_config(&cli).await?;
+                run_state_command(config.as_ref(), args).await
             }
-            CliCommand::Doctor => run_doctor_command(Config::from_cli(&cli)).await,
+            CliCommand::Doctor => {
+                let config = supervised_config_result(&cli).await?;
+                run_doctor_command(config).await
+            }
             CliCommand::Runs(args) => run_runs_command(args),
             CliCommand::Open(args) => run_open_command(args),
             CliCommand::Fix => run_fix_command().await,
@@ -109,17 +113,17 @@ async fn run() -> Result<()> {
         };
     }
 
-    let config = Config::from_cli(&cli)?;
+    let config = supervised_config(&cli).await?;
 
-    // TUI mode
+    // TUI mode owns Ctrl-C in two phases: its preflight installs a signal
+    // supervisor before raw mode, then the event loop receives Ctrl-C as a key
+    // and owns analysis cancellation/terminal cleanup.
     if cli.tui {
         prview::tui::run_tui(config).await?;
         return Ok(());
     }
 
     let app = App::from_config(config)?;
-    // The TUI is deliberately not wrapped: it puts the terminal in raw mode, so
-    // Ctrl-C reaches it as a key event and it owns its own quit path.
     let governor = app.governor();
 
     // Watch mode
@@ -180,6 +184,25 @@ async fn run() -> Result<()> {
     std::process::exit(exit_code);
 }
 
+async fn supervised_config(cli: &Cli) -> Result<Config> {
+    supervise_startup_stage(|| Config::from_cli(cli), CtrlC).await
+}
+
+async fn optional_supervised_config(cli: &Cli) -> Result<Option<Config>> {
+    match supervise_startup_stage(|| Config::from_cli(cli), CtrlC).await {
+        Ok(config) => Ok(Some(config)),
+        Err(error) if is_cancellation(&error) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn supervised_config_result(cli: &Cli) -> Result<Result<Config>> {
+    match supervise_startup_stage(|| Config::from_cli(cli), CtrlC).await {
+        Err(error) if is_cancellation(&error) => Err(error),
+        result => Ok(result),
+    }
+}
+
 async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     let mut run_cli = cli.clone();
     run_cli.command = None;
@@ -198,7 +221,7 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     // the `--ci`-scoped warnings escape hatch must not leak into it.
     run_cli.fail_on_warnings = false;
 
-    let mut config = Config::from_cli(&run_cli)?;
+    let mut config = supervised_config(&run_cli).await?;
     let enforcement_mode = prview::policy::engine::EnforcementMode::from_gate_flags(
         args.strict,
         args.fail_on_warnings,
@@ -331,7 +354,7 @@ async fn run_init_command(cli: &prview::Cli) -> Result<()> {
     );
 
     let repo_root = std::env::current_dir()?;
-    let config = Config::from_cli(cli)?;
+    let config = supervised_config(cli).await?;
     let profile_kind = config.profile.kind;
     println!(
         "  {} Detected project profile: {:?}",
