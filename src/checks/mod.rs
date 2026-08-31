@@ -977,14 +977,27 @@ async fn presync_python_venv(
 }
 
 fn uv_concurrency_env(worker_limit: u32) -> Vec<(String, String)> {
-    let limit = worker_limit.max(1).to_string();
+    uv_concurrency_env_with(worker_limit, |key| std::env::var(key).ok())
+}
+
+fn uv_concurrency_env_with(
+    worker_limit: u32,
+    mut inherited: impl FnMut(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let run_limit = worker_limit.max(1);
     [
         "UV_CONCURRENT_DOWNLOADS",
         "UV_CONCURRENT_BUILDS",
         "UV_CONCURRENT_INSTALLS",
     ]
     .into_iter()
-    .map(|key| (key.to_owned(), limit.clone()))
+    .map(|key| {
+        let limit = inherited(key)
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .map_or(run_limit, |operator_limit| operator_limit.min(run_limit));
+        (key.to_owned(), limit.to_string())
+    })
     .collect()
 }
 
@@ -2728,9 +2741,9 @@ mod tests {
     }
 
     #[test]
-    fn uv_sync_inherits_the_run_descendant_cap() {
+    fn uv_sync_preserves_the_stricter_descendant_cap() {
         assert_eq!(
-            uv_concurrency_env(2),
+            uv_concurrency_env_with(2, |_| None),
             vec![
                 ("UV_CONCURRENT_DOWNLOADS".to_string(), "2".to_string()),
                 ("UV_CONCURRENT_BUILDS".to_string(), "2".to_string()),
@@ -2738,8 +2751,23 @@ mod tests {
             ]
         );
         assert!(
-            uv_concurrency_env(0).iter().all(|(_, value)| value == "1"),
+            uv_concurrency_env_with(0, |_| None)
+                .iter()
+                .all(|(_, value)| value == "1"),
             "invalid zero plans still produce uv's required non-zero cap"
+        );
+        assert_eq!(
+            uv_concurrency_env_with(4, |key| match key {
+                "UV_CONCURRENT_BUILDS" => Some("1".to_string()),
+                "UV_CONCURRENT_INSTALLS" => Some("8".to_string()),
+                _ => Some("not-a-limit".to_string()),
+            }),
+            vec![
+                ("UV_CONCURRENT_DOWNLOADS".to_string(), "4".to_string()),
+                ("UV_CONCURRENT_BUILDS".to_string(), "1".to_string()),
+                ("UV_CONCURRENT_INSTALLS".to_string(), "4".to_string()),
+            ],
+            "prview may lower an inherited uv cap but must never raise it",
         );
     }
 
