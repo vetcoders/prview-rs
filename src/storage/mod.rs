@@ -2758,23 +2758,10 @@ mod tests {
         assert!(msg.contains("/tmp/dashboard.html"));
     }
 
-    // `run_runs_command` reaches the global index/lock via PRVIEW_HOME, so these
-    // tests serialize env mutation. No other storage test uses the global paths
-    // (they all pass explicit paths), so scoping PRVIEW_HOME here is safe.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_prview_home<R>(f: impl FnOnce(&Path) -> R) -> R {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
-        let prev = std::env::var("PRVIEW_HOME").ok();
-        // SAFETY: serialized by ENV_LOCK; restored before returning.
-        unsafe { std::env::set_var("PRVIEW_HOME", home.path()) };
-        let result = f(home.path());
-        match prev {
-            Some(v) => unsafe { std::env::set_var("PRVIEW_HOME", v) },
-            None => unsafe { std::env::remove_var("PRVIEW_HOME") },
-        }
-        result
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        f(home.path())
     }
 
     fn runs_opts_all_json() -> RunsOpts {
@@ -2837,8 +2824,11 @@ mod tests {
             let (release_first_tx, release_first_rx) = mpsc::channel();
             let (second_started_tx, second_started_rx) = mpsc::channel();
             let (second_acquired_tx, second_acquired_rx) = mpsc::channel();
+            let first_home = home.to_path_buf();
+            let second_home = home.to_path_buf();
 
             let first_thread = std::thread::spawn(move || {
+                let _home = crate::config::override_test_prview_home(first_home);
                 let publication = super::acquire_publication_lock(|| false).unwrap();
                 let transaction = crate::artifacts::git_artifacts::begin_latest_publication(
                     &publication,
@@ -2854,6 +2844,7 @@ mod tests {
 
             first_advertised_rx.recv().unwrap();
             let second_thread = std::thread::spawn(move || {
+                let _home = crate::config::override_test_prview_home(second_home);
                 second_started_tx.send(()).unwrap();
                 let publication = super::acquire_publication_lock(|| false).unwrap();
                 second_acquired_tx.send(()).unwrap();
