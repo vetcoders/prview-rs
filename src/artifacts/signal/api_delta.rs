@@ -1311,7 +1311,10 @@ fn unknown_proofs_match(
     target: &RustApiSnapshot,
     right: &RustApiUnknown,
 ) -> bool {
-    left.kind != RustApiUnknownKind::PathNonUtf8
+    !matches!(
+        left.kind,
+        RustApiUnknownKind::PathNonUtf8 | RustApiUnknownKind::WorkspaceDiscovery
+    )
         && left.kind == right.kind
         && left.crate_name == right.crate_name
         && left.module_path == right.module_path
@@ -2291,6 +2294,52 @@ mod tests {
                 .as_ref()
                 .is_some_and(|source| source.source_path.contains("git-path-bytes"))
         }));
+    }
+
+    #[test]
+    fn ambiguous_rootless_workspace_authority_remains_typed_unknown() {
+        let delta = repository_delta(&[
+            (
+                "backend/Cargo.toml",
+                "[workspace]\nmembers=['api']\n",
+                "[workspace]\nmembers=['api']\n",
+            ),
+            (
+                "backend/api/Cargo.toml",
+                "[package]\nname='backend-api'\nversion='0.0.0'\n",
+                "[package]\nname='backend-api'\nversion='0.0.0'\n",
+            ),
+            (
+                "backend/api/src/lib.rs",
+                "pub fn backend() {}\n",
+                "pub fn backend() {}\n",
+            ),
+            (
+                "tests/fixtures/Cargo.toml",
+                "[workspace]\nmembers=['sample']\n",
+                "[workspace]\nmembers=['sample']\n",
+            ),
+            (
+                "tests/fixtures/sample/Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n",
+            ),
+            (
+                "tests/fixtures/sample/src/lib.rs",
+                "pub fn fixture() {}\n",
+                "pub fn fixture() {}\n",
+            ),
+        ]);
+        assert_eq!(
+            delta
+                .unknown
+                .iter()
+                .filter(|finding| finding.identity.name == "WorkspaceDiscovery")
+                .count(),
+            2,
+            "workspace authority uncertainty is side-specific and never neutralized"
+        );
+        assert!(delta.added.is_empty() && delta.removed.is_empty() && delta.changed.is_empty());
     }
 
     #[test]

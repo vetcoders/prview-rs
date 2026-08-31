@@ -69,6 +69,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skipped with a warning while the new row and all predecessor rows are kept.
 - Repo-backed crate discovery follows workspace `members`/`exclude` (or the
   single root package). Fixture and tool `Cargo.toml` files are not product API.
+- Multiple independent workspaces without a root `Cargo.toml` now fail closed
+  as side-specific `WorkspaceDiscovery` uncertainty instead of being silently
+  unioned into one public surface.
 - `impl std::fmt::Display` (and other external/prelude traits) on a public type
   is a `TraitImplResolution` unknown, not a silent no-delta.
 - Unqualified imported trait impls on public types are retained as

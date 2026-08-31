@@ -156,6 +156,7 @@ pub enum RustApiUnknownKind {
     ManifestRead,
     ManifestNonUtf8,
     ManifestParse,
+    WorkspaceDiscovery,
     MissingLibRoot,
     SourceRead,
     SourceNonUtf8,
@@ -616,7 +617,16 @@ impl<'a> SnapshotBuilder<'a> {
             })
             .map(|(path, _)| path.clone())
             .collect();
-        let allowed = api_crate_manifests(self.source, &manifests);
+        let (allowed, workspace_ambiguity) = api_crate_manifests(self.source, &manifests);
+        if let Some(evidence) = workspace_ambiguity {
+            self.unknown(
+                RustApiUnknownKind::WorkspaceDiscovery,
+                None,
+                &[],
+                "<workspace-discovery>",
+                evidence,
+            );
+        }
         for manifest_path in manifests {
             if !allowed.contains(&manifest_path) {
                 continue;
@@ -3890,7 +3900,10 @@ fn cargo_glob_matches(pattern: &str, path: &str) -> bool {
 
 /// Product crates are workspace members (minus `exclude`), or the root package
 /// of a non-workspace repo. Nested fixture/tool packages are not API surface.
-fn api_crate_manifests(source: &dyn RevisionFileSource, manifests: &[String]) -> BTreeSet<String> {
+fn api_crate_manifests(
+    source: &dyn RevisionFileSource,
+    manifests: &[String],
+) -> (BTreeSet<String>, Option<String>) {
     let parsed: Vec<(&str, toml::Value)> = manifests
         .iter()
         .filter_map(|path| peek_manifest_toml(source, path).map(|value| (path.as_str(), value)))
@@ -3919,14 +3932,14 @@ fn api_crate_manifests(source: &dyn RevisionFileSource, manifests: &[String]) ->
         // A malformed or non-UTF-8 root manifest is still the repository's
         // authority. Keep it selected so the snapshot emits its typed unknown
         // instead of silently falling through to a nested fixture package.
-        return BTreeSet::from(["Cargo.toml".to_owned()]);
+        return (BTreeSet::from(["Cargo.toml".to_owned()]), None);
     }
     if let Some((_, root)) = parsed.iter().find(|(path, _)| *path == "Cargo.toml") {
         let Some(workspace) = root.get("workspace").and_then(toml::Value::as_table) else {
             return if root.get("package").is_some() {
-                BTreeSet::from(["Cargo.toml".to_owned()])
+                (BTreeSet::from(["Cargo.toml".to_owned()]), None)
             } else {
-                BTreeSet::new()
+                (BTreeSet::new(), None)
             };
         };
 
@@ -3953,14 +3966,37 @@ fn api_crate_manifests(source: &dyn RevisionFileSource, manifests: &[String]) ->
                 allowed.insert((*package).to_owned());
             }
         }
-        return allowed;
+        return (allowed, None);
     }
 
     // Compatibility fallback for revision sources rooted below the repository
     // root (for example a caller-provided single-crate source). A real repo with
     // Cargo.toml above never reaches this branch.
     if workspaces.is_empty() {
-        return packages.into_iter().map(str::to_owned).collect();
+        return if packages.len() <= 1 {
+            (packages.into_iter().map(str::to_owned).collect(), None)
+        } else {
+            (
+                BTreeSet::new(),
+                Some(format!(
+                    "multiple package manifests without a root Cargo.toml or workspace authority: {}",
+                    packages.join(", ")
+                )),
+            )
+        };
+    }
+    if workspaces.len() != 1 {
+        return (
+            BTreeSet::new(),
+            Some(format!(
+                "multiple workspace authorities without a root Cargo.toml: {}",
+                workspaces
+                    .iter()
+                    .map(|(dir, _, _, _)| if dir.is_empty() { "." } else { dir.as_str() })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        );
     }
     let mut allowed = BTreeSet::new();
     for (dir, members, exclude, has_package) in &workspaces {
@@ -3995,7 +4031,7 @@ fn api_crate_manifests(source: &dyn RevisionFileSource, manifests: &[String]) ->
             }
         }
     }
-    allowed
+    (allowed, None)
 }
 
 fn trait_is_external_public(pending: &PendingTraitImpl) -> bool {
@@ -5323,6 +5359,43 @@ mod tests {
         let snapshot = snapshot_rust_api(&explicit);
         assert_eq!(snapshot.crates[0].name, "public_name");
         assert_eq!(snapshot.crates[0].root_path, "nested/source/root.rs");
+
+        let one_rootless_workspace = MemorySource::new(&[
+            ("backend/Cargo.toml", b"[workspace]\nmembers=['api']\n"),
+            (
+                "backend/api/Cargo.toml",
+                b"[package]\nname='backend-api'\nversion='0.0.0'\n",
+            ),
+            ("backend/api/src/lib.rs", b"pub fn backend() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&one_rootless_workspace);
+        assert_eq!(snapshot.crates[0].name, "backend_api");
+        assert!(snapshot.unknowns.is_empty());
+
+        let ambiguous_rootless_workspaces = MemorySource::new(&[
+            ("backend/Cargo.toml", b"[workspace]\nmembers=['api']\n"),
+            (
+                "backend/api/Cargo.toml",
+                b"[package]\nname='backend-api'\nversion='0.0.0'\n",
+            ),
+            ("backend/api/src/lib.rs", b"pub fn backend() {}"),
+            (
+                "tests/fixtures/Cargo.toml",
+                b"[workspace]\nmembers=['sample']\n",
+            ),
+            (
+                "tests/fixtures/sample/Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\n",
+            ),
+            ("tests/fixtures/sample/src/lib.rs", b"pub fn fixture() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&ambiguous_rootless_workspaces);
+        assert!(snapshot.crates.is_empty());
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                && unknown.evidence.contains("backend")
+                && unknown.evidence.contains("tests/fixtures")
+        }));
 
         let rooted = MemorySource::new(&[
             (

@@ -545,7 +545,9 @@ Expression-position include macros retain included-byte digests, and
 transforming-attribute unknowns are bound to their annotated input. Legal
 non-UTF-8 Git paths emit side-specific typed path uncertainty while valid sibling
 files continue to be analyzed; their collision-free internal identity cannot be
-forged by a literal UTF-8 surrogate filename. Unqualified imported trait impls on public owners
+forged by a literal UTF-8 surrogate filename. Multiple independent workspace
+authorities in a rootless revision source emit `WorkspaceDiscovery` uncertainty
+instead of unioning product and fixture crates. Unqualified imported trait impls on public owners
 remain typed uncertainty until compiler-backed name resolution exists.
 
 #### How to read an artifact pack

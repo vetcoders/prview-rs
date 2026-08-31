@@ -1493,7 +1493,11 @@ does not contaminate confirmed facts from independently parsed valid paths.
 checkout, working-tree overlay, or patch fallback. Crate discovery follows
 Cargo workspace `members`/`exclude` when a workspace exists, and otherwise only
 the repository-root package — nested fixture and tool manifests are not product
-API. Private-field types stay in the parent contract (auto-trait effects such as
+API. A revision source intentionally rooted below the repository may expose one
+package or one workspace authority. Multiple rootless packages/workspaces are
+not silently unioned: they emit side-specific `WorkspaceDiscovery` uncertainty
+and no confirmed product-crate surface until an authority is explicit.
+Private-field types stay in the parent contract (auto-trait effects such as
 replacing `u8` with `Rc<()>`), and implementations of external/prelude traits on
 a public type are typed `TraitImplResolution` unknowns. Duplicate exact base/target
 OID pairs are coalesced in stable first-seen order before either snapshot is
