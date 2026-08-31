@@ -502,7 +502,7 @@ impl<'a> SnapshotBuilder<'a> {
                 entry.kind == super::revision_source::RevisionEntryKind::Unsupported
                     && entry.path.contains(crate::git::NON_UTF8_GIT_PATH_PREFIX)
             })
-            .map(|entry| entry.path.clone())
+            .map(|entry| crate::git::display_git_path(&entry.path).to_owned())
             .collect();
         for path in paths {
             self.unknown(

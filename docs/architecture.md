@@ -1478,8 +1478,11 @@ serialize the complete semantic identity, including both sides' cfg regions,
 contracts, and typed unknown provenance; legal ambiguous input is data, never
 an assertion failure.
 
-A legal non-UTF-8 Git tree component is represented by a deterministic
-`<git-path-bytes:...>` inventory surrogate and a side-specific `PathNonUtf8`
+A legal non-UTF-8 Git tree component is represented by a deterministic internal
+identity prefixed with NUL — a byte Git forbids in real pathnames — and a
+printable `<git-path-bytes:...>` surrogate only at the artifact boundary. A
+legal UTF-8 file literally named like that surrogate therefore remains a
+separate readable entry. The raw path emits a side-specific `PathNonUtf8`
 unknown. The tree walk skips only descendants whose prefix cannot be represented
 and continues through valid siblings. Unlike an unchanged parser/resolver
 unknown, path uncertainty is deliberately not neutralized across revisions and

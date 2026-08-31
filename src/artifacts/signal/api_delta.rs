@@ -1661,7 +1661,7 @@ mod tests {
             ("src/lib.rs", "pub fn stable() {}\n", "pub fn stable() {}\n"),
         ]);
 
-        let mut tree_records = git_with_input(
+        let tree_records = git_with_input(
             tmp.path(),
             &["ls-tree", "-z", &format!("{seed}^{{tree}}")],
             &[],
@@ -1674,8 +1674,27 @@ mod tests {
         .expect("blob oid")
         .trim()
         .to_owned();
-        tree_records.extend_from_slice(format!("100644 blob {blob}\t").as_bytes());
-        tree_records.extend_from_slice(b"non_utf8_\xff.rs\0");
+        let mut records = tree_records
+            .split_inclusive(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        let mut printable_collision = format!("100644 blob {blob}\t").into_bytes();
+        printable_collision.extend_from_slice(b"<git-path-bytes:ff>\0");
+        records.push(printable_collision);
+        let mut non_utf8 = format!("100644 blob {blob}\t").into_bytes();
+        non_utf8.extend_from_slice(b"\xff\0");
+        records.push(non_utf8);
+        fn record_name(record: &[u8]) -> &[u8] {
+            let start = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .map_or(record.len(), |index| index + 1);
+            let path = &record[start..];
+            path.strip_suffix(&[0]).unwrap_or(path)
+        }
+        records.sort_by(|left, right| record_name(left).cmp(record_name(right)));
+        let tree_records = records.into_iter().flatten().collect::<Vec<_>>();
         let tree = String::from_utf8(git_with_input(tmp.path(), &["mktree", "-z"], &tree_records))
             .expect("tree oid")
             .trim()
@@ -2219,6 +2238,32 @@ mod tests {
     #[test]
     fn git_object_t5_non_utf8_entry_preserves_valid_api_siblings() {
         let (_tmp, repo, base, target) = repository_with_unchanged_non_utf8_entry();
+        let tree = super::super::revision_source::GitTree::new(&repo, &base)
+            .expect("exact tree with colliding printable names");
+        let collision_entries = tree
+            .entries()
+            .into_iter()
+            .filter(|entry| crate::git::display_git_path(&entry.path) == "<git-path-bytes:ff>")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            collision_entries.len(),
+            2,
+            "raw ff and a legal literal surrogate name must keep distinct inventory identities"
+        );
+        assert_eq!(
+            collision_entries
+                .iter()
+                .filter(|entry| entry.path.starts_with('\0'))
+                .count(),
+            1,
+            "only the raw-byte entry uses the impossible Git-path key"
+        );
+        assert!(matches!(
+            tree.read("<git-path-bytes:ff>")
+                .expect("literal UTF-8 path remains readable"),
+            RevisionRead::Bytes(_)
+        ));
+
         let delta =
             compare_rust_api_revisions(&repo, &[make_diff_with_ids(base, target, Vec::new())])
                 .expect("a legal non-UTF-8 Git path must not abort API analysis")

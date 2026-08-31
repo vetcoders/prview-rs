@@ -100,10 +100,16 @@ pub(crate) enum GitTreeEntryKind {
     Unsupported,
 }
 
-/// Prefix for a deterministic, printable surrogate of a Git path component
-/// that cannot be represented as UTF-8. Consumers must retain the entry as
-/// typed uncertainty instead of attempting to read the surrogate path.
-pub(crate) const NON_UTF8_GIT_PATH_PREFIX: &str = "<git-path-bytes:";
+/// Internal prefix for a deterministic surrogate of a Git path component that
+/// cannot be represented as UTF-8. Git forbids NUL in pathnames, so the leading
+/// NUL makes this inventory key impossible to forge with a legal UTF-8 name.
+/// Strip it only at an output boundary; never use the printable suffix as an
+/// identity key.
+pub(crate) const NON_UTF8_GIT_PATH_PREFIX: &str = "\0<git-path-bytes:";
+
+pub(crate) fn display_git_path(path: &str) -> &str {
+    path.strip_prefix('\0').unwrap_or(path)
+}
 
 /// One entry from an exact commit tree, including non-regular entries.
 #[derive(Debug, Clone, PartialEq, Eq)]

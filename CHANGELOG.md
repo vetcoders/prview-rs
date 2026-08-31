@@ -116,6 +116,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layout, public data-type binder semantics, and valid siblings beside legal
   non-UTF-8 Git paths. Trait impls that need compiler resolution remain typed
   unknowns instead of silently disappearing.
+- Raw non-UTF-8 Git path identities cannot collide with a legal UTF-8 file whose
+  name literally matches the printable `<git-path-bytes:...>` surrogate.
 - Public modules, library-crate declarations, and Cargo feature contracts now
   participate in the shared Rust `ApiDelta`, so their removal is projected
   consistently through human artifacts, JSON, MERGE_GATE, report, CLI, and MCP
