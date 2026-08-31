@@ -592,7 +592,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tui_ctrl_c_cancels_joins_and_reaps_a_real_process_tree() {
-        use std::io::Read;
         use std::os::unix::process::CommandExt;
 
         let tmp = tempfile::tempdir().expect("process-tree tempdir");
@@ -604,19 +603,15 @@ mod tests {
         let root_pid = child.id();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !pidfile.exists() {
+        while crate::proc::read_published_unix_pid(&pidfile).is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "grandchild pid was not published"
+                "complete grandchild pid was not published"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let mut pid = String::new();
-        std::fs::File::open(&pidfile)
-            .expect("open grandchild pid")
-            .read_to_string(&mut pid)
-            .expect("read grandchild pid");
-        let grandchild_pid: i32 = pid.trim().parse().expect("numeric grandchild pid");
+        let grandchild_pid = crate::proc::read_published_unix_pid(&pidfile)
+            .expect("complete numeric grandchild pid");
 
         let governor = Arc::new(crate::governor::ResourceGovernor::new());
         assert!(governor.register_child("tui-test", root_pid));

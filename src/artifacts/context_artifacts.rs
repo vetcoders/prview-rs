@@ -2345,8 +2345,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn registration_after_cancellation_kills_the_sync_process_group() {
-        use std::io::Read;
-
         let tmp = tempfile::tempdir().expect("tempdir");
         let pidfile = tmp.path().join("late-context-grandchild.pid");
         let script = format!("sleep 30 & echo $! > {} ; wait", pidfile.display());
@@ -2365,21 +2363,20 @@ mod tests {
         let timings =
             super::run_context_cmds_parallel_after_spawn(&cmds, 2, false, &governor, |_| {
                 for _ in 0..100 {
-                    if marker.exists() {
+                    if crate::proc::read_published_unix_pid(&marker).is_some() {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                assert!(marker.exists(), "child must publish its grandchild pid");
+                assert!(
+                    crate::proc::read_published_unix_pid(&marker).is_some(),
+                    "child must publish its complete grandchild pid"
+                );
                 governor.cancel();
             });
 
-        let mut contents = String::new();
-        std::fs::File::open(&pidfile)
-            .expect("grandchild pidfile")
-            .read_to_string(&mut contents)
-            .expect("read grandchild pid");
-        let grandchild: i32 = contents.trim().parse().expect("numeric grandchild pid");
+        let grandchild = crate::proc::read_published_unix_pid(&pidfile)
+            .expect("complete numeric grandchild pid");
         let mut gone = false;
         for _ in 0..100 {
             // SAFETY: signal 0 is a read-only existence/permission probe, and

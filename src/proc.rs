@@ -496,6 +496,14 @@ pub(crate) fn windows_pid_exists(pid: u32) -> bool {
         .any(|line| line.contains(&format!("\"{pid}\"")))
 }
 
+/// Read a test-owned Unix pidfile only after the producer has completed the
+/// write. `echo > file` creates an empty file before writing its digits, so
+/// existence alone is a racy readiness oracle under concurrent test load.
+#[cfg(all(test, unix))]
+pub(crate) fn read_published_unix_pid(path: &std::path::Path) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,7 +669,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn registration_after_cancellation_kills_the_async_process_group() {
-        use std::io::Read;
         use std::sync::Arc;
         use std::thread::sleep;
 
@@ -681,12 +688,15 @@ mod tests {
             || anyhow::anyhow!("late async tree timed out"),
             move |_| {
                 for _ in 0..100 {
-                    if marker.exists() {
+                    if super::read_published_unix_pid(&marker).is_some() {
                         break;
                     }
                     sleep(Duration::from_millis(10));
                 }
-                assert!(marker.exists(), "child must publish its grandchild pid");
+                assert!(
+                    super::read_published_unix_pid(&marker).is_some(),
+                    "child must publish its complete grandchild pid"
+                );
                 canceller.cancel();
             },
         );
@@ -696,12 +706,8 @@ mod tests {
                 .await
                 .expect("late registration must kill before the timeout branch wins");
 
-        let mut contents = String::new();
-        std::fs::File::open(&pidfile)
-            .expect("grandchild pidfile")
-            .read_to_string(&mut contents)
-            .expect("read grandchild pid");
-        let grandchild = contents.trim().parse().expect("numeric grandchild pid");
+        let grandchild =
+            super::read_published_unix_pid(&pidfile).expect("complete numeric grandchild pid");
         assert_grandchild_reaped(grandchild).await;
         assert_eq!(governor.inflight_count(), 0);
         assert!(

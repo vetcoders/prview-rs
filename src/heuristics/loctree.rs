@@ -435,8 +435,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn worker_process_is_killed_on_cancel() {
-        use std::io::Read;
-
         let temp = tempfile::tempdir().expect("worker fixture");
         let pidfile = temp.path().join("worker.pid");
         let late_marker = temp.path().join("late-write");
@@ -453,10 +451,10 @@ mod tests {
             tokio::spawn(async move { run_worker_command(command, Some(worker_governor)).await });
 
         let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !pidfile.exists() {
+        while crate::proc::read_published_unix_pid(&pidfile).is_none() {
             assert!(
                 std::time::Instant::now() < start_deadline,
-                "worker never entered its synchronous body"
+                "worker never published its complete pid"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -476,12 +474,8 @@ mod tests {
             "cancelled worker wrote after its kill"
         );
 
-        let mut pid = String::new();
-        std::fs::File::open(&pidfile)
-            .expect("worker pidfile")
-            .read_to_string(&mut pid)
-            .expect("read worker pid");
-        let pid: i32 = pid.trim().parse().expect("worker pid");
+        let pid =
+            crate::proc::read_published_unix_pid(&pidfile).expect("complete numeric worker pid");
         // SAFETY: signal 0 only probes the pid published by this test worker.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(
