@@ -1357,16 +1357,17 @@ fn describe_enabled_steps(config: &Config) -> String {
 
 fn describe_expensive_steps(config: &Config) -> String {
     let mut steps = Vec::new();
+    let fast_lint_skipped = config.is_fast_remote_only_standard() && !config.lint_forced;
     if which::which("semgrep").is_ok() {
         steps.push("semgrep(capped)");
     }
     if config.profile.has_cargo {
         steps.push("cargo/rustc(capped)");
     }
-    if config.profile.has_tsconfig {
+    if config.profile.has_tsconfig && !fast_lint_skipped {
         steps.push("tsc(serial)");
     }
-    if config.profile.has_package_json && config.run_lint {
+    if config.profile.has_package_json && config.run_lint && !fast_lint_skipped {
         steps.push("eslint(serial)");
     }
     if config.profile.has_package_json && config.run_tests {
@@ -1661,7 +1662,7 @@ mod tests {
     use super::*;
     use crate::checks::{CheckResult, CheckStatus};
     use crate::cli::ExecutionMode;
-    use crate::config::{test_config, test_rust_profile};
+    use crate::config::{test_config, test_js_profile, test_rust_profile};
 
     /// Minimal artifact pack carrying one `MERGE_GATE.json` decision. The gate
     /// artifact is now the ONLY source of the verdict, so every summary test
@@ -5021,5 +5022,20 @@ api-router/app/core/cache.py
         assert!(steps.contains("cargo-check"));
         assert!(steps.contains("lint"));
         assert!(steps.contains("cargo-audit"));
+    }
+
+    #[test]
+    fn fast_remote_preflight_does_not_advertise_skipped_js_lints_as_expensive() {
+        let mut config = test_config();
+        config.profile = test_js_profile(true);
+        config.execution_mode = ExecutionMode::Standard;
+        config.remote_only = true;
+        config.run_lint = true;
+
+        let expensive = describe_expensive_steps(&config);
+
+        assert!(!expensive.contains("tsc"), "got: {expensive}");
+        assert!(!expensive.contains("eslint"), "got: {expensive}");
+        assert!(expensive.contains("semgrep") || expensive == "none selected");
     }
 }

@@ -116,7 +116,19 @@ async fn initialize_state_supervised(
         state.config.resource_plan,
     ));
     let work = async { crate::governor::blocking_stage(|| initialize_state(state)) };
-    crate::governor::with_cancellation(work, &governor, interrupts).await
+    let result = crate::governor::with_cancellation(work, &governor, interrupts).await;
+    finish_tui_preflight(result, &governor)
+}
+
+fn finish_tui_preflight<T>(
+    result: Result<T>,
+    governor: &crate::governor::ResourceGovernor,
+) -> Result<T> {
+    if governor.is_cancelled() {
+        Err(crate::governor::Cancelled.into())
+    } else {
+        result
+    }
 }
 
 fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
@@ -604,6 +616,17 @@ mod tests {
         test_config()
     }
 
+    #[test]
+    fn cancelled_preflight_cannot_enter_raw_mode_after_work_returns_ok() {
+        let governor = crate::governor::ResourceGovernor::new();
+        governor.cancel();
+
+        let error = finish_tui_preflight(Ok(()), &governor)
+            .expect_err("a late startup interrupt must not become TUI success");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+    }
+
     #[cfg(unix)]
     struct InterruptWhenFileExists {
         path: std::path::PathBuf,
@@ -626,7 +649,15 @@ mod tests {
             if self.delivered {
                 std::future::pending::<()>().await;
             }
-            while !self.path.exists() {
+            // Opening with shell redirection publishes an empty file before
+            // `printf` writes the PID. Existence is not process readiness and
+            // can fire cancellation before the parent has registered the just-
+            // spawned group; wait for a complete numeric payload instead.
+            while std::fs::read_to_string(&self.path)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .is_none()
+            {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             self.delivered = true;

@@ -707,15 +707,6 @@ async fn run_all_checks(
 
     runnable_checks.sort_by_key(|check| schedule_rank(check.as_ref()));
 
-    // Pre-sync Python venv if any Python checks will run and uv is available.
-    // This separates venv build time from the per-check timeout budget.
-    let has_python_checks = runnable_checks
-        .iter()
-        .any(|c| matches!(c.name(), "Ruff" | "Mypy" | "Pytest"));
-    if has_python_checks && config.profile.runs_python_checks() && which::which("uv").is_ok() {
-        presync_python_venv(config, governor, emit).await?;
-    }
-
     // Materialise ONE shared target snapshot for the whole run so every
     // snapshot-backed check reuses it instead of creating (and cleaning up) its
     // own worktree (thread 1). On failure, leave the override unset so each
@@ -727,8 +718,22 @@ async fn run_all_checks(
     // the cache or was ruled out still goes on to read the reviewed tree in the
     // context stage, and it is `share_target_snapshot` that decides whether a
     // snapshot is needed at all.
+    //
+    // This must happen BEFORE Python pre-sync. The sync reads the same tree and
+    // uses the same per-commit environment as the gates; doing it against
+    // repo_root in an off-HEAD review mutates the operator's environment and
+    // does not prepare the environment the checks consume.
     let mut config = config.clone();
     share_target_snapshot(&mut config, &runnable_checks, ledger);
+
+    // Pre-sync Python venv if any Python checks will run and uv is available.
+    // This separates venv build time from the per-check timeout budget.
+    let has_python_checks = runnable_checks
+        .iter()
+        .any(|c| matches!(c.name(), "Ruff" | "Mypy" | "Pytest"));
+    if has_python_checks && config.profile.runs_python_checks() && which::which("uv").is_ok() {
+        presync_python_venv(&config, governor, emit).await?;
+    }
 
     if !runnable_checks.is_empty() {
         let board = Arc::new(std::sync::Mutex::new(RunBoard::new(
@@ -923,8 +928,16 @@ async fn presync_python_venv(
     // Exclusive before spawning, and pass the same descendant cap the run
     // advertises to uv's download/build/install pools.
     let _budget = governor.acquire(Weight::Exclusive).await?;
-    let uv_env = uv_concurrency_env(governor.worker_limit());
-
+    let plan = match plan_python_presync(config, governor.worker_limit()) {
+        Ok(plan) => plan,
+        Err(error) => {
+            if emit {
+                print!("\r\x1b[2K  {} Python venv: {error}\n", "⚠".yellow());
+                let _ = std::io::stdout().flush();
+            }
+            return Ok(());
+        }
+    };
     if emit {
         print!("  {} Syncing Python venv...", "●".blue());
         let _ = std::io::stdout().flush();
@@ -936,9 +949,9 @@ async fn presync_python_venv(
         run_command_with_timeout_and_env(
             "uv",
             &["sync", "--quiet"],
-            &config.repo_root,
+            &plan.cwd,
             CHECK_TIMEOUT_SECS,
-            &uv_env,
+            &plan.env,
         ),
     )
     .await;
@@ -976,6 +989,17 @@ async fn presync_python_venv(
     Ok(())
 }
 
+/// Resolve the exact tree and environment the Python checks will consume, then
+/// add uv's bounded descendant pools. Keeping this as one tested plan prevents
+/// the pre-sync and the actual gates from drifting onto different substrates.
+fn plan_python_presync(config: &Config, worker_limit: u32) -> Result<python::PythonRun> {
+    let mut plan = python::plan_python_run(config)?;
+    let mut env = uv_concurrency_env(worker_limit);
+    env.extend(plan.env);
+    plan.env = env;
+    Ok(plan)
+}
+
 fn uv_concurrency_env(worker_limit: u32) -> Vec<(String, String)> {
     uv_concurrency_env_with(worker_limit, |key| std::env::var(key).ok())
 }
@@ -989,6 +1013,10 @@ fn uv_concurrency_env_with(
         "UV_CONCURRENT_DOWNLOADS",
         "UV_CONCURRENT_BUILDS",
         "UV_CONCURRENT_INSTALLS",
+        // uv caps simultaneous source builds, not the pool inside one
+        // Rust-backed PEP 517 backend. An arbitrary backend may still expose a
+        // different private knob, but Cargo-backed builds stay in the plan.
+        "CARGO_BUILD_JOBS",
     ]
     .into_iter()
     .map(|key| {
@@ -1114,6 +1142,11 @@ where
 
     runnable_checks.sort_by_key(|check| schedule_rank(check.as_ref()));
 
+    // Materialise the reviewed substrate before pre-sync, exactly as headless
+    // does. The TUI must not sync an off-HEAD dependency set into repo_root.
+    let mut config = config.clone();
+    share_target_snapshot(&mut config, &runnable_checks, ledger);
+
     // Pre-sync Python venv before running checks, through the SAME helper the
     // headless dispatcher uses. It was a bare `run_command_with_timeout` under a
     // comment claiming to mirror `run_all` — a copy that had stopped mirroring
@@ -1125,7 +1158,7 @@ where
         .any(|c| matches!(c.name(), "Ruff" | "Mypy" | "Pytest"));
     if has_python_checks && config.profile.runs_python_checks() && which::which("uv").is_ok() {
         // `emit: false` — the TUI owns the screen; progress reaches it as events.
-        presync_python_venv(config, governor, false).await?;
+        presync_python_venv(&config, governor, false).await?;
     }
 
     // Second pass: run checks in parallel, fire events as they complete.
@@ -1137,11 +1170,6 @@ where
                 name: check.name().to_string(),
             });
         }
-
-        // One shared target snapshot for the whole run, owned by the ledger so
-        // it outlives this frame (thread 1); see run_all.
-        let mut config = config.clone();
-        share_target_snapshot(&mut config, &runnable_checks, ledger);
 
         let config = Arc::new(config);
         let cache = Arc::new(cache);
@@ -2741,6 +2769,37 @@ mod tests {
     }
 
     #[test]
+    fn python_presync_uses_the_reviewed_snapshot_and_per_commit_environment() {
+        let home = tempfile::tempdir().expect("prview home");
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let repo = tempfile::tempdir().expect("operator checkout");
+        let snapshot = tempfile::tempdir().expect("reviewed snapshot");
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+        config.scan_dir_override = Some(snapshot.path().to_path_buf());
+
+        let plan = plan_python_presync(&config, 1).expect("presync plan");
+
+        assert_eq!(plan.cwd, snapshot.path());
+        assert!(plan.env.iter().any(|(key, value)| {
+            key == "UV_PROJECT_ENVIRONMENT" && !std::path::Path::new(value).starts_with(repo.path())
+        }));
+        for key in [
+            "UV_CONCURRENT_DOWNLOADS",
+            "UV_CONCURRENT_BUILDS",
+            "UV_CONCURRENT_INSTALLS",
+            "CARGO_BUILD_JOBS",
+        ] {
+            assert!(
+                plan.env
+                    .iter()
+                    .any(|(actual, value)| actual == key && value == "1"),
+                "{key} must be capped in the exact presync environment"
+            );
+        }
+    }
+
+    #[test]
     fn uv_sync_preserves_the_stricter_descendant_cap() {
         assert_eq!(
             uv_concurrency_env_with(2, |_| None),
@@ -2748,6 +2807,7 @@ mod tests {
                 ("UV_CONCURRENT_DOWNLOADS".to_string(), "2".to_string()),
                 ("UV_CONCURRENT_BUILDS".to_string(), "2".to_string()),
                 ("UV_CONCURRENT_INSTALLS".to_string(), "2".to_string()),
+                ("CARGO_BUILD_JOBS".to_string(), "2".to_string()),
             ]
         );
         assert!(
@@ -2760,12 +2820,14 @@ mod tests {
             uv_concurrency_env_with(4, |key| match key {
                 "UV_CONCURRENT_BUILDS" => Some("1".to_string()),
                 "UV_CONCURRENT_INSTALLS" => Some("8".to_string()),
+                "CARGO_BUILD_JOBS" => Some("1".to_string()),
                 _ => Some("not-a-limit".to_string()),
             }),
             vec![
                 ("UV_CONCURRENT_DOWNLOADS".to_string(), "4".to_string()),
                 ("UV_CONCURRENT_BUILDS".to_string(), "1".to_string()),
                 ("UV_CONCURRENT_INSTALLS".to_string(), "4".to_string()),
+                ("CARGO_BUILD_JOBS".to_string(), "1".to_string()),
             ],
             "prview may lower an inherited uv cap but must never raise it",
         );

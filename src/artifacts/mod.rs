@@ -1158,10 +1158,9 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
                 ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)?;
                 unreachable!("a cancelled governor fails the index seam");
             }
-            if emit_human_stdout {
-                use colored::Colorize;
-                eprintln!("  {} Index: {}", "\u{26a0}".yellow(), e);
-            }
+            return Err(e.context(
+                "run publication failed; generated files were not committed to discoverable history",
+            ));
         } else if let Err(error) = finish_latest_publication(&latest_transaction) {
             // Index and alias are already consistent. Keep the journal for the
             // next publisher, which will reconcile it idempotently.

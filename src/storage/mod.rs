@@ -147,6 +147,34 @@ fn read_entries_skipping_bad_lines(file: fs::File, path: &Path) -> Vec<RunEntry>
     entries
 }
 
+/// Parse every persisted index row or fail without manufacturing an empty
+/// ledger. Writers and crash recovery use this path because silently dropping
+/// one row and saving the remainder would turn a local corruption into durable
+/// history loss.
+fn read_entries_strict(file: fs::File, path: &Path) -> Result<Vec<RunEntry>> {
+    let reader = std::io::BufReader::new(file);
+    let mut entries = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line_number = idx + 1;
+        let line = line.with_context(|| {
+            format!(
+                "Failed reading run index line {line_number} from {}",
+                path.display()
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        entries.push(serde_json::from_str::<RunEntry>(&line).with_context(|| {
+            format!(
+                "Invalid run index JSON on line {line_number} in {}",
+                path.display()
+            )
+        })?);
+    }
+    Ok(entries)
+}
+
 impl RunIndex {
     /// Load index from `~/.prview/index.jsonl`. Missing/corrupt lines are skipped.
     pub fn load() -> Self {
@@ -156,6 +184,24 @@ impl RunIndex {
             Err(_) => Vec::new(),
         };
         Self { entries }
+    }
+
+    /// Load the canonical index for a read-modify-write transaction.
+    ///
+    /// A missing index is the expected first-run state. Every other open or
+    /// parse error is fatal so publication never persists a fabricated empty
+    /// ledger over historical rows it could not faithfully read.
+    pub(crate) fn load_strict() -> Result<Self> {
+        let path = resolve_explicit_index_path(&index_path())?;
+        let entries = match fs::File::open(&path) {
+            Ok(file) => read_entries_strict(file, &path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed opening run index {}", path.display()));
+            }
+        };
+        Ok(Self { entries })
     }
 
     /// Load index from an explicit path. Missing/corrupt lines are skipped.
@@ -1128,7 +1174,7 @@ pub fn run_runs_command(opts: &RunsOpts) -> Result<()> {
         // read-oriented command.
         match acquire_lock() {
             Ok(_lock) => {
-                let mut idx = RunIndex::load();
+                let mut idx = RunIndex::load_strict()?;
                 let before = idx.entries().len();
                 idx.remove_stale();
                 if idx.entries().len() < before {
@@ -1422,7 +1468,7 @@ fn register_and_prune_with_policy_locked(
     if abort() {
         bail!("publication aborted before the run index was committed");
     }
-    let mut index = RunIndex::load();
+    let mut index = RunIndex::load_strict()?;
     // A previous process may have died after moving retained runs but before
     // committing their removal. Reconcile durable tombstone metadata against
     // the still-persisted index before starting another transaction.
@@ -2297,6 +2343,31 @@ mod tests {
         let reloaded = RunIndex::load_from(&out_path);
         let ids2: Vec<&str> = reloaded.entries().iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids2, vec!["001", "003"]);
+    }
+
+    #[test]
+    fn strict_load_rejects_a_corrupt_index_without_rewriting_it() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let valid = serde_json::to_string(&make_entry("001", "repo", "main", 1000)).unwrap();
+        let original = format!("{valid}\nnot-json\n");
+        fs::write(index_path(), &original).unwrap();
+
+        let error = match RunIndex::load_strict() {
+            Ok(_) => panic!("transactional readers must reject a partial ledger"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("Invalid run index JSON"));
+        assert_eq!(fs::read_to_string(index_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn strict_load_accepts_a_missing_first_run_index() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+
+        assert!(RunIndex::load_strict().unwrap().entries().is_empty());
     }
 
     #[test]

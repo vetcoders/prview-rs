@@ -134,6 +134,11 @@ and returns `run_timeout` with `retry_hint.profile: "deep"`. Success is defined 
 the child's exit code (prview exits non-zero on a `BLOCK` verdict, yet the run is
 a valid completed review). Response:
 
+Completion includes durable publication into prview's run index. If the index
+is unreadable or the finished pack cannot be committed to discoverable history,
+the call returns fail-loud `run_failed`; an unindexed directory is never exposed
+as a completed MCP run.
+
 ```json
 {
   "run_id": "20260701-120000-a1b2c3d",

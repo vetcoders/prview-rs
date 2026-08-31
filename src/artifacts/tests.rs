@@ -248,6 +248,35 @@ fn explicit_output_dir_is_one_immutable_pack_path() {
 }
 
 #[test]
+fn index_commit_failure_is_fatal_and_does_not_publish_a_completed_run() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let pack = output.path().join("pack");
+    let governor = crate::governor::ResourceGovernor::new();
+    crate::storage::arm_test_index_save_failure();
+
+    let error = generate_fixture_pack(repo.path(), &pack, &target_sha, &base_sha, &governor)
+        .expect_err("an unindexed pack must not be reported as completed");
+
+    assert!(
+        error.to_string().contains("run publication failed"),
+        "got {error:#}"
+    );
+    assert!(
+        crate::storage::RunIndex::load().entries().is_empty(),
+        "failed publication must not manufacture an index row"
+    );
+    #[cfg(unix)]
+    assert!(
+        !output.path().join("latest").exists(),
+        "failed publication must roll back its latest advertisement"
+    );
+}
+
+#[test]
 fn mcp_output_reservation_is_strict_and_single_use() {
     let tmp = tempfile::tempdir().expect("output root");
     let pack = tmp.path().join("pack");

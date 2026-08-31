@@ -68,6 +68,13 @@ async fn run() -> Result<()> {
 
     let cli = Cli::parse();
 
+    if cli.build_source_sha {
+        // Build-script provenance is intentionally a private binary probe, not
+        // a new public library API surface.
+        println!("{}", env!("PRVIEW_BUILD_SOURCE_SHA"));
+        return Ok(());
+    }
+
     // Force-disable ANSI color for --no-color / --ci before anything prints.
     // set_override wins over colored's auto-detection; the NO_COLOR env
     // convention is already honored natively by the colored crate.

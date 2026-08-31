@@ -206,8 +206,15 @@ serialized. High current load, or an unavailable load reading, backpressures the
 effective plan to `safe`.
 
 Cold Python environment setup applies the same cap to `UV_CONCURRENT_DOWNLOADS`,
-`UV_CONCURRENT_BUILDS`, and `UV_CONCURRENT_INSTALLS`. If the operator already
-set a lower positive value, prview preserves that stricter limit.
+`UV_CONCURRENT_BUILDS`, `UV_CONCURRENT_INSTALLS`, and `CARGO_BUILD_JOBS` for
+Rust-backed Python packages. Pytest also receives
+`PYTEST_XDIST_AUTO_NUM_WORKERS`; when project or inherited addopts request
+xdist (`-n auto` or explicit `-n N`), a final CLI `-n <limit>` clamps that pool
+to the run plan. If the operator already set a lower positive uv/Cargo value,
+prview preserves that stricter limit. Arbitrary third-party PEP 517 backends can
+still own private worker controls that no portable parent setting can infer;
+they remain serialized as one Exclusive parent rather than being claimed as a
+universally capped child pool.
 
 Before checks start, the human preflight prints the requested/effective budget,
 parent and child caps, expensive tools, and the cheap-first execution schedule.
@@ -473,7 +480,12 @@ process crash **when all publishers are 0.8 or newer**. A journal whose pack is
 missing, malformed, or has a mismatched `RUN.json` identity is never trusted to
 retarget `latest`: prview preserves it as a uniquely named
 `publication-transaction.invalid.*` quarantine file and permits the next clean
-publication instead of permanently denying every later run. The compatibility lock
+publication instead of permanently denying every later run. A valid journal is
+not discarded when the durable index is unreadable: transactional readers
+reject any invalid JSONL row, preserve the journal, and fail the run rather than
+reconstructing or saving a partial ledger. Likewise, failure to commit the
+finished pack into the index is fatal; a pack is not reported as completed when
+`state`/`verdict` could not discover it. The compatibility lock
 serializes the index critical section with pre-0.8 binaries, but it cannot
 serialize their earlier `latest` update. Before installing or starting 0.8,
 drain and exclude every pre-0.8 publisher that shares `PRVIEW_HOME`; concurrent
@@ -497,9 +509,10 @@ restart recovery is independent of a later process's working directory. An
 explicit output path must not already exist: it is atomically claimed for one
 immutable pack and cannot be reused for a later run. This prevents stale files
 and multiple history rows from pretending that one mutable directory contains
-several historical packs. `--watch` therefore cannot be combined with an
-explicit `--output-dir`: watch mode emits a separate immutable pack for every
-iteration through the default unique allocator. MCP keeps the same invariant
+several historical packs. `--watch` and `--tui` therefore cannot be combined
+with an explicit `--output-dir`: each watch iteration and each interactive TUI
+rerun emits a separate immutable pack through the default unique allocator. MCP
+keeps the same invariant
 through a private, one-shot reservation that only its child process can claim;
 ordinary CLI callers cannot adopt an existing directory.
 On Windows, every reparse-point directory or file (including junctions and

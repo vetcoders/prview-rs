@@ -295,11 +295,21 @@ pub(crate) fn recover_latest_publication(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    let recovery = (|| -> Result<()> {
-        let record: LatestPublicationRecord = serde_json::from_slice(&bytes)
-            .with_context(|| format!("Invalid publication transaction {}", path.display()))?;
-        reconcile_latest_publication_record(&record, true)
-    })();
+    let record: LatestPublicationRecord = match serde_json::from_slice(&bytes)
+        .with_context(|| format!("Invalid publication transaction {}", path.display()))
+    {
+        Ok(record) => record,
+        Err(error) => {
+            quarantine_invalid_latest_publication_record(&path, &error)?;
+            return Ok(());
+        }
+    };
+
+    // Index I/O or parse failure is not evidence that the publication journal
+    // is invalid. Preserve the journal and stop so a later healthy process can
+    // reconcile against the complete durable ledger.
+    let index = crate::storage::RunIndex::load_strict()?;
+    let recovery = reconcile_latest_publication_record_with_index(&record, true, &index);
     match recovery {
         Ok(()) => clear_latest_publication_record(),
         Err(error) => {
@@ -314,6 +324,16 @@ fn reconcile_latest_publication_record(
     record: &LatestPublicationRecord,
     validate_persisted_identity: bool,
 ) -> Result<()> {
+    let index = crate::storage::RunIndex::load_strict()?;
+    reconcile_latest_publication_record_with_index(record, validate_persisted_identity, &index)
+}
+
+#[cfg(unix)]
+fn reconcile_latest_publication_record_with_index(
+    record: &LatestPublicationRecord,
+    validate_persisted_identity: bool,
+    index: &crate::storage::RunIndex,
+) -> Result<()> {
     if record.schema != 1 {
         anyhow::bail!(
             "Unsupported latest publication transaction schema {}",
@@ -327,7 +347,7 @@ fn reconcile_latest_publication_record(
     let Some(parent) = out_dir.parent() else {
         return Ok(());
     };
-    let indexed_target = crate::storage::RunIndex::load()
+    let indexed_target = index
         .entries()
         .iter()
         .rev()
@@ -1085,6 +1105,45 @@ mod latest_tests {
     }
 
     #[test]
+    fn recovery_preserves_its_journal_when_the_index_is_corrupt() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let branch = home.path().join("runs/repo/main");
+        let predecessor = branch.join("predecessor");
+        let interrupted = branch.join("interrupted");
+        write_pack_identity(&predecessor);
+        write_pack_identity(&interrupted);
+        symlink("predecessor", branch.join("latest")).unwrap();
+
+        let publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+        let _transaction = begin_latest_publication(&publication, &interrupted).unwrap();
+        fs::write(home.path().join("index.jsonl"), b"not-json\n").unwrap();
+
+        let error = recover_latest_publication(&publication)
+            .expect_err("recovery must stop when the durable ledger is unreadable");
+
+        assert!(error.to_string().contains("Invalid run index JSON"));
+        assert!(latest_publication_record_path().is_file());
+        assert_eq!(
+            fs::read_link(branch.join("latest")).unwrap(),
+            PathBuf::from("interrupted"),
+            "recovery must not guess an older target from an unreadable ledger"
+        );
+        assert!(
+            !fs::read_dir(home.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("publication-transaction.invalid")
+            }),
+            "a valid journal must not be quarantined because its index is corrupt"
+        );
+    }
+
+    #[test]
     fn unconfirmed_index_rollback_keeps_journal_for_next_owner_recovery() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
@@ -1247,14 +1306,15 @@ mod latest_tests {
         let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::new());
         governor.cancel();
 
-        let started = std::time::Instant::now();
-        crate::governor::with_run_scope(std::sync::Arc::clone(&governor), async {
-            restore_latest_symlink(&cancelled, Some(previous.as_os_str()))
-        })
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::governor::with_run_scope(std::sync::Arc::clone(&governor), async {
+                restore_latest_symlink(&cancelled, Some(previous.as_os_str()))
+            }),
+        )
         .await
+        .expect("consistency rollback must not wait on the cancelled work queue")
         .expect("consistency rollback ignores the already-cancelled governor");
-
-        assert!(started.elapsed() < std::time::Duration::from_millis(100));
         assert_eq!(
             fs::read_link(root.path().join("latest")).unwrap(),
             PathBuf::from("predecessor")

@@ -70,7 +70,10 @@ not agree. This proves the CLI default itself resolves to the one-parent,
 one-child `safe` envelope; an explicit selector cannot hide default-wiring
 drift. Semgrep RPC coordinators are reported separately from its actual scan
 workers. The receipt also requires a clean source tree whose `HEAD` is the exact
-candidate SHA; a dirty local build cannot masquerade as exact-SHA evidence. The
+candidate SHA. The release build embeds that exact `PRVIEW_SOURCE_SHA`; the
+harness probes it from the binary, requires it to match the requested commit,
+and records the binary's SHA-256 digest. A dirty or stale local build therefore
+cannot masquerade as exact-SHA evidence. The
 job keeps its failure-shaped receipt under the runner's temporary directory so
 initializing that evidence cannot dirty the checkout it is about to validate.
 It has an internal 20-minute deadline inside a 45-minute Actions timeout, then

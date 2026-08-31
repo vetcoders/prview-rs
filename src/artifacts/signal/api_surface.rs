@@ -249,6 +249,13 @@ struct UseEdge {
     leaves: Vec<UseLeaf>,
 }
 
+#[derive(Debug, Clone)]
+struct SelfCrateAlias {
+    crate_name: String,
+    alias_path: Vec<String>,
+    cfg_guard: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UseLeaf {
     segments: Vec<String>,
@@ -346,6 +353,7 @@ struct SnapshotBuilder<'a> {
     symbols: BTreeMap<SymbolKey, Vec<RawSymbol>>,
     uses: Vec<UseEdge>,
     private_uses: Vec<UseEdge>,
+    self_crate_aliases: Vec<SelfCrateAlias>,
     pending_assoc: Vec<PendingAssoc>,
     pending_trait_impls: Vec<PendingTraitImpl>,
     module_proofs: Vec<ModuleProof>,
@@ -376,6 +384,7 @@ impl<'a> SnapshotBuilder<'a> {
             symbols: BTreeMap::new(),
             uses: Vec::new(),
             private_uses: Vec::new(),
+            self_crate_aliases: Vec::new(),
             pending_assoc: Vec::new(),
             pending_trait_impls: Vec::new(),
             module_proofs: Vec::new(),
@@ -587,8 +596,11 @@ impl<'a> SnapshotBuilder<'a> {
                 .push(declaration.clone());
         }
 
-        let (private_aliases, private_module_aliases) =
-            private_alias_graph(&self.private_uses, &self.declarations);
+        let (private_aliases, private_module_aliases) = private_alias_graph(
+            &self.private_uses,
+            &self.self_crate_aliases,
+            &self.declarations,
+        );
 
         let mut implementation_evidence: BTreeMap<PrivateTypeKey, Vec<GuardedImplEvidence>> =
             BTreeMap::new();
@@ -1599,17 +1611,28 @@ impl<'a> SnapshotBuilder<'a> {
                         self.private_uses.push(edge);
                     }
                 }
-                Item::ExternCrate(item_extern)
-                    if module_reachable && is_public(&item_extern.vis) =>
-                {
-                    self.unknown_guarded(
-                        RustApiUnknownKind::UnsupportedExternResolution,
-                        Some(crate_name),
-                        module_path,
-                        source_path,
-                        &cfg_guard,
-                        canonical_tokens(item_extern.to_token_stream()),
-                    );
+                Item::ExternCrate(item_extern) => {
+                    if normalize_identifier(item_extern.ident.to_string()) == "self"
+                        && let Some((_, alias)) = &item_extern.rename
+                    {
+                        let mut alias_path = module_path.to_vec();
+                        alias_path.push(normalize_identifier(alias.to_string()));
+                        self.self_crate_aliases.push(SelfCrateAlias {
+                            crate_name: crate_name.to_owned(),
+                            alias_path,
+                            cfg_guard: cfg_guard.clone(),
+                        });
+                    }
+                    if module_reachable && is_public(&item_extern.vis) {
+                        self.unknown_guarded(
+                            RustApiUnknownKind::UnsupportedExternResolution,
+                            Some(crate_name),
+                            module_path,
+                            source_path,
+                            &cfg_guard,
+                            canonical_tokens(item_extern.to_token_stream()),
+                        );
+                    }
                 }
                 Item::Impl(item_impl) => self.collect_impl(
                     crate_name,
@@ -2916,8 +2939,11 @@ impl<'a> SnapshotBuilder<'a> {
     }
 
     fn resolve_trait_impls(&mut self) {
-        let (private_aliases, private_module_aliases) =
-            private_alias_graph(&self.private_uses, &self.declarations);
+        let (private_aliases, private_module_aliases) = private_alias_graph(
+            &self.private_uses,
+            &self.self_crate_aliases,
+            &self.declarations,
+        );
         for pending in self.pending_trait_impls.clone() {
             let initial_trait_key = (
                 pending.crate_name.clone(),
@@ -6055,6 +6081,7 @@ fn api_crate_manifests(
 
 fn private_alias_graph(
     private_uses: &[UseEdge],
+    self_crate_aliases: &[SelfCrateAlias],
     declarations: &[RustApiDeclaration],
 ) -> (
     BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
@@ -6127,6 +6154,18 @@ fn private_alias_graph(
                     .push((path, edge.cfg_guard.clone()));
             }
         }
+    }
+
+    // `extern crate self as alias` binds a module path back to the current
+    // crate root. It participates in private type dependency resolution even
+    // when the binding itself is not public; otherwise `alias::Hidden` is
+    // mistaken for an unrelated local module and a private layout/auto-trait
+    // change can disappear behind stable placeholder evidence.
+    for alias in self_crate_aliases {
+        private_module_aliases
+            .entry((alias.crate_name.clone(), alias.alias_path.clone()))
+            .or_default()
+            .push((Vec::new(), alias.cfg_guard.clone()));
     }
 
     for declaration in declarations
@@ -9178,6 +9217,26 @@ mod tests {
             private_dependency_evidence(&dep_a, "make"),
             private_dependency_evidence(&dep_b, "make"),
             "a private alias retarget must not disappear when neither external terminal has a local declaration"
+        );
+    }
+
+    #[test]
+    fn private_dependency_resolves_extern_crate_self_alias_to_the_real_root_type() {
+        let base = snapshot_rust_api(&source(
+            "extern crate self as alias; struct Hidden(u8); \
+             pub struct Api(pub alias::Hidden);",
+        ));
+        let changed = snapshot_rust_api(&source(
+            "extern crate self as alias; struct Hidden(std::rc::Rc<()>); \
+             pub struct Api(pub alias::Hidden);",
+        ));
+
+        let base_evidence = private_dependency_evidence(&base, "Api");
+        let changed_evidence = private_dependency_evidence(&changed, "Api");
+
+        assert_ne!(
+            base_evidence, changed_evidence,
+            "a private type change behind extern crate self must not become a false-green delta"
         );
     }
 

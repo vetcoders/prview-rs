@@ -258,12 +258,20 @@ pub struct Cli {
     pub tui: bool,
 
     /// Override the artifacts output directory (default: ~/.prview/runs/<repo>/<branch>/<run_id>/)
-    #[arg(long = "output-dir", value_name = "PATH", conflicts_with = "watch")]
+    #[arg(
+        long = "output-dir",
+        value_name = "PATH",
+        conflicts_with_all = ["watch", "tui"]
+    )]
     pub output_dir: Option<PathBuf>,
 
     /// Print shell alias setup instructions and exit
     #[arg(long = "shell-setup")]
     pub shell_setup: bool,
+
+    /// Internal: print the exact source SHA embedded by the build and exit
+    #[arg(long = "build-source-sha", hide = true)]
+    pub build_source_sha: bool,
 
     /// Explain why the merge gate is blocking (human-readable)
     #[arg(long = "why-blocked")]
@@ -639,6 +647,7 @@ mod tests {
             tui: false,
             output_dir: None,
             shell_setup: false,
+            build_source_sha: false,
             why_blocked: false,
         }
     }
@@ -660,11 +669,27 @@ mod tests {
     }
 
     #[test]
+    fn hidden_build_source_probe_parses_without_a_repository_target() {
+        let cli = Cli::try_parse_from(["prview", "--build-source-sha"])
+            .expect("private provenance probe");
+        assert!(cli.build_source_sha);
+    }
+
+    #[test]
     fn watch_rejects_one_fixed_immutable_output_path() {
         let error = Cli::try_parse_from(["prview", "--watch", "--output-dir", "review-pack"])
             .expect_err("watch needs a fresh default run path for every iteration");
         let rendered = error.to_string();
         assert!(rendered.contains("--watch"), "got: {rendered}");
+        assert!(rendered.contains("--output-dir"), "got: {rendered}");
+    }
+
+    #[test]
+    fn tui_rejects_one_fixed_immutable_output_path() {
+        let error = Cli::try_parse_from(["prview", "--tui", "--output-dir", "review-pack"])
+            .expect_err("TUI reruns need a fresh default run path for every analysis");
+        let rendered = error.to_string();
+        assert!(rendered.contains("--tui"), "got: {rendered}");
         assert!(rendered.contains("--output-dir"), "got: {rendered}");
     }
 

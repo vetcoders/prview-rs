@@ -9,24 +9,24 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static TEST_TAR_PROGRAM: std::cell::RefCell<Option<std::ffi::OsString>> = const {
         std::cell::RefCell::new(None)
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct TestTarOverride(Option<std::ffi::OsString>);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for TestTarOverride {
     fn drop(&mut self) {
         TEST_TAR_PROGRAM.with(|program| *program.borrow_mut() = self.0.take());
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn override_test_tar_program(program: impl Into<std::ffi::OsString>) -> TestTarOverride {
     let previous = TEST_TAR_PROGRAM.with(|slot| slot.borrow_mut().replace(program.into()));
     TestTarOverride(previous)

@@ -322,6 +322,16 @@ dependency set is still installed and judged, in a prview-owned environment kept
 warm across runs. A local review sets no override and uses the checkout's own
 environment exactly as before.
 
+The cold `uv sync` pre-step is resolved only after the run-wide target snapshot
+exists, through that same `plan_python_run()`. Its cwd and
+`UV_PROJECT_ENVIRONMENT` are therefore identical to the later gates; it never
+syncs an off-HEAD dependency set into the operator checkout. uv download/build/
+install pools and Cargo-backed PEP 517 builds inherit the run's child limit.
+Pytest-xdist gets the same limit through its auto-worker environment and a final
+CLI override whenever repo or inherited addopts request xdist. Unknown build
+backends remain one serialized Exclusive parent; the governor does not claim to
+discover every third-party backend's private thread knob.
+
 That environment is per reviewed **commit**, not per repository. `uv run` syncs
 before executing and releases the environment lock while the child command runs,
 so two concurrent prview processes reviewing different commits of one repo would
@@ -989,6 +999,11 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
   or above `0.75/core` (or an unavailable load reading) backpressures a requested
   balanced run to the safe plan. This is a CPU/memory envelope, not a claim that
   future peak memory can be predicted exactly.
+- **Python descendants use the same plan.** The pre-sync and Python gates share
+  one reviewed snapshot and per-commit uv environment. uv pools, Cargo-backed
+  package builds, and pytest-xdist are clamped to the child-worker limit. A
+  third-party PEP 517 backend with its own undocumented pool is still serialized
+  at the parent level but is not falsely advertised as internally capped.
 - **A permit is held, never released by hand.** `GovernorPermit` returns the
   permits on drop, so an error path cannot leak budget.
 - **Cancellation closes the semaphore.** That refuses a newcomer and a task
@@ -1132,6 +1147,11 @@ advertised alias, so stale or tampered recovery evidence cannot deny all future
 publications. The shared review worktree is explicitly removed before either
 advertisement; cancellation during that governed cleanup therefore produces an
 incomplete, unpublished pack rather than exit 130 after a published verdict.
+A valid journal is preserved when `index.jsonl` cannot be opened or parsed.
+Publication and recovery use a strict loader that rejects every malformed row;
+they never turn partial input into a rewritten partial ledger. Failure to commit
+the finished pack into that ledger is a fatal generation error, because a pack
+that `state` and MCP cannot discover is not a completed publication.
 A cancellation that wins after the alias swap performs a
 short, uninterruptible consistency rollback while it still owns that lock. The
 index append itself is abortable: the file is saved only while the run is still
@@ -1246,7 +1266,9 @@ mirror `run_all`. Artifact generation on the TUI path uses the same
 poll q/Escape while the pack is being written. The initial repository/ref
 preflight is the exception: it runs before raw mode under a temporary Ctrl-C
 signal supervisor, so a slow fetch cannot enter a window where signals are
-disabled but the terminal event reader does not yet exist.
+disabled but the terminal event reader does not yet exist. A post-stage cancel
+check prevents an interrupt that lands after fetch but before state resolution
+finishes from entering raw mode with an already-cancelled governor.
 
 **Operator surface.** `--resource-budget safe|balanced` selects the plan; preflight
 prints requested/effective budget, parent permits, child-worker cap, current-load
@@ -1434,7 +1456,10 @@ changed included source keeps the unknown active instead of treating an
 identical invocation as unchanged. A reachable `pub extern crate` is likewise
 retained as guarded `UnsupportedExternResolution` until external/prelude
 resolution exists; private or unreachable declarations do not create external
-semantic surface.
+semantic surface. A private `extern crate self as alias` is nevertheless a
+same-crate module binding for dependency resolution: `alias::Hidden` is followed
+back to the root `Hidden` declaration so its layout/auto-trait uncertainty stays
+attached to the public owner that exposes it.
 Semantic proof comparison includes the public unknown's kind, crate/module
 location, exact evidence, and guards, while continuing to exclude source paths,
 provenance, and private reexport target/origin spelling. A public reexport's

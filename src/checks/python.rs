@@ -58,12 +58,12 @@ fn missing_reviewed_python_project(config: &Config) -> Option<String> {
 }
 
 /// Where a python check must execute, plus the environment it needs there.
-struct PythonRun {
+pub(super) struct PythonRun {
     /// Directory to run the tool in — the reviewed snapshot in `--pr`/`--remote`
     /// mode, the local checkout otherwise.
-    cwd: PathBuf,
+    pub(super) cwd: PathBuf,
     /// Extra child environment (`UV_PROJECT_ENVIRONMENT`), empty for a local run.
-    env: Vec<(String, String)>,
+    pub(super) env: Vec<(String, String)>,
     /// Ephemeral snapshot, kept alive until the check finishes.
     _snapshot: Option<crate::git::WorktreeSnapshot>,
 }
@@ -92,7 +92,7 @@ struct PythonRun {
 ///
 /// A local review (target == `HEAD`) sets no environment override and behaves
 /// exactly as before.
-fn plan_python_run(config: &Config) -> Result<PythonRun> {
+pub(super) fn plan_python_run(config: &Config) -> Result<PythonRun> {
     let plan = plan_check_run(config)?;
     metadata_stays_in_project(&plan.scan_dir)?;
     let env = if plan.scan_dir == config.repo_root {
@@ -118,6 +118,112 @@ fn plan_python_run(config: &Config) -> Result<PythonRun> {
 /// configuration from it, and uv discovers the project through it. `uv.lock`
 /// pins the dependency set that gets installed and imported.
 const PYTHON_PROJECT_METADATA: &[&str] = &["pyproject.toml", "uv.lock"];
+const PYTEST_CONFIG_FILES: &[&str] = &["pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini"];
+
+fn contains_xdist_worker_option(value: &str) -> bool {
+    value.split_whitespace().any(|token| {
+        token == "-n"
+            || token.strip_prefix("-n").is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && (suffix.bytes().all(|byte| byte.is_ascii_digit())
+                        || matches!(suffix, "auto" | "logical"))
+            })
+            || token == "--numprocesses"
+            || token.starts_with("--numprocesses=")
+    })
+}
+
+fn pytest_config_addopts(name: &str, contents: &str) -> Option<String> {
+    if name == "pyproject.toml" {
+        let value = toml::from_str::<toml::Value>(contents).ok()?;
+        let addopts = value
+            .get("tool")?
+            .get("pytest")?
+            .get("ini_options")?
+            .get("addopts")?;
+        return match addopts {
+            toml::Value::String(value) => Some(value.clone()),
+            toml::Value::Array(values) => Some(
+                values
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => None,
+        };
+    }
+
+    let wanted_section = if name == "setup.cfg" {
+        "tool:pytest"
+    } else {
+        "pytest"
+    };
+    let mut in_pytest = false;
+    let mut collecting = false;
+    let mut addopts = String::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if collecting {
+                break;
+            }
+            in_pytest = trimmed[1..trimmed.len() - 1].trim() == wanted_section;
+            continue;
+        }
+        if !in_pytest || trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';')
+        {
+            continue;
+        }
+        if collecting {
+            if line.chars().next().is_some_and(char::is_whitespace) {
+                addopts.push(' ');
+                addopts.push_str(trimmed);
+                continue;
+            }
+            break;
+        }
+        if let Some((key, value)) = trimmed.split_once('=')
+            && key.trim() == "addopts"
+        {
+            addopts.push_str(value.trim());
+            collecting = true;
+        }
+    }
+    (!addopts.is_empty()).then_some(addopts)
+}
+
+fn pytest_requests_xdist(root: &Path, inherited_addopts: Option<&str>) -> bool {
+    inherited_addopts.is_some_and(contains_xdist_worker_option)
+        || PYTEST_CONFIG_FILES.iter().any(|name| {
+            std::fs::read_to_string(root.join(name))
+                .ok()
+                .and_then(|contents| pytest_config_addopts(name, &contents))
+                .is_some_and(|addopts| contains_xdist_worker_option(&addopts))
+        })
+}
+
+fn bounded_pytest_invocation(
+    root: &Path,
+    base_env: &[(String, String)],
+    worker_limit: u32,
+    inherited_addopts: Option<&str>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let worker_limit = worker_limit.max(1);
+    let mut args = vec!["-v".to_owned()];
+    if pytest_requests_xdist(root, inherited_addopts) {
+        // Pytest prepends ini/PYTEST_ADDOPTS before explicit CLI arguments, so
+        // this final option clamps both `-n auto` and an explicit `-n N`.
+        args.extend(["-n".to_owned(), worker_limit.to_string()]);
+    }
+    let mut env = base_env.to_vec();
+    env.retain(|(key, _)| key != "PYTEST_XDIST_AUTO_NUM_WORKERS");
+    env.push((
+        "PYTEST_XDIST_AUTO_NUM_WORKERS".to_owned(),
+        worker_limit.to_string(),
+    ));
+    (args, env)
+}
 
 /// Refuse project metadata that resolves outside the tree being judged.
 ///
@@ -522,24 +628,34 @@ impl Check for PytestCheck {
         // to `repo_root`, so that path is unchanged.
         let plan = plan_python_run(config)?;
         let run_dir = &plan.cwd;
+        let inherited_addopts = std::env::var("PYTEST_ADDOPTS").ok();
+        let (pytest_args, pytest_env) = bounded_pytest_invocation(
+            run_dir,
+            &plan.env,
+            config.resource_plan.worker_limit,
+            inherited_addopts.as_deref(),
+        );
+        let pytest_arg_refs: Vec<&str> = pytest_args.iter().map(String::as_str).collect();
 
         let use_uv = which::which("uv").is_ok();
         let output = if use_uv {
+            let mut uv_args = vec!["run", "pytest"];
+            uv_args.extend(pytest_arg_refs.iter().copied());
             run_command_with_timeout_and_env(
                 "uv",
-                &["run", "pytest", "-v"],
+                &uv_args,
                 run_dir,
                 TEST_TIMEOUT_SECS,
-                &plan.env,
+                &pytest_env,
             )
             .await?
         } else {
             run_command_with_timeout_and_env(
                 "pytest",
-                &["-v"],
+                &pytest_arg_refs,
                 run_dir,
                 TEST_TIMEOUT_SECS,
-                &plan.env,
+                &pytest_env,
             )
             .await?
         };
@@ -555,10 +671,11 @@ impl Check for PytestCheck {
             CheckStatus::Failed
         };
 
+        let pytest_command = pytest_args.join(" ");
         let cmd_str = if use_uv {
-            "uv run pytest -v"
+            format!("uv run pytest {pytest_command}")
         } else {
-            "pytest -v"
+            format!("pytest {pytest_command}")
         };
         Ok(CheckResult {
             name: self.name().to_string(),
@@ -568,7 +685,7 @@ impl Check for PytestCheck {
             cached: false,
             provenance: Some(
                 CheckProvenance {
-                    command: cmd_str.to_string(),
+                    command: cmd_str,
                     tool_version: None,
                     cwd: run_dir.display().to_string(),
                     exit_code: output.status.code(),
@@ -930,6 +1047,81 @@ mod tests {
         assert!(
             run.env.is_empty(),
             "a local review must keep using the checkout's own environment",
+        );
+    }
+
+    #[test]
+    fn pytest_xdist_requests_are_clamped_to_the_run_worker_limit() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[tool.pytest.ini_options]\naddopts = '-n auto'\n",
+        )
+        .unwrap();
+
+        let (args, env) = bounded_pytest_invocation(root.path(), &[], 1, None);
+        assert_eq!(args, ["-v", "-n", "1"]);
+        assert!(
+            env.iter()
+                .any(|(key, value)| { key == "PYTEST_XDIST_AUTO_NUM_WORKERS" && value == "1" })
+        );
+
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[tool.pytest.ini_options]\n",
+        )
+        .unwrap();
+        let (args, _) = bounded_pytest_invocation(root.path(), &[], 2, Some("-n 12"));
+        assert_eq!(args, ["-v", "-n", "2"]);
+    }
+
+    #[test]
+    fn unrelated_xdist_text_does_not_inject_a_missing_plugin_option() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\ndescription = 'documentation mentions pytest -n auto'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("setup.cfg"),
+            "[metadata]\ndescription = examples use -n 12\n",
+        )
+        .unwrap();
+
+        let (args, _) = bounded_pytest_invocation(root.path(), &[], 1, None);
+
+        assert_eq!(args, ["-v"]);
+    }
+
+    #[test]
+    fn multiline_ini_addopts_are_clamped() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(
+            root.path().join("pytest.ini"),
+            "[pytest]\naddopts = -q\n    --numprocesses=logical\n",
+        )
+        .unwrap();
+
+        let (args, _) = bounded_pytest_invocation(root.path(), &[], 3, None);
+
+        assert_eq!(args, ["-v", "-n", "3"]);
+    }
+
+    #[test]
+    fn serial_pytest_keeps_its_command_but_caps_a_plugin_auto_pool() {
+        let root = tempfile::tempdir().expect("pytest project");
+        let base_env = vec![("UV_PROJECT_ENVIRONMENT".to_owned(), "env".to_owned())];
+
+        let (args, env) = bounded_pytest_invocation(root.path(), &base_env, 1, None);
+
+        assert_eq!(args, ["-v"]);
+        assert_eq!(
+            env,
+            [
+                ("UV_PROJECT_ENVIRONMENT".to_owned(), "env".to_owned()),
+                ("PYTEST_XDIST_AUTO_NUM_WORKERS".to_owned(), "1".to_owned()),
+            ]
         );
     }
 

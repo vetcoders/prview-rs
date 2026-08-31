@@ -7,24 +7,24 @@
 
 use std::process::Command;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static TEST_GIT_PROGRAM: std::cell::RefCell<Option<std::ffi::OsString>> = const {
         std::cell::RefCell::new(None)
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct TestGitOverride(Option<std::ffi::OsString>);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for TestGitOverride {
     fn drop(&mut self) {
         TEST_GIT_PROGRAM.with(|program| *program.borrow_mut() = self.0.take());
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn override_test_git_program(program: impl Into<std::ffi::OsString>) -> TestGitOverride {
     let previous = TEST_GIT_PROGRAM.with(|slot| slot.borrow_mut().replace(program.into()));
     TestGitOverride(previous)

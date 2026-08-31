@@ -18,6 +18,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Off-HEAD Python pre-sync now runs on the shared reviewed snapshot with the
+  same per-commit `UV_PROJECT_ENVIRONMENT` as Ruff, Mypy, and Pytest; it no
+  longer mutates the operator checkout's environment or warms a venv the gates
+  do not use. The safe child cap also reaches `pytest-xdist` (`-n auto` and
+  explicit `-n N`) and Rust-backed Python package builds through
+  `CARGO_BUILD_JOBS`.
+- Run publication fails closed when the durable index cannot be read or when a
+  completed pack cannot be committed to discoverable history. Transactional
+  readers reject corrupt JSONL instead of saving a fabricated partial ledger,
+  and latest-journal recovery preserves a valid journal until the index is
+  readable again.
+- Ordinary-machine bounded-runtime receipts bind their release binary to the
+  exact clean source commit through an embedded build SHA and record the
+  binary's SHA-256 digest; an old binary beside a new checkout cannot produce
+  exact-SHA evidence.
+- Private Rust API dependency resolution follows `extern crate self as alias`
+  back to the crate root, so a private layout or auto-trait change behind
+  `alias::Type` cannot disappear as stable unresolved evidence.
+- TUI startup converts a late preflight interrupt into typed cancellation
+  before entering raw mode. `--tui` now rejects one fixed immutable
+  `--output-dir`, just like `--watch`, because every rerun needs a fresh pack.
+- Unix-only Git/tar test overrides are compiled only on Unix, allowing the
+  Windows process-tree cancellation job to compile under `-D warnings`.
+- Publication rollback tests use a bounded completion deadline instead of a
+  scheduler-sensitive sub-100ms assertion.
+- Fast remote-only preflight no longer lists TSC or ESLint as expensive work
+  when that preset will skip those gates.
 - MCP Quick and Deep reserve their output path through a private one-shot nonce
   before launching the child, then adopt only that fresh control-only directory.
   Public `--output-dir` remains immutable and cannot reuse an existing pack;

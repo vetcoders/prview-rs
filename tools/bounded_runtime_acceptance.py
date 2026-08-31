@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
@@ -396,6 +397,27 @@ def source_tree_observation(root: pathlib.Path) -> dict[str, Any]:
     }
 
 
+def binary_observation(path: pathlib.Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    probe = subprocess.run(
+        [str(path), "--build-source-sha"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    return {
+        "path": str(path),
+        "sha256": digest.hexdigest(),
+        "embedded_source_sha": probe.stdout.strip() if probe.returncode == 0 else None,
+        "probe_exit_code": probe.returncode,
+        "probe_stderr": probe.stderr.strip() or None,
+    }
+
+
 def add_assertion(violations: list[str], condition: bool, message: str) -> None:
     if not condition:
         violations.append(message)
@@ -551,7 +573,7 @@ def main() -> int:
     receipt_path = args.receipt_dir / "receipt.json"
     log_path = args.receipt_dir / "prview.log"
     receipt: dict[str, Any] = {
-        "schema": "prview.bounded-runtime-acceptance.v1",
+        "schema": "prview.bounded-runtime-acceptance.v2",
         "status": "failed",
         "source_sha": args.source_sha,
         "started_at": utc_now(),
@@ -595,6 +617,12 @@ def main() -> int:
     try:
         source_root = pathlib.Path(__file__).resolve().parent.parent
         receipt["source_tree"] = source_tree_observation(source_root)
+        binary = (
+            args.binary.resolve()
+            if args.binary is not None and args.binary.is_file()
+            else None
+        )
+        receipt["binary"] = binary_observation(binary) if binary is not None else None
         add_assertion(
             receipt["violations"],
             re.fullmatch(r"[0-9a-fA-F]{40}", args.source_sha) is not None,
@@ -612,8 +640,21 @@ def main() -> int:
         )
         add_assertion(
             receipt["violations"],
-            args.binary is not None and args.binary.is_file(),
+            binary is not None,
             "release binary is missing",
+        )
+        add_assertion(
+            receipt["violations"],
+            receipt["binary"] is not None
+            and receipt["binary"]["probe_exit_code"] == 0,
+            "release binary source probe failed",
+        )
+        add_assertion(
+            receipt["violations"],
+            receipt["binary"] is not None
+            and str(receipt["binary"]["embedded_source_sha"] or "").lower()
+            == args.source_sha.lower(),
+            "release binary was not built from the requested source SHA",
         )
         add_assertion(
             receipt["violations"],
@@ -627,7 +668,7 @@ def main() -> int:
             repo = prepare_fixture(args.fixture.resolve(), work, log_path)
             pack = repo / ".acceptance-pack"
             command = [
-                str(args.binary.resolve()),
+                str(binary),
                 "--deep",
                 "--no-cache",
                 "--no-fetch",
