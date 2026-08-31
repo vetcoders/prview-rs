@@ -75,7 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TraitImplResolution` unknowns without relying on a hard-coded trait-name
   allowlist.
 - Private-field type changes on a public struct (for example `u8` → `Rc<()>`,
-  which drops `Send`/`Sync`) change the parent contract.
+  which drops `Send`/`Sync`) change the parent contract, while a pure private
+  field reorder under the default/`repr(Rust)` layout does not.
 - TUI/headless `git fetch` and `git archive | tar` register with the run
   governor, so q/Escape/Ctrl-C can stop the sync phase.
 - Context commands share one stage timeout instead of minting a fresh deadline
@@ -89,6 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Public trait-impl evidence alpha-normalizes impl-level generic binders, so
   renaming `impl<T> Trait for Wrapper<T>` to `impl<U> Trait for Wrapper<U>`
   is not a review-required unknown delta.
+- Public trait associated const/type members reuse the same alpha-normalized
+  binder scopes, and named fields added to a variant-level `#[non_exhaustive]`
+  variant remain informational rather than a parent breaking change.
 - Public trait impls declared in private helper modules are retained as
   `TraitImplResolution` unknowns instead of disappearing from the delta.
 - Retargeting a public reexport between two still-public types is a compared

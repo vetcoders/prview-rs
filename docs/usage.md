@@ -535,9 +535,12 @@ visibility-changed Rust facts are breaking; added-only facts are informational.
 Typed unknowns degrade confidence and require review without claiming a
 confirmed removal. Rust identities include ordinary type/value/macro items plus
 public modules, library crates, and Cargo features. Tuple-constructor privacy,
-explicit `repr(...)` private layout, and exhaustive-enum variant additions are
-observable changes; additions to an otherwise unchanged `#[non_exhaustive]`
-enum are informational unless an ABI-sensitive `repr` makes layout observable.
+ABI-sensitive `repr(C)`/`repr(packed)`/`repr(transparent)` private layout, and
+exhaustive-enum variant additions are observable changes. `repr(Rust)` private
+field order is not, although private field types remain observable through auto
+traits. Additions to an otherwise unchanged `#[non_exhaustive]` enum, and named
+fields added to a variant-level `#[non_exhaustive]` variant, are informational
+unless an ABI-sensitive repr makes layout observable.
 Expression-position include macros retain included-byte digests, and
 transforming-attribute unknowns are bound to their annotated input. Legal
 non-UTF-8 Git paths emit side-specific typed path uncertainty while valid sibling

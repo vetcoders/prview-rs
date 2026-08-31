@@ -434,16 +434,38 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
         public_enum_contract(&after.contract),
     ) {
         (Some(before_enum), Some(after_enum)) => {
-            let additive_non_exhaustive = before_enum.non_exhaustive
-                && after_enum.non_exhaustive
-                && !before_enum.layout_sensitive
+            let new_variants = after_enum
+                .variants
+                .keys()
+                .filter(|name| !before_enum.variants.contains_key(*name))
+                .cloned()
+                .collect::<Vec<_>>();
+            let outer_variant_addition_allowed = new_variants.is_empty()
+                || (before_enum.non_exhaustive && after_enum.non_exhaustive);
+            let mut added_variant_fields = Vec::new();
+            let existing_variants_compatible = before_enum.variants.iter().all(|(name, before)| {
+                let Some(after) = after_enum.variants.get(name) else {
+                    return false;
+                };
+                if before == after {
+                    return true;
+                }
+                let Some(fields) = additive_non_exhaustive_variant_fields(before, after) else {
+                    return false;
+                };
+                added_variant_fields.extend(
+                    fields
+                        .into_iter()
+                        .map(|(field, contract)| (name.clone(), field, contract)),
+                );
+                true
+            });
+            let additive_non_exhaustive = !before_enum.layout_sensitive
                 && !after_enum.layout_sensitive
                 && before_enum.header == after_enum.header
-                && after_enum.variants.len() > before_enum.variants.len()
-                && before_enum
-                    .variants
-                    .iter()
-                    .all(|(name, contract)| after_enum.variants.get(name) == Some(contract));
+                && outer_variant_addition_allowed
+                && existing_variants_compatible
+                && (!new_variants.is_empty() || !added_variant_fields.is_empty());
             if additive_non_exhaustive {
                 for (name, contract) in after_enum
                     .variants
@@ -456,6 +478,23 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
                         after_variant.identity.clone(),
                         None,
                         Some(after_variant),
+                    ));
+                }
+                for (variant, field, contract) in added_variant_fields {
+                    let after_variant = variant_side(
+                        after,
+                        &variant,
+                        after_enum
+                            .variants
+                            .get(&variant)
+                            .expect("compatible variant remains present"),
+                    );
+                    let after_field = field_side(&after_variant, &field, &contract);
+                    delta.added.push(known_finding(
+                        ApiDeltaKind::Added,
+                        after_field.identity.clone(),
+                        None,
+                        Some(after_field),
                     ));
                 }
             } else {
@@ -561,6 +600,80 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
             Some(after.clone()),
         ));
     }
+}
+
+/// Return fields added to an existing variant that explicitly opted downstream
+/// callers out of exhaustive construction and matching.
+///
+/// This first cut is deliberately named-field only. Tuple arity has additional
+/// constructor and pattern ergonomics, so it stays on the conservative parent
+/// `Changed` path until its exact compatibility contract is proven separately.
+fn additive_non_exhaustive_variant_fields(
+    before: &str,
+    after: &str,
+) -> Option<Vec<(String, String)>> {
+    fn parse_variant(contract: &str) -> Option<syn::Variant> {
+        let item =
+            syn::parse_str::<syn::ItemEnum>(&format!("enum __Prview {{ {contract} }}")).ok()?;
+        item.variants.into_iter().next()
+    }
+
+    let before = parse_variant(before)?;
+    let after = parse_variant(after)?;
+    let is_non_exhaustive = |variant: &syn::Variant| {
+        variant
+            .attrs
+            .iter()
+            .any(|attribute| attribute.path().is_ident("non_exhaustive"))
+    };
+    if !is_non_exhaustive(&before) || !is_non_exhaustive(&after) {
+        return None;
+    }
+
+    let syn::Fields::Named(before_fields) = &before.fields else {
+        return None;
+    };
+    let syn::Fields::Named(after_fields) = &after.fields else {
+        return None;
+    };
+
+    let mut before_header = before.clone();
+    before_header.fields = syn::Fields::Unit;
+    let mut after_header = after.clone();
+    after_header.fields = syn::Fields::Unit;
+    if quote::ToTokens::to_token_stream(&before_header).to_string()
+        != quote::ToTokens::to_token_stream(&after_header).to_string()
+    {
+        return None;
+    }
+
+    let field_map = |fields: &syn::FieldsNamed| {
+        fields
+            .named
+            .iter()
+            .filter_map(|field| {
+                Some((
+                    field.ident.as_ref()?.to_string(),
+                    quote::ToTokens::to_token_stream(field).to_string(),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before_fields = field_map(before_fields);
+    let after_fields = field_map(after_fields);
+    if after_fields.len() <= before_fields.len()
+        || !before_fields
+            .iter()
+            .all(|(name, contract)| after_fields.get(name) == Some(contract))
+    {
+        return None;
+    }
+    Some(
+        after_fields
+            .into_iter()
+            .filter(|(name, _)| !before_fields.contains_key(name))
+            .collect(),
+    )
 }
 
 struct PublicEnumContract {
@@ -2036,6 +2149,71 @@ mod tests {
             }),
             "ABI-sensitive enums stay on the parent Changed path"
         );
+
+        let repr_rust_delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[repr(Rust)] #[non_exhaustive] pub enum Flexible { A }\n",
+                "#[repr(Rust)] #[non_exhaustive] pub enum Flexible { A, B }\n",
+            ),
+        ]);
+        assert!(repr_rust_delta.added.iter().any(|finding| {
+            finding.identity.name == "B" && finding.identity.module_path == ["Flexible".to_owned()]
+        }));
+        assert!(!repr_rust_delta.changed.iter().any(|finding| {
+            finding.identity.name == "Flexible" && finding.identity.namespace == "type"
+        }));
+    }
+
+    #[test]
+    fn variant_level_non_exhaustive_named_field_addition_is_informational() {
+        let additive = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub enum Message { #[non_exhaustive] Data { value: u8 } }\n",
+                "pub enum Message { #[non_exhaustive] Data { value: u8, extra: u16 } }\n",
+            ),
+        ]);
+        assert!(additive.added.iter().any(|finding| {
+            finding.identity.name == "extra"
+                && finding.identity.module_path == ["Message".to_owned(), "Data".to_owned()]
+        }));
+        assert!(!additive.changed.iter().any(|finding| {
+            finding.identity.name == "Message" && finding.identity.namespace == "type"
+        }));
+
+        for (before, after) in [
+            (
+                "pub enum Message { Data { value: u8 } }\n",
+                "pub enum Message { Data { value: u8, extra: u16 } }\n",
+            ),
+            (
+                "pub enum Message { #[non_exhaustive] Data { value: u8 } }\n",
+                "pub enum Message { #[non_exhaustive] Data { value: u16 } }\n",
+            ),
+        ] {
+            let breaking = repository_delta(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("src/lib.rs", before, after),
+            ]);
+            assert!(breaking.changed.iter().any(|finding| {
+                finding.identity.name == "Message" && finding.identity.namespace == "type"
+            }));
+        }
     }
 
     #[test]

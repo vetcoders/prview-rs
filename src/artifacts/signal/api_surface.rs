@@ -2826,7 +2826,7 @@ fn normalized_contract(mut item: Item) -> String {
             trim_signature_punctuation(&mut function.sig);
         }
         Item::Struct(value) => {
-            let layout_sensitive = has_explicit_repr(&value.attrs);
+            let layout_sensitive = has_layout_sensitive_repr(&value.attrs);
             let mut normalizer = SignatureAlphaNormalizer::default();
             normalizer.push_generics(&value.generics);
             value.generics = normalizer.fold_generics(value.generics.clone());
@@ -2839,7 +2839,7 @@ fn normalized_contract(mut item: Item) -> String {
             trim_generics_punctuation(&mut value.generics);
         }
         Item::Union(value) => {
-            let layout_sensitive = has_explicit_repr(&value.attrs);
+            let layout_sensitive = has_layout_sensitive_repr(&value.attrs);
             let mut fields = Fields::Named(value.fields.clone());
             let mut normalizer = SignatureAlphaNormalizer::default();
             normalizer.push_generics(&value.generics);
@@ -2884,11 +2884,39 @@ fn normalized_contract(mut item: Item) -> String {
                 .collect();
             trim_generics_punctuation(&mut value.generics);
             for trait_item in &mut value.items {
-                if let syn::TraitItem::Fn(function) = trait_item {
-                    function.default = None;
-                    function.semi_token = Some(Default::default());
-                    normalizer.normalize_signature(&mut function.sig);
-                    trim_signature_punctuation(&mut function.sig);
+                match trait_item {
+                    syn::TraitItem::Const(value) => {
+                        normalizer.push_generics(&value.generics);
+                        value.generics = normalizer.fold_generics(value.generics.clone());
+                        value.ty = normalizer.fold_type(value.ty.clone());
+                        if let Some((eq, default)) = value.default.take() {
+                            value.default = Some((eq, normalizer.fold_expr(default)));
+                        }
+                        trim_generics_punctuation(&mut value.generics);
+                        normalizer.pop_scope();
+                    }
+                    syn::TraitItem::Fn(function) => {
+                        function.default = None;
+                        function.semi_token = Some(Default::default());
+                        normalizer.normalize_signature(&mut function.sig);
+                        trim_signature_punctuation(&mut function.sig);
+                    }
+                    syn::TraitItem::Type(value) => {
+                        normalizer.push_generics(&value.generics);
+                        value.generics = normalizer.fold_generics(value.generics.clone());
+                        value.bounds = value
+                            .bounds
+                            .clone()
+                            .into_iter()
+                            .map(|bound| normalizer.fold_type_param_bound(bound))
+                            .collect();
+                        if let Some((eq, default)) = value.default.take() {
+                            value.default = Some((eq, normalizer.fold_type(default)));
+                        }
+                        trim_generics_punctuation(&mut value.generics);
+                        normalizer.pop_scope();
+                    }
+                    _ => {}
                 }
             }
             normalizer.pop_scope();
@@ -2934,9 +2962,42 @@ fn normalized_macro_contract(item: &syn::ItemMacro) -> String {
     canonical_tokens(item.to_token_stream())
 }
 
-fn filter_private_fields(fields: &mut Fields, _layout_sensitive: bool) {
+fn filter_private_fields(fields: &mut Fields, layout_sensitive: bool) {
     match fields {
         Fields::Named(named) => {
+            if !layout_sensitive {
+                // Rust's default representation gives downstream callers no
+                // field-order ABI. Keep private field TYPES in the contract
+                // (they can change Send/Sync and other auto traits), but sort
+                // them by their semantic input so a pure private-field reorder
+                // is not reported as a breaking API change. Public named-field
+                // order is likewise not observable in literals or patterns.
+                let mut fields = named.named.iter().cloned().collect::<Vec<_>>();
+                fields.sort_by_key(|field| {
+                    if is_public(&field.vis) {
+                        format!(
+                            "0:{}",
+                            field
+                                .ident
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_default()
+                        )
+                    } else {
+                        let mut semantic = field.clone();
+                        semantic.ident = Some(syn::Ident::new(
+                            "__prview_private_field",
+                            field
+                                .ident
+                                .as_ref()
+                                .expect("named field has an identifier")
+                                .span(),
+                        ));
+                        format!("1:{}", canonical_tokens(semantic.to_token_stream()))
+                    }
+                });
+                named.named = fields.into_iter().collect();
+            }
             for (index, field) in named.named.iter_mut().enumerate() {
                 if !is_public(&field.vis) {
                     field.ident = Some(syn::Ident::new(
@@ -2971,10 +3032,19 @@ fn filter_private_fields(fields: &mut Fields, _layout_sensitive: bool) {
     }
 }
 
-fn has_explicit_repr(attrs: &[Attribute]) -> bool {
-    attrs
-        .iter()
-        .any(|attribute| attribute.path().is_ident("repr"))
+fn has_layout_sensitive_repr(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attribute| {
+        if !attribute.path().is_ident("repr") {
+            return false;
+        }
+        let syn::Meta::List(list) = &attribute.meta else {
+            return false;
+        };
+        list.tokens
+            .to_string()
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|token| matches!(token, "C" | "packed" | "transparent"))
+    })
 }
 
 fn normalize_item_attrs(item: &mut Item) {
@@ -4774,6 +4844,52 @@ mod tests {
         assert_eq!(
             associated_before.items, associated_renamed.items,
             "an alpha rename must not rename a same-spelled associated item"
+        );
+
+        let trait_members_before = snapshot_rust_api(&source(
+            "pub trait Convert<T, const N: usize> { \
+             const FALLBACK: Option<[T; N]>; \
+             type Out<U: Into<T>>: AsRef<[T; N]>; }",
+        ));
+        let trait_members_renamed = snapshot_rust_api(&source(
+            "pub trait Convert<V, const M: usize> { \
+             const FALLBACK: Option<[V; M]>; \
+             type Out<W: Into<V>>: AsRef<[V; M]>; }",
+        ));
+        assert_eq!(
+            trait_members_before.items, trait_members_renamed.items,
+            "outer and member-local trait binders are spelling-only"
+        );
+        let trait_members_retargeted = snapshot_rust_api(&source(
+            "pub trait Convert<V, const M: usize> { \
+             const FALLBACK: Option<[V; M]>; \
+             type Out<W: Into<V>>: AsRef<[W; M]>; }",
+        ));
+        assert_ne!(
+            trait_members_before.items, trait_members_retargeted.items,
+            "changing which binder reaches an associated member remains observable"
+        );
+    }
+
+    #[test]
+    fn rust_api_snapshot_repr_rust_ignores_private_reorder_but_keeps_private_types() {
+        let before = snapshot_rust_api(&source(
+            "#[repr(Rust)] pub struct Api { first: u8, second: u16 }",
+        ));
+        let reordered = snapshot_rust_api(&source(
+            "#[repr(Rust)] pub struct Api { second: u16, first: u8 }",
+        ));
+        assert_eq!(
+            before.items, reordered.items,
+            "repr(Rust) does not expose private field order as an ABI contract"
+        );
+
+        let changed_type = snapshot_rust_api(&source(
+            "#[repr(Rust)] pub struct Api { first: u8, second: String }",
+        ));
+        assert_ne!(
+            before.items, changed_type.items,
+            "private field types remain observable through auto traits"
         );
     }
 

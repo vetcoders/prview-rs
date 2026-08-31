@@ -1373,10 +1373,13 @@ cannot neutralize a changed item. Foreign functions/statics inherit the parent
 ABI, safety, and relevant attributes.
 
 Contracts are emitted from normalized `syn` ASTs. Function/default bodies and
-ordinary named private member types are excluded. Tuple-field position and
-privacy remain structural because any private tuple element changes constructor
-callability and arity; explicit `repr(...)` types retain anonymized private field
-types because they participate in the declared layout contract. ABI, qualifiers,
+ordinary named private member names/order are excluded. Their anonymized type
+multiset remains observable because a private type can change public auto traits
+such as `Send`/`Sync`; only ABI-sensitive `repr(C)`, `repr(packed)`, and
+`repr(transparent)` retain declaration order as layout. `repr(Rust)` follows the
+ordinary order-insensitive contract. Tuple-field position and privacy remain
+structural because any private tuple element changes constructor callability and
+arity. ABI, qualifiers,
 generics/bounds/where clauses, return types, public fields with structural tuple
 indices, enum variants/discriminants, trait headers and associated items, type
 aliases, public constants/statics, and relevant attributes remain. Inherent
@@ -1393,9 +1396,10 @@ evaluating host configuration.
 Function parameter patterns are canonicalized to `_`, and generic, const, and
 lifetime binders are alpha-normalized by declaration order across free, trait,
 inherent, foreign, and higher-ranked function signatures as well as public
-structs, unions, enums, and type aliases. The mapping is reused at every bound
-occurrence, so renaming a binder is neutral while generic order, types, ABI, and
-lifetime relationships remain part of the contract. Source-only analysis does
+structs, unions, enums, type aliases, and associated trait const/type members.
+The mapping is reused at every bound, type, and default occurrence, so renaming
+a binder is neutral while generic order, types, ABI, and lifetime relationships
+remain part of the contract. Source-only analysis does
 not pretend to resolve trait selection or coherence: an impl whose trait and
 owner are both externally reachable is retained as `TraitImplResolution`
 uncertainty with its normalized source contract until compiler-backed resolution
@@ -1432,8 +1436,11 @@ adding variants to an exhaustive public enum changes the parent contract, while
 an otherwise unchanged public `#[non_exhaustive]` enum exposes each new variant
 as informational `Added`. ABI-sensitive `#[repr(...)]` enums remain on the
 parent `Changed` path even when they are non-exhaustive, because payload growth
-can change size or alignment. Removing or changing an existing variant, or
-changing the enum header/policy, remains a parent `Changed` fact.
+can change size or alignment. Adding a named field to an existing variant-level
+`#[non_exhaustive]` variant is likewise informational: downstream callers cannot
+construct it and must match with `..`. Exhaustive variants, tuple variants,
+field removals/type changes, and enum header/policy changes stay on the
+conservative parent `Changed` path.
 
 Exact identity is grouped on both sides before any fact is consumed: only a
 `1 ↔ 1` component may become a confirmed change, while wider components are
