@@ -630,15 +630,6 @@ impl<'a> SnapshotBuilder<'a> {
             } else {
                 &trait_resolution.terminals
             };
-            let mut trait_evidence = trait_targets
-                .iter()
-                .map(|state| guarded_private_type_evidence("resolved-trait", state))
-                .collect::<Vec<_>>();
-            if let Some(digest) = &trait_resolution.exhaustion_digest {
-                trait_evidence.push(format!("trait-alias-resolution-exhausted:{digest}"));
-            }
-            trait_evidence.sort();
-            trait_evidence.dedup();
             let owner_resolution = resolve_private_type_alias_keys(
                 initial_key,
                 &pending.cfg_guard,
@@ -672,16 +663,48 @@ impl<'a> SnapshotBuilder<'a> {
                         })
                     });
                 if has_overlapping_declaration {
-                    let resolved_impl_evidence = format!(
-                        "{}\n{}\n{}",
-                        pending.semantic_evidence,
-                        guarded_private_type_evidence("resolved-owner", &owner),
-                        trait_evidence.join("\n--\n")
-                    );
+                    let owner_evidence = guarded_private_type_evidence("resolved-owner", &owner);
+                    let mut recorded_pair = false;
+                    for trait_state in trait_targets.iter().filter(|trait_state| {
+                        !guards_proven_disjoint(&trait_state.cfg_guard, &owner.cfg_guard)
+                    }) {
+                        let effective_guard =
+                            combined_guards(&trait_state.cfg_guard, &owner.cfg_guard);
+                        let exhaustion_evidence = trait_resolution
+                            .exhaustion_digest
+                            .as_ref()
+                            .map(|digest| format!("\ntrait-alias-resolution-exhausted:{digest}"))
+                            .unwrap_or_default();
+                        let resolved_impl_evidence = format!(
+                            "{}\n{}\n{}\nimpl-effective-cfg:{effective_guard:?}{exhaustion_evidence}",
+                            pending.semantic_evidence,
+                            owner_evidence,
+                            guarded_private_type_evidence("resolved-trait", trait_state),
+                        );
+                        implementation_evidence
+                            .entry(owner.key.clone())
+                            .or_default()
+                            .push(GuardedImplEvidence {
+                                raw_contract: pending.evidence.clone(),
+                                semantic_evidence: resolved_impl_evidence,
+                                cfg_guard: effective_guard,
+                                declaring_module_path: pending.declaring_module_path.clone(),
+                            });
+                        recorded_pair = true;
+                    }
+                    if recorded_pair {
+                        continue;
+                    }
+                    let Some(digest) = &trait_resolution.exhaustion_digest else {
+                        continue;
+                    };
                     implementation_evidence.entry(owner.key).or_default().push(
                         GuardedImplEvidence {
                             raw_contract: pending.evidence.clone(),
-                            semantic_evidence: resolved_impl_evidence,
+                            semantic_evidence: format!(
+                                "{}\n{}\ntrait-alias-resolution-exhausted:{digest}",
+                                pending.semantic_evidence, owner_evidence,
+                            ),
                             cfg_guard: owner.cfg_guard,
                             declaring_module_path: pending.declaring_module_path.clone(),
                         },
@@ -9260,6 +9283,32 @@ mod tests {
             private_dependency_evidence(&base, "expose_a"),
             private_dependency_evidence(&swapped, "expose_a"),
             "impl evidence must keep the effective cfg region of its canonical owner"
+        );
+    }
+
+    #[test]
+    fn private_impl_evidence_preserves_joint_trait_and_owner_cfg_region() {
+        let prefix = "mod a { pub struct Item; } mod b { pub struct Item; } \
+                      trait TraitA {} trait TraitB {} \
+                      #[cfg(unix)] use a::Item as Owner; \
+                      #[cfg(windows)] use b::Item as Owner; ";
+        let base = snapshot_rust_api(&source(&format!(
+            "{prefix} #[cfg(unix)] use TraitA as Local; \
+             #[cfg(windows)] use TraitB as Local; \
+             impl Local for Owner {{}} \
+             pub fn expose_a() -> a::Item {{ todo!() }}"
+        )));
+        let swapped = snapshot_rust_api(&source(&format!(
+            "{prefix} #[cfg(unix)] use TraitB as Local; \
+             #[cfg(windows)] use TraitA as Local; \
+             impl Local for Owner {{}} \
+             pub fn expose_a() -> a::Item {{ todo!() }}"
+        )));
+
+        assert_ne!(
+            private_dependency_evidence(&base, "expose_a"),
+            private_dependency_evidence(&swapped, "expose_a"),
+            "trait evidence must stay correlated with the cfg-selected owner instead of becoming one global set"
         );
     }
 

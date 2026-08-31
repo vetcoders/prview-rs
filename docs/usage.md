@@ -210,16 +210,27 @@ Cold Python environment setup and every later `uv run` apply the same cap to
 `UV_CONCURRENT_INSTALLS`, and `CARGO_BUILD_JOBS` for Rust-backed Python
 packages. Pytest also receives
 `PYTEST_XDIST_AUTO_NUM_WORKERS`; when project or inherited addopts request
-xdist (`-n auto` or explicit `-n N`), a final CLI `-n <limit>` clamps that pool
-to the run plan. Prview passes `-c` for the single highest-precedence pytest
-config inside the reviewed root, or an explicit empty config when none exists,
-and fixes `--rootdir` to that root. Parent-directory pytest options therefore
-cannot change test selection or worker count. If the operator already set a
-lower positive uv/Cargo value, prview preserves that stricter limit. Arbitrary
-third-party PEP 517 backends can
+xdist (`-n auto`, `logical`, or explicit `-n N`), prview caps only a dynamic or
+too-large pool. An explicit smaller count and `-n 0` remain unchanged. A short,
+isolated probe of the actual project pytest selects the matching supported
+major/minor config-discovery rules; unsupported versions fail closed. Prview then
+passes `-c` for the single highest-precedence config inside the reviewed root,
+or an explicit empty config when none exists, and fixes `--rootdir` to that
+root. Malformed, unreadable, non-UTF-8, or conflicting recognized config and
+addopts are reported instead of silently skipped. A standalone `--` in config
+or inherited addopts is rejected because it would disable the later isolation
+and worker-cap arguments. Xdist `--tx` and `--px` gateway options are rejected
+because their process fan-out is independent of `-n` and cannot be bounded by
+the numeric worker override. Parent-directory pytest
+options therefore cannot change test selection or worker count. If the operator
+already set a lower positive uv/Cargo value, prview preserves that stricter
+limit. Arbitrary third-party PEP 517 backends can
 still own private worker controls that no portable parent setting can infer;
 they remain serialized as one Exclusive parent rather than being claimed as a
-universally capped child pool.
+universally capped child pool. The same boundary applies to executable project
+`conftest.py` code and third-party pytest plugins: Pytest remains Exclusive, but
+prview does not claim to infer arbitrary plugin-created processes or xdist hook
+mutations.
 
 Before checks start, the human preflight prints the requested/effective budget,
 parent and child caps, expensive tools, and the cheap-first execution schedule.
@@ -639,8 +650,10 @@ non-reciprocal membership remains `WorkspaceDiscovery` uncertainty.
 Unqualified imported trait impls on public owners remain typed uncertainty
 until compiler-backed name resolution exists. Trait/owner alias spelling is
 canonicalized at the resolved nominal pair, including reference, pointer,
-slice, and array owners, and ordinary impl members are compared as an unordered
-set. Declaring scope intentionally remains part of the proof because relative
+slice, and array owners. Each resolved trait remains correlated with only the
+owner cfg regions where that impl can exist; cfg-selected trait swaps therefore
+cannot collapse into one global evidence set. Ordinary impl members are compared
+as an unordered set. Declaring scope intentionally remains part of the proof because relative
 paths inside an impl can change meaning when it moves modules. Aliases used only
 inside generic arguments can therefore still produce a conservative warning;
 they are not neutralized without compiler-backed name resolution.

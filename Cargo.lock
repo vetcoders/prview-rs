@@ -3243,6 +3243,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "shlex",
  "syn 2.0.117",
  "tempfile",
  "tokio",

@@ -138,7 +138,9 @@ valid completed review). Response:
 Completion requires durable publication into prview's run index. If the index
 is unreadable or the finished pack cannot be committed to discoverable history,
 the call returns fail-loud `storage_corrupt` or `run_failed`; SANITY without the
-matching durable row remains running/stale and is never exposed as completed.
+matching durable row is never exposed as completed. Synchronous launch fails
+loud; later readers report failed or stale according to the surviving control
+marker instead of fabricating completion from SANITY alone.
 
 ```json
 {

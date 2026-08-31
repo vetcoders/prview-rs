@@ -1677,17 +1677,7 @@ mod tests {
             if self.delivered {
                 std::future::pending::<()>().await;
             }
-            while std::fs::read_to_string(&self.path)
-                .ok()
-                .filter(|contents| {
-                    contents
-                        .split_whitespace()
-                        .filter_map(|value| value.parse::<u32>().ok())
-                        .count()
-                        == 2
-                })
-                .is_none()
-            {
+            while crate::proc::read_published_unix_pids(&self.path, 2).is_none() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             self.delivered = true;

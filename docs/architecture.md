@@ -328,14 +328,29 @@ exists, through that same `plan_python_run()`. Its cwd and
 syncs an off-HEAD dependency set into the operator checkout. uv download/build/
 install pools and Cargo-backed PEP 517 builds inherit the run's child limit.
 The cap remains on every later `uv run`, so an unsuccessful pre-sync cannot
-retry outside the envelope. Pytest is explicitly bound to the one
-highest-precedence config inside the reviewed root (including pytest 9 TOML and
-hidden variants), or to an empty config when the root has none; it never walks
-into an ambient parent project. Pytest-xdist gets the same limit through its
-auto-worker environment and a final CLI override whenever that selected config
-or inherited addopts request xdist. Unknown build backends remain one serialized
-Exclusive parent; the governor does not claim to discover every third-party
-backend's private thread knob.
+retry outside the envelope. Before collection, a plugin-disabled, null-config
+`--version` probe uses the same pytest launcher, reviewed cwd, and bounded
+environment as the real check. Its actual major and minor select the pytest
+6.0-7.1, 7.2-8.0, 8.1-8.x, or 9.x discovery contract; unsupported versions fail
+closed instead of guessing.
+Pytest is then explicitly bound to the one highest-precedence config inside the
+reviewed root (including pytest 9 TOML and hidden variants), or to an empty
+config when the root has none, so it never walks into an ambient parent project.
+Existing but unreadable, non-UTF-8, malformed, or conflicting recognized config
+is an execution error, not absence. Pytest-xdist gets the same upper bound
+through its auto-worker environment and a final CLI override only when the
+effective shell-tokenized config/environment request exceeds that bound or is
+dynamic; an explicit smaller count or zero remains unchanged. A standalone
+`--` in config or inherited addopts fails closed because it would turn the
+later isolation and worker-cap arguments into positional values. Xdist's custom
+and proxy gateway options (`--tx` and `--px`) also fail closed: those paths can
+create execution environments independently of `-n`, so a numeric override
+cannot prove the run-wide child bound. Unknown build
+backends remain one serialized Exclusive parent; the governor does not claim to
+discover every third-party backend's private thread knob. Pytest itself also
+remains Exclusive: arbitrary project `conftest.py` code and third-party plugins
+can create private processes or mutate xdist hooks, which a portable parent
+cannot infer or truthfully claim to cap.
 
 That environment is per reviewed **commit**, not per repository. `uv run` syncs
 before executing and releases the environment lock while the child command runs,
@@ -1508,6 +1523,10 @@ impls are collected independently of module reachability, resolve owners through
 same-crate `self`/`super`/`crate` paths, and retain self type, specialization,
 impl generics/bounds/where clauses, and impl/item attributes before projection
 through every reachable type alias. Unprovable owners are typed unknowns.
+Private trait-impl dependency evidence is keyed by the joint effective cfg of
+each resolved trait/owner pair. Alternative trait targets are never flattened
+into one owner-independent set, so exchanging cfg-selected traits changes the
+public dependency proof even when the owner aliases stay fixed.
 Documentation, rustfmt, and lint-control attributes are recursively discarded;
 shape/ABI attributes remain. Raw identifiers and NFC-equivalent identifiers
 share semantic names. Nested `cfg`/`cfg_attr` use the same recursive sorted and

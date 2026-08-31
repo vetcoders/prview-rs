@@ -719,11 +719,7 @@ mod tests {
             // `printf` writes the PID. Existence is not process readiness and
             // can fire cancellation before the parent has registered the just-
             // spawned group; wait for a complete numeric payload instead.
-            while std::fs::read_to_string(&self.path)
-                .ok()
-                .and_then(|value| value.trim().parse::<u32>().ok())
-                .is_none()
-            {
+            while crate::proc::read_published_unix_pid(&self.path).is_none() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             self.delivered = true;

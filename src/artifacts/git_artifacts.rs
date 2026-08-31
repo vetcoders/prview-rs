@@ -1295,7 +1295,7 @@ mod latest_tests {
     }
 
     #[tokio::test]
-    async fn cancelled_rollback_is_immediate_and_restores_the_predecessor() {
+    async fn rollback_completes_on_a_real_blocking_worker_and_restores_the_predecessor() {
         let root = tempfile::tempdir().unwrap();
         let predecessor = root.path().join("predecessor");
         let cancelled = root.path().join("cancelled");
@@ -1303,17 +1303,14 @@ mod latest_tests {
         fs::create_dir(&cancelled).unwrap();
         create_latest_symlink(&predecessor).unwrap();
         let previous = create_latest_symlink(&cancelled).unwrap().unwrap();
-        let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::new());
-        governor.cancel();
-
         let rollback = tokio::task::spawn_blocking(move || {
             restore_latest_symlink(&cancelled, Some(previous.as_os_str()))
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), rollback)
             .await
-            .expect("consistency rollback must not wait on the cancelled work queue")
+            .expect("consistency rollback must complete on a real blocking worker")
             .expect("rollback worker must join")
-            .expect("consistency rollback ignores the already-cancelled governor");
+            .expect("consistency rollback must restore the previous latest alias");
         assert_eq!(
             fs::read_link(root.path().join("latest")).unwrap(),
             PathBuf::from("predecessor")

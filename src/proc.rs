@@ -209,10 +209,11 @@ pub fn terminate_and_reap_owned_std_child(child: &mut dyn process_wrap::std::Chi
         // Cancellation may have won through the governor milliseconds before
         // this owner reached its own cleanup path. A second group kill can then
         // report no live group before the direct root becomes waitable. Poll
-        // for a short, finite interval so the owned root cannot remain a zombie
-        // in a long-lived MCP process. The false return still preserves the
-        // distinction between a confirmed tree termination and this best-effort
-        // direct-root reap.
+        // for a short, finite interval so the owned root gets a bounded chance
+        // to be reaped instead of being abandoned immediately. The false return
+        // still preserves the distinction between a confirmed tree termination
+        // and this best-effort direct-root reap; a root that exits only after
+        // the deadline is not claimed as reaped.
         let deadline = std::time::Instant::now() + Duration::from_millis(250);
         loop {
             match child.try_wait() {
@@ -985,12 +986,55 @@ pub(crate) fn windows_pid_exists(pid: u32) -> bool {
 /// existence alone is a racy readiness oracle under concurrent test load.
 #[cfg(all(test, unix))]
 pub(crate) fn read_published_unix_pid(path: &std::path::Path) -> Option<i32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    read_published_unix_pids(path, 1)?.into_iter().next()
+}
+
+/// Require the producer's newline terminator, an exact token count, and two
+/// identical reads. A parseable prefix such as `"987 3"` must not be mistaken
+/// for a completed `"987 32145\n"` while the shell is still writing it.
+#[cfg(all(test, unix))]
+pub(crate) fn read_published_unix_pids(
+    path: &std::path::Path,
+    expected: usize,
+) -> Option<Vec<i32>> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    if !contents.ends_with('\n') {
+        return None;
+    }
+    let tokens = contents.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() != expected {
+        return None;
+    }
+    let pids = tokens
+        .into_iter()
+        .map(str::parse::<i32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (std::fs::read_to_string(path).ok()? == contents).then_some(pids)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn published_unix_pid_reader_rejects_partial_or_extra_payloads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("tree.pids");
+
+        std::fs::write(&pidfile, "987 3").expect("partial pid payload");
+        assert_eq!(read_published_unix_pids(&pidfile, 2), None);
+
+        std::fs::write(&pidfile, "987 32145\n").expect("complete pid payload");
+        assert_eq!(
+            read_published_unix_pids(&pidfile, 2),
+            Some(vec![987, 32145])
+        );
+
+        std::fs::write(&pidfile, "987 32145 6\n").expect("extra pid payload");
+        assert_eq!(read_published_unix_pids(&pidfile, 2), None);
+    }
 
     #[cfg(any(unix, windows))]
     #[test]
@@ -1035,17 +1079,7 @@ mod tests {
             let mut child = command.spawn().expect("spawn hardened timeout tree");
             let root_pid = child.id();
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while std::fs::read_to_string(&pidfile)
-                .ok()
-                .filter(|contents| {
-                    let pids = contents
-                        .split_whitespace()
-                        .filter_map(|value| value.parse::<u32>().ok())
-                        .count();
-                    pids == 2
-                })
-                .is_none()
-            {
+            while read_published_unix_pids(&pidfile, 2).is_none() {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "timeout fixture never published its process tree"

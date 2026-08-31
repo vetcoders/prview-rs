@@ -25,8 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CARGO_BUILD_JOBS` caps, so a failed pre-sync cannot retry an unbounded build.
   Pytest is pinned to the single config selected inside the reviewed root (or
   an explicit empty config), preventing ambient parent options from changing
-  the run; pytest 9 TOML/hidden INI, INI `:` syntax, precedence, inherited
-  addopts, and explicit/auto xdist pools are all clamped to the run limit.
+  the run. An isolated probe of the actual project pytest selects the supported
+  major/minor discovery contract; unknown versions, malformed or unreadable
+  configs, unparseable addopts, a standalone option terminator, and xdist custom
+  gateway options (`--tx`/`--px`) fail closed. Shell-quoted inherited/config
+  addopts follow pytest token boundaries, while explicit lower
+  or disabled xdist counts stay unchanged and larger/auto pools are capped.
 - Run publication fails closed when the durable index cannot be read or when a
   completed pack cannot be committed to discoverable history. Transactional
   readers reject corrupt JSONL instead of saving a fabricated partial ledger,
@@ -296,7 +300,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolves to the safe one-parent/one-child plan.
 - Rust trait-impl unknown evidence resolves top-level trait/owner aliases
   (including reference, pointer, slice, and array owners) to guarded nominal
-  pairs and compares ordinary associated items independently of source order.
+  pairs, preserves each trait/owner pair's joint cfg region, and compares
+  ordinary associated items independently of source order.
   Declaring scope remains fail-closed for relative names; aliases used only in
   generic arguments remain typed uncertainty until compiler-backed resolution.
 - Alias-resolution exhaustion is structural, never paired away as an equal

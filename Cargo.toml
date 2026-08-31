@@ -44,6 +44,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 toml = "1"
+shlex = "1.3"
 
 # Whole-file Rust API snapshots (dark 0.8 backend).
 syn = { version = "2", features = ["full", "fold"] }

@@ -7,9 +7,10 @@ use super::{
 };
 use crate::Config;
 use crate::cache;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Local;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -132,10 +133,21 @@ const PYTHON_PROJECT_METADATA: &[&str] = &[
     "tox.ini",
     "setup.cfg",
 ];
-/// Pytest 9's discovery order. The first matching file wins; options are never
-/// merged. Dedicated pytest files match even when empty, while the generic
-/// project files require their pytest section/table.
-const PYTEST_CONFIG_FILES: &[&str] = &[
+/// Pytest 6.0 through 7.1 did not include `.pytest.ini` in `config_names`.
+const PYTEST_PRE_HIDDEN_CONFIG_FILES: &[&str] =
+    &["pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"];
+/// Pytest 7.2-8's discovery order. These versions do not recognize the native
+/// TOML configuration introduced in pytest 9.
+const PYTEST_LEGACY_CONFIG_FILES: &[&str] = &[
+    "pytest.ini",
+    ".pytest.ini",
+    "pyproject.toml",
+    "tox.ini",
+    "setup.cfg",
+];
+/// Pytest 9's discovery order. Dedicated TOML and INI files match even when
+/// empty; generic project files require a pytest section/table.
+const PYTEST_NINE_CONFIG_FILES: &[&str] = &[
     "pytest.toml",
     ".pytest.toml",
     "pytest.ini",
@@ -145,114 +157,443 @@ const PYTEST_CONFIG_FILES: &[&str] = &[
     "setup.cfg",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PytestConfigDialect {
+    /// Pytest 6.0-7.1: no hidden INI name and no pyproject fallback.
+    LegacyPreHidden,
+    /// Pytest 7.2-8.0: hidden INI name, but no pyproject fallback.
+    LegacyHidden,
+    /// Pytest 8.1-8.x: hidden INI name and sectionless pyproject fallback.
+    Legacy,
+    Nine,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum PytestConfigMatch {
     NotMatched,
-    Matched(Option<String>),
+    Matched(Option<Vec<String>>),
 }
 
-fn contains_xdist_worker_option(value: &str) -> bool {
-    value.split_whitespace().any(|token| {
-        token == "-n"
-            || token.strip_prefix("-n").is_some_and(|suffix| {
-                let suffix = suffix.strip_prefix('=').unwrap_or(suffix);
-                !suffix.is_empty()
-                    && (suffix.bytes().all(|byte| byte.is_ascii_digit())
-                        || matches!(suffix, "auto" | "logical"))
-            })
-            || token == "--numprocesses"
-            || token.starts_with("--numprocesses=")
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum XdistWorkerRequest {
+    Dynamic,
+    Count(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum XdistWorkerDisposition {
+    Absent,
+    Disabled,
+    Requested(XdistWorkerRequest),
+}
+
+type PytestInvocation = (Vec<String>, Vec<(String, String)>);
+
+fn xdist_value_disposition(value: &str) -> Option<XdistWorkerDisposition> {
+    if matches!(value, "auto" | "logical") {
+        Some(XdistWorkerDisposition::Requested(
+            XdistWorkerRequest::Dynamic,
+        ))
+    } else if let Some((negative, digits)) = normalized_python_int(value) {
+        let normalized = digits.trim_start_matches('0');
+        if negative {
+            return Some(XdistWorkerDisposition::Disabled);
+        }
+        if normalized.is_empty() {
+            Some(XdistWorkerDisposition::Disabled)
+        } else {
+            Some(XdistWorkerDisposition::Requested(
+                XdistWorkerRequest::Count(normalized.to_owned()),
+            ))
+        }
+    } else {
+        None
+    }
+}
+
+/// Safe `int()` spellings accepted by pytest-xdist's `parse_numprocesses`:
+/// outer ASCII whitespace, an optional sign, and ASCII digits with underscores
+/// only between digits. Unicode digits stay fail-closed deliberately.
+fn normalized_python_int(value: &str) -> Option<(bool, String)> {
+    let value = value.trim_matches(|ch: char| ch.is_ascii_whitespace());
+    let (negative, unsigned) = match value.as_bytes().first() {
+        Some(b'+') => (false, &value[1..]),
+        Some(b'-') => (true, &value[1..]),
+        _ => (false, value),
+    };
+    if unsigned.is_empty() {
+        return None;
+    }
+    let bytes = unsigned.as_bytes();
+    if !bytes.first()?.is_ascii_digit() || !bytes.last()?.is_ascii_digit() {
+        return None;
+    }
+    let mut digits = String::with_capacity(unsigned.len());
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if byte.is_ascii_digit() {
+            digits.push(char::from(byte));
+        } else if byte == b'_'
+            && bytes[index - 1].is_ascii_digit()
+            && bytes[index + 1].is_ascii_digit()
+        {
+            continue;
+        } else {
+            return None;
+        }
+    }
+    Some((negative, digits))
+}
+
+fn xdist_worker_disposition(tokens: &[String]) -> Result<XdistWorkerDisposition> {
+    let mut disposition = XdistWorkerDisposition::Absent;
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let parsed = if matches!(token.as_str(), "-n" | "--numprocesses") {
+            Some((tokens.get(index + 1).map(String::as_str), 2))
+        } else if let Some(value) = token.strip_prefix("--numprocesses=") {
+            Some((Some(value), 1))
+        } else if let Some(value) = token.strip_prefix("-n") {
+            Some((Some(value.strip_prefix('=').unwrap_or(value)), 1))
+        } else {
+            None
+        };
+        let Some((value, consumed)) = parsed else {
+            index += 1;
+            continue;
+        };
+        let value = value.ok_or_else(|| anyhow::anyhow!("{token} is missing its worker count"))?;
+        disposition = xdist_value_disposition(value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{token} uses unsupported worker count {value:?}; refusing an unbounded pytest run"
+            )
+        })?;
+        index += consumed;
+    }
+    Ok(disposition)
+}
+
+fn xdist_request_exceeds_limit(request: &XdistWorkerRequest, worker_limit: u32) -> bool {
+    match request {
+        XdistWorkerRequest::Dynamic => true,
+        XdistWorkerRequest::Count(count) => {
+            let limit = worker_limit.to_string();
+            count.len() > limit.len()
+                || (count.len() == limit.len() && count.as_str() > limit.as_str())
+        }
+    }
+}
+
+/// Rust's `shlex` crate follows shell comment rules, while Python explicitly
+/// calls `shlex.split(..., comments=False)` for pytest addopts. Escape only
+/// unquoted, unescaped `#` bytes before splitting so they remain ordinary token
+/// content without changing quote or backslash semantics.
+fn escape_unquoted_hashes(value: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut escaped = false;
+    let mut quote = Quote::None;
+    let mut prepared = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if escaped {
+            prepared.push(ch);
+            escaped = false;
+            continue;
+        }
+        match (quote, ch) {
+            (Quote::Single, '\'') => quote = Quote::None,
+            (Quote::Double, '"') => quote = Quote::None,
+            (Quote::None, '\'') => quote = Quote::Single,
+            (Quote::None, '"') => quote = Quote::Double,
+            (Quote::None | Quote::Double, '\\') => escaped = true,
+            (Quote::None, '#') => prepared.push('\\'),
+            _ => {}
+        }
+        prepared.push(ch);
+    }
+    prepared
+}
+
+fn split_pytest_addopts(value: &str) -> Result<Vec<String>> {
+    shlex::split(&escape_unquoted_hashes(value)).ok_or_else(|| {
+        anyhow::anyhow!("pytest addopts contains an unterminated quote or trailing escape")
     })
 }
 
-fn toml_addopts(value: &toml::Value) -> Option<String> {
+fn checked_pytest_addopts(
+    value: std::result::Result<String, std::env::VarError>,
+) -> Result<Option<String>> {
     match value {
-        toml::Value::String(value) => Some(value.clone()),
-        toml::Value::Array(values) => Some(
-            values
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-        _ => None,
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("PYTEST_ADDOPTS is not valid Unicode and cannot be bounded safely")
+        }
     }
 }
 
-fn pytest_config_addopts(name: &str, contents: &str) -> PytestConfigMatch {
-    if matches!(name, "pytest.toml" | ".pytest.toml") {
-        let Ok(document) = toml::from_str::<toml::Value>(contents) else {
-            // Pytest will fail on the malformed dedicated config before it can
-            // start workers. It still wins discovery over lower-priority files.
-            return PytestConfigMatch::Matched(None);
+fn validate_pytest_addopts_safety(tokens: &[String], source: &str) -> Result<()> {
+    for token in tokens {
+        if token == "--" {
+            anyhow::bail!(
+                "{source} contains `--`, which would turn prview's pytest safety arguments into positional values"
+            );
+        }
+        if matches!(token.as_str(), "--tx" | "--px")
+            || token.starts_with("--tx=")
+            || token.starts_with("--px=")
+        {
+            anyhow::bail!(
+                "{source} contains unsupported xdist gateway option {token:?}; prview cannot bound custom or proxy gateways"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn normalize_xdist_auto_workers(value: &str) -> Result<String> {
+    let Some((negative, digits)) = normalized_python_int(value) else {
+        anyhow::bail!(
+            "PYTEST_XDIST_AUTO_NUM_WORKERS must be a positive ASCII integer, got {value:?}"
+        );
+    };
+    let normalized = digits.trim_start_matches('0');
+    if negative || normalized.is_empty() {
+        anyhow::bail!("PYTEST_XDIST_AUTO_NUM_WORKERS must be greater than zero");
+    }
+    Ok(normalized.to_owned())
+}
+
+fn checked_xdist_auto_workers(
+    value: std::result::Result<String, std::env::VarError>,
+) -> Result<Option<String>> {
+    match value {
+        Ok(value) => normalize_xdist_auto_workers(&value).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+            "PYTEST_XDIST_AUTO_NUM_WORKERS is not valid Unicode and cannot be bounded safely"
+        ),
+    }
+}
+
+fn toml_addopts(value: &toml::Value, source: &str) -> Result<Vec<String>> {
+    match value {
+        toml::Value::String(value) => {
+            split_pytest_addopts(value).with_context(|| format!("invalid addopts in {source}"))
+        }
+        toml::Value::Array(values) => values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("{source} addopts[{index}] is not a string"))
+            })
+            .collect(),
+        _ => anyhow::bail!("{source} addopts must be a string or an array of strings"),
+    }
+}
+
+type IniDocument = BTreeMap<String, BTreeMap<String, String>>;
+
+/// Parse enough of pytest's INI grammar to make discovery and addopts
+/// fail-closed. Invalid files must not be silently skipped: pytest itself would
+/// stop before collection rather than continue to a lower-priority config.
+fn parse_pytest_ini(name: &str, contents: &str) -> Result<IniDocument> {
+    let mut document = IniDocument::new();
+    let mut current_section: Option<String> = None;
+    let mut current_key: Option<String> = None;
+
+    for (index, line) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+
+        if line.starts_with('[') {
+            let section_line = line
+                .split(['#', ';'])
+                .next()
+                .expect("split always yields one item")
+                .trim_end();
+            if !section_line.ends_with(']') {
+                anyhow::bail!("malformed section header in {name}:{line_number}");
+            }
+            let section = &section_line[1..section_line.len() - 1];
+            if section.is_empty() {
+                anyhow::bail!("empty section name in {name}:{line_number}");
+            }
+            if document
+                .insert(section.to_owned(), BTreeMap::new())
+                .is_some()
+            {
+                anyhow::bail!("duplicate section [{section}] in {name}:{line_number}");
+            }
+            current_section = Some(section.to_owned());
+            current_key = None;
+            continue;
+        }
+
+        if line.chars().next().is_some_and(char::is_whitespace) {
+            let section = current_section.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("continuation before a section in {name}:{line_number}")
+            })?;
+            let key = current_key.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("continuation before an option in {name}:{line_number}")
+            })?;
+            let value = document
+                .get_mut(section)
+                .and_then(|options| options.get_mut(key))
+                .expect("current INI option exists");
+            if !value.is_empty() {
+                value.push('\n');
+            }
+            value.push_str(trimmed);
+            continue;
+        }
+
+        let section = current_section
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("option before a section in {name}:{line_number}"))?;
+        let delimiter = match (trimmed.find('='), trimmed.find(':')) {
+            (Some(equal), Some(colon)) => equal.min(colon),
+            (Some(equal), None) => equal,
+            (None, Some(colon)) => colon,
+            (None, None) => anyhow::bail!("malformed option in {name}:{line_number}"),
         };
+        let key = trimmed[..delimiter].trim();
+        if key.is_empty() {
+            anyhow::bail!("empty option name in {name}:{line_number}");
+        }
+        let options = document
+            .get_mut(section)
+            .expect("current INI section exists");
+        if options
+            .insert(key.to_owned(), trimmed[delimiter + 1..].trim().to_owned())
+            .is_some()
+        {
+            anyhow::bail!("duplicate option {key} in {name}:{line_number}");
+        }
+        current_key = Some(key.to_owned());
+    }
+
+    Ok(document)
+}
+
+fn table_at<'a>(value: &'a toml::Value, path: &str, source: &str) -> Result<&'a toml::Table> {
+    value
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("{source} [{path}] must be a table"))
+}
+
+fn optional_toml_addopts(table: &toml::Table, source: &str) -> Result<Option<Vec<String>>> {
+    table
+        .get("addopts")
+        .map(|value| toml_addopts(value, source))
+        .transpose()
+}
+
+fn pytest_config_addopts(
+    name: &str,
+    contents: &str,
+    dialect: PytestConfigDialect,
+) -> Result<PytestConfigMatch> {
+    if matches!(name, "pytest.toml" | ".pytest.toml") {
+        if dialect != PytestConfigDialect::Nine {
+            return Ok(PytestConfigMatch::NotMatched);
+        }
+        let document = toml::from_str::<toml::Value>(contents)
+            .with_context(|| format!("failed to parse {name}"))?;
         let addopts = document
             .get("pytest")
-            .and_then(|table| table.get("addopts"))
-            .and_then(toml_addopts);
-        return PytestConfigMatch::Matched(addopts);
+            .map(|pytest| table_at(pytest, "pytest", name))
+            .transpose()?
+            .map(|pytest| optional_toml_addopts(pytest, name))
+            .transpose()?
+            .flatten();
+        return Ok(PytestConfigMatch::Matched(addopts));
     }
 
     if name == "pyproject.toml" {
-        let Ok(document) = toml::from_str::<toml::Value>(contents) else {
-            return PytestConfigMatch::Matched(None);
+        let document =
+            toml::from_str::<toml::Value>(contents).context("failed to parse pyproject.toml")?;
+        let Some(tool) = document.get("tool") else {
+            return Ok(PytestConfigMatch::NotMatched);
         };
-        let Some(pytest) = document.get("tool").and_then(|tool| tool.get("pytest")) else {
-            return PytestConfigMatch::NotMatched;
+        let tool = table_at(tool, "tool", name)?;
+        let Some(pytest) = tool.get("pytest") else {
+            return Ok(PytestConfigMatch::NotMatched);
         };
-        let native_addopts = pytest.get("addopts").and_then(toml_addopts);
-        let ini_addopts = pytest
+        let pytest = table_at(pytest, "tool.pytest", name)?;
+        let ini = pytest
             .get("ini_options")
-            .and_then(|table| table.get("addopts"))
-            .and_then(toml_addopts);
-        return PytestConfigMatch::Matched(native_addopts.or(ini_addopts));
+            .map(|ini| table_at(ini, "tool.pytest.ini_options", name))
+            .transpose()?;
+
+        if dialect != PytestConfigDialect::Nine {
+            return Ok(match ini {
+                Some(ini) => PytestConfigMatch::Matched(optional_toml_addopts(ini, name)?),
+                None => PytestConfigMatch::NotMatched,
+            });
+        }
+
+        let native_has_values = pytest.keys().any(|key| key != "ini_options");
+        if native_has_values && ini.is_some() {
+            anyhow::bail!(
+                "pyproject.toml defines both [tool.pytest] and [tool.pytest.ini_options]"
+            );
+        }
+        return Ok(if native_has_values {
+            PytestConfigMatch::Matched(optional_toml_addopts(pytest, name)?)
+        } else if let Some(ini) = ini {
+            PytestConfigMatch::Matched(optional_toml_addopts(ini, name)?)
+        } else {
+            // An empty native table is not a pytest configuration; pytest 9
+            // continues discovery and may later use this file only as fallback.
+            PytestConfigMatch::NotMatched
+        });
     }
 
-    let wanted_section = if name == "setup.cfg" {
-        "tool:pytest"
-    } else {
-        "pytest"
+    let document = parse_pytest_ini(name, contents)?;
+    if name == "setup.cfg" {
+        if let Some(options) = document.get("tool:pytest") {
+            return Ok(PytestConfigMatch::Matched(
+                options
+                    .get("addopts")
+                    .map(|value| split_pytest_addopts(value))
+                    .transpose()
+                    .with_context(|| format!("invalid addopts in {name}"))?,
+            ));
+        }
+        if document.contains_key("pytest") {
+            anyhow::bail!("setup.cfg uses unsupported [pytest]; rename it to [tool:pytest]");
+        }
+        return Ok(PytestConfigMatch::NotMatched);
+    }
+
+    let dedicated =
+        name == "pytest.ini" || (name == ".pytest.ini" && dialect == PytestConfigDialect::Nine);
+    let Some(options) = document.get("pytest") else {
+        return Ok(if dedicated {
+            PytestConfigMatch::Matched(None)
+        } else {
+            PytestConfigMatch::NotMatched
+        });
     };
-    let dedicated = matches!(name, "pytest.ini" | ".pytest.ini");
-    let mut saw_pytest_section = false;
-    let mut in_pytest = false;
-    let mut collecting = false;
-    let mut addopts = String::new();
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if collecting {
-                break;
-            }
-            in_pytest = trimmed[1..trimmed.len() - 1].trim() == wanted_section;
-            saw_pytest_section |= in_pytest;
-            continue;
-        }
-        if !in_pytest || trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';')
-        {
-            continue;
-        }
-        if collecting {
-            if line.chars().next().is_some_and(char::is_whitespace) {
-                addopts.push(' ');
-                addopts.push_str(trimmed);
-                continue;
-            }
-            break;
-        }
-        if let Some(delimiter) = trimmed.find(['=', ':']) {
-            let (key, value) = trimmed.split_at(delimiter);
-            if key.trim() == "addopts" {
-                addopts.push_str(value[1..].trim());
-                collecting = true;
-            }
-        }
-    }
-    if dedicated || saw_pytest_section {
-        PytestConfigMatch::Matched((!addopts.is_empty()).then_some(addopts))
-    } else {
-        PytestConfigMatch::NotMatched
-    }
+    Ok(PytestConfigMatch::Matched(
+        options
+            .get("addopts")
+            .map(|value| split_pytest_addopts(value))
+            .transpose()
+            .with_context(|| format!("invalid addopts in {name}"))?,
+    ))
 }
 
 fn empty_pytest_config() -> PathBuf {
@@ -263,32 +604,105 @@ fn empty_pytest_config() -> PathBuf {
     path
 }
 
-fn selected_pytest_config(root: &Path) -> (PathBuf, Option<String>) {
-    for name in PYTEST_CONFIG_FILES {
+fn read_pytest_config(path: &Path) -> Result<Option<String>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(path) {
+                Ok(metadata) if !metadata.is_file() => Ok(None),
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(None)
+                }
+                _ => Err(error).with_context(|| {
+                    format!("pytest config {} exists but cannot be read", path.display())
+                }),
+            };
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "pytest config {} exists but cannot be inspected",
+                    path.display()
+                )
+            });
+        }
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("pytest config {} exists but cannot be read", path.display())
+            });
+        }
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .with_context(|| format!("pytest config {} is not valid UTF-8", path.display()))
+}
+
+fn selected_pytest_config(
+    root: &Path,
+    dialect: PytestConfigDialect,
+) -> Result<(PathBuf, Option<Vec<String>>)> {
+    let names = match dialect {
+        PytestConfigDialect::LegacyPreHidden => PYTEST_PRE_HIDDEN_CONFIG_FILES,
+        PytestConfigDialect::LegacyHidden | PytestConfigDialect::Legacy => {
+            PYTEST_LEGACY_CONFIG_FILES
+        }
+        PytestConfigDialect::Nine => PYTEST_NINE_CONFIG_FILES,
+    };
+    let mut pyproject_fallback = None;
+    for name in names {
         let path = root.join(name);
-        let Ok(contents) = std::fs::read_to_string(&path) else {
+        let Some(contents) = read_pytest_config(&path)? else {
             continue;
         };
-        match pytest_config_addopts(name, &contents) {
-            PytestConfigMatch::NotMatched => {}
-            PytestConfigMatch::Matched(addopts) => return (path, addopts),
+        if *name == "pyproject.toml" {
+            pyproject_fallback = Some(path.clone());
         }
+        match pytest_config_addopts(name, &contents, dialect)? {
+            PytestConfigMatch::NotMatched => {}
+            PytestConfigMatch::Matched(addopts) => return Ok((path, addopts)),
+        }
+    }
+
+    if matches!(
+        dialect,
+        PytestConfigDialect::Legacy | PytestConfigDialect::Nine
+    ) && let Some(pyproject) = pyproject_fallback
+    {
+        return Ok((pyproject, None));
     }
 
     // An explicit empty config prevents pytest from walking above the reviewed
     // tree and inheriting an ambient parent project's addopts. These are the
     // platform null devices, so no checkout file needs to be created.
-    (empty_pytest_config(), None)
+    Ok((empty_pytest_config(), None))
 }
 
-fn bounded_pytest_invocation(
+fn bounded_pytest_invocation_with_auto_workers(
     root: &Path,
     base_env: &[(String, String)],
     worker_limit: u32,
     inherited_addopts: Option<&str>,
-) -> (Vec<String>, Vec<(String, String)>) {
+    inherited_auto_workers: Option<&str>,
+    dialect: PytestConfigDialect,
+) -> Result<PytestInvocation> {
     let worker_limit = worker_limit.max(1);
-    let (config_path, config_addopts) = selected_pytest_config(root);
+    let (config_path, config_addopts) = selected_pytest_config(root, dialect)?;
+    let inherited_addopts = inherited_addopts
+        .map(split_pytest_addopts)
+        .transpose()
+        .context("invalid PYTEST_ADDOPTS")?;
+    if let Some(config_addopts) = &config_addopts {
+        validate_pytest_addopts_safety(config_addopts, "pytest config addopts")?;
+    }
+    if let Some(inherited_addopts) = &inherited_addopts {
+        validate_pytest_addopts_safety(inherited_addopts, "PYTEST_ADDOPTS")?;
+    }
     let mut args = vec![
         "-v".to_owned(),
         "-c".to_owned(),
@@ -296,20 +710,170 @@ fn bounded_pytest_invocation(
         "--rootdir".to_owned(),
         root.display().to_string(),
     ];
-    if inherited_addopts.is_some_and(contains_xdist_worker_option)
-        || config_addopts.is_some_and(|value| contains_xdist_worker_option(&value))
-    {
+    let config_disposition = config_addopts
+        .as_deref()
+        .map(xdist_worker_disposition)
+        .transpose()?
+        .unwrap_or(XdistWorkerDisposition::Absent);
+    let inherited_disposition = inherited_addopts
+        .as_deref()
+        .map(xdist_worker_disposition)
+        .transpose()?
+        .unwrap_or(XdistWorkerDisposition::Absent);
+    let effective_disposition = match &inherited_disposition {
+        XdistWorkerDisposition::Absent => &config_disposition,
+        _ => &inherited_disposition,
+    };
+    if matches!(
+        effective_disposition,
+        XdistWorkerDisposition::Requested(request)
+            if xdist_request_exceeds_limit(request, worker_limit)
+    ) {
         // Pytest prepends ini/PYTEST_ADDOPTS before explicit CLI arguments, so
         // this final option clamps both `-n auto` and an explicit `-n N`.
         args.extend(["-n".to_owned(), worker_limit.to_string()]);
     }
     let mut env = base_env.to_vec();
     env.retain(|(key, _)| key != "PYTEST_XDIST_AUTO_NUM_WORKERS");
-    env.push((
-        "PYTEST_XDIST_AUTO_NUM_WORKERS".to_owned(),
-        worker_limit.to_string(),
-    ));
-    (args, env)
+    let auto_workers = inherited_auto_workers
+        .map(normalize_xdist_auto_workers)
+        .transpose()?
+        .map(|workers| {
+            if xdist_request_exceeds_limit(
+                &XdistWorkerRequest::Count(workers.clone()),
+                worker_limit,
+            ) {
+                worker_limit.to_string()
+            } else {
+                workers
+            }
+        })
+        .unwrap_or_else(|| worker_limit.to_string());
+    env.push(("PYTEST_XDIST_AUTO_NUM_WORKERS".to_owned(), auto_workers));
+    Ok((args, env))
+}
+
+#[cfg(test)]
+fn bounded_pytest_invocation(
+    root: &Path,
+    base_env: &[(String, String)],
+    worker_limit: u32,
+    inherited_addopts: Option<&str>,
+    dialect: PytestConfigDialect,
+) -> Result<PytestInvocation> {
+    bounded_pytest_invocation_with_auto_workers(
+        root,
+        base_env,
+        worker_limit,
+        inherited_addopts,
+        None,
+        dialect,
+    )
+}
+
+fn parse_pytest_version(value: &str) -> Result<(PytestConfigDialect, String)> {
+    let version = value
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("pytest "))
+        .and_then(|suffix| suffix.split_whitespace().next())
+        .map(|token| {
+            token
+                .trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '.')
+                .to_owned()
+        })
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("pytest --version did not report a parseable version"))?;
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .filter(|major| *major > 0)
+        .ok_or_else(|| anyhow::anyhow!("pytest --version reported invalid version {version:?}"))?;
+    let minor = version
+        .split('.')
+        .nth(1)
+        .map(|minor| {
+            minor
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .filter(|minor| !minor.is_empty())
+        .and_then(|minor| minor.parse::<u64>().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("pytest --version did not report a usable minor in {version:?}")
+        })?;
+    let dialect = match (major, minor) {
+        (6, _) | (7, 0..=1) => PytestConfigDialect::LegacyPreHidden,
+        (7, minor) if minor >= 2 => PytestConfigDialect::LegacyHidden,
+        (8, 0) => PytestConfigDialect::LegacyHidden,
+        (8, minor) if minor >= 1 => PytestConfigDialect::Legacy,
+        (9, _) => PytestConfigDialect::Nine,
+        _ => anyhow::bail!("pytest {version} uses an unsupported config discovery dialect"),
+    };
+    Ok((dialect, version))
+}
+
+/// Ask the exact pytest launcher used by the check which discovery dialect it
+/// implements. The null config, explicit root and scrubbed addopts/plugin env
+/// keep ambient parents and plugins out of this version oracle.
+async fn probe_pytest_runtime(
+    root: &Path,
+    base_env: &[(String, String)],
+    use_uv: bool,
+) -> Result<(PytestConfigDialect, String)> {
+    let null_config = empty_pytest_config().display().to_string();
+    let root_dir = root.display().to_string();
+    let mut args = Vec::new();
+    if use_uv {
+        args.extend(["run".to_owned(), "pytest".to_owned()]);
+    }
+    args.extend([
+        "-c".to_owned(),
+        null_config,
+        "--rootdir".to_owned(),
+        root_dir,
+        "--version".to_owned(),
+    ]);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let env = pytest_probe_env(base_env);
+    let command = if use_uv { "uv" } else { "pytest" };
+    let output = run_command_with_timeout_and_env(command, &arg_refs, root, 30, &env)
+        .await
+        .with_context(|| format!("failed to run isolated {command} pytest version probe"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let evidence = format!("{stdout}\n{stderr}");
+    if !output.status.success() {
+        anyhow::bail!(
+            "isolated pytest version probe failed with exit {:?}: {}",
+            output.status.code(),
+            evidence.trim()
+        );
+    }
+    parse_pytest_version(&evidence).with_context(|| {
+        format!(
+            "cannot select a pytest config dialect from probe output: {}",
+            evidence.trim()
+        )
+    })
+}
+
+fn pytest_probe_env(base_env: &[(String, String)]) -> Vec<(String, String)> {
+    let mut env = base_env.to_vec();
+    env.retain(|(key, _)| {
+        !matches!(
+            key.as_str(),
+            "PYTEST_ADDOPTS" | "PYTEST_DISABLE_PLUGIN_AUTOLOAD" | "PYTEST_PLUGINS"
+        )
+    });
+    env.extend([
+        ("PYTEST_ADDOPTS".to_owned(), String::new()),
+        ("PYTEST_DISABLE_PLUGIN_AUTOLOAD".to_owned(), "1".to_owned()),
+        ("PYTEST_PLUGINS".to_owned(), String::new()),
+    ]);
+    env
 }
 
 /// Refuse project metadata that resolves outside the tree being judged.
@@ -715,16 +1279,22 @@ impl Check for PytestCheck {
         // to `repo_root`, so that path is unchanged.
         let plan = plan_python_run(config)?;
         let run_dir = &plan.cwd;
-        let inherited_addopts = std::env::var("PYTEST_ADDOPTS").ok();
-        let (pytest_args, pytest_env) = bounded_pytest_invocation(
+        let use_uv = which::which("uv").is_ok();
+        let (pytest_dialect, pytest_version) =
+            probe_pytest_runtime(run_dir, &plan.env, use_uv).await?;
+        let inherited_addopts = checked_pytest_addopts(std::env::var("PYTEST_ADDOPTS"))?;
+        let inherited_auto_workers =
+            checked_xdist_auto_workers(std::env::var("PYTEST_XDIST_AUTO_NUM_WORKERS"))?;
+        let (pytest_args, pytest_env) = bounded_pytest_invocation_with_auto_workers(
             run_dir,
             &plan.env,
             config.resource_plan.worker_limit,
             inherited_addopts.as_deref(),
-        );
+            inherited_auto_workers.as_deref(),
+            pytest_dialect,
+        )?;
         let pytest_arg_refs: Vec<&str> = pytest_args.iter().map(String::as_str).collect();
 
-        let use_uv = which::which("uv").is_ok();
         let output = if use_uv {
             let mut uv_args = vec!["run", "pytest"];
             uv_args.extend(pytest_arg_refs.iter().copied());
@@ -773,7 +1343,7 @@ impl Check for PytestCheck {
             provenance: Some(
                 CheckProvenance {
                     command: cmd_str,
-                    tool_version: None,
+                    tool_version: Some(pytest_version),
                     cwd: run_dir.display().to_string(),
                     exit_code: output.status.code(),
                     started_at,
@@ -1161,7 +1731,9 @@ mod tests {
         )
         .unwrap();
 
-        let (args, env) = bounded_pytest_invocation(root.path(), &[], 1, None);
+        let (args, env) =
+            bounded_pytest_invocation(root.path(), &[], 1, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
         assert_eq!(
             args,
             [
@@ -1184,7 +1756,14 @@ mod tests {
             "[tool.pytest.ini_options]\n",
         )
         .unwrap();
-        let (args, _) = bounded_pytest_invocation(root.path(), &[], 2, Some("-n 12"));
+        let (args, _) = bounded_pytest_invocation(
+            root.path(),
+            &[],
+            2,
+            Some("-n 12"),
+            PytestConfigDialect::Nine,
+        )
+        .expect("pytest invocation");
         assert_eq!(&args[args.len() - 2..], ["-n", "2"]);
     }
 
@@ -1202,10 +1781,15 @@ mod tests {
         )
         .unwrap();
 
-        let (args, _) = bounded_pytest_invocation(root.path(), &[], 1, None);
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 1, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
 
         assert!(!args.iter().any(|arg| arg == "-n"));
-        assert_eq!(args[2], empty_pytest_config().display().to_string());
+        assert_eq!(
+            args[2],
+            root.path().join("pyproject.toml").display().to_string()
+        );
     }
 
     #[test]
@@ -1217,7 +1801,9 @@ mod tests {
         )
         .unwrap();
 
-        let (args, _) = bounded_pytest_invocation(root.path(), &[], 3, None);
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 3, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
 
         assert_eq!(&args[args.len() - 2..], ["-n", "3"]);
     }
@@ -1231,7 +1817,9 @@ mod tests {
         )
         .unwrap();
 
-        let (args, _) = bounded_pytest_invocation(root.path(), &[], 2, None);
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 2, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
 
         assert_eq!(&args[args.len() - 2..], ["-n", "2"]);
 
@@ -1240,7 +1828,9 @@ mod tests {
             "[pytest]\naddopts: -q -n=12\n",
         )
         .unwrap();
-        let (args, _) = bounded_pytest_invocation(root.path(), &[], 1, None);
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 1, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
         assert_eq!(&args[args.len() - 2..], ["-n", "1"]);
     }
 
@@ -1253,7 +1843,9 @@ mod tests {
         )
         .unwrap();
 
-        let (args, _) = bounded_pytest_invocation(root.path(), &[], 3, None);
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 3, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
         assert_eq!(&args[args.len() - 2..], ["-n", "3"]);
 
         std::fs::remove_file(root.path().join("pytest.toml")).unwrap();
@@ -1262,7 +1854,9 @@ mod tests {
             "[pytest]\naddopts = --numprocesses=logical\n",
         )
         .unwrap();
-        let (args, _) = bounded_pytest_invocation(root.path(), &[], 1, None);
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 1, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
         assert_eq!(&args[args.len() - 2..], ["-n", "1"]);
     }
 
@@ -1276,7 +1870,9 @@ mod tests {
         .unwrap();
         std::fs::write(root.path().join("pytest.ini"), "[pytest]\naddopts = -q\n").unwrap();
 
-        let (args, _) = bounded_pytest_invocation(root.path(), &[], 1, None);
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 1, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
         assert_eq!(
             args[2],
             root.path().join("pytest.ini").display().to_string()
@@ -1290,7 +1886,9 @@ mod tests {
             "[pytest]\naddopts = -n 32\n",
         )
         .unwrap();
-        let (args, _) = bounded_pytest_invocation(root.path(), &[], 1, None);
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 1, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
         assert_eq!(
             args[2],
             root.path().join("pytest.toml").display().to_string()
@@ -1309,7 +1907,8 @@ mod tests {
         let root = parent.path().join("reviewed");
         std::fs::create_dir(&root).unwrap();
 
-        let (args, _) = bounded_pytest_invocation(&root, &[], 1, None);
+        let (args, _) = bounded_pytest_invocation(&root, &[], 1, None, PytestConfigDialect::Nine)
+            .expect("pytest invocation");
 
         assert_eq!(args[2], empty_pytest_config().display().to_string());
         assert_eq!(args[4], root.display().to_string());
@@ -1321,7 +1920,9 @@ mod tests {
         let root = tempfile::tempdir().expect("pytest project");
         let base_env = vec![("UV_PROJECT_ENVIRONMENT".to_owned(), "env".to_owned())];
 
-        let (args, env) = bounded_pytest_invocation(root.path(), &base_env, 1, None);
+        let (args, env) =
+            bounded_pytest_invocation(root.path(), &base_env, 1, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
 
         assert_eq!(args[0], "-v");
         assert_eq!(args[1], "-c");
@@ -1332,6 +1933,671 @@ mod tests {
                 ("UV_PROJECT_ENVIRONMENT".to_owned(), "env".to_owned()),
                 ("PYTEST_XDIST_AUTO_NUM_WORKERS".to_owned(), "1".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn pytest_version_selects_the_runtime_config_dialect() {
+        assert_eq!(
+            parse_pytest_version("pytest 6.2.5\n").expect("pytest 6 version"),
+            (PytestConfigDialect::LegacyPreHidden, "6.2.5".to_owned())
+        );
+        assert_eq!(
+            parse_pytest_version("pytest 7.1.0\n").expect("pytest 7.1 version"),
+            (PytestConfigDialect::LegacyPreHidden, "7.1.0".to_owned())
+        );
+        assert_eq!(
+            parse_pytest_version("pytest 7.2.0\n").expect("pytest 7.2 version"),
+            (PytestConfigDialect::LegacyHidden, "7.2.0".to_owned())
+        );
+        assert_eq!(
+            parse_pytest_version("pytest 8.0.2\n").expect("pytest 8.0 version"),
+            (PytestConfigDialect::LegacyHidden, "8.0.2".to_owned())
+        );
+        assert_eq!(
+            parse_pytest_version("pytest 8.1.0\n").expect("pytest 8.1 version"),
+            (PytestConfigDialect::Legacy, "8.1.0".to_owned())
+        );
+        assert_eq!(
+            parse_pytest_version("pytest 8.4.2\n").expect("pytest 8 version"),
+            (PytestConfigDialect::Legacy, "8.4.2".to_owned())
+        );
+        assert_eq!(
+            parse_pytest_version("launcher note\npytest 9.1.0\n").expect("pytest 9 version"),
+            (PytestConfigDialect::Nine, "9.1.0".to_owned())
+        );
+        assert!(parse_pytest_version("pytest development-build").is_err());
+        assert!(parse_pytest_version("pytest 5.4.3").is_err());
+        assert!(parse_pytest_version("pytest 10.0.0").is_err());
+        assert!(parse_pytest_version("not pytest output").is_err());
+    }
+
+    #[test]
+    fn pytest_version_probe_scrubs_all_ambient_plugin_inputs() {
+        let env = pytest_probe_env(&[
+            ("KEEP".to_owned(), "value".to_owned()),
+            ("PYTEST_ADDOPTS".to_owned(), "-n 99".to_owned()),
+            ("PYTEST_DISABLE_PLUGIN_AUTOLOAD".to_owned(), "0".to_owned()),
+            ("PYTEST_PLUGINS".to_owned(), "ambient.plugin".to_owned()),
+        ]);
+        assert_eq!(
+            env,
+            [
+                ("KEEP".to_owned(), "value".to_owned()),
+                ("PYTEST_ADDOPTS".to_owned(), String::new()),
+                ("PYTEST_DISABLE_PLUGIN_AUTOLOAD".to_owned(), "1".to_owned()),
+                ("PYTEST_PLUGINS".to_owned(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn pytest_addopts_use_python_shlex_token_boundaries_without_comments() {
+        let quoted_flag = split_pytest_addopts(r#""-n" 8"#).expect("quoted flag");
+        assert_eq!(
+            xdist_worker_disposition(&quoted_flag).expect("supported worker count"),
+            XdistWorkerDisposition::Requested(XdistWorkerRequest::Count("8".to_owned()))
+        );
+
+        let quoted_pair = split_pytest_addopts(r#""-n 8" -q"#).expect("quoted pair");
+        assert_eq!(
+            xdist_worker_disposition(&quoted_pair).expect("attached quoted worker count"),
+            XdistWorkerDisposition::Requested(XdistWorkerRequest::Count("8".to_owned()))
+        );
+
+        let escaped_flag = split_pytest_addopts(r#"\-n 4"#).expect("escaped flag");
+        assert_eq!(
+            xdist_worker_disposition(&escaped_flag).expect("supported worker count"),
+            XdistWorkerDisposition::Requested(XdistWorkerRequest::Count("4".to_owned()))
+        );
+
+        let unquoted_hash = split_pytest_addopts("#marker -n 3").expect("literal hash");
+        assert_eq!(unquoted_hash[0], "#marker");
+        assert_eq!(
+            xdist_worker_disposition(&unquoted_hash).expect("supported worker count"),
+            XdistWorkerDisposition::Requested(XdistWorkerRequest::Count("3".to_owned()))
+        );
+
+        let quoted_hash = split_pytest_addopts(r#"-k '#tag'"#).expect("quoted hash");
+        assert_eq!(quoted_hash, ["-k", "#tag"]);
+        assert_eq!(
+            xdist_worker_disposition(&quoted_hash).expect("no worker count"),
+            XdistWorkerDisposition::Absent
+        );
+
+        let escaped_hash = split_pytest_addopts(r#"\#tag -q"#).expect("escaped hash");
+        assert_eq!(escaped_hash, ["#tag", "-q"]);
+    }
+
+    #[test]
+    fn effective_xdist_worker_option_honors_disable_and_last_value() {
+        let disposition = |value| {
+            let tokens = split_pytest_addopts(value).expect("valid addopts");
+            xdist_worker_disposition(&tokens).expect("supported worker count")
+        };
+
+        assert_eq!(disposition("-n 0"), XdistWorkerDisposition::Disabled);
+        assert_eq!(disposition("-n0"), XdistWorkerDisposition::Disabled);
+        assert_eq!(disposition("-n00"), XdistWorkerDisposition::Disabled);
+        assert_eq!(disposition("-n +0"), XdistWorkerDisposition::Disabled);
+        assert_eq!(disposition("-n 0_0"), XdistWorkerDisposition::Disabled);
+        assert_eq!(disposition("-n -4"), XdistWorkerDisposition::Disabled);
+        assert_eq!(
+            disposition("--numprocesses=0"),
+            XdistWorkerDisposition::Disabled
+        );
+        assert_eq!(
+            disposition("--numprocesses 0"),
+            XdistWorkerDisposition::Disabled
+        );
+        assert_eq!(disposition("-n 8 -n 0"), XdistWorkerDisposition::Disabled);
+        assert_eq!(
+            disposition("-n0 --numprocesses=logical"),
+            XdistWorkerDisposition::Requested(XdistWorkerRequest::Dynamic)
+        );
+        assert_eq!(
+            disposition("--numprocesses=4 -n=0 -n auto"),
+            XdistWorkerDisposition::Requested(XdistWorkerRequest::Dynamic)
+        );
+        assert_eq!(
+            disposition("-n001"),
+            XdistWorkerDisposition::Requested(XdistWorkerRequest::Count("1".to_owned()))
+        );
+        assert_eq!(
+            disposition("-n +16"),
+            XdistWorkerDisposition::Requested(XdistWorkerRequest::Count("16".to_owned()))
+        );
+        assert_eq!(
+            disposition("-n ' +16 '"),
+            XdistWorkerDisposition::Requested(XdistWorkerRequest::Count("16".to_owned()))
+        );
+        assert_eq!(
+            disposition("--numprocesses=1_000"),
+            XdistWorkerDisposition::Requested(XdistWorkerRequest::Count("1000".to_owned()))
+        );
+        assert_eq!(
+            disposition(r#""--numprocesses= 16 ""#),
+            XdistWorkerDisposition::Requested(XdistWorkerRequest::Count("16".to_owned()))
+        );
+        for invalid in [
+            "-n invalid",
+            "-n 1__0",
+            "--numprocesses=invalid",
+            "-n ١٦",
+            "-n",
+        ] {
+            let tokens = split_pytest_addopts(invalid).expect("valid shlex");
+            assert!(
+                xdist_worker_disposition(&tokens).is_err(),
+                "unsupported worker count must fail closed: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn pytest_xdist_disable_overrides_config_and_environment_in_order() {
+        let root = tempfile::tempdir().expect("pytest project");
+        let config = root.path().join("pytest.ini");
+        std::fs::write(&config, "[pytest]\naddopts = -n 0\n").unwrap();
+
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 2, None, PytestConfigDialect::Nine)
+                .expect("disabled config");
+        assert!(!args.iter().any(|arg| arg == "-n"));
+
+        std::fs::write(&config, "[pytest]\naddopts = -n 1\n").unwrap();
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 2, None, PytestConfigDialect::Nine)
+                .expect("lower explicit request");
+        assert!(!args.iter().any(|arg| arg == "-n"));
+
+        std::fs::write(&config, "[pytest]\naddopts = -n001\n").unwrap();
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 2, None, PytestConfigDialect::Nine)
+                .expect("zero-padded lower explicit request");
+        assert!(!args.iter().any(|arg| arg == "-n"));
+
+        std::fs::write(&config, "[pytest]\naddopts = -n auto\n").unwrap();
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 2, None, PytestConfigDialect::Nine)
+                .expect("dynamic request");
+        assert_eq!(&args[args.len() - 2..], ["-n", "2"]);
+
+        std::fs::write(&config, "[pytest]\naddopts = \"-n 1\"\n").unwrap();
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 2, None, PytestConfigDialect::Nine)
+                .expect("quoted attached lower request");
+        assert!(!args.iter().any(|arg| arg == "-n"));
+
+        std::fs::write(&config, "[pytest]\naddopts = \"-n 16\"\n").unwrap();
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 2, None, PytestConfigDialect::Nine)
+                .expect("quoted attached higher request");
+        assert_eq!(&args[args.len() - 2..], ["-n", "2"]);
+
+        std::fs::write(&config, "[pytest]\naddopts = -n 8\n").unwrap();
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 2, Some("-n 0"), PytestConfigDialect::Nine)
+                .expect("environment disables config request");
+        assert!(!args.iter().any(|arg| arg == "-n"));
+
+        std::fs::write(&config, "[pytest]\naddopts = --numprocesses=0\n").unwrap();
+        let (args, _) = bounded_pytest_invocation(
+            root.path(),
+            &[],
+            2,
+            Some("--numprocesses=8"),
+            PytestConfigDialect::Nine,
+        )
+        .expect("environment enables workers after config disable");
+        assert_eq!(&args[args.len() - 2..], ["-n", "2"]);
+    }
+
+    #[test]
+    fn malformed_pytest_addopts_fail_closed() {
+        assert!(split_pytest_addopts("-k 'unterminated").is_err());
+        assert!(split_pytest_addopts("-q \\").is_err());
+
+        let root = tempfile::tempdir().expect("pytest project");
+        let error = bounded_pytest_invocation(
+            root.path(),
+            &[],
+            1,
+            Some("-k 'unterminated"),
+            PytestConfigDialect::Nine,
+        )
+        .expect_err("malformed ambient addopts must fail");
+        assert!(error.to_string().contains("PYTEST_ADDOPTS"));
+    }
+
+    #[test]
+    fn pytest_option_terminator_cannot_bypass_safety_arguments() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(
+            root.path().join("pytest.ini"),
+            "[pytest]\naddopts = -n auto --\n",
+        )
+        .unwrap();
+        assert!(
+            bounded_pytest_invocation(root.path(), &[], 2, None, PytestConfigDialect::Nine)
+                .is_err()
+        );
+
+        std::fs::write(root.path().join("pytest.ini"), "[pytest]\n").unwrap();
+        for inherited in ["-n auto --", "-- -n auto"] {
+            let error = bounded_pytest_invocation(
+                root.path(),
+                &[],
+                2,
+                Some(inherited),
+                PytestConfigDialect::Nine,
+            )
+            .expect_err("option terminator must fail closed");
+            assert!(error.to_string().contains("PYTEST_ADDOPTS"));
+        }
+    }
+
+    #[test]
+    fn pytest_xdist_gateway_options_fail_closed_in_config_and_environment() {
+        let root = tempfile::tempdir().expect("pytest project");
+        let config = root.path().join("pytest.ini");
+        for option in [
+            "--tx=ssh=remote//python=python3",
+            "--px=ssh=proxy//chdir=/tmp",
+        ] {
+            std::fs::write(&config, format!("[pytest]\naddopts = {option}\n")).unwrap();
+            let error =
+                bounded_pytest_invocation(root.path(), &[], 2, None, PytestConfigDialect::Nine)
+                    .expect_err("config gateway must fail closed");
+            assert!(error.to_string().contains("pytest config addopts"));
+            assert!(error.to_string().contains(&option[..4]));
+        }
+
+        std::fs::write(&config, "[pytest]\n").unwrap();
+        for inherited in [
+            "--tx popen --tx=ssh=remote//python=python3",
+            "--px proxy-spec",
+            "--px=ssh=proxy//chdir=/tmp",
+        ] {
+            let error = bounded_pytest_invocation(
+                root.path(),
+                &[],
+                2,
+                Some(inherited),
+                PytestConfigDialect::Nine,
+            )
+            .expect_err("environment gateway must fail closed");
+            assert!(error.to_string().contains("PYTEST_ADDOPTS"));
+            assert!(error.to_string().contains("--t") || error.to_string().contains("--p"));
+        }
+    }
+
+    #[test]
+    fn absent_pytest_addopts_is_distinct_from_an_unreadable_value() {
+        assert_eq!(
+            checked_pytest_addopts(Err(std::env::VarError::NotPresent))
+                .expect("an absent variable is allowed"),
+            None
+        );
+        assert_eq!(
+            checked_pytest_addopts(Ok("-n 2".to_owned())).expect("Unicode value"),
+            Some("-n 2".to_owned())
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let error = checked_pytest_addopts(Err(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from_vec(vec![0xff]),
+            )))
+            .expect_err("non-Unicode worker control must fail closed");
+            assert!(error.to_string().contains("not valid Unicode"));
+        }
+    }
+
+    #[test]
+    fn inherited_xdist_auto_worker_cap_is_validated_without_global_env_mutation() {
+        assert_eq!(
+            checked_xdist_auto_workers(Err(std::env::VarError::NotPresent))
+                .expect("absent auto-worker cap"),
+            None
+        );
+        assert_eq!(
+            checked_xdist_auto_workers(Ok("1_000".to_owned())).expect("positive cap"),
+            Some("1000".to_owned())
+        );
+        assert_eq!(
+            checked_xdist_auto_workers(Ok(" 2 ".to_owned())).expect("spaced positive cap"),
+            Some("2".to_owned())
+        );
+        for invalid in ["0", "-1", "invalid", "١٦"] {
+            assert!(
+                checked_xdist_auto_workers(Ok(invalid.to_owned())).is_err(),
+                "invalid inherited auto-worker cap must fail: {invalid}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            assert!(
+                checked_xdist_auto_workers(Err(std::env::VarError::NotUnicode(
+                    std::ffi::OsString::from_vec(vec![0xff]),
+                )))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_xdist_auto_worker_cap_is_only_lowered() {
+        fn env_value(env: &[(String, String)]) -> Option<&str> {
+            env.iter()
+                .find(|(key, _)| key == "PYTEST_XDIST_AUTO_NUM_WORKERS")
+                .map(|(_, value)| value.as_str())
+        }
+
+        let root = tempfile::tempdir().expect("pytest project");
+
+        let (_, env) = bounded_pytest_invocation_with_auto_workers(
+            root.path(),
+            &[],
+            2,
+            None,
+            Some("1"),
+            PytestConfigDialect::Nine,
+        )
+        .expect("lower inherited cap");
+        assert_eq!(env_value(&env), Some("1"));
+
+        let (_, env) = bounded_pytest_invocation_with_auto_workers(
+            root.path(),
+            &[],
+            2,
+            None,
+            Some("10"),
+            PytestConfigDialect::Nine,
+        )
+        .expect("higher inherited cap");
+        assert_eq!(env_value(&env), Some("2"));
+
+        let (_, env) = bounded_pytest_invocation_with_auto_workers(
+            root.path(),
+            &[],
+            2,
+            None,
+            None,
+            PytestConfigDialect::Nine,
+        )
+        .expect("default cap");
+        assert_eq!(env_value(&env), Some("2"));
+
+        assert!(
+            bounded_pytest_invocation_with_auto_workers(
+                root.path(),
+                &[],
+                2,
+                None,
+                Some("invalid"),
+                PytestConfigDialect::Nine,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pytest_toml_array_preserves_argument_boundaries_and_clamps_attached_counts() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(
+            root.path().join("pytest.toml"),
+            "[pytest]\naddopts = ['-n 8', '-q']\n",
+        )
+        .unwrap();
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 2, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
+        assert_eq!(&args[args.len() - 2..], ["-n", "2"]);
+
+        std::fs::write(
+            root.path().join("pytest.toml"),
+            "[pytest]\naddopts = ['-n', '8', '-q']\n",
+        )
+        .unwrap();
+        let (args, _) =
+            bounded_pytest_invocation(root.path(), &[], 2, None, PytestConfigDialect::Nine)
+                .expect("pytest invocation");
+        assert_eq!(&args[args.len() - 2..], ["-n", "2"]);
+    }
+
+    #[test]
+    fn pytest_eight_and_nine_use_distinct_discovery_orders() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(
+            root.path().join("pytest.toml"),
+            "[pytest]\naddopts = ['-n', '9']\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("pytest.ini"), "[pytest]\naddopts = -q\n").unwrap();
+
+        let (legacy_path, legacy_addopts) =
+            selected_pytest_config(root.path(), PytestConfigDialect::Legacy)
+                .expect("legacy config");
+        assert_eq!(legacy_path, root.path().join("pytest.ini"));
+        assert_eq!(legacy_addopts, Some(vec!["-q".to_owned()]));
+
+        let (nine_path, nine_addopts) =
+            selected_pytest_config(root.path(), PytestConfigDialect::Nine)
+                .expect("pytest 9 config");
+        assert_eq!(nine_path, root.path().join("pytest.toml"));
+        assert_eq!(nine_addopts, Some(vec!["-n".to_owned(), "9".to_owned()]));
+    }
+
+    #[test]
+    fn hidden_empty_ini_differs_between_pytest_eight_and_nine() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(root.path().join(".pytest.ini"), "").unwrap();
+        std::fs::write(root.path().join("tox.ini"), "[pytest]\naddopts = -n 5\n").unwrap();
+
+        let (legacy_path, _) = selected_pytest_config(root.path(), PytestConfigDialect::Legacy)
+            .expect("legacy config");
+        assert_eq!(legacy_path, root.path().join("tox.ini"));
+
+        let (nine_path, _) = selected_pytest_config(root.path(), PytestConfigDialect::Nine)
+            .expect("pytest 9 config");
+        assert_eq!(nine_path, root.path().join(".pytest.ini"));
+
+        std::fs::write(root.path().join("pytest.ini"), "").unwrap();
+        let (legacy_path, _) = selected_pytest_config(root.path(), PytestConfigDialect::Legacy)
+            .expect("legacy empty pytest.ini");
+        assert_eq!(legacy_path, root.path().join("pytest.ini"));
+    }
+
+    #[test]
+    fn hidden_ini_name_enters_discovery_in_pytest_seven_two() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(
+            root.path().join(".pytest.ini"),
+            "[pytest]\naddopts = -n 7\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("tox.ini"), "[pytest]\naddopts = -q\n").unwrap();
+
+        let (pre_hidden_path, _) =
+            selected_pytest_config(root.path(), PytestConfigDialect::LegacyPreHidden)
+                .expect("pytest 7.1 config");
+        assert_eq!(pre_hidden_path, root.path().join("tox.ini"));
+
+        let (hidden_path, hidden_addopts) =
+            selected_pytest_config(root.path(), PytestConfigDialect::LegacyHidden)
+                .expect("pytest 7.2 config");
+        assert_eq!(hidden_path, root.path().join(".pytest.ini"));
+        assert_eq!(hidden_addopts, Some(vec!["-n".to_owned(), "7".to_owned()]));
+    }
+
+    #[test]
+    fn sectionless_pyproject_fallback_starts_in_pytest_eight_one() {
+        let root = tempfile::tempdir().expect("pytest project");
+        let pyproject = root.path().join("pyproject.toml");
+        std::fs::write(&pyproject, "[project]\nname = 'fixture'\n").unwrap();
+
+        for dialect in [
+            PytestConfigDialect::LegacyPreHidden,
+            PytestConfigDialect::LegacyHidden,
+        ] {
+            let (path, addopts) =
+                selected_pytest_config(root.path(), dialect).expect("pre-8.1 config discovery");
+            assert_eq!(path, empty_pytest_config());
+            assert_eq!(addopts, None);
+        }
+
+        for dialect in [PytestConfigDialect::Legacy, PytestConfigDialect::Nine] {
+            let (path, addopts) =
+                selected_pytest_config(root.path(), dialect).expect("8.1+ config discovery");
+            assert_eq!(path, pyproject);
+            assert_eq!(addopts, None);
+        }
+    }
+
+    #[test]
+    fn pytest_nine_empty_native_table_continues_then_falls_back() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(root.path().join("pyproject.toml"), "[tool.pytest]\n").unwrap();
+        std::fs::write(root.path().join("tox.ini"), "[pytest]\naddopts = -n 4\n").unwrap();
+
+        let (path, addopts) = selected_pytest_config(root.path(), PytestConfigDialect::Nine)
+            .expect("lower config after empty native table");
+        assert_eq!(path, root.path().join("tox.ini"));
+        assert_eq!(addopts, Some(vec!["-n".to_owned(), "4".to_owned()]));
+
+        std::fs::remove_file(root.path().join("tox.ini")).unwrap();
+        let (path, addopts) = selected_pytest_config(root.path(), PytestConfigDialect::Nine)
+            .expect("pyproject fallback");
+        assert_eq!(path, root.path().join("pyproject.toml"));
+        assert_eq!(addopts, None);
+    }
+
+    #[test]
+    fn pytest_native_and_legacy_pyproject_conflict_is_version_aware() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[tool.pytest]\naddopts = ['-n', '9']\n\n[tool.pytest.ini_options]\naddopts = '-q'\n",
+        )
+        .unwrap();
+
+        let legacy = selected_pytest_config(root.path(), PytestConfigDialect::Legacy)
+            .expect("pytest 8 ignores native keys");
+        assert_eq!(legacy.1, Some(vec!["-q".to_owned()]));
+
+        let error = selected_pytest_config(root.path(), PytestConfigDialect::Nine)
+            .expect_err("pytest 9 rejects conflicting tables");
+        assert!(error.to_string().contains("defines both"));
+
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[tool.pytest]\naddopts = ['-n', '9']\n\n[tool.pytest.ini_options]\n",
+        )
+        .unwrap();
+        assert!(
+            selected_pytest_config(root.path(), PytestConfigDialect::Nine).is_err(),
+            "even an empty legacy table conflicts with native pytest 9 keys"
+        );
+    }
+
+    #[test]
+    fn selected_config_ignores_malformed_lower_priority_files() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(root.path().join("pytest.toml"), "[pytest]\n").unwrap();
+        std::fs::write(root.path().join("pytest.ini"), "[pytest\n").unwrap();
+
+        let (path, _) = selected_pytest_config(root.path(), PytestConfigDialect::Nine)
+            .expect("lower config is outside discovery after a winner");
+        assert_eq!(path, root.path().join("pytest.toml"));
+    }
+
+    #[test]
+    fn malformed_existing_pytest_configs_fail_closed() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(root.path().join("pytest.toml"), "[pytest\n").unwrap();
+        assert!(selected_pytest_config(root.path(), PytestConfigDialect::Nine).is_err());
+        let legacy = selected_pytest_config(root.path(), PytestConfigDialect::Legacy)
+            .expect("pytest 8 ignores pytest.toml");
+        assert_eq!(legacy.0, empty_pytest_config());
+
+        std::fs::remove_file(root.path().join("pytest.toml")).unwrap();
+        std::fs::write(root.path().join("pytest.ini"), "[pytest\n").unwrap();
+        assert!(selected_pytest_config(root.path(), PytestConfigDialect::Legacy).is_err());
+        assert!(selected_pytest_config(root.path(), PytestConfigDialect::Nine).is_err());
+
+        std::fs::remove_file(root.path().join("pytest.ini")).unwrap();
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[tool.pytest.ini_options\n",
+        )
+        .unwrap();
+        assert!(selected_pytest_config(root.path(), PytestConfigDialect::Legacy).is_err());
+        assert!(selected_pytest_config(root.path(), PytestConfigDialect::Nine).is_err());
+    }
+
+    #[test]
+    fn malformed_ini_bom_and_indented_sections_fail_closed() {
+        assert!(parse_pytest_ini("pytest.ini", "\u{feff}[pytest]\naddopts = -q\n").is_err());
+        assert!(parse_pytest_ini("pytest.ini", "  [pytest]\naddopts = -q\n").is_err());
+        assert!(parse_pytest_ini("pytest.ini", "[pytest#comment]\naddopts = -q\n").is_err());
+        assert!(parse_pytest_ini("pytest.ini", "[pytest]\nunexpected\n").is_err());
+    }
+
+    #[test]
+    fn setup_cfg_pytest_section_is_fatal_but_tool_pytest_is_valid() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(root.path().join("setup.cfg"), "[pytest]\naddopts = -q\n").unwrap();
+        let error = selected_pytest_config(root.path(), PytestConfigDialect::Legacy)
+            .expect_err("setup.cfg [pytest] must fail");
+        assert!(error.to_string().contains("[tool:pytest]"));
+        assert!(selected_pytest_config(root.path(), PytestConfigDialect::Nine).is_err());
+
+        std::fs::write(
+            root.path().join("setup.cfg"),
+            "[tool:pytest]\naddopts = -n logical\n",
+        )
+        .unwrap();
+        let (path, addopts) = selected_pytest_config(root.path(), PytestConfigDialect::Legacy)
+            .expect("valid setup.cfg");
+        assert_eq!(path, root.path().join("setup.cfg"));
+        assert_eq!(addopts, Some(vec!["-n".to_owned(), "logical".to_owned()]));
+    }
+
+    #[test]
+    fn non_utf8_config_fails_closed_and_non_files_are_ignored() {
+        let root = tempfile::tempdir().expect("pytest project");
+        std::fs::write(root.path().join("pytest.ini"), [0xff, 0xfe]).unwrap();
+        let error = selected_pytest_config(root.path(), PytestConfigDialect::Legacy)
+            .expect_err("non-UTF-8 config must fail");
+        assert!(error.to_string().contains("not valid UTF-8"));
+
+        std::fs::remove_file(root.path().join("pytest.ini")).unwrap();
+        std::fs::create_dir(root.path().join("pytest.ini")).unwrap();
+        let (path, _) = selected_pytest_config(root.path(), PytestConfigDialect::Legacy)
+            .expect("pytest ignores config names that are not files");
+        assert_eq!(path, empty_pytest_config());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_existing_pytest_config_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("pytest project");
+        let path = root.path().join("pytest.ini");
+        std::fs::write(&path, "[pytest]\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = read_pytest_config(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            result.is_err(),
+            "an unreadable existing config is not absent"
         );
     }
 
