@@ -2975,6 +2975,15 @@ fn normalized_macro_contract(item: &syn::ItemMacro) -> String {
 fn filter_private_fields(fields: &mut Fields, layout_sensitive: bool) {
     match fields {
         Fields::Named(named) => {
+            for field in &mut named.named {
+                if !is_public(&field.vis) {
+                    // Restricted and inherited visibility are both private to
+                    // external callers. Normalize before sorting and token
+                    // serialization so spelling-only scope changes do not
+                    // become public API deltas.
+                    field.vis = Visibility::Inherited;
+                }
+            }
             if !layout_sensitive {
                 // Rust's default representation gives downstream callers no
                 // field-order ABI. Keep private field TYPES in the contract
@@ -3031,6 +3040,7 @@ fn filter_private_fields(fields: &mut Fields, layout_sensitive: bool) {
                     let marker: Attribute = if is_public(&field.vis) {
                         syn::parse_quote!(#[prview_tuple_index = #index])
                     } else {
+                        field.vis = Visibility::Inherited;
                         syn::parse_quote!(#[prview_tuple_private_index = #index])
                     };
                     field.attrs.push(marker);
@@ -3904,10 +3914,14 @@ fn api_crate_manifests(
     source: &dyn RevisionFileSource,
     manifests: &[String],
 ) -> (BTreeSet<String>, Option<String>) {
-    let parsed: Vec<(&str, toml::Value)> = manifests
-        .iter()
-        .filter_map(|path| peek_manifest_toml(source, path).map(|value| (path.as_str(), value)))
-        .collect();
+    let mut parsed = Vec::new();
+    let mut unresolved = Vec::new();
+    for path in manifests {
+        match peek_manifest_toml(source, path) {
+            Some(value) => parsed.push((path.as_str(), value)),
+            None => unresolved.push(path.as_str()),
+        }
+    }
     let mut workspaces = Vec::new();
     let mut packages = Vec::new();
     for (path, manifest) in &parsed {
@@ -3967,6 +3981,19 @@ fn api_crate_manifests(
             }
         }
         return (allowed, None);
+    }
+
+    if !unresolved.is_empty() {
+        // Without a root Cargo.toml, every discovered manifest is a candidate
+        // authority. A malformed, unreadable, or non-UTF-8 candidate cannot be
+        // discarded in favour of whichever fixture happens to parse.
+        return (
+            BTreeSet::new(),
+            Some(format!(
+                "rootless workspace authority cannot be established because manifests could not be parsed: {}",
+                unresolved.join(", ")
+            )),
+        );
     }
 
     // Compatibility fallback for revision sources rooted below the repository
@@ -4930,6 +4957,48 @@ mod tests {
     }
 
     #[test]
+    fn rust_api_snapshot_normalizes_external_private_field_visibility() {
+        let inherited = snapshot_rust_api(&source(
+            "pub mod api { pub struct Named { inner: u8 } pub struct Tuple(u16); }",
+        ));
+        let restricted = snapshot_rust_api(&source(
+            "pub mod api { pub struct Named { pub(crate) inner: u8 } pub struct Tuple(pub(super) u16); }",
+        ));
+        assert_eq!(
+            inherited.items, restricted.items,
+            "inherited and restricted fields have the same external-private identity"
+        );
+
+        let named_type_changed = snapshot_rust_api(&source(
+            "pub mod api { pub struct Named { pub(crate) inner: String } pub struct Tuple(pub(super) u16); }",
+        ));
+        assert_ne!(
+            find_item(&inherited, "Named").contract,
+            find_item(&named_type_changed, "Named").contract,
+            "private named-field types remain observable after visibility normalization"
+        );
+        assert_eq!(
+            find_item(&inherited, "Tuple").contract,
+            find_item(&named_type_changed, "Tuple").contract,
+            "the unchanged tuple control remains stable"
+        );
+
+        let tuple_type_changed = snapshot_rust_api(&source(
+            "pub mod api { pub struct Named { pub(crate) inner: u8 } pub struct Tuple(pub(super) u32); }",
+        ));
+        assert_eq!(
+            find_item(&inherited, "Named").contract,
+            find_item(&tuple_type_changed, "Named").contract,
+            "the unchanged named-field control remains stable"
+        );
+        assert_ne!(
+            find_item(&inherited, "Tuple").contract,
+            find_item(&tuple_type_changed, "Tuple").contract,
+            "private tuple-field types remain observable after visibility normalization"
+        );
+    }
+
+    #[test]
     fn rust_api_snapshot_keeps_type_abi_and_lifetime_relations_observable() {
         let typed = snapshot_rust_api(&source("pub fn parse(value: u8) {}"));
         let type_changed = snapshot_rust_api(&source("pub fn parse(value: u16) {}"));
@@ -5396,6 +5465,36 @@ mod tests {
                 && unknown.evidence.contains("backend")
                 && unknown.evidence.contains("tests/fixtures")
         }));
+
+        for rootless in [
+            MemorySource::new(&[
+                ("broken/Cargo.toml", b"[package\n"),
+                (
+                    "fixture/Cargo.toml",
+                    b"[package]\nname='fixture'\nversion='0.0.0'\n",
+                ),
+                ("fixture/src/lib.rs", b"pub fn fixture() {}"),
+            ]),
+            MemorySource::new(&[
+                ("binary/Cargo.toml", &[0xff, 0xfe]),
+                (
+                    "fixture/Cargo.toml",
+                    b"[package]\nname='fixture'\nversion='0.0.0'\n",
+                ),
+                ("fixture/src/lib.rs", b"pub fn fixture() {}"),
+            ]),
+            MemorySource::new(&[("broken/Cargo.toml", b"[package\n")]),
+        ] {
+            let snapshot = snapshot_rust_api(&rootless);
+            assert!(
+                snapshot.crates.is_empty(),
+                "an unresolved rootless authority must not select a parseable sibling"
+            );
+            assert!(snapshot.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::WorkspaceDiscovery
+                    && unknown.evidence.contains("rootless workspace authority")
+            }));
+        }
 
         let rooted = MemorySource::new(&[
             (

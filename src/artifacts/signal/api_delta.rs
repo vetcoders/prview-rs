@@ -763,7 +763,25 @@ fn attr_is_layout_sensitive_repr(attribute: &syn::Attribute) -> bool {
     list.tokens
         .to_string()
         .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|token| matches!(token, "C" | "packed" | "transparent"))
+        .any(|token| {
+            matches!(
+                token,
+                "C" | "packed"
+                    | "transparent"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "u128"
+                    | "usize"
+                    | "i8"
+                    | "i16"
+                    | "i32"
+                    | "i64"
+                    | "i128"
+                    | "isize"
+            )
+        })
 }
 
 fn field_side(parent: &ApiFactSide, name: &str, contract: &str) -> ApiFactSide {
@@ -2170,6 +2188,28 @@ mod tests {
                 finding.identity.name == "B" && finding.identity.module_path == ["Abi".to_owned()]
             }),
             "ABI-sensitive enums stay on the parent Changed path"
+        );
+
+        let primitive_repr_delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[repr(u8)] #[non_exhaustive] pub enum Abi { A(u8) }\n",
+                "#[repr(u8)] #[non_exhaustive] pub enum Abi { A(u8), B(u16) }\n",
+            ),
+        ]);
+        assert!(primitive_repr_delta.changed.iter().any(|finding| {
+            finding.identity.name == "Abi" && finding.identity.namespace == "type"
+        }));
+        assert!(
+            !primitive_repr_delta.added.iter().any(|finding| {
+                finding.identity.name == "B" && finding.identity.module_path == ["Abi".to_owned()]
+            }),
+            "primitive integer repr enums stay on the parent Changed path"
         );
 
         let repr_rust_delta = repository_delta(&[
