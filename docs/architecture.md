@@ -1036,11 +1036,13 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
   pools. The safe default therefore serializes every whole-machine tool.
 - **The default is intentionally conservative.** `--resource-budget safe` uses
   one parent permit and one child worker. The opt-in `balanced` plan admits at
-  most two capped heavy parents, caps each supported child pool at four, and caps
-  the logical permit envelope at eight even on a large host. A one-minute load at
-  or above `0.75/core` (or an unavailable load reading) backpressures a requested
-  balanced run to the safe plan. This is a CPU/memory envelope, not a claim that
-  future peak memory can be predicted exactly.
+  most two capped heavy parents, never creates more parent permits than detected
+  logical cores, caps each supported child pool at four, and caps the logical
+  permit envelope at eight even on a large host. A one-core host therefore stays
+  single-parent and single-worker. A one-minute load at or above `0.75/core` (or
+  an unavailable load reading) backpressures a requested balanced run to the safe
+  plan. This is a CPU/memory envelope, not a claim that future peak memory can be
+  predicted exactly.
 - **Python descendants use the same plan.** The pre-sync and Python gates share
   one reviewed snapshot and per-commit uv environment. uv pools, Cargo-backed
   package builds, and pytest-xdist are clamped to the child-worker limit. A

@@ -116,7 +116,7 @@ impl ResourcePlan {
                 // Keep the envelope bounded even on a large build host: at
                 // most two capped heavy parents, each with at most four
                 // descendants. This is a throughput opt-in, not "use it all".
-                let total_budget = logical_cores.clamp(2, 8);
+                let total_budget = logical_cores.clamp(1, 8);
                 Self {
                     requested,
                     effective,
@@ -755,11 +755,39 @@ mod tests {
         assert_eq!(balanced.heavy_cost, 4, "at most two heavy parents");
         assert_eq!(balanced.worker_limit, 4, "child pools remain capped");
 
+        let single_core =
+            ResourcePlan::from_observation(ResourceBudget::Balanced, 1, Some(0.0));
+        assert_eq!(single_core.effective, ResourceBudget::Balanced);
+        assert_eq!(single_core.total_budget, 1, "one core admits one parent");
+        assert_eq!(single_core.heavy_cost, 1, "heavy work owns that core");
+        assert_eq!(single_core.worker_limit, 1, "child pools stay single-worker");
+
         let pressured = ResourcePlan::from_observation(ResourceBudget::Balanced, 8, Some(7.0));
         assert_eq!(pressured.effective, ResourceBudget::Safe);
         assert!(pressured.backpressured);
         assert_eq!(pressured.total_budget, 1);
         assert_eq!(pressured.worker_limit, 1);
+    }
+
+    #[tokio::test]
+    async fn one_core_balanced_admits_only_one_heavy_parent() {
+        let plan =
+            ResourcePlan::from_observation(ResourceBudget::Balanced, 1, Some(0.0));
+        assert_eq!(plan.effective, ResourceBudget::Balanced);
+        assert_eq!(plan.logical_cores, 1);
+        assert_eq!(plan.total_budget, 1);
+        assert_eq!(plan.heavy_cost, 1);
+        assert_eq!(plan.worker_limit, 1);
+
+        let governor = ResourceGovernor::from_plan(plan);
+        let first = governor.acquire(Weight::Heavy).await.expect("first heavy");
+        let second =
+            tokio::time::timeout(Duration::from_millis(25), governor.acquire(Weight::Heavy)).await;
+        assert!(
+            second.is_err(),
+            "one core must not admit a second heavy parent"
+        );
+        drop(first);
     }
 
     #[tokio::test]

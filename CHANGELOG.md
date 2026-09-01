@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The opt-in balanced resource plan no longer creates two parent permits on a
+  one-core host; parent permits now stay within the detected logical-core count,
+  preserving the advertised single-heavy-tool envelope on constrained runners.
 - The `gh --version` startup probe preserves typed cancellation at its own
   error boundary instead of relying on the outer startup supervisor to recover
   it. Direct or internal config construction under a run scope no longer

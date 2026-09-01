@@ -199,8 +199,10 @@ runs at a time and supported descendant pools receive one worker. This is the
 recommended setting for ordinary developer machines.
 
 `--resource-budget balanced` is an explicit throughput opt-in. It still admits
-at most two capped heavy parents; Cargo/rustc receive `CARGO_BUILD_JOBS`, Cargo
-test binaries receive `RUST_TEST_THREADS`, and Semgrep receives `--jobs`.
+at most two capped heavy parents and never creates more parent permits than the
+detected logical-core count; a one-core host therefore remains single-parent
+and single-worker. Cargo/rustc receive `CARGO_BUILD_JOBS`, Cargo test binaries
+receive `RUST_TEST_THREADS`, and Semgrep receives `--jobs`.
 Vitest remains capped at one CLI worker because a higher CLI value would
 override and raise a repository's stricter `maxWorkers` setting. Tools without
 a stable portable cap (including tsc
