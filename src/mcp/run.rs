@@ -15,6 +15,11 @@ use std::time::Duration;
 
 type OwnedDetachedChild = Box<dyn process_wrap::std::ChildWrapper>;
 
+struct OwnedDetachedReview {
+    child: OwnedDetachedChild,
+    child_groups: crate::proc::ExternalChildGroupTracker,
+}
+
 /// Review depth requested by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
@@ -607,7 +612,15 @@ pub async fn start(
             }
         }
         Profile::Deep => {
-            let child = spawn_detached(repo, &args, &output_reservation, out_file, err_file)?;
+            let child_group_owner = run_dir.parent().unwrap_or(&run_dir);
+            let child = spawn_detached(
+                repo,
+                &args,
+                &output_reservation,
+                out_file,
+                err_file,
+                child_group_owner,
+            )?;
             activate_detached_child(
                 &run_dir,
                 child,
@@ -637,7 +650,8 @@ fn spawn_detached(
     output_reservation: &str,
     out_file: File,
     err_file: File,
-) -> Result<OwnedDetachedChild, ToolError> {
+    child_group_owner: &Path,
+) -> Result<OwnedDetachedReview, ToolError> {
     let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e| {
         ToolError::new(error_class::RUN_FAILED, format!("current_exe failed: {e}"))
     })?);
@@ -650,60 +664,101 @@ fn spawn_detached(
         .stdout(std::process::Stdio::from(out_file))
         .stderr(std::process::Stdio::from(err_file));
     crate::proc::harden_std(&mut cmd);
+    let child_group_setup =
+        crate::proc::ExternalChildGroupTracker::attach_std(&mut cmd, child_group_owner).map_err(
+            |error| {
+                ToolError::new(
+                    error_class::RUN_FAILED,
+                    format!("failed to establish deep-review process ownership: {error}"),
+                )
+            },
+        )?;
 
     // Windows uses the same durable Job Object ownership as the other sync
     // process paths, so descendants remain owned even if the direct root exits.
-    crate::proc::spawn_owned_std_child(cmd).map_err(|e| {
+    let child = crate::proc::spawn_owned_std_child(cmd).map_err(|e| {
         ToolError::new(
             error_class::RUN_FAILED,
             format!("spawn detached prview failed: {e}"),
         )
+    })?;
+    let mut child_groups = child_group_setup;
+    child_groups.child_spawned(Some(child.id()));
+    Ok(OwnedDetachedReview {
+        child,
+        child_groups,
     })
 }
 
 /// Terminate the complete detached tree and reap its direct root. A child that
 /// already exited is also explicitly waited, so immediate failure cannot leave
 /// a zombie in the long-lived MCP server.
-fn terminate_and_reap_detached_child(child: &mut OwnedDetachedChild) -> bool {
-    crate::proc::terminate_and_reap_owned_std_child(child.as_mut())
+fn terminate_and_reap_detached_child(review: &mut OwnedDetachedReview) -> bool {
+    let root_reaped = crate::proc::terminate_and_reap_owned_std_child(review.child.as_mut());
+    if !root_reaped {
+        return false;
+    }
+    review.child_groups.root_reaped();
+    review
+        .child_groups
+        .finalize_after_root_exit_blocking(Duration::from_secs(5))
+}
+
+fn detached_marker_cleanup_allowed(containment_confirmed: bool, status: &read::RunStatus) -> bool {
+    containment_confirmed && matches!(status, read::RunStatus::Completed)
 }
 
 /// Transfer a child into one detached waiter thread without losing ownership
 /// if thread creation fails. The parent retains the same shared slot until the
 /// builder succeeds; only the running reaper may take the child afterwards.
 fn install_detached_reaper(
-    child: OwnedDetachedChild,
+    review: OwnedDetachedReview,
     run_dir: PathBuf,
     publication_index: PathBuf,
-) -> Result<(), (std::io::Error, OwnedDetachedChild)> {
-    let owned = Arc::new(Mutex::new(Some(child)));
+) -> Result<(), (std::io::Error, OwnedDetachedReview)> {
+    let owned = Arc::new(Mutex::new(Some(review)));
     let reaper_owned = Arc::clone(&owned);
     let spawn = std::thread::Builder::new()
         .name("prview-mcp-deep-reaper".to_string())
         .spawn(move || {
-            let child = reaper_owned
+            let review = reaper_owned
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
-            let Some(mut child) = child else {
+            let Some(mut review) = review else {
                 return;
             };
             #[cfg(unix)]
-            let pid = child.id();
-            let _ = child.wait();
+            let pid = review.child.id();
+            let root_reaped = review.child.wait().is_ok();
+            if root_reaped {
+                review.child_groups.root_reaped();
+            }
             // On Unix the direct root may exit while a background descendant
             // remains in the process group created by `harden_std`. Reaping
-            // the root is not tree ownership: close the residual group before
-            // declaring the marker non-blocking. Windows' wrapper wait owns the
-            // complete Job Object lifecycle.
+            // the root is not tree ownership: close both the residual root group
+            // and every separately-grouped tool mirrored in the shared ledger.
+            // Windows' wrapper wait owns the complete Job Object lifecycle.
             #[cfg(unix)]
-            let _ = crate::proc::sigkill_process_group(pid);
-            // Successful publication is the only state that may discard the
-            // marker. Failed children retain a stale diagnostic marker, but no
-            // zombie and no active-run lockout.
-            if read::run_status_with_index(&run_dir, &publication_index)
-                == read::RunStatus::Completed
-            {
+            let root_group_terminated = crate::proc::sigkill_process_group(pid);
+            #[cfg(not(unix))]
+            let root_group_terminated = true;
+            let child_groups_terminated = root_reaped
+                && review
+                    .child_groups
+                    .finalize_after_root_exit_blocking(Duration::from_secs(5));
+            let containment_confirmed =
+                root_reaped && root_group_terminated && child_groups_terminated;
+            if !containment_confirmed {
+                eprintln!(
+                    "prview MCP: deep reaper could not confirm complete nested process-tree containment"
+                );
+            }
+            // Successful publication plus confirmed containment is the only
+            // state that may discard the marker. Every other outcome retains a
+            // stale diagnostic marker without creating an active-run lockout.
+            let status = read::run_status_with_index(&run_dir, &publication_index);
+            if detached_marker_cleanup_allowed(containment_confirmed, &status) {
                 let _ = std::fs::remove_file(read::running_marker_path(&run_dir));
             }
         });
@@ -714,12 +769,12 @@ fn install_detached_reaper(
             Ok(())
         }
         Err(error) => {
-            let child = owned
+            let review = owned
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take()
                 .expect("reaper child remains owned when thread spawn fails");
-            Err((error, child))
+            Err((error, review))
         }
     }
 }
@@ -729,7 +784,7 @@ fn install_detached_reaper(
 /// child tree is terminated and the direct root reaped before the RPC fails.
 fn activate_detached_child(
     run_dir: &Path,
-    mut child: OwnedDetachedChild,
+    mut review: OwnedDetachedReview,
     profile: Profile,
     commit: String,
     base_used: Vec<String>,
@@ -738,24 +793,26 @@ fn activate_detached_child(
     // deliberately thread-local, so a reaper that re-resolves PRVIEW_HOME on
     // its own thread could otherwise inspect the operator's real index.
     let publication_index = crate::config::prview_home().join("index.jsonl");
-    let pid = child.id();
+    let pid = review.child.id();
     let marker = match running_marker(pid, profile, commit, base_used) {
         Ok(marker) => marker,
         Err(error) => {
-            let _ = terminate_and_reap_detached_child(&mut child);
+            let _ = terminate_and_reap_detached_child(&mut review);
             return Err(error);
         }
     };
     if let Err(error) = write_marker(run_dir, &marker) {
-        let _ = terminate_and_reap_detached_child(&mut child);
+        let _ = terminate_and_reap_detached_child(&mut review);
         return Err(error);
     }
-    if let Err((error, mut child)) =
-        install_detached_reaper(child, run_dir.to_path_buf(), publication_index)
+    if let Err((error, mut review)) =
+        install_detached_reaper(review, run_dir.to_path_buf(), publication_index)
     {
-        let reaped = terminate_and_reap_detached_child(&mut child);
-        let _ = std::fs::remove_file(read::running_marker_path(run_dir));
-        let detail = if reaped {
+        let containment_confirmed = terminate_and_reap_detached_child(&mut review);
+        if containment_confirmed {
+            let _ = std::fs::remove_file(read::running_marker_path(run_dir));
+        }
+        let detail = if containment_confirmed {
             String::new()
         } else {
             "; process-tree termination/direct-root reap could not be confirmed".to_string()
@@ -858,6 +915,8 @@ mod tests {
     const QUICK_NESTED_GROUP_FIXTURE_ENV: &str = "PRVIEW_MCP_QUICK_NESTED_GROUP_DIR";
     #[cfg(unix)]
     const QUICK_PREEXEC_GAP_FIXTURE_ENV: &str = "PRVIEW_MCP_QUICK_PREEXEC_GAP_DIR";
+    #[cfg(unix)]
+    const DEEP_NESTED_GROUP_FIXTURE_ENV: &str = "PRVIEW_MCP_DEEP_NESTED_GROUP_DIR";
 
     #[test]
     fn unconfirmed_containment_is_part_of_the_mcp_error_contract() {
@@ -870,6 +929,25 @@ mod tests {
             serde_json::json!(false)
         );
         assert!(error.message.contains("containment could not be confirmed"));
+    }
+
+    #[test]
+    fn detached_marker_requires_both_publication_and_confirmed_containment() {
+        assert!(detached_marker_cleanup_allowed(
+            true,
+            &read::RunStatus::Completed
+        ));
+        assert!(!detached_marker_cleanup_allowed(
+            false,
+            &read::RunStatus::Completed
+        ));
+        assert!(!detached_marker_cleanup_allowed(
+            true,
+            &read::RunStatus::Stale {
+                pid: 42,
+                started_at: "fixture root exited".to_string(),
+            }
+        ));
     }
 
     /// Subprocess-only fixture. The parent test launches this exact test under
@@ -893,6 +971,51 @@ mod tests {
                 .expect("spawn background-grandchild fixture");
             assert!(status.success());
         }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !signal.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if signal.exists() {
+            std::process::exit(17);
+        }
+        std::process::exit(18);
+    }
+
+    /// Subprocess-only deep fixture. The review root adopts the parent-owned
+    /// capability, launches one governed tool in its own PGID, then exits
+    /// without running governor cleanup. The detached MCP reaper must own that
+    /// tool and its grandchild independently of the dead root PGID.
+    #[cfg(unix)]
+    #[test]
+    fn detached_deep_nested_group_child_fixture() {
+        let Some(dir) = std::env::var_os(DEEP_NESTED_GROUP_FIXTURE_ENV) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        crate::proc::initialize_external_child_group_capability()
+            .expect("deep fixture adopts parent-owned child-group capability");
+
+        let grandchild_path = dir.join("grandchild.pid");
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "set -eu; test -z \"${PRVIEW_INTERNAL_CHILD_GROUP_FD+x}\"; test -z \"${PRVIEW_INTERNAL_CHILD_GROUP_TOKEN+x}\"; trap '' HUP INT TERM; sleep 30 & printf '%s\n' \"$!\" > \"$PRVIEW_MCP_NESTED_GRANDCHILD\"; wait",
+            ])
+            .env("PRVIEW_MCP_NESTED_GRANDCHILD", &grandchild_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::proc::harden_std(&mut command);
+        let tool = command
+            .spawn()
+            .expect("spawn separately-grouped deep tool fixture");
+        let tool_pid = tool.id();
+        let governor = crate::governor::ResourceGovernor::with_budget(1, 1);
+        assert!(governor.register_child("deep-tool", tool_pid));
+        std::fs::write(dir.join("root.pid"), std::process::id().to_string()).unwrap();
+        std::fs::write(dir.join("tool.pid"), tool_pid.to_string()).unwrap();
+
+        let signal = dir.join("exit-root");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !signal.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
@@ -1005,7 +1128,25 @@ mod tests {
         panic!("pre-exec gap fixture was unexpectedly released");
     }
 
-    fn spawn_reaper_fixture(signal: &Path) -> OwnedDetachedChild {
+    fn spawn_owned_detached_fixture(
+        mut command: std::process::Command,
+        owner_dir: &Path,
+    ) -> OwnedDetachedReview {
+        crate::proc::harden_std(&mut command);
+        let child_group_setup =
+            crate::proc::ExternalChildGroupTracker::attach_std(&mut command, owner_dir)
+                .expect("attach detached fixture child-group tracker");
+        let child =
+            crate::proc::spawn_owned_std_child(command).expect("spawn owned detached fixture");
+        let mut child_groups = child_group_setup;
+        child_groups.child_spawned(Some(child.id()));
+        OwnedDetachedReview {
+            child,
+            child_groups,
+        }
+    }
+
+    fn spawn_reaper_fixture(signal: &Path) -> OwnedDetachedReview {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -1016,12 +1157,16 @@ mod tests {
             .env(REAPER_FIXTURE_ENV, signal)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        crate::proc::harden_std(&mut command);
-        crate::proc::spawn_owned_std_child(command).expect("spawn detached reaper fixture")
+        spawn_owned_detached_fixture(
+            command,
+            signal
+                .parent()
+                .expect("fixture signal has an owner directory"),
+        )
     }
 
     #[cfg(unix)]
-    fn spawn_reaper_fixture_with_grandchild(signal: &Path, pidfile: &Path) -> OwnedDetachedChild {
+    fn spawn_reaper_fixture_with_grandchild(signal: &Path, pidfile: &Path) -> OwnedDetachedReview {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -1033,9 +1178,27 @@ mod tests {
             .env(REAPER_GRANDCHILD_PID_ENV, pidfile)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        crate::proc::harden_std(&mut command);
-        crate::proc::spawn_owned_std_child(command)
-            .expect("spawn detached reaper fixture with grandchild")
+        spawn_owned_detached_fixture(
+            command,
+            signal
+                .parent()
+                .expect("fixture signal has an owner directory"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn spawn_deep_nested_group_fixture(dir: &Path) -> OwnedDetachedReview {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "mcp::run::tests::detached_deep_nested_group_child_fixture",
+                "--nocapture",
+            ])
+            .env(DEEP_NESTED_GROUP_FIXTURE_ENV, dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        spawn_owned_detached_fixture(command, dir)
     }
 
     fn wait_until_process_is_reaped(pid: u32) {
@@ -1246,6 +1409,72 @@ mod tests {
         wait_until_process_is_reaped(grandchild);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn detached_deep_reaper_terminates_registered_nested_group_after_root_exit() {
+        let run_dir = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let review = spawn_deep_nested_group_fixture(fixture.path());
+        let root_pid = activate_detached_child(
+            run_dir.path(),
+            review,
+            Profile::Deep,
+            "abc1234".to_string(),
+            vec!["main".to_string()],
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let read_pid = |name: &str| loop {
+            if let Ok(text) = std::fs::read_to_string(fixture.path().join(name))
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deep nested-group fixture never published {name}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(read_pid("root.pid"), root_pid);
+        let tool_pid = read_pid("tool.pid");
+        let grandchild_pid = read_pid("grandchild.pid");
+
+        // SAFETY: read-only PGID probes of fixture-owned live processes.
+        let root_pgid = unsafe { libc::getpgid(root_pid as i32) };
+        // SAFETY: same bounded identity probe for the hardened tool root.
+        let tool_pgid = unsafe { libc::getpgid(tool_pid as i32) };
+        assert_eq!(root_pgid, root_pid as i32);
+        assert_eq!(tool_pgid, tool_pid as i32);
+        assert_ne!(root_pgid, tool_pgid, "fixture must contain nested PGIDs");
+        assert!(crate::storage::is_process_alive(grandchild_pid));
+        let sidecar = std::fs::read_dir(fixture.path())
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".mcp-child-groups-")
+            })
+            .expect("deep-review ownership sidecar")
+            .path();
+
+        std::fs::write(fixture.path().join("exit-root"), b"go").unwrap();
+        wait_until_process_is_reaped(root_pid);
+        wait_until_process_is_reaped(tool_pid);
+        wait_until_process_is_reaped(grandchild_pid);
+        let sidecar_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sidecar.exists() && std::time::Instant::now() < sidecar_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !sidecar.exists(),
+            "confirmed detached deep cleanup removes its ownership sidecar"
+        );
+    }
+
     #[test]
     fn marker_write_failure_terminates_and_reaps_detached_child() {
         let run_dir = tempfile::tempdir().unwrap();
@@ -1254,7 +1483,7 @@ mod tests {
         std::fs::create_dir(read::running_marker_path(run_dir.path())).unwrap();
         let signal_dir = tempfile::tempdir().unwrap();
         let child = spawn_reaper_fixture(&signal_dir.path().join("never-release"));
-        let pid = child.id();
+        let pid = child.child.id();
 
         let error = activate_detached_child(
             run_dir.path(),

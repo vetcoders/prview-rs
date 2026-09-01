@@ -333,8 +333,8 @@ pub(crate) fn report_external_child_group_finished(pid: u32, birth_identity: &st
     }
 }
 
-/// Parent-side mirror of the separately-grouped tools owned by an MCP quick
-/// review. Windows already has recursive `taskkill /T`; Unix needs this explicit
+/// Parent-side mirror of the separately-grouped tools owned by an MCP review.
+/// Windows already has recursive `taskkill /T`; Unix needs this explicit
 /// registry because a process group does not contain another process group.
 pub(crate) struct ExternalChildGroupTracker {
     root_pid: Option<u32>,
@@ -359,76 +359,62 @@ pub(crate) struct ExternalChildGroupTracker {
 }
 
 impl ExternalChildGroupTracker {
-    pub(crate) fn attach(
-        cmd: &mut TokioCommand,
-        owner_dir: &std::path::Path,
-    ) -> std::io::Result<Self> {
-        #[cfg(unix)]
+    #[cfg(unix)]
+    fn create(owner_dir: &std::path::Path) -> std::io::Result<(Self, String, libc::c_int)> {
+        use std::io::{Seek as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let sequence = EXTERNAL_CHILD_GROUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let token = format!("{}-{nonce}-{sequence}", std::process::id());
+        let path = owner_dir.join(format!(".mcp-child-groups-{token}"));
+        let header = format!("{EXTERNAL_CHILD_GROUP_HEADER} {token}\n");
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        if let Err(error) = writer
+            .write_all(header.as_bytes())
+            .and_then(|()| writer.sync_data())
         {
-            use std::io::{Seek as _, Write as _};
-            use std::os::fd::AsRawFd as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        if let Err(error) = set_close_on_exec(writer.as_raw_fd())
+            .and_then(|()| lock_external_child_group_ledger(writer.as_raw_fd()))
+        {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
 
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            let sequence =
-                EXTERNAL_CHILD_GROUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let token = format!("{}-{nonce}-{sequence}", std::process::id());
-            let path = owner_dir.join(format!(".mcp-child-groups-{token}"));
-            let header = format!("{EXTERNAL_CHILD_GROUP_HEADER} {token}\n");
-            let mut writer = std::fs::OpenOptions::new()
-                .read(true)
-                .append(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)?;
-            if let Err(error) = writer
-                .write_all(header.as_bytes())
-                .and_then(|()| writer.sync_data())
-            {
+        let mut reader = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(reader) => reader,
+            Err(error) => {
                 let _ = std::fs::remove_file(&path);
                 return Err(error);
             }
-            if let Err(error) = set_close_on_exec(writer.as_raw_fd())
-                .and_then(|()| lock_external_child_group_ledger(writer.as_raw_fd()))
-            {
-                let _ = std::fs::remove_file(&path);
-                return Err(error);
-            }
-
-            let mut reader = match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-            {
-                Ok(reader) => reader,
-                Err(error) => {
-                    let _ = std::fs::remove_file(&path);
-                    return Err(error);
-                }
-            };
-            if let Err(error) = reader.seek(std::io::SeekFrom::Start(header.len() as u64)) {
-                let _ = std::fs::remove_file(&path);
-                return Err(error);
-            }
-            if let Err(error) = set_close_on_exec(reader.as_raw_fd()) {
-                let _ = std::fs::remove_file(&path);
-                return Err(error);
-            }
-            let writer_fd = writer.as_raw_fd();
-            cmd.env(EXTERNAL_CHILD_GROUP_TOKEN_ENV, &token)
-                .env(EXTERNAL_CHILD_GROUP_FD_ENV, writer_fd.to_string());
-            // Keep the descriptor CLOEXEC in the multi-threaded MCP parent.
-            // Only the already-forked review root may clear the bit immediately
-            // before its exec; unrelated concurrent spawns can never inherit it.
-            // SAFETY: fcntl on one inherited integer descriptor is
-            // async-signal-safe and the closure allocates no state.
-            unsafe {
-                cmd.pre_exec(move || clear_close_on_exec(writer_fd));
-            }
-            Ok(Self {
+        };
+        if let Err(error) = reader.seek(std::io::SeekFrom::Start(header.len() as u64)) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        if let Err(error) = set_close_on_exec(reader.as_raw_fd()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        let writer_fd = writer.as_raw_fd();
+        Ok((
+            Self {
                 root_pid: None,
                 path,
                 reader,
@@ -439,7 +425,57 @@ impl ExternalChildGroupTracker {
                 settled_provisional: std::collections::BTreeMap::new(),
                 proven_terminated_groups: std::collections::BTreeSet::new(),
                 ledger_writer: Some(writer),
-            })
+            },
+            token,
+            writer_fd,
+        ))
+    }
+
+    pub(crate) fn attach(
+        cmd: &mut TokioCommand,
+        owner_dir: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let (tracker, token, writer_fd) = Self::create(owner_dir)?;
+            cmd.env(EXTERNAL_CHILD_GROUP_TOKEN_ENV, &token)
+                .env(EXTERNAL_CHILD_GROUP_FD_ENV, writer_fd.to_string());
+            // Keep the descriptor CLOEXEC in the multi-threaded MCP parent.
+            // Only the already-forked review root may clear the bit immediately
+            // before its exec; unrelated concurrent spawns can never inherit it.
+            // SAFETY: fcntl on one inherited integer descriptor is
+            // async-signal-safe and the closure allocates no state.
+            unsafe {
+                cmd.pre_exec(move || clear_close_on_exec(writer_fd));
+            }
+            Ok(tracker)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (cmd, owner_dir);
+            Ok(Self { root_pid: None })
+        }
+    }
+
+    pub(crate) fn attach_std(
+        cmd: &mut std::process::Command,
+        owner_dir: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+
+            let (tracker, token, writer_fd) = Self::create(owner_dir)?;
+            cmd.env(EXTERNAL_CHILD_GROUP_TOKEN_ENV, &token)
+                .env(EXTERNAL_CHILD_GROUP_FD_ENV, writer_fd.to_string());
+            // Same capability transfer as the Tokio adapter above. The parent
+            // descriptor remains CLOEXEC; only this already-forked review root
+            // clears it immediately before exec.
+            unsafe {
+                cmd.pre_exec(move || clear_close_on_exec(writer_fd));
+            }
+            Ok(tracker)
         }
 
         #[cfg(not(unix))]
@@ -518,6 +554,23 @@ impl ExternalChildGroupTracker {
         let barrier_closed = self.wait_for_spawn_barrier(timeout).await;
         let groups_terminated = self.terminate_active_groups(true);
         barrier_closed && groups_terminated
+    }
+
+    /// Synchronous twin of [`Self::finalize_after_root_exit`] for the dedicated
+    /// detached MCP reaper thread, which deliberately owns no Tokio runtime.
+    pub(crate) fn finalize_after_root_exit_blocking(&mut self, timeout: Duration) -> bool {
+        #[cfg(unix)]
+        {
+            let barrier_closed = self.wait_for_spawn_barrier_blocking(timeout);
+            let groups_terminated = self.terminate_active_groups(true);
+            barrier_closed && groups_terminated
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = timeout;
+            self.terminate_active_groups(true)
+        }
     }
 
     pub(crate) fn root_reaped(&mut self) {
@@ -700,7 +753,7 @@ impl Drop for ExternalChildGroupTracker {
                         Ok(groups) => self.terminate_proven_descendant_groups(&groups),
                         Err(error) => {
                             eprintln!(
-                                "prview: could not prove quick-review descendant groups during cleanup: {error}"
+                                "prview: could not prove MCP review descendant groups during cleanup: {error}"
                             );
                             false
                         }
@@ -716,14 +769,12 @@ impl Drop for ExternalChildGroupTracker {
             // Drop is the ownership fallback for an aborted MCP future. It may
             // block briefly, but it must not abandon a forked pre-exec writer
             // after an arbitrary scheduler-dependent 100 ms window.
-            let barrier_closed = self.wait_for_spawn_barrier_blocking(Duration::from_secs(5));
-            let final_groups_terminated = self.terminate_active_groups(true);
-            containment_confirmed &= barrier_closed && final_groups_terminated;
+            containment_confirmed &= self.finalize_after_root_exit_blocking(Duration::from_secs(5));
             if containment_confirmed {
                 let _ = std::fs::remove_file(&self.path);
             } else {
                 eprintln!(
-                    "prview: quick-review cleanup remains unconfirmed; retained ownership sidecar {}",
+                    "prview: MCP review cleanup remains unconfirmed; retained ownership sidecar {}",
                     self.path.display()
                 );
             }
@@ -1266,7 +1317,7 @@ pub(crate) async fn terminate_supervised_tokio_child(
 }
 
 /// Apply the standard rails to `cmd`: detached stdin, `kill_on_drop`, and (unix)
-/// its own process group. A quick-review child inherits the MCP ledger only for
+/// its own process group. An MCP review child inherits the ledger only for
 /// its async-signal-safe provisional write; the descriptor and capability env
 /// are closed/removed at exec. The tool's whole group is then represented by
 /// that one registration. Stdout/stderr are left to the caller — piped for
