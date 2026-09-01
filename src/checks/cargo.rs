@@ -127,7 +127,7 @@ fn cargo_jobs_env(config: &Config, cwd: &Path) -> (String, String) {
         config.resource_plan.logical_cores,
         cwd,
         cargo_home.as_deref(),
-        std::env::var_os,
+        |key| std::env::var_os(key),
     )
 }
 
