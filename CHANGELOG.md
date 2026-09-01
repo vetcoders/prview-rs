@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MCP active-run discovery filters markerless history and the completed-run
+  `latest` alias before lifecycle probing. Runs without `SANITY.json` no longer
+  reload the global publication index while they are polled, while completed
+  publication still wins over a lingering live marker.
 - MCP deep reviews retain and reap every detached direct child, including an
   immediately failing process, so a zombie cannot keep a later review blocked.
   Versioned running markers bind the PID to its native process-birth identity

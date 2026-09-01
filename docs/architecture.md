@@ -1334,6 +1334,10 @@ an immediate failure. After normal root exit it also terminates residual Unix
 process-group members; Windows retains the complete Job Object until wait.
 The caller also captures the exact publication-index path before starting the
 waiter, so background completion never re-resolves a different storage home.
+Active-run discovery rejects markerless history and the completed-run `latest`
+alias before lifecycle probing. A run without `SANITY.json` never reads the
+global publication index; index lookup is reserved for proving that a finalized
+pack committed durable publication.
 `RUNNING.json` protocol v2 pairs the PID with the native
 process creation identity; liveness requires both values to match, while legacy
 PID-only markers fail closed by blocking while their PID is live, then become

@@ -189,16 +189,26 @@ pub fn run_status(run_dir: &Path) -> RunStatus {
 /// test overrides are intentionally thread-scoped, and production callers may
 /// likewise need the exact storage dependency captured before spawning work.
 pub(crate) fn run_status_with_index(run_dir: &Path, index_path: &Path) -> RunStatus {
+    run_status_with_publication_probe(run_dir, |run_id, run_dir| {
+        RunIndex::load_from(index_path)
+            .entries()
+            .iter()
+            .any(|entry| Some(entry.id.as_str()) == run_id && same_run_path(&entry.path, run_dir))
+    })
+}
+
+fn run_status_with_publication_probe(
+    run_dir: &Path,
+    is_published: impl FnOnce(Option<&str>, &Path) -> bool,
+) -> RunStatus {
     // SANITY is necessary but not sufficient: it precedes the transactional
     // index/latest commit. A lossy read is acceptable only for this lifecycle
     // hint; every MCP success path separately uses `strict_run_index`.
     let finalized = run_dir.join("00_summary").join("SANITY.json").exists();
     let run_id = run_dir.file_name().and_then(|name| name.to_str());
-    let published = RunIndex::load_from(index_path)
-        .entries()
-        .iter()
-        .any(|entry| Some(entry.id.as_str()) == run_id && same_run_path(&entry.path, run_dir));
-    if finalized && published {
+    // A run without SANITY cannot be durably completed, so do not parse the
+    // global index while polling its liveness.
+    if finalized && is_published(run_id, run_dir) {
         return RunStatus::Completed;
     }
 
@@ -374,14 +384,26 @@ fn running_run_for_head(repo_name: &str, branch_key: &str, head: &str) -> Option
         .join(branch_key);
     let mut best: Option<(String, ResolvedRun)> = None;
     for entry in std::fs::read_dir(&base).ok()?.flatten() {
-        let run_dir = entry.path();
-        if !run_dir.is_dir() || !matches!(run_status(&run_dir), RunStatus::Running { .. }) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // `latest` is a directory symlink. Following it would reclassify the
+        // published target under run id "latest" and miss its exact index row.
+        if !file_type.is_dir() {
             continue;
         }
+        let run_dir = entry.path();
         let Some(marker) = read_running_marker(&run_dir) else {
             continue;
         };
         if !commit_matches(&marker.commit, head) {
+            continue;
+        }
+        // This scan only searches for Running. Markerless and off-HEAD
+        // directories cannot qualify, so reject them before the durable
+        // publication probe. Keep the status check after the marker: a
+        // published pack must still beat a lingering live marker.
+        if !matches!(run_status(&run_dir), RunStatus::Running { .. }) {
             continue;
         }
         let Some(run_id) = run_dir.file_name().and_then(|n| n.to_str()) else {
@@ -1700,6 +1722,51 @@ mod tests {
                 pid: std::process::id()
             }
         );
+    }
+
+    #[test]
+    fn run_status_without_sanity_does_not_probe_publication_index() {
+        let dir = tempfile::tempdir().unwrap();
+        write_marker(dir.path(), std::process::id());
+        let probes = std::cell::Cell::new(0);
+
+        let status = run_status_with_publication_probe(dir.path(), |_, _| {
+            probes.set(probes.get() + 1);
+            false
+        });
+
+        assert_eq!(
+            status,
+            RunStatus::Running {
+                pid: std::process::id()
+            }
+        );
+        assert_eq!(probes.get(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_run_for_head_skips_latest_alias_to_published_run() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let branch_dir = home.path().join("runs/demo/main");
+        let run_dir = branch_dir.join("published-run");
+        let summary = run_dir.join("00_summary");
+        std::fs::create_dir_all(&summary).unwrap();
+        std::fs::write(summary.join("SANITY.json"), "{}").unwrap();
+        write_marker(&run_dir, std::process::id());
+
+        let mut published = entry("published-run", "abc1234", "2026-07-01T12:00:00Z");
+        published.path = run_dir.clone();
+        std::fs::write(
+            home.path().join("index.jsonl"),
+            format!("{}\n", serde_json::to_string(&published).unwrap()),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("published-run", branch_dir.join("latest")).unwrap();
+
+        assert_eq!(run_status(&run_dir), RunStatus::Completed);
+        assert!(running_run_for_head("demo", "main", "abc1234").is_none());
     }
 
     #[test]

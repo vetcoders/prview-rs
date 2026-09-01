@@ -118,9 +118,21 @@ fn active_run(repo_name: &str, branch_key: &str) -> Option<String> {
         .join(branch_key);
     let read = std::fs::read_dir(&base).ok()?;
     for entry in read.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // `latest` is a symlink to a completed run, never an activation slot.
+        if !file_type.is_dir() {
+            continue;
+        }
         let dir = entry.path();
-        if dir.is_dir()
-            && matches!(read::run_status(&dir), read::RunStatus::Running { .. })
+        if read::read_running_marker(&dir).is_none() {
+            continue;
+        }
+        // A marker is necessary for Running. Avoid probing the global index
+        // for markerless history, while retaining the status check so durable
+        // publication still beats a lingering marker.
+        if matches!(read::run_status(&dir), read::RunStatus::Running { .. })
             && let Some(id) = dir.file_name().and_then(|n| n.to_str())
         {
             return Some(id.to_string());
@@ -947,6 +959,57 @@ mod tests {
             !read::running_marker_path(&run_dir).exists(),
             "reaper must resolve completion from the caller's captured publication index"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_run_skips_latest_alias_to_published_run() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let branch_dir = home.path().join("runs/mcp-latest-test/main");
+        let run_dir = branch_dir.join("published-run");
+        let summary = run_dir.join("00_summary");
+        std::fs::create_dir_all(&summary).unwrap();
+        std::fs::write(summary.join("SANITY.json"), "{}").unwrap();
+        let marker = read::RunningMarker {
+            schema_version: read::RUNNING_MARKER_SCHEMA_VERSION,
+            pid: std::process::id(),
+            process_birth_id: crate::storage::process_birth_identity(std::process::id()).ok(),
+            started_at: "2026-07-01T12:00:00Z".to_string(),
+            profile: "deep".to_string(),
+            commit: "abc1234".to_string(),
+            base_used: vec!["main".to_string()],
+        };
+        std::fs::write(
+            read::running_marker_path(&run_dir),
+            serde_json::to_string(&marker).unwrap(),
+        )
+        .unwrap();
+        let published = serde_json::json!({
+            "id": "published-run",
+            "repo": "mcp-latest-test",
+            "branch": "main",
+            "commit": "abc1234",
+            "path": run_dir,
+            "created_at": "2026-07-01T12:00:00Z",
+            "quality_pass": true,
+            "merge_status": "ALLOW",
+            "policy_mode": "shadow",
+            "checks_passed": 1,
+            "checks_failed": 0,
+            "files_changed": 1,
+            "size_bytes": 1,
+            "has_dashboard": false,
+        });
+        std::fs::write(
+            home.path().join("index.jsonl"),
+            format!("{}\n", serde_json::to_string(&published).unwrap()),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("published-run", branch_dir.join("latest")).unwrap();
+
+        assert_eq!(read::run_status(&run_dir), read::RunStatus::Completed);
+        assert_eq!(active_run("mcp-latest-test", "main"), None);
     }
 
     #[cfg(unix)]

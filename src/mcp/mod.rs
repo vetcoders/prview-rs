@@ -554,10 +554,14 @@ fn running_run_summary_from_base_with(
 ) -> Option<serde_json::Value> {
     let mut candidates: Vec<(String, serde_json::Value)> = Vec::new();
     for entry in std::fs::read_dir(base).ok()?.flatten() {
-        let run_dir = entry.path();
-        if !run_dir.is_dir() || !matches!(run_status(&run_dir), read::RunStatus::Running { .. }) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // Do not follow the completed-run `latest` alias as a second run id.
+        if !file_type.is_dir() {
             continue;
         }
+        let run_dir = entry.path();
         let Some(run_id) = run_dir.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
@@ -567,6 +571,11 @@ fn running_run_summary_from_base_with(
         if let Some(head) = head
             && !read::commit_matches(&marker.commit, head)
         {
+            continue;
+        }
+        // Only marker-bearing candidates can be Running. Filter markerless
+        // history and off-HEAD markers before probing durable publication.
+        if !matches!(run_status(&run_dir), read::RunStatus::Running { .. }) {
             continue;
         }
         let body = in_progress_body(run_id, &marker.commit, &marker);
@@ -908,16 +917,25 @@ mod tests {
         let missing_marker = base.join("20260704-missing-marker");
         std::fs::create_dir(&missing_marker).unwrap();
 
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("20260704-healthy", base.join("latest")).unwrap();
+
+        let status_probes = std::cell::Cell::new(0);
+
         let summary = running_run_summary_from_base_with(
             base,
             None,
-            |_| read::RunStatus::Running {
-                pid: std::process::id(),
+            |_| {
+                status_probes.set(status_probes.get() + 1);
+                read::RunStatus::Running {
+                    pid: std::process::id(),
+                }
             },
             read::read_running_marker,
         )
         .unwrap();
         assert_eq!(summary["run_id"], serde_json::json!("20260704-healthy"));
         assert_eq!(summary["commit"], serde_json::json!("abcdef123456"));
+        assert_eq!(status_probes.get(), 1);
     }
 }
