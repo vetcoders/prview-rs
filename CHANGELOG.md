@@ -18,6 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MCP `run_review` now rejects source-buildable targets without a native
+  PID-reuse-safe process-birth identity before taking the activation lock or
+  spawning a review. Linux, macOS, and Windows remain the explicitly supported
+  MCP review targets; other targets retain the direct CLI path.
+- MCP branch activation no longer maps every lock failure to a retryable
+  "another review is running" response. Live contention carries
+  `retryable: true`; a stale legacy-compatible `.active.lock` preserves the
+  fail-closed mixed-version invariant but exposes `recovery_required`, its exact
+  path, and no retry timer. Permission, link, and malformed-lock failures surface
+  as non-retryable `storage_corrupt`.
+- Python checks honor uv's `UV_NO_CONFIG` boolish contract before inspecting
+  repository configuration: enabled values skip discovered `uv.toml` and
+  `[tool.uv]` limits, false values preserve discovery, and an explicit contained
+  `UV_CONFIG_FILE` remains authoritative. Invalid and non-UTF-8 values fail loud
+  instead of manufacturing a resource ceiling.
 - Direct Cargo gates preserve the effective repository `[build].jobs` ceiling
   visible from the exact reviewed cwd, including remote snapshots, instead of
   overriding a stricter project limit with prview's resource-plan width.

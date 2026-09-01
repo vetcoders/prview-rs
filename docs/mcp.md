@@ -122,6 +122,13 @@ candidates; `base_caveats` explains that fallback.
 
 Generate a review pack.
 
+MCP `run_review` is supported on Linux, macOS, and Windows. Its durable
+`RUNNING.json` marker must bind a PID to a native process-birth identity, so on
+other source-buildable targets the tool returns `run_failed` before taking the
+branch activation lock or spawning prview. The CLI remains the direct review
+surface there; source-build availability does not manufacture a PID-reuse-safe
+MCP lifecycle contract.
+
 | Arg | Required | Description |
 |-----|----------|-------------|
 | `repo` | yes | Absolute path to the git repo to review. |
@@ -249,7 +256,14 @@ complete publication and confirmed process-tree containment.
 Poll [`verdict`](#verdict) with that `run_id` until `status` is `completed`.
 
 **One active run per repo branch.** A second `run_review` while one is in flight
-returns `storage_locked` with an `active_run_id` and a `retry_after_ms` hint.
+returns retryable `storage_locked` with an `active_run_id` and a
+`retry_after_ms` hint. A stale pre-0.8-compatible `.active.lock` is different:
+automatic takeover could race a paused legacy contender, so the response is
+non-retryable `storage_locked` with `recovery_required: true`, the exact
+`lock_path`, and a recovery instruction. Remove only that path, and only after
+verifying that no pre-0.8 prview process is using the same storage root.
+Permission, link, and malformed-lock failures return non-retryable
+`storage_corrupt` instead of pretending that another review is live.
 
 The launcher exclusively reserves the future pack directory before spawning so
 `RUNNING.json` and the two process logs are observable immediately. The child
@@ -390,10 +404,11 @@ While a `deep` run is in flight or after it dies, `verdict` reports liveness via
 the run's versioned `RUNNING.json` marker instead of a decision. Marker v2 binds
 the PID to a native process-birth identity (Linux boot UUID plus start ticks,
 macOS process start time, or Windows creation FILETIME), so PID recycling cannot
-make a v2 run appear live. A PID-only legacy marker with a live PID deliberately
-blocks as `running` until that PID exits; without a birth token, preserving the
-one-active-run invariant is safer than starting a second heavy review. A legacy
-marker becomes `stale` once its PID is dead:
+make a v2 run appear live. Those are the supported MCP `run_review` targets; a
+different target is rejected before spawn. A PID-only legacy marker with a live
+PID deliberately blocks as `running` until that PID exits; without a birth token,
+preserving the one-active-run invariant is safer than starting a second heavy
+review. A legacy marker becomes `stale` once its PID is dead:
 
 | `status` | Meaning | Extra fields |
 |----------|---------|--------------|
@@ -494,8 +509,8 @@ fields (e.g. `retry_after_ms`, `active_run_id`, `run_id`).
 | `run_not_found` | No run matches the given `run_id` / HEAD; call `run_review`. |
 | `artifact_missing` | The requested artifact does not exist within the run, is not UTF-8 text, or would escape the run directory. |
 | `tool_missing` | A required external tool is unavailable. |
-| `storage_locked` | Another review is already running for this repo branch. Carries `active_run_id` and `retry_after_ms`. |
-| `storage_corrupt` | `MERGE_GATE.json` is missing, invalid, carries a `schema_version` with an unknown MAJOR, states no decision signal at all, or an explicit `run_id` is ambiguous in storage. |
+| `storage_locked` | Another review is already running for this repo branch (`retryable: true`, `active_run_id`, `retry_after_ms`), or a stale legacy-compatible activation sentinel requires explicit recovery (`retryable: false`, `recovery_required: true`, `lock_path`). |
+| `storage_corrupt` | `MERGE_GATE.json` is missing, invalid, carries a `schema_version` with an unknown MAJOR, states no decision signal at all; an explicit `run_id` is ambiguous; or the branch activation lock cannot be opened safely. Activation-lock failures carry `retryable: false` and `lock_path`. |
 | `stale_run` | The run is still in progress or its process died before completing. Carries `retry_after_ms` while running. |
 
 ### Retrying
@@ -503,3 +518,5 @@ fields (e.g. `retry_after_ms`, `active_run_id`, `run_id`).
 When a response carries `retry_after_ms`, wait that long before retrying the same
 call. It appears on `storage_locked` (another run holds the branch), on an
 `in_progress` `verdict`, and on a `stale_run` while a review is still in progress.
+Never loop on `retryable: false`; follow its recovery detail or repair the named
+storage path condition first.

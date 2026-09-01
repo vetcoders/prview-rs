@@ -228,11 +228,16 @@ environment value, and the matching project value from `uv.toml` or
 unreadable concurrency authority fails closed instead of widening the run.
 `pyproject.toml`, `uv.lock`, and any discovered `uv.toml` must resolve inside the
 reviewed tree. An explicit in-tree `UV_CONFIG_FILE` replaces discovery, matching
-uv's precedence. `UV_PROJECT`, `UV_WORKING_DIR`, and the legacy
-`UV_WORKING_DIRECTORY` are refused when they redirect execution away from the
-exact reviewed root; an in-tree explicit config remains the concurrency
-authority uv will actually use. User- and system-level uv configuration is not
-currently reproduced by this project-level resolver. Pytest also receives
+uv's precedence. An enabled boolish `UV_NO_CONFIG` skips discovered `uv.toml`
+and `[tool.uv]` concurrency values, while an explicit `UV_CONFIG_FILE` remains
+authoritative even when both variables are set. The project manifest and other
+metadata still require containment because uv and the selected Python tools
+consume them independently of uv configuration discovery. `UV_PROJECT`,
+`UV_WORKING_DIR`, and the legacy `UV_WORKING_DIRECTORY` are refused when they
+redirect execution away from the exact reviewed root; an in-tree explicit
+config remains the concurrency authority uv will actually use. User- and
+system-level uv configuration is not currently reproduced by this project-level
+resolver. Pytest also receives
 `PYTEST_XDIST_AUTO_NUM_WORKERS`; when project or inherited addopts request
 xdist (`-n auto`, `logical`, or explicit `-n N`), prview caps only a dynamic or
 too-large pool. An explicit smaller count and `-n 0` remain unchanged. A short,

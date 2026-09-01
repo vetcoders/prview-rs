@@ -339,8 +339,10 @@ syncs an off-HEAD dependency set into the operator checkout. uv download/build/
 install pools and Cargo-backed PEP 517 builds inherit the run's child limit.
 Before exporting higher-precedence `UV_CONCURRENT_*` values, the plan reads the
 project-scoped authority selected by uv's explicit/discovery precedence: an
-in-tree `UV_CONFIG_FILE`, otherwise `uv.toml`, otherwise `[tool.uv]` from
-`pyproject.toml`. Each pool takes the
+in-tree `UV_CONFIG_FILE`; otherwise, when boolish `UV_NO_CONFIG` is enabled, no
+discovered uv configuration; otherwise `uv.toml`, then `[tool.uv]` from
+`pyproject.toml`. An explicit config remains authoritative together with
+`UV_NO_CONFIG`, matching uv. Each pool takes the
 minimum of that project ceiling, inherited environment, and the run plan;
 malformed, unreadable, non-UTF-8, wrong-type, or non-positive authority fails
 closed. User- and system-level uv config remains outside this deliberately
@@ -421,7 +423,10 @@ provenance recorded an exact `snapshot` scan and the cache filed the verdict
 under the reviewed commit (`uv run` is given neither `--no-project` nor
 `--locked`, so nothing downstream re-asks). Metadata linked to a real file inside
 the tree resolves back inside and passes: escape is the target, not symlinks.
-Ambient `UV_CONFIG_FILE`, `UV_PROJECT`, `UV_WORKING_DIR`, and legacy
+An enabled `UV_NO_CONFIG` removes only discovered `uv.toml` from that boundary;
+`pyproject.toml` and `uv.lock` remain independently consumed metadata. Invalid
+or non-UTF-8 boolish values fail loud, as uv would. Ambient `UV_CONFIG_FILE`,
+`UV_PROJECT`, `UV_WORKING_DIR`, and legacy
 `UV_WORKING_DIRECTORY` are checked at the same boundary. A config file may stay
 inside the tree, but a project or working-directory redirect must resolve to the
 exact reviewed root; prview reports a planning error instead of silently
@@ -1304,9 +1309,13 @@ publication has the end-to-end transaction described above. A live legacy
 owner blocks normally; a stale legacy sentinel fails
 closed and is never rewritten automatically because an old process could have
 observed it before pausing. An operator may remove that exact sentinel only
-after ruling out old publishers. Lock opens reject symlinks/reparse points and,
-on Unix, shared hardlink inodes; journal/index/prune manifests are published via
-owned unique temp files and atomic rename.
+after ruling out old publishers. MCP branch activation preserves this rule:
+stale `.active.lock` evidence becomes non-retryable `storage_locked` with
+`recovery_required` and its exact path, rather than the false claim that a live
+review will clear on retry. Unsafe or unreadable activation paths become
+`storage_corrupt`; they are not folded into lock contention. Lock opens reject
+symlinks/reparse points and, on Unix, shared hardlink inodes; journal/index/prune
+manifests are published via owned unique temp files and atomic rename.
 The prune manifest is not path authority by itself: before recovery moves or
 deletes a payload, the payload root, its `00_summary` directory, and its
 `RUN.json` must each be owned non-link components, and RUN must identify the
@@ -1465,6 +1474,11 @@ stale after it exits. The server returns `status: running` for a new review only
 after identity capture, marker publication, and reaper installation all succeed.
 Failure at any setup seam terminates the child tree, reaps the direct root, and
 fails the RPC instead of publishing an untracked run.
+Linux, macOS, and Windows are the supported MCP `run_review` targets because
+they provide the native PID-reuse-safe identity required by this protocol. A
+different source-buildable target is refused before activation locking or child
+spawn; the ordinary CLI does not require a durable MCP liveness marker and
+remains the direct execution surface there.
 
 ### artifacts/mod.rs
 
