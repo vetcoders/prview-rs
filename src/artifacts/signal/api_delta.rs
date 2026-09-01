@@ -5,9 +5,9 @@
 //! by both production Rust API artifacts.
 
 use super::api_surface::{
-    RustApiDeclaration, RustApiItem, RustApiItemKey, RustApiSnapshot, RustApiUnknown,
-    RustApiUnknownKind, RustNamespace, RustSourceCertainty, guards_proven_disjoint,
-    trait_member_cfg_key,
+    NON_NEUTRALIZABLE_SYMLINK_ROOT, RustApiDeclaration, RustApiItem, RustApiItemKey,
+    RustApiSnapshot, RustApiUnknown, RustApiUnknownKind, RustNamespace, RustSourceCertainty,
+    guards_proven_disjoint, trait_member_cfg_key,
 };
 use super::revision_source::RevisionProvenance;
 use crate::git::{Diff, Repository};
@@ -1526,6 +1526,11 @@ fn unknown_proofs_match(
     target: &RustApiSnapshot,
     right: &RustApiUnknown,
 ) -> bool {
+    if left.evidence.contains(NON_NEUTRALIZABLE_SYMLINK_ROOT)
+        || right.evidence.contains(NON_NEUTRALIZABLE_SYMLINK_ROOT)
+    {
+        return false;
+    }
     if left.kind == RustApiUnknownKind::CfgPredicate
         && (left.evidence.contains("cfg-authority-digest:unresolved:")
             || right.evidence.contains("cfg-authority-digest:unresolved:"))
@@ -6081,6 +6086,246 @@ mod tests {
             "rustc-provided target_abi is not custom cfg authority: {:?}",
             target_abi.findings()
         );
+    }
+
+    #[test]
+    fn repository_backed_cargo_edge_contracts_do_not_false_clean() {
+        let build_true = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nbuild=true\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nbuild=true\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("build.rs", "fn main() {}\n", "fn main() {}\n"),
+            ("src/lib.rs", "pub fn removed(value: u8) {}\n", ""),
+        ]);
+        assert!(
+            build_true
+                .removed
+                .iter()
+                .any(|finding| finding.identity.name == "removed"),
+            "Cargo-valid build=true must not hide the library API: {:?}",
+            build_true.findings()
+        );
+        assert!(build_true.unknown.iter().all(|finding| {
+            !finding
+                .unknown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("package.build=true"))
+        }));
+
+        let build_true_cfg_authority = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nbuild=true\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nbuild=true\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo::rustc-cfg=public_api\"); }\n",
+                "fn main() {}\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(build_true_cfg_authority.unknown.iter().any(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("custom-cfg:")
+                    && reason.contains("public_api")
+                    && reason.contains("cfg-authority-digest:sha256:")
+            })
+        }));
+
+        for (manifest, label) in [
+            (
+                "[package]\nname='type'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "inferred keyword crate name",
+            ),
+            (
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\nname='type'\npath='src/lib.rs'\n",
+                "explicit keyword library name",
+            ),
+        ] {
+            let keyword = repository_delta(&[
+                ("Cargo.toml", manifest, manifest),
+                (
+                    "src/lib.rs",
+                    "pub fn api(value: u8) {}\n",
+                    "pub fn api(value: u16) {}\n",
+                ),
+            ]);
+            assert!(
+                keyword.changed.iter().any(|finding| {
+                    finding.identity.crate_name == "type" && finding.identity.name == "api"
+                }),
+                "{label} must retain real API facts: {:?}",
+                keyword.findings()
+            );
+            assert!(keyword.unknown.iter().all(|finding| {
+                !finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("ManifestParse"))
+            }));
+        }
+
+        let associated_native_exports = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Api; pub trait Exported { extern \"C\" fn call(value: u8); } impl Api { #[unsafe(no_mangle)] pub extern \"C\" fn exported(value: u8) {} } impl Exported for Api { #[unsafe(export_name=\"call_v1\")] extern \"C\" fn call(value: u8) {} }\n",
+                "pub struct Api; pub trait Exported { extern \"C\" fn call(value: u16); } impl Api { #[unsafe(no_mangle)] pub extern \"C\" fn exported(value: u16) {} } impl Exported for Api { #[unsafe(export_name=\"call_v2\")] extern \"C\" fn call(value: u16) {} }\n",
+            ),
+        ]);
+        assert!(associated_native_exports.unknown.iter().any(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("Api::exported") && reason.contains("binary-export")
+            })
+        }));
+        assert!(associated_native_exports.unknown.iter().any(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("<Api as Exported>::call") && reason.contains("binary-export")
+            })
+        }));
+
+        let mixed_private_owner = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['rlib', 'cdylib']\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['rlib', 'cdylib']\n",
+            ),
+            (
+                "src/lib.rs",
+                "struct Hidden; impl Hidden { #[unsafe(no_mangle)] pub extern \"C\" fn exported(value: u8) {} }\n",
+                "struct Hidden; impl Hidden { #[unsafe(no_mangle)] pub extern \"C\" fn exported(value: u16) {} }\n",
+            ),
+        ]);
+        assert!(mixed_private_owner.unknown.iter().any(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("Hidden::exported") && reason.contains("binary-export")
+            })
+        }));
+
+        let mixed_private_module_direct_export = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['rlib', 'cdylib']\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['rlib', 'cdylib']\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod hidden { #[unsafe(export_name=\"shared\")] pub extern \"C\" fn exported(value: u8) {} }\n",
+                "mod hidden { #[unsafe(export_name=\"shared\")] pub extern \"C\" fn exported(value: u16) {} }\n",
+            ),
+        ]);
+        assert!(
+            mixed_private_module_direct_export
+                .unknown
+                .iter()
+                .any(|finding| {
+                    finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("public-owner:exported") && reason.contains("binary-export")
+                    })
+                })
+        );
+
+        let alpha_renamed_owner = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Holder<T>(T); impl<T> Holder<T> { #[unsafe(export_name=\"shared\")] pub extern \"C\" fn exported() {} }\n",
+                "pub struct Holder<U>(U); impl<U> Holder<U> { #[unsafe(export_name=\"shared\")] pub extern \"C\" fn exported() {} }\n",
+            ),
+        ]);
+        assert!(
+            alpha_renamed_owner.findings().is_empty(),
+            "pure impl binder renames must not change native export evidence: {:?}",
+            alpha_renamed_owner.findings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_backed_symlink_library_root_is_non_neutralizable_unknown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git = git2::Repository::init(tmp.path()).unwrap();
+        let signature = git2::Signature::now("Test", "test@test.com").unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.0.0'\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("shared.rs"), "pub fn api(value: u8) {}\n").unwrap();
+        std::os::unix::fs::symlink("../shared.rs", tmp.path().join("src/lib.rs")).unwrap();
+
+        let mut index = git.index().unwrap();
+        index.add_path(Path::new("Cargo.toml")).unwrap();
+        index.add_path(Path::new("shared.rs")).unwrap();
+        index.add_path(Path::new("src/lib.rs")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git.find_tree(tree_id).unwrap();
+        let base = git
+            .commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])
+            .unwrap();
+        drop(tree);
+
+        fs::write(tmp.path().join("shared.rs"), "pub fn api(value: u16) {}\n").unwrap();
+        let mut index = git.index().unwrap();
+        index.add_path(Path::new("shared.rs")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git.find_tree(tree_id).unwrap();
+        let parent = git.find_commit(base).unwrap();
+        let target = git
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "target",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        drop(tree);
+        drop(parent);
+        drop(git);
+
+        let repo = Repository::open(tmp.path()).unwrap();
+        let delta = compare_rust_api_revisions(
+            &repo,
+            &[make_diff_with_ids(
+                base.to_string(),
+                target.to_string(),
+                Vec::new(),
+            )],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            delta.unknown.len(),
+            2,
+            "the same unresolved symlink proof must stay visible on both sides: {:?}",
+            delta.findings()
+        );
+        assert!(delta.unknown.iter().all(|finding| {
+            finding
+                .unknown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains(NON_NEUTRALIZABLE_SYMLINK_ROOT))
+        }));
     }
 
     #[test]

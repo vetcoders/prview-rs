@@ -7,7 +7,8 @@
 //! as a typed unknown instead of being interpreted as an empty API.
 
 use super::revision_source::{
-    RevisionContentKind, RevisionEntry, RevisionFileSource, RevisionProvenance, RevisionRead,
+    RevisionContentKind, RevisionEntry, RevisionEntryKind, RevisionEntryState, RevisionFileSource,
+    RevisionProvenance, RevisionRead,
 };
 use quote::{ToTokens, quote};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +18,8 @@ use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::{Attribute, Fields, Item, Meta, Token, UseTree, Visibility};
 use unicode_normalization::UnicodeNormalization;
+
+pub(crate) const NON_NEUTRALIZABLE_SYMLINK_ROOT: &str = "non-neutralizable-symlink-library-root:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustApiSnapshot {
@@ -1347,6 +1350,11 @@ impl<'a> SnapshotBuilder<'a> {
             };
             let proc_macro =
                 declared_proc_macro || crate_types.iter().any(|kind| kind.as_str() == "proc-macro");
+            let crate_name = normalize_identifier(
+                explicit_name
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| package_name.replace('-', "_")),
+            );
             let root_path =
                 match safe_join_repo_path(&manifest_dir, explicit_root.unwrap_or("src/lib.rs")) {
                     Ok(path) => path,
@@ -1361,19 +1369,6 @@ impl<'a> SnapshotBuilder<'a> {
                         continue;
                     }
                 };
-            if lib.is_none()
-                && !self
-                    .inventory
-                    .get(&root_path)
-                    .is_some_and(is_live_regular_entry)
-            {
-                continue;
-            }
-            let crate_name = normalize_identifier(
-                explicit_name
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| package_name.replace('-', "_")),
-            );
             let cargo_features = match cargo_feature_contracts(&manifest) {
                 Ok(features) => features,
                 Err(reason) => {
@@ -1387,22 +1382,34 @@ impl<'a> SnapshotBuilder<'a> {
                     Vec::new()
                 }
             };
-            if !self
-                .inventory
-                .get(&root_path)
-                .is_some_and(is_live_regular_entry)
-            {
-                let state = self
-                    .inventory
-                    .get(&root_path)
+            let root_entry = self.inventory.get(&root_path);
+            if !root_entry.is_some_and(is_live_regular_entry) {
+                let implicit_root_is_absent = lib.is_none()
+                    && root_entry.is_none_or(|entry| {
+                        matches!(
+                            entry.state,
+                            RevisionEntryState::Deleted | RevisionEntryState::Renamed { .. }
+                        )
+                    });
+                if implicit_root_is_absent {
+                    continue;
+                }
+                let state = root_entry
                     .map(|entry| format!("{:?} {:?}", entry.kind, entry.state))
                     .unwrap_or_else(|| "missing inventory entry".to_owned());
+                let evidence = if root_entry.is_some_and(is_live_symlink_entry) {
+                    format!(
+                        "{NON_NEUTRALIZABLE_SYMLINK_ROOT}{root_path}\nlibrary root declared by {manifest_path} is a tracked symlink whose compiler-visible source and module base cannot be proven from revision bytes: {state}"
+                    )
+                } else {
+                    format!("library root declared by {manifest_path} is unavailable: {state}")
+                };
                 self.unknown(
                     RustApiUnknownKind::MissingLibRoot,
                     Some(&crate_name),
                     &[],
                     &root_path,
-                    format!("library root declared by {manifest_path} is unavailable: {state}"),
+                    evidence,
                 );
                 continue;
             }
@@ -1737,6 +1744,31 @@ impl<'a> SnapshotBuilder<'a> {
                     evidence,
                 );
             }
+            if let Item::Impl(item_impl) = item {
+                for member in &item_impl.items {
+                    let syn::ImplItem::Fn(function) = member else {
+                        continue;
+                    };
+                    if binary_export_attributes(&function.attrs).is_empty() {
+                        continue;
+                    }
+                    let member_cfg = canonical_cfg(&function.attrs);
+                    let effective_guard = combined_guards(&cfg_guard, &member_cfg.guards);
+                    for evidence in member_cfg.errors {
+                        self.unknown_guarded(
+                            RustApiUnknownKind::CfgPredicate,
+                            Some(crate_name),
+                            module_path,
+                            source_path,
+                            &effective_guard,
+                            format!(
+                                "native-export-associated-function:{}\n{evidence}",
+                                normalize_identifier(function.sig.ident.to_string())
+                            ),
+                        );
+                    }
+                }
+            }
             // Attribute macros can emit externally reachable items even when
             // their annotated input is private. Treat every syntactically
             // supported item as an opaque transform boundary; visibility is
@@ -1780,7 +1812,9 @@ impl<'a> SnapshotBuilder<'a> {
                 }
                 continue;
             }
-            for (name, public, export_guard, evidence) in binary_exports(item, !rust_linkable) {
+            for (name, public, export_guard, evidence) in
+                binary_exports(item, !rust_linkable || !module_reachable)
+            {
                 let effective_guard = combined_guards(&cfg_guard, &export_guard);
                 let visibility = if public { "public" } else { "private" };
                 self.unknown_guarded(
@@ -6622,12 +6656,28 @@ fn module_path_attribute(attrs: &[Attribute]) -> Result<String, String> {
 }
 
 fn is_live_regular_entry(entry: &RevisionEntry) -> bool {
-    entry.kind == super::revision_source::RevisionEntryKind::RegularFile
+    entry.kind == RevisionEntryKind::RegularFile
         && matches!(
             entry.state,
-            super::revision_source::RevisionEntryState::Present
-                | super::revision_source::RevisionEntryState::Added
-                | super::revision_source::RevisionEntryState::RenamedFrom { .. }
+            RevisionEntryState::Present
+                | RevisionEntryState::Added
+                | RevisionEntryState::RenamedFrom { .. }
+        )
+}
+
+fn is_live_symlink_entry(entry: &RevisionEntry) -> bool {
+    (entry.kind == RevisionEntryKind::Symlink
+        && matches!(
+            entry.state,
+            RevisionEntryState::Present
+                | RevisionEntryState::Added
+                | RevisionEntryState::RenamedFrom { .. }
+        ))
+        || matches!(
+            entry.state,
+            RevisionEntryState::NonRegular {
+                kind: RevisionEntryKind::Symlink
+            }
         )
 }
 
@@ -9321,20 +9371,19 @@ fn package_has_active_build_script(
     manifest_dir: &str,
     inventory: &BTreeMap<String, RevisionEntry>,
 ) -> Result<bool, String> {
+    let declared_build_script = |path: &str| {
+        let path = safe_join_repo_path(manifest_dir, path)
+            .map_err(|reason| format!("package.build cannot be resolved: {reason}"))?;
+        inventory
+            .get(&path)
+            .is_some_and(is_live_regular_entry)
+            .then_some(true)
+            .ok_or_else(|| format!("declared build script {path} is unavailable"))
+    };
     match package.get("build") {
         Some(toml::Value::Boolean(false)) => Ok(false),
-        Some(toml::Value::Boolean(true)) => {
-            Err("package.build=true is not a valid Cargo build target".to_owned())
-        }
-        Some(toml::Value::String(path)) => {
-            let path = safe_join_repo_path(manifest_dir, path)
-                .map_err(|reason| format!("package.build cannot be resolved: {reason}"))?;
-            inventory
-                .get(&path)
-                .is_some_and(is_live_regular_entry)
-                .then_some(true)
-                .ok_or_else(|| format!("declared build script {path} is unavailable"))
-        }
+        Some(toml::Value::Boolean(true)) => declared_build_script("build.rs"),
+        Some(toml::Value::String(path)) => declared_build_script(path),
         Some(_) => Err("package.build must be a string or boolean".to_owned()),
         None => safe_join_repo_path(manifest_dir, "build.rs")
             .map(|path| inventory.get(&path).is_some_and(is_live_regular_entry)),
@@ -9967,9 +10016,13 @@ fn validate_package_name(name: &str) -> Result<(), String> {
         ));
     }
     let crate_name = name.replace('-', "_");
-    syn::parse_str::<syn::Ident>(&crate_name).map_err(|_| {
-        format!("package.name does not normalize to a Rust crate identifier: {name:?}")
-    })?;
+    if syn::parse_str::<syn::Ident>(&crate_name).is_err()
+        && !is_raw_identifier_compatible_keyword(&crate_name)
+    {
+        return Err(format!(
+            "package.name does not normalize to a Rust crate identifier or keyword: {name:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -9977,8 +10030,11 @@ fn validate_lib_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("lib.name must not be empty".to_owned());
     }
-    syn::parse_str::<syn::Ident>(name)
-        .map_err(|_| format!("lib.name must be a Rust crate identifier: {name:?}"))?;
+    if syn::parse_str::<syn::Ident>(name).is_err() && !is_raw_identifier_compatible_keyword(name) {
+        return Err(format!(
+            "lib.name must be a Rust crate identifier or keyword: {name:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -10976,7 +11032,7 @@ fn is_binary_export_meta(meta: &Meta) -> bool {
     })
 }
 
-fn binary_exports(item: &Item, include_public: bool) -> Vec<(String, bool, Vec<String>, String)> {
+fn binary_export_attributes(attrs: &[Attribute]) -> Vec<(Vec<String>, String)> {
     fn collect(meta: &Meta, inherited_guard: &[String], exports: &mut Vec<(Vec<String>, String)>) {
         if is_binary_export_meta(meta) {
             exports.push((
@@ -11011,40 +11067,92 @@ fn binary_exports(item: &Item, include_public: bool) -> Vec<(String, bool, Vec<S
         }
     }
 
-    let (name, attrs, public) = match item {
-        Item::Fn(value) => (
-            normalize_identifier(value.sig.ident.to_string()),
-            value.attrs.as_slice(),
-            is_public(&value.vis),
-        ),
-        Item::Static(value) => (
-            normalize_identifier(value.ident.to_string()),
-            value.attrs.as_slice(),
-            is_public(&value.vis),
-        ),
-        _ => return Vec::new(),
-    };
-    if public && !include_public {
-        return Vec::new();
-    }
     let mut exports = Vec::new();
     for attr in attrs {
         collect(&attr.meta, &[], &mut exports);
     }
     exports
-        .into_iter()
-        .map(|(guard, export)| {
-            (
-                name.clone(),
-                public,
-                guard,
+}
+
+fn binary_exports(
+    item: &Item,
+    include_public_direct: bool,
+) -> Vec<(String, bool, Vec<String>, String)> {
+    let direct = |name: String, attrs: &[Attribute], public: bool, input: String| {
+        if public && !include_public_direct {
+            return Vec::new();
+        }
+        binary_export_attributes(attrs)
+            .into_iter()
+            .map(|(guard, export)| {
+                (
+                    name.clone(),
+                    public,
+                    guard,
+                    format!("{export}\ninput:{input}"),
+                )
+            })
+            .collect()
+    };
+
+    match item {
+        Item::Fn(value) => direct(
+            normalize_identifier(value.sig.ident.to_string()),
+            &value.attrs,
+            is_public(&value.vis),
+            canonical_tokens(item.to_token_stream()),
+        ),
+        Item::Static(value) => direct(
+            normalize_identifier(value.ident.to_string()),
+            &value.attrs,
+            is_public(&value.vis),
+            canonical_tokens(item.to_token_stream()),
+        ),
+        Item::Impl(item_impl) => {
+            let normalized_impl =
+                CanonicalFold.fold_item_impl(normalized_trait_impl_item(item_impl));
+            let owner = if let Some((_, trait_path, _)) = &normalized_impl.trait_ {
                 format!(
-                    "{export}\ninput:{}",
-                    canonical_tokens(item.to_token_stream())
-                ),
-            )
-        })
-        .collect()
+                    "<{} as {}>",
+                    canonical_tokens(normalized_impl.self_ty.to_token_stream()),
+                    canonical_tokens(trait_path.to_token_stream())
+                )
+            } else {
+                canonical_tokens(normalized_impl.self_ty.to_token_stream())
+            };
+            item_impl
+                .items
+                .iter()
+                .filter_map(|member| {
+                    let syn::ImplItem::Fn(function) = member else {
+                        return None;
+                    };
+                    let public = is_public(&function.vis);
+                    let member_cfg = canonical_cfg(&function.attrs);
+                    if !member_cfg.errors.is_empty() {
+                        return None;
+                    }
+                    let name = format!(
+                        "{owner}::{}",
+                        normalize_identifier(function.sig.ident.to_string())
+                    );
+                    let input = normalized_associated_contract(item_impl, member, false);
+                    Some(binary_export_attributes(&function.attrs).into_iter().map(
+                        move |(guard, export)| {
+                            (
+                                name.clone(),
+                                public,
+                                combined_guards(&member_cfg.guards, &guard),
+                                format!("{export}\ninput:{input}"),
+                            )
+                        },
+                    ))
+                })
+                .flatten()
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn macro_export_guards(attrs: &[Attribute]) -> Vec<Vec<String>> {
@@ -11201,6 +11309,10 @@ fn is_rust_keyword(value: &str) -> bool {
             | "try"
             | "gen"
     )
+}
+
+fn is_raw_identifier_compatible_keyword(value: &str) -> bool {
+    is_rust_keyword(value) && !matches!(value, "crate" | "self" | "Self" | "super")
 }
 fn is_public(visibility: &Visibility) -> bool {
     matches!(visibility, Visibility::Public(_))
@@ -12310,6 +12422,52 @@ mod tests {
     }
 
     #[test]
+    fn rust_api_snapshot_accepts_cargo_build_true_and_keyword_crate_names() {
+        let valid = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='type'\nversion='0.0.0'\nbuild=true\n[lib]\nname='type'\npath='src/lib.rs'\n",
+            ),
+            ("build.rs", b"fn main() {}"),
+            ("src/lib.rs", b"pub fn api() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&valid);
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|crate_snap| crate_snap.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["type"]
+        );
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .any(|item| { item.key.crate_name == "type" && item.key.external_name == "api" })
+        );
+        assert!(snapshot.unknowns.iter().all(|unknown| {
+            unknown.kind != RustApiUnknownKind::ManifestParse
+                || !unknown.evidence.contains("package.build")
+        }));
+
+        let missing_declared_build = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nbuild=true\n",
+            ),
+            ("src/lib.rs", b"pub fn api() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&missing_declared_build);
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::ManifestParse
+                && unknown
+                    .evidence
+                    .contains("declared build script build.rs is unavailable")
+        }));
+    }
+
+    #[test]
     fn rust_api_snapshot_respects_library_projection_modes() {
         for crate_type in ["cdylib", "staticlib", "bin"] {
             let manifest = format!(
@@ -12334,6 +12492,33 @@ mod tests {
                     && unknown.evidence.contains("public-binary-export:")
             }));
         }
+
+        let associated_exports = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n",
+            ),
+            (
+                "src/lib.rs",
+                b"pub struct Api; pub trait Exported { extern \"C\" fn call(); } #[cfg(unix)] impl Api { #[cfg_attr(feature = \"ffi\", unsafe(no_mangle))] pub extern \"C\" fn exported() {} } impl Exported for Api { #[unsafe(export_name=\"trait_call\")] extern \"C\" fn call() {} }",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&associated_exports);
+        assert!(snapshot.items.is_empty());
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::UnsupportedExternResolution
+                && unknown.evidence.contains("Api::exported")
+                && unknown.cfg_guard.iter().any(|guard| guard == "unix")
+                && unknown
+                    .cfg_guard
+                    .iter()
+                    .any(|guard| guard == "feature = \"ffi\"")
+        }));
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::UnsupportedExternResolution
+                && unknown.evidence.contains("<Api as Exported>::call")
+                && unknown.evidence.contains("trait_call")
+        }));
 
         let mixed = MemorySource::new(&[
             (

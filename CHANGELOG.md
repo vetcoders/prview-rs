@@ -168,7 +168,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A package without an explicit `[lib]` and without a live implicit
   `src/lib.rs` is now correctly treated as having no library target instead of
   emitting `MissingLibRoot`; an explicit missing library root remains typed
-  uncertainty.
+  uncertainty. A tracked symlink in the implicit root position is never
+  silently treated as an absent crate or followed outside revision provenance;
+  both compared sides retain non-neutralizable typed uncertainty instead.
+- Cargo-valid keyword package and library names that Rust can address as raw
+  identifiers remain in the API census, and `package.build = true` resolves to
+  Cargo's default `build.rs` rather than being rejected as an invalid manifest
+  value.
 - Cache hits take content and mtime from one open file handle, so a concurrent
   replacement cannot pair one entry's bytes with another's age.
 - A finished context-command child is unregistered before its output is read.
@@ -183,8 +189,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   projection is limited to Rust-linkable `lib`/`rlib`/`dylib` outputs,
   procedural macros declared by either `proc-macro = true` or an effective
   `crate-type = ["proc-macro"]` retain their separate export surface, and native-only
-  `cdylib`/`staticlib`/`bin` targets retain binary-export evidence plus typed
-  target uncertainty without inventing a Rust dependency API.
+  `cdylib`/`staticlib`/`bin` targets retain binary-export evidence, including
+  exported associated functions in inherent and trait impls, plus typed target
+  uncertainty without inventing a Rust dependency API.
 - Exported declarative macro contracts bind the effective defining-crate
   edition, including package, workspace-inherited, and library-target
   authority. An edition change without an exported macro does not manufacture

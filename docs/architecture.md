@@ -1426,12 +1426,17 @@ target) and `proc-macro`; the library root path and edition stay in
 evidence/provenance rather than globally changing every crate fact. Optional normal/build/target
 dependencies without an explicit `[features]` entry become implicit Cargo
 features unless suppressed through `dep:` references. Package and explicit
-library names must also be non-empty valid Cargo/crate identifiers; a TOML
-string alone is not semantic validation. A valid virtual workspace is
+library names must also be non-empty valid Cargo/crate identifiers, including
+Cargo-valid keyword names that Rust can address as raw identifiers; reserved
+path keywords such as `crate`, `self`, `Self`, and `super` remain invalid. A
+TOML string alone is not semantic validation. A valid virtual workspace is
 non-crate; an implicit library exists only when effective `autolib` permits it
 and its live default `src/lib.rs` exists. Its absence is not a missing-root
 error, while an explicit `[lib]` whose effective root is unavailable remains
-typed `MissingLibRoot`. Repository-relative
+typed `MissingLibRoot`. A tracked symlink at an implicit library root is not
+followed: its compiler-visible source and module base are revision-ambiguous,
+so each compared side retains non-neutralizable `MissingLibRoot` uncertainty.
+Repository-relative
 paths are normalized fallibly: absolute, prefixed, non-UTF-8, and escaping
 paths become manifest/source unknowns rather than being remapped. Missing,
 renamed-away, deleted, non-regular, non-UTF-8, unreadable, or parse-failed
@@ -1442,8 +1447,9 @@ Target projection follows Cargo/Rust linkage semantics. `lib`, `rlib`, and
 targets expose only supported procedural macro entry points. A target whose
 effective types are only `cdylib`, `staticlib`, or `bin` is not projected as a
 Rust dependency surface. Its public and private native exports are still
-scanned, and the native target remains typed uncertainty so a transition to or
-from a Rust-linkable target cannot be reported as falsely clean.
+scanned, including exported associated functions in inherent and trait impls,
+and the native target remains typed uncertainty so a transition to or from a
+Rust-linkable target cannot be reported as falsely clean.
 
 Reachability starts at each library root. Ordinary inline modules and
 `mod foo;` files (`foo.rs` or `foo/mod.rs`) are walked as whole syntax trees.
@@ -1549,7 +1555,8 @@ predicates. An externally relevant custom predicate on an item, field, variant,
 trait or impl member, or foreign item emits `CfgPredicate` evidence bound to a
 revision-backed authority digest whenever an active build script or repository
 Cargo config can supply `--cfg`. A declared build script must resolve to a live
-regular revision entry; `build = false` disables it. Only the effective
+regular revision entry; Cargo's `build = true` explicitly selects the default
+`build.rs`, while `build = false` disables it. Only the effective
 repository-root Cargo config qualifies; when both names exist Cargo's legacy
 `.cargo/config` precedence over `.cargo/config.toml` is preserved. Authority is
 recognized only at legal schema paths (`build.rustflags`, target-specific

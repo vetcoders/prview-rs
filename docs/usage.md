@@ -622,10 +622,14 @@ confirmed removal. Rust identities include ordinary type/value/macro items plus
 public modules, library crates, and Cargo features. An implicit library target
 is present only when Cargo auto-discovery is enabled for the effective edition
 and a live `src/lib.rs` exists; absence is not a `MissingLibRoot`, while an
-explicit unavailable `[lib]` root remains unknown. Ordinary Rust items are
-projected only for Rust-linkable `lib`/`rlib`/`dylib` outputs. Proc-macro
+explicit unavailable `[lib]` root remains unknown. A tracked symlink in the
+implicit root position is not followed and remains non-neutralizable typed
+uncertainty on both sides. Cargo-valid keyword package and library names that
+can be addressed as raw identifiers remain part of the census. Ordinary Rust
+items are projected only for Rust-linkable `lib`/`rlib`/`dylib` outputs. Proc-macro
 exports remain separate, and native-only `cdylib`/`staticlib`/`bin` targets
-retain binary-export and target uncertainty without pretending that their
+retain binary-export and target uncertainty, including exported associated
+functions in inherent and trait impls, without pretending that their
 internal `pub` items are dependency API. Exported declarative macro contracts
 bind the effective direct, workspace-inherited, or library-target edition; an
 edition change without such a macro does not create a synthetic break.
@@ -673,8 +677,9 @@ unresolved manifest/config Cargo source replacement never neutralize, while the
 local aggregate may over-report after an unrelated tracked-file edit. Custom
 cfg predicates bind revision-backed build-script or Cargo-config authority when
 present, including nested public contract positions. A declared build script
-must be a live revision file; only an effective repository-root config whose
-legal build/target rustflags or a concrete-target link-override rustc-cfg
+must be a live revision file; `build = true` selects the default `build.rs` and
+`build = false` disables discovery. Only an effective repository-root config
+whose legal build/target rustflags or a concrete-target link-override rustc-cfg
 matching the package's `links` can define custom cfg qualifies. If both root
 config filenames exist, Cargo's extensionless `.cargo/config` precedence is
 preserved. The package must still own a live build script when it declares
