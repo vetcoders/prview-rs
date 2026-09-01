@@ -1751,11 +1751,14 @@ mod tests {
         let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::new());
         governor.cancel();
 
-        let error = crate::governor::with_run_scope(governor, async {
+        let result = crate::governor::with_run_scope(governor, async {
             fetch_pr_info(27, Some("vetcoders/prview-rs"))
         })
-        .await
-        .expect_err("an already-cancelled gh probe must remain typed cancellation");
+        .await;
+        let error = match result {
+            Ok(_) => panic!("an already-cancelled gh probe must remain typed cancellation"),
+            Err(error) => error,
+        };
 
         assert!(crate::governor::is_cancellation(&error), "{error:#}");
     }
