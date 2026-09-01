@@ -409,10 +409,14 @@ impl ResourceGovernor {
                 // waits, an unmirrored surviving member would have no durable
                 // birth identity and the MCP parent must not signal a merely
                 // provisional PGID. ESRCH is success-shaped (the group already
-                // vanished); every other failure cancels the run fail-closed.
-                if !crate::proc::terminate_process_tree(pid) {
+                // vanished). A rejected signal is accepted only when a bounded
+                // census proves no live member retains this still-unreusable
+                // PGID; every unverified/live failure cancels fail-closed.
+                if let Err(error) = crate::proc::close_exited_child_process_group(pid) {
                     drop(inflight);
-                    eprintln!("prview: failed to close exited-before-mirror child group {pid}");
+                    eprintln!(
+                        "prview: failed to close exited-before-mirror child group {pid}: {error}"
+                    );
                     self.cancel();
                     let _ = crate::proc::terminate_process_tree(pid);
                     return false;

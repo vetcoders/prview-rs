@@ -163,8 +163,11 @@ and reaps the root, acquires the ledger lock, and accepts the final drain. The
 macOS review root additionally handles a leader that exits before its native
 birth identity can be mirrored: while the owned leader is still unreaped and
 its PGID cannot be reused, registration terminates any surviving member of that
-group. The parent can then settle the provisional row without ever signalling
-from provisional evidence. The sidecar lives beside, never inside, the
+group. If the group signal is rejected, registration accepts closure only when
+a bounded process census proves that no live member retains that still-owned
+PGID; a live member or failed census aborts fail-closed. The parent can then
+settle the provisional row without ever signalling from provisional evidence.
+The sidecar lives beside, never inside, the
 immutable run directory. Confirmed
 cleanup removes it; unconfirmed cleanup retains it and returns
 `containment_confirmed: false` instead of claiming success. Hardened tool

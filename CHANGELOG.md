@@ -40,8 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distinguishes that completed child from an ambiguous identity failure while
   preserving its PID/PGID until registration. If another member still occupies
   that exited leader's group, registration terminates the group while the
-  leader remains unreaped; a provisional-only PGID is never left for the MCP
-  parent to guess about after PID reuse becomes possible.
+  leader remains unreaped. A rejected group signal is no longer mistaken for a
+  surviving tree when a bounded process census proves that only the zombie
+  leader remains; a live member or unreadable census still cancels fail-closed.
+  A provisional-only PGID is never left for the MCP parent to guess about after
+  PID reuse becomes possible.
 - MCP `run_review` now rejects source-buildable targets without a native
   PID-reuse-safe process-birth identity before taking the activation lock or
   spawning a review. Linux, macOS, and Windows remain the explicitly supported

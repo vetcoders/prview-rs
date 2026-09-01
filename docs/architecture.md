@@ -1405,7 +1405,10 @@ review root also handles the macOS gap where a very short-lived group leader is
 already waitable but no longer exposes its native birth identity: because the
 owned leader remains unreaped, registration can safely terminate that exact
 PGID and any surviving members before PID reuse becomes possible. The parent
-then settles the provisional row without treating it as signal authority. The
+accepts a rejected signal only when a bounded local census proves that the PGID
+has no live members (a zombie leader alone is already closed); live members or
+an unreadable census remain fail-closed. It then settles the provisional row
+without treating it as signal authority. The
 sidecar is a control file beside the run directory, never an input to its
 immutable manifest or ZIP. If the bounded unwind stalls, the parent terminates
 every still-owned group before killing and reaping the direct review root;

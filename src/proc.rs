@@ -929,11 +929,66 @@ fn terminate_windows_process_tree_with(
 /// the pgid; signalling `-pid` then reaches the wrapper AND its grandchildren.
 #[cfg(unix)]
 pub fn sigkill_process_group(pid: u32) -> bool {
+    sigkill_process_group_result(pid).is_ok()
+}
+
+#[cfg(unix)]
+fn sigkill_process_group_result(pid: u32) -> std::io::Result<()> {
     // SAFETY: plain kill(2) syscall against the process group created by
     // `harden[_std]`. ESRCH means the group is already gone; every other errno
     // (especially EPERM) means tree termination was not confirmed.
     let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-    unix_group_kill_succeeded(result, std::io::Error::last_os_error().raw_os_error())
+    if unix_group_kill_succeeded(result, std::io::Error::last_os_error().raw_os_error()) {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Close a group whose direct leader is known waitable but remains unreaped.
+///
+/// A failed group signal is not itself evidence that a descendant survived.
+/// In particular, macOS may reject a signal after the short-lived leader has
+/// become a zombie even though no live member retains the PGID. The unreaped
+/// leader prevents PGID reuse, so one bounded process-table snapshot can settle
+/// that exact group safely. A live member or an unreadable census remains a
+/// fail-closed error.
+#[cfg(unix)]
+pub(crate) fn close_exited_child_process_group(pid: u32) -> std::io::Result<()> {
+    close_exited_child_process_group_with(
+        pid,
+        || sigkill_process_group_result(pid),
+        || bounded_unix_process_table(Duration::from_millis(250)),
+    )
+}
+
+#[cfg(unix)]
+fn close_exited_child_process_group_with(
+    pid: u32,
+    terminate: impl FnOnce() -> std::io::Result<()>,
+    census: impl FnOnce() -> std::io::Result<Vec<UnixProcessRow>>,
+) -> std::io::Result<()> {
+    let signal_error = match terminate() {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let rows = census().map_err(|census_error| {
+        std::io::Error::other(format!(
+            "group signal failed ({signal_error}); unable to verify process group {pid}: {census_error}"
+        ))
+    })?;
+    let live_members = rows
+        .iter()
+        .filter(|row| row.pgid == pid && !row.state.starts_with('Z'))
+        .map(|row| row.pid)
+        .collect::<Vec<_>>();
+    if live_members.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "group signal failed ({signal_error}); process group {pid} still has live members {live_members:?}"
+        )))
+    }
 }
 
 #[cfg(unix)]
@@ -3350,6 +3405,59 @@ mod tests {
         assert!(unix_group_kill_succeeded(-1, Some(libc::ESRCH)));
         assert!(!unix_group_kill_succeeded(-1, Some(libc::EPERM)));
         assert!(!unix_group_kill_succeeded(-1, Some(libc::EINVAL)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_group_signal_failure_requires_a_no_live_members_census() {
+        let zombie_only = vec![UnixProcessRow {
+            pid: 41,
+            ppid: 1,
+            pgid: 41,
+            state: "Z".to_string(),
+        }];
+        close_exited_child_process_group_with(
+            41,
+            || Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            || Ok(zombie_only),
+        )
+        .expect("a zombie leader is not a live surviving group member");
+
+        let with_survivor = vec![
+            UnixProcessRow {
+                pid: 41,
+                ppid: 1,
+                pgid: 41,
+                state: "Z".to_string(),
+            },
+            UnixProcessRow {
+                pid: 42,
+                ppid: 41,
+                pgid: 41,
+                state: "S".to_string(),
+            },
+        ];
+        let error = close_exited_child_process_group_with(
+            41,
+            || Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            || Ok(with_survivor),
+        )
+        .expect_err("a live survivor must keep the closure fail-closed");
+        assert!(
+            error.to_string().contains("live members [42]"),
+            "unexpected error: {error}"
+        );
+
+        let error = close_exited_child_process_group_with(
+            41,
+            || Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            || Err(std::io::Error::other("fixture census failure")),
+        )
+        .expect_err("an unreadable census cannot certify closure");
+        assert!(
+            error.to_string().contains("unable to verify"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Poll until `grandchild` no longer exists. EPERM is not absence: treating
