@@ -755,12 +755,14 @@ mod tests {
         assert_eq!(balanced.heavy_cost, 4, "at most two heavy parents");
         assert_eq!(balanced.worker_limit, 4, "child pools remain capped");
 
-        let single_core =
-            ResourcePlan::from_observation(ResourceBudget::Balanced, 1, Some(0.0));
+        let single_core = ResourcePlan::from_observation(ResourceBudget::Balanced, 1, Some(0.0));
         assert_eq!(single_core.effective, ResourceBudget::Balanced);
         assert_eq!(single_core.total_budget, 1, "one core admits one parent");
         assert_eq!(single_core.heavy_cost, 1, "heavy work owns that core");
-        assert_eq!(single_core.worker_limit, 1, "child pools stay single-worker");
+        assert_eq!(
+            single_core.worker_limit, 1,
+            "child pools stay single-worker"
+        );
 
         let pressured = ResourcePlan::from_observation(ResourceBudget::Balanced, 8, Some(7.0));
         assert_eq!(pressured.effective, ResourceBudget::Safe);
@@ -771,8 +773,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_core_balanced_admits_only_one_heavy_parent() {
-        let plan =
-            ResourcePlan::from_observation(ResourceBudget::Balanced, 1, Some(0.0));
+        let plan = ResourcePlan::from_observation(ResourceBudget::Balanced, 1, Some(0.0));
         assert_eq!(plan.effective, ResourceBudget::Balanced);
         assert_eq!(plan.logical_cores, 1);
         assert_eq!(plan.total_budget, 1);

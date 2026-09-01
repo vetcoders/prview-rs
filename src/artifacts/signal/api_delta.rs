@@ -4194,8 +4194,7 @@ mod tests {
 
     #[test]
     fn repository_backed_real_binary_targets_never_false_clean_native_exports() {
-        let implicit_manifest =
-            "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n";
+        let implicit_manifest = "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n";
         let implicit = repository_delta(&[
             ("Cargo.toml", implicit_manifest, implicit_manifest),
             (
@@ -4225,14 +4224,18 @@ mod tests {
                 "mod types { pub type Word = u16; } use types::Word;\n#[unsafe(no_mangle)] extern \"C\" fn binary_api(_: Word) {}\n",
             ),
         ]);
-        assert!(alias_abi.unknown.iter().any(|finding| {
-            finding.identity.crate_name == "fixture#bin:fixture"
-                && finding.identity.name == "PrivateTypeDependency"
-                && finding
-                    .unknown_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("native export binary_api"))
-        }), "a local alias-derived ABI change must not neutralize behind an unchanged export signature: {:?}", alias_abi.findings());
+        assert!(
+            alias_abi.unknown.iter().any(|finding| {
+                finding.identity.crate_name == "fixture#bin:fixture"
+                    && finding.identity.name == "PrivateTypeDependency"
+                    && finding
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("native export binary_api"))
+            }),
+            "a local alias-derived ABI change must not neutralize behind an unchanged export signature: {:?}",
+            alias_abi.findings()
+        );
 
         let associated_alias_abi = repository_delta(&[
             ("Cargo.toml", implicit_manifest, implicit_manifest),
@@ -4242,14 +4245,18 @@ mod tests {
                 "struct Api; type Word = u16; impl Api { #[unsafe(no_mangle)] extern \"C\" fn call(_: Word) {} }\n",
             ),
         ]);
-        assert!(associated_alias_abi.unknown.iter().any(|finding| {
-            finding.identity.crate_name == "fixture#bin:fixture"
-                && finding.identity.name == "PrivateTypeDependency"
-                && finding
-                    .unknown_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("native export Api::call"))
-        }), "associated native exports must bind their owner/signature alias closure: {:?}", associated_alias_abi.findings());
+        assert!(
+            associated_alias_abi.unknown.iter().any(|finding| {
+                finding.identity.crate_name == "fixture#bin:fixture"
+                    && finding.identity.name == "PrivateTypeDependency"
+                    && finding
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("native export Api::call"))
+            }),
+            "associated native exports must bind their owner/signature alias closure: {:?}",
+            associated_alias_abi.findings()
+        );
 
         let unrelated_static_owner_layout = repository_delta(&[
             ("Cargo.toml", implicit_manifest, implicit_manifest),
@@ -4273,17 +4280,20 @@ mod tests {
                 "struct Api(u16); impl Api { #[unsafe(no_mangle)] extern \"C\" fn call(_: Self) {} }\n",
             ),
         ]);
-        assert!(self_typed_owner_layout.unknown.iter().any(|finding| {
-            finding.identity.crate_name == "fixture#bin:fixture"
-                && finding.identity.name == "PrivateTypeDependency"
-                && finding
-                    .unknown_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("native export Api::call"))
-        }), "Self in an exported signature must bind the owner declaration closure: {:?}", self_typed_owner_layout.findings());
+        assert!(
+            self_typed_owner_layout.unknown.iter().any(|finding| {
+                finding.identity.crate_name == "fixture#bin:fixture"
+                    && finding.identity.name == "PrivateTypeDependency"
+                    && finding
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("native export Api::call"))
+            }),
+            "Self in an exported signature must bind the owner declaration closure: {:?}",
+            self_typed_owner_layout.findings()
+        );
 
-        let macro_workspace =
-            "[workspace]\nmembers=['app','macros']\nresolver='2'\n";
+        let macro_workspace = "[workspace]\nmembers=['app','macros']\nresolver='2'\n";
         let app_manifest = "[package]\nname='app'\nversion='0.0.0'\nedition='2024'\n[dependencies]\nmacros={path='../macros'}\n";
         let macro_manifest = "[package]\nname='macros'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\nproc-macro=true\n";
         let macro_source = "#[proc_macro_attribute] pub fn expose(_: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream { let mut output: proc_macro::TokenStream = \"#[unsafe(no_mangle)]\".parse().unwrap(); output.extend(input); output }\n";
@@ -4299,13 +4309,17 @@ mod tests {
             ("macros/Cargo.toml", macro_manifest, macro_manifest),
             ("macros/src/lib.rs", macro_source, macro_source),
         ]);
-        assert!(transformed_alias_abi.unknown.iter().any(|finding| {
-            finding.identity.crate_name == "app#bin:app"
-                && finding.identity.name == "PrivateTypeDependency"
-                && finding.unknown_reason.as_deref().is_some_and(|reason| {
-                    reason.contains("macro-generated-native-export-potential:api")
-                })
-        }), "a proven unchanged custom transform must not hide a changed alias behind its potential native export: {:?}", transformed_alias_abi.findings());
+        assert!(
+            transformed_alias_abi.unknown.iter().any(|finding| {
+                finding.identity.crate_name == "app#bin:app"
+                    && finding.identity.name == "PrivateTypeDependency"
+                    && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("macro-generated-native-export-potential:api")
+                    })
+            }),
+            "a proven unchanged custom transform must not hide a changed alias behind its potential native export: {:?}",
+            transformed_alias_abi.findings()
+        );
 
         let transformed_associated_alias_abi = repository_delta(&[
             ("Cargo.toml", macro_workspace, macro_workspace),
@@ -4319,13 +4333,20 @@ mod tests {
             ("macros/Cargo.toml", macro_manifest, macro_manifest),
             ("macros/src/lib.rs", macro_source, macro_source),
         ]);
-        assert!(transformed_associated_alias_abi.unknown.iter().any(|finding| {
-            finding.identity.crate_name == "app#bin:app"
-                && finding.identity.name == "PrivateTypeDependency"
-                && finding.unknown_reason.as_deref().is_some_and(|reason| {
-                    reason.contains("macro-generated-native-export-potential:Api::api")
-                })
-        }), "an associated custom-transform export potential must bind its local alias closure: {:?}", transformed_associated_alias_abi.findings());
+        assert!(
+            transformed_associated_alias_abi
+                .unknown
+                .iter()
+                .any(|finding| {
+                    finding.identity.crate_name == "app#bin:app"
+                        && finding.identity.name == "PrivateTypeDependency"
+                        && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                            reason.contains("macro-generated-native-export-potential:Api::api")
+                        })
+                }),
+            "an associated custom-transform export potential must bind its local alias closure: {:?}",
+            transformed_associated_alias_abi.findings()
+        );
 
         let transformed_struct_alias = repository_delta(&[
             ("Cargo.toml", macro_workspace, macro_workspace),
@@ -4339,13 +4360,17 @@ mod tests {
             ("macros/Cargo.toml", macro_manifest, macro_manifest),
             ("macros/src/lib.rs", macro_source, macro_source),
         ]);
-        assert!(transformed_struct_alias.unknown.iter().any(|finding| {
-            finding.identity.crate_name == "app#bin:app"
-                && finding.identity.name == "PrivateTypeDependency"
-                && finding.unknown_reason.as_deref().is_some_and(|reason| {
-                    reason.contains("macro-generated-native-export-potential:Api")
-                })
-        }), "a transforming attribute on a non-function item must bind its type surface: {:?}", transformed_struct_alias.findings());
+        assert!(
+            transformed_struct_alias.unknown.iter().any(|finding| {
+                finding.identity.crate_name == "app#bin:app"
+                    && finding.identity.name == "PrivateTypeDependency"
+                    && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("macro-generated-native-export-potential:Api")
+                    })
+            }),
+            "a transforming attribute on a non-function item must bind its type surface: {:?}",
+            transformed_struct_alias.findings()
+        );
 
         let unchanged_transformed_struct = repository_delta(&[
             ("Cargo.toml", macro_workspace, macro_workspace),
@@ -4377,17 +4402,21 @@ mod tests {
             ("macros/Cargo.toml", macro_manifest, macro_manifest),
             ("macros/src/lib.rs", macro_source, macro_source),
         ]);
-        assert!(conditional_transform_overlap.unknown.iter().any(|finding| {
-            finding.identity.name == "PrivateTypeDependency"
-                && finding
-                    .identity
-                    .cfg_region
-                    .iter()
-                    .any(|guard| guard.contains("feature = \"ffi\""))
-                && finding.unknown_reason.as_deref().is_some_and(|reason| {
-                    reason.contains("macro-generated-native-export-potential:Api")
-                })
-        }), "a conditional transform must bind aliases in its overlapping cfg region: {:?}", conditional_transform_overlap.findings());
+        assert!(
+            conditional_transform_overlap.unknown.iter().any(|finding| {
+                finding.identity.name == "PrivateTypeDependency"
+                    && finding
+                        .identity
+                        .cfg_region
+                        .iter()
+                        .any(|guard| guard.contains("feature = \"ffi\""))
+                    && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("macro-generated-native-export-potential:Api")
+                    })
+            }),
+            "a conditional transform must bind aliases in its overlapping cfg region: {:?}",
+            conditional_transform_overlap.findings()
+        );
 
         let conditional_transform_disjoint = repository_delta(&[
             ("Cargo.toml", macro_workspace, macro_workspace),
@@ -4415,13 +4444,19 @@ mod tests {
                 "type Word = u16; macro_rules! export { ($ty:ty) => {} } export!(Word); fn main() {}\n",
             ),
         ]);
-        assert!(macro_invocation_alias.unknown.iter().any(|finding| {
-            finding.identity.crate_name == "fixture#bin:fixture"
-                && finding.identity.name == "PrivateTypeDependency"
-                && finding.unknown_reason.as_deref().is_some_and(|reason| {
-                    reason.contains("macro-generated-native-export-potential:macro-invocation:export")
-                })
-        }), "a native item-position macro invocation must bind parseable type arguments: {:?}", macro_invocation_alias.findings());
+        assert!(
+            macro_invocation_alias.unknown.iter().any(|finding| {
+                finding.identity.crate_name == "fixture#bin:fixture"
+                    && finding.identity.name == "PrivateTypeDependency"
+                    && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains(
+                            "macro-generated-native-export-potential:macro-invocation:export",
+                        )
+                    })
+            }),
+            "a native item-position macro invocation must bind parseable type arguments: {:?}",
+            macro_invocation_alias.findings()
+        );
 
         let opaque_macro_invocation_alias = repository_delta(&[
             ("Cargo.toml", implicit_manifest, implicit_manifest),
@@ -4431,12 +4466,18 @@ mod tests {
                 "type Word = u16; macro_rules! export { ($name:ident: $ty:ty) => {} } export!(api: Word); fn main() {}\n",
             ),
         ]);
-        assert!(opaque_macro_invocation_alias.unknown.iter().any(|finding| {
-            finding.identity.name == "PrivateTypeDependency"
-                && finding.unknown_reason.as_deref().is_some_and(|reason| {
-                    reason.contains("macro-generated-native-export-potential:macro-invocation:export")
-                })
-        }), "an arbitrary native macro grammar must fail closed over the target type substrate: {:?}", opaque_macro_invocation_alias.findings());
+        assert!(
+            opaque_macro_invocation_alias.unknown.iter().any(|finding| {
+                finding.identity.name == "PrivateTypeDependency"
+                    && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains(
+                            "macro-generated-native-export-potential:macro-invocation:export",
+                        )
+                    })
+            }),
+            "an arbitrary native macro grammar must fail closed over the target type substrate: {:?}",
+            opaque_macro_invocation_alias.findings()
+        );
 
         let qualified_opaque_macro_alias = repository_delta(&[
             ("Cargo.toml", implicit_manifest, implicit_manifest),
@@ -4446,13 +4487,19 @@ mod tests {
                 "mod types { pub type Word = u16; } macro_rules! export { ($name:ident: $ty:ty) => {} } export!(api: types::Word); fn main() {}\n",
             ),
         ]);
-        assert!(qualified_opaque_macro_alias.unknown.iter().any(|finding| {
-            finding.identity.crate_name == "fixture#bin:fixture"
-                && finding.identity.name == "PrivateTypeDependency"
-                && finding.unknown_reason.as_deref().is_some_and(|reason| {
-                    reason.contains("macro-generated-native-export-potential:macro-invocation:export")
-                })
-        }), "an opaque invocation must bind qualified aliases from another module in the same binary target: {:?}", qualified_opaque_macro_alias.findings());
+        assert!(
+            qualified_opaque_macro_alias.unknown.iter().any(|finding| {
+                finding.identity.crate_name == "fixture#bin:fixture"
+                    && finding.identity.name == "PrivateTypeDependency"
+                    && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains(
+                            "macro-generated-native-export-potential:macro-invocation:export",
+                        )
+                    })
+            }),
+            "an opaque invocation must bind qualified aliases from another module in the same binary target: {:?}",
+            qualified_opaque_macro_alias.findings()
+        );
 
         let associated_qualified_opaque_macro_alias = repository_delta(&[
             ("Cargo.toml", implicit_manifest, implicit_manifest),
@@ -4512,18 +4559,21 @@ mod tests {
                 ("Cargo.toml", implicit_manifest, implicit_manifest),
                 ("src/main.rs", before, after),
             ]);
-            assert!(export_presence.unknown.iter().any(|finding| {
-                finding.identity.crate_name == "fixture#bin:fixture"
-                    && finding.identity.name == "UnsupportedExternResolution"
-                    && finding
-                        .unknown_reason
-                        .as_deref()
-                        .is_some_and(|reason| reason.contains("toggled"))
-            }), "adding or removing a native export must remain review-required: {:?}", export_presence.findings());
+            assert!(
+                export_presence.unknown.iter().any(|finding| {
+                    finding.identity.crate_name == "fixture#bin:fixture"
+                        && finding.identity.name == "UnsupportedExternResolution"
+                        && finding
+                            .unknown_reason
+                            .as_deref()
+                            .is_some_and(|reason| reason.contains("toggled"))
+                }),
+                "adding or removing a native export must remain review-required: {:?}",
+                export_presence.findings()
+            );
         }
 
-        let explicit_manifest =
-            "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nautobins=false\n[[bin]]\nname='worker'\npath='cmd/worker.rs'\n";
+        let explicit_manifest = "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nautobins=false\n[[bin]]\nname='worker'\npath='cmd/worker.rs'\n";
         let explicit = repository_delta(&[
             ("Cargo.toml", explicit_manifest, explicit_manifest),
             (
@@ -4539,19 +4589,19 @@ mod tests {
                     .unknown_source
                     .as_ref()
                     .is_some_and(|source| source.source_path == "cmd/worker.rs")
-                && finding
-                    .unknown_reason
-                    .as_deref()
-                    .is_some_and(|reason| {
-                        reason.contains("worker_v1") || reason.contains("worker_v2")
-                    })
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("worker_v1") || reason.contains("worker_v2")
+                })
         }));
 
-        let mixed_manifest =
-            "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n";
+        let mixed_manifest = "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n";
         let mixed = repository_delta(&[
             ("Cargo.toml", mixed_manifest, mixed_manifest),
-            ("src/lib.rs", "pub fn library_api() {}\n", "pub fn library_api() {}\n"),
+            (
+                "src/lib.rs",
+                "pub fn library_api() {}\n",
+                "pub fn library_api() {}\n",
+            ),
             (
                 "src/main.rs",
                 "#[unsafe(no_mangle)] pub extern \"C\" fn binary_api(_: u8) {}\n",

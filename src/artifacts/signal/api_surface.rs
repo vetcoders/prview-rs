@@ -861,43 +861,45 @@ impl<'a> SnapshotBuilder<'a> {
 
         let collect_dependency_closure =
             |raw_roots: BTreeSet<PrivateTypeKey>, initial_guard: Vec<String>| {
-            let mut roots: BTreeSet<GuardedPrivateTypeKey> = raw_roots
-                .into_iter()
-                .map(|key| GuardedPrivateTypeKey {
-                    key,
-                    cfg_guard: initial_guard.clone(),
-                })
-                .collect();
+                let mut roots: BTreeSet<GuardedPrivateTypeKey> = raw_roots
+                    .into_iter()
+                    .map(|key| GuardedPrivateTypeKey {
+                        key,
+                        cfg_guard: initial_guard.clone(),
+                    })
+                    .collect();
 
-            let mut visited = BTreeSet::new();
-            let mut closure = Vec::new();
-            let mut alias_resolution_exhausted = false;
-            while let Some(state) = roots.pop_first() {
-                if !visited.insert(state.clone()) {
-                    continue;
-                }
-                let alias_resolution = resolve_private_type_alias_keys(
-                    state.key.clone(),
-                    &state.cfg_guard,
-                    &private_aliases,
-                    &private_module_aliases,
-                );
-                alias_resolution_exhausted |= alias_resolution.exhausted;
-                if let Some(digest) = &alias_resolution.exhaustion_digest {
-                    closure.push(format!("alias-resolution-exhausted:{digest}"));
-                }
-                for terminal in &alias_resolution.terminals {
-                    if terminal == &state {
+                let mut visited = BTreeSet::new();
+                let mut closure = Vec::new();
+                let mut alias_resolution_exhausted = false;
+                while let Some(state) = roots.pop_first() {
+                    if !visited.insert(state.clone()) {
                         continue;
                     }
-                    let has_local_declaration =
-                        declarations.get(&terminal.key).is_some_and(|candidates| {
-                            candidates.iter().any(|declaration| {
-                                !guards_proven_disjoint(&declaration.cfg_guard, &terminal.cfg_guard)
-                            })
-                        });
-                    let has_local_impl =
-                        implementation_evidence
+                    let alias_resolution = resolve_private_type_alias_keys(
+                        state.key.clone(),
+                        &state.cfg_guard,
+                        &private_aliases,
+                        &private_module_aliases,
+                    );
+                    alias_resolution_exhausted |= alias_resolution.exhausted;
+                    if let Some(digest) = &alias_resolution.exhaustion_digest {
+                        closure.push(format!("alias-resolution-exhausted:{digest}"));
+                    }
+                    for terminal in &alias_resolution.terminals {
+                        if terminal == &state {
+                            continue;
+                        }
+                        let has_local_declaration =
+                            declarations.get(&terminal.key).is_some_and(|candidates| {
+                                candidates.iter().any(|declaration| {
+                                    !guards_proven_disjoint(
+                                        &declaration.cfg_guard,
+                                        &terminal.cfg_guard,
+                                    )
+                                })
+                            });
+                        let has_local_impl = implementation_evidence
                             .get(&terminal.key)
                             .is_some_and(|impls| {
                                 impls.iter().any(|implementation| {
@@ -907,36 +909,73 @@ impl<'a> SnapshotBuilder<'a> {
                                     )
                                 })
                             });
-                    if !has_local_declaration && !has_local_impl {
-                        closure.push(format!(
-                            "alias-target:{}::{:?}::{}\neffective-cfg:{:?}",
-                            terminal.key.0, terminal.key.1, terminal.key.2, terminal.cfg_guard
-                        ));
+                        if !has_local_declaration && !has_local_impl {
+                            closure.push(format!(
+                                "alias-target:{}::{:?}::{}\neffective-cfg:{:?}",
+                                terminal.key.0, terminal.key.1, terminal.key.2, terminal.cfg_guard
+                            ));
+                        }
                     }
-                }
-                roots.extend(
-                    alias_resolution
-                        .states
-                        .into_iter()
-                        .filter(|alias| alias != &state),
-                );
-                if let Some(impls) = implementation_evidence.get(&state.key) {
-                    for implementation in impls.iter().filter(|implementation| {
-                        !guards_proven_disjoint(&implementation.cfg_guard, &state.cfg_guard)
-                    }) {
+                    roots.extend(
+                        alias_resolution
+                            .states
+                            .into_iter()
+                            .filter(|alias| alias != &state),
+                    );
+                    if let Some(impls) = implementation_evidence.get(&state.key) {
+                        for implementation in impls.iter().filter(|implementation| {
+                            !guards_proven_disjoint(&implementation.cfg_guard, &state.cfg_guard)
+                        }) {
+                            let effective_guard =
+                                combined_guards(&state.cfg_guard, &implementation.cfg_guard);
+                            closure.push(format!(
+                                "impl-cfg:{effective_guard:?}\n{}",
+                                implementation.semantic_evidence
+                            ));
+                            if let Ok(parsed) =
+                                syn::parse_str::<syn::ItemImpl>(&implementation.raw_contract)
+                            {
+                                roots.extend(
+                                    LocalTypeDependencyCollector::collect_impl_types(
+                                        &state.key.0,
+                                        &implementation.declaring_module_path,
+                                        &parsed,
+                                    )
+                                    .into_iter()
+                                    .map(|key| {
+                                        GuardedPrivateTypeKey {
+                                            key,
+                                            cfg_guard: effective_guard.clone(),
+                                        }
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    for declaration in
+                        declarations
+                            .get(&state.key)
+                            .into_iter()
+                            .flatten()
+                            .filter(|declaration| {
+                                !guards_proven_disjoint(&declaration.cfg_guard, &state.cfg_guard)
+                            })
+                    {
                         let effective_guard =
-                            combined_guards(&state.cfg_guard, &implementation.cfg_guard);
+                            combined_guards(&state.cfg_guard, &declaration.cfg_guard);
                         closure.push(format!(
-                            "impl-cfg:{effective_guard:?}\n{}",
-                            implementation.semantic_evidence
+                            "declaration:{}::{:?}::{}\neffective-cfg:{:?}\n{}",
+                            state.key.0,
+                            state.key.1,
+                            state.key.2,
+                            effective_guard,
+                            declaration.contract
                         ));
-                        if let Ok(parsed) =
-                            syn::parse_str::<syn::ItemImpl>(&implementation.raw_contract)
-                        {
+                        if let Ok(parsed) = syn::parse_str::<Item>(&declaration.contract) {
                             roots.extend(
-                                LocalTypeDependencyCollector::collect_impl_types(
+                                LocalTypeDependencyCollector::collect_item_types(
                                     &state.key.0,
-                                    &implementation.declaring_module_path,
+                                    &state.key.1,
                                     &parsed,
                                 )
                                 .into_iter()
@@ -948,44 +987,10 @@ impl<'a> SnapshotBuilder<'a> {
                         }
                     }
                 }
-                for declaration in
-                    declarations
-                        .get(&state.key)
-                        .into_iter()
-                        .flatten()
-                        .filter(|declaration| {
-                            !guards_proven_disjoint(&declaration.cfg_guard, &state.cfg_guard)
-                        })
-                {
-                    let effective_guard = combined_guards(&state.cfg_guard, &declaration.cfg_guard);
-                    closure.push(format!(
-                        "declaration:{}::{:?}::{}\neffective-cfg:{:?}\n{}",
-                        state.key.0,
-                        state.key.1,
-                        state.key.2,
-                        effective_guard,
-                        declaration.contract
-                    ));
-                    if let Ok(parsed) = syn::parse_str::<Item>(&declaration.contract) {
-                        roots.extend(
-                            LocalTypeDependencyCollector::collect_item_types(
-                                &state.key.0,
-                                &state.key.1,
-                                &parsed,
-                            )
-                            .into_iter()
-                            .map(|key| GuardedPrivateTypeKey {
-                                key,
-                                cfg_guard: effective_guard.clone(),
-                            }),
-                        );
-                    }
-                }
-            }
-            closure.sort();
-            closure.dedup();
-            (closure, alias_resolution_exhausted)
-        };
+                closure.sort();
+                closure.dedup();
+                (closure, alias_resolution_exhausted)
+            };
 
         let mut dependency_unknowns = Vec::new();
         for item in &self.items {
@@ -1008,10 +1013,8 @@ impl<'a> SnapshotBuilder<'a> {
                 continue;
             }
 
-            let (closure, alias_resolution_exhausted) = collect_dependency_closure(
-                raw_roots,
-                combined_guards(&item.cfg_guard, &[]),
-            );
+            let (closure, alias_resolution_exhausted) =
+                collect_dependency_closure(raw_roots, combined_guards(&item.cfg_guard, &[]));
             if closure.is_empty() && !alias_resolution_exhausted {
                 continue;
             }
@@ -1056,10 +1059,8 @@ impl<'a> SnapshotBuilder<'a> {
             if raw_roots.is_empty() {
                 continue;
             }
-            let (closure, alias_resolution_exhausted) = collect_dependency_closure(
-                raw_roots,
-                combined_guards(&subject.cfg_guard, &[]),
-            );
+            let (closure, alias_resolution_exhausted) =
+                collect_dependency_closure(raw_roots, combined_guards(&subject.cfg_guard, &[]));
             if closure.is_empty() && !alias_resolution_exhausted {
                 continue;
             }
@@ -1990,9 +1991,7 @@ impl<'a> SnapshotBuilder<'a> {
                             module_path: module_path.to_vec(),
                             source_path: source_path.to_owned(),
                             cfg_guard: combined_guards(&cfg_guard, &potential_guard),
-                            export_name: format!(
-                                "macro-generated-native-export-potential:{name}"
-                            ),
+                            export_name: format!("macro-generated-native-export-potential:{name}"),
                             raw_roots,
                             crate_type_substrate,
                         });
@@ -2766,7 +2765,7 @@ impl<'a> SnapshotBuilder<'a> {
                     }
                     if rust_linkable
                         && let Some((name, namespace, kind, contract)) =
-                        public_item_contract(item, &derive_name_ambiguity)
+                            public_item_contract(item, &derive_name_ambiguity)
                     {
                         let origin = SymbolKey {
                             crate_name: crate_name.to_owned(),
@@ -9830,24 +9829,19 @@ fn cargo_binary_targets(
 ) -> CargoBinaryDiscovery {
     let mut discovery = CargoBinaryDiscovery::default();
     let conventional = conventional_cargo_binary_roots(manifest_dir, package_name, inventory);
-    if manifest.get("bin").is_none()
-        && conventional.is_empty()
-        && package.get("autobins").is_none()
+    if manifest.get("bin").is_none() && conventional.is_empty() && package.get("autobins").is_none()
     {
         return discovery;
     }
-    let package_edition = match effective_library_edition(
-        manifest_path,
-        manifest,
-        None,
-        parsed_manifest_authorities,
-    ) {
-        Ok(edition) => edition,
-        Err(reason) => {
-            discovery.errors.push(reason);
-            return discovery;
-        }
-    };
+    let package_edition =
+        match effective_library_edition(manifest_path, manifest, None, parsed_manifest_authorities)
+        {
+            Ok(edition) => edition,
+            Err(reason) => {
+                discovery.errors.push(reason);
+                return discovery;
+            }
+        };
     let manual_target_exists = ["lib", "bin", "example", "test", "bench"]
         .iter()
         .any(|target| manifest.get(*target).is_some());
@@ -9906,17 +9900,15 @@ fn cargo_binary_targets(
                 continue;
             }
             let root_path = match table.get("path") {
-                Some(toml::Value::String(path)) => {
-                    match safe_join_repo_path(manifest_dir, path) {
-                        Ok(path) => path,
-                        Err(reason) => {
-                            discovery.errors.push(format!(
-                                "bin[{index}].path cannot be resolved: {reason}"
-                            ));
-                            continue;
-                        }
+                Some(toml::Value::String(path)) => match safe_join_repo_path(manifest_dir, path) {
+                    Ok(path) => path,
+                    Err(reason) => {
+                        discovery
+                            .errors
+                            .push(format!("bin[{index}].path cannot be resolved: {reason}"));
+                        continue;
                     }
-                }
+                },
                 Some(_) => {
                     discovery
                         .errors
@@ -10109,10 +10101,7 @@ fn conventional_cargo_binary_roots(
     candidates
 }
 
-fn binary_required_features(
-    table: &toml::Table,
-    index: usize,
-) -> Result<Vec<String>, String> {
+fn binary_required_features(table: &toml::Table, index: usize) -> Result<Vec<String>, String> {
     let Some(value) = table.get("required-features") else {
         return Ok(Vec::new());
     };
@@ -10912,7 +10901,9 @@ impl LocalTypeDependencyCollector {
     ) -> BTreeSet<PrivateTypeKey> {
         let mut collector = Self::new(crate_name, module_path);
         match item {
-            Item::Const(value) => collector.fold_type((*value.ty).clone()),
+            Item::Const(value) => {
+                collector.fold_type((*value.ty).clone());
+            }
             Item::Enum(value) => {
                 collector.fold_generics(value.generics.clone());
                 for variant in &value.variants {
@@ -10921,7 +10912,9 @@ impl LocalTypeDependencyCollector {
                     }
                 }
             }
-            Item::Fn(value) => collector.fold_signature(value.sig.clone()),
+            Item::Fn(value) => {
+                collector.fold_signature(value.sig.clone());
+            }
             Item::ForeignMod(value) => {
                 for foreign in &value.items {
                     match foreign {
@@ -10958,17 +10951,19 @@ impl LocalTypeDependencyCollector {
                     }
                 }
             }
-            Item::Static(value) => collector.fold_type((*value.ty).clone()),
+            Item::Static(value) => {
+                collector.fold_type((*value.ty).clone());
+            }
             Item::Mod(value) => {
                 if let Some((_, items)) = &value.content {
                     for nested in items {
-                        collector.dependencies.extend(
-                            Self::collect_native_transform_item_types(
+                        collector
+                            .dependencies
+                            .extend(Self::collect_native_transform_item_types(
                                 crate_name,
                                 module_path,
                                 nested,
-                            ),
-                        );
+                            ));
                     }
                 }
             }
@@ -11088,9 +11083,7 @@ impl LocalTypeDependencyCollector {
             // owner/generic layout merely because it lives in the impl block.
             collector.fold_generics(item_impl.generics.clone());
         }
-        if bind_transform_owner
-            && let Some((_, trait_path, _)) = &item_impl.trait_
-        {
+        if bind_transform_owner && let Some((_, trait_path, _)) = &item_impl.trait_ {
             collector.fold_path(trait_path.clone());
         }
         collector.dependencies
@@ -12094,13 +12087,7 @@ fn binary_exports(
     include_public_direct: bool,
     crate_name: &str,
     module_path: &[String],
-) -> Vec<(
-    String,
-    bool,
-    Vec<String>,
-    String,
-    BTreeSet<PrivateTypeKey>,
-)> {
+) -> Vec<(String, bool, Vec<String>, String, BTreeSet<PrivateTypeKey>)> {
     let direct = |name: String, attrs: &[Attribute], public: bool, input: String| {
         if public && !include_public_direct {
             return Vec::new();
@@ -12153,14 +12140,13 @@ fn binary_exports(
                         normalize_identifier(function.sig.ident.to_string())
                     );
                     let input = normalized_associated_contract(item_impl, member, false);
-                    let raw_roots =
-                        LocalTypeDependencyCollector::collect_native_associated_types(
-                            crate_name,
-                            module_path,
-                            item_impl,
-                            function,
-                            false,
-                        );
+                    let raw_roots = LocalTypeDependencyCollector::collect_native_associated_types(
+                        crate_name,
+                        module_path,
+                        item_impl,
+                        function,
+                        false,
+                    );
                     Some(binary_export_attributes(&function.attrs).into_iter().map(
                         move |(guard, export)| {
                             (
@@ -13873,8 +13859,7 @@ mod tests {
             item.key.crate_name == "fixture" && item.key.external_name == "library_api"
         }));
         assert!(!snapshot.items.iter().any(|item| {
-            item.key.crate_name.contains("#bin:")
-                || item.key.external_name == "binary_internal"
+            item.key.crate_name.contains("#bin:") || item.key.external_name == "binary_internal"
         }));
         assert!(snapshot.unknowns.iter().any(|unknown| {
             unknown.crate_name.as_deref() == Some("fixture#bin:fixture")
@@ -13912,10 +13897,12 @@ mod tests {
                 b"#[unsafe(no_mangle)] extern \"C\" fn default_off() {}",
             ),
         ]);
-        assert!(snapshot_rust_api(&edition_2015_manual_target)
-            .unknowns
-            .iter()
-            .all(|unknown| !unknown.evidence.contains("default_off")));
+        assert!(
+            snapshot_rust_api(&edition_2015_manual_target)
+                .unknowns
+                .iter()
+                .all(|unknown| !unknown.evidence.contains("default_off"))
+        );
 
         let edition_2015_opt_in = MemorySource::new(&[
             (
@@ -13927,13 +13914,15 @@ mod tests {
                 b"#[unsafe(no_mangle)] extern \"C\" fn opted_in() {}",
             ),
         ]);
-        assert!(snapshot_rust_api(&edition_2015_opt_in)
-            .unknowns
-            .iter()
-            .any(|unknown| {
-                unknown.crate_name.as_deref() == Some("fixture#bin:fixture")
-                    && unknown.evidence.contains("opted_in")
-            }));
+        assert!(
+            snapshot_rust_api(&edition_2015_opt_in)
+                .unknowns
+                .iter()
+                .any(|unknown| {
+                    unknown.crate_name.as_deref() == Some("fixture#bin:fixture")
+                        && unknown.evidence.contains("opted_in")
+                })
+        );
 
         let explicit_without_path = MemorySource::new(&[
             (
@@ -13945,14 +13934,16 @@ mod tests {
                 b"#[unsafe(no_mangle)] extern \"C\" fn inferred_explicit() {}",
             ),
         ]);
-        assert!(snapshot_rust_api(&explicit_without_path)
-            .unknowns
-            .iter()
-            .any(|unknown| {
-                unknown.crate_name.as_deref() == Some("fixture#bin:fixture")
-                    && unknown.source_path == "src/main.rs"
-                    && unknown.evidence.contains("inferred_explicit")
-            }));
+        assert!(
+            snapshot_rust_api(&explicit_without_path)
+                .unknowns
+                .iter()
+                .any(|unknown| {
+                    unknown.crate_name.as_deref() == Some("fixture#bin:fixture")
+                        && unknown.source_path == "src/main.rs"
+                        && unknown.evidence.contains("inferred_explicit")
+                })
+        );
     }
 
     #[test]
@@ -14025,7 +14016,10 @@ mod tests {
         let discovery = cargo_binary_targets(
             "Cargo.toml",
             &manifest,
-            manifest.get("package").and_then(toml::Value::as_table).unwrap(),
+            manifest
+                .get("package")
+                .and_then(toml::Value::as_table)
+                .unwrap(),
             "fixture",
             "",
             &authorities,
@@ -14039,12 +14033,17 @@ mod tests {
             "Cargo.toml",
             b"[package]\nname='fixture'\nversion='0.0.0'\nautobins=false\n[[bin]]\nname='worker'\npath='cmd/missing.rs'\n",
         )]);
-        assert!(snapshot_rust_api(&missing_root).unknowns.iter().any(|unknown| {
-            unknown.kind == RustApiUnknownKind::ManifestParse
-                && unknown.crate_name.as_deref() == Some("fixture#bin:worker")
-                && unknown.source_path == "cmd/missing.rs"
-                && unknown.evidence.contains("unavailable root")
-        }));
+        assert!(
+            snapshot_rust_api(&missing_root)
+                .unknowns
+                .iter()
+                .any(|unknown| {
+                    unknown.kind == RustApiUnknownKind::ManifestParse
+                        && unknown.crate_name.as_deref() == Some("fixture#bin:worker")
+                        && unknown.source_path == "cmd/missing.rs"
+                        && unknown.evidence.contains("unavailable root")
+                })
+        );
 
         let mut symlink_root = MemorySource::new(&[
             (
@@ -14059,20 +14058,19 @@ mod tests {
                 kind: RevisionEntryKind::Symlink,
             },
         );
-        assert!(snapshot_rust_api(&symlink_root).unknowns.iter().any(|unknown| {
-            unknown.kind == RustApiUnknownKind::ManifestParse
-                && unknown.crate_name.as_deref() == Some("fixture#bin:worker")
-                && unknown.source_path == "cmd/worker.rs"
-                && unknown
-                    .evidence
-                    .contains(NON_NEUTRALIZABLE_SYMLINK_ROOT)
-        }));
+        assert!(
+            snapshot_rust_api(&symlink_root)
+                .unknowns
+                .iter()
+                .any(|unknown| {
+                    unknown.kind == RustApiUnknownKind::ManifestParse
+                        && unknown.crate_name.as_deref() == Some("fixture#bin:worker")
+                        && unknown.source_path == "cmd/worker.rs"
+                        && unknown.evidence.contains(NON_NEUTRALIZABLE_SYMLINK_ROOT)
+                })
+        );
 
-        for implicit_root in [
-            "src/main.rs",
-            "src/bin/tool.rs",
-            "src/bin/tool/main.rs",
-        ] {
+        for implicit_root in ["src/main.rs", "src/bin/tool.rs", "src/bin/tool/main.rs"] {
             let mut source = MemorySource::new(&[
                 (
                     "Cargo.toml",
@@ -14086,13 +14084,14 @@ mod tests {
                     kind: RevisionEntryKind::Symlink,
                 },
             );
-            assert!(snapshot_rust_api(&source).unknowns.iter().any(|unknown| {
-                unknown.kind == RustApiUnknownKind::ManifestParse
-                    && unknown.source_path == implicit_root
-                    && unknown
-                        .evidence
-                        .contains(NON_NEUTRALIZABLE_SYMLINK_ROOT)
-            }), "implicit exact binary root {implicit_root} must reach typed symlink validation");
+            assert!(
+                snapshot_rust_api(&source).unknowns.iter().any(|unknown| {
+                    unknown.kind == RustApiUnknownKind::ManifestParse
+                        && unknown.source_path == implicit_root
+                        && unknown.evidence.contains(NON_NEUTRALIZABLE_SYMLINK_ROOT)
+                }),
+                "implicit exact binary root {implicit_root} must reach typed symlink validation"
+            );
         }
 
         for manifest in [
