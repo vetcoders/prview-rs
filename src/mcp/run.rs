@@ -581,6 +581,7 @@ fn terminate_and_reap_detached_child(child: &mut OwnedDetachedChild) -> bool {
 fn install_detached_reaper(
     child: OwnedDetachedChild,
     run_dir: PathBuf,
+    publication_index: PathBuf,
 ) -> Result<(), (std::io::Error, OwnedDetachedChild)> {
     let owned = Arc::new(Mutex::new(Some(child)));
     let reaper_owned = Arc::clone(&owned);
@@ -594,6 +595,7 @@ fn install_detached_reaper(
             let Some(mut child) = child else {
                 return;
             };
+            #[cfg(unix)]
             let pid = child.id();
             let _ = child.wait();
             // On Unix the direct root may exit while a background descendant
@@ -606,7 +608,9 @@ fn install_detached_reaper(
             // Successful publication is the only state that may discard the
             // marker. Failed children retain a stale diagnostic marker, but no
             // zombie and no active-run lockout.
-            if read::run_status(&run_dir) == read::RunStatus::Completed {
+            if read::run_status_with_index(&run_dir, &publication_index)
+                == read::RunStatus::Completed
+            {
                 let _ = std::fs::remove_file(read::running_marker_path(&run_dir));
             }
         });
@@ -637,6 +641,10 @@ fn activate_detached_child(
     commit: String,
     base_used: Vec<String>,
 ) -> Result<u32, ToolError> {
+    // Capture the publication dependency on the caller thread. Test homes are
+    // deliberately thread-local, so a reaper that re-resolves PRVIEW_HOME on
+    // its own thread could otherwise inspect the operator's real index.
+    let publication_index = crate::config::prview_home().join("index.jsonl");
     let pid = child.id();
     let marker = match running_marker(pid, profile, commit, base_used) {
         Ok(marker) => marker,
@@ -649,7 +657,9 @@ fn activate_detached_child(
         let _ = terminate_and_reap_detached_child(&mut child);
         return Err(error);
     }
-    if let Err((error, mut child)) = install_detached_reaper(child, run_dir.to_path_buf()) {
+    if let Err((error, mut child)) =
+        install_detached_reaper(child, run_dir.to_path_buf(), publication_index)
+    {
         let reaped = terminate_and_reap_detached_child(&mut child);
         let _ = std::fs::remove_file(read::running_marker_path(run_dir));
         let detail = if reaped {
@@ -876,6 +886,66 @@ mod tests {
             active_run(repo_name, branch_key),
             None,
             "a failed deep child must not block the next run"
+        );
+    }
+
+    #[test]
+    fn detached_reaper_uses_captured_publication_index() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let run_dir = home
+            .path()
+            .join("runs")
+            .join("mcp-reaper-test")
+            .join("main")
+            .join("published-run");
+        let summary = run_dir.join("00_summary");
+        std::fs::create_dir_all(&summary).unwrap();
+        std::fs::write(summary.join("SANITY.json"), "{}").unwrap();
+        let published = serde_json::json!({
+            "id": "published-run",
+            "repo": "mcp-reaper-test",
+            "branch": "main",
+            "commit": "abc1234",
+            "path": run_dir,
+            "created_at": "2026-07-01T12:00:00Z",
+            "quality_pass": true,
+            "merge_status": "ALLOW",
+            "policy_mode": "shadow",
+            "checks_passed": 1,
+            "checks_failed": 0,
+            "files_changed": 1,
+            "size_bytes": 1,
+            "has_dashboard": false,
+        });
+        std::fs::write(
+            home.path().join("index.jsonl"),
+            format!("{}\n", serde_json::to_string(&published).unwrap()),
+        )
+        .unwrap();
+
+        let signal_dir = tempfile::tempdir().unwrap();
+        let signal = signal_dir.path().join("exit-now");
+        let child = spawn_reaper_fixture(&signal);
+        let pid = activate_detached_child(
+            &run_dir,
+            child,
+            Profile::Deep,
+            "abc1234".to_string(),
+            vec!["main".to_string()],
+        )
+        .unwrap();
+        assert!(read::running_marker_path(&run_dir).exists());
+
+        std::fs::write(&signal, b"go").unwrap();
+        wait_until_process_is_reaped(pid);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while read::running_marker_path(&run_dir).exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !read::running_marker_path(&run_dir).exists(),
+            "reaper must resolve completion from the caller's captured publication index"
         );
     }
 

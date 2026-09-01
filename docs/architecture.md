@@ -1330,6 +1330,8 @@ Deep reviews are asynchronous at the RPC boundary, not unowned processes. A
 dedicated waiter thread retains each `Child` and reaps its direct root, including
 an immediate failure. After normal root exit it also terminates residual Unix
 process-group members; Windows retains the complete Job Object until wait.
+The caller also captures the exact publication-index path before starting the
+waiter, so background completion never re-resolves a different storage home.
 `RUNNING.json` protocol v2 pairs the PID with the native
 process creation identity; liveness requires both values to match, while legacy
 PID-only markers fail closed by blocking while their PID is live, then become

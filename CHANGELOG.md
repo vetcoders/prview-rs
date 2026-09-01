@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   across Linux, macOS, and Windows; recycled v2 PIDs become stale, while a live
   legacy PID blocks conservatively until it exits. Marker or reaper setup
   failures terminate and reap the child tree before the RPC returns
-  `run_failed`.
+  `run_failed`. The reaper receives the caller's exact publication-index path,
+  so its background completion check cannot drift into another storage home.
 - Off-HEAD Python pre-sync now runs on the shared reviewed snapshot with the
   same per-commit `UV_PROJECT_ENVIRONMENT` as Ruff, Mypy, and Pytest; it no
   longer mutates the operator checkout's environment or warms a venv the gates

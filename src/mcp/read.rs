@@ -179,12 +179,22 @@ pub fn read_running_marker(run_dir: &Path) -> Option<RunningMarker> {
 
 /// Derive the deterministic lifecycle status of a run directory.
 pub fn run_status(run_dir: &Path) -> RunStatus {
+    let index_path = crate::config::prview_home().join("index.jsonl");
+    run_status_with_index(run_dir, &index_path)
+}
+
+/// Derive lifecycle status against an explicitly selected publication index.
+///
+/// Background helpers must not rediscover `PRVIEW_HOME` on their own thread:
+/// test overrides are intentionally thread-scoped, and production callers may
+/// likewise need the exact storage dependency captured before spawning work.
+pub(crate) fn run_status_with_index(run_dir: &Path, index_path: &Path) -> RunStatus {
     // SANITY is necessary but not sufficient: it precedes the transactional
     // index/latest commit. A lossy read is acceptable only for this lifecycle
     // hint; every MCP success path separately uses `strict_run_index`.
     let finalized = run_dir.join("00_summary").join("SANITY.json").exists();
     let run_id = run_dir.file_name().and_then(|name| name.to_str());
-    let published = RunIndex::load()
+    let published = RunIndex::load_from(index_path)
         .entries()
         .iter()
         .any(|entry| Some(entry.id.as_str()) == run_id && same_run_path(&entry.path, run_dir));
