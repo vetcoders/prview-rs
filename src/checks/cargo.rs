@@ -12,6 +12,8 @@ use async_trait::async_trait;
 use chrono::Local;
 use std::path::{Path, PathBuf};
 
+const MAX_CARGO_CONFIG_BYTES: u64 = 1024 * 1024;
+
 pub struct CargoCheck;
 pub struct ClippyCheck;
 pub struct CargoTestCheck;
@@ -254,18 +256,31 @@ fn reviewed_cargo_jobs_limit(
 }
 
 fn cargo_jobs_directive_in(directory: &Path, logical_cores: u32) -> CargoJobsDirective {
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return CargoJobsDirective::Uncertain,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CargoJobsDirective::Absent;
+        }
+        Err(_) => return CargoJobsDirective::Uncertain,
+    }
     let legacy = directory.join("config");
     let modern = directory.join("config.toml");
-    let path = match legacy.try_exists() {
+    let present = |path: &Path| match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    };
+    let path = match present(&legacy) {
         Ok(true) => legacy,
-        Ok(false) => match modern.try_exists() {
+        Ok(false) => match present(&modern) {
             Ok(true) => modern,
             Ok(false) => return CargoJobsDirective::Absent,
             Err(_) => return CargoJobsDirective::Uncertain,
         },
         Err(_) => return CargoJobsDirective::Uncertain,
     };
-    let Ok(contents) = std::fs::read_to_string(path) else {
+    let Ok(contents) = read_bounded_regular_cargo_config(&path) else {
         return CargoJobsDirective::Uncertain;
     };
     let Ok(document) = toml::from_str::<toml::Value>(&contents) else {
@@ -293,6 +308,55 @@ fn cargo_jobs_directive_in(directory: &Path, logical_cores: u32) -> CargoJobsDir
                 .map(|value| cargo_jobs_directive_from_integer(value, logical_cores))
         })
         .unwrap_or(CargoJobsDirective::Uncertain)
+}
+
+/// Read only a finite regular Cargo config without following a final symlink.
+///
+/// This runs before any governed Cargo child exists, so it must not block on a
+/// tracked FIFO/device or consume an unbounded file reached through a snapshot
+/// symlink. Unsupported input is intentionally `Uncertain`; the resource plan
+/// then lowers Cargo to one worker while Cargo itself reports its config error.
+fn read_bounded_regular_cargo_config(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Cargo config is not a direct regular file",
+            ));
+        }
+    }
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_CARGO_CONFIG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo config is not a bounded regular file",
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CARGO_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CARGO_CONFIG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo config exceeds the bounded read limit",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 fn cargo_jobs_directive_from_text(value: &str, logical_cores: u32) -> CargoJobsDirective {
@@ -2258,6 +2322,8 @@ mod tests {
     use super::*;
     use crate::cli::ExecutionMode;
     use crate::config::{test_config_builder, test_rust_profile};
+    #[cfg(unix)]
+    use std::time::Duration;
 
     fn create_test_config(has_cargo: bool, run_lint: bool, run_tests: bool) -> Config {
         test_config_builder()
@@ -2418,6 +2484,174 @@ mod tests {
 
         write_cargo_config(&member, "config.toml", "[build]\njobs = \"default\"\n");
         assert_eq!(resolved_jobs(4, 8, &member, &cargo_home, None), "4");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_jobs_refuses_a_symlinked_config_before_reading_it() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let cargo_home = tmp.path().join("cargo-home");
+        let external = tmp.path().join("external-config.toml");
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        std::fs::write(&external, "[build]\njobs = 7\n").unwrap();
+        symlink(&external, repo.join(".cargo/config")).unwrap();
+        std::fs::write(repo.join(".cargo/config.toml"), "[build]\njobs = 2\n").unwrap();
+
+        assert_eq!(
+            resolved_jobs(8, 8, &repo, &cargo_home, None),
+            "1",
+            "the higher-precedence symlink is uncertain and must not be followed or skipped",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn off_head_snapshot_refuses_a_tracked_config_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(root.join("external-config.toml"), "[build]\njobs = 7\n").unwrap();
+        symlink("../external-config.toml", root.join(".cargo/config")).unwrap();
+        init_repo_with_commit(root);
+        let target = head_sha(root);
+        std::fs::write(root.join("later.txt"), "make target off HEAD\n").unwrap();
+        commit_all(root, "later");
+
+        let snapshot = crate::git::create_worktree_snapshot(root, &target)
+            .expect("materialize the reviewed commit");
+        assert_eq!(
+            cargo_jobs_directive_in(&snapshot.worktree_path.join(".cargo"), 8),
+            CargoJobsDirective::Uncertain,
+            "a revision-backed symlink must not escape the snapshot read boundary",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_jobs_refuses_a_symlinked_cargo_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let external = tmp.path().join("external-cargo");
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("config.toml"), "[build]\njobs = 7\n").unwrap();
+        symlink(&external, repo.join(".cargo")).unwrap();
+
+        assert_eq!(resolved_jobs(8, 8, &repo, &cargo_home, None), "1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_jobs_dangerous_config_helper() {
+        let Ok(directory) = std::env::var("PRVIEW_TEST_CARGO_CONFIG_DIR") else {
+            return;
+        };
+        assert_eq!(
+            cargo_jobs_directive_in(Path::new(&directory), 8),
+            CargoJobsDirective::Uncertain,
+        );
+        std::fs::write(
+            std::env::var("PRVIEW_TEST_CARGO_CONFIG_DONE").expect("result path"),
+            "done\n",
+        )
+        .expect("publish bounded result");
+    }
+
+    #[cfg(unix)]
+    fn assert_dangerous_cargo_config_returns_promptly(prepare: impl FnOnce(&Path), label: &str) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cargo_dir = tmp.path().join(".cargo");
+        let done = tmp.path().join("done");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        prepare(&cargo_dir.join("config"));
+
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "checks::cargo::tests::cargo_jobs_dangerous_config_helper",
+                "--nocapture",
+            ])
+            .env("PRVIEW_TEST_CARGO_CONFIG_DIR", &cargo_dir)
+            .env("PRVIEW_TEST_CARGO_CONFIG_DONE", &done)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn bounded config probe");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait().expect("poll config probe") {
+                Some(status) => {
+                    assert!(
+                        status.success(),
+                        "{label} must fail closed without blocking"
+                    );
+                    assert!(
+                        done.is_file(),
+                        "{label} probe did not execute its assertion"
+                    );
+                    break;
+                }
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{label} blocked the synchronous resource planner");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_jobs_never_reads_a_dev_zero_symlink() {
+        use std::os::unix::fs::symlink;
+
+        assert_dangerous_cargo_config_returns_promptly(
+            |path| symlink("/dev/zero", path).expect("symlink /dev/zero"),
+            "a /dev/zero config symlink",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_jobs_never_blocks_on_a_fifo() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        assert_dangerous_cargo_config_returns_promptly(
+            |path| {
+                let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path");
+                // SAFETY: the path is a NUL-terminated temporary pathname and
+                // mkfifo creates only that fixture with owner read/write mode.
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            },
+            "a FIFO Cargo config",
+        );
+    }
+
+    #[test]
+    fn cargo_jobs_refuses_an_oversized_config_before_parsing_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        std::fs::write(
+            repo.join(".cargo/config.toml"),
+            vec![b' '; MAX_CARGO_CONFIG_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        assert_eq!(resolved_jobs(8, 8, &repo, &cargo_home, None), "1");
     }
 
     #[test]

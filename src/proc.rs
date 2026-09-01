@@ -5,8 +5,10 @@
 //!    the operator's terminal (npm's "Ok to proceed?" — the `--deep` hang class),
 //! 2. run under `kill_on_drop`, so a dropped wait-future reaps the direct child,
 //! 3. on unix lead its own process group (`process_group(0)`), so one SIGKILL to
-//!    `-pgid` takes down the WHOLE tree (cargo → rustc → cc, npx → node → tool),
-//!    not just the direct child — `kill_on_drop` alone leaves grandchildren,
+//!    `-pgid` reaches the normal inherited tree (cargo → rustc → cc, npx → node
+//!    → tool); cancellation/timeout additionally freezes and inventories live
+//!    PPID descendants that moved into their own group via `setsid`/`setpgid`,
+//!    because `kill_on_drop` alone leaves grandchildren,
 //! 4. on Windows own a Job Object, so the tree remains killable after a short-
 //!    lived wrapper exits and its PID can no longer be passed to `taskkill /T`.
 //!
@@ -764,7 +766,7 @@ impl ExternalChildGroupTracker {
                     // cannot name a newly-created group until the old one is
                     // empty. A live different-birth leader is the reuse case and
                     // deliberately does not enter this branch.
-                    if terminate_process_tree(identity.pid) {
+                    if terminate_hardened_process_tree(identity.pid) {
                         self.settle_identity(identity);
                     } else {
                         complete = false;
@@ -823,7 +825,7 @@ impl ExternalChildGroupTracker {
     fn terminate_proven_descendant_groups(&mut self, groups: &[u32]) -> bool {
         let mut complete = true;
         for &pgid in groups {
-            if terminate_process_tree(pgid) {
+            if terminate_hardened_process_tree(pgid) {
                 self.proven_terminated_groups.insert(pgid);
             } else {
                 complete = false;
@@ -1110,6 +1112,111 @@ fn direct_child_process_groups(rows: &[UnixProcessRow], root_pid: u32) -> Vec<u3
 }
 
 #[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnixOwnedDescendantGroup {
+    pgid: u32,
+    birth_identity: String,
+    depth: usize,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum HardenedDescendantFreezeError {
+    RootGone,
+    Other(std::io::Error),
+}
+
+#[cfg(unix)]
+fn unix_process_state_is_quiescent(state: &str) -> bool {
+    state.starts_with('T') || state.starts_with('Z')
+}
+
+#[cfg(unix)]
+fn unix_process_group_is_quiescent(rows: &[UnixProcessRow], pgid: u32) -> bool {
+    let mut found = false;
+    for row in rows.iter().filter(|row| row.pgid == pgid) {
+        found = true;
+        if !unix_process_state_is_quiescent(&row.state) {
+            return false;
+        }
+    }
+    found
+}
+
+#[cfg(unix)]
+fn stable_census_step(consecutive: &mut u8, stable: bool) -> bool {
+    if stable {
+        *consecutive = consecutive.saturating_add(1);
+    } else {
+        *consecutive = 0;
+    }
+    *consecutive >= 2
+}
+
+#[cfg(unix)]
+fn terminate_exact_descendant_groups(mut groups: Vec<UnixOwnedDescendantGroup>) -> bool {
+    groups.sort_by_key(|group| std::cmp::Reverse(group.depth));
+    let mut confirmed = true;
+    for group in groups {
+        let exact =
+            crate::storage::process_birth_identity_matches(group.pgid, &group.birth_identity);
+        let terminated = exact && sigkill_process_group(group.pgid);
+        confirmed &= terminated;
+    }
+    confirmed
+}
+
+#[cfg(unix)]
+fn cleanup_frozen_descendant_groups(
+    groups: &std::collections::BTreeMap<u32, UnixOwnedDescendantGroup>,
+    error: std::io::Error,
+) -> std::io::Error {
+    if terminate_exact_descendant_groups(groups.values().cloned().collect()) {
+        error
+    } else {
+        std::io::Error::new(
+            error.kind(),
+            format!("{error}; cleanup of already-frozen descendant groups was unconfirmed"),
+        )
+    }
+}
+
+/// Find every process-group leader still connected to `root_pid` by live PPID
+/// ancestry, including nested groups created with `setsid` or `setpgid`.
+#[cfg(unix)]
+fn transitive_descendant_group_leaders(
+    rows: &[UnixProcessRow],
+    root_pid: u32,
+) -> Vec<(u32, usize)> {
+    let mut depths = std::collections::BTreeMap::from([(root_pid, 0_usize)]);
+    loop {
+        let mut changed = false;
+        for row in rows {
+            let Some(parent_depth) = depths.get(&row.ppid).copied() else {
+                continue;
+            };
+            if let std::collections::btree_map::Entry::Vacant(entry) = depths.entry(row.pid) {
+                entry.insert(parent_depth + 1);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    depths
+        .into_iter()
+        .filter(|(pid, _)| *pid != root_pid)
+        .filter_map(|(pid, depth)| {
+            rows.iter()
+                .any(|row| row.pid == pid && row.pgid == pid)
+                .then_some((pid, depth))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
 fn unlinked_process_table_capture() -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -1282,6 +1389,235 @@ fn bounded_unix_process_table(timeout: Duration) -> std::io::Result<Vec<UnixProc
     parse_unix_process_table(&stdout)
 }
 
+/// Freeze every live descendant group of a stopped hardened tool until two
+/// consecutive censuses reach a stable fixed point.
+///
+/// The original tool group is already stopped by the caller. Each newly found
+/// group is bound to its native birth identity before and after SIGSTOP, so a
+/// later kill never relies on a recyclable PID/PGID alone.
+#[cfg(unix)]
+fn freeze_hardened_descendant_groups(
+    root_pid: u32,
+    timeout: Duration,
+) -> Result<Vec<UnixOwnedDescendantGroup>, HardenedDescendantFreezeError> {
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            HardenedDescendantFreezeError::Other(std::io::Error::other(
+                "descendant census timeout overflow",
+            ))
+        })?;
+    let mut owned = std::collections::BTreeMap::<u32, UnixOwnedDescendantGroup>::new();
+    let mut consecutive_stable_censuses = 0_u8;
+
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(HardenedDescendantFreezeError::Other(
+                cleanup_frozen_descendant_groups(
+                    &owned,
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "hardened process tree did not reach a stable stopped census",
+                    ),
+                ),
+            ));
+        }
+        let rows = match bounded_unix_process_table(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(250)),
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Err(HardenedDescendantFreezeError::Other(
+                    cleanup_frozen_descendant_groups(&owned, error),
+                ));
+            }
+        };
+        let Some(root) = rows.iter().find(|row| row.pid == root_pid) else {
+            if terminate_exact_descendant_groups(owned.values().cloned().collect()) {
+                return Err(HardenedDescendantFreezeError::RootGone);
+            }
+            return Err(HardenedDescendantFreezeError::Other(std::io::Error::other(
+                "hardened root disappeared and cleanup of already-frozen descendant groups was unconfirmed",
+            )));
+        };
+        if !unix_process_state_is_quiescent(&root.state)
+            || !unix_process_group_is_quiescent(&rows, root_pid)
+        {
+            if !suspend_process_group(root_pid) {
+                return Err(HardenedDescendantFreezeError::Other(
+                    cleanup_frozen_descendant_groups(
+                        &owned,
+                        std::io::Error::other(format!(
+                            "could not re-stop active member of hardened root process group {root_pid}"
+                        )),
+                    ),
+                ));
+            }
+            stable_census_step(&mut consecutive_stable_censuses, false);
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+
+        let mut added = false;
+        for (pgid, depth) in transitive_descendant_group_leaders(&rows, root_pid) {
+            if let Some(group) = owned.get(&pgid) {
+                if !crate::storage::process_birth_identity_matches(
+                    group.pgid,
+                    &group.birth_identity,
+                ) {
+                    return Err(HardenedDescendantFreezeError::Other(
+                        cleanup_frozen_descendant_groups(
+                            &owned,
+                            std::io::Error::other(format!(
+                                "descendant process group {pgid} changed identity during containment"
+                            )),
+                        ),
+                    ));
+                }
+                continue;
+            }
+
+            let birth_identity = match crate::storage::process_birth_identity(pgid) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    return Err(HardenedDescendantFreezeError::Other(
+                        cleanup_frozen_descendant_groups(&owned, error),
+                    ));
+                }
+            };
+            if !crate::storage::process_birth_identity_matches(pgid, &birth_identity) {
+                return Err(HardenedDescendantFreezeError::Other(
+                    cleanup_frozen_descendant_groups(
+                        &owned,
+                        std::io::Error::other(format!(
+                            "descendant process group {pgid} changed before containment"
+                        )),
+                    ),
+                ));
+            }
+            if !suspend_process_group(pgid) {
+                return Err(HardenedDescendantFreezeError::Other(
+                    cleanup_frozen_descendant_groups(
+                        &owned,
+                        std::io::Error::other(format!(
+                            "could not stop descendant process group {pgid}"
+                        )),
+                    ),
+                ));
+            }
+            owned.insert(
+                pgid,
+                UnixOwnedDescendantGroup {
+                    pgid,
+                    birth_identity: birth_identity.clone(),
+                    depth,
+                },
+            );
+            if !crate::storage::process_birth_identity_matches(pgid, &birth_identity) {
+                return Err(HardenedDescendantFreezeError::Other(
+                    cleanup_frozen_descendant_groups(
+                        &owned,
+                        std::io::Error::other(format!(
+                            "descendant process group {pgid} changed while being stopped"
+                        )),
+                    ),
+                ));
+            }
+            added = true;
+        }
+
+        let mut restopped = false;
+        for group in owned.values() {
+            if unix_process_group_is_quiescent(&rows, group.pgid) {
+                continue;
+            }
+            if !crate::storage::process_birth_identity_matches(group.pgid, &group.birth_identity) {
+                return Err(HardenedDescendantFreezeError::Other(
+                    cleanup_frozen_descendant_groups(
+                        &owned,
+                        std::io::Error::other(format!(
+                            "descendant process group {} changed before re-stop",
+                            group.pgid
+                        )),
+                    ),
+                ));
+            }
+            if !suspend_process_group(group.pgid) {
+                return Err(HardenedDescendantFreezeError::Other(
+                    cleanup_frozen_descendant_groups(
+                        &owned,
+                        std::io::Error::other(format!(
+                            "could not re-stop active member of descendant process group {}",
+                            group.pgid
+                        )),
+                    ),
+                ));
+            }
+            restopped = true;
+        }
+
+        let all_stopped = owned.values().all(|group| {
+            unix_process_group_is_quiescent(&rows, group.pgid)
+                && rows.iter().any(|row| row.pid == group.pgid)
+                && crate::storage::process_birth_identity_matches(group.pgid, &group.birth_identity)
+        });
+        if stable_census_step(
+            &mut consecutive_stable_censuses,
+            !added && !restopped && all_stopped,
+        ) {
+            return Ok(owned.into_values().collect());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Terminate a live hardened tool plus nested groups that escaped its original
+/// PGID while retaining PPID ancestry.
+///
+/// This is the cancellation/timeout primitive for children spawned by prview.
+/// A root that has already disappeared falls back to the original PGID kill;
+/// no Unix census can recover a descendant that double-forked and was already
+/// reparented, so documentation deliberately limits the claim to live ancestry.
+#[cfg(unix)]
+pub fn terminate_hardened_process_tree(pid: u32) -> bool {
+    if !unix_process_group_exists(pid) {
+        return true;
+    }
+
+    let root_suspended = suspend_process_group(pid);
+    let descendants = if root_suspended {
+        freeze_hardened_descendant_groups(pid, Duration::from_secs(1))
+    } else {
+        Err(HardenedDescendantFreezeError::Other(std::io::Error::other(
+            format!("could not suspend hardened root process group {pid}"),
+        )))
+    };
+
+    let descendants_terminated = match descendants {
+        Ok(groups) => terminate_exact_descendant_groups(groups),
+        Err(HardenedDescendantFreezeError::RootGone) => {
+            // A completed wrapper may already have been reaped. Preserve the
+            // established same-PGID cleanup without claiming a live-ancestry
+            // census that is no longer possible.
+            true
+        }
+        Err(HardenedDescendantFreezeError::Other(error)) => {
+            eprintln!("prview: could not prove hardened descendant containment for {pid}: {error}");
+            false
+        }
+    };
+    let root_terminated = sigkill_process_group(pid);
+    root_suspended && descendants_terminated && root_terminated
+}
+
+#[cfg(not(unix))]
+pub fn terminate_hardened_process_tree(pid: u32) -> bool {
+    terminate_process_tree(pid)
+}
+
 /// Wait for one process-table snapshot that both proves the review root has
 /// reached stopped state and inventories its descendants. The same snapshot
 /// supplies both facts, so the root cannot create or reap between proof and
@@ -1331,11 +1667,12 @@ fn unix_group_kill_succeeded(result: i32, errno: Option<i32>) -> bool {
     result == 0 || (result == -1 && errno == Some(libc::ESRCH))
 }
 
-/// Terminate the full process tree led by `pid` on every supported platform.
+/// Terminate the primary process group/tree led by `pid` on every platform.
 ///
-/// Unix children lead their own process group, so one negative-pgid SIGKILL is
-/// sufficient. Windows has no inherited Unix-style process group contract;
-/// the built-in `taskkill /T /F` primitive walks and force-terminates the tree.
+/// Unix uses one negative-pgid SIGKILL. Call
+/// [`terminate_hardened_process_tree`] for a prview-spawned tool when live
+/// descendants may have moved to another group. Windows has no inherited
+/// Unix-style process group contract; `taskkill /T /F` walks the tree.
 pub fn terminate_process_tree(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -1583,7 +1920,7 @@ fn reap_direct_std_child_within(
 pub fn terminate_owned_std_child(child: &mut dyn process_wrap::std::ChildWrapper) -> bool {
     #[cfg(unix)]
     {
-        terminate_process_tree(child.id())
+        terminate_hardened_process_tree(child.id())
     }
 
     #[cfg(windows)]
@@ -2053,7 +2390,7 @@ async fn terminate_owned_tokio_child(
     pid: Option<u32>,
 ) -> bool {
     #[cfg(unix)]
-    let group_terminated = pid.is_some_and(sigkill_process_group);
+    let group_terminated = pid.is_some_and(terminate_hardened_process_tree);
 
     // On Windows JobObjectChild::start_kill terminates the job even when the
     // direct root has already exited. If that owned primitive fails while the
@@ -2781,6 +3118,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn transitive_census_includes_nested_detached_group_leaders() {
+        let rows = parse_unix_process_table(
+            b"100 1 100 T\n200 100 100 T\n300 200 300 S\n301 300 300 S\n400 301 400 S\n500 1 500 S\n",
+        )
+        .expect("parse process table");
+        assert_eq!(
+            transitive_descendant_group_leaders(&rows, 100),
+            vec![(300, 2), (400, 4)],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_and_zombie_roots_are_quiescent_for_descendant_census() {
+        assert!(unix_process_state_is_quiescent("T"));
+        assert!(unix_process_state_is_quiescent("T+"));
+        assert!(unix_process_state_is_quiescent("Z"));
+        assert!(unix_process_state_is_quiescent("Z+"));
+        assert!(!unix_process_state_is_quiescent("S"));
+        assert!(!unix_process_state_is_quiescent("R+"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_census_requires_every_visible_member_to_be_quiescent() {
+        let mixed = parse_unix_process_table(b"100 1 100 T\n101 100 100 S\n102 100 100 Z\n")
+            .expect("parse mixed process group");
+        assert!(!unix_process_group_is_quiescent(&mixed, 100));
+
+        let stopped = parse_unix_process_table(b"100 1 100 T\n101 100 100 T+\n102 100 100 Z\n")
+            .expect("parse quiescent process group");
+        assert!(unix_process_group_is_quiescent(&stopped, 100));
+        assert!(!unix_process_group_is_quiescent(&stopped, 999));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_census_requires_two_quiescent_observations_after_a_restop() {
+        let mut consecutive = 1;
+        assert!(!stable_census_step(&mut consecutive, false));
+        assert_eq!(consecutive, 0);
+        assert!(!stable_census_step(&mut consecutive, true));
+        assert_eq!(consecutive, 1);
+        assert!(stable_census_step(&mut consecutive, true));
+        assert_eq!(consecutive, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn process_table_parser_rejects_partial_and_extra_rows() {
         assert!(parse_unix_process_table(b"100 1\n").is_err());
         assert!(parse_unix_process_table(b"100 1 100 S extra\n").is_err());
@@ -3037,6 +3423,154 @@ mod tests {
         assert_ne!(grandchild, 0, "sh should publish a complete grandchild pid");
 
         assert_grandchild_reaped(grandchild).await;
+    }
+
+    /// Helper process for the two cross-PGID containment regressions below.
+    /// It is inert in the ordinary suite and becomes a long-lived descendant
+    /// only when a parent test invokes this exact test in a subprocess.
+    #[cfg(unix)]
+    #[test]
+    fn unix_detached_descendant_helper() {
+        let Ok(pidfile) = std::env::var("PRVIEW_TEST_DETACHED_PIDFILE") else {
+            return;
+        };
+        let mode = std::env::var("PRVIEW_TEST_DETACHED_MODE").expect("detachment mode");
+        // A non-interactive shell normally keeps its background child in the
+        // shell's group. Make that precondition explicit so the fixture never
+        // becomes a group leader merely because one shell changes job-control
+        // policy, which would make setsid fail with EPERM for the wrong reason.
+        // SAFETY: both queries and setpgid target this dedicated helper and its
+        // live parent; no unrelated process is changed.
+        let parent_group = unsafe { libc::getpgid(libc::getppid()) };
+        assert!(parent_group > 0, "read parent process group");
+        if unsafe { libc::getpgrp() } == unsafe { libc::getpid() } {
+            assert_eq!(
+                unsafe { libc::setpgid(0, parent_group) },
+                0,
+                "join wrapper process group before detaching: {}",
+                std::io::Error::last_os_error(),
+            );
+        }
+        let detached = match mode.as_str() {
+            "setsid" => {
+                // SAFETY: the helper is a dedicated subprocess and requests a
+                // new session only for itself before publishing its PID.
+                unsafe { libc::setsid() != -1 }
+            }
+            "setpgid" => {
+                // SAFETY: pid/pgid zero means this helper process only; it
+                // creates a group named by its own PID.
+                unsafe { libc::setpgid(0, 0) != -1 }
+            }
+            other => panic!("unknown detachment mode {other}"),
+        };
+        assert!(
+            detached,
+            "{mode} failed: {}",
+            std::io::Error::last_os_error()
+        );
+        std::fs::write(pidfile, format!("{}\n", std::process::id())).expect("publish helper pid");
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(unix)]
+    async fn assert_timeout_reaps_detached_group(mode: &str) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join(format!("{mode}.pid"));
+        let helper = std::env::current_exe().expect("current test binary");
+        let mut cmd = TokioCommand::new("sh");
+        cmd.args([
+            "-c",
+            "\"$PRVIEW_TEST_HELPER\" --exact proc::tests::unix_detached_descendant_helper --nocapture & wait",
+        ])
+        .env("PRVIEW_TEST_HELPER", helper)
+        .env("PRVIEW_TEST_DETACHED_PIDFILE", &pidfile)
+        .env("PRVIEW_TEST_DETACHED_MODE", mode);
+
+        let published_pid = Arc::new(AtomicI32::new(0));
+        let captured_pid = Arc::clone(&published_pid);
+        let captured_pidfile = pidfile.clone();
+        let error = run_capture_with_timeout_after_spawn(
+            cmd,
+            Duration::from_secs(3),
+            "detached-group-tree",
+            || anyhow::anyhow!("detached group tree timed out"),
+            move |_| {
+                for _ in 0..200 {
+                    if let Some(pid) = read_published_unix_pid(&captured_pidfile) {
+                        captured_pid.store(pid, Ordering::Release);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            },
+        )
+        .await
+        .expect_err("the live detached descendant must reach the timeout path");
+        assert!(error.to_string().contains("detached group tree timed out"));
+
+        let descendant = published_pid.load(Ordering::Acquire);
+        assert_ne!(descendant, 0, "helper must publish its detached PID");
+        assert_grandchild_reaped(descendant).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_reaps_a_setsid_descendant() {
+        assert_timeout_reaps_detached_group("setsid").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_reaps_a_setpgid_descendant() {
+        assert_timeout_reaps_detached_group("setpgid").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn governor_cancel_reaps_a_setsid_descendant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("cancel-setsid.pid");
+        let helper = std::env::current_exe().expect("current test binary");
+        let mut cmd = TokioCommand::new("sh");
+        cmd.args([
+            "-c",
+            "\"$PRVIEW_TEST_HELPER\" --exact proc::tests::unix_detached_descendant_helper --nocapture & wait",
+        ])
+        .env("PRVIEW_TEST_HELPER", helper)
+        .env("PRVIEW_TEST_DETACHED_PIDFILE", &pidfile)
+        .env("PRVIEW_TEST_DETACHED_MODE", "setsid");
+
+        let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::new());
+        let canceller = std::sync::Arc::clone(&governor);
+        let marker = pidfile.clone();
+        let cancel_task = tokio::spawn(async move {
+            for _ in 0..400 {
+                if read_published_unix_pid(&marker).is_some() {
+                    canceller.cancel();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("detached helper did not publish before cancellation");
+        });
+
+        let _ = crate::governor::with_child_scope(
+            std::sync::Arc::clone(&governor),
+            "detached-cancel-tree",
+            run_capture_with_timeout(cmd, Duration::from_secs(30), "detached-cancel-tree", || {
+                anyhow::anyhow!("detached cancel tree timed out")
+            }),
+        )
+        .await;
+        cancel_task.await.expect("canceller task");
+
+        let descendant = read_published_unix_pid(&pidfile).expect("published detached PID");
+        assert_grandchild_reaped(descendant).await;
+        assert_eq!(governor.inflight_count(), 0);
     }
 
     /// A wrapper can exit successfully while a background descendant keeps its

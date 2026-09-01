@@ -214,7 +214,10 @@ may lower an effective limit to the active plan, but never raises it. Cargo conf
 resolved from the exact reviewed cwd, including a materialized remote snapshot,
 using Cargo's nearest-scalar and legacy-`config` precedence. An unreadable,
 invalid, zero-valued, or include-dependent `build.jobs` contract fails closed
-to one worker instead of guessing a wider limit. Signed inherited
+to one worker instead of guessing a wider limit. Configuration planning opens
+only bounded direct regular files; a symlink, device, FIFO, or oversized config
+also lowers the plan fail-closed and is never followed or read without a bound.
+Signed inherited
 `CARGO_BUILD_JOBS` values use Cargo's logical-core-relative semantics; invalid
 or zero inherited values fail closed in the same way. An empty `CARGO_HOME`
 falls back to the operator home rather than being mistaken for the reviewed cwd.

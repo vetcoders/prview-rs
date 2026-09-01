@@ -121,6 +121,11 @@ one expensive tool and one supported child worker at a time. The preflight names
 the effective budget, expensive checks, and schedule; `balanced` remains capped
 and falls back to `safe` under load.
 
+On Unix, cancellation and timeout cleanup also follows live PPID ancestry when
+a tool descendant leaves its inherited process group with `setsid` or
+`setpgid`; Windows uses Job Object ownership. An already-reparented Unix
+double-fork is outside the portable containment guarantee.
+
 In TUI raw mode, `q`, Escape, or the first Ctrl-C follows the TUI's cooperative
 quit path and returns normally after cleanup. If an in-process Git analysis
 stage is still unwinding, a second Ctrl-C event is the immediate escape hatch:

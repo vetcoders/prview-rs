@@ -222,7 +222,7 @@ struct CancellationBatch(Vec<InflightChild>);
 impl CancellationBatch {
     fn terminate(self) {
         for child in self.0 {
-            if crate::proc::terminate_process_tree(child.pid)
+            if crate::proc::terminate_hardened_process_tree(child.pid)
                 && let Some(identity) = child.external_birth_identity.as_deref()
             {
                 crate::proc::report_external_child_group_finished(child.pid, identity);
@@ -386,7 +386,7 @@ impl ResourceGovernor {
         if self.cancelled.load(Ordering::SeqCst) {
             drop(inflight);
             let external_birth_identity = crate::proc::report_external_child_group_started(pid);
-            if crate::proc::terminate_process_tree(pid)
+            if crate::proc::terminate_hardened_process_tree(pid)
                 && let Ok(start) = external_birth_identity
                 && let Some(identity) = start.into_mirrored_identity()
             {
@@ -418,7 +418,7 @@ impl ResourceGovernor {
                         "prview: failed to close exited-before-mirror child group {pid}: {error}"
                     );
                     self.cancel();
-                    let _ = crate::proc::terminate_process_tree(pid);
+                    let _ = crate::proc::terminate_hardened_process_tree(pid);
                     return false;
                 }
                 None
@@ -431,7 +431,7 @@ impl ResourceGovernor {
                     "prview: failed to register child group {pid} with its external owner: {error}"
                 );
                 self.cancel();
-                crate::proc::terminate_process_tree(pid);
+                crate::proc::terminate_hardened_process_tree(pid);
                 return false;
             }
         };

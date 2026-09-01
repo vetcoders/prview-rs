@@ -380,11 +380,15 @@ support depends on the real `windows-latest` process-tree job. It exercises
 checks and synchronous context wrappers whose root exits before a descendant;
 all captured descendant PIDs must disappear.
 
-Cancellation is deliberately immediate: Unix sends `SIGKILL` to the owned
-process group and Windows force-terminates the owned tree. A killed Cargo/rustc
-tree can leave a shared target directory dirty. The next Cargo invocation should
-validate/rebuild it; remove that target directory only if Cargo reports persistent
-corruption.
+Cancellation is deliberately immediate: Unix first freezes the owned process
+group, inventories and freezes live PPID descendants that moved into their own
+`setsid`/`setpgid` groups, and requires every visible member to remain stopped
+or zombie across two censuses before sending `SIGKILL` leaf-first; Windows
+force-terminates the Job Object tree. Unix cannot portably recover an
+adversarial double-fork that was already reparented before cleanup. A killed
+Cargo/rustc tree can leave a shared target directory dirty. The next Cargo
+invocation should validate/rebuild it; remove that target directory only if
+Cargo reports persistent corruption.
 
 ## Status note
 

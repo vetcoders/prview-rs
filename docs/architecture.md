@@ -329,6 +329,12 @@ scenarios the shared snapshot exists for. `consumable_scaffolding` therefore
 normalises its argument through `check_id_from_name`, since a ledger entry
 carries only the id (`tsc`, `tests`) and never the display name.
 
+The same table covers context commands that can consume the link. `tauri_info`
+and `esbuild_meta` prefer binaries from `node_modules/.bin`, while `npm_sbom`
+walks the linked dependency tree; their ledger rows therefore report
+`snapshot-borrowed-deps` whenever that link exists, rather than certifying the
+context artifact as an exact target-only snapshot.
+
 The Python checks add one step on top of that symlink. `uv run` synchronises the
 project environment before executing, so a reviewed commit whose dependencies
 differ from the local branch would install into — and remove packages from — the
@@ -1086,6 +1092,12 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
   an unavailable load reading) backpressures a requested balanced run to the safe
   plan. This is a CPU/memory envelope, not a claim that future peak memory can be
   predicted exactly.
+- **Cargo configuration cannot escape the planner's read bound.** Effective
+  `build.jobs` discovery honors Cargo's cwd hierarchy and filename precedence,
+  but opens only direct regular `.cargo/config*` files under a direct `.cargo`
+  directory. Final or directory symlinks, devices, FIFOs, invalid text, and
+  inputs beyond the byte cap are `Uncertain` and lower the child limit to one;
+  the synchronous planner never follows or reads them without a bound.
 - **Python descendants use the same plan.** The pre-sync and Python gates share
   one reviewed snapshot and per-commit uv environment. uv pools, Cargo-backed
   package builds, and pytest-xdist are clamped to the child-worker limit. A
@@ -1098,8 +1110,10 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
   started. `cancelled_signal()` is a `watch::Receiver` a dispatcher loop can
   `select!` on, and it starts at the current state so a late subscriber is not
   left waiting for a change that already happened.
-- **`cancel()` force-terminates each registered process tree.** Unix uses
-  immediate `SIGKILL` on the child's process group. Windows children are
+- **`cancel()` force-terminates each registered process tree.** Unix freezes
+  the child's group, reaches a fixed point of live PPID descendants that moved
+  into new groups, verifies their native birth identities, and then uses
+  leaf-first `SIGKILL`. Windows children are
   attached to Job Objects before execution; synchronous wrappers terminate the
   live Job Object and use native `taskkill /T /F` only as a fallback. After a
   successful tree kill, prview reaps the direct root through the raw child
@@ -1382,6 +1396,19 @@ returned guard unregisters on drop, so the success, timeout and error paths all
 leave the registry clean — a pid the governor still believes in is a pid it may
 signal, and pids are reused.
 
+On Unix, cancellation and timeout do not assume that inherited PGID membership
+is permanent. The owner first stops the hardened root group, repeatedly takes a
+bounded process-table snapshot, follows the live transitive PPID closure, and
+stops every newly discovered `setsid`/`setpgid` group until the census reaches a
+fixed point. Stability requires every visible member of every owned group to be
+stopped or zombie in two consecutive censuses, including the case where no
+detached group was found. Each detached group is paired with its native
+process-birth identity and killed leaf-first before the root PGID. An unreadable
+or unstable census is unconfirmed containment, never success. This portable
+guarantee ends when a descendant has already double-forked and been reparented
+before cleanup; unlike a Windows Job Object, Unix process groups plus a PPID
+census are not an OS-owned container for an adversarial daemon.
+
 An MCP `quick` review adds one cross-process ownership boundary around that
 in-process registry. The adapter cannot treat the review root's Unix process
 group as a recursive tree: checks intentionally lead distinct groups. It sends
@@ -1400,7 +1427,8 @@ direct children and committed native identities may be signalled; a provisional
 PID never authorizes a signal by itself. After killing and reaping the root, the
 MCP parent must acquire the lock before its final drain, so a child cannot
 disappear into the spawn-before-registration gap. The descriptor closes at
-tool exec, while every descendant is already contained by its tool group. The
+tool exec. Ordinary descendants remain in that tool group; a live descendant
+that creates its own group is recovered by the stopped fixed-point census. The
 review root also handles the macOS gap where a very short-lived group leader is
 already waitable but no longer exposes its native birth identity: because the
 owned leader remains unreaped, registration can safely terminate that exact

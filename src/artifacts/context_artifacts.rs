@@ -2280,6 +2280,90 @@ mod tests {
         assert!(tools.contains(&"cargo_tree"), "got {tools:?}");
     }
 
+    #[test]
+    fn linked_snapshot_context_tools_record_borrowed_dependencies() {
+        let (repo, target) = js_repo_with_off_head_target();
+        let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target)
+            .expect("worktree snapshot of the reviewed commit");
+        let scan_root = snapshot.worktree_path.clone();
+        if !scan_root.join("node_modules").is_symlink() {
+            // Snapshot dependency links are currently a Unix contract.
+            return;
+        }
+        let cmds = ["tauri info", "esbuild meta", "npm sbom"]
+            .into_iter()
+            .map(|label| context_cmd(label, None, "/bin/echo", &scan_root))
+            .collect::<Vec<_>>();
+
+        let ledger = TaskLedger::new();
+        let governor = ResourceGovernor::new();
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor)
+            .expect("context commands");
+        super::record_context_runs(&ledger, repo.path(), &cmds, &timings);
+
+        let entries = ledger.entries();
+        assert_eq!(entries.len(), 3);
+        for entry in entries {
+            assert!(matches!(entry.state, TaskState::Run { .. }));
+            assert_eq!(
+                entry.key.substrate.tree_state,
+                Some(crate::checks::TreeState::SnapshotBorrowedDeps),
+                "{} consumes the linked node_modules tree",
+                entry.key.tool,
+            );
+        }
+    }
+
+    #[test]
+    fn skipped_linked_snapshot_context_tool_keeps_borrowed_provenance() {
+        let (repo, target) = js_repo_with_off_head_target();
+        let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target)
+            .expect("worktree snapshot of the reviewed commit");
+        let scan_root = snapshot.worktree_path.clone();
+        if !scan_root.join("node_modules").is_symlink() {
+            return;
+        }
+        let cmds = vec![context_cmd(
+            "tauri info",
+            None,
+            &scan_root.join("no-such-tauri").display().to_string(),
+            &scan_root,
+        )];
+        let governor = ResourceGovernor::new();
+        let timings = super::run_context_cmds_parallel(&cmds, 30, false, &governor)
+            .expect("context command accounting");
+        assert_eq!(timings[0].status, "spawn_failed");
+
+        let ledger = TaskLedger::new();
+        super::record_context_runs(&ledger, repo.path(), &cmds, &timings);
+        let entry = &ledger.entries()[0];
+        assert!(matches!(entry.state, TaskState::Skipped { .. }));
+        assert_eq!(
+            entry.key.substrate.tree_state,
+            Some(crate::checks::TreeState::SnapshotBorrowedDeps),
+        );
+    }
+
+    #[test]
+    fn context_tool_without_dependency_link_records_exact_snapshot() {
+        let (repo, target) = js_repo_with_off_head_target();
+        fs::remove_dir_all(repo.path().join("node_modules")).expect("remove local dependency tree");
+        let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target)
+            .expect("worktree snapshot without borrowed dependencies");
+        let scan_root = snapshot.worktree_path.clone();
+        let cmds = vec![context_cmd("npm sbom", None, "/bin/echo", &scan_root)];
+        let governor = ResourceGovernor::new();
+        let timings =
+            super::run_context_cmds_parallel(&cmds, 30, false, &governor).expect("context command");
+
+        let ledger = TaskLedger::new();
+        super::record_context_runs(&ledger, repo.path(), &cmds, &timings);
+        assert_eq!(
+            ledger.entries()[0].key.substrate.tree_state,
+            Some(crate::checks::TreeState::Snapshot),
+        );
+    }
+
     /// A sleeping context command, for the tests that care about scheduling
     /// rather than about output.
     fn sleeping_cmd(label: &str, cwd: &Path, secs: &str) -> ContextCmd {

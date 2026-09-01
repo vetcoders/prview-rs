@@ -216,8 +216,11 @@ const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
 /// only knew display names would answer "consumes nothing" for every one of them.
 pub(crate) fn consumable_scaffolding(check: &str) -> &'static [&'static str] {
     match crate::check_id::check_id_from_name(check).as_str() {
-        // "TypeScript", "ESLint", "Vitest", "Stylelint" — as their canonical ids.
-        "tsc" | "eslint" | "tests" | "stylelint" => &["node_modules"],
+        // JS checks and context generators — as their canonical ids. The
+        // latter prefer local binaries or traverse the dependency tree too.
+        "tsc" | "eslint" | "tests" | "stylelint" | "tauri_info" | "esbuild_meta" | "npm_sbom" => {
+            &["node_modules"]
+        }
         _ => &[],
     }
 }
@@ -2626,7 +2629,15 @@ mod tests {
                 "{check} does not read prview's dependency links",
             );
         }
-        for check in ["TypeScript", "ESLint", "Vitest", "Stylelint"] {
+        for check in [
+            "TypeScript",
+            "ESLint",
+            "Vitest",
+            "Stylelint",
+            "tauri_info",
+            "esbuild_meta",
+            "npm_sbom",
+        ] {
             assert_eq!(
                 consumable_scaffolding(check),
                 &["node_modules"],

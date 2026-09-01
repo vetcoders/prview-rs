@@ -171,10 +171,12 @@ The sidecar lives beside, never inside, the
 immutable run directory. Confirmed
 cleanup removes it; unconfirmed cleanup retains it and returns
 `containment_confirmed: false` instead of claiming success. Hardened tool
-children receive neither capability env nor ledger descriptor after exec;
-their descendants are already contained by the one tool group. This is
-required because one Unix process group cannot contain another. Windows uses
-recursive process-tree termination. The run's `RUNNING.json` remains as
+children receive neither capability env nor ledger descriptor after exec.
+Ordinary descendants remain in that tool group; a live descendant that moves
+to a new group is recovered by the bounded stopped-root PPID census and native
+birth identity before termination. An already-reparented Unix double-fork is
+outside this portable guarantee; Windows uses recursive Job Object ownership.
+The run's `RUNNING.json` remains as
 diagnostic `Stale` state after the root is reaped and does not block a later
 review.
 

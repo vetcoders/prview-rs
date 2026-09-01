@@ -18,6 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cargo resource planning now opens only bounded regular configuration files
+  and refuses final symlinks, devices, FIFOs, and oversized inputs before any
+  synchronous read. A malicious off-HEAD `.cargo/config*` can therefore lower
+  the plan fail-closed, but cannot hang or exhaust the review before a governed
+  child exists. Context provenance now also marks `tauri info`, esbuild
+  metadata, and npm SBOM collection as `snapshot-borrowed-deps` when those
+  commands consume prview's linked local `node_modules`.
+- Unix cancellation and timeout cleanup now freezes a hardened tool group,
+  discovers the fixed point of its live PPID descendants, binds each detached
+  group leader to its native birth identity, and kills leaf groups before the
+  original PGID. A child using `setsid` or `setpgid` can no longer escape the
+  resource governor merely by leaving its parent's group. Already-reparented
+  double-fork daemons remain outside the portable Unix guarantee and are
+  documented as such rather than covered by a false whole-tree claim.
 - Rust API analysis now treats `dylib` as both Rust-linkable and
   native-producing, so private macro boundaries that may synthesize exported
   symbols cannot disappear from an otherwise ordinary Rust dependency
