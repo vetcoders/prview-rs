@@ -6,7 +6,7 @@ use crate::cache::Cache;
 use crate::config::{Config, ProfileKind};
 use crate::governor::{Cancelled, ResourceGovernor, Weight};
 use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -709,10 +709,11 @@ async fn run_all_checks(
 
     // Materialise ONE shared target snapshot for the whole run so every
     // snapshot-backed check reuses it instead of creating (and cleaning up) its
-    // own worktree (thread 1). On failure, leave the override unset so each
-    // check falls back to resolving its own plan — the original per-check
-    // behaviour. The ledger owns the snapshot, so the reviewed tree survives
-    // this frame and the artifact stage can still read it.
+    // own worktree (thread 1). Snapshot failure is terminal: allowing checks to
+    // resolve their own temporary trees while later artifact stages fall back
+    // to repo_root would mix revisions in one pack. The ledger owns the
+    // snapshot, so the reviewed tree survives this frame and the artifact stage
+    // can still read it.
     //
     // OUTSIDE the "anything to run" guard on purpose: a run whose every gate hit
     // the cache or was ruled out still goes on to read the reviewed tree in the
@@ -724,7 +725,7 @@ async fn run_all_checks(
     // repo_root in an off-HEAD review mutates the operator's environment and
     // does not prepare the environment the checks consume.
     let mut config = config.clone();
-    share_target_snapshot(&mut config, &runnable_checks, ledger);
+    share_target_snapshot(&mut config, &runnable_checks, ledger)?;
 
     // Pre-sync Python venv if any Python checks will run and uv is available.
     // This separates venv build time from the per-check timeout budget.
@@ -1175,7 +1176,7 @@ where
     // Materialise the reviewed substrate before pre-sync, exactly as headless
     // does. The TUI must not sync an off-HEAD dependency set into repo_root.
     let mut config = config.clone();
-    share_target_snapshot(&mut config, &runnable_checks, ledger);
+    share_target_snapshot(&mut config, &runnable_checks, ledger)?;
 
     // Pre-sync Python venv before running checks, through the SAME helper the
     // headless dispatcher uses. It was a bare `run_command_with_timeout` under a
@@ -1699,24 +1700,31 @@ pub fn off_head_target_commit(config: &Config) -> Option<String> {
 ///
 /// Nothing is installed (`scan_dir_override` stays unset, the ledger keeps no
 /// snapshot) when the target IS the checked-out `HEAD` and no runnable check
-/// wants one — there the repo root genuinely is the reviewed tree — or when
-/// snapshot creation fails, in which case each check falls back to resolving its
-/// own plan and later stages fall back to the repo root, the original per-check
-/// behaviour.
+/// wants one — there the repo root genuinely is the reviewed tree. Once a
+/// snapshot is required, creation failure is terminal: per-check snapshots do
+/// not give later artifact stages a verified tree and would permit one pack to
+/// mix the reviewed target with the operator's checkout.
 fn share_target_snapshot(
     config: &mut Config,
     runnable_checks: &[Box<dyn Check>],
     ledger: &TaskLedger,
-) {
+) -> Result<()> {
+    share_target_snapshot_with(config, runnable_checks, ledger, plan_check_run)
+}
+
+fn share_target_snapshot_with(
+    config: &mut Config,
+    runnable_checks: &[Box<dyn Check>],
+    ledger: &TaskLedger,
+    planner: impl FnOnce(&Config) -> Result<CheckPlan>,
+) -> Result<()> {
     let wanted_by_a_gate = runnable_checks
         .iter()
         .any(|c| uses_shared_scan_dir(c.name()));
     if !wanted_by_a_gate && off_head_target_commit(config).is_none() {
-        return;
+        return Ok(());
     }
-    let Ok(plan) = plan_check_run(config) else {
-        return;
-    };
+    let plan = planner(config).context("failed to materialize shared review snapshot")?;
     config.scan_dir_override = Some(plan.scan_dir.clone());
     // The run-wide substrate is the tree identity of the shared scan dir, with
     // no per-command scaffolding judgement: a check that ran reports its own,
@@ -1747,6 +1755,7 @@ fn share_target_snapshot(
     );
     ledger.set_substrate_keyed(run_wide, &per_tool);
     ledger.set_shared_snapshot(plan._snapshot);
+    Ok(())
 }
 
 /// How each tool reads `scan_dir`, for re-keying the entries decided before the
@@ -2245,7 +2254,8 @@ mod tests {
 
         let ledger = TaskLedger::new();
         let snapshot_backed: Vec<Box<dyn Check>> = vec![Box::new(cargo::CargoCheck)];
-        share_target_snapshot(&mut config, &snapshot_backed, &ledger);
+        share_target_snapshot(&mut config, &snapshot_backed, &ledger)
+            .expect("shared target snapshot");
 
         let scan_dir = ledger
             .scan_dir()
@@ -2310,7 +2320,8 @@ mod tests {
         );
 
         let snapshot_backed: Vec<Box<dyn Check>> = vec![Box::new(cargo::CargoCheck)];
-        share_target_snapshot(&mut config, &snapshot_backed, &ledger);
+        share_target_snapshot(&mut config, &snapshot_backed, &ledger)
+            .expect("shared target snapshot");
 
         assert_eq!(
             ledger.entries()[0].key.substrate,
@@ -2363,7 +2374,8 @@ mod tests {
         });
 
         let snapshot_backed: Vec<Box<dyn Check>> = vec![Box::new(cargo::CargoCheck)];
-        share_target_snapshot(&mut config, &snapshot_backed, &ledger);
+        share_target_snapshot(&mut config, &snapshot_backed, &ledger)
+            .expect("shared target snapshot");
 
         let scan_dir = ledger
             .scan_dir()
@@ -2959,12 +2971,39 @@ mod tests {
         let semgrep_only: Vec<Box<dyn Check>> =
             vec![Box::new(crate::checks::semgrep::SemgrepCheck)];
         let ledger = TaskLedger::new();
-        share_target_snapshot(&mut config, &semgrep_only, &ledger);
+        share_target_snapshot(&mut config, &semgrep_only, &ledger)
+            .expect("same-HEAD semgrep-only run needs no snapshot");
         assert!(config.scan_dir_override.is_none());
         assert!(
             ledger.scan_dir().is_none(),
             "no shared worktree means the ledger has none to hand to later stages"
         );
+        assert!(ledger.resolved_substrate().is_none());
+    }
+
+    #[test]
+    fn required_shared_snapshot_failure_aborts_without_mixing_revisions() {
+        let (repo, _target) = repo_with_off_head_target();
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some("feature".to_string());
+        let semgrep_only: Vec<Box<dyn Check>> =
+            vec![Box::new(crate::checks::semgrep::SemgrepCheck)];
+        let ledger = TaskLedger::new();
+
+        let error = share_target_snapshot_with(&mut config, &semgrep_only, &ledger, |_| {
+            anyhow::bail!("fixture snapshot failure")
+        })
+        .expect_err("an off-HEAD run must not fall back to the local checkout");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to materialize shared review snapshot"),
+            "unexpected error: {error:#}",
+        );
+        assert!(config.scan_dir_override.is_none());
+        assert!(ledger.scan_dir().is_none());
         assert!(ledger.resolved_substrate().is_none());
     }
 
