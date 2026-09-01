@@ -156,8 +156,7 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
     // Armed before the child starts: if cancellation/timeout wins after Git has
     // registered the path but before the command returns, Drop can still undo
     // that exact administrative entry in-process.
-    let mut registration_rollback =
-        WorktreeRegistrationRollback::new(repo_root, &worktree_path);
+    let mut registration_rollback = WorktreeRegistrationRollback::new(repo_root, &worktree_path);
 
     let mut command = git_cmd();
     command
@@ -244,7 +243,8 @@ mod tests {
         let candidate = repo
             .worktree("candidate", &candidate_path, None)
             .expect("candidate worktree");
-        candidate.lock(Some("partial registration"))
+        candidate
+            .lock(Some("partial registration"))
             .expect("lock candidate");
         let _control = repo
             .worktree("control", &control_path, None)
@@ -264,8 +264,10 @@ mod tests {
             "the exact partial registration must be removed"
         );
         assert!(
-            paths.iter().any(|path| comparable_worktree_path(path)
-                == comparable_worktree_path(&control_path)),
+            paths
+                .iter()
+                .any(|path| comparable_worktree_path(path)
+                    == comparable_worktree_path(&control_path)),
             "rollback must not prune a sibling worktree"
         );
     }
@@ -344,16 +346,14 @@ mod tests {
                 governor.cancel();
             })
         };
-        let result = crate::governor::with_run_scope(
-            std::sync::Arc::clone(&governor),
-            async move {
+        let result =
+            crate::governor::with_run_scope(std::sync::Arc::clone(&governor), async move {
                 crate::governor::blocking_stage(|| {
                     let _override = crate::git::override_test_git_program(shim);
                     create_worktree_snapshot(&repo_root, "HEAD")
                 })
-            },
-        )
-        .await;
+            })
+            .await;
         canceller.join().expect("canceller");
 
         let error = match result {

@@ -4633,8 +4633,7 @@ mod tests {
                 })
         }));
 
-        let generated_export_source =
-            "struct Hidden; impl Hidden { #[macros::expose] pub extern \"C\" fn generated(value: u8) {} }\n";
+        let generated_export_source = "struct Hidden; impl Hidden { #[macros::expose] pub extern \"C\" fn generated(value: u8) {} }\n";
         let generated_export_before = "#[proc_macro_attribute] pub fn expose(_: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream { let mut output: proc_macro::TokenStream = \"#[unsafe(no_mangle)]\".parse().unwrap(); output.extend(input); output }\n";
         let generated_export_after = "#[proc_macro_attribute] pub fn expose(_: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n";
         for generated_manifest in [api_manifest, mixed_api_manifest] {
