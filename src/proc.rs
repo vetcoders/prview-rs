@@ -387,9 +387,10 @@ pub(crate) fn report_external_child_group_started(
             ExternalChildBirthIdentity::Captured(identity) => identity,
             ExternalChildBirthIdentity::ChildExited => {
                 // The owning process has observed this direct child exit without
-                // reaping it, so its PID cannot be reused. Its pre-exec
-                // provisional row remains the MCP parent's fail-closed evidence
-                // for any descendants until ordinary owned-tree cleanup.
+                // reaping it, so its PID/PGID cannot be reused. Registration
+                // must use that narrow window to terminate any surviving group
+                // members; afterwards the pre-exec provisional row can settle
+                // without ever becoming signal authority in the MCP parent.
                 return Ok(ExternalChildGroupStart::ExitedBeforeMirror);
             }
         };

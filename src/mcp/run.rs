@@ -1171,10 +1171,10 @@ mod tests {
         std::process::exit(18);
     }
 
-    /// Subprocess-only fixture for a command that completes
-    /// before the governor can mirror its native birth identity to the MCP
-    /// parent. The owned child remains unreaped until after registration, so its
-    /// PID cannot be reused during the proof.
+    /// Subprocess-only fixture for a command that completes before the governor
+    /// can mirror its native birth identity to the MCP parent while one member
+    /// of its process group survives. The owned leader remains unreaped until
+    /// after registration, so its PID/PGID cannot be reused during the proof.
     #[cfg(target_os = "macos")]
     #[test]
     fn exited_before_registration_child_fixture() {
@@ -1185,13 +1185,35 @@ mod tests {
         crate::proc::initialize_external_child_group_capability()
             .expect("short-child fixture adopts parent-owned capability");
 
-        let mut command = std::process::Command::new("true");
+        let survivor_path = dir.join("survivor.pid");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "trap '' HUP; /bin/sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+                "prview-exited-before-mirror",
+            ])
+            .arg(&survivor_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
         crate::proc::harden_std(&mut command);
         let mut child = command.spawn().expect("spawn short-lived hardened child");
         let pid = child.id();
         std::fs::write(dir.join("tool.pid"), pid.to_string()).expect("publish short-child pid");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !survivor_path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "short-lived leader did not publish its surviving group member"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let survivor_pid = std::fs::read_to_string(&survivor_path)
+            .expect("read surviving member pid")
+            .trim()
+            .parse::<u32>()
+            .expect("surviving member pid");
         while crate::storage::process_birth_identity(pid).is_ok() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1209,7 +1231,17 @@ mod tests {
         assert_eq!(
             governor.inflight_count(),
             1,
-            "the unreaped child's PGID remains available to cancellation"
+            "the unreaped leader remains registered until ordinary cleanup"
+        );
+        let termination_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while crate::storage::is_process_alive(survivor_pid)
+            && std::time::Instant::now() < termination_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !crate::storage::is_process_alive(survivor_pid),
+            "registration must close the surviving exited-before-mirror group member"
         );
         assert!(child.wait().expect("reap short-lived child").success());
         governor.unregister_child("already-exited");
@@ -1969,6 +2001,12 @@ mod tests {
         let tool_pid =
             std::fs::read_to_string(fixture.path().join("tool.pid")).expect("read short-child pid");
         let tool_pid = tool_pid.trim();
+        let survivor_pid = std::fs::read_to_string(fixture.path().join("survivor.pid"))
+            .expect("read surviving group member pid")
+            .trim()
+            .parse::<u32>()
+            .expect("surviving group member pid");
+        wait_until_process_is_reaped(survivor_pid);
         let sidecar = std::fs::read_dir(fixture.path())
             .unwrap()
             .flatten()

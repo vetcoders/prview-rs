@@ -399,11 +399,26 @@ impl ResourceGovernor {
         // the registration so the external hard fallback never sees a live
         // registry entry without its corresponding pid.
         let external_birth_identity = match crate::proc::report_external_child_group_started(pid) {
-            // Exited-before-mirror also maps to no durable identity. The direct
-            // owner still holds an unreaped child handle, so its PID cannot be
-            // reused and the PGID remains cancellable until owned-tree cleanup;
-            // the parent's provisional row covers the external fallback.
-            Ok(start) => start.into_mirrored_identity(),
+            Ok(crate::proc::ExternalChildGroupStart::NotMirrored) => None,
+            #[cfg(unix)]
+            Ok(crate::proc::ExternalChildGroupStart::Mirrored(identity)) => Some(identity),
+            #[cfg(unix)]
+            Ok(crate::proc::ExternalChildGroupStart::ExitedBeforeMirror) => {
+                // The direct child is still unreaped, so this PID/PGID cannot
+                // have been reused. Close the whole group NOW: after the owner
+                // waits, an unmirrored surviving member would have no durable
+                // birth identity and the MCP parent must not signal a merely
+                // provisional PGID. ESRCH is success-shaped (the group already
+                // vanished); every other failure cancels the run fail-closed.
+                if !crate::proc::terminate_process_tree(pid) {
+                    drop(inflight);
+                    eprintln!("prview: failed to close exited-before-mirror child group {pid}");
+                    self.cancel();
+                    let _ = crate::proc::terminate_process_tree(pid);
+                    return false;
+                }
+                None
+            }
             Err(error) => {
                 drop(inflight);
                 // The MCP parent cannot prove ownership without the mirror.
