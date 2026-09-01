@@ -154,8 +154,9 @@ pub struct RunningMarker {
 
 /// Deterministic run status. Completion requires both finalized pack bytes and
 /// the exact durable index row. Otherwise liveness requires both the marker's
-/// PID and its native process-birth identity. A dead/recycled v2 publisher is
-/// `Stale`; a live legacy PID remains conservatively active until it exits.
+/// PID and its native process-birth identity. A dead or affirmatively recycled
+/// v2 publisher is `Stale`; a live PID remains conservatively active when the
+/// marker or native identity probe cannot verify its incarnation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
     Completed,
@@ -223,17 +224,11 @@ fn run_status_with_publication_probe(
 
     match read_running_marker(run_dir) {
         Some(marker) => {
-            let current_identity_matches = marker.schema_version == RUNNING_MARKER_SCHEMA_VERSION
-                && marker.process_birth_id.as_deref().is_some_and(|birth_id| {
-                    crate::storage::process_birth_identity_matches(marker.pid, birth_id)
-                });
-            // A v1 marker cannot distinguish its original process from a
-            // recycled PID. While that PID is live, preserve the one-active-run
-            // invariant and block conservatively; treating it as stale would
-            // launch a second heavy review during a real pre-upgrade run.
-            let legacy_pid_still_live = marker.schema_version < RUNNING_MARKER_SCHEMA_VERSION
-                && crate::storage::is_process_alive(marker.pid);
-            if current_identity_matches || legacy_pid_still_live {
+            if marker_owner_may_be_live(
+                &marker,
+                crate::storage::is_process_alive,
+                crate::storage::process_birth_identity,
+            ) {
                 RunStatus::Running { pid: marker.pid }
             } else {
                 RunStatus::Stale {
@@ -245,6 +240,41 @@ fn run_status_with_publication_probe(
         // No completion, no live/parseable marker: the run failed or never
         // produced a pack.
         None => RunStatus::Failed,
+    }
+}
+
+/// Whether a running marker may still belong to a live publisher.
+///
+/// `false` requires affirmative evidence: the PID is dead, or the native birth
+/// identity was read successfully and names a different process incarnation.
+/// A live PID with a legacy/future marker, a missing v2 identity, or an
+/// indeterminate native identity probe stays active. That fail-closed boundary
+/// preserves the one-active-run invariant without allowing a confirmed
+/// recycled PID to block forever.
+fn marker_owner_may_be_live(
+    marker: &RunningMarker,
+    is_process_alive: impl FnOnce(u32) -> bool,
+    process_birth_identity: impl FnOnce(u32) -> std::io::Result<String>,
+) -> bool {
+    if !is_process_alive(marker.pid) {
+        return false;
+    }
+
+    if marker.schema_version != RUNNING_MARKER_SCHEMA_VERSION {
+        return true;
+    }
+
+    let Some(expected) = marker
+        .process_birth_id
+        .as_deref()
+        .filter(|identity| !identity.is_empty())
+    else {
+        return true;
+    };
+
+    match process_birth_identity(marker.pid) {
+        Ok(observed) => observed == expected,
+        Err(_) => true,
     }
 }
 
@@ -1847,6 +1877,50 @@ mod tests {
         .unwrap();
 
         assert!(matches!(run_status(dir.path()), RunStatus::Stale { .. }));
+    }
+
+    #[test]
+    fn run_status_current_live_pid_without_birth_identity_fails_closed_as_running() {
+        let dir = tempfile::tempdir().unwrap();
+        write_marker(dir.path(), std::process::id());
+        let mut marker = read_running_marker(dir.path()).unwrap();
+        marker.process_birth_id = None;
+        std::fs::write(
+            running_marker_path(dir.path()),
+            serde_json::to_string(&marker).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            run_status(dir.path()),
+            RunStatus::Running {
+                pid: std::process::id()
+            }
+        );
+    }
+
+    #[test]
+    fn live_pid_with_indeterminate_birth_probe_fails_closed_as_running() {
+        let marker = RunningMarker {
+            schema_version: RUNNING_MARKER_SCHEMA_VERSION,
+            pid: 42,
+            process_birth_id: Some("recorded-incarnation".to_string()),
+            started_at: "2026-07-01T12:00:00Z".to_string(),
+            profile: "deep".to_string(),
+            commit: "abc1234".to_string(),
+            base_used: vec!["main".to_string()],
+        };
+
+        assert!(marker_owner_may_be_live(
+            &marker,
+            |_| true,
+            |_| Err(std::io::Error::other("fixture probe failure")),
+        ));
+        assert!(!marker_owner_may_be_live(
+            &marker,
+            |_| true,
+            |_| Ok("different-incarnation".to_string()),
+        ));
     }
 
     #[test]
