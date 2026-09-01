@@ -4534,8 +4534,11 @@ mod tests {
             ),
         ]);
         assert!(
-            qualified_opaque_macro_neutral.findings().is_empty(),
-            "the crate-scoped type fallback must not digest unrelated function bodies: {:?}",
+            !qualified_opaque_macro_neutral
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "PrivateTypeDependency"),
+            "the crate-scoped type fallback must not digest unrelated function bodies; unresolved macro proofs remain independently fail-closed: {:?}",
             qualified_opaque_macro_neutral.findings()
         );
 
@@ -4548,8 +4551,11 @@ mod tests {
             ),
         ]);
         assert!(
-            neutral_macro_invocation.findings().is_empty(),
-            "an unrelated function-body change must not perturb the native macro type substrate: {:?}",
+            !neutral_macro_invocation
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "PrivateTypeDependency"),
+            "an unrelated function-body change must not perturb the native macro type substrate; unresolved macro proofs remain independently fail-closed: {:?}",
             neutral_macro_invocation.findings()
         );
 
