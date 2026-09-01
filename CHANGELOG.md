@@ -92,17 +92,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Inherited, `pub(crate)`, and `pub(super)` fields share one external-private
   Rust API visibility while their types and tuple positions remain observable.
 - `uv sync` preserves an operator's stricter inherited `UV_CONCURRENT_*` caps,
-  and direct Cargo gates preserve a stricter inherited `CARGO_BUILD_JOBS`,
-  instead of raising either to the prview worker limit.
+  direct Cargo gates preserve a stricter inherited `CARGO_BUILD_JOBS`, and
+  Cargo test binaries preserve a stricter inherited `RUST_TEST_THREADS`,
+  instead of raising any of them to the prview worker limit.
 - Snapshot extraction preserves the `git archive` stdout pipe after applying
   hardened subprocess defaults, so `tar` receives the archive instead of an
   empty stdin and the producer no longer exits through SIGPIPE.
 - Rust API crate discovery anchors workspace authority at the repository-root
   `Cargo.toml`; a nested fixture workspace can no longer displace a root product
   package from the census.
-- Nested `tsconfig*.json` files under fixtures or generated/vendor directories
-  no longer turn a Rust repository into a Mixed profile; real monorepo package
-  configs remain product signals.
+- Nested `tsconfig*.json` files under fixtures, dependency/build-cache trees, or
+  vendor directories no longer turn a Rust repository into a Mixed profile;
+  real monorepo configs remain product signals even when a legitimate package
+  is named `build` or `dist`.
 - `prview state --tui` no longer starts a review from `r`.
 - Moving a library crate root (`src/lib.rs` → `lib.rs`) is not a public API
   change; the compared crate contract keeps `proc-macro` and `crate-type` only.
@@ -238,14 +240,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   help overlay, so `r` can still be typed into the branch filter.
 - `cargo test` caps libtest through `RUST_TEST_THREADS` rather than forwarding
   `--test-threads` after `--`, so `harness = false` custom targets are not
-  passed libtest-only flags.
+  passed libtest-only flags and a stricter operator-provided thread limit is
+  never raised.
 - Repo-backed Rust API analysis now preserves callable tuple-constructor shape,
   exhaustive versus `#[non_exhaustive]` enum policy, explicit-repr private
   layout, public data-type binder semantics, and valid siblings beside legal
   non-UTF-8 Git paths. Trait impls that need compiler resolution remain typed
   unknowns instead of silently disappearing.
 - Raw non-UTF-8 Git path identities cannot collide with a legal UTF-8 file whose
-  name literally matches the printable `<git-path-bytes:...>` surrogate.
+  name literally matches the printable `<git-path-bytes:...>` surrogate, while
+  nested artifact-facing surrogates remove the internal NUL sentinel before
+  JSON or rendered output.
 - Public modules, library-crate declarations, and Cargo feature contracts now
   participate in the shared Rust `ApiDelta`, so their removal is projected
   consistently through human artifacts, JSON, MERGE_GATE, report, CLI, and MCP

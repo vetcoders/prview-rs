@@ -105,14 +105,18 @@ pub(crate) enum GitTreeEntryKind {
 }
 
 /// Internal prefix for a deterministic surrogate of a Git path component that
-/// cannot be represented as UTF-8. Git forbids NUL in pathnames, so the leading
-/// NUL makes this inventory key impossible to forge with a legal UTF-8 name.
-/// Strip it only at an output boundary; never use the printable suffix as an
-/// identity key.
+/// cannot be represented as UTF-8. Git forbids NUL in pathnames, so the NUL
+/// sentinel makes this inventory key impossible to forge with a legal UTF-8
+/// name even when the component is nested. Strip sentinels only at an output
+/// boundary; never use the printable suffix as an identity key.
 pub(crate) const NON_UTF8_GIT_PATH_PREFIX: &str = "\0<git-path-bytes:";
 
-pub(crate) fn display_git_path(path: &str) -> &str {
-    path.strip_prefix('\0').unwrap_or(path)
+pub(crate) fn display_git_path(path: &str) -> String {
+    // A surrogate for a nested component has the shape
+    // `valid/dir/\0<git-path-bytes:...>`, so stripping only a leading NUL would
+    // leak the sentinel into artifact JSON. Git forbids NUL anywhere in a real
+    // pathname, which makes removing every internal sentinel unambiguous.
+    path.replace('\0', "")
 }
 
 /// One entry from an exact commit tree, including non-regular entries.
@@ -1256,6 +1260,8 @@ mod tests {
     use super::*;
     use crate::config::{test_config_builder, test_generic_profile};
     use std::fs;
+    use std::io::Write;
+    use std::process::Stdio;
 
     fn run_git(repo: &Path, args: &[&str]) {
         let status = git_cmd()
@@ -1264,6 +1270,92 @@ mod tests {
             .status()
             .expect("git command");
         assert!(status.success(), "git {:?} failed with {status}", args);
+    }
+
+    fn git_with_input(repo: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
+        let mut child = git_cmd()
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "prview test")
+            .env("GIT_AUTHOR_EMAIL", "prview@example.test")
+            .env("GIT_COMMITTER_NAME", "prview test")
+            .env("GIT_COMMITTER_EMAIL", "prview@example.test")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn git object command");
+        child
+            .stdin
+            .take()
+            .expect("git stdin")
+            .write_all(input)
+            .expect("write git object input");
+        let output = child
+            .wait_with_output()
+            .expect("wait for git object command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    #[test]
+    fn nested_non_utf8_git_path_has_no_nul_at_the_output_boundary() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let blob = String::from_utf8(git_with_input(
+            tmp.path(),
+            &["hash-object", "-w", "--stdin"],
+            b"raw path fixture\n",
+        ))
+        .expect("blob oid")
+        .trim()
+        .to_owned();
+        let mut subtree_record = format!("100644 blob {blob}\t").into_bytes();
+        subtree_record.extend_from_slice(b"\xff\0");
+        let subtree = String::from_utf8(git_with_input(
+            tmp.path(),
+            &["mktree", "-z"],
+            &subtree_record,
+        ))
+        .expect("subtree oid")
+        .trim()
+        .to_owned();
+        let root_record = format!("040000 tree {subtree}\tdir\0");
+        let root = String::from_utf8(git_with_input(
+            tmp.path(),
+            &["mktree", "-z"],
+            root_record.as_bytes(),
+        ))
+        .expect("root tree oid")
+        .trim()
+        .to_owned();
+        let commit = String::from_utf8(git_with_input(
+            tmp.path(),
+            &["commit-tree", &root],
+            b"nested non-UTF-8 path\n",
+        ))
+        .expect("commit oid")
+        .trim()
+        .to_owned();
+
+        let repo = Repository::open(tmp.path()).expect("open fixture repository");
+        let entry = repo
+            .tree_entries_at_oid(&commit)
+            .expect("walk exact tree")
+            .into_iter()
+            .find(|entry| entry.kind == GitTreeEntryKind::Unsupported)
+            .expect("nested non-UTF-8 entry");
+        assert_eq!(entry.path, format!("dir/{NON_UTF8_GIT_PATH_PREFIX}ff>"));
+        let display = display_git_path(&entry.path);
+        assert_eq!(display, "dir/<git-path-bytes:ff>");
+        assert!(
+            !display.contains('\0'),
+            "artifact-facing paths must never contain the internal NUL sentinel"
+        );
     }
 
     fn write_commit(repo: &Path, name: &str, body: &str) -> String {

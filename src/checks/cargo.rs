@@ -137,9 +137,19 @@ fn cargo_jobs_env_with(
 }
 
 fn cargo_test_thread_env(config: &Config) -> (String, String) {
+    cargo_test_thread_env_with(config.resource_plan.worker_limit, |key| {
+        std::env::var(key).ok()
+    })
+}
+
+fn cargo_test_thread_env_with(
+    worker_limit: u32,
+    mut inherited: impl FnMut(&str) -> Option<String>,
+) -> (String, String) {
     (
         "RUST_TEST_THREADS".to_string(),
-        config.resource_plan.worker_limit.max(1).to_string(),
+        bounded_descendant_limit(worker_limit, inherited("RUST_TEST_THREADS").as_deref())
+            .to_string(),
     )
 }
 
@@ -148,7 +158,8 @@ fn cargo_test_thread_env(config: &Config) -> (String, String) {
 /// Cargo's build-job cap does not constrain libtest's own worker pool. Cap
 /// libtest through `RUST_TEST_THREADS` rather than forwarding `--test-threads`
 /// after `--`, because `[ARGS]...` are passed to every test binary — including
-/// `harness = false` custom targets that reject libtest flags.
+/// `harness = false` custom targets that reject libtest flags. A stricter
+/// positive `RUST_TEST_THREADS` supplied by the operator remains the ceiling.
 fn cargo_test_args(config: &Config) -> Vec<String> {
     let mut args = vec![
         "test".to_string(),
@@ -2021,6 +2032,20 @@ mod tests {
     }
 
     #[test]
+    fn cargo_test_threads_never_raises_a_stricter_operator_limit() {
+        let value = |worker_limit, inherited: Option<&str>| {
+            cargo_test_thread_env_with(worker_limit, |_| inherited.map(str::to_owned)).1
+        };
+
+        assert_eq!(value(4, Some("1")), "1");
+        assert_eq!(value(4, Some("8")), "4");
+        assert_eq!(value(4, None), "4");
+        assert_eq!(value(4, Some("0")), "4");
+        assert_eq!(value(4, Some("not-a-limit")), "4");
+        assert_eq!(value(0, None), "1");
+    }
+
+    #[test]
     fn test_clippy_check_can_run() {
         let config = create_test_config(true, true, false);
         let check = ClippyCheck;
@@ -2103,7 +2128,7 @@ mod tests {
             vec!["test", "--all-targets", "--no-fail-fast"]
         );
         assert_eq!(
-            cargo_test_thread_env(&config),
+            cargo_test_thread_env_with(config.resource_plan.worker_limit, |_| None),
             ("RUST_TEST_THREADS".to_string(), "1".to_string())
         );
     }
@@ -2119,7 +2144,7 @@ mod tests {
             vec!["test", "--all-targets", "--no-fail-fast", "critical path"]
         );
         assert_eq!(
-            cargo_test_thread_env(&config),
+            cargo_test_thread_env_with(config.resource_plan.worker_limit, |_| None),
             ("RUST_TEST_THREADS".to_string(), "3".to_string())
         );
     }

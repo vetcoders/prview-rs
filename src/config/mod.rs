@@ -1278,16 +1278,14 @@ fn has_product_tsconfig(repo_root: &Path) -> bool {
         .map(|paths| {
             paths.filter_map(Result::ok).any(|path| {
                 let relative = path.strip_prefix(repo_root).unwrap_or(&path);
+                // A tsconfig is itself a product-project signal. Generic names
+                // such as `build` or `dist` can also be legitimate package
+                // names, so only exclude directories that are unambiguously
+                // fixtures, dependency trees, build caches, or vendored code.
                 !relative.components().any(|component| {
                     matches!(
                         component.as_os_str().to_string_lossy().as_ref(),
-                        "fixture"
-                            | "fixtures"
-                            | "node_modules"
-                            | "target"
-                            | "dist"
-                            | "build"
-                            | "vendor"
+                        "fixture" | "fixtures" | "node_modules" | "target" | "vendor"
                     )
                 })
             })
@@ -2210,6 +2208,24 @@ mod tests {
         let app_dir = monorepo.path().join("packages/app");
         std::fs::create_dir_all(&app_dir).expect("app dir");
         std::fs::write(app_dir.join("tsconfig.json"), "{}\n").expect("app config");
+
+        let profile =
+            detect_profile(&monorepo.path().to_path_buf(), Profile::Auto, None).expect("profile");
+        assert_eq!(profile.kind, ProfileKind::Mixed);
+        assert!(profile.has_tsconfig);
+    }
+
+    #[test]
+    fn test_detect_profile_keeps_tsconfig_in_package_named_build() {
+        let monorepo = tempfile::tempdir().expect("monorepo");
+        std::fs::write(
+            monorepo.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("cargo");
+        let package_dir = monorepo.path().join("packages/build");
+        std::fs::create_dir_all(&package_dir).expect("package dir");
+        std::fs::write(package_dir.join("tsconfig.json"), "{}\n").expect("package config");
 
         let profile =
             detect_profile(&monorepo.path().to_path_buf(), Profile::Auto, None).expect("profile");

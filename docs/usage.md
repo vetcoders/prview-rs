@@ -199,12 +199,14 @@ runs at a time and supported descendant pools receive one worker. This is the
 recommended setting for ordinary developer machines.
 
 `--resource-budget balanced` is an explicit throughput opt-in. It still admits
-at most two capped heavy parents; Cargo/rustc receive `CARGO_BUILD_JOBS`, Vitest
-receives `--maxWorkers`, and Semgrep receives `--jobs`. Tools without a stable
-portable cap (including tsc and ESLint across supported project versions) remain
-serialized. High current load, or an unavailable load reading, backpressures the
-effective plan to `safe`. A positive inherited `CARGO_BUILD_JOBS` remains an
-operator ceiling: prview may lower it to the active plan, but never raises it.
+at most two capped heavy parents; Cargo/rustc receive `CARGO_BUILD_JOBS`, Cargo
+test binaries receive `RUST_TEST_THREADS`, Vitest receives `--maxWorkers`, and
+Semgrep receives `--jobs`. Tools without a stable portable cap (including tsc
+and ESLint across supported project versions) remain serialized. High current
+load, or an unavailable load reading, backpressures the effective plan to
+`safe`. Positive inherited `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` values
+remain operator ceilings: prview may lower them to the active plan, but never
+raises them.
 
 Cold Python environment setup and every later `uv run` apply the same cap to
 `UV_CONCURRENT_DOWNLOADS`, `UV_CONCURRENT_BUILDS`,

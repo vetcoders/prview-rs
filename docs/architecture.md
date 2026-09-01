@@ -156,7 +156,9 @@ Profile detection inspects the **actual source files**, not just the presence of
 manifests:
 - `has_js_source` = `.ts/.tsx/.js/.jsx` files under `src/`
 - root or nested `tsconfig*.json` declares a JS/TS product component, except
-  under fixture, `node_modules`, `target`, `dist`, `build`, or `vendor`
+  under fixture, `node_modules`, `target`, or `vendor`; generic directory names
+  such as `build` and `dist` remain valid package names when they contain a
+  project config
 - `Cargo.toml` → Rust (also checks `src-tauri/`, `*_rs/`)
 - `pyproject.toml` → Python
 - combinations → Mixed
@@ -1082,10 +1084,12 @@ Job Object contract cannot disappear with an unrelated dependency change.
   before the process starts. The weight comes from `Check::resource_weight`,
   which defaults to `Exclusive`. Rustfmt opts into `Light`; Cargo/rustc, Vitest
   and Semgrep opt into `Heavy` because they receive `CARGO_BUILD_JOBS`,
-  `--maxWorkers`, and `--jobs` respectively. TSC, ESLint, Stylelint, Python gates
-  and other uncapped pools stay `Exclusive`. Cargo's child cap is the minimum of
-  the active resource plan and any positive inherited `CARGO_BUILD_JOBS`, so an
-  operator's stricter limit is never raised.
+  `--maxWorkers`, and `--jobs` respectively. Cargo test binaries additionally
+  receive `RUST_TEST_THREADS`. TSC, ESLint, Stylelint, Python gates and other
+  uncapped pools stay `Exclusive`. Cargo's build and libtest child caps are the
+  minimum of the active resource plan and any positive inherited
+  `CARGO_BUILD_JOBS` or `RUST_TEST_THREADS`, so an operator's stricter limit is
+  never raised.
 - **Context commands** (`artifacts::context_artifacts`) take a permit before each
   spawn, via the synchronous `try_acquire` — `artifacts::generate` is a blocking
   pipeline with a poll loop and has nothing to `.await` on. The weight comes from
@@ -1679,10 +1683,12 @@ contracts, and typed unknown provenance; legal ambiguous input is data, never
 an assertion failure.
 
 A legal non-UTF-8 Git tree component is represented by a deterministic internal
-identity prefixed with NUL — a byte Git forbids in real pathnames — and a
-printable `<git-path-bytes:...>` surrogate only at the artifact boundary. A
-legal UTF-8 file literally named like that surrogate therefore remains a
-separate readable entry. The raw path emits a side-specific `PathNonUtf8`
+identity whose surrogate component starts with a NUL sentinel — a byte Git
+forbids anywhere in real pathnames. At the artifact boundary every internal
+sentinel is removed, including for a nested path, producing a printable
+`dir/<git-path-bytes:...>` surrogate without embedding NUL in JSON or rendered
+output. A legal UTF-8 file literally named like that surrogate therefore remains
+a separate readable entry. The raw path emits a side-specific `PathNonUtf8`
 unknown. The tree walk skips only descendants whose prefix cannot be represented
 and continues through valid siblings. Unlike an unchanged parser/resolver
 unknown, path uncertainty is deliberately not neutralized across revisions and
