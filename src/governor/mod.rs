@@ -588,6 +588,17 @@ where
         .await
 }
 
+/// The governor attached to the current child scope, when one exists.
+///
+/// Process owners use this to distinguish an intentionally ungoverned helper
+/// from a governed child whose registration was refused because cancellation
+/// already won the spawn/register race.
+pub(crate) fn current_child_governor() -> Option<Arc<ResourceGovernor>> {
+    CHILD_SCOPE
+        .try_with(|scope| Arc::clone(&scope.governor))
+        .ok()
+}
+
 /// Register `pid` with the run-wide governor, if this task is inside a run.
 ///
 /// Unlike [`register_active_child`], this does not need a per-check

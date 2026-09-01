@@ -773,6 +773,11 @@ async fn run_capture_with_timeout_after_spawn(
 
     after_spawn(child.id());
 
+    // Capture the scope separately from the registration result. `None` means
+    // either "not governed" or "registration refused after cancellation";
+    // only the latter must terminate and return typed `Cancelled` immediately.
+    let scoped_governor = crate::governor::current_child_governor();
+
     // Held for the whole wait: dropping it unregisters, so the success, timeout
     // and wait-error paths all leave the registry clean without saying so.
     let registration = child.id().and_then(crate::governor::register_active_child);
@@ -793,6 +798,15 @@ async fn run_capture_with_timeout_after_spawn(
         }
         buf
     });
+
+    if scoped_governor.is_some() && registration.is_none() {
+        let _ = terminate_owned_tokio_child(child.as_mut(), pid).await;
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        return Err(crate::governor::Cancelled.into());
+    }
 
     // `JobObjectChild::wait` deliberately waits for every descendant. Poll the
     // direct root instead, so root-exits-first is observed immediately and the
@@ -1410,18 +1424,18 @@ mod tests {
             },
         );
 
-        let output =
+        let error =
             crate::governor::with_child_scope(Arc::clone(&governor), "late-async-tree", run)
                 .await
-                .expect("late registration must kill before the timeout branch wins");
+                .expect_err("late registration must return typed cancellation");
 
         let grandchild =
             super::read_published_unix_pid(&pidfile).expect("complete numeric grandchild pid");
         assert_grandchild_reaped(grandchild).await;
         assert_eq!(governor.inflight_count(), 0);
         assert!(
-            !output.status.success(),
-            "the cancelled process group must not report a successful command",
+            crate::governor::is_cancellation(&error),
+            "the refused late registration must preserve cancellation identity: {error:#}",
         );
     }
 
