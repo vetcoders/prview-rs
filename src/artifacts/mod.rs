@@ -191,8 +191,9 @@ struct MergeGateInput<'a> {
     dir: &'a Path,
     config: &'a Config,
     /// The run's task ledger, read for ONE fact no `CheckResult` carries: how
-    /// old the stored result behind a replayed check was. A blocking row built
-    /// on a days-old replay earns the advisory `stale_cache_caveats` entry.
+    /// old the stored result behind a replayed check was. Any gate row built on
+    /// a days-old replay earns the advisory `stale_cache_caveats` entry because
+    /// both stale failures and stale passes can support the decision.
     ledger: &'a TaskLedger,
     checks: &'a [CheckResult],
     heuristics: Option<&'a HeuristicsResult>,

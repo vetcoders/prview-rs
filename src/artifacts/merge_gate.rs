@@ -8,10 +8,11 @@ use super::*;
 /// Seven days is deliberately loose. The caveat exists for the shape seen in the
 /// Vista dogfood run (`PRV-CACHE-STALENESS`): a `Cargo audit` result replayed
 /// from a cache written before a reboot co-authored a `BLOCK`, and nothing in
-/// the pack said the blocking evidence was days old. A tight threshold would
-/// annotate ordinary same-day replays and teach readers to ignore the field, so
-/// the bar is set where "this evidence may simply be out of date" is the honest
-/// reading.
+/// the pack said the evidence was days old. The same omission on a cached PASS
+/// can support a clean verdict after the toolchain changes. A tight threshold
+/// would annotate ordinary same-day replays and teach readers to ignore the
+/// field, so the bar is set where "this evidence may simply be out of date" is
+/// the honest reading.
 ///
 /// The caveat is WARN-ONLY: it is an additive report about the pack and changes
 /// no verdict, no exit code, and no other field. The threshold is a constant on
@@ -141,15 +142,12 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
                 .map(|id| format!("20_quality/{}.log", id)),
         }));
 
-        // A verdict may rest on evidence this run never produced. The row counts
-        // as blocking influence when policy ruled it a hard blocker, or when the
-        // tool failed outright — a failure gates `quality_pass` and ratchets the
-        // merge axis even where severity stops short of a block. Only then is an
-        // old replay worth naming; a stale PASS misleads nobody.
-        let blocking_influence = matches!(effective_eval.merge_impact, MergeRecommendation::Block)
-            || matches!(eval.raw_status.as_str(), "failed" | "error");
-        if blocking_influence
-            && let Some(age) = replayed_cache_age_secs(ledger, &eval.name)
+        // A verdict may rest on evidence this run never produced. That is true
+        // for a stale failure holding the merge AND for a stale pass allowing a
+        // clean decision after the compiler/toolchain changed. Name every old
+        // replayed gate row; the ledger lookup already proves this exact check
+        // came from cache, while the caveat remains advisory-only.
+        if let Some(age) = replayed_cache_age_secs(ledger, &eval.name)
             && age > STALE_CACHE_CAVEAT_MAX_AGE_SECS
         {
             stale_cache_caveats.push(json!({
@@ -707,18 +705,26 @@ mod tests {
     /// One gate run whose failing row was REPLAYED from a stored result of the
     /// given age — the `PRV-CACHE-STALENESS` shape, with the age as the only
     /// variable.
-    fn run_gate_with_cached_semgrep(cache_age_secs: u64) -> serde_json::Value {
+    fn run_gate_with_cached_semgrep_status(
+        cache_age_secs: u64,
+        status: CheckStatus,
+    ) -> serde_json::Value {
         use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = test_config();
         let mut check = semgrep_check();
+        let passing = status == CheckStatus::Passed;
+        check.status = status;
         check.cached = true;
         let checks = vec![check];
         let inline = InlineFindingsSummary {
-            status: "failed".to_string(),
-            findings_count: 1,
-            dashboard_findings: vec![semgrep_dashboard_finding("src/b.rs", true)],
+            status: if passing { "passed" } else { "failed" }.to_string(),
+            findings_count: usize::from(!passing),
+            dashboard_findings: (!passing)
+                .then(|| semgrep_dashboard_finding("src/b.rs", true))
+                .into_iter()
+                .collect(),
         };
         let coverage = empty_coverage();
         let (resolved_target, resolved_bases) = resolved_refs();
@@ -756,6 +762,10 @@ mod tests {
         serde_json::from_slice(&std::fs::read(tmp.path().join("MERGE_GATE.json")).unwrap()).unwrap()
     }
 
+    fn run_gate_with_cached_semgrep(cache_age_secs: u64) -> serde_json::Value {
+        run_gate_with_cached_semgrep_status(cache_age_secs, CheckStatus::Failed)
+    }
+
     /// The Vista dogfood shape: the row holding the merge came out of a cache
     /// written a week ago, and until now the pack said only "cached: true".
     #[test]
@@ -775,6 +785,27 @@ mod tests {
         assert_eq!(
             caveats[0]["threshold_secs"],
             STALE_CACHE_CAVEAT_MAX_AGE_SECS
+        );
+    }
+
+    /// A clean decision can be just as stale as a block: the toolchain may have
+    /// changed since a cached PASS was produced even when source inputs did not.
+    #[test]
+    fn a_passing_row_replayed_from_an_old_cache_is_named() {
+        let gate = run_gate_with_cached_semgrep_status(
+            STALE_CACHE_CAVEAT_MAX_AGE_SECS + 60,
+            CheckStatus::Passed,
+        );
+        let caveats = gate["stale_cache_caveats"]
+            .as_array()
+            .expect("stale_cache_caveats is an array");
+
+        assert_eq!(gate["checks"][0]["status"], "passed");
+        assert_eq!(caveats.len(), 1, "one stale passing row, one caveat");
+        assert_eq!(caveats[0]["check_id"], "semgrep_scan");
+        assert_eq!(
+            caveats[0]["cache_age_secs"],
+            STALE_CACHE_CAVEAT_MAX_AGE_SECS + 60
         );
     }
 

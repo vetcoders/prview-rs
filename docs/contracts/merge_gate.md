@@ -20,7 +20,7 @@ document disagree, the code is the contract and this document is the bug.
 | `policy` | object | `{ version, mode, default_severity, source }` |
 | `checks` | object[] | Per-check evaluation records (see below) |
 | `inline_findings` | object | Inline SARIF summary (see below) |
-| `stale_cache_caveats` | object[] | Advisory, additive: blocking rows whose evidence was replayed from an old cache (see below) |
+| `stale_cache_caveats` | object[] | Advisory, additive: gate rows whose evidence was replayed from an old cache (see below) |
 | `decision` | object | The merge decision (see below) |
 | `files` | object | Artifact-root-relative paths (see below) |
 | `rust_api_delta` | object \| null | Additive lossless Rust API delta; `null` on non-Rust runs (see below) |
@@ -214,9 +214,9 @@ a complete proof.
 
 ## `stale_cache_caveats`
 
-An additive, advisory list naming every gate row that had BLOCKING influence on
-the verdict while its result was REPLAYED from a stored entry older than the
-staleness threshold. Empty on a run where no such row exists.
+An additive, advisory list naming every gate row whose result was REPLAYED from
+a stored entry older than the staleness threshold. Empty on a run where no such
+row exists.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -225,11 +225,11 @@ staleness threshold. Empty on a run where no such row exists.
 | `cache_age_secs` | integer | Age of the replayed entry, from the run's task ledger |
 | `threshold_secs` | integer | The threshold that was exceeded (currently 7 days) |
 
-"Blocking influence" is the emitter-side fact, not prose: policy ruled the row a
-hard blocker (`merge_impact == block`), or the tool reported a raw `failed` /
-`error` status, which gates `quality_pass` and ratchets the merge axis even where
-severity stops short of a block. A stale PASSING row raises nothing — only
-evidence that held the merge is worth dating.
+A stale failure can hold a merge, while a stale passing row can support a clean
+verdict after a compiler or tool version changed without changing the current
+source key. Both are evidence the current run did not produce, so both are
+dated. The ledger lookup binds the caveat to an actual cached replay rather than
+to the row's status text.
 
 The list is WARN-ONLY and changes nothing else. It is deliberately NOT part of
 `decision`: that object is closed and every field in it ranks the verdict, so a
