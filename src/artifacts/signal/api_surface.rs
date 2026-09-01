@@ -1726,7 +1726,7 @@ impl<'a> SnapshotBuilder<'a> {
         let repo_config_cfg_authority =
             repository_cargo_cfg_authority(self.source, &self.inventory, package_links);
         let build_script_cfg_authority =
-            package_has_active_build_script(package, manifest_dir, &self.inventory);
+            package_has_active_build_script(package, &manifest_dir, &self.inventory);
         let cfg_authority = match build_script_cfg_authority {
             Ok(true) => Some(cfg_authority_digest.to_owned()),
             Ok(false) if package_links.is_some() => {
