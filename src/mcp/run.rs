@@ -715,7 +715,7 @@ fn install_detached_reaper(
     review: OwnedDetachedReview,
     run_dir: PathBuf,
     publication_index: PathBuf,
-) -> Result<(), (std::io::Error, OwnedDetachedReview)> {
+) -> Result<(), (std::io::Error, Box<OwnedDetachedReview>)> {
     let owned = Arc::new(Mutex::new(Some(review)));
     let reaper_owned = Arc::clone(&owned);
     let spawn = std::thread::Builder::new()
@@ -774,7 +774,7 @@ fn install_detached_reaper(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take()
                 .expect("reaper child remains owned when thread spawn fails");
-            Err((error, review))
+            Err((error, Box::new(review)))
         }
     }
 }
