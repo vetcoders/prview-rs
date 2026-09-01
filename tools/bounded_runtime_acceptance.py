@@ -21,17 +21,28 @@ from typing import Any
 
 WHOLE_MACHINE_TOOLS = ("cargo", "vitest", "semgrep", "tsc", "eslint", "stylelint")
 REQUIRED_RUN_CHECKS = {
-    "cargo": "cargo",
-    "vitest": "vitest",
-    "semgrep": "semgrep",
-    "tsc": "typescript",
-    "eslint": "eslint",
-    "stylelint": "stylelint",
+    "cargo": "Cargo check",
+    "vitest": "Vitest",
+    "semgrep": "Semgrep scan",
+    "tsc": "TypeScript",
+    "eslint": "ESLint",
+    "stylelint": "Stylelint",
 }
 
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def has_successful_live_check(run: dict[str, Any] | None, expected_name: str) -> bool:
+    """Return true only when the exact gate ran live and passed."""
+    for row in (run or {}).get("checks") or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("name") != expected_name:
+            continue
+        return row.get("status") == "passed" and row.get("cached") is False
+    return False
 
 
 def run_checked(command: list[str], cwd: pathlib.Path, log: pathlib.Path) -> None:
@@ -490,11 +501,15 @@ def evaluate(
         "--resource-budget" not in (receipt.get("command") or []),
         "acceptance command overrides the CLI default resource budget",
     )
-    check_blob = " ".join(
-        str(row.get("name") or "")
+    receipt["run_checks"] = [
+        {
+            "name": row.get("name"),
+            "status": row.get("status"),
+            "cached": row.get("cached"),
+        }
         for row in (run or {}).get("checks") or []
         if isinstance(row, dict)
-    ).lower()
+    ]
     for tool in WHOLE_MACHINE_TOOLS:
         add_assertion(
             violations,
@@ -504,8 +519,8 @@ def evaluate(
         check_name = REQUIRED_RUN_CHECKS[tool]
         add_assertion(
             violations,
-            check_name in check_blob,
-            f"RUN.json checks do not include the {tool} gate",
+            has_successful_live_check(run, check_name),
+            f"RUN.json does not contain a live successful {check_name} gate",
         )
     add_assertion(
         violations,

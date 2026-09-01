@@ -379,9 +379,14 @@ async fn run_worker_command(
         crate::governor::with_child_scope(Arc::clone(governor), "Loctree", run).await
     } else {
         run.await
-    }?;
+    };
+    // Cancellation can terminate the registered process tree just before the
+    // async waiter observes the governor flag. On that seam macOS may report a
+    // wait error instead of an exit status; the run still ended because the
+    // operator cancelled it, so preserve the typed cancellation contract
+    // before propagating an incidental process error.
     ensure_not_cancelled(governor.as_deref())?;
-    Ok(output)
+    output
 }
 
 #[cfg(test)]

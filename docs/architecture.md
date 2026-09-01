@@ -1089,7 +1089,9 @@ Job Object contract cannot disappear with an unrelated dependency change.
   uncapped pools stay `Exclusive`. Cargo's build and libtest child caps are the
   minimum of the active resource plan and any positive inherited
   `CARGO_BUILD_JOBS` or `RUST_TEST_THREADS`, so an operator's stricter limit is
-  never raised.
+  never raised. Vitest stays at one CLI worker in every plan: its CLI option
+  overrides project configuration, so passing the wider balanced limit could
+  raise a repository's intentional `maxWorkers: 1` ceiling.
 - **Context commands** (`artifacts::context_artifacts`) take a permit before each
   spawn, via the synchronous `try_acquire` — `artifacts::generate` is a blocking
   pipeline with a poll loop and has nothing to `.await` on. The weight comes from

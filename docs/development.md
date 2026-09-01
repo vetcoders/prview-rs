@@ -62,8 +62,10 @@ against `tools/fixtures/bounded-runtime`, a real mixed Rust, TypeScript,
 JavaScript, and CSS repo. The fixture installs TSC, ESLint, Stylelint, and
 Vitest; the workflow also installs a pinned real Semgrep scanner. The
 stdlib-only `tools/bounded_runtime_acceptance.py` sampler requires all six tool
-families (Cargo, Vitest, Semgrep, TSC, ESLint, and Stylelint) to appear both in
-the owned process census and in `RUN.json`. It fails when more than one
+families (Cargo, Vitest, Semgrep, TSC, ESLint, and Stylelint) to appear in the
+owned process census and to have an exact, live, non-cached `passed` row in
+`RUN.json`; a skipped or failed process launch is not acceptance evidence. It
+fails when more than one
 whole-machine tool is active, when a Cargo/rustc, Vitest, or Semgrep pool
 exceeds the selected cap, or when the final pack and its resource metadata do
 not agree. This proves the CLI default itself resolves to the one-parent,

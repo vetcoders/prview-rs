@@ -61,10 +61,16 @@ fn stylelint_args(config: &Config) -> Vec<String> {
 }
 
 fn vitest_args(config: &Config) -> Vec<String> {
+    // Vitest's CLI flag overrides the project's configured maxWorkers. Using
+    // the wider balanced-plan limit here could therefore *raise* a project's
+    // intentional single-worker ceiling. Keep the owned Vitest pool at one
+    // worker in every plan until Vitest exposes a portable "min(config, cap)"
+    // mechanism; the run-wide limit remains an upper bound, never a request to
+    // increase project concurrency.
     let mut args = vec![
         "run".to_string(),
         "--maxWorkers".to_string(),
-        config.resource_plan.worker_limit.to_string(),
+        "1".to_string(),
     ];
     if let Some(pattern) = &config.tests_pattern {
         args.extend(["--grep".to_string(), pattern.clone()]);
@@ -766,14 +772,14 @@ mod tests {
     }
 
     #[test]
-    fn vitest_args_cap_workers_and_preserve_pattern() {
+    fn vitest_args_preserve_project_ceiling_and_pattern() {
         let mut config = create_test_config(true);
         config.resource_plan.worker_limit = 3;
         config.tests_pattern = Some("critical path".to_string());
 
         assert_eq!(
             vitest_args(&config),
-            vec!["run", "--maxWorkers", "3", "--grep", "critical path"]
+            vec!["run", "--maxWorkers", "1", "--grep", "critical path"]
         );
     }
 

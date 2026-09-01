@@ -117,6 +117,8 @@ jobs:
             --initialize-only \
             --receipt-dir "$PRVIEW_ACCEPTANCE_DIR" \
             --source-sha "$PRVIEW_SOURCE_SHA"
+      - name: Test bounded-runtime gate evidence classifier
+        run: python3 -m unittest discover -s tools/tests -p 'test_bounded_runtime_acceptance.py'
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}

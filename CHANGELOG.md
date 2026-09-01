@@ -370,13 +370,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (128 + SIGINT), deliberately outside prview's verdict codes because it
   produced no verdict; a second interrupt exits immediately. Context commands
   that never started are recorded as `cancelled` rather than omitted. `--tui`
-  keeps its own quit path.
+  keeps its own quit path. A Loctree worker reaped on the narrow
+  cancel-versus-wait seam remains a typed cancellation rather than leaking a
+  platform-specific wait error.
 
 ### Changed
 
 - The ordinary-machine `--deep` acceptance fixture now runs and requires real
   Cargo, Vitest, Semgrep, TSC, ESLint, and Stylelint processes. A green receipt
-  can no longer be produced by the narrower Rust-plus-Vitest subset. Its census
+  can no longer be produced by the narrower Rust-plus-Vitest subset or by a
+  check that merely started and then failed, skipped, or reused cached evidence:
+  every required `RUN.json` row must be a live `passed` result. Its census
   separates Semgrep RPC coordinators from scan workers, and exact-SHA receipts
   require a clean source tree at the claimed commit. The harness deliberately
   omits `--resource-budget`, so it proves the bare `--deep` CLI default itself
@@ -410,6 +414,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget and now lead their own process groups like the checks always have.
   `--resource-budget safe|balanced` selects the plan: `safe` is the default
   (one expensive tool and one child worker); `balanced` is the capped opt-in.
+  Vitest remains at one CLI worker in both plans because its CLI override must
+  not raise a repository's stricter project-level worker ceiling.
 
 - Progress output tells queued work from running work. The stage line reads
   `Running: X (12s) · Queued: Y, Z` instead of naming every runnable check as
