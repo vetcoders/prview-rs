@@ -100,30 +100,73 @@ pub(super) fn plan_python_run(config: &Config) -> Result<PythonRun> {
 
 pub(super) fn plan_python_run_with_env(
     config: &Config,
+    inherited: impl FnMut(&str) -> Option<OsString>,
+) -> Result<PythonRun> {
+    plan_python_tool_run_with_env(config, true, inherited)
+}
+
+fn plan_python_tool_run(config: &Config, use_uv: bool) -> Result<PythonRun> {
+    plan_python_tool_run_with_env(config, use_uv, |key| std::env::var_os(key))
+}
+
+fn plan_python_tool_run_with_env(
+    config: &Config,
+    use_uv: bool,
     mut inherited: impl FnMut(&str) -> Option<OsString>,
 ) -> Result<PythonRun> {
     let plan = plan_check_run(config)?;
-    let no_discovered_uv_config = uv_no_config_enabled(&mut inherited)?;
-    let explicit_config = checked_uv_environment_with(&plan.scan_dir, &mut inherited)?;
+    // A directly installed Ruff, Mypy, or Pytest never invokes uv. In that
+    // path uv-only environment selectors and repository configuration are not
+    // execution authority and must not turn an otherwise runnable check into
+    // an error. Generic Python metadata remains contained below because the
+    // direct tools still consume pyproject/pytest configuration themselves.
+    let (no_discovered_uv_config, explicit_config) = if use_uv {
+        (
+            uv_no_config_enabled(&mut inherited)?,
+            checked_uv_environment_with(&plan.scan_dir, &mut inherited)?,
+        )
+    } else {
+        (true, None)
+    };
     metadata_stays_in_project(
         &plan.scan_dir,
         explicit_config.is_some() || no_discovered_uv_config,
+        use_uv,
     )?;
-    let configured_limits = project_uv_concurrency_limits(
-        &plan.scan_dir,
-        explicit_config.as_deref(),
-        no_discovered_uv_config,
-    )?;
+    let configured_limits = if use_uv {
+        project_uv_concurrency_limits(
+            &plan.scan_dir,
+            explicit_config.as_deref(),
+            no_discovered_uv_config,
+        )?
+    } else {
+        super::UvConcurrencyLimits::default()
+    };
     // Every `uv run`, not only the eager pre-sync, may synchronize or build the
     // environment. Keep all of uv's own pools and Cargo-backed PEP 517 builds
     // inside the same descendant envelope the run advertises. An operator's
     // stricter inherited or project-owned cap still wins.
-    let mut env = super::uv_concurrency_env_with(
-        config.resource_plan.worker_limit,
-        configured_limits,
-        &mut inherited,
-    )?;
-    if plan.scan_dir != config.repo_root {
+    let mut env = if use_uv {
+        super::uv_concurrency_env_with(
+            config.resource_plan.worker_limit,
+            configured_limits,
+            &mut inherited,
+        )?
+    } else {
+        // Direct Python tools do not consume UV_CONCURRENT_* either. Preserve
+        // only the generic Cargo backend cap for plugins that build extensions.
+        let inherited_cargo_jobs =
+            inherited("CARGO_BUILD_JOBS").and_then(|value| value.into_string().ok());
+        vec![(
+            "CARGO_BUILD_JOBS".to_owned(),
+            super::bounded_descendant_limit(
+                config.resource_plan.worker_limit,
+                inherited_cargo_jobs.as_deref(),
+            )
+            .to_string(),
+        )]
+    };
+    if use_uv && plan.scan_dir != config.repo_root {
         let env_dir = config.uv_env_dir_for(&reviewed_env_token(config, &plan.scan_dir));
         mark_and_prune_uv_envs(&config.uv_env_root(), &env_dir);
         env.push((
@@ -917,11 +960,20 @@ fn pytest_probe_env(base_env: &[(String, String)]) -> Vec<(String, String)> {
 /// INSIDE the tree resolves back inside and passes. A path that cannot be
 /// canonicalised is simply not there: the tools reporting a missing project is a
 /// truthful failure of this tree, not a foreign one's verdict.
-fn metadata_stays_in_project(root: &Path, ignore_discovered_uv_config: bool) -> Result<()> {
+fn metadata_stays_in_project(
+    root: &Path,
+    ignore_discovered_uv_config: bool,
+    use_uv: bool,
+) -> Result<()> {
     let Ok(resolved_root) = root.canonicalize() else {
         return Ok(());
     };
     for name in PYTHON_PROJECT_METADATA {
+        if !use_uv && matches!(*name, "uv.toml" | "uv.lock") {
+            // Direct Ruff/Mypy/Pytest do not consume uv's configuration or
+            // lockfile. Their presence cannot affect this invocation.
+            continue;
+        }
         if ignore_discovered_uv_config && *name == "uv.toml" {
             // UV_CONFIG_FILE replaces discovery of uv.toml, while
             // UV_NO_CONFIG disables discovery altogether. An explicit file was
@@ -1299,10 +1351,9 @@ impl Check for RuffCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let plan = plan_python_run(config)?;
-        let run_dir = &plan.cwd;
-
         let use_uv = which::which("uv").is_ok();
+        let plan = plan_python_tool_run(config, use_uv)?;
+        let run_dir = &plan.cwd;
         let output = if use_uv {
             run_command_with_env("uv", &["run", "ruff", "check", "."], run_dir, &plan.env).await?
         } else {
@@ -1399,10 +1450,9 @@ impl Check for MypyCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        let plan = plan_python_run(config)?;
-        let run_dir = &plan.cwd;
-
         let use_uv = which::which("uv").is_ok();
+        let plan = plan_python_tool_run(config, use_uv)?;
+        let run_dir = &plan.cwd;
         let output = if use_uv {
             run_command_with_env("uv", &["run", "mypy", "."], run_dir, &plan.env).await?
         } else {
@@ -1483,9 +1533,9 @@ impl Check for PytestCheck {
         // test runner Vitest all resolve their cwd through `plan_check_run`;
         // Pytest was the sole outlier. For a local review the plan resolves back
         // to `repo_root`, so that path is unchanged.
-        let plan = plan_python_run(config)?;
-        let run_dir = &plan.cwd;
         let use_uv = which::which("uv").is_ok();
+        let plan = plan_python_tool_run(config, use_uv)?;
+        let run_dir = &plan.cwd;
         let (pytest_dialect, pytest_version) =
             probe_pytest_runtime(run_dir, &plan.env, use_uv).await?;
         let inherited_addopts = checked_pytest_addopts(std::env::var("PYTEST_ADDOPTS"))?;
@@ -2009,6 +2059,37 @@ mod tests {
         .expect("safe explicit config replaces discovered uv.toml");
 
         assert_eq!(planned_env_value(&run, "UV_CONCURRENT_BUILDS"), "3");
+    }
+
+    #[test]
+    fn direct_python_tools_ignore_uv_only_configuration() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"reviewed\"\n",
+        )
+        .expect("pyproject");
+        std::fs::write(root.path().join("uv.toml"), "concurrent-builds = [\n")
+            .expect("malformed uv.toml");
+        std::fs::write(root.path().join("uv.lock"), b"\xff").expect("non-UTF-8 uv lock");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = root.path().to_path_buf();
+        config.resource_plan.worker_limit = 4;
+        let run = plan_python_tool_run_with_env(&config, false, |key| match key {
+            "UV_NO_CONFIG" => Some(OsString::from("not-a-boolean")),
+            "UV_CONFIG_FILE" => Some(OsString::from("missing-uv-config.toml")),
+            "UV_CONCURRENT_BUILDS" => Some(OsString::from("not-a-limit")),
+            "CARGO_BUILD_JOBS" => Some(OsString::from("2")),
+            _ => None,
+        })
+        .expect("a direct tool does not consume uv-only authority");
+
+        assert_eq!(run.cwd, root.path());
+        assert_eq!(
+            run.env,
+            vec![("CARGO_BUILD_JOBS".to_owned(), "2".to_owned())]
+        );
     }
 
     #[test]
