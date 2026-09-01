@@ -18,10 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The `gh --version` startup probe preserves typed cancellation instead of
-  reporting an operator interrupt as a missing GitHub CLI, so `--pr` keeps the
-  no-verdict exit-130 contract even when Ctrl-C lands during availability
-  detection.
+- The `gh --version` startup probe preserves typed cancellation at its own
+  error boundary instead of relying on the outer startup supervisor to recover
+  it. Direct or internal config construction under a run scope no longer
+  mislabels cancellation as a missing GitHub CLI.
 - MCP quick reviews route Tokio child-wait errors through the same bounded
   whole-tree termination and direct-root reap used for timeouts. Their running
   marker remains as non-blocking diagnostic stale state instead of substituting
