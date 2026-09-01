@@ -4683,6 +4683,37 @@ mod tests {
         }));
         assert!(mixed.changed.is_empty());
 
+        let body_only = repository_delta(&[
+            ("Cargo.toml", implicit_manifest, implicit_manifest),
+            (
+                "src/main.rs",
+                "#[unsafe(no_mangle)] extern \"C\" fn binary_api() -> u8 { 1 }\n",
+                "#[unsafe(no_mangle)] extern \"C\" fn binary_api() -> u8 { 2 }\n",
+            ),
+        ]);
+        assert!(
+            body_only.findings().is_empty(),
+            "a direct native function body is not ABI evidence: {:?}",
+            body_only.findings()
+        );
+
+        let static_initializer = repository_delta(&[
+            ("Cargo.toml", implicit_manifest, implicit_manifest),
+            (
+                "src/main.rs",
+                "#[unsafe(no_mangle)] pub static BINARY_VALUE: u8 = 1;\n",
+                "#[unsafe(no_mangle)] pub static BINARY_VALUE: u8 = 2;\n",
+            ),
+        ]);
+        assert!(static_initializer.unknown.iter().any(|finding| {
+            finding.identity.crate_name == "fixture#bin:fixture"
+                && finding.identity.name == "UnsupportedExternResolution"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("BINARY_VALUE"))
+        }));
+
         let unchanged = repository_delta(&[
             ("Cargo.toml", implicit_manifest, implicit_manifest),
             (
@@ -7020,6 +7051,100 @@ mod tests {
                     .is_some_and(|reason| reason.contains("ManifestParse"))
             }));
         }
+
+        for special_name in ["self", "crate", "super", "Self"] {
+            for (manifest, label) in [
+                (
+                    format!(
+                        "[package]\nname='{special_name}'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n"
+                    ),
+                    "inferred special crate name",
+                ),
+                (
+                    format!(
+                        "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\nname='{special_name}'\npath='src/lib.rs'\n"
+                    ),
+                    "explicit special library name",
+                ),
+            ] {
+                let special = repository_delta(&[
+                    ("Cargo.toml", manifest.as_str(), manifest.as_str()),
+                    (
+                        "src/lib.rs",
+                        "pub fn api(value: u8) {}\n",
+                        "pub fn api(value: u16) {}\n",
+                    ),
+                ]);
+                assert!(
+                    special.changed.iter().any(|finding| {
+                        finding.identity.crate_name == special_name
+                            && finding.identity.name == "api"
+                    }),
+                    "{label} {special_name:?} must retain real API facts: {:?}",
+                    special.findings()
+                );
+                assert!(special.unknown.iter().all(|finding| {
+                    !finding
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("ManifestParse"))
+                }));
+            }
+        }
+
+        let renamed_special_dependency = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['special','consumer']\nresolver='2'\n",
+                "[workspace]\nmembers=['special','consumer']\nresolver='2'\n",
+            ),
+            (
+                "special/Cargo.toml",
+                "[package]\nname='self'\nversion='0.0.0'\n[lib]\nname='self'\npath='src/lib.rs'\n",
+                "[package]\nname='self'\nversion='0.0.0'\n[lib]\nname='self'\npath='src/lib.rs'\n",
+            ),
+            (
+                "special/src/lib.rs",
+                "pub struct Api(pub u8);\n",
+                "pub struct Api(pub u16);\n",
+            ),
+            (
+                "consumer/Cargo.toml",
+                "[package]\nname='consumer'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\ndep={package='self',path='../special'}\n",
+                "[package]\nname='consumer'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\ndep={package='self',path='../special'}\n",
+            ),
+            (
+                "consumer/src/lib.rs",
+                "pub fn accepts(_: dep::Api) {}\n",
+                "pub fn accepts(_: dep::Api) {}\n",
+            ),
+        ]);
+        assert!(renamed_special_dependency.changed.iter().any(|finding| {
+            finding.identity.crate_name == "self" && finding.identity.name == "Api"
+        }));
+        assert!(renamed_special_dependency.unknown.iter().all(|finding| {
+            !finding
+                .unknown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("crate identifier or keyword"))
+        }));
+
+        let edition_2015_mixed_targets = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2015'\n[[bin]]\nname='worker'\npath='cmd/worker.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2015'\n[[bin]]\nname='worker'\npath='cmd/worker.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn library_api(value: u8) {}\n",
+                "pub fn library_api(value: u16) {}\n",
+            ),
+            ("cmd/worker.rs", "fn main() {}\n", "fn main() {}\n"),
+        ]);
+        assert!(edition_2015_mixed_targets.changed.iter().any(|finding| {
+            finding.identity.crate_name == "fixture" && finding.identity.name == "library_api"
+        }));
 
         let associated_native_exports = repository_delta(&[
             (

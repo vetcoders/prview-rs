@@ -1391,7 +1391,7 @@ impl<'a> SnapshotBuilder<'a> {
                         continue;
                     }
                 },
-                None => default_autolib(&manifest, &edition),
+                None => true,
             };
             if lib.is_none() && !autolib {
                 continue;
@@ -9812,13 +9812,6 @@ fn effective_library_edition(
     validate_edition(edition)
 }
 
-fn default_autolib(manifest: &toml::Value, edition: &str) -> bool {
-    edition != "2015"
-        || !["bin", "example", "test", "bench"]
-            .iter()
-            .any(|target| manifest.get(*target).is_some())
-}
-
 fn cargo_binary_targets(
     manifest_path: &str,
     manifest: &toml::Value,
@@ -9843,9 +9836,7 @@ fn cargo_binary_targets(
                 return discovery;
             }
         };
-    let manual_target_exists = ["lib", "bin", "example", "test", "bench"]
-        .iter()
-        .any(|target| manifest.get(*target).is_some());
+    let manual_bin_target_exists = manifest.get("bin").is_some();
     let autobins = match package.get("autobins") {
         Some(toml::Value::Boolean(value)) => *value,
         Some(_) => {
@@ -9854,7 +9845,7 @@ fn cargo_binary_targets(
                 .push("package.autobins must be a boolean".to_owned());
             return discovery;
         }
-        None => package_edition != "2015" || !manual_target_exists,
+        None => package_edition != "2015" || !manual_bin_target_exists,
     };
     if manifest.get("bin").is_none() && (!autobins || conventional.is_empty()) {
         return discovery;
@@ -10812,9 +10803,7 @@ fn validate_package_name(name: &str) -> Result<(), String> {
         ));
     }
     let crate_name = name.replace('-', "_");
-    if syn::parse_str::<syn::Ident>(&crate_name).is_err()
-        && !is_raw_identifier_compatible_keyword(&crate_name)
-    {
+    if syn::parse_str::<syn::Ident>(&crate_name).is_err() && !is_rust_keyword(&crate_name) {
         return Err(format!(
             "package.name does not normalize to a Rust crate identifier or keyword: {name:?}"
         ));
@@ -10826,7 +10815,7 @@ fn validate_lib_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("lib.name must not be empty".to_owned());
     }
-    if syn::parse_str::<syn::Ident>(name).is_err() && !is_raw_identifier_compatible_keyword(name) {
+    if syn::parse_str::<syn::Ident>(name).is_err() && !is_rust_keyword(name) {
         return Err(format!(
             "lib.name must be a Rust crate identifier or keyword: {name:?}"
         ));
@@ -12129,7 +12118,7 @@ fn binary_exports(
             normalize_identifier(value.sig.ident.to_string()),
             &value.attrs,
             is_public(&value.vis),
-            canonical_tokens(item.to_token_stream()),
+            normalized_contract(item.clone()),
         ),
         Item::Static(value) => direct(
             normalize_identifier(value.ident.to_string()),
@@ -12497,9 +12486,6 @@ fn is_rust_keyword(value: &str) -> bool {
     )
 }
 
-fn is_raw_identifier_compatible_keyword(value: &str) -> bool {
-    is_rust_keyword(value) && !matches!(value, "crate" | "self" | "Self" | "super")
-}
 fn is_public(visibility: &Visibility) -> bool {
     matches!(visibility, Visibility::Public(_))
 }
@@ -13637,6 +13623,36 @@ mod tests {
                 || !unknown.evidence.contains("package.build")
         }));
 
+        for special_name in ["self", "crate", "super", "Self"] {
+            for manifest in [
+                format!(
+                    "[package]\nname='{special_name}'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n"
+                ),
+                format!(
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\nname='{special_name}'\npath='src/lib.rs'\n"
+                ),
+            ] {
+                let source = MemorySource::new(&[
+                    ("Cargo.toml", manifest.as_bytes()),
+                    ("src/lib.rs", b"pub fn special_api() {}"),
+                ]);
+                let snapshot = snapshot_rust_api(&source);
+                assert!(
+                    snapshot
+                        .crates
+                        .iter()
+                        .any(|krate| krate.name == special_name)
+                );
+                assert!(snapshot.items.iter().any(|item| {
+                    item.key.crate_name == special_name && item.key.external_name == "special_api"
+                }));
+                assert!(snapshot.unknowns.iter().all(|unknown| {
+                    unknown.kind != RustApiUnknownKind::ManifestParse
+                        || !unknown.evidence.contains("crate identifier or keyword")
+                }));
+            }
+        }
+
         let missing_declared_build = MemorySource::new(&[
             (
                 "Cargo.toml",
@@ -13940,31 +13956,63 @@ mod tests {
                 && unknown.evidence.contains("directory_export")
         }));
 
-        let edition_2015_manual_target = MemorySource::new(&[
+        let edition_2015_other_target = MemorySource::new(&[
             (
                 "Cargo.toml",
                 b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2015'\n[[example]]\nname='demo'\npath='examples/demo.rs'\n",
             ),
             (
                 "src/main.rs",
-                b"#[unsafe(no_mangle)] extern \"C\" fn default_off() {}",
+                b"#[unsafe(no_mangle)] extern \"C\" fn default_on() {}",
             ),
         ]);
         assert!(
-            snapshot_rust_api(&edition_2015_manual_target)
+            snapshot_rust_api(&edition_2015_other_target)
+                .unknowns
+                .iter()
+                .any(|unknown| unknown.evidence.contains("default_on"))
+        );
+
+        let edition_2015_explicit_bin = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2015'\n[[bin]]\nname='worker'\npath='cmd/worker.rs'\n",
+            ),
+            (
+                "src/main.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn default_off() {}",
+            ),
+            (
+                "cmd/worker.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn explicit_worker() {}",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&edition_2015_explicit_bin);
+        assert!(
+            snapshot
                 .unknowns
                 .iter()
                 .all(|unknown| !unknown.evidence.contains("default_off"))
+        );
+        assert!(
+            snapshot
+                .unknowns
+                .iter()
+                .any(|unknown| unknown.evidence.contains("explicit_worker"))
         );
 
         let edition_2015_opt_in = MemorySource::new(&[
             (
                 "Cargo.toml",
-                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2015'\nautobins=true\n[[example]]\nname='demo'\npath='examples/demo.rs'\n",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2015'\nautobins=true\n[[bin]]\nname='worker'\npath='cmd/worker.rs'\n",
             ),
             (
                 "src/main.rs",
                 b"#[unsafe(no_mangle)] extern \"C\" fn opted_in() {}",
+            ),
+            (
+                "cmd/worker.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn explicit_worker() {}",
             ),
         ]);
         assert!(
