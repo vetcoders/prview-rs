@@ -415,7 +415,11 @@ make a v2 run appear live. Those are the supported MCP `run_review` targets; a
 different target is rejected before spawn. A PID-only legacy marker with a live
 PID deliberately blocks as `running` until that PID exits; without a birth token,
 preserving the one-active-run invariant is safer than starting a second heavy
-review. A legacy marker becomes `stale` once its PID is dead:
+review. The same fail-closed rule applies to a live PID whose current marker is
+missing its birth token or whose native identity cannot be read: it remains
+`running` until the process exits or a successful probe proves PID reuse. A
+dead PID, or a live PID whose successfully read identity differs from the v2
+marker, becomes `stale`:
 
 | `status` | Meaning | Extra fields |
 |----------|---------|--------------|

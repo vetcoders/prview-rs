@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MCP lifecycle readers no longer classify a possibly-active v2 review as
+  stale merely because its process-birth identity is missing or the native
+  identity probe is indeterminate. A live PID now retains the one-active-run
+  invariant unless a successfully read identity proves PID reuse; confirmed
+  dead or recycled publishers still become stale.
+- Off-HEAD reviews now abort when their required shared target snapshot cannot
+  be materialized. Checks, Python pre-sync, and later context artifacts can no
+  longer continue against independent or local trees and combine multiple
+  revisions in one apparently coherent pack.
 - `MERGE_GATE.json.stale_cache_caveats` now dates old cached passing rows as
   well as failures/blockers. A stale PASS can support a clean verdict after a
   compiler or toolchain change just as a stale failure can hold a merge; the

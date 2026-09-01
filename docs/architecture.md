@@ -298,6 +298,13 @@ tree, and the artifact stage's fallback to `config.repo_root` is the right answe
 The call therefore sits *outside* the dispatcher's "anything to run" guard, since
 a run with an empty runnable set is exactly the case it exists to cover.
 
+Once either arm requires a snapshot, materialisation failure aborts the run.
+Letting each check create an independent temporary tree would not give the
+later context and artifact stages a verified root; their fallback to
+`config.repo_root` could then combine the target commit's gate results with the
+operator checkout's context in one pack. A missing snapshot is therefore a
+provenance failure, not an optimization failure.
+
 Materialising also resolves the run-wide substrate
 (`ledger.set_substrate_keyed`), which adopts the first pass's skips and cache
 replays off the unknown substrate they were necessarily recorded under. That is
@@ -1005,6 +1012,11 @@ resolved substrate on the ledger, and hands the ledger the snapshot handle.
 context generators' root as `ledger.scan_dir()`, falling back to
 `config.repo_root`.
 
+That fallback is valid only when the reviewed target is the checked-out
+`HEAD`, where both paths name the same tree. If an off-`HEAD` snapshot is
+required but cannot be created, the checks dispatcher returns an error before
+pre-sync or gate execution; it never publishes a mixed-revision pack.
+
 This is what keeps a pack describing ONE revision. `scan_dir_override` is set on
 a *clone* of the config inside `run_all`, so `App::run`'s own config never learns
 about the snapshot; before the ledger owned the handle, the worktree was also
@@ -1479,10 +1491,12 @@ alias before lifecycle probing. A run without `SANITY.json` never reads the
 global publication index; index lookup is reserved for proving that a finalized
 pack committed durable publication.
 `RUNNING.json` protocol v2 pairs the PID with the native
-process creation identity; liveness requires both values to match, while legacy
-PID-only markers fail closed by blocking while their PID is live, then become
-stale after it exits. The server returns `status: running` for a new review only
-after identity capture, marker publication, and reaper installation all succeed.
+process creation identity. A successfully read mismatch proves PID reuse and
+becomes stale, while a live PID whose token is absent or whose native identity
+cannot be read fails closed as running. Legacy and unknown marker versions use
+the same conservative live-PID boundary, then become stale after that PID exits.
+The server returns `status: running` for a new review only after identity
+capture, marker publication, and reaper installation all succeed.
 Failure at any setup seam terminates the child tree, reaps the direct root, and
 fails the RPC instead of publishing an untracked run.
 Linux, macOS, and Windows are the supported MCP `run_review` targets because
