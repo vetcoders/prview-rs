@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be materialized. Checks, Python pre-sync, and later context artifacts can no
   longer continue against independent or local trees and combine multiple
   revisions in one apparently coherent pack.
+- Python runners now resolve `CARGO_BUILD_JOBS` through the same effective
+  Cargo configuration path as direct Cargo gates. A Rust-backed `uv sync`,
+  `uv run`, or direct Python plugin can no longer raise a stricter reviewed
+  repository `[build].jobs` ceiling.
 - `MERGE_GATE.json.stale_cache_caveats` now dates old cached passing rows as
   well as failures/blockers. A stale PASS can support a clean verdict after a
   compiler or toolchain change just as a stale failure can hold a merge; the

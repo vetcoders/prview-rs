@@ -121,13 +121,27 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
 }
 
 fn cargo_jobs_env(config: &Config, cwd: &Path) -> (String, String) {
-    let cargo_home = cargo_home_path(cwd, std::env::var_os("CARGO_HOME"), cargo_operator_home());
+    cargo_jobs_env_with_inherited(config, cwd, |key| std::env::var_os(key))
+}
+
+/// Resolve Cargo's effective worker ceiling for a command launched from
+/// `cwd`, including inherited environment and repository/home configuration.
+///
+/// Python runners reuse this for Rust-backed build frontends spawned by uv or
+/// Python plugins. Exporting `CARGO_BUILD_JOBS` there has the same precedence as
+/// a direct Cargo gate, so both paths must preserve the same stricter contract.
+pub(super) fn cargo_jobs_env_with_inherited(
+    config: &Config,
+    cwd: &Path,
+    mut inherited: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> (String, String) {
+    let cargo_home = cargo_home_path(cwd, inherited("CARGO_HOME"), cargo_operator_home());
     cargo_jobs_env_with(
         config.resource_plan.worker_limit,
         config.resource_plan.logical_cores,
         cwd,
         cargo_home.as_deref(),
-        |key| std::env::var_os(key),
+        inherited,
     )
 }
 

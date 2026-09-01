@@ -144,8 +144,9 @@ fn plan_python_tool_run_with_env(
     };
     // Every `uv run`, not only the eager pre-sync, may synchronize or build the
     // environment. Keep all of uv's own pools and Cargo-backed PEP 517 builds
-    // inside the same descendant envelope the run advertises. An operator's
-    // stricter inherited or project-owned cap still wins.
+    // inside the same descendant envelope the run advertises. An operator's or
+    // repository's stricter Cargo cap still wins through the exact same
+    // resolver used by direct Cargo gates.
     let mut env = if use_uv {
         super::uv_concurrency_env_with(
             config.resource_plan.worker_limit,
@@ -155,17 +156,15 @@ fn plan_python_tool_run_with_env(
     } else {
         // Direct Python tools do not consume UV_CONCURRENT_* either. Preserve
         // only the generic Cargo backend cap for plugins that build extensions.
-        let inherited_cargo_jobs =
-            inherited("CARGO_BUILD_JOBS").and_then(|value| value.into_string().ok());
-        vec![(
-            "CARGO_BUILD_JOBS".to_owned(),
-            super::bounded_descendant_limit(
-                config.resource_plan.worker_limit,
-                inherited_cargo_jobs.as_deref(),
-            )
-            .to_string(),
-        )]
+        Vec::new()
     };
+    let cargo_jobs =
+        super::cargo::cargo_jobs_env_with_inherited(config, &plan.scan_dir, &mut inherited);
+    if let Some(existing) = env.iter_mut().find(|(key, _)| key == &cargo_jobs.0) {
+        *existing = cargo_jobs;
+    } else {
+        env.push(cargo_jobs);
+    }
     if use_uv && plan.scan_dir != config.repo_root {
         let env_dir = config.uv_env_dir_for(&reviewed_env_token(config, &plan.scan_dir));
         mark_and_prune_uv_envs(&config.uv_env_root(), &env_dir);
@@ -2090,6 +2089,37 @@ mod tests {
             run.env,
             vec![("CARGO_BUILD_JOBS".to_owned(), "2".to_owned())]
         );
+    }
+
+    #[test]
+    fn python_runners_preserve_reviewed_cargo_config_cap() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"reviewed\"\n",
+        )
+        .expect("pyproject");
+        std::fs::create_dir(root.path().join(".cargo")).expect("cargo config directory");
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[build]\njobs = 1\n",
+        )
+        .expect("cargo config");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = root.path().to_path_buf();
+        config.resource_plan.worker_limit = 4;
+        config.resource_plan.logical_cores = 8;
+
+        for use_uv in [true, false] {
+            let run = plan_python_tool_run_with_env(&config, use_uv, |_| None)
+                .expect("Python runner plan");
+            assert_eq!(
+                planned_env_value(&run, "CARGO_BUILD_JOBS"),
+                "1",
+                "Python runners must not override a stricter reviewed Cargo config",
+            );
+        }
     }
 
     #[test]

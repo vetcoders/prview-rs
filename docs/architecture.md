@@ -344,6 +344,9 @@ exists, through that same `plan_python_run()`. Its cwd and
 `UV_PROJECT_ENVIRONMENT` are therefore identical to the later gates; it never
 syncs an off-HEAD dependency set into the operator checkout. uv download/build/
 install pools and Cargo-backed PEP 517 builds inherit the run's child limit.
+`CARGO_BUILD_JOBS` is then resolved through the direct Cargo gate's exact-cwd
+configuration path, so a reviewed repository `[build].jobs` value remains a
+ceiling for both uv and directly launched Python tools.
 Before exporting higher-precedence `UV_CONCURRENT_*` values, the plan reads the
 project-scoped authority selected by uv's explicit/discovery precedence: an
 in-tree `UV_CONFIG_FILE`; otherwise, when boolish `UV_NO_CONFIG` is enabled, no

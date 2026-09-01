@@ -226,6 +226,9 @@ packages. Each uv pool is the minimum of the run plan, a positive inherited
 environment value, and the matching project value from `uv.toml` or
 `[tool.uv]`; `uv.toml` wins when both project files exist. Invalid or
 unreadable concurrency authority fails closed instead of widening the run.
+Python pre-sync and check runners resolve Cargo's effective `[build].jobs`
+from their exact reviewed cwd as well, using the same precedence and
+fail-closed rules as direct Cargo gates.
 `pyproject.toml`, `uv.lock`, and any discovered `uv.toml` must resolve inside the
 reviewed tree. An explicit in-tree `UV_CONFIG_FILE` replaces discovery, matching
 uv's precedence. An enabled boolish `UV_NO_CONFIG` skips discovered `uv.toml`
