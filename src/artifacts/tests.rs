@@ -21,6 +21,26 @@ fn generate_fixture_pack_with_ledger(
     governor: &crate::governor::ResourceGovernor,
     ledger: &crate::ledger::TaskLedger,
 ) -> Result<PathBuf> {
+    generate_fixture_pack_with_ledger_and_diffs(
+        repo_root,
+        output_dir,
+        target_sha,
+        base_sha,
+        governor,
+        ledger,
+        &[],
+    )
+}
+
+fn generate_fixture_pack_with_ledger_and_diffs(
+    repo_root: &Path,
+    output_dir: &Path,
+    target_sha: &str,
+    base_sha: &str,
+    governor: &crate::governor::ResourceGovernor,
+    ledger: &crate::ledger::TaskLedger,
+    diffs: &[Diff],
+) -> Result<PathBuf> {
     let mut config = test_config_builder()
         .repo_root(repo_root)
         .target(Some("feature"))
@@ -54,7 +74,7 @@ fn generate_fixture_pack_with_ledger(
     generate(GenerateInput {
         config: &config,
         ledger,
-        diffs: &[],
+        diffs,
         checks: &[],
         heuristics: None,
         resolved_target: &resolved_target,
@@ -4784,6 +4804,163 @@ fn plan_context_artifacts_marks_tauri_info_deferred_for_fast_remote_only() {
         tauri_info
             .reason
             .contains("Tauri config/build files changed")
+    );
+}
+
+#[test]
+fn tauri_context_dir_preserves_local_path_and_rebases_the_snapshot() {
+    let repo = tempfile::tempdir().expect("repo");
+    let snapshot = tempfile::tempdir().expect("snapshot");
+    let local_tauri = repo.path().join("desktop/src-tauri");
+    let mut config = create_test_config(PolicyConfig::default());
+    config.repo_root = repo.path().to_path_buf();
+    config.profile.cargo_root = Some(local_tauri.clone());
+
+    assert_eq!(
+        tauri_dir_in_context_tree(&config, repo.path()),
+        local_tauri,
+        "local reviews keep the previously selected cargo root",
+    );
+    assert_eq!(
+        tauri_dir_in_context_tree(&config, snapshot.path()),
+        snapshot.path().join("desktop/src-tauri"),
+        "off-HEAD reviews project that relative layout onto the reviewed tree",
+    );
+}
+
+#[test]
+fn static_tauri_commands_follow_the_shared_reviewed_tree() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let repo = tempfile::tempdir().expect("repo");
+    run_git_fixture(repo.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(repo.path().join("src-tauri/src")).expect("base tauri layout");
+    write_commit_fixture(
+        repo.path(),
+        "src-tauri/Cargo.toml",
+        "[package]\nname = \"desktop\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write_commit_fixture(repo.path(), "src-tauri/src/lib.rs", "mod local;\n");
+    let base_sha = write_commit_fixture(
+        repo.path(),
+        "src-tauri/src/local.rs",
+        "#[tauri::command]\npub fn base_command() {}\n",
+    );
+
+    run_git_fixture(repo.path(), &["checkout", "-q", "-b", "feature"]);
+    std::fs::remove_file(repo.path().join("src-tauri/src/local.rs")).expect("remove base command");
+    std::fs::create_dir_all(repo.path().join("src-tauri/src/commands"))
+        .expect("target command layout");
+    std::fs::write(
+        repo.path().join("src-tauri/src/lib.rs"),
+        "#[path = \"commands/target.rs\"]\nmod target;\n",
+    )
+    .expect("target crate root");
+    std::fs::write(
+        repo.path().join("src-tauri/src/commands/target.rs"),
+        "#[tauri::command]\npub fn target_command() {}\n",
+    )
+    .expect("target command");
+    run_git_fixture(repo.path(), &["add", "-A"]);
+    run_git_fixture(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=prview test",
+            "-c",
+            "user.email=prview@example.test",
+            "commit",
+            "-q",
+            "-m",
+            "target tauri layout",
+        ],
+    );
+    let target_sha = String::from_utf8(
+        git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .expect("target rev-parse")
+            .stdout,
+    )
+    .expect("UTF-8 target sha")
+    .trim()
+    .to_owned();
+
+    run_git_fixture(repo.path(), &["checkout", "-q", "main"]);
+    std::fs::remove_dir_all(repo.path().join("src-tauri")).expect("remove local tauri layout");
+    std::fs::create_dir_all(repo.path().join("local-shell/src")).expect("different local layout");
+    std::fs::write(
+        repo.path().join("local-shell/src/local.rs"),
+        "#[tauri::command]\npub fn local_only_command() {}\n",
+    )
+    .expect("local-only command");
+
+    let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target_sha)
+        .expect("shared reviewed snapshot");
+    let ledger = crate::ledger::TaskLedger::new();
+    ledger.set_shared_snapshot(Some(snapshot));
+    let diffs = [Diff {
+        base: "main".to_string(),
+        target: "feature".to_string(),
+        base_commit_id: base_sha.clone(),
+        target_commit_id: target_sha.clone(),
+        files: vec![
+            FileChange {
+                path: "src-tauri/src/local.rs".to_string(),
+                status: FileStatus::Deleted,
+                additions: 0,
+                deletions: 2,
+            },
+            FileChange {
+                path: "src-tauri/src/commands/target.rs".to_string(),
+                status: FileStatus::Added,
+                additions: 2,
+                deletions: 0,
+            },
+            FileChange {
+                path: "src-tauri/src/lib.rs".to_string(),
+                status: FileStatus::Modified,
+                additions: 2,
+                deletions: 1,
+            },
+        ],
+        stats: DiffStats {
+            files_changed: 3,
+            additions: 4,
+            deletions: 3,
+            copied: 0,
+        },
+        commits: vec![],
+    }];
+    let output = tempfile::tempdir().expect("output");
+    let pack = output.path().join("pack");
+
+    generate_fixture_pack_with_ledger_and_diffs(
+        repo.path(),
+        &pack,
+        &target_sha,
+        &base_sha,
+        &crate::governor::ResourceGovernor::new(),
+        &ledger,
+        &diffs,
+    )
+    .expect("reviewed-tree pack");
+
+    let commands = std::fs::read_to_string(pack.join("30_context/tauri-commands.txt"))
+        .expect("reviewed Tauri commands artifact");
+    assert!(
+        commands.contains("[ADDED] src/commands/target.rs:target_command"),
+        "target snapshot command missing: {commands}",
+    );
+    assert!(
+        commands.contains("[REMOVED] src/local.rs:base_command"),
+        "base command delta missing: {commands}",
+    );
+    assert!(
+        !commands.contains("local_only_command") && !commands.contains("local-shell"),
+        "local checkout layout leaked into reviewed Tauri truth: {commands}",
     );
 }
 

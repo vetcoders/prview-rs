@@ -668,20 +668,24 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     )?;
     signal::generate_pattern_scan(&context_dir, diffs, &repo)?;
 
-    let tauri_dir = if let Some(cargo_root) = &config.profile.cargo_root {
-        if cargo_root.ends_with("src-tauri") {
-            cargo_root.clone()
+    let tauri_dir = tauri_dir_in_context_tree(config, &context_scan_root);
+    if is_tauri_project(&context_scan_root) && tauri_dir.exists() {
+        // Diff paths are repository-relative. When `tauri_dir` belongs to the
+        // shared off-HEAD worktree, the Repository path must name that same
+        // tree or `strip_prefix(tauri_dir)` inside the signal generator cannot
+        // map changed files back onto the scanned command set. The worktree's
+        // repository shares the object database, so base revisions remain
+        // available without consulting working-tree bytes from the checkout.
+        let result = if context_scan_root == config.repo_root {
+            signal::generate_tauri_commands(&context_dir, diffs, &repo, &tauri_dir)
         } else {
-            config.repo_root.join("src-tauri")
+            Repository::open(&context_scan_root).and_then(|context_repo| {
+                signal::generate_tauri_commands(&context_dir, diffs, &context_repo, &tauri_dir)
+            })
+        };
+        if let Err(e) = result {
+            eprintln!("Warning: failed scanning tauri commands: {}", e);
         }
-    } else {
-        config.repo_root.join("src-tauri")
-    };
-    if is_tauri_project(&config.repo_root)
-        && tauri_dir.exists()
-        && let Err(e) = signal::generate_tauri_commands(&context_dir, diffs, &repo, &tauri_dir)
-    {
-        eprintln!("Warning: failed scanning tauri commands: {}", e);
     }
     stage_timings.push(finish_timing(emit_human_stdout, "30_context", t));
     ensure_generation_active(
@@ -1181,6 +1185,56 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     }
 
     Ok(out_dir)
+}
+
+/// Locate the Tauri crate in the same tree as the context stage.
+///
+/// The detected profile describes the operator's checkout. Preserve that exact
+/// path for a local review, but project an in-repository `.../src-tauri` cargo
+/// root onto the run-wide target worktree for an off-HEAD review. An external
+/// cargo root cannot exist in a snapshot of this repository, so the reviewed
+/// tree's canonical `src-tauri` location is the only truthful fallback.
+fn tauri_dir_in_context_tree(config: &Config, context_scan_root: &Path) -> PathBuf {
+    let local_tauri_dir = config
+        .profile
+        .cargo_root
+        .as_ref()
+        .filter(|cargo_root| cargo_root.ends_with("src-tauri"))
+        .cloned()
+        .unwrap_or_else(|| config.repo_root.join("src-tauri"));
+    if context_scan_root == config.repo_root {
+        return local_tauri_dir;
+    }
+
+    let Some(cargo_root) = config
+        .profile
+        .cargo_root
+        .as_deref()
+        .filter(|cargo_root| cargo_root.ends_with("src-tauri"))
+    else {
+        return context_scan_root.join("src-tauri");
+    };
+    let relative = if cargo_root.is_relative() {
+        cargo_root
+    } else if let Ok(relative) = cargo_root.strip_prefix(&config.repo_root) {
+        relative
+    } else {
+        return context_scan_root.join("src-tauri");
+    };
+    if !relative.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return context_scan_root.join("src-tauri");
+    }
+    relative
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .fold(context_scan_root.to_path_buf(), |path, component| {
+            path.join(component)
+        })
 }
 
 /// Plant a one-shot reservation in the fresh directory exclusively allocated
