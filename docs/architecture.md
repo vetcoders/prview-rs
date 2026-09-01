@@ -271,16 +271,18 @@ and the condition is **not** "some gate needs it". It is:
 
 The second arm exists because the gates are not the only stage that reads the
 tree: the context stage plans and produces the whole of `30_context` from
-`ledger.scan_dir()`. Two ordinary runs have an off-`HEAD` target and nothing
-snapshot-backed to run — the **second** `prview --pr N` of the same PR, where
-every gate replays from a cache keyed on the reviewed commit, and the fast
-remote-only preset, where the snapshot-backed gates all skip and only semgrep
-remains. Tying materialisation to the runnable set left both with no scan dir, so
+`ledger.scan_dir()`. An off-`HEAD` run can have nothing snapshot-backed to run —
+for example, the fast remote-only preset, where those gates skip and only
+semgrep remains, or a profile whose complete runnable set has sound cache hits.
+TypeScript, ESLint, Stylelint, Ruff and Mypy do not currently take that path:
+they opt out of persistent replay and remain runnable. Tying materialisation to
+the runnable set left an empty-run case with no scan dir, so
 `cargo tree`, the SBOMs, `tauri info` and the entry-point probes read the
 operator's local checkout while the diffs and `MERGE_GATE.json` described the PR's
 commit, and `RUN.json` looked identical either way
-(`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). A warm `--pr` run therefore pays for one
-`git worktree` its gates do not need: a correct pack outranks a saved checkout.
+(`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). A warm all-cacheable `--pr` run therefore
+pays for one `git worktree` its gates do not need: a correct pack outranks a
+saved checkout.
 
 When the target **is** the checked-out `HEAD` and no runnable check wants a
 snapshot, nothing is materialised — there the repo root genuinely is the reviewed
@@ -647,6 +649,12 @@ record describes the run that *populated* the entry — its `cwd`, `started_at`,
 `target_sha` and `tree_state` — and `cached: true` on the result is what marks
 it as a replay rather than a fresh execution. Without this the fastest runs
 (all-cache-hit) were the only ones with no audit trail at all.
+
+A check returns no cache key when its complete effective input set cannot be
+proved. TypeScript, ESLint, Stylelint, Ruff and Mypy currently opt out: their
+answers depend on config, ignore rules, plugins and installed tool/dependency
+state beyond the former source-only hashes. They still participate in same-run
+`Run` to `Reused` context dedup; only persistent cross-run replay is disabled.
 
 The entry is written to a `<key>.tmp-<pid>-<nanos>` staging file and published
 with a single `fs::rename`, so a concurrent reader sees either the old entry or
@@ -1474,10 +1482,20 @@ and lint-only `cfg_attr` branches are semantic no-ops; conditional cfg, shape,
 ABI, path, and transforming branches retain their distinct meaning. Globs, true
 cycles, external/prelude paths, `include!`, and unexpanded macro-generated items
 remain typed unknowns. An `include!` / `include_str!` / `include_bytes!` unknown
-carries a digest of the included file when that path is readable, including
-invocations inside public constant and static expressions; an unresolved or
-changed included source keeps the unknown active instead of treating an
-identical invocation as unchanged. A reachable `pub extern crate` is likewise
+carries a digest of the included file when that path is readable. Its proof
+walks the caller-observable contract — signatures, generics, field and alias
+types, enum discriminants, trait members, public constants and inherent
+associated items, plus observable trait-impl associated types/constants — but
+not ordinary function bodies. It materializes only when
+the owning declaration is externally reachable, directly or through a public
+reexport. An unresolved or changed included source keeps the unknown active
+instead of treating an identical invocation as unchanged. Unchanged terminal
+`include_str!` and `include_bytes!` proofs may neutralize because the digest
+binds their complete output. Plain `include!` remains review-required even when
+its direct file is unchanged: that file may contain path-sensitive `file!()` or
+nested relative includes whose transitive sources are not yet Merkle-proven.
+A reachable
+`pub extern crate` is likewise
 retained as guarded `UnsupportedExternResolution` until external/prelude
 resolution exists; private or unreachable declarations do not create external
 semantic surface. A private `extern crate self as alias` is nevertheless a
@@ -1485,8 +1503,12 @@ same-crate module binding for dependency resolution: `alias::Hidden` is followed
 back to the root `Hidden` declaration so its layout/auto-trait uncertainty stays
 attached to the public owner that exposes it.
 Semantic proof comparison includes the public unknown's kind, crate/module
-location, exact evidence, and guards, while continuing to exclude source paths,
-provenance, and private reexport target/origin spelling. A public reexport's
+location, exact evidence, and guards, while continuing to exclude private
+reexport target/origin spelling. Terminal `include_str!` / `include_bytes!`
+proof matching also excludes the private donor source path because its public
+path, normalized contract, invocation, and digest already bind the complete
+caller-visible output. Plain `include!` remains source-path-sensitive.
+A public reexport's
 resolved origin is part of the compared contract, so retargeting
 `pub use a::A as Public` to `pub use b::B as Public` when both donors remain
 public is a `Changed` fact.
@@ -1534,6 +1556,13 @@ shape/ABI attributes remain. Raw identifiers and NFC-equivalent identifiers
 share semantic names. Nested `cfg`/`cfg_attr` use the same recursive sorted and
 deduplicated `all(...)`/`any(...)` canonicalization as top-level guards, without
 evaluating host configuration.
+
+Union members are canonicalized as an order-independent set even under
+`repr(C)`: every member starts at offset zero, while names and types still
+determine source compatibility, size, alignment, and auto traits. Named
+enum-variant fields are order-neutral under `repr(Rust)` but retain declaration
+order when the enum has a layout-sensitive repr; tuple-variant order is always
+preserved.
 
 Function parameter patterns are canonicalized to `_`, and generic, const, and
 lifetime binders are alpha-normalized by declaration order across free, trait,
@@ -1618,10 +1647,13 @@ be confirmed. A glob, include, source-parse, or other relevant unknown therefore
 blocks a contradictory confirmed fact at either the source or destination.
 Standalone unknown findings retain their source side, source path, and revision
 provenance. Before those findings are emitted, identical one-to-one unknown
-proofs on base and target cancel out: kind, crate/module, source path, cfg guard,
-evidence, and provenance class must match, and each proof must belong to its
-own snapshot. Changed, one-sided, duplicate, detached, or Git-tree-versus-overlay
-proofs remain typed unknowns. Finding IDs preserve Rust identifier case and
+proofs on base and target cancel out: kind, crate/module, cfg guard, evidence,
+and provenance class must match, and each proof must belong to its own snapshot.
+Source path must also match for every unknown kind except terminal
+`include_str!` / `include_bytes!`, whose private donor file may move without
+changing the bound public proof. Changed,
+one-sided, duplicate, detached, or Git-tree-versus-overlay proofs remain typed
+unknowns. Finding IDs preserve Rust identifier case and
 serialize the complete semantic identity, including both sides' cfg regions,
 contracts, and typed unknown provenance; legal ambiguous input is data, never
 an assertion failure.

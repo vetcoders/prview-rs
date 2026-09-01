@@ -655,8 +655,17 @@ impl Drop for ChildRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
+
+    #[test]
+    fn cancellation_detection_survives_anyhow_context() {
+        let error = Err::<(), _>(Cancelled)
+            .context("gate review run failed")
+            .expect_err("the cancellation remains an error");
+        assert!(is_cancellation(&error));
+    }
 
     /// The budget is the point: however the weights are mixed, the permits
     /// actually held at any instant never exceed it.

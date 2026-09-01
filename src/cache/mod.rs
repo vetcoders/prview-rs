@@ -261,12 +261,18 @@ fn age_from_mtime(meta: &fs::Metadata) -> Option<u64> {
     )
 }
 
-/// Generate a content-based cache key for TypeScript checks.
+/// Legacy TypeScript content fingerprint.
+///
+/// This deliberately omits tool, dependency, and configuration state and is
+/// therefore not safe as a persistent replay key for TypeScript-family checks.
 pub fn ts_hash(repo_root: &Path) -> String {
     hash_files(repo_root, &["*.ts", "*.tsx", "**/*.ts", "**/*.tsx"])
 }
 
-/// Generate a content-based cache key for Stylelint checks.
+/// Legacy Stylelint content fingerprint.
+///
+/// This is retained for compatibility, but is incomplete and must not be used
+/// as a persistent replay key.
 pub fn stylelint_hash(repo_root: &Path) -> String {
     let style_hash = hash_files(
         repo_root,
@@ -302,7 +308,10 @@ pub fn cargo_lock_hash(repo_root: &Path) -> String {
     hash_files(repo_root, &["Cargo.lock", "Cargo.toml"])
 }
 
-/// Generate a content-based cache key for Python checks.
+/// Legacy Python content fingerprint.
+///
+/// This deliberately omits interpreter, tool, and dependency state and is
+/// therefore not safe as a persistent replay key for Python checks.
 pub fn python_hash(repo_root: &Path) -> String {
     let config_hash = hash_files(repo_root, &["pyproject.toml", "requirements*.txt"]);
     let src_hash = hash_files(repo_root, &["*.py", "**/*.py"]);

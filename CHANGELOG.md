@@ -191,6 +191,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Same-run context dedup is `reused`, not `cached` with a null age. A live
   gate that already produced the signal is reuse; only a stored replay stays
   `cached` with the original entry's age. `RUN.json` `ledger.schema` is `2`.
+- Persistent replay is disabled for TypeScript, ESLint, Stylelint, Ruff and
+  Mypy until their keys can bind the complete effective config, ignore,
+  plugin, dependency and toolchain inputs. Same-run context reuse remains.
 - `RUN.json` ledger rows emit `queue_wait_secs` when a check waited on the
   resource budget before admission, so a slow tool is not confused with queue
   pressure.
@@ -200,6 +203,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Public trait associated const/type members reuse the same alpha-normalized
   binder scopes, and named fields added to a variant-level `#[non_exhaustive]`
   variant remain informational rather than a parent breaking change.
+- `include!`, `include_str!` and `include_bytes!` dependencies in every public
+  contract position carry their source digest, including declarations exposed
+  through private-module reexports, without degrading unreachable declarations
+  or scanning ordinary function bodies. Proofs bind the resolved public alias,
+  never cross disjoint cfg declarations, and terminal `include_str!` /
+  `include_bytes!` proofs remain stable when an unchanged private donor file
+  moves behind that alias. Plain `include!` stays review-required until its
+  path-sensitive and transitive expansion can be proven.
+- `repr(C)` union members are canonicalized as an order-independent set while
+  retaining names and types; named `repr(Rust)` enum-variant fields are likewise
+  order-neutral, while `repr(C)` enum payload order remains ABI-significant.
 - Public trait impls declared in private helper modules are retained as
   `TraitImplResolution` unknowns instead of disappearing from the delta.
 - Retargeting a public reexport between two still-public types is a compared
@@ -395,9 +409,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A `--pr` / `--remote` run with nothing snapshot-backed to run now still reads
   the reviewed tree. The shared target snapshot was materialised only when a
-  runnable check needed one, which silently excluded two ordinary runs: the
-  **second** run of the same PR, where every gate replays from a cache keyed on
-  the reviewed commit, and the fast remote-only preset, where the
+  runnable check needed one, which silently excluded two ordinary shapes: a
+  run whose complete applicable gate set has sound cache hits, and the fast
+  remote-only preset, where the
   snapshot-backed gates all skip and only semgrep (which owns its worktree)
   remains. Both left the task ledger with no scan dir, so every `30_context`
   command fell back to the operator's local checkout while the diffs and
@@ -405,9 +419,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PRV-CONTEXT-SNAPSHOT-PROVENANCE` split pack, reached through a quieter door,
   with nothing in `RUN.json` to distinguish it. An off-`HEAD` target is now
   enough to materialise the snapshot on its own, which also resolves the
-  run-wide substrate so `RUN.json` stops reporting a warm `--pr` run's replays
-  and skips as being about no particular tree. A warm `--pr` run pays for one
-  `git worktree` its gates do not need. Local reviews (target == `HEAD`) still
+  run-wide substrate so `RUN.json` stops reporting an all-cacheable `--pr`
+  run's replays and skips as being about no particular tree. Such a run pays
+  for one `git worktree` its gates do not need. Local reviews (target == `HEAD`) still
   materialise nothing.
 
 - `30_context/*` artifacts are now produced from the same reviewed tree the

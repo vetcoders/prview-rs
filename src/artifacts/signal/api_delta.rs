@@ -1399,7 +1399,12 @@ fn unknown_proofs_match(
         && left.kind == right.kind
         && left.crate_name == right.crate_name
         && left.module_path == right.module_path
-        && left.source_path == right.source_path
+        // String/byte include proofs bind their complete output by digest, so
+        // their private declaration file is provenance rather than identity.
+        // Plain include! remains path-sensitive: identical source bytes may
+        // expand differently after a move through file!() or nested includes.
+        && (left.source_path == right.source_path
+            || (include_output_is_digest_bound(left) && include_output_is_digest_bound(right)))
         && left.cfg_guard == right.cfg_guard
         && left.evidence == right.evidence
         // Revision ids necessarily differ across the comparison. What must not
@@ -1420,8 +1425,34 @@ fn alias_resolution_exhausted(unknown: &RustApiUnknown) -> bool {
 }
 
 fn include_dependent_source_is_proven(unknown: &RustApiUnknown) -> bool {
-    unknown.kind != RustApiUnknownKind::IncludeMacro
-        || !unknown.evidence.contains("included-digest:unresolved")
+    let evidence_is_resolved = !unknown
+        .evidence
+        .lines()
+        .any(|line| line == "included-digest:unresolved");
+    let include_kinds: Vec<_> = unknown
+        .evidence
+        .lines()
+        .filter_map(|line| line.strip_prefix("include-kind:"))
+        .collect();
+    let carries_include_digest = unknown
+        .evidence
+        .lines()
+        .any(|line| line.starts_with("included-digest:"));
+    evidence_is_resolved
+        && ((!carries_include_digest && include_kinds.is_empty())
+            || include_kinds
+                .iter()
+                .all(|kind| matches!(*kind, "include_str" | "include_bytes")))
+}
+
+fn include_output_is_digest_bound(unknown: &RustApiUnknown) -> bool {
+    unknown.kind == RustApiUnknownKind::IncludeMacro
+        && unknown.evidence.lines().any(|line| {
+            matches!(
+                line,
+                "include-kind:include_str" | "include-kind:include_bytes"
+            )
+        })
 }
 
 fn same_provenance_class(left: &RevisionProvenance, right: &RevisionProvenance) -> bool {
@@ -2645,6 +2676,84 @@ mod tests {
     }
 
     #[test]
+    fn repository_backed_member_order_follows_struct_union_and_enum_layout_rules() {
+        let union_reordered = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[repr(C)] pub union Value { pub small: u8, pub large: u32 }\n",
+                "#[repr(C)] pub union Value { pub large: u32, pub small: u8 }\n",
+            ),
+        ]);
+        assert!(
+            union_reordered.findings().is_empty(),
+            "repr(C) union members all start at offset zero, so order is neutral: {:?}",
+            union_reordered.findings()
+        );
+
+        let union_type_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[repr(C)] pub union Value { hidden: u8, pub tag: u8 }\n",
+                "#[repr(C)] pub union Value { hidden: u64, pub tag: u8 }\n",
+            ),
+        ]);
+        assert!(
+            union_type_changed
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Value"),
+            "union member types still determine size, alignment and auto traits"
+        );
+
+        let rust_enum_reordered = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub enum Event { Value { small: u8, large: u32 } }\n",
+                "pub enum Event { Value { large: u32, small: u8 } }\n",
+            ),
+        ]);
+        assert!(
+            rust_enum_reordered.findings().is_empty(),
+            "named repr(Rust) variant fields are addressed by name, not order"
+        );
+
+        let c_enum_reordered = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[repr(C)] pub enum Event { Value { small: u8, large: u32 } }\n",
+                "#[repr(C)] pub enum Event { Value { large: u32, small: u8 } }\n",
+            ),
+        ]);
+        assert!(
+            c_enum_reordered
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Event"),
+            "repr(C) enum payload layout remains declaration-order-sensitive"
+        );
+    }
+
+    #[test]
     fn alpha_normalization_never_collides_with_public_identifiers() {
         let swapped = repository_delta(&[
             (
@@ -2826,8 +2935,8 @@ mod tests {
             ("src/api.rs", "pub fn item() {}\n", "pub fn item() {}\n"),
         ]);
         assert!(
-            unchanged.unknown.is_empty(),
-            "an unchanged include and unchanged included file neutralize"
+            !unchanged.unknown.is_empty(),
+            "plain include! stays review-required until its transitive expansion is proven"
         );
 
         let included_changed = repository_delta(&[
@@ -2889,7 +2998,462 @@ mod tests {
         ]);
         assert!(
             expression_unchanged.unknown.is_empty(),
-            "unchanged expression-position include proof neutralizes"
+            "unchanged terminal include_bytes! proof neutralizes"
+        );
+
+        let nested_dependency_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub type Item = include!(\"outer.rs\");\n",
+                "pub type Item = include!(\"outer.rs\");\n",
+            ),
+            (
+                "src/outer.rs",
+                "include!(\"inner.rs\")\n",
+                "include!(\"inner.rs\")\n",
+            ),
+            ("src/inner.rs", "u8\n", "u16\n"),
+        ]);
+        assert!(
+            nested_dependency_changed.unknown.iter().any(|finding| {
+                finding.identity.name == "IncludeMacro"
+                    && finding
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("include-kind:include"))
+            }),
+            "a direct digest cannot neutralize plain include! with a changed nested dependency"
+        );
+
+        let root_nested_dependency_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "include!(\"outer.rs\");\n",
+                "include!(\"outer.rs\");\n",
+            ),
+            (
+                "src/outer.rs",
+                "include!(\"inner.rs\");\n",
+                "include!(\"inner.rs\");\n",
+            ),
+            ("src/inner.rs", "pub fn old() {}\n", "pub fn changed() {}\n"),
+        ]);
+        assert!(
+            !root_nested_dependency_changed.unknown.is_empty(),
+            "a root item-position include! also stays active when only its nested source changes"
+        );
+
+        let trait_impl_nested_dependency_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Contract { type Assoc; } pub struct Owner; impl Contract for Owner { type Assoc = include!(\"outer.rs\"); }\n",
+                "pub trait Contract { type Assoc; } pub struct Owner; impl Contract for Owner { type Assoc = include!(\"outer.rs\"); }\n",
+            ),
+            (
+                "src/outer.rs",
+                "include!(\"inner.rs\")\n",
+                "include!(\"inner.rs\")\n",
+            ),
+            ("src/inner.rs", "u8\n", "u16\n"),
+        ]);
+        assert!(
+            trait_impl_nested_dependency_changed
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "TraitImplResolution"
+                    && finding
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("include-kind:include")))
+        );
+    }
+
+    #[test]
+    fn repository_backed_include_tracks_every_public_contract_position() {
+        let public_contracts = [
+            "pub type Bytes = [u8; include!(\"n.rs\")];\n",
+            "pub struct Packet { pub bytes: [u8; include!(\"n.rs\")] }\n",
+            "pub fn packet() -> [u8; include!(\"n.rs\")] { todo!() }\n",
+            "#[repr(u8)] pub enum Tag { Value = include!(\"n.rs\") }\n",
+            "pub trait Contract { const N: usize = include!(\"n.rs\"); }\n",
+            "pub struct Owner; impl Owner { pub const N: usize = include!(\"n.rs\"); }\n",
+            "pub type Included = include!(\"type.rs\");\n",
+        ];
+
+        for source in public_contracts {
+            let delta = repository_delta(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("src/lib.rs", source, source),
+                ("src/n.rs", "1\n", "2\n"),
+                ("src/type.rs", "u8\n", "u16\n"),
+            ]);
+            assert!(
+                delta.unknown.iter().any(|finding| {
+                    finding.identity.name == "IncludeMacro"
+                        && finding
+                            .unknown_reason
+                            .as_deref()
+                            .is_some_and(|reason| reason.contains("included-digest"))
+                }),
+                "a changed include dependency in {source:?} must stay review-required: {:?}",
+                delta.findings()
+            );
+        }
+
+        let nested_item_contracts = [
+            (
+                "pub trait Contract { include!(\"nested.rs\"); }\n",
+                "type Assoc;\n",
+                "type Changed;\n",
+            ),
+            (
+                "pub trait Contract { type Assoc; } pub struct Owner; impl Contract for Owner { include!(\"nested.rs\"); }\n",
+                "type Assoc = u8;\n",
+                "type Assoc = u16;\n",
+            ),
+            (
+                "pub struct Owner; impl Owner { include!(\"nested.rs\"); }\n",
+                "pub fn build() -> u8 { 1 }\n",
+                "pub fn build() -> u16 { 1 }\n",
+            ),
+            (
+                "unsafe extern \"C\" { include!(\"nested.rs\"); }\n",
+                "pub fn old();\n",
+                "pub fn new();\n",
+            ),
+            (
+                "std::include!(\"nested.rs\");\n",
+                "pub fn old() {}\n",
+                "pub fn new() {}\n",
+            ),
+        ];
+        for (source, base_nested, target_nested) in nested_item_contracts {
+            let delta = repository_delta(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                    "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("src/lib.rs", source, source),
+                ("src/nested.rs", base_nested, target_nested),
+            ]);
+            assert!(
+                delta.unknown.iter().any(|finding| {
+                    finding
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("included-digest"))
+                }),
+                "nested item-position include must bind included bytes for {source:?}: {:?}",
+                delta.findings()
+            );
+        }
+
+        let nested_unchanged = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Contract { include!(\"nested.rs\"); }\n",
+                "pub trait Contract { include!(\"nested.rs\"); }\n",
+            ),
+            ("src/nested.rs", "type Assoc;\n", "type Assoc;\n"),
+        ]);
+        assert!(
+            !nested_unchanged.unknown.is_empty(),
+            "plain include! item expansion remains conservative without a transitive proof"
+        );
+
+        let private_foreign_reexport = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod hidden { unsafe extern \"C\" { include!(\"ffi.rs\"); } } pub use hidden::old;\n",
+                "mod hidden { unsafe extern \"C\" { include!(\"ffi.rs\"); } } pub use hidden::old;\n",
+            ),
+            ("src/ffi.rs", "pub fn old();\n", "pub fn renamed();\n"),
+        ]);
+        assert!(private_foreign_reexport.unknown.iter().any(|finding| {
+            finding
+                .unknown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("included-digest"))
+        }));
+
+        let private_inherent_owner_renamed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod hidden { pub struct Old; impl Old { pub const N: &str = include_str!(\"n.txt\"); include!(\"assoc.rs\"); } } pub use hidden::Old as Public;\n",
+                "mod hidden { pub struct New; impl New { pub const N: &str = include_str!(\"n.txt\"); include!(\"assoc.rs\"); } } pub use hidden::New as Public;\n",
+            ),
+            ("src/n.txt", "same\n", "same\n"),
+            (
+                "src/assoc.rs",
+                "pub fn build() -> u8 { 1 }\n",
+                "pub fn build() -> u8 { 1 }\n",
+            ),
+        ]);
+        assert!(
+            !private_inherent_owner_renamed.unknown.is_empty()
+                && private_inherent_owner_renamed
+                    .unknown
+                    .iter()
+                    .all(|finding| {
+                        finding
+                            .evidence
+                            .iter()
+                            .all(|evidence| !evidence.contains("Old") && !evidence.contains("New"))
+                    }),
+            "a conservative plain-include finding must bind the stable public alias, not leak a private owner rename: {:?}",
+            private_inherent_owner_renamed.findings()
+        );
+
+        let trait_impl = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Contract { type Assoc; } pub struct Owner; impl Contract for Owner { type Assoc = include!(\"type.rs\"); }\n",
+                "pub trait Contract { type Assoc; } pub struct Owner; impl Contract for Owner { type Assoc = include!(\"type.rs\"); }\n",
+            ),
+            ("src/type.rs", "u8\n", "u16\n"),
+        ]);
+        assert!(trait_impl.unknown.iter().any(|finding| {
+            finding.identity.name == "TraitImplResolution"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("included-digest"))
+        }));
+
+        let trait_impl_reordered = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Contract { const A: &'static str; const B: &'static str; } pub struct Owner; impl Contract for Owner { const A: &'static str = include_str!(\"a.txt\"); const B: &'static str = include_str!(\"b.txt\"); }\n",
+                "pub trait Contract { const A: &'static str; const B: &'static str; } pub struct Owner; impl Contract for Owner { const B: &'static str = include_str!(\"b.txt\"); const A: &'static str = include_str!(\"a.txt\"); }\n",
+            ),
+            ("src/a.txt", "a\n", "a\n"),
+            ("src/b.txt", "b\n", "b\n"),
+        ]);
+        assert!(
+            trait_impl_reordered.findings().is_empty(),
+            "ordinary trait-impl members and their include proofs form an unordered set"
+        );
+
+        let unresolved_trait_impl = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub trait Contract { type Assoc; } pub struct Owner; impl Contract for Owner { type Assoc = include!(concat!(\"type\", \".rs\")); }\n",
+                "pub trait Contract { type Assoc; } pub struct Owner; impl Contract for Owner { type Assoc = include!(concat!(\"type\", \".rs\")); }\n",
+            ),
+        ]);
+        assert!(unresolved_trait_impl.unknown.iter().any(|finding| {
+            finding.identity.name == "TraitImplResolution"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("included-digest:unresolved"))
+        }));
+
+        let implementation_only_change = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn packet() -> [u8; include!(\"n.rs\")] { [1] }\n",
+                "pub fn packet() -> [u8; include!(\"n.rs\")] { [2] }\n",
+            ),
+            ("src/n.rs", "1\n", "1\n"),
+        ]);
+        assert!(
+            implementation_only_change.unknown.len() == 2
+                && implementation_only_change.unknown[0].evidence
+                    == implementation_only_change.unknown[1].evidence,
+            "plain include! remains conservative, but its proof evidence must still exclude function bodies"
+        );
+
+        let private_unreachable = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod hidden { pub type Bytes = [u8; include!(\"n.rs\")]; }\n",
+                "mod hidden { pub type Bytes = [u8; include!(\"n.rs\")]; }\n",
+            ),
+            ("src/n.rs", "1\n", "2\n"),
+        ]);
+        assert!(
+            private_unreachable.findings().is_empty(),
+            "an include owned only by an unreachable item is not public API"
+        );
+
+        let reexported = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod hidden { pub type Bytes = [u8; include!(\"n.rs\")]; } pub use hidden::Bytes;\n",
+                "mod hidden { pub type Bytes = [u8; include!(\"n.rs\")]; } pub use hidden::Bytes;\n",
+            ),
+            ("src/n.rs", "1\n", "2\n"),
+        ]);
+        assert!(
+            reexported
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "IncludeMacro"),
+            "a reexport makes the private-module declaration externally reachable"
+        );
+
+        let body_only = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn calculate() { let _: usize = include!(\"n.rs\"); }\n",
+                "pub fn calculate() { let _: usize = include!(\"n.rs\"); }\n",
+            ),
+            ("src/n.rs", "1\n", "2\n"),
+        ]);
+        assert!(
+            body_only.findings().is_empty(),
+            "ordinary function bodies are implementation, not public contracts"
+        );
+    }
+
+    #[test]
+    fn include_proof_survives_private_donor_file_move_under_stable_alias() {
+        let manifest = b"[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let donor =
+            b"pub struct Owner; impl Owner { pub const N: &str = include_str!(\"n.txt\"); }\n";
+        let base = snapshot_rust_api(&MemorySource {
+            provenance: RevisionProvenance::GitTree {
+                commit_oid: "base".to_owned(),
+            },
+            files: BTreeMap::from([
+                ("Cargo.toml".to_owned(), manifest.to_vec()),
+                (
+                    "src/lib.rs".to_owned(),
+                    b"#[path=\"old/mod.rs\"] mod hidden; pub use hidden::Owner as Public;\n"
+                        .to_vec(),
+                ),
+                ("src/old/mod.rs".to_owned(), donor.to_vec()),
+                ("src/old/n.txt".to_owned(), b"same\n".to_vec()),
+            ]),
+        });
+        let target = snapshot_rust_api(&MemorySource {
+            provenance: RevisionProvenance::GitTree {
+                commit_oid: "target".to_owned(),
+            },
+            files: BTreeMap::from([
+                ("Cargo.toml".to_owned(), manifest.to_vec()),
+                (
+                    "src/lib.rs".to_owned(),
+                    b"#[path=\"new/mod.rs\"] mod hidden; pub use hidden::Owner as Public;\n"
+                        .to_vec(),
+                ),
+                ("src/new/mod.rs".to_owned(), donor.to_vec()),
+                ("src/new/n.txt".to_owned(), b"same\n".to_vec()),
+            ]),
+        });
+        let delta = compare_rust_api(&base, &target);
+        assert!(
+            delta.findings().is_empty(),
+            "a private donor file move with the same public alias, contract, and included bytes is not an API change: {:?}",
+            delta.findings()
+        );
+
+        let path_sensitive_donor =
+            b"pub struct Owner; impl Owner { pub const PATH: &str = include!(\"path.rs\"); }\n";
+        let base = snapshot_rust_api(&MemorySource {
+            provenance: RevisionProvenance::GitTree {
+                commit_oid: "base".to_owned(),
+            },
+            files: BTreeMap::from([
+                ("Cargo.toml".to_owned(), manifest.to_vec()),
+                (
+                    "src/lib.rs".to_owned(),
+                    b"#[path=\"old/mod.rs\"] mod hidden; pub use hidden::Owner as Public;\n"
+                        .to_vec(),
+                ),
+                ("src/old/mod.rs".to_owned(), path_sensitive_donor.to_vec()),
+                ("src/old/path.rs".to_owned(), b"file!()\n".to_vec()),
+            ]),
+        });
+        let target = snapshot_rust_api(&MemorySource {
+            provenance: RevisionProvenance::GitTree {
+                commit_oid: "target".to_owned(),
+            },
+            files: BTreeMap::from([
+                ("Cargo.toml".to_owned(), manifest.to_vec()),
+                (
+                    "src/lib.rs".to_owned(),
+                    b"#[path=\"new/mod.rs\"] mod hidden; pub use hidden::Owner as Public;\n"
+                        .to_vec(),
+                ),
+                ("src/new/mod.rs".to_owned(), path_sensitive_donor.to_vec()),
+                ("src/new/path.rs".to_owned(), b"file!()\n".to_vec()),
+            ]),
+        });
+        assert!(
+            !compare_rust_api(&base, &target).unknown.is_empty(),
+            "plain include! remains path-sensitive because file!() and nested relative includes may change expansion"
         );
     }
 

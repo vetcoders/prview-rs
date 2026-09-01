@@ -278,6 +278,22 @@ struct PendingAssoc {
 }
 
 #[derive(Debug, Clone)]
+struct PendingIncludeProof {
+    origin: SymbolKey,
+    cfg_guard: Vec<String>,
+    source_path: String,
+    item_evidence: String,
+    macro_call: syn::Macro,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PublicIncludeOrigin {
+    module_path: Vec<String>,
+    external_name: String,
+    cfg_guard: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct PendingTraitImpl {
     crate_name: String,
     declaring_module_path: Vec<String>,
@@ -355,6 +371,7 @@ struct SnapshotBuilder<'a> {
     private_uses: Vec<UseEdge>,
     self_crate_aliases: Vec<SelfCrateAlias>,
     pending_assoc: Vec<PendingAssoc>,
+    pending_include_proofs: Vec<PendingIncludeProof>,
     pending_trait_impls: Vec<PendingTraitImpl>,
     module_proofs: Vec<ModuleProof>,
     all_module_aliases: Vec<RustModuleAlias>,
@@ -386,6 +403,7 @@ impl<'a> SnapshotBuilder<'a> {
             private_uses: Vec::new(),
             self_crate_aliases: Vec::new(),
             pending_assoc: Vec::new(),
+            pending_include_proofs: Vec::new(),
             pending_trait_impls: Vec::new(),
             module_proofs: Vec::new(),
             all_module_aliases: Vec::new(),
@@ -408,6 +426,7 @@ impl<'a> SnapshotBuilder<'a> {
         self.resolve_reexports();
         self.resolve_trait_impls();
         self.resolve_inherent_items();
+        self.resolve_include_proofs();
         self.materialize_public_modules();
         self.attach_public_reexport_origins();
         self.record_private_type_dependencies();
@@ -1487,22 +1506,6 @@ impl<'a> SnapshotBuilder<'a> {
                     continue;
                 }
             }
-            for macro_call in expression_include_macros(item) {
-                let evidence = format!(
-                    "item:{}\ninclude:{}\nincluded-digest:{}",
-                    canonical_tokens(item.to_token_stream()),
-                    canonical_tokens(macro_call.to_token_stream()),
-                    self.include_digest(source_path, &macro_call),
-                );
-                self.unknown_guarded(
-                    RustApiUnknownKind::IncludeMacro,
-                    Some(crate_name),
-                    module_path,
-                    source_path,
-                    &cfg_guard,
-                    evidence,
-                );
-            }
             match item {
                 Item::Mod(module) => {
                     let name = normalize_identifier(module.ident.to_string());
@@ -1709,6 +1712,18 @@ impl<'a> SnapshotBuilder<'a> {
                             syn::ForeignItem::Fn(function) if is_public(&function.vis) => {
                                 let name = normalize_identifier(function.sig.ident.to_string());
                                 let contract = normalized_foreign_contract(foreign, foreign_item);
+                                self.queue_include_proofs(
+                                    SymbolKey {
+                                        crate_name: crate_name.to_owned(),
+                                        module_path: module_path.to_vec(),
+                                        name: name.clone(),
+                                        namespace: RustNamespace::Value,
+                                    },
+                                    source_path,
+                                    &foreign_guard,
+                                    contract.clone(),
+                                    foreign_contract_include_macros(foreign_item),
+                                );
                                 self.record_symbol(
                                     crate_name,
                                     module_path,
@@ -1724,6 +1739,18 @@ impl<'a> SnapshotBuilder<'a> {
                             syn::ForeignItem::Static(value) if is_public(&value.vis) => {
                                 let name = normalize_identifier(value.ident.to_string());
                                 let contract = normalized_foreign_contract(foreign, foreign_item);
+                                self.queue_include_proofs(
+                                    SymbolKey {
+                                        crate_name: crate_name.to_owned(),
+                                        module_path: module_path.to_vec(),
+                                        name: name.clone(),
+                                        namespace: RustNamespace::Value,
+                                    },
+                                    source_path,
+                                    &foreign_guard,
+                                    contract.clone(),
+                                    foreign_contract_include_macros(foreign_item),
+                                );
                                 self.record_symbol(
                                     crate_name,
                                     module_path,
@@ -1735,6 +1762,29 @@ impl<'a> SnapshotBuilder<'a> {
                                     RustApiItemKind::ForeignStatic,
                                     contract,
                                 );
+                            }
+                            syn::ForeignItem::Macro(value) => {
+                                for macro_call in foreign_contract_include_macros(foreign_item) {
+                                    self.unknown_guarded(
+                                        RustApiUnknownKind::IncludeMacro,
+                                        Some(crate_name),
+                                        module_path,
+                                        source_path,
+                                        &foreign_guard,
+                                        format!(
+                                            "foreign-item:{}\ninclude-kind:{}\ninclude:{}\nincluded-digest:{}",
+                                            canonical_tokens(value.to_token_stream()),
+                                            macro_call
+                                                .path
+                                                .segments
+                                                .last()
+                                                .map(|segment| segment.ident.to_string())
+                                                .unwrap_or_else(|| "unknown".to_owned()),
+                                            canonical_tokens(macro_call.to_token_stream()),
+                                            self.include_digest(source_path, &macro_call),
+                                        ),
+                                    );
+                                }
                             }
                             syn::ForeignItem::Type(value) if is_public(&value.vis) => {
                                 self.unknown_guarded(
@@ -1787,7 +1837,13 @@ impl<'a> SnapshotBuilder<'a> {
                     }
                 }
                 Item::Macro(item_macro) => {
-                    let macro_name = item_macro.mac.path.to_token_stream().to_string();
+                    let macro_name = item_macro
+                        .mac
+                        .path
+                        .segments
+                        .last()
+                        .map(|segment| segment.ident.to_string())
+                        .unwrap_or_default();
                     if let Some(macro_ident) = item_macro.ident.as_ref().filter(|_| {
                         item_macro
                             .attrs
@@ -1819,6 +1875,8 @@ impl<'a> SnapshotBuilder<'a> {
                     if item_macro.ident.is_none() || macro_name == "include" {
                         let mut evidence = canonical_tokens(item_macro.to_token_stream());
                         if kind == RustApiUnknownKind::IncludeMacro {
+                            evidence.push_str("\ninclude-kind:");
+                            evidence.push_str(&macro_name);
                             evidence.push_str("\nincluded-digest:");
                             evidence.push_str(&self.include_digest(source_path, &item_macro.mac));
                         }
@@ -1858,6 +1916,18 @@ impl<'a> SnapshotBuilder<'a> {
                         });
                     }
                     if let Some((name, namespace, kind, contract)) = public_item_contract(item) {
+                        self.queue_include_proofs(
+                            SymbolKey {
+                                crate_name: crate_name.to_owned(),
+                                module_path: module_path.to_vec(),
+                                name: name.clone(),
+                                namespace,
+                            },
+                            source_path,
+                            &cfg_guard,
+                            contract.clone(),
+                            public_contract_include_macros(item),
+                        );
                         self.record_symbol(
                             crate_name,
                             module_path,
@@ -1887,6 +1957,103 @@ impl<'a> SnapshotBuilder<'a> {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn queue_include_proofs(
+        &mut self,
+        origin: SymbolKey,
+        source_path: &str,
+        cfg_guard: &[String],
+        item_evidence: String,
+        macro_calls: Vec<syn::Macro>,
+    ) {
+        self.pending_include_proofs
+            .extend(
+                macro_calls
+                    .into_iter()
+                    .map(|macro_call| PendingIncludeProof {
+                        origin: origin.clone(),
+                        cfg_guard: cfg_guard.to_vec(),
+                        source_path: source_path.to_owned(),
+                        item_evidence: item_evidence.clone(),
+                        macro_call,
+                    }),
+            );
+    }
+
+    /// Materialize include proofs only when their declaration reached the
+    /// external API, directly or through a public reexport. A `pub` item inside
+    /// an unreachable private module is not caller-observable by itself and
+    /// must not degrade the whole crate snapshot.
+    fn resolve_include_proofs(&mut self) {
+        let mut public_origins: BTreeMap<SymbolKey, Vec<PublicIncludeOrigin>> = BTreeMap::new();
+        for item in &self.items {
+            public_origins
+                .entry(SymbolKey {
+                    crate_name: item.key.crate_name.clone(),
+                    module_path: item.origin_module_path.clone(),
+                    name: item.origin_name.clone(),
+                    namespace: item.key.namespace,
+                })
+                .or_default()
+                .push(PublicIncludeOrigin {
+                    module_path: item.key.module_path.clone(),
+                    external_name: item.key.external_name.clone(),
+                    cfg_guard: item.cfg_guard.clone(),
+                });
+        }
+        for origins in public_origins.values_mut() {
+            origins.sort();
+            origins.dedup();
+        }
+
+        for proof in self.pending_include_proofs.clone() {
+            let Some(resolved_origins) = public_origins.get(&proof.origin) else {
+                continue;
+            };
+            for resolved_origin in resolved_origins {
+                if guards_proven_disjoint(&proof.cfg_guard, &resolved_origin.cfg_guard) {
+                    continue;
+                }
+                let external_path = if resolved_origin.module_path.is_empty() {
+                    resolved_origin.external_name.clone()
+                } else {
+                    format!(
+                        "{}::{}",
+                        resolved_origin.module_path.join("::"),
+                        resolved_origin.external_name
+                    )
+                };
+                let include_kind = proof
+                    .macro_call
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let evidence = format!(
+                    "origin:{:?}:{}\nitem:{}\ninclude-kind:{}\ninclude:{}\nincluded-digest:{}",
+                    proof.origin.namespace,
+                    external_path,
+                    proof.item_evidence,
+                    include_kind,
+                    canonical_tokens(proof.macro_call.to_token_stream()),
+                    self.include_digest(&proof.source_path, &proof.macro_call),
+                );
+                let mut effective_guard = proof.cfg_guard.clone();
+                effective_guard.extend(resolved_origin.cfg_guard.iter().cloned());
+                effective_guard.sort();
+                effective_guard.dedup();
+                self.unknown_guarded(
+                    RustApiUnknownKind::IncludeMacro,
+                    Some(&proof.origin.crate_name),
+                    &resolved_origin.module_path,
+                    &proof.source_path,
+                    &effective_guard,
+                    evidence,
+                );
             }
         }
     }
@@ -2053,6 +2220,30 @@ impl<'a> SnapshotBuilder<'a> {
                         false,
                     ),
                 };
+            let mut evidence = normalized_trait_impl_contract(item_impl);
+            let mut semantic_evidence = normalized_trait_impl_semantic_contract(item_impl);
+            let mut include_evidence = trait_impl_contract_include_macros(item_impl)
+                .into_iter()
+                .map(|macro_call| {
+                    format!(
+                        "\ninclude-kind:{}\ninclude:{}\nincluded-digest:{}",
+                        macro_call
+                            .path
+                            .segments
+                            .last()
+                            .map(|segment| segment.ident.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        canonical_tokens(macro_call.to_token_stream()),
+                        self.include_digest(source_path, &macro_call),
+                    )
+                })
+                .collect::<Vec<_>>();
+            include_evidence.sort();
+            include_evidence.dedup();
+            for include_evidence in include_evidence {
+                evidence.push_str(&include_evidence);
+                semantic_evidence.push_str(&include_evidence);
+            }
             // Trait impls are globally usable when the trait and owner are
             // public, even if the impl lives in a private helper module.
             self.pending_trait_impls.push(PendingTraitImpl {
@@ -2065,8 +2256,8 @@ impl<'a> SnapshotBuilder<'a> {
                 owner_path_resolved,
                 cfg_guard: cfg_guard.to_vec(),
                 source_path: source_path.to_owned(),
-                evidence: normalized_trait_impl_contract(item_impl),
-                semantic_evidence: normalized_trait_impl_semantic_contract(item_impl),
+                evidence,
+                semantic_evidence,
             });
             return;
         }
@@ -2086,6 +2277,48 @@ impl<'a> SnapshotBuilder<'a> {
         else {
             return;
         };
+        for item in &item_impl.items {
+            let syn::ImplItem::Macro(macro_item) = item else {
+                continue;
+            };
+            let macro_calls = associated_contract_include_macros(item);
+            if macro_calls.is_empty() {
+                continue;
+            }
+            let mut associated_cfg = cfg_guard.to_vec();
+            let item_cfg = canonical_cfg(&macro_item.attrs);
+            associated_cfg.extend(item_cfg.guards);
+            associated_cfg.sort();
+            associated_cfg.dedup();
+            if !item_cfg.errors.is_empty() {
+                for evidence in item_cfg.errors {
+                    self.unknown_guarded(
+                        RustApiUnknownKind::CfgPredicate,
+                        Some(crate_name),
+                        module_path,
+                        source_path,
+                        &associated_cfg,
+                        evidence,
+                    );
+                }
+                continue;
+            }
+            self.queue_include_proofs(
+                SymbolKey {
+                    crate_name: crate_name.to_owned(),
+                    module_path: owner_module_path.clone(),
+                    name: owner_name.clone(),
+                    namespace: RustNamespace::Type,
+                },
+                source_path,
+                &associated_cfg,
+                format!(
+                    "impl-owner:__prview_owner\n{}",
+                    canonical_tokens(macro_item.to_token_stream())
+                ),
+                macro_calls,
+            );
+        }
         for item in &item_impl.items {
             let (name, namespace, kind, attrs, public) = match item {
                 syn::ImplItem::Fn(function) => (
@@ -2146,6 +2379,19 @@ impl<'a> SnapshotBuilder<'a> {
             }
             let evidence = normalized_associated_contract(item_impl, item, false);
             let contract = normalized_associated_contract(item_impl, item, true);
+            let origin_name = format!("{}::{name}", owner_name);
+            self.queue_include_proofs(
+                SymbolKey {
+                    crate_name: crate_name.to_owned(),
+                    module_path: owner_module_path.clone(),
+                    name: origin_name,
+                    namespace,
+                },
+                source_path,
+                &associated_cfg,
+                contract.clone(),
+                associated_contract_include_macros(item),
+            );
             self.pending_assoc.push(PendingAssoc {
                 crate_name: crate_name.to_owned(),
                 owner_module_path: owner_module_path.clone(),
@@ -3430,7 +3676,6 @@ fn normalized_contract(mut item: Item) -> String {
             trim_generics_punctuation(&mut value.generics);
         }
         Item::Union(value) => {
-            let layout_sensitive = has_layout_sensitive_repr(&value.attrs);
             let mut fields = Fields::Named(value.fields.clone());
             let mut normalizer = SignatureAlphaNormalizer::with_occupied(free_identifiers.clone());
             normalizer.push_generics(&value.generics);
@@ -3439,7 +3684,10 @@ fn normalized_contract(mut item: Item) -> String {
                 field.ty = normalizer.fold_type(field.ty.clone());
             }
             normalizer.pop_scope();
-            filter_private_fields(&mut fields, layout_sensitive);
+            // Every union member starts at offset zero, including under
+            // repr(C): layout depends on the member set, not declaration
+            // order. Canonicalize that set while retaining names and types.
+            filter_private_fields(&mut fields, false);
             let Fields::Named(fields) = fields else {
                 unreachable!("union fields are named")
             };
@@ -3448,6 +3696,7 @@ fn normalized_contract(mut item: Item) -> String {
             trim_generics_punctuation(&mut value.generics);
         }
         Item::Enum(value) => {
+            let layout_sensitive = has_layout_sensitive_repr(&value.attrs);
             let mut normalizer = SignatureAlphaNormalizer::with_occupied(free_identifiers.clone());
             normalizer.push_generics(&value.generics);
             value.generics = normalizer.fold_generics(value.generics.clone());
@@ -3460,6 +3709,17 @@ fn normalized_contract(mut item: Item) -> String {
             trim_trailing_punct(&mut value.variants);
             trim_generics_punctuation(&mut value.generics);
             for variant in &mut value.variants {
+                if !layout_sensitive && let Fields::Named(fields) = &mut variant.fields {
+                    let mut canonical = fields.named.iter().cloned().collect::<Vec<_>>();
+                    canonical.sort_by_key(|field| {
+                        field
+                            .ident
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default()
+                    });
+                    fields.named = canonical.into_iter().collect();
+                }
                 trim_fields_punctuation(&mut variant.fields);
             }
         }
@@ -6510,14 +6770,13 @@ fn include_literal_path(macro_call: &syn::Macro) -> Option<String> {
 }
 
 #[derive(Default)]
-struct ExpressionIncludeCollector {
+struct ContractIncludeCollector {
     macros: Vec<syn::Macro>,
 }
 
-impl Fold for ExpressionIncludeCollector {
-    fn fold_expr_macro(&mut self, expression: syn::ExprMacro) -> syn::ExprMacro {
-        let name = expression
-            .mac
+impl Fold for ContractIncludeCollector {
+    fn fold_macro(&mut self, macro_call: syn::Macro) -> syn::Macro {
+        let name = macro_call
             .path
             .segments
             .last()
@@ -6526,20 +6785,154 @@ impl Fold for ExpressionIncludeCollector {
             .as_deref()
             .is_some_and(|name| matches!(name, "include" | "include_str" | "include_bytes"))
         {
-            self.macros.push(expression.mac.clone());
+            self.macros.push(macro_call.clone());
         }
-        syn::fold::fold_expr_macro(self, expression)
+        syn::fold::fold_macro(self, macro_call)
     }
 }
 
-fn expression_include_macros(item: &Item) -> Vec<syn::Macro> {
-    let expression = match item {
-        Item::Const(value) if is_public(&value.vis) => value.expr.as_ref(),
-        Item::Static(value) if is_public(&value.vis) => value.expr.as_ref(),
-        _ => return Vec::new(),
-    };
-    let mut collector = ExpressionIncludeCollector::default();
-    collector.fold_expr(expression.clone());
+fn public_contract_include_macros(item: &Item) -> Vec<syn::Macro> {
+    let mut collector = ContractIncludeCollector::default();
+    match item {
+        Item::Fn(value) if is_public(&value.vis) => {
+            collector.fold_signature(value.sig.clone());
+        }
+        Item::Struct(value) if is_public(&value.vis) => {
+            collector.fold_generics(value.generics.clone());
+            for field in &value.fields {
+                collector.fold_type(field.ty.clone());
+            }
+        }
+        Item::Union(value) if is_public(&value.vis) => {
+            collector.fold_generics(value.generics.clone());
+            for field in &value.fields.named {
+                collector.fold_type(field.ty.clone());
+            }
+        }
+        Item::Enum(value) if is_public(&value.vis) => {
+            collector.fold_generics(value.generics.clone());
+            for variant in &value.variants {
+                for field in &variant.fields {
+                    collector.fold_type(field.ty.clone());
+                }
+                if let Some((_, discriminant)) = &variant.discriminant {
+                    collector.fold_expr(discriminant.clone());
+                }
+            }
+        }
+        Item::Trait(value) if is_public(&value.vis) => {
+            collector.fold_generics(value.generics.clone());
+            for bound in &value.supertraits {
+                collector.fold_type_param_bound(bound.clone());
+            }
+            for trait_item in &value.items {
+                match trait_item {
+                    syn::TraitItem::Const(value) => {
+                        collector.fold_generics(value.generics.clone());
+                        collector.fold_type(value.ty.clone());
+                        if let Some((_, default)) = &value.default {
+                            collector.fold_expr(default.clone());
+                        }
+                    }
+                    syn::TraitItem::Fn(value) => {
+                        collector.fold_signature(value.sig.clone());
+                    }
+                    syn::TraitItem::Type(value) => {
+                        collector.fold_generics(value.generics.clone());
+                        for bound in &value.bounds {
+                            collector.fold_type_param_bound(bound.clone());
+                        }
+                        if let Some((_, default)) = &value.default {
+                            collector.fold_type(default.clone());
+                        }
+                    }
+                    syn::TraitItem::Macro(value) => {
+                        collector.fold_macro(value.mac.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Item::Type(value) if is_public(&value.vis) => {
+            collector.fold_generics(value.generics.clone());
+            collector.fold_type((*value.ty).clone());
+        }
+        Item::Const(value) if is_public(&value.vis) => {
+            collector.fold_type((*value.ty).clone());
+            collector.fold_expr((*value.expr).clone());
+        }
+        Item::Static(value) if is_public(&value.vis) => {
+            collector.fold_type((*value.ty).clone());
+            collector.fold_expr((*value.expr).clone());
+        }
+        _ => {}
+    }
+    collector.macros
+}
+
+fn foreign_contract_include_macros(item: &syn::ForeignItem) -> Vec<syn::Macro> {
+    let mut collector = ContractIncludeCollector::default();
+    match item {
+        syn::ForeignItem::Fn(value) if is_public(&value.vis) => {
+            collector.fold_signature(value.sig.clone());
+        }
+        syn::ForeignItem::Static(value) if is_public(&value.vis) => {
+            collector.fold_type((*value.ty).clone());
+        }
+        syn::ForeignItem::Macro(value) => {
+            collector.fold_macro(value.mac.clone());
+        }
+        _ => {}
+    }
+    collector.macros
+}
+
+fn associated_contract_include_macros(item: &syn::ImplItem) -> Vec<syn::Macro> {
+    let mut collector = ContractIncludeCollector::default();
+    match item {
+        syn::ImplItem::Fn(value) if is_public(&value.vis) => {
+            collector.fold_signature(value.sig.clone());
+        }
+        syn::ImplItem::Const(value) if is_public(&value.vis) => {
+            collector.fold_generics(value.generics.clone());
+            collector.fold_type(value.ty.clone());
+            collector.fold_expr(value.expr.clone());
+        }
+        syn::ImplItem::Macro(value) => {
+            collector.fold_macro(value.mac.clone());
+        }
+        _ => {}
+    }
+    collector.macros
+}
+
+fn trait_impl_contract_include_macros(item_impl: &syn::ItemImpl) -> Vec<syn::Macro> {
+    let mut collector = ContractIncludeCollector::default();
+    collector.fold_generics(item_impl.generics.clone());
+    collector.fold_type((*item_impl.self_ty).clone());
+    if let Some((_, trait_path, _)) = &item_impl.trait_ {
+        collector.fold_path(trait_path.clone());
+    }
+    for item in &item_impl.items {
+        match item {
+            syn::ImplItem::Fn(value) => {
+                collector.fold_signature(value.sig.clone());
+            }
+            syn::ImplItem::Const(value) => {
+                collector.fold_generics(value.generics.clone());
+                collector.fold_type(value.ty.clone());
+                collector.fold_expr(value.expr.clone());
+            }
+            syn::ImplItem::Type(value) => {
+                collector.fold_generics(value.generics.clone());
+                collector.fold_type(value.ty.clone());
+            }
+            syn::ImplItem::Macro(value) => {
+                collector.fold_macro(value.mac.clone());
+            }
+            _ => {}
+        }
+    }
     collector.macros
 }
 
@@ -7582,6 +7975,40 @@ mod tests {
                 .iter()
                 .any(|unknown| unknown.kind == RustApiUnknownKind::NonRegularModule)
         );
+    }
+
+    #[test]
+    fn include_proofs_do_not_cross_disjoint_cfg_declarations() {
+        let fixture = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                b"#[cfg(unix)] pub type X = [u8; include!(\"u.rs\")];\n#[cfg(windows)] pub type X = [u8; include!(\"w.rs\")];\n",
+            ),
+            ("src/u.rs", b"1\n"),
+            ("src/w.rs", b"2\n"),
+        ]);
+        let snapshot = snapshot_rust_api(&fixture);
+        let include_proofs: Vec<_> = snapshot
+            .unknowns
+            .iter()
+            .filter(|unknown| unknown.kind == RustApiUnknownKind::IncludeMacro)
+            .collect();
+        assert_eq!(
+            include_proofs.len(),
+            2,
+            "one proof per reachable cfg region"
+        );
+        assert!(include_proofs.iter().all(|unknown| {
+            !(unknown.cfg_guard.iter().any(|guard| guard.contains("unix"))
+                && unknown
+                    .cfg_guard
+                    .iter()
+                    .any(|guard| guard.contains("windows")))
+        }));
     }
 
     fn fixture_snapshot(cell: &str, side: &str) -> RustApiSnapshot {

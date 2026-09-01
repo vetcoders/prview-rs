@@ -5,7 +5,6 @@ use super::{
     js_tool_available, plan_check_run, run_js_command, run_js_command_with_timeout,
 };
 use crate::Config;
-use crate::cache;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Local;
@@ -244,15 +243,11 @@ impl Check for TypeScriptCheck {
         super::CheckEligibility::Run
     }
 
-    fn cache_key(&self, config: &Config) -> Option<String> {
-        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
-        let target = repo.resolve_target(config).ok()?;
-        let head = repo.head_commit_id().ok()?;
-        if head == target.commit_id {
-            Some(format!("tsc-{}", cache::ts_hash(&config.repo_root)))
-        } else {
-            Some(format!("tsc-{}", target.commit_id))
-        }
+    fn cache_key(&self, _config: &Config) -> Option<String> {
+        // A sound tsc key must bind every effective source/config input plus
+        // the compiler and dependency environment. The old *.ts/*.tsx hash
+        // could replay a PASS after tsconfig, JS/JSX or toolchain changes.
+        None
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -338,15 +333,10 @@ impl Check for ESLintCheck {
         super::CheckEligibility::Run
     }
 
-    fn cache_key(&self, config: &Config) -> Option<String> {
-        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
-        let target = repo.resolve_target(config).ok()?;
-        let head = repo.head_commit_id().ok()?;
-        if head == target.commit_id {
-            Some(format!("eslint-{}", cache::ts_hash(&config.repo_root)))
-        } else {
-            Some(format!("eslint-{}", target.commit_id))
-        }
+    fn cache_key(&self, _config: &Config) -> Option<String> {
+        // ESLint consumes more than TS sources (JS/JSX, config, ignore rules,
+        // plugins and CLI policy), so source-only replay is not truth-preserving.
+        None
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -573,18 +563,10 @@ impl Check for StylelintCheck {
         super::CheckEligibility::Run
     }
 
-    fn cache_key(&self, config: &Config) -> Option<String> {
-        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
-        let target = repo.resolve_target(config).ok()?;
-        let head = repo.head_commit_id().ok()?;
-        if head == target.commit_id {
-            Some(format!(
-                "stylelint-{}",
-                cache::stylelint_hash(&config.repo_root)
-            ))
-        } else {
-            Some(format!("stylelint-{}", target.commit_id))
-        }
+    fn cache_key(&self, _config: &Config) -> Option<String> {
+        // Stylelint's result also depends on ignore files, plugins, CLI policy
+        // and the installed toolchain; the former content hash omitted them.
+        None
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -678,31 +660,24 @@ mod tests {
     }
 
     #[test]
-    fn test_typescript_check_cache_key() {
+    fn test_typescript_check_disables_unsafe_persistent_cache() {
         let config = create_test_config(true);
         let check = TypeScriptCheck;
-        let key = check.cache_key(&config);
-        assert!(key.is_some());
-        // Verify it has prefix
-        assert!(key.unwrap().starts_with("tsc-"));
+        assert!(check.cache_key(&config).is_none());
     }
 
     #[test]
-    fn test_eslint_cache_key_has_prefix() {
+    fn test_eslint_disables_unsafe_persistent_cache() {
         let config = create_test_config(true);
         let check = ESLintCheck;
-        let key = check.cache_key(&config);
-        assert!(key.is_some());
-        assert!(key.unwrap().starts_with("eslint-"));
+        assert!(check.cache_key(&config).is_none());
     }
 
     #[test]
-    fn test_stylelint_cache_key_has_prefix() {
+    fn test_stylelint_disables_unsafe_persistent_cache() {
         let config = create_test_config(true);
         let check = StylelintCheck;
-        let key = check.cache_key(&config);
-        assert!(key.is_some());
-        assert!(key.unwrap().starts_with("stylelint-"));
+        assert!(check.cache_key(&config).is_none());
     }
 
     #[test]

@@ -1639,14 +1639,14 @@ pub fn off_head_target_commit(config: &Config) -> Option<String> {
 /// arm is not redundant: the gates are not the only stage that reads the tree.
 /// The context stage plans and produces the whole of `30_context` from
 /// `ledger.scan_dir()`, so tying materialisation to the runnable set alone gave
-/// back `PRV-CONTEXT-SNAPSHOT-PROVENANCE` through a quieter door — the SECOND
-/// `--pr N` run of the same PR, where every gate replays from the cache, and the
-/// fast remote-only preset, where the snapshot-backed gates all skip and only
-/// semgrep (which owns its worktree) remains. Both left the ledger with no scan
+/// back `PRV-CONTEXT-SNAPSHOT-PROVENANCE` through a quieter door — a run whose
+/// complete applicable gate set has sound cache hits, or the fast remote-only
+/// preset, where the snapshot-backed gates all skip and only semgrep (which
+/// owns its worktree) remains. Both left the ledger with no scan
 /// dir, and the context commands then read the operator's local checkout while
-/// the diffs and the gate described the PR's commit. A warm `--pr` run therefore
-/// pays for one `git worktree` it does not strictly need for its gates: a
-/// correct pack is worth more than a saved checkout.
+/// the diffs and the gate described the PR's commit. An all-cacheable `--pr`
+/// run therefore pays for one `git worktree` it does not strictly need for its
+/// gates: a correct pack is worth more than a saved checkout.
 ///
 /// Nothing is installed (`scan_dir_override` stays unset, the ledger keeps no
 /// snapshot) when the target IS the checked-out `HEAD` and no runnable check
@@ -3736,14 +3736,12 @@ test result: ok. 2 passed; 0 failed
         );
     }
 
-    /// PRV-CONTEXT-SNAPSHOT-PROVENANCE, the quiet half: the SECOND `--pr N` run
-    /// of the same PR replays every gate off the cache (`tsc-<sha>` and friends
-    /// are keyed on the reviewed commit, so the second run hits them all), which
-    /// left NOTHING runnable — and the reviewed tree was then never materialised
-    /// at all. The context stage went on to read the operator's own checkout
-    /// while the diffs and MERGE_GATE described the PR's commit, and `RUN.json`
-    /// looked identical either way. The tree is what the context stage needs, so
-    /// an off-HEAD target is enough to require it.
+    /// PRV-CONTEXT-SNAPSHOT-PROVENANCE, the quiet half: a run whose complete
+    /// applicable gate set has sound cache hits leaves NOTHING runnable. The
+    /// reviewed tree still has to be materialised for context; otherwise that
+    /// stage reads the operator's checkout while the diff and gate describe the
+    /// PR commit. A synthetic cacheable check keeps this invariant independent
+    /// of language checks that deliberately opt out of persistent replay.
     #[tokio::test]
     async fn a_fully_cached_off_head_run_still_materialises_the_reviewed_tree() {
         let (repo, target) = repo_with_off_head_target();
@@ -3755,13 +3753,19 @@ test result: ok. 2 passed; 0 failed
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let cache = Cache::with_dir(cache_dir.path().to_path_buf(), true);
         cache
-            .set("TypeScript", "tsc-target", "passed", Some("replay"), None)
+            .set(
+                "CacheableCheck",
+                "cacheable-target",
+                "passed",
+                Some("replay"),
+                None,
+            )
             .expect("seed cache");
 
         let checks: Vec<Box<dyn Check>> = vec![Box::new(StagedCheck {
-            name: "TypeScript",
+            name: "CacheableCheck",
             eligibility: CheckEligibility::Run,
-            cache_key: Some("tsc-target"),
+            cache_key: Some("cacheable-target"),
         })];
 
         let ledger = TaskLedger::new();
@@ -3773,7 +3777,7 @@ test result: ok. 2 passed; 0 failed
         assert_eq!((results.len(), skipped.len()), (1, 0));
         assert!(
             results[0].cached,
-            "the fixture is only meaningful while every gate replays and nothing runs",
+            "the fixture is only meaningful while its sole synthetic gate replays",
         );
 
         let scan_dir = ledger

@@ -1073,15 +1073,11 @@ impl Check for RuffCheck {
         super::CheckEligibility::Run
     }
 
-    fn cache_key(&self, config: &Config) -> Option<String> {
-        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
-        let target = repo.resolve_target(config).ok()?;
-        let head = repo.head_commit_id().ok()?;
-        if head == target.commit_id {
-            Some(format!("ruff-{}", cache::python_hash(&config.repo_root)))
-        } else {
-            Some(format!("ruff-{}", target.commit_id))
-        }
+    fn cache_key(&self, _config: &Config) -> Option<String> {
+        // Ruff also depends on dedicated config, CLI policy and the installed
+        // environment. Replaying a python-source-only key can produce a stale
+        // PASS, so persistent replay stays off until that proof is complete.
+        None
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -1178,15 +1174,10 @@ impl Check for MypyCheck {
         super::CheckEligibility::Run
     }
 
-    fn cache_key(&self, config: &Config) -> Option<String> {
-        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
-        let target = repo.resolve_target(config).ok()?;
-        let head = repo.head_commit_id().ok()?;
-        if head == target.commit_id {
-            Some(format!("mypy-{}", cache::python_hash(&config.repo_root)))
-        } else {
-            Some(format!("mypy-{}", target.commit_id))
-        }
+    fn cache_key(&self, _config: &Config) -> Option<String> {
+        // Mypy consumes config and environment state not covered by the old
+        // python hash. An incomplete key is not an equivalence proof.
+        None
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -2704,21 +2695,17 @@ mod tests {
     }
 
     #[test]
-    fn test_ruff_check_cache_key() {
+    fn test_ruff_disables_unsafe_persistent_cache() {
         let config = create_test_config(true, true, false);
         let check = RuffCheck;
-        let key = check.cache_key(&config);
-        assert!(key.is_some());
-        assert!(key.unwrap().starts_with("ruff-"));
+        assert!(check.cache_key(&config).is_none());
     }
 
     #[test]
-    fn test_mypy_check_cache_key() {
+    fn test_mypy_disables_unsafe_persistent_cache() {
         let config = create_test_config(true, true, false);
         let check = MypyCheck;
-        let key = check.cache_key(&config);
-        assert!(key.is_some());
-        assert!(key.unwrap().starts_with("mypy-"));
+        assert!(check.cache_key(&config).is_none());
     }
 
     #[test]
@@ -2847,15 +2834,10 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
-    /// Cache keys must follow the SUBSTRATE, not the local working tree.
-    ///
-    /// The cached-result lookup runs before the shared target snapshot exists,
-    /// so a key derived from the local tree would let a `--pr` run hit the entry
-    /// a previous local run stored — serving the local checkout's verdict as the
-    /// reviewed commit's. The snapshot-backed language checks key on the target
-    /// commit id whenever it differs from `HEAD`; this locks that in.
+    /// Incomplete language fingerprints must not become persistent truth for
+    /// either the local tree or an off-HEAD snapshot.
     #[test]
-    fn language_cache_keys_do_not_share_entries_across_substrates() {
+    fn language_checks_disable_persistent_cache_across_substrates() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo_path = tmp.path();
         run_git(repo_path, &["init", "-q", "-b", "main"]);
@@ -2866,7 +2848,7 @@ mod tests {
         .unwrap();
         run_git(repo_path, &["add", "pyproject.toml"]);
         let first = write_commit(repo_path, "main.py", "def hello():\n    pass\n");
-        let second = write_commit(
+        write_commit(
             repo_path,
             "main.py",
             "import os\n\ndef hello():\n    pass\n",
@@ -2885,41 +2867,12 @@ mod tests {
             builder.build()
         };
 
-        // HEAD sits on `second`; a local review keys on the local tree hash.
-        let local_key = RuffCheck
-            .cache_key(&config_for(None))
-            .expect("local cache key");
-
-        // Same checkout, but the reviewed target is an older commit: the check
-        // will scan a snapshot of `first`, so its key must name `first`.
-        let off_head_key = RuffCheck
-            .cache_key(&config_for(Some(first.as_str())))
-            .expect("off-HEAD cache key");
-
-        assert!(
-            off_head_key.contains(&first),
-            "an off-HEAD key must name the analysed commit, got {off_head_key}"
-        );
-        assert_ne!(
-            local_key, off_head_key,
-            "a local run and a run on a fetched target must never share a cache entry"
-        );
-        assert!(
-            !local_key.contains(&second),
-            "a local review keys on the working tree, which HEAD alone does not describe"
-        );
-
-        // Two different targets must not collide with each other either.
-        let other_target_key = RuffCheck
-            .cache_key(&config_for(Some(second.as_str())))
-            .expect("second-target cache key");
-        assert_ne!(off_head_key, other_target_key);
-
-        // Mypy shares the shape; guard it too so the pair cannot drift apart.
-        assert_ne!(
-            MypyCheck.cache_key(&config_for(None)),
-            MypyCheck.cache_key(&config_for(Some(first.as_str()))),
-        );
+        let local = config_for(None);
+        let off_head = config_for(Some(first.as_str()));
+        assert!(RuffCheck.cache_key(&local).is_none());
+        assert!(RuffCheck.cache_key(&off_head).is_none());
+        assert!(MypyCheck.cache_key(&local).is_none());
+        assert!(MypyCheck.cache_key(&off_head).is_none());
     }
 
     #[tokio::test]
