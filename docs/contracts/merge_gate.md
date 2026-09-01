@@ -20,7 +20,7 @@ document disagree, the code is the contract and this document is the bug.
 | `policy` | object | `{ version, mode, default_severity, source }` |
 | `checks` | object[] | Per-check evaluation records (see below) |
 | `inline_findings` | object | Inline SARIF summary (see below) |
-| `stale_cache_caveats` | object[] | Advisory, additive: gate rows whose evidence was replayed from an old cache (see below) |
+| `stale_cache_caveats` | object[] | Advisory, additive: gate rows replayed from an old or age-unverifiable cache (see below) |
 | `decision` | object | The merge decision (see below) |
 | `files` | object | Artifact-root-relative paths (see below) |
 | `rust_api_delta` | object \| null | Additive lossless Rust API delta; `null` on non-Rust runs (see below) |
@@ -218,21 +218,24 @@ become a complete proof.
 ## `stale_cache_caveats`
 
 An additive, advisory list naming every gate row whose result was REPLAYED from
-a stored entry older than the staleness threshold. Empty on a run where no such
-row exists.
+a stored entry older than the staleness threshold or whose age cannot be
+established. Empty on a run where no such row exists.
 
 | Field | Type | Notes |
 |---|---|---|
 | `check_id` | string | Policy check id, the same value as `checks[].id` |
 | `check_name` | string | Human-readable check name |
-| `cache_age_secs` | integer | Age of the replayed entry, from the run's task ledger |
-| `threshold_secs` | integer | The threshold that was exceeded (currently 7 days) |
+| `cache_age_secs` | integer \| null | Age of the replayed entry, or null when the ledger cannot establish it |
+| `age_status` | `stale` \| `unknown` | Whether the age exceeded the threshold or could not be verified |
+| `threshold_secs` | integer | Current staleness threshold (7 days); exceeded when `age_status` is `stale` |
 
 A stale failure can hold a merge, while a stale passing row can support a clean
 verdict after a compiler or tool version changed without changing the current
 source key. Both are evidence the current run did not produce, so both are
 dated. The ledger lookup binds the caveat to an actual cached replay rather than
 to the row's status text.
+An unknown age (including a future mtime after clock rollback) is not silently
+treated as fresh: it produces an `unknown` caveat with a null age.
 
 The list is WARN-ONLY and changes nothing else. It is deliberately NOT part of
 `decision`: that object is closed and every field in it ranks the verdict, so a

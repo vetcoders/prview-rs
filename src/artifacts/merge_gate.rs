@@ -20,13 +20,21 @@ use super::*;
 /// fact.
 const STALE_CACHE_CAVEAT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// The age of the stored result `check_name` was replayed from, when this run
-/// replayed one and the ledger recorded how old it was.
+/// Whether this run replayed `check_name` from a cache of known or unknown age.
 ///
 /// Only [`TaskKind::Check`] entries answer. A context artifact backed by the
 /// same tool is different work under the same id, and its replay says nothing
 /// about the gate row this caveat is about.
-fn replayed_cache_age_secs(ledger: &crate::ledger::TaskLedger, check_name: &str) -> Option<u64> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayedCacheAge {
+    Known(u64),
+    Unknown,
+}
+
+fn replayed_cache_age(
+    ledger: &crate::ledger::TaskLedger,
+    check_name: &str,
+) -> Option<ReplayedCacheAge> {
     use crate::ledger::{TaskKind, TaskState};
 
     let tool = crate::check_id::check_id_from_name(check_name);
@@ -36,7 +44,14 @@ fn replayed_cache_age_secs(ledger: &crate::ledger::TaskLedger, check_name: &str)
         .rev()
         .find(|entry| entry.kind == TaskKind::Check && entry.key.tool == tool)
         .and_then(|entry| match &entry.state {
-            TaskState::Cached { cache_age_secs, .. } => *cache_age_secs,
+            TaskState::Cached {
+                cache_age_secs: Some(age),
+                ..
+            } => Some(ReplayedCacheAge::Known(*age)),
+            TaskState::Cached {
+                cache_age_secs: None,
+                ..
+            } => Some(ReplayedCacheAge::Unknown),
             _ => None,
         })
 }
@@ -147,15 +162,30 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         // clean decision after the compiler/toolchain changed. Name every old
         // replayed gate row; the ledger lookup already proves this exact check
         // came from cache, while the caveat remains advisory-only.
-        if let Some(age) = replayed_cache_age_secs(ledger, &eval.name)
-            && age > STALE_CACHE_CAVEAT_MAX_AGE_SECS
-        {
-            stale_cache_caveats.push(json!({
-                "check_id": eval.check_id,
-                "check_name": eval.name,
-                "cache_age_secs": age,
-                "threshold_secs": STALE_CACHE_CAVEAT_MAX_AGE_SECS,
-            }));
+        match replayed_cache_age(ledger, &eval.name) {
+            Some(ReplayedCacheAge::Known(age)) if age > STALE_CACHE_CAVEAT_MAX_AGE_SECS => {
+                stale_cache_caveats.push(json!({
+                    "check_id": eval.check_id,
+                    "check_name": eval.name,
+                    "cache_age_secs": age,
+                    "age_status": "stale",
+                    "threshold_secs": STALE_CACHE_CAVEAT_MAX_AGE_SECS,
+                }));
+            }
+            Some(ReplayedCacheAge::Unknown) => {
+                // A future mtime, missing legacy metadata, or an unreadable
+                // timestamp cannot be presented as fresh evidence. Preserve
+                // the unknown instead of inventing zero, and surface the same
+                // advisory caveat as an explicitly old replay.
+                stale_cache_caveats.push(json!({
+                    "check_id": eval.check_id,
+                    "check_name": eval.name,
+                    "cache_age_secs": null,
+                    "age_status": "unknown",
+                    "threshold_secs": STALE_CACHE_CAVEAT_MAX_AGE_SECS,
+                }));
+            }
+            _ => {}
         }
     }
 
@@ -705,8 +735,8 @@ mod tests {
     /// One gate run whose failing row was REPLAYED from a stored result of the
     /// given age — the `PRV-CACHE-STALENESS` shape, with the age as the only
     /// variable.
-    fn run_gate_with_cached_semgrep_status(
-        cache_age_secs: u64,
+    fn run_gate_with_cached_semgrep_age_status(
+        cache_age_secs: Option<u64>,
         status: CheckStatus,
     ) -> serde_json::Value {
         use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
@@ -734,7 +764,7 @@ mod tests {
             key: TaskKey::new("Semgrep scan", SubstrateKey::default()),
             kind: TaskKind::Check,
             state: TaskState::Cached {
-                cache_age_secs: Some(cache_age_secs),
+                cache_age_secs,
                 origin: SubstrateKey::default(),
             },
             queued_at: None,
@@ -760,6 +790,13 @@ mod tests {
         .expect("merge gate");
 
         serde_json::from_slice(&std::fs::read(tmp.path().join("MERGE_GATE.json")).unwrap()).unwrap()
+    }
+
+    fn run_gate_with_cached_semgrep_status(
+        cache_age_secs: u64,
+        status: CheckStatus,
+    ) -> serde_json::Value {
+        run_gate_with_cached_semgrep_age_status(Some(cache_age_secs), status)
     }
 
     fn run_gate_with_cached_semgrep(cache_age_secs: u64) -> serde_json::Value {
@@ -807,6 +844,32 @@ mod tests {
             caveats[0]["cache_age_secs"],
             STALE_CACHE_CAVEAT_MAX_AGE_SECS + 60
         );
+        assert_eq!(caveats[0]["age_status"], "stale");
+    }
+
+    /// Unknown age is not fresh age. A future mtime after clock rollback (or a
+    /// legacy entry with no usable timestamp) must remain visible when its
+    /// cached PASS supports a clean decision.
+    #[test]
+    fn a_passing_row_replayed_from_a_cache_of_unknown_age_is_named() {
+        let gate = run_gate_with_cached_semgrep_age_status(None, CheckStatus::Passed);
+        let caveats = gate["stale_cache_caveats"]
+            .as_array()
+            .expect("stale_cache_caveats is an array");
+
+        assert_eq!(gate["checks"][0]["status"], "passed");
+        assert_eq!(caveats.len(), 1, "one unverifiable passing row, one caveat");
+        assert_eq!(caveats[0]["check_id"], "semgrep_scan");
+        assert!(caveats[0]["cache_age_secs"].is_null());
+        assert_eq!(caveats[0]["age_status"], "unknown");
+
+        let fresh = run_gate_with_cached_semgrep_status(60, CheckStatus::Passed);
+        assert_eq!(
+            gate["decision"], fresh["decision"],
+            "an unknown-age caveat remains advisory-only"
+        );
+        assert_eq!(gate["checks"], fresh["checks"]);
+        assert_eq!(gate["inline_findings"], fresh["inline_findings"]);
     }
 
     /// The caveat is advisory in the strong sense: the ONLY difference a stale

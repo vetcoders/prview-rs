@@ -361,7 +361,12 @@ discovered uv configuration; otherwise `uv.toml`, then `[tool.uv]` from
 `UV_NO_CONFIG`, matching uv. Each pool takes the
 minimum of that project ceiling, inherited environment, and the run plan;
 malformed, unreadable, non-UTF-8, wrong-type, or non-positive authority fails
-closed. User- and system-level uv config remains outside this deliberately
+closed. Because this inspection precedes the governed uv child, the selected
+project-scoped authority is opened non-blocking on Unix, must resolve to a
+regular file, and is read through a 1 MiB cap. FIFOs, devices, and oversized
+`uv.toml`/`pyproject.toml` inputs fail closed without hanging or exhausting the
+planner; an in-tree metadata symlink is bounded at its resolved regular target.
+User- and system-level uv config remains outside this deliberately
 project-scoped resolver. The cap remains on every later `uv run`, so an
 unsuccessful pre-sync cannot retry outside the envelope. A direct Ruff, Mypy,
 or Pytest fallback selected because uv is unavailable skips uv-only files and
@@ -1570,9 +1575,16 @@ would reject:
 ```json
 "stale_cache_caveats": [
   { "check_id": "cargo_audit", "check_name": "Cargo audit",
-    "cache_age_secs": 806400, "threshold_secs": 604800 }
+    "cache_age_secs": 806400, "age_status": "stale",
+    "threshold_secs": 604800 }
 ]
 ```
+
+If the ledger cannot establish an age — for example after clock rollback gives
+the cache file a future mtime — the entry remains in this list with
+`"cache_age_secs": null` and `"age_status": "unknown"`. Unknown age is
+unverifiable evidence, not a fabricated fresh replay. Known old entries use
+`"age_status": "stale"`.
 
 The field is **WARN-ONLY and additive**. It sits at the top level, deliberately
 outside `decision`: that object is closed by contract and every field in it ranks

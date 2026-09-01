@@ -19,6 +19,10 @@ pub struct RuffCheck;
 pub struct MypyCheck;
 pub struct PytestCheck;
 
+/// Project-scoped uv configuration is inspected synchronously before the
+/// governed child exists. Keep that planning read finite on every platform.
+const MAX_UV_CONFIG_BYTES: u64 = 1024 * 1024;
+
 /// Skip reason when the REVIEWED commit is not a Python project.
 ///
 /// `config.profile` describes the local checkout. When a target removes the last
@@ -1093,7 +1097,7 @@ fn project_uv_concurrency_limits(
     no_discovered_config: bool,
 ) -> Result<super::UvConcurrencyLimits> {
     if let Some(path) = explicit_config {
-        return uv_concurrency_limits_from_file(path, false);
+        return uv_concurrency_limits_from_file(root, path, false);
     }
     if no_discovered_config {
         return Ok(super::UvConcurrencyLimits::default());
@@ -1104,7 +1108,7 @@ fn project_uv_concurrency_limits(
         .try_exists()
         .with_context(|| format!("cannot inspect {}", uv_toml.display()))?
     {
-        return uv_concurrency_limits_from_file(&uv_toml, false);
+        return uv_concurrency_limits_from_file(root, &uv_toml, false);
     }
 
     let pyproject = root.join("pyproject.toml");
@@ -1112,20 +1116,39 @@ fn project_uv_concurrency_limits(
         .try_exists()
         .with_context(|| format!("cannot inspect {}", pyproject.display()))?
     {
-        return uv_concurrency_limits_from_file(&pyproject, true);
+        return uv_concurrency_limits_from_file(root, &pyproject, true);
     }
     Ok(super::UvConcurrencyLimits::default())
 }
 
 fn uv_concurrency_limits_from_file(
+    root: &Path,
     path: &Path,
     embedded_in_pyproject: bool,
 ) -> Result<super::UvConcurrencyLimits> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read uv configuration {}", path.display()))?;
-    let contents = std::str::from_utf8(&bytes)
-        .with_context(|| format!("uv configuration {} is not UTF-8", path.display()))?;
-    let parsed = toml::from_str::<toml::Value>(contents)
+    // Contained symlinks are part of the existing Python metadata contract.
+    // Resolve them once, then open the resolved final path without following a
+    // replacement symlink. The containment guard ran before this planner.
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve uv configuration {}", path.display()))?;
+    let resolved_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve reviewed Python root {}", root.display()))?;
+    if !resolved.starts_with(&resolved_root) {
+        anyhow::bail!(
+            "uv configuration {} resolves outside the reviewed Python root {}",
+            path.display(),
+            root.display(),
+        );
+    }
+    let contents = read_bounded_regular_uv_config(&resolved).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to read uv configuration {}: {error}",
+            path.display()
+        )
+    })?;
+    let parsed = toml::from_str::<toml::Value>(&contents)
         .with_context(|| format!("failed to parse uv configuration {}", path.display()))?;
 
     let table = if embedded_in_pyproject {
@@ -1152,6 +1175,41 @@ fn uv_concurrency_limits_from_file(
         builds: positive_uv_concurrency_limit(table, "concurrent-builds", path)?,
         installs: positive_uv_concurrency_limit(table, "concurrent-installs", path)?,
     })
+}
+
+/// Read one already-contained uv authority without blocking on special files
+/// or allocating from an attacker-controlled length.
+fn read_bounded_regular_uv_config(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+
+    // Reject a special file before open as well as after it. O_NONBLOCK keeps
+    // ordinary Unix FIFOs safe, but not every device driver is required to
+    // honor that flag; the post-open fstat below closes the replacement race.
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() || path_metadata.file_type().is_symlink() {
+        anyhow::bail!("uv configuration is not a direct regular file");
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_UV_CONFIG_BYTES {
+        anyhow::bail!("uv configuration is not a bounded regular file");
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_UV_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_UV_CONFIG_BYTES {
+        anyhow::bail!("uv configuration exceeds the bounded read limit");
+    }
+    String::from_utf8(bytes).context("uv configuration is not UTF-8")
 }
 
 fn positive_uv_concurrency_limit(
@@ -2322,6 +2380,126 @@ mod tests {
         let error = project_uv_concurrency_limits(root.path(), None, false)
             .expect_err("non-UTF-8 project policy must not become absent");
         assert!(error.to_string().contains("not UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uv_config_dangerous_file_helper() {
+        let Ok(directory) = std::env::var("PRVIEW_TEST_UV_CONFIG_DIR") else {
+            return;
+        };
+        project_uv_concurrency_limits(Path::new(&directory), None, false)
+            .expect_err("a special uv authority must fail closed");
+        std::fs::write(
+            std::env::var("PRVIEW_TEST_UV_CONFIG_DONE").expect("result path"),
+            "done\n",
+        )
+        .expect("publish bounded result");
+    }
+
+    #[cfg(unix)]
+    fn assert_dangerous_uv_config_returns_promptly(
+        name: &str,
+        prepare: impl FnOnce(&Path),
+        label: &str,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let done = tmp.path().join("done");
+        prepare(&tmp.path().join(name));
+
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "checks::python::tests::uv_config_dangerous_file_helper",
+                "--nocapture",
+            ])
+            .env("PRVIEW_TEST_UV_CONFIG_DIR", tmp.path())
+            .env("PRVIEW_TEST_UV_CONFIG_DONE", &done)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn bounded uv config probe");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait().expect("poll uv config probe") {
+                Some(status) => {
+                    assert!(
+                        status.success(),
+                        "{label} must fail closed without blocking"
+                    );
+                    assert!(
+                        done.is_file(),
+                        "{label} probe did not execute its assertion"
+                    );
+                    break;
+                }
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{label} blocked the synchronous resource planner");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uv_config_planning_never_blocks_on_a_fifo() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        for name in ["uv.toml", "pyproject.toml"] {
+            assert_dangerous_uv_config_returns_promptly(
+                name,
+                |path| {
+                    let path =
+                        std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path");
+                    // SAFETY: the path is a NUL-terminated temporary pathname
+                    // and mkfifo creates only that fixture with owner rw mode.
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                },
+                &format!("a FIFO {name}"),
+            );
+        }
+    }
+
+    #[test]
+    fn uv_config_planning_refuses_oversized_authorities_before_parsing() {
+        for name in ["uv.toml", "pyproject.toml"] {
+            let root = tempfile::tempdir().expect("reviewed root");
+            std::fs::write(
+                root.path().join(name),
+                vec![b' '; MAX_UV_CONFIG_BYTES as usize + 1],
+            )
+            .expect("oversized uv authority");
+
+            let error = project_uv_concurrency_limits(root.path(), None, false)
+                .expect_err("an oversized uv authority must fail closed");
+            assert!(
+                error.to_string().contains("bounded regular file")
+                    || error.to_string().contains("bounded read limit"),
+                "the refusal must name the read bound for {name}: {error}",
+            );
+        }
+    }
+
+    #[test]
+    fn uv_config_planning_accepts_an_exactly_capped_regular_authority() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        std::fs::write(
+            root.path().join("uv.toml"),
+            vec![b' '; MAX_UV_CONFIG_BYTES as usize],
+        )
+        .expect("exact-cap uv authority");
+
+        assert_eq!(
+            project_uv_concurrency_limits(root.path(), None, false)
+                .expect("an exact-cap regular file remains within the contract"),
+            super::super::UvConcurrencyLimits::default(),
+        );
     }
 
     /// One environment per repository was still shared state: two prview

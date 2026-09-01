@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child exists. Context provenance now also marks `tauri info`, esbuild
   metadata, and npm SBOM collection as `snapshot-borrowed-deps` when those
   commands consume prview's linked local `node_modules`.
+- Python resource planning now applies the same finite-read boundary to the
+  selected project-scoped uv authority. A FIFO, device, non-regular file, or
+  `uv.toml`/`pyproject.toml` above 1 MiB fails closed before a governed uv child
+  exists; contained metadata symlinks still resolve to their in-tree regular
+  target.
 - Unix cancellation and timeout cleanup now freezes a hardened tool group,
   discovers the fixed point of its live PPID descendants, binds each detached
   group leader to its native birth identity, and kills leaf groups before the
@@ -55,7 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MERGE_GATE.json.stale_cache_caveats` now dates old cached passing rows as
   well as failures/blockers. A stale PASS can support a clean verdict after a
   compiler or toolchain change just as a stale failure can hold a merge; the
-  caveat remains additive and never changes the decision by itself.
+  caveat remains additive and never changes the decision by itself. A replay
+  whose age cannot be established is now surfaced as `age_status: "unknown"`
+  with a null age instead of being silently treated as fresh.
 - MCP quick reviews no longer cancel when a short-lived hardened helper exits
   between spawn and governor registration. A non-reaping wait-status probe
   distinguishes that completed child from an ambiguous identity failure while

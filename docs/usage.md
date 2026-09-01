@@ -229,6 +229,11 @@ packages. Each uv pool is the minimum of the run plan, a positive inherited
 environment value, and the matching project value from `uv.toml` or
 `[tool.uv]`; `uv.toml` wins when both project files exist. Invalid or
 unreadable concurrency authority fails closed instead of widening the run.
+The selected project-scoped uv authority is opened only as a regular file and
+read up to 1 MiB before parsing; a FIFO, device, or oversized `uv.toml` or
+`pyproject.toml` therefore cannot block or exhaust the synchronous planner.
+An in-tree metadata symlink remains supported and is bounded at its resolved
+regular target.
 Python pre-sync and check runners resolve Cargo's effective `[build].jobs`
 from their exact reviewed cwd as well, using the same precedence and
 fail-closed rules as direct Cargo gates.
