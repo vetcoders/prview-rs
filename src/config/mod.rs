@@ -1496,14 +1496,14 @@ fn fetch_pr_info(pr_number: u64, gh_repo: Option<&str>) -> Result<PrInfo> {
     // Check if gh is available
     let mut version = gh_cmd();
     version.arg("--version").current_dir(std::env::temp_dir());
-    if crate::proc::output_governed_with_timeout(
+    match crate::proc::output_governed_with_timeout(
         version,
         "gh version startup probe",
         std::time::Duration::from_secs(10),
-    )
-    .is_err()
-    {
-        bail!("gh CLI is not installed (required for --pr mode)");
+    ) {
+        Ok(_) => {}
+        Err(error) if crate::governor::is_cancellation(&error) => return Err(error),
+        Err(_) => bail!("gh CLI is not installed (required for --pr mode)"),
     }
 
     // Use `gh api` from a non-repo directory to avoid git-fetch noise on /dev/tty.
@@ -1744,6 +1744,20 @@ mod tests {
         for pid in pids {
             assert_process_gone(pid).await;
         }
+    }
+
+    #[tokio::test]
+    async fn gh_version_probe_preserves_typed_cancellation() {
+        let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::new());
+        governor.cancel();
+
+        let error = crate::governor::with_run_scope(governor, async {
+            fetch_pr_info(27, Some("vetcoders/prview-rs"))
+        })
+        .await
+        .expect_err("an already-cancelled gh probe must remain typed cancellation");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
     }
 
     fn init_git_repo_with_branch(branch: &str) -> tempfile::TempDir {
