@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MCP quick reviews no longer cancel when a short-lived hardened helper exits
+  between spawn and governor registration. A non-reaping wait-status probe
+  distinguishes that completed child from an ambiguous identity failure while
+  preserving its PID/PGID for owned-tree cancellation until normal cleanup.
 - MCP `run_review` now rejects source-buildable targets without a native
   PID-reuse-safe process-birth identity before taking the activation lock or
   spawning a review. Linux, macOS, and Windows remain the explicitly supported

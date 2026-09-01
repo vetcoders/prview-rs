@@ -374,7 +374,8 @@ impl ResourceGovernor {
     /// `pid` must be the pid of a child spawned through [`crate::proc::harden`],
     /// which makes it the leader of its own process group — that is what lets
     /// one signal take down a `cargo` → `rustc` → `cc` tree rather than just its
-    /// root.
+    /// root. Its owning child handle must not have been waited or reaped yet;
+    /// that keeps the PID unavailable for reuse throughout registration.
     ///
     /// Registration and cancellation share the registry lock. If cancellation
     /// won the race after `spawn` but before this call, the child is refused and
@@ -386,7 +387,8 @@ impl ResourceGovernor {
             drop(inflight);
             let external_birth_identity = crate::proc::report_external_child_group_started(pid);
             if crate::proc::terminate_process_tree(pid)
-                && let Ok(Some(identity)) = external_birth_identity
+                && let Ok(crate::proc::ExternalChildGroupStart::Mirrored(identity)) =
+                    external_birth_identity
             {
                 crate::proc::report_external_child_group_finished(pid, &identity);
             }
@@ -397,7 +399,13 @@ impl ResourceGovernor {
         // the registration so the external hard fallback never sees a live
         // registry entry without its corresponding pid.
         let external_birth_identity = match crate::proc::report_external_child_group_started(pid) {
-            Ok(identity) => identity,
+            Ok(crate::proc::ExternalChildGroupStart::NotMirrored) => None,
+            Ok(crate::proc::ExternalChildGroupStart::Mirrored(identity)) => Some(identity),
+            // The direct owner still holds an unreaped child handle, so this PID
+            // cannot be reused. Keep the PGID cancellable until ordinary owned-
+            // tree cleanup even though the dead leader had no birth identity to
+            // mirror; the parent's provisional row covers the external fallback.
+            Ok(crate::proc::ExternalChildGroupStart::ExitedBeforeMirror) => None,
             Err(error) => {
                 drop(inflight);
                 // The MCP parent cannot prove ownership without the mirror.

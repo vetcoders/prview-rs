@@ -984,6 +984,9 @@ mod tests {
     const QUICK_PREEXEC_GAP_FIXTURE_ENV: &str = "PRVIEW_MCP_QUICK_PREEXEC_GAP_DIR";
     #[cfg(unix)]
     const DEEP_NESTED_GROUP_FIXTURE_ENV: &str = "PRVIEW_MCP_DEEP_NESTED_GROUP_DIR";
+    #[cfg(target_os = "macos")]
+    const EXITED_BEFORE_REGISTRATION_FIXTURE_ENV: &str =
+        "PRVIEW_MCP_EXITED_BEFORE_REGISTRATION_DIR";
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -1166,6 +1169,52 @@ mod tests {
             std::process::exit(17);
         }
         std::process::exit(18);
+    }
+
+    /// Subprocess-only fixture for a command that completes
+    /// before the governor can mirror its native birth identity to the MCP
+    /// parent. The owned child remains unreaped until after registration, so its
+    /// PID cannot be reused during the proof.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exited_before_registration_child_fixture() {
+        let Some(dir) = std::env::var_os(EXITED_BEFORE_REGISTRATION_FIXTURE_ENV) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        crate::proc::initialize_external_child_group_capability()
+            .expect("short-child fixture adopts parent-owned capability");
+
+        let mut command = std::process::Command::new("true");
+        crate::proc::harden_std(&mut command);
+        let mut child = command.spawn().expect("spawn short-lived hardened child");
+        let pid = child.id();
+        std::fs::write(dir.join("tool.pid"), pid.to_string()).expect("publish short-child pid");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while crate::storage::process_birth_identity(pid).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "short-lived child did not reach the Darwin post-exit identity gap"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let governor = crate::governor::ResourceGovernor::with_budget(1, 1);
+        assert!(
+            governor.register_child("already-exited", pid),
+            "a waitable exited child is accepted without cancelling the run"
+        );
+        assert!(!governor.is_cancelled());
+        assert_eq!(
+            governor.inflight_count(),
+            1,
+            "the unreaped child's PGID remains available to cancellation"
+        );
+        assert!(child.wait().expect("reap short-lived child").success());
+        governor.unregister_child("already-exited");
+        assert_eq!(governor.inflight_count(), 0);
+        std::fs::write(dir.join("accepted"), b"ok").expect("publish fixture success");
     }
 
     /// Subprocess-only fixture for the spawn/registration boundary a flat
@@ -1888,6 +1937,67 @@ mod tests {
         assert!(
             !sidecar.exists(),
             "confirmed tracker Drop removes its ownership sidecar"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn quick_review_accepts_a_child_exited_before_governor_registration() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "mcp::run::tests::exited_before_registration_child_fixture",
+                "--nocapture",
+            ])
+            .env(EXITED_BEFORE_REGISTRATION_FIXTURE_ENV, fixture.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::proc::harden(&mut command);
+        let tracker_setup =
+            crate::proc::ExternalChildGroupTracker::attach(&mut command, fixture.path())
+                .expect("attach short-child tracker");
+        let mut child = command.spawn().expect("spawn short-child review fixture");
+        let mut child_groups = tracker_setup;
+        child_groups.child_spawned(child.id());
+
+        let status = child.wait().await.expect("wait for short-child fixture");
+        child_groups.root_reaped();
+        assert!(status.success());
+        assert!(fixture.path().join("accepted").is_file());
+        let tool_pid =
+            std::fs::read_to_string(fixture.path().join("tool.pid")).expect("read short-child pid");
+        let tool_pid = tool_pid.trim();
+        let sidecar = std::fs::read_dir(fixture.path())
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".mcp-child-groups-")
+            })
+            .expect("short-child ownership sidecar");
+        let sidecar_text = std::fs::read_to_string(sidecar.path()).unwrap();
+        let provisional = format!("?{tool_pid}");
+        let started = format!("+{tool_pid}\t");
+        let finished = format!("-{tool_pid}\t");
+        assert!(
+            sidecar_text.lines().any(|line| line == provisional),
+            "the pre-exec provisional row must cover the short child"
+        );
+        assert!(
+            sidecar_text
+                .lines()
+                .all(|line| !line.starts_with(&started) && !line.starts_with(&finished)),
+            "the regression must exercise exited-before-mirror, not an ordinary mirrored child"
+        );
+        assert!(
+            child_groups
+                .finalize_after_root_exit(Duration::from_secs(2))
+                .await,
+            "the provisional row for the gone group must settle cleanly"
         );
     }
 

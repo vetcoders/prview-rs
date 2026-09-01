@@ -46,6 +46,69 @@ struct ExternalChildGroupIdentity {
     birth_identity: String,
 }
 
+pub(crate) enum ExternalChildGroupStart {
+    NotMirrored,
+    Mirrored(String),
+    ExitedBeforeMirror,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum ExternalChildBirthIdentity {
+    Captured(String),
+    ChildExited,
+}
+
+#[cfg(unix)]
+fn classify_external_child_birth_identity(
+    birth_identity: std::io::Result<String>,
+    child_exited: impl FnOnce() -> std::io::Result<bool>,
+) -> std::io::Result<ExternalChildBirthIdentity> {
+    match birth_identity {
+        Ok(identity) => Ok(ExternalChildBirthIdentity::Captured(identity)),
+        Err(error) => match child_exited() {
+            Ok(true) => Ok(ExternalChildBirthIdentity::ChildExited),
+            Ok(false) | Err(_) => Err(error),
+        },
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unix_child_exited_without_reaping(pid: u32) -> std::io::Result<bool> {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: info is writable siginfo storage. P_PID scopes the query to
+        // the direct child just spawned by this process; WNOWAIT observes exit
+        // without releasing that child/PID for reuse before registration.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: successful waitid initialized the supplied siginfo. POSIX
+            // reports si_pid == 0 when WNOHANG found no waitable state.
+            return Ok(unsafe { info.assume_init().si_pid() } != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn unix_child_exited_without_reaping(_pid: u32) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "non-reaping child-exit identity is unsupported on this platform",
+    ))
+}
+
 #[cfg(unix)]
 static EXTERNAL_CHILD_GROUP_WRITER: std::sync::OnceLock<ExternalChildGroupWriterState> =
     std::sync::OnceLock::new();
@@ -295,21 +358,35 @@ fn report_external_child_group(
     file.write_all(row.as_bytes())
 }
 
-pub(crate) fn report_external_child_group_started(pid: u32) -> std::io::Result<Option<String>> {
+pub(crate) fn report_external_child_group_started(
+    pid: u32,
+) -> std::io::Result<ExternalChildGroupStart> {
     #[cfg(unix)]
     {
         let Some(writer) = external_child_group_writer()? else {
-            return Ok(None);
+            return Ok(ExternalChildGroupStart::NotMirrored);
         };
-        let birth_identity = crate::storage::process_birth_identity(pid)?;
+        let birth_identity = match classify_external_child_birth_identity(
+            crate::storage::process_birth_identity(pid),
+            || unix_child_exited_without_reaping(pid),
+        )? {
+            ExternalChildBirthIdentity::Captured(identity) => identity,
+            ExternalChildBirthIdentity::ChildExited => {
+                // The owning process has observed this direct child exit without
+                // reaping it, so its PID cannot be reused. Its pre-exec
+                // provisional row remains the MCP parent's fail-closed evidence
+                // for any descendants until ordinary owned-tree cleanup.
+                return Ok(ExternalChildGroupStart::ExitedBeforeMirror);
+            }
+        };
         report_external_child_group(writer, '+', pid, &birth_identity)?;
-        Ok(Some(birth_identity))
+        Ok(ExternalChildGroupStart::Mirrored(birth_identity))
     }
 
     #[cfg(not(unix))]
     {
         let _ = pid;
-        Ok(None)
+        Ok(ExternalChildGroupStart::NotMirrored)
     }
 }
 
@@ -2402,6 +2479,33 @@ mod tests {
     const CHILD_GROUP_FD_EXPECT_ENV: &str = "PRVIEW_CHILD_GROUP_FD_EXPECT";
     #[cfg(unix)]
     const CHILD_GROUP_FD_IDENTITY_ENV: &str = "PRVIEW_CHILD_GROUP_FD_IDENTITY";
+
+    #[cfg(unix)]
+    #[test]
+    fn waitable_exit_after_birth_identity_failure_is_completed() {
+        let completed = classify_external_child_birth_identity(
+            Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            || Ok(true),
+        )
+        .expect("an unreaped direct-child exit is definitive completion");
+        assert!(matches!(completed, ExternalChildBirthIdentity::ChildExited));
+
+        let ambiguous = classify_external_child_birth_identity(
+            Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            || Ok(false),
+        )
+        .expect_err("a child not observed exited must fail closed");
+        assert_eq!(ambiguous.raw_os_error(), Some(libc::EPERM));
+
+        let captured = classify_external_child_birth_identity(Ok("birth".to_string()), || {
+            panic!("a successful native identity must not probe child status")
+        })
+        .expect("captured identity");
+        assert!(matches!(
+            captured,
+            ExternalChildBirthIdentity::Captured(identity) if identity == "birth"
+        ));
+    }
 
     #[cfg(unix)]
     #[test]
