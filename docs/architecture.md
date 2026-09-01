@@ -98,10 +98,16 @@ main.rs
 Cli::parse()              ─── clap parses arguments
     │
     ▼
-App::new(&cli)            ─── builds Config + opens Repository
+supervise_startup_stage(…) ─── temporary startup governor owns Config probes
     │
     ▼
-app.run()
+Config::from_cli(&cli)    ─── resolves PR metadata and builds Config
+    │
+    ▼
+App::from_config(config)  ─── opens Repository + creates the run governor
+    │
+    ▼
+with_cancellation(app.run(), run governor)
     │
     ├─► resolve_target()       ─── resolves the target branch
     ├─► resolve_bases()        ─── resolves bases (repo default plus tool fallbacks)
