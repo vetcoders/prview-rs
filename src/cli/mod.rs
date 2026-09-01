@@ -233,8 +233,12 @@ pub struct Cli {
     )]
     pub fail_on_warnings: bool,
 
-    /// Regex pattern to filter which tests to run (passed to the test runner, e.g. vitest --grep)
-    #[arg(long = "tests-pattern", value_name = "REGEX")]
+    /// Runner-aware pattern used to filter supported test checks
+    #[arg(
+        long = "tests-pattern",
+        value_name = "PATTERN",
+        long_help = "Filter supported test checks using each runner's native semantics. Vitest accepts a regular expression through --grep. Cargo/libtest accepts only a literal substring; regex metacharacters, option-shaped values, and filtered runs with no executed tests fail closed. Mixed JS/Rust reviews therefore accept only the shared literal subset. Pytest is currently not filtered by this flag."
+    )]
     pub tests_pattern: Option<String>,
 
     /// PR URL to embed in artifact metadata (e.g. for traceability in RUN.json)
@@ -666,6 +670,29 @@ mod tests {
         let balanced =
             Cli::try_parse_from(["prview", "--resource-budget", "balanced"]).expect("balanced CLI");
         assert_eq!(balanced.resource_budget, ResourceBudget::Balanced);
+    }
+
+    #[test]
+    fn tests_pattern_help_names_runner_specific_contract() {
+        let cli = Cli::try_parse_from(["prview", "--tests-pattern", "critical_path"])
+            .expect("tests pattern");
+        assert_eq!(cli.tests_pattern.as_deref(), Some("critical_path"));
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--tests-pattern <PATTERN>"), "got: {help}");
+        assert!(
+            help.contains("Vitest accepts a regular expression"),
+            "got: {help}"
+        );
+        assert!(
+            help.contains("Cargo/libtest accepts only a literal substring"),
+            "got: {help}"
+        );
+        assert!(help.contains("Mixed JS/Rust reviews"), "got: {help}");
+        assert!(
+            help.contains("Pytest is currently not filtered"),
+            "got: {help}"
+        );
     }
 
     #[test]

@@ -208,9 +208,16 @@ override and raise a repository's stricter `maxWorkers` setting. Tools without
 a stable portable cap (including tsc
 and ESLint across supported project versions) remain serialized. High current
 load, or an unavailable load reading, backpressures the effective plan to
-`safe`. Positive inherited `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` values
-remain operator ceilings: prview may lower them to the active plan, but never
-raises them.
+`safe`. Inherited `CARGO_BUILD_JOBS`, repository Cargo `[build].jobs`, and
+positive inherited `RUST_TEST_THREADS` values remain operator ceilings: prview
+may lower an effective limit to the active plan, but never raises it. Cargo config is
+resolved from the exact reviewed cwd, including a materialized remote snapshot,
+using Cargo's nearest-scalar and legacy-`config` precedence. An unreadable,
+invalid, zero-valued, or include-dependent `build.jobs` contract fails closed
+to one worker instead of guessing a wider limit. Signed inherited
+`CARGO_BUILD_JOBS` values use Cargo's logical-core-relative semantics; invalid
+or zero inherited values fail closed in the same way. An empty `CARGO_HOME`
+falls back to the operator home rather than being mistaken for the reviewed cwd.
 
 Cold Python environment setup and every later `uv run` apply the same cap to
 `UV_CONCURRENT_DOWNLOADS`, `UV_CONCURRENT_BUILDS`,
@@ -248,6 +255,28 @@ This envelope covers review generation and its check/context subprocesses. The
 explicit mutating `prview fix` command still invokes formatter/fixer toolchains
 synchronously and is not yet governed by `--resource-budget`; do not treat the
 review envelope as a product-wide cap for that separate command.
+
+### Test selection
+
+`--tests-pattern PATTERN` is runner-aware rather than one portable regex:
+
+| Runner | Selection contract |
+|--------|--------------------|
+| Vitest | Regular expression passed to `--grep` |
+| Cargo/libtest | Literal substring only; regex metacharacters and values beginning with `-` are rejected before Cargo starts |
+| Pytest | Not currently filtered by this flag |
+
+A Mixed JS/Rust review runs both Vitest and Cargo with the same value, so the
+portable contract is their literal intersection. A regex-specific value makes
+the Cargo check `ERROR`; use a literal substring common to both runners, omit
+the shared selector, or run runner-specific test commands separately.
+
+A filtered Cargo run is `ERROR`, not `PASS`, unless standard libtest summaries
+prove that at least one selected test executed. This prevents both zero-match
+false greens and option-shaped values such as `--no-run` from turning a test
+gate into compile-only success. Custom Cargo harnesses without a verifiable
+libtest summary therefore require an unfiltered run or a separate runner-aware
+profile.
 
 ## Quick cheat sheet
 
@@ -319,6 +348,7 @@ prview --help
 | `--skip-security` | Skip heavy security checks |
 | `--security-full` | Full security tier: runs full-tree Semgrep and adds cargo-geiger's unsafe scan (slow; off even under `--deep`) |
 | `--resource-budget safe\|balanced` | Select the whole-machine envelope (`safe` is the default; `balanced` is capped and load-aware) |
+| `--tests-pattern PATTERN` | Filter Vitest by regex or Cargo/libtest by literal substring; Mixed uses the literal intersection and Pytest remains unfiltered |
 
 By default, Semgrep is scoped to the change when prview can resolve a clean git
 baseline: it passes Semgrep `--baseline-commit <merge-base>` so existing

@@ -346,6 +346,10 @@ closed instead of guessing.
 Pytest is then explicitly bound to the one highest-precedence config inside the
 reviewed root (including pytest 9 TOML and hidden variants), or to an empty
 config when the root has none, so it never walks into an ambient parent project.
+Pytest 7.2-8.x recognizes `.pytest.ini` as a candidate but does not select an
+empty hidden file unconditionally; that behavior begins with pytest 9. The
+versioned discovery model preserves this distinction instead of treating every
+recognized basename as an automatic winner.
 Existing but unreadable, non-UTF-8, malformed, or conflicting recognized config
 is an execution error, not absence. Pytest-xdist gets the same upper bound
 through its auto-worker environment and a final CLI override only when the
@@ -1095,11 +1099,25 @@ Job Object contract cannot disappear with an unrelated dependency change.
   `--maxWorkers`, and `--jobs` respectively. Cargo test binaries additionally
   receive `RUST_TEST_THREADS`. TSC, ESLint, Stylelint, Python gates and other
   uncapped pools stay `Exclusive`. Cargo's build and libtest child caps are the
-  minimum of the active resource plan and any positive inherited
-  `CARGO_BUILD_JOBS` or `RUST_TEST_THREADS`, so an operator's stricter limit is
-  never raised. Vitest stays at one CLI worker in every plan: its CLI option
+  minimum of the active resource plan, any valid inherited
+  `CARGO_BUILD_JOBS`, and the effective Cargo `[build].jobs` visible from the
+  exact reviewed cwd (including a remote snapshot). The resolver follows
+  Cargo's nearest scalar and legacy-`config` precedence; unreadable, invalid,
+  zero-valued, or include-dependent config fails closed to one worker.
+  Inherited `CARGO_BUILD_JOBS` uses the same signed logical-core-relative
+  interpretation; invalid and zero values also fail closed. Empty `CARGO_HOME`
+  follows Cargo's operator-home fallback rather than resolving to the reviewed
+  cwd.
+  `RUST_TEST_THREADS` is bounded independently by the plan and inherited
+  ceiling, so an operator's stricter limit is never raised. Vitest stays at one
+  CLI worker in every plan: its CLI option
   overrides project configuration, so passing the wider balanced limit could
   raise a repository's intentional `maxWorkers: 1` ceiling.
+  Test selection is runner-specific: Vitest receives a regex, while Cargo gets
+  only a literal substring validated before snapshot planning. A filtered Cargo
+  exit 0 becomes `Error` unless libtest summaries prove positive execution. In
+  a Mixed JS/Rust profile the one shared selector is therefore restricted to
+  the literal intersection; per-runner selectors remain a future contract.
 - **Context commands** (`artifacts::context_artifacts`) take a permit before each
   spawn, via the synchronous `try_acquire` — `artifacts::generate` is a blocking
   pipeline with a poll loop and has nothing to `.await` on. The weight comes from

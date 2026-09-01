@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Direct Cargo gates preserve the effective repository `[build].jobs` ceiling
+  visible from the exact reviewed cwd, including remote snapshots, instead of
+  overriding a stricter project limit with prview's resource-plan width.
+  Signed inherited job limits retain Cargo's logical-core-relative semantics;
+  unknown, invalid, or zero Cargo config influence fails closed to one worker.
+- `--tests-pattern` no longer allows a Cargo regex to match zero tests or an
+  option-shaped value such as `--no-run` to produce a false green. Cargo accepts
+  literal substrings only and filtered runs require positive libtest execution
+  evidence; Vitest retains regex semantics, Mixed JS/Rust reviews require their
+  shared literal subset, and Pytest is explicitly unfiltered.
 - Repo-backed Rust API analysis now discovers Cargo's real binary targets from
   `src/main.rs`, `src/bin/*.rs`, `src/bin/*/main.rs`, and `[[bin]]` entries,
   respecting `autobins`, target editions, explicit paths, and
@@ -195,7 +205,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Inherited, `pub(crate)`, and `pub(super)` fields share one external-private
   Rust API visibility while their types and tuple positions remain observable.
 - `uv sync` preserves an operator's stricter inherited `UV_CONCURRENT_*` caps,
-  direct Cargo gates preserve a stricter inherited `CARGO_BUILD_JOBS`, and
+  direct Cargo gates preserve stricter inherited and repository-configured
+  `CARGO_BUILD_JOBS`, and
   Cargo test binaries preserve a stricter inherited `RUST_TEST_THREADS`,
   instead of raising any of them to the prview worker limit.
 - Snapshot extraction preserves the `git archive` stdout pipe after applying
