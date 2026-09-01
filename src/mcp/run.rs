@@ -362,6 +362,28 @@ fn stderr_tail(run_dir: &Path) -> String {
     tail.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
+/// Close the complete quick-review process tree after Tokio can no longer wait
+/// for its direct root. The marker deliberately remains on disk: once the root
+/// is reaped, lifecycle readers classify it as diagnostic `Stale` state without
+/// blocking the next review.
+async fn quick_wait_failure(
+    child: &mut tokio::process::Child,
+    child_pid: Option<u32>,
+    error: std::io::Error,
+) -> ToolError {
+    let reaped =
+        crate::proc::terminate_and_reap_tokio_child(child, child_pid, Duration::from_secs(5)).await;
+    if !reaped {
+        eprintln!(
+            "prview MCP: quick wait failure could not confirm process-tree termination and direct-root reap"
+        );
+    }
+    ToolError::new(
+        error_class::RUN_FAILED,
+        format!("failed to wait on prview: {error}"),
+    )
+}
+
 /// Start a review. Returns the ready success body (without `schema_version`,
 /// which the tool layer stamps).
 pub async fn start(
@@ -494,10 +516,7 @@ pub async fn start(
                         }),
                     ))
                 }
-                Ok(Err(e)) => Err(ToolError::new(
-                    error_class::RUN_FAILED,
-                    format!("failed to wait on prview: {e}"),
-                )),
+                Ok(Err(e)) => Err(quick_wait_failure(&mut child, child_pid, e).await),
                 Ok(Ok(status)) => {
                     // A BLOCK verdict may exit non-zero and still be a valid
                     // review. The success oracle is therefore not exit zero,
@@ -1068,6 +1087,88 @@ mod tests {
         assert_eq!(error.class, error_class::RUN_FAILED);
         assert!(error.message.contains("running marker"));
         wait_until_process_is_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_wait_failure_terminates_tree_and_leaves_nonblocking_stale_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let repo_name = "mcp-quick-wait-error";
+        let branch_key = "main";
+        let run_dir = home
+            .path()
+            .join("runs")
+            .join(repo_name)
+            .join(branch_key)
+            .join("wait-error");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let fixture = tempfile::tempdir().unwrap();
+        let pidfile = fixture.path().join("grandchild.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "sleep 30 & printf '%s\\n' \"$!\" > '{}'; wait",
+                pidfile.display()
+            ),
+        ]);
+        crate::proc::harden(&mut command);
+        let mut child = command.spawn().expect("spawn hardened quick-review tree");
+        let child_pid = child.id();
+        let marker = running_marker(
+            child_pid.expect("quick fixture root pid"),
+            Profile::Quick,
+            "abc1234".to_string(),
+            vec!["main".to_string()],
+        )
+        .unwrap();
+        write_marker(&run_dir, &marker).unwrap();
+        assert_eq!(
+            active_run(repo_name, branch_key).as_deref(),
+            Some("wait-error")
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let grandchild = loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "quick fixture never published a complete grandchild pid"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(crate::storage::is_process_alive(grandchild));
+
+        let error = quick_wait_failure(
+            &mut child,
+            child_pid,
+            std::io::Error::other("injected quick wait failure"),
+        )
+        .await;
+
+        assert_eq!(error.class, error_class::RUN_FAILED);
+        assert!(error.message.contains("injected quick wait failure"));
+        wait_until_process_is_reaped(child_pid.unwrap());
+        wait_until_process_is_reaped(grandchild);
+        assert!(
+            read::running_marker_path(&run_dir).exists(),
+            "failed quick run keeps its diagnostic marker"
+        );
+        assert!(matches!(
+            read::run_status(&run_dir),
+            read::RunStatus::Stale { .. }
+        ));
+        assert_eq!(
+            active_run(repo_name, branch_key),
+            None,
+            "a reaped wait-error run must not block the next review"
+        );
     }
 
     #[test]

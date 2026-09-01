@@ -1744,29 +1744,138 @@ impl<'a> SnapshotBuilder<'a> {
                     evidence,
                 );
             }
+            // Binary ABI reachability is independent of Rust item reachability:
+            // a mixed Rust-linkable/native target may export a symbol from a
+            // private owner that `collect_impl` intentionally does not expose.
             if let Item::Impl(item_impl) = item {
                 for member in &item_impl.items {
                     let syn::ImplItem::Fn(function) = member else {
                         continue;
                     };
-                    if binary_export_attributes(&function.attrs).is_empty() {
+                    let binary_exports = binary_export_attributes(&function.attrs);
+                    if binary_exports.is_empty() {
                         continue;
                     }
                     let member_cfg = canonical_cfg(&function.attrs);
-                    let effective_guard = combined_guards(&cfg_guard, &member_cfg.guards);
-                    for evidence in member_cfg.errors {
+                    let member_guard = combined_guards(&cfg_guard, &member_cfg.guards);
+                    for evidence in &member_cfg.errors {
                         self.unknown_guarded(
                             RustApiUnknownKind::CfgPredicate,
                             Some(crate_name),
                             module_path,
                             source_path,
-                            &effective_guard,
+                            &member_guard,
                             format!(
                                 "native-export-associated-function:{}\n{evidence}",
                                 normalize_identifier(function.sig.ident.to_string())
                             ),
                         );
                     }
+                    let mut transform_boundaries =
+                        transforming_attrs(&function.attrs)
+                            .map(|attr| {
+                                format!(
+                                    "transform-boundary:attribute\n{}",
+                                    canonical_tokens(attr.to_token_stream())
+                                )
+                            })
+                            .chain(transforming_cfg_attrs(&function.attrs).into_iter().map(
+                                |evidence| format!("transform-boundary:attribute\n{evidence}"),
+                            ))
+                            .collect::<Vec<_>>();
+                    transform_boundaries.sort();
+                    transform_boundaries.dedup();
+                    if transform_boundaries.is_empty() {
+                        continue;
+                    }
+                    let member_name = normalize_identifier(function.sig.ident.to_string());
+                    let owner_contract = normalized_associated_contract(item_impl, member, false);
+                    let export_guards = binary_exports
+                        .into_iter()
+                        .map(|(guard, _)| guard)
+                        .collect::<BTreeSet<_>>();
+                    for export_guard in export_guards {
+                        let effective_guard = combined_guards(&member_guard, &export_guard);
+                        for boundary in &transform_boundaries {
+                            self.unknown_guarded(
+                                RustApiUnknownKind::MacroGeneratedItems,
+                                Some(crate_name),
+                                module_path,
+                                source_path,
+                                &effective_guard,
+                                bind_associated_native_transform_evidence(
+                                    boundary,
+                                    &member_name,
+                                    member,
+                                    &owner_contract,
+                                    self.macro_implementation_digest.as_deref(),
+                                ),
+                            );
+                        }
+                    }
+                }
+                for member in &item_impl.items {
+                    let syn::ImplItem::Macro(macro_item) = member else {
+                        continue;
+                    };
+                    let member_cfg = canonical_cfg(&macro_item.attrs);
+                    let member_guard = combined_guards(&cfg_guard, &member_cfg.guards);
+                    if !member_cfg.errors.is_empty() {
+                        for evidence in member_cfg.errors {
+                            self.unknown_guarded(
+                                RustApiUnknownKind::CfgPredicate,
+                                Some(crate_name),
+                                module_path,
+                                source_path,
+                                &member_guard,
+                                format!(
+                                    "native-export-associated-macro:{}\n{evidence}",
+                                    canonical_tokens(macro_item.mac.path.to_token_stream())
+                                ),
+                            );
+                        }
+                        continue;
+                    }
+                    let macro_name = macro_item
+                        .mac
+                        .path
+                        .segments
+                        .last()
+                        .map(|segment| segment.ident.to_string())
+                        .unwrap_or_default();
+                    let kind = if matches!(
+                        macro_name.as_str(),
+                        "include" | "include_str" | "include_bytes"
+                    ) {
+                        RustApiUnknownKind::IncludeMacro
+                    } else {
+                        RustApiUnknownKind::MacroGeneratedItems
+                    };
+                    let input = canonical_tokens(macro_item.to_token_stream());
+                    let evidence = if kind == RustApiUnknownKind::IncludeMacro {
+                        format!(
+                            "native-export-associated-macro\ninput:{input}\ninclude-kind:{macro_name}\nincluded-digest:{}",
+                            self.include_digest(source_path, &macro_item.mac)
+                        )
+                    } else {
+                        format!(
+                            "native-export-associated-macro\ntransform-boundary:macro-invocation\ninput:{input}\nmacro-implementation-digest:{}\ndeclarative-implementation-digest:{}",
+                            self.macro_implementation_digest
+                                .as_deref()
+                                .unwrap_or("unresolved:not-captured"),
+                            self.macro_invocation_implementation_digest
+                                .as_deref()
+                                .unwrap_or("unresolved:not-captured"),
+                        )
+                    };
+                    self.unknown_guarded(
+                        kind,
+                        Some(crate_name),
+                        module_path,
+                        source_path,
+                        &member_guard,
+                        evidence,
+                    );
                 }
             }
             // Attribute macros can emit externally reachable items even when
@@ -2213,7 +2322,7 @@ impl<'a> SnapshotBuilder<'a> {
                         );
                     }
                 }
-                Item::Macro(item_macro) if rust_linkable => {
+                Item::Macro(item_macro) => {
                     let macro_name = item_macro
                         .mac
                         .path
@@ -2225,7 +2334,7 @@ impl<'a> SnapshotBuilder<'a> {
                     if let Some(macro_ident) = item_macro
                         .ident
                         .as_ref()
-                        .filter(|_| !export_guards.is_empty())
+                        .filter(|_| rust_linkable && !export_guards.is_empty())
                     {
                         let name = normalize_identifier(macro_ident.to_string());
                         for export_guard in export_guards {
@@ -10934,6 +11043,21 @@ fn bind_transform_evidence<T: ToTokens>(
         canonical_tokens(input.to_token_stream()),
         implementation_digest.unwrap_or("unresolved:not-captured")
     )
+}
+
+fn bind_associated_native_transform_evidence(
+    boundary: &str,
+    member_name: &str,
+    member: &syn::ImplItem,
+    owner_contract: &str,
+    implementation_digest: Option<&str>,
+) -> String {
+    let mut evidence = bind_transform_evidence(boundary.to_owned(), member, implementation_digest);
+    evidence.push_str("\nnative-export-associated-function:");
+    evidence.push_str(member_name);
+    evidence.push_str("\nassociated-owner-contract:");
+    evidence.push_str(owner_contract);
+    evidence
 }
 
 fn bind_additive_derive_evidence<T: ToTokens>(

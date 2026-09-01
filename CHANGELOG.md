@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MCP quick reviews route Tokio child-wait errors through the same bounded
+  whole-tree termination and direct-root reap used for timeouts. Their running
+  marker remains as non-blocking diagnostic stale state instead of substituting
+  stale-marker expiry for explicit cleanup before the next review.
 - MCP active-run discovery filters markerless history and the completed-run
   `latest` alias before lifecycle probing. Runs without `SANITY.json` no longer
   reload the global publication index while they are polled, while completed
@@ -97,9 +101,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unsafe(link_section)` remain ordinary confirmed attributes on public items.
   A private `no_mangle`/`export_name` function or static emits typed
   binary-export uncertainty instead of disappearing from the API analysis,
-  including through nested `cfg_attr`. Conditional `macro_export` declarations
-  remain root API, and top-level function-like macro invocations bind their
-  input to a revision-backed implementation-substrate digest.
+  including through nested `cfg_attr`. In native-only targets, associated binary
+  exports with a transforming attribute bind their complete macro-visible member
+  input, a separate normalized owner/ABI contract, and the revision-backed
+  transformer implementation. Conditional `macro_export`
+  declarations remain root API, while item-position macro invocations in both
+  Rust-linkable and native-only targets bind their input to a revision-backed
+  implementation substrate; native-only `include!` also retains its included
+  source proof instead of disappearing behind the target-level uncertainty.
 - Rust named private-field order is preserved only when `repr(C)` defines it.
   Pure reorders under `repr(transparent)` or standalone `repr(packed)` /
   `repr(align)` are neutral, while private field types and semantic repr

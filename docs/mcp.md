@@ -135,6 +135,11 @@ by a finalized pack plus its exact durable run-id/path index row, not by the
 child's exit code (prview exits non-zero on a `BLOCK` verdict, yet the run is a
 valid completed review). Response:
 
+If the synchronous child wait itself fails, the server routes it through the
+same bounded whole-tree termination and direct-root reap before returning
+`run_failed`. Its `RUNNING.json` remains as diagnostic `Stale` state after the
+root is reaped and does not block a later review.
+
 Completion requires durable publication into prview's run index. If the index
 is unreadable or the finished pack cannot be committed to discoverable history,
 the call returns fail-loud `storage_corrupt` or `run_failed`; SANITY without the

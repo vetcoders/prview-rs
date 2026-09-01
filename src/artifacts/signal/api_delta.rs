@@ -4309,6 +4309,161 @@ mod tests {
     }
 
     #[test]
+    fn repository_backed_native_only_macro_boundaries_are_never_falsely_clean() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n";
+        let lock = "version = 4\n";
+
+        let declarative_changed = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native(value: u8) {} } } export!();\n",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native(value: u16) {} } } export!();\n",
+            ),
+        ]);
+        assert!(declarative_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("transform-boundary:macro-invocation")
+                        && reason.contains("declarative-implementation-digest:sha256:")
+                })
+        }));
+
+        let associated_declarative_changed = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native(value: u8) {} } } struct Api; impl Api { export!(); }\n",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native(value: u16) {} } } struct Api; impl Api { export!(); }\n",
+            ),
+        ]);
+        assert!(
+            associated_declarative_changed
+                .unknown
+                .iter()
+                .any(|finding| {
+                    finding.identity.name == "MacroGeneratedItems"
+                        && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                            reason.contains("native-export-associated-macro")
+                                && reason.contains("transform-boundary:macro-invocation")
+                                && reason.contains("declarative-implementation-digest:sha256:")
+                        })
+                })
+        );
+
+        let included_changed = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "include!(\"native.rs\");\n",
+                "include!(\"native.rs\");\n",
+            ),
+            (
+                "src/native.rs",
+                "#[unsafe(no_mangle)] pub extern \"C\" fn native(value: u8) {}\n",
+                "#[unsafe(no_mangle)] pub extern \"C\" fn native(value: u16) {}\n",
+            ),
+        ]);
+        assert!(included_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "IncludeMacro"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("include-kind:include")
+                        && reason.contains("included-digest:")
+                        && !reason.contains("included-digest:unresolved")
+                })
+        }));
+
+        let associated_include_changed = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "struct Api; impl Api { include!(\"native.rs\"); }\n",
+                "struct Api; impl Api { include!(\"native.rs\"); }\n",
+            ),
+            (
+                "src/native.rs",
+                "#[unsafe(no_mangle)] pub extern \"C\" fn native(value: u8) {}\n",
+                "#[unsafe(no_mangle)] pub extern \"C\" fn native(value: u16) {}\n",
+            ),
+        ]);
+        assert!(associated_include_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "IncludeMacro"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("native-export-associated-macro")
+                        && reason.contains("include-kind:include")
+                        && reason.contains("included-digest:")
+                        && !reason.contains("included-digest:unresolved")
+                })
+        }));
+
+        let assembly_changed = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "core::arch::global_asm!(\".global native_v1\");\n",
+                "core::arch::global_asm!(\".global native_v2\");\n",
+            ),
+        ]);
+        assert!(assembly_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("global_asm")
+                        && reason.contains("transform-boundary:macro-invocation")
+                })
+        }));
+
+        let unchanged_boundaries = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native() {} } } export!(); core::arch::global_asm!(\".global assembly_native\");\n",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native() {} } } export!(); core::arch::global_asm!(\".global assembly_native\");\n",
+            ),
+        ]);
+        assert!(
+            unchanged_boundaries.findings().is_empty(),
+            "unchanged proven native macro boundaries must neutralize: {:?}",
+            unchanged_boundaries.findings()
+        );
+
+        let unchanged_associated_boundary = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native() {} } } struct Api; impl Api { export!(); }\n",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native() {} } } struct Api; impl Api { export!(); }\n",
+            ),
+        ]);
+        assert!(
+            unchanged_associated_boundary.findings().is_empty(),
+            "an unchanged proven associated native macro boundary must neutralize: {:?}",
+            unchanged_associated_boundary.findings()
+        );
+
+        let unused_declarative_changed = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "macro_rules! unused { () => { fn helper(value: u8) {} } }\n",
+                "macro_rules! unused { () => { fn helper(value: u16) {} } }\n",
+            ),
+        ]);
+        assert!(
+            unused_declarative_changed.findings().is_empty(),
+            "an unused declarative macro is not itself a native export boundary: {:?}",
+            unused_declarative_changed.findings()
+        );
+    }
+
+    #[test]
     fn custom_default_helper_stays_out_of_the_confirmed_enum_contract() {
         let workspace = "[workspace]\nmembers=['api','macros']\nresolver='2'\n";
         let api_manifest = "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={path='../macros'}\n";
@@ -4394,6 +4549,106 @@ mod tests {
             api_output.status.success(),
             "an explicit imported derive shadows the builtin name: {}",
             String::from_utf8_lossy(&api_output.stderr)
+        );
+    }
+
+    #[test]
+    fn repository_backed_transformed_associated_native_export_binds_macro_implementation() {
+        let workspace = "[workspace]\nmembers=['api','macros']\nresolver='2'\n";
+        let api_manifest = "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n[dependencies]\nmacros={path='../macros'}\n";
+        let macro_manifest = "[package]\nname='macros'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\nproc-macro=true\n";
+        let api_source = "pub struct Api; impl Api { #[macros::erase] #[unsafe(no_mangle)] pub extern \"C\" fn native(value: u8) {} }\n";
+        let before_macro = "#[proc_macro_attribute] pub fn erase(_: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n";
+        let after_macro = "#[proc_macro_attribute] pub fn erase(_: proc_macro::TokenStream, _: proc_macro::TokenStream) -> proc_macro::TokenStream { proc_macro::TokenStream::new() }\n";
+
+        let changed = repository_delta(&[
+            ("Cargo.toml", workspace, workspace),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            ("api/Cargo.toml", api_manifest, api_manifest),
+            ("api/src/lib.rs", api_source, api_source),
+            ("macros/Cargo.toml", macro_manifest, macro_manifest),
+            ("macros/src/lib.rs", before_macro, after_macro),
+        ]);
+        assert!(changed.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("native-export-associated-function:native")
+                        && reason.contains("transform:transform-boundary:attribute")
+                        && reason.contains("input:# [macros :: erase]")
+                        && reason.contains("associated-owner-contract:impl Api")
+                        && reason.contains("macro-implementation-digest:sha256:")
+                })
+        }));
+
+        let mixed_api_manifest = "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['rlib','cdylib']\n[dependencies]\nmacros={path='../macros'}\n";
+        let mixed_private_source = "struct Hidden; impl Hidden { #[macros::erase] #[unsafe(no_mangle)] pub extern \"C\" fn native(value: u8) {} }\n";
+        let mixed_private_changed = repository_delta(&[
+            ("Cargo.toml", workspace, workspace),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            ("api/Cargo.toml", mixed_api_manifest, mixed_api_manifest),
+            ("api/src/lib.rs", mixed_private_source, mixed_private_source),
+            ("macros/Cargo.toml", macro_manifest, macro_manifest),
+            ("macros/src/lib.rs", before_macro, after_macro),
+        ]);
+        assert!(mixed_private_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("native-export-associated-function:native")
+                        && reason.contains("associated-owner-contract:impl Hidden")
+                        && reason.contains("macro-implementation-digest:sha256:")
+                })
+        }));
+
+        let external_manifest = "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n[dependencies]\nmacros='1'\n";
+        let external_lock = "version = 4\n[[package]]\nname='macros'\nversion='1.0.0'\nsource='registry+https://index.crates.io/'\nchecksum='0000000000000000000000000000000000000000000000000000000000000000'\n";
+        let body_changed = repository_delta(&[
+            ("Cargo.toml", external_manifest, external_manifest),
+            ("Cargo.lock", external_lock, external_lock),
+            (
+                "src/lib.rs",
+                "pub struct Api; impl Api { #[macros::erase] #[unsafe(no_mangle)] pub extern \"C\" fn native() { let value = 1; drop(value); } }\n",
+                "pub struct Api; impl Api { #[macros::erase] #[unsafe(no_mangle)] pub extern \"C\" fn native() { let value = 2; drop(value); } }\n",
+            ),
+        ]);
+        assert!(body_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("native-export-associated-function:native")
+                        && reason.contains("input:# [macros :: erase]")
+                        && reason.contains("macro-implementation-digest:sha256:")
+                })
+        }));
+
+        let untransformed_body_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Api; impl Api { #[unsafe(no_mangle)] pub extern \"C\" fn native() { let value = 1; drop(value); } }\n",
+                "pub struct Api; impl Api { #[unsafe(no_mangle)] pub extern \"C\" fn native() { let value = 2; drop(value); } }\n",
+            ),
+        ]);
+        assert!(
+            untransformed_body_changed.findings().is_empty(),
+            "an untransformed native export body remains outside the API contract: {:?}",
+            untransformed_body_changed.findings()
+        );
+
+        let unchanged = repository_delta(&[
+            ("Cargo.toml", workspace, workspace),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            ("api/Cargo.toml", api_manifest, api_manifest),
+            ("api/src/lib.rs", api_source, api_source),
+            ("macros/Cargo.toml", macro_manifest, macro_manifest),
+            ("macros/src/lib.rs", before_macro, before_macro),
+        ]);
+        assert!(
+            unchanged.findings().is_empty(),
+            "unchanged associated native transform proof must neutralize: {:?}",
+            unchanged.findings()
         );
     }
 

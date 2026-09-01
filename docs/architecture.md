@@ -1328,6 +1328,12 @@ and read truth back from storage. Every tool takes an explicit `repo` path,
 every response carries `schema_version`, and every failure is fail-loud. See
 `docs/mcp.md` for the tool reference.
 
+Synchronous quick reviews retain their hardened child through the bounded wait.
+A timeout or child-wait error routes through bounded whole-tree termination and
+direct-root reap before the RPC returns. Failed quick runs retain `RUNNING.json`
+as diagnostic `Stale` state, which lifecycle readers do not treat as an active
+run.
+
 Deep reviews are asynchronous at the RPC boundary, not unowned processes. A
 dedicated waiter thread retains each `Child` and reaps its direct root, including
 an immediate failure. After normal root exit it also terminates residual Unix
@@ -1451,9 +1457,16 @@ Target projection follows Cargo/Rust linkage semantics. `lib`, `rlib`, and
 targets expose only supported procedural macro entry points. A target whose
 effective types are only `cdylib`, `staticlib`, or `bin` is not projected as a
 Rust dependency surface. Its public and private native exports are still
-scanned, including exported associated functions in inherent and trait impls,
-and the native target remains typed uncertainty so a transition to or from a
-Rust-linkable target cannot be reported as falsely clean.
+scanned, including exported associated functions in inherent and trait impls.
+In a native-only target, an associated binary export carrying a transforming
+attribute binds the full macro-visible member input, a separate normalized
+owner/ABI contract, and the revision-backed transformer implementation.
+Item-position invocations backed by `macro_rules!`, plus `include!`,
+`global_asm!`, and other opaque macro invocations, are native-export boundaries
+even when the target is not Rust-linkable; their invocation, included source,
+or implementation proof therefore cannot neutralize after the generated native
+surface changes. The native target remains typed uncertainty, so a transition
+to or from a Rust-linkable target cannot be reported as falsely clean.
 
 Reachability starts at each library root. Ordinary inline modules and
 `mod foo;` files (`foo.rs` or `foo/mod.rs`) are walked as whole syntax trees.
@@ -1627,11 +1640,13 @@ transform evidence is materialized only after its inherent or trait owner
 reaches the external API, directly or by reexport. Public type-alias chains are
 resolved transitively and conservatively emit owner uncertainty because source
 analysis does not prove generic specialization. Function-like associated
-macros, top-level macro invocations, and nested trait/trait-impl attributes bind
-both their invocation/input and the appropriate revision-backed implementation
-substrate. Conditional and nested `cfg_attr(..., macro_export)` declarations
-remain crate-root macro API. A lock-backed external candidate binds all
-reachable product/path manifests, effective Cargo config bytes, and lockfiles.
+macros, top-level macro invocations (including native-only item-position
+boundaries), and nested trait/trait-impl attributes bind both their
+invocation/input and the appropriate revision-backed implementation substrate.
+Conditional and nested `cfg_attr(..., macro_export)` declarations remain
+crate-root macro API only for Rust-linkable targets. A lock-backed external
+candidate binds all reachable product/path manifests, effective Cargo config
+bytes, and lockfiles.
 When a reachable local proc-macro exists, the current safety floor additionally hashes
 the complete live tracked-entry inventory by Git object identity (excluding
 redundant directory-tree objects), including nonstandard `lib.path`, `#[path]`,
