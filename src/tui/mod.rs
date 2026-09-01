@@ -329,19 +329,25 @@ async fn cancel_analysis(analysis: &mut Option<AnalysisTask>) -> Result<()> {
         return Ok(());
     };
 
-    task.governor.cancel();
-    let mut handle = task.handle;
+    // Publish cancellation before returning, but move platform tree termination
+    // off the event-loop thread. Windows may need to wait for taskkill; raw input
+    // must remain live throughout that wait so a second Ctrl-C can force exit.
+    let termination = task.governor.begin_background_cancel();
+    wait_for_cancelled_analysis(task.handle, termination).await
+}
+
+async fn wait_for_cancelled_analysis(
+    mut handle: tokio::task::JoinHandle<Result<()>>,
+    mut termination: tokio::task::JoinHandle<()>,
+) -> Result<()> {
+    let mut analysis_result = None;
+    let mut termination_result = None;
     loop {
+        if analysis_result.is_some() && termination_result.is_some() {
+            break;
+        }
         tokio::select! {
             biased;
-            joined = &mut handle => {
-                return match joined {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(err)) if crate::governor::is_cancellation(&err) => Ok(()),
-                    Ok(Err(err)) => Err(err),
-                    Err(join_err) => Err(anyhow::anyhow!("analysis task aborted: {join_err}")),
-                };
-            }
             input = next_terminal_event(Duration::from_millis(100)) => {
                 if is_raw_ctrl_c(input?.as_ref()) {
                     // `blocking_stage` deliberately keeps non-Send libgit2 work
@@ -354,8 +360,26 @@ async fn cancel_analysis(analysis: &mut Option<AnalysisTask>) -> Result<()> {
                     return Err(crate::governor::Cancelled.into());
                 }
             }
+            joined = &mut handle, if analysis_result.is_none() => {
+                analysis_result = Some(match joined {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(err)) if crate::governor::is_cancellation(&err) => Ok(()),
+                    Ok(Err(err)) => Err(err),
+                    Err(join_err) => Err(anyhow::anyhow!("analysis task aborted: {join_err}")),
+                });
+            }
+            finished = &mut termination, if termination_result.is_none() => {
+                termination_result = Some(finished);
+            }
         }
     }
+
+    if let Err(join_error) = termination_result.expect("termination branch completed") {
+        return Err(anyhow::anyhow!(
+            "cancellation tree-termination worker failed: {join_error}"
+        ));
+    }
+    analysis_result.expect("analysis branch completed")
 }
 
 fn is_raw_ctrl_c(event: Option<&Event>) -> bool {
@@ -733,6 +757,73 @@ mod tests {
         );
         released.kind = KeyEventKind::Release;
         assert!(!is_raw_ctrl_c(Some(&Event::Key(released))));
+    }
+
+    #[tokio::test]
+    async fn second_ctrl_c_stays_live_while_tree_termination_blocks() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let termination = tokio::task::spawn_blocking(move || {
+            entered_tx
+                .send(())
+                .expect("test still waits for the termination worker");
+            release_rx
+                .recv()
+                .expect("test releases the blocking termination worker");
+        });
+        entered_rx
+            .await
+            .expect("blocking termination worker must start");
+
+        let analysis = tokio::spawn(std::future::pending::<Result<()>>());
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )))
+            .expect("inject the second Ctrl-C");
+
+        let wait = TEST_INPUT_EVENTS.scope(
+            std::cell::RefCell::new(input_rx),
+            wait_for_cancelled_analysis(analysis, termination),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("second Ctrl-C must not wait for tree termination")
+            .expect_err("second Ctrl-C returns typed forced cancellation");
+
+        release_tx
+            .send(())
+            .expect("release the blocking termination worker");
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn ready_second_ctrl_c_wins_over_completed_analysis_and_termination() {
+        let analysis = tokio::spawn(async { Ok(()) });
+        let termination = tokio::spawn(async {});
+        while !analysis.is_finished() || !termination.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )))
+            .expect("prefill the second Ctrl-C");
+
+        let error = TEST_INPUT_EVENTS
+            .scope(
+                std::cell::RefCell::new(input_rx),
+                wait_for_cancelled_analysis(analysis, termination),
+            )
+            .await
+            .expect_err("a ready second Ctrl-C must win the completion handoff");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
     }
 
     struct ChannelInterrupts(tokio::sync::mpsc::UnboundedReceiver<()>);

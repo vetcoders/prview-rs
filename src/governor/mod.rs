@@ -210,6 +210,33 @@ struct InflightChild {
     external_birth_identity: Option<String>,
 }
 
+/// The process-tree half of a cancellation after the run has already been
+/// closed to new work.
+///
+/// Keeping the drained children in an owned batch lets async interrupt owners
+/// move the blocking platform termination calls off their executor thread while
+/// they continue polling for the operator's second interrupt. Synchronous
+/// callers still finish the same batch inline through [`ResourceGovernor::cancel`].
+struct CancellationBatch(Vec<InflightChild>);
+
+impl CancellationBatch {
+    fn terminate(self) {
+        for child in self.0 {
+            if crate::proc::terminate_process_tree(child.pid)
+                && let Some(identity) = child.external_birth_identity.as_deref()
+            {
+                crate::proc::report_external_child_group_finished(child.pid, identity);
+            }
+        }
+    }
+}
+
+fn spawn_blocking_cancellation(
+    cancellation: impl FnOnce() + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(cancellation)
+}
+
 pub struct ResourceGovernor {
     semaphore: Arc<Semaphore>,
     total_budget: u32,
@@ -418,6 +445,17 @@ impl ResourceGovernor {
     /// because a pid whose process died between the two calls may by then belong
     /// to somebody else.
     pub fn cancel(&self) {
+        self.begin_cancel().terminate();
+    }
+
+    /// Publish cancellation and take exclusive ownership of every child that
+    /// was registered before it.
+    ///
+    /// This phase is deliberately synchronous and bounded: once it returns,
+    /// every waiter/newcomer is refused and late child registration takes its
+    /// own termination path. Platform process-tree termination is kept in the
+    /// returned batch because Windows' `taskkill` fallback is a blocking wait.
+    fn begin_cancel(&self) -> CancellationBatch {
         self.cancelled.store(true, Ordering::SeqCst);
         // Closing wakes every task parked on the budget with an error, so a
         // waiter is refused exactly like a newcomer.
@@ -428,13 +466,19 @@ impl ResourceGovernor {
         self.cancel_tx.send_replace(true);
 
         let children = std::mem::take(&mut *self.lock_inflight());
-        for child in children.into_values() {
-            if crate::proc::terminate_process_tree(child.pid)
-                && let Some(identity) = child.external_birth_identity.as_deref()
-            {
-                crate::proc::report_external_child_group_finished(child.pid, identity);
-            }
-        }
+        CancellationBatch(children.into_values().collect())
+    }
+
+    /// Start cancellation without parking the async interrupt owner in a
+    /// platform tree-kill primitive.
+    ///
+    /// The state transition and registry drain happen before this method
+    /// returns. Only the owned blocking termination batch moves to Tokio's
+    /// blocking pool, so callers can keep polling a second Ctrl-C while still
+    /// awaiting ordinary cleanup when the operator does not force an exit.
+    pub(crate) fn begin_background_cancel(&self) -> tokio::task::JoinHandle<()> {
+        let batch = self.begin_cancel();
+        spawn_blocking_cancellation(move || batch.terminate())
     }
 
     /// Whether the run has been cancelled.
@@ -896,6 +940,22 @@ mod tests {
             governor.acquire(Weight::Heavy).await.unwrap_err(),
             Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn background_cancel_publishes_state_before_returning() {
+        let governor = ResourceGovernor::with_budget(4, 2);
+
+        let termination = governor.begin_background_cancel();
+
+        assert!(governor.is_cancelled());
+        assert_eq!(
+            governor.acquire(Weight::Light).await.unwrap_err(),
+            Cancelled
+        );
+        termination
+            .await
+            .expect("an empty termination batch must finish without panic");
     }
 
     /// The case a plain flag check would miss: the task was ALREADY waiting when

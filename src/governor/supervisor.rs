@@ -71,11 +71,19 @@ pub async fn with_cancellation<T>(
     governor: &Arc<ResourceGovernor>,
     interrupts: impl Interrupts,
 ) -> Result<T> {
-    // The guard stops the supervisor whichever way `work` leaves — a value, an
-    // error or a panic — so a task listening for a signal never outlives the run
-    // it was listening on behalf of.
-    let _supervisor = InterruptSupervisor::start(Arc::clone(governor), interrupts);
-    work.await
+    // A normal value/error finishes through the explicit biased handoff below:
+    // an interrupt already ready when `work` completes must cancel the run, not
+    // lose to Drop aborting the watcher and escape as a publishable result.
+    // Panic unwind still reaches InterruptSupervisor::drop as the last-resort
+    // watcher cleanup.
+    let supervisor = InterruptSupervisor::start(Arc::clone(governor), interrupts);
+    let result = work.await;
+    supervisor.stop().await;
+    if governor.is_cancelled() {
+        Err(super::Cancelled.into())
+    } else {
+        result
+    }
 }
 
 /// A signal owner that can hand responsibility to another input mechanism
@@ -122,7 +130,24 @@ async fn supervise(
         "\n{} stopping running tools and cleaning up (Ctrl-C again to exit now)",
         "^C".yellow().bold(),
     );
-    governor.cancel();
+    let mut termination = governor.begin_background_cancel();
+
+    // Windows' native taskkill fallback is a synchronous process wait. It runs
+    // on the blocking pool, while this task remains the live owner of the second
+    // interrupt. A completed work future may already have sent `stop`; ordinary
+    // handoff still waits for tree termination, but the operator can always
+    // choose the hard exit instead.
+    match wait_for_termination_or_second_interrupt(&mut interrupts, &mut termination).await {
+        None => {
+            eprintln!("{} second interrupt — exiting now", "^C".yellow().bold());
+            interrupts.abandon_run();
+            return;
+        }
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            eprintln!("prview: cancellation tree-termination worker failed: {error}");
+        }
+    }
 
     tokio::select! {
         biased;
@@ -131,6 +156,23 @@ async fn supervise(
     }
     eprintln!("{} second interrupt — exiting now", "^C".yellow().bold());
     interrupts.abandon_run();
+}
+
+/// Wait for the blocking process-tree batch while preserving the second
+/// interrupt as the higher-priority escape hatch.
+///
+/// `None` means the operator interrupted again; `Some` carries the blocking
+/// worker's completion so production can surface a worker panic without
+/// confusing it with a second signal.
+async fn wait_for_termination_or_second_interrupt(
+    interrupts: &mut impl Interrupts,
+    termination: &mut tokio::task::JoinHandle<()>,
+) -> Option<std::result::Result<(), tokio::task::JoinError>> {
+    tokio::select! {
+        biased;
+        _ = interrupts.next() => None,
+        finished = termination => Some(finished),
+    }
 }
 
 impl Drop for InterruptSupervisor {
@@ -211,6 +253,22 @@ mod tests {
         assert!(!abandoned.load(Ordering::SeqCst));
     }
 
+    #[tokio::test]
+    async fn an_interrupt_ready_at_work_completion_cancels_the_result() {
+        let governor = Arc::new(ResourceGovernor::with_budget(2, 1));
+        let (tx, interrupts, abandoned) = scripted();
+        tx.send(())
+            .expect("prefill the interrupt before work returns");
+
+        let error = with_cancellation(async { Ok(7) }, &governor, interrupts)
+            .await
+            .expect_err("a ready interrupt must win the result handoff");
+
+        assert!(is_cancellation(&error), "{error:#}");
+        assert!(governor.is_cancelled());
+        assert!(!abandoned.load(Ordering::SeqCst));
+    }
+
     /// The first interrupt asks the run to stop and lets it unwind — that is
     /// what removes the temporary worktrees an aborted process would leave.
     #[tokio::test]
@@ -261,9 +319,10 @@ mod tests {
             ))
         };
 
-        with_cancellation(work, &governor, interrupts)
+        let error = with_cancellation(work, &governor, interrupts)
             .await
-            .expect("a blocking stage must still see the cancel");
+            .expect_err("a blocking stage must return typed cancellation");
+        assert!(is_cancellation(&error), "{error:#}");
         assert!(governor.is_cancelled());
     }
 
@@ -297,6 +356,45 @@ mod tests {
             abandoned.load(Ordering::SeqCst),
             "the second interrupt must not wait for the run to finish unwinding",
         );
+    }
+
+    #[tokio::test]
+    async fn a_second_interrupt_stays_live_while_tree_termination_blocks() {
+        let (tx, mut interrupts, abandoned) = scripted();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut termination = super::super::spawn_blocking_cancellation(move || {
+            entered_tx
+                .send(())
+                .expect("test still waits for the termination worker");
+            release_rx
+                .recv()
+                .expect("test releases the blocking termination worker");
+        });
+        entered_rx
+            .await
+            .expect("blocking termination worker must start");
+
+        tx.send(()).expect("second interrupt receiver remains live");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_termination_or_second_interrupt(&mut interrupts, &mut termination),
+        )
+        .await
+        .expect("second interrupt must not wait for tree termination");
+        assert!(
+            outcome.is_none(),
+            "the interrupt, not termination, must win"
+        );
+        interrupts.abandon_run();
+        assert!(abandoned.load(Ordering::SeqCst));
+
+        release_tx
+            .send(())
+            .expect("release the blocking termination worker");
+        termination
+            .await
+            .expect("termination worker must finish without panic");
     }
 
     /// Outside a multi-threaded runtime there is no other worker to protect, so
