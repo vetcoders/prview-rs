@@ -172,6 +172,30 @@ when `breaking_escalation` is enabled. Unknown facts degrade analysis confidence
 and require review; they never masquerade as confirmed removals. Review caveats
 carry the same IDs, so consumers can join directly to this structure.
 
+Unknown classifier names are an additive, open vocabulary rather than a closed
+client enum. `OpaqueReturnAutoTraits` identifies a caller-observable `async fn`
+or return-position `impl Trait` whose unchanged signature does not prove that
+its hidden return type kept the same auto traits. Its evidence may include
+`opaque-implementation-digest:sha256:<digest>`. One-sided opaque proofs are not
+emitted for wholly added/removed items because the corresponding Added/Removed
+finding is already canonical. `MacroGeneratedItems` evidence may include
+`macro-implementation-digest:sha256:<digest>` and
+`declarative-implementation-digest:sha256:<digest>`. Associated and top-level
+function-like macro boundaries neutralize only when the digest required for
+their boundary kind is revision-backed. For both proof classes an `unresolved:*`
+digest is deliberately non-neutralizable. Only the effective
+product/workspace `Cargo.lock` may qualify these proofs; unrelated nested locks
+do not, and a proc-macro dependency candidate must appear under its actual
+package name with an external source and a locked version satisfying the
+declared requirement, including registry checksum or precise Git commit.
+Reachable path manifests and effective Cargo config bytes from every reachable
+manifest invocation context participate in the digest. Unresolved
+manifest/config Cargo source replacement, a stale same-name local lock entry,
+or a tracked symlink (including an overlay
+typechange to symlink) keeps the digest non-neutralizable. Additive derive
+unknowns do not suppress confirmed changes to their annotated input item; they
+cover only generated output.
+
 ## `stale_cache_caveats`
 
 An additive, advisory list naming every gate row that had BLOCKING influence on

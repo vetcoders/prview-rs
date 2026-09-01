@@ -429,6 +429,9 @@ fn declaration_side(declaration: &RustApiDeclaration) -> ApiFactSide {
 }
 
 fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &ApiFactSide) {
+    if trait_default_addition_is_compatible(&before.contract, &after.contract) {
+        return;
+    }
     match (
         public_enum_contract(&before.contract),
         public_enum_contract(&after.contract),
@@ -583,6 +586,71 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
             Some(after.clone()),
         ));
     }
+}
+
+fn trait_default_addition_is_compatible(before: &str, after: &str) -> bool {
+    fn defaults_and_contract(contract: &str) -> Option<(BTreeSet<String>, String)> {
+        let contract = contract
+            .split_once("\nreexport-origin:")
+            .map_or(contract, |(item, _)| item);
+        let syn::Item::Trait(mut item) = syn::parse_str::<syn::Item>(contract).ok()? else {
+            return None;
+        };
+        let mut defaults = BTreeSet::new();
+        for trait_item in &mut item.items {
+            let syn::TraitItem::Fn(function) = trait_item else {
+                continue;
+            };
+            let had_default = function
+                .attrs
+                .iter()
+                .any(|attribute| attribute.path().is_ident("prview_trait_default"));
+            if had_default {
+                defaults.insert(function.sig.ident.to_string());
+            }
+            function
+                .attrs
+                .retain(|attribute| !attribute.path().is_ident("prview_trait_default"));
+        }
+        Some((
+            defaults,
+            quote::ToTokens::to_token_stream(&item).to_string(),
+        ))
+    }
+
+    let Some((before_defaults, before_without_defaults)) = defaults_and_contract(before) else {
+        return false;
+    };
+    let Some((after_defaults, after_without_defaults)) = defaults_and_contract(after) else {
+        return false;
+    };
+    before_without_defaults == after_without_defaults
+        && before_defaults.is_subset(&after_defaults)
+        && before_defaults != after_defaults
+}
+
+fn trait_default_methods(contract: &str) -> Option<BTreeSet<String>> {
+    let contract = contract
+        .split_once("\nreexport-origin:")
+        .map_or(contract, |(item, _)| item);
+    let syn::Item::Trait(item) = syn::parse_str::<syn::Item>(contract).ok()? else {
+        return None;
+    };
+    Some(
+        item.items
+            .iter()
+            .filter_map(|trait_item| {
+                let syn::TraitItem::Fn(function) = trait_item else {
+                    return None;
+                };
+                function
+                    .attrs
+                    .iter()
+                    .any(|attribute| attribute.path().is_ident("prview_trait_default"))
+                    .then(|| function.sig.ident.to_string())
+            })
+            .collect(),
+    )
 }
 
 fn variant_is_fieldless(contract: &str) -> bool {
@@ -1240,20 +1308,49 @@ fn consume_one_sided_ambiguities(
 
 fn region_is_unknown(unknowns: &[RustApiUnknown], identity: &ApiIdentity) -> bool {
     unknowns.iter().any(|unknown| {
-        !matches!(
+        !(matches!(
             unknown.kind,
             RustApiUnknownKind::PathNonUtf8
                 | RustApiUnknownKind::TraitImplResolution
                 | RustApiUnknownKind::PrivateTypeDependency
-        ) && unknown
-            .crate_name
-            .as_ref()
-            .is_none_or(|crate_name| crate_name == &identity.crate_name)
+                | RustApiUnknownKind::OpaqueReturnAutoTraits
+        ) || unknown.kind == RustApiUnknownKind::MacroGeneratedItems
+            && unknown
+                .evidence
+                .lines()
+                .any(|line| line == "transform-kind:additive-derive"))
+            && unknown
+                .crate_name
+                .as_ref()
+                .is_none_or(|crate_name| crate_name == &identity.crate_name)
             && (unknown.module_path.is_empty()
                 || identity.module_path.starts_with(&unknown.module_path)
                 || unknown.module_path.starts_with(&identity.module_path))
             && guards_may_overlap(&unknown.cfg_guard, &identity.cfg_region)
+            && transform_scope_may_cover(unknown, identity)
     })
+}
+
+fn transform_scope_may_cover(unknown: &RustApiUnknown, identity: &ApiIdentity) -> bool {
+    let owner = unknown.evidence.lines().find_map(|line| {
+        line.strip_prefix("public-owner:")
+            .or_else(|| line.strip_prefix("public-type-alias:"))
+    });
+    if let Some(owner) = owner {
+        return identity.name == owner
+            || identity
+                .name
+                .strip_prefix(owner)
+                .is_some_and(|suffix| suffix.starts_with("::"));
+    }
+    if let Some(owner) = unknown
+        .evidence
+        .lines()
+        .find_map(|line| line.strip_prefix("trait-owner:"))
+    {
+        return identity.name == owner;
+    }
+    true
 }
 
 fn guards_may_overlap(left: &[String], right: &[String]) -> bool {
@@ -1278,7 +1375,7 @@ fn snapshot_unknown_findings(
             .map(|(index, _)| index);
         if let Some(index) = counterpart {
             target_used[index] = true;
-        } else {
+        } else if unmatched_unknown_is_observable(base, target, unknown) {
             findings.push(snapshot_unknown_finding(unknown, ApiSnapshotSide::Base));
         }
     }
@@ -1288,10 +1385,81 @@ fn snapshot_unknown_findings(
             .unknowns
             .iter()
             .enumerate()
-            .filter(|(index, _)| !target_used[*index])
+            .filter(|(index, unknown)| {
+                !target_used[*index] && unmatched_unknown_is_observable(base, target, unknown)
+            })
             .map(|(_, unknown)| snapshot_unknown_finding(unknown, ApiSnapshotSide::Target)),
     );
     findings
+}
+
+fn unmatched_unknown_is_observable(
+    base: &RustApiSnapshot,
+    target: &RustApiSnapshot,
+    unknown: &RustApiUnknown,
+) -> bool {
+    unknown.kind != RustApiUnknownKind::OpaqueReturnAutoTraits
+        || (opaque_origin_exists(base, unknown)
+            && opaque_origin_exists(target, unknown)
+            && !trait_default_only_transition(base, target, unknown))
+}
+
+fn opaque_origin_exists(snapshot: &RustApiSnapshot, unknown: &RustApiUnknown) -> bool {
+    opaque_origin_item(snapshot, unknown).is_some()
+}
+
+fn opaque_origin_item<'a>(
+    snapshot: &'a RustApiSnapshot,
+    unknown: &RustApiUnknown,
+) -> Option<&'a RustApiItem> {
+    let origin = unknown
+        .evidence
+        .lines()
+        .find_map(|line| line.strip_prefix("origin:"))?;
+    let (namespace, external_path) = origin.split_once(':')?;
+    snapshot.items.iter().find(|item| {
+        let item_path = if item.key.module_path.is_empty() {
+            item.key.external_name.clone()
+        } else {
+            format!(
+                "{}::{}",
+                item.key.module_path.join("::"),
+                item.key.external_name
+            )
+        };
+        item.key.crate_name == unknown.crate_name.as_deref().unwrap_or_default()
+            && format!("{:?}", item.key.namespace) == namespace
+            && item_path == external_path
+    })
+}
+
+fn trait_default_only_transition(
+    base: &RustApiSnapshot,
+    target: &RustApiSnapshot,
+    unknown: &RustApiUnknown,
+) -> bool {
+    let Some(method) = unknown
+        .evidence
+        .lines()
+        .find_map(|line| line.strip_prefix("opaque-return:trait-default:"))
+    else {
+        return false;
+    };
+    let (Some(before), Some(after)) = (
+        opaque_origin_item(base, unknown),
+        opaque_origin_item(target, unknown),
+    ) else {
+        return false;
+    };
+    let Some(before_defaults) = trait_default_methods(&before.contract) else {
+        return false;
+    };
+    let Some(after_defaults) = trait_default_methods(&after.contract) else {
+        return false;
+    };
+    before_defaults.contains(method) != after_defaults.contains(method)
+        && (trait_default_addition_is_compatible(&before.contract, &after.contract)
+            || trait_default_addition_is_compatible(&after.contract, &before.contract))
 }
 
 fn unknown_proofs_match(
@@ -1321,6 +1489,8 @@ fn unknown_proofs_match(
             || (include_output_is_digest_bound(left) && include_output_is_digest_bound(right)))
         && left.cfg_guard == right.cfg_guard
         && left.evidence == right.evidence
+        && macro_implementation_is_proven(left)
+        && opaque_implementation_is_proven(left)
         // Revision ids necessarily differ across the comparison. What must not
         // differ is the provenance class, and each proof must still belong to
         // the snapshot that supplied it; an overlay is not silently equated to
@@ -1329,6 +1499,42 @@ fn unknown_proofs_match(
         && right.provenance == target.provenance
         && same_provenance_class(&left.provenance, &right.provenance)
         && include_dependent_source_is_proven(left)
+}
+
+fn opaque_implementation_is_proven(unknown: &RustApiUnknown) -> bool {
+    !unknown
+        .evidence
+        .lines()
+        .any(|line| line.starts_with("opaque-return:"))
+        || unknown
+            .evidence
+            .lines()
+            .any(|line| line.starts_with("opaque-implementation-digest:sha256:"))
+}
+
+fn macro_implementation_is_proven(unknown: &RustApiUnknown) -> bool {
+    let boundaries = unknown
+        .evidence
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("transform-boundary:")
+                .or_else(|| line.strip_prefix("transform:transform-boundary:"))
+        })
+        .collect::<BTreeSet<_>>();
+    let proc_macro_proven = unknown
+        .evidence
+        .lines()
+        .any(|line| line.starts_with("macro-implementation-digest:sha256:"));
+    let declarative_proven = unknown
+        .evidence
+        .lines()
+        .any(|line| line.starts_with("declarative-implementation-digest:sha256:"));
+    if boundaries.is_empty() {
+        return unknown.kind != RustApiUnknownKind::MacroGeneratedItems || proc_macro_proven;
+    }
+    (!boundaries.contains("attribute") || proc_macro_proven)
+        && (!boundaries.contains("declarative-macro") || declarative_proven)
+        && (!boundaries.contains("macro-invocation") || declarative_proven)
 }
 
 fn alias_resolution_exhausted(unknown: &RustApiUnknown) -> bool {
@@ -1553,10 +1759,11 @@ mod tests {
     };
     use crate::artifacts::signal::test_helpers::{make_diff_with_ids, make_test_repo};
     use crate::git::git_cmd;
+    use sha2::Digest;
     use std::fs;
     use std::io::Write;
     use std::path::{Path, PathBuf};
-    use std::process::Stdio;
+    use std::process::{Command, Stdio};
 
     #[derive(Clone)]
     struct MemorySource {
@@ -1602,10 +1809,10 @@ mod tests {
 
         fn entries(&self) -> Vec<RevisionEntry> {
             self.files
-                .keys()
-                .map(|path| RevisionEntry {
+                .iter()
+                .map(|(path, bytes)| RevisionEntry {
                     path: path.clone(),
-                    baseline_object_id: Some(format!("fixture:{path}")),
+                    baseline_object_id: Some(hex::encode(sha2::Sha256::digest(bytes))),
                     mode: 0o100644,
                     kind: RevisionEntryKind::RegularFile,
                     state: RevisionEntryState::Present,
@@ -2718,6 +2925,101 @@ mod tests {
     }
 
     #[test]
+    fn repository_backed_repr_field_order_tracks_only_layouts_that_define_it() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        for attribute in [
+            "#[repr(transparent)]",
+            "#[repr(align(8))]",
+            "#[repr(packed)]",
+            "#[cfg_attr(feature = \"ffi\", repr(transparent))]",
+        ] {
+            let base = format!(
+                "struct First; struct Second; {attribute} pub struct Wrapper {{ pub value: u8, first: First, second: Second }}\n"
+            );
+            let target = format!(
+                "struct First; struct Second; {attribute} pub struct Wrapper {{ pub value: u8, second: Second, first: First }}\n"
+            );
+            let delta = repository_delta(&[
+                ("Cargo.toml", manifest, manifest),
+                ("src/lib.rs", &base, &target),
+            ]);
+            assert!(
+                delta.findings().is_empty(),
+                "{attribute} does not define named-field declaration order: {:?}",
+                delta.findings()
+            );
+        }
+
+        let transparent_marker_changed = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "struct First; struct Second; #[repr(transparent)] pub struct Wrapper { pub value: u8, marker: First }\n",
+                "struct First; struct Second; #[repr(transparent)] pub struct Wrapper { pub value: u8, marker: Second }\n",
+            ),
+        ]);
+        assert!(
+            transparent_marker_changed
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Wrapper"),
+            "private marker types still affect transparent layout and auto traits"
+        );
+
+        for attribute in [
+            "#[repr(C)]",
+            "#[repr(C, packed)]",
+            "#[repr(C, align(8))]",
+            "#[cfg_attr(feature = \"ffi\", repr(C))]",
+        ] {
+            let base = format!("{attribute} pub struct Layout {{ first: u8, second: u32 }}\n");
+            let target = format!("{attribute} pub struct Layout {{ second: u32, first: u8 }}\n");
+            let delta = repository_delta(&[
+                ("Cargo.toml", manifest, manifest),
+                ("src/lib.rs", &base, &target),
+            ]);
+            assert!(
+                delta
+                    .changed
+                    .iter()
+                    .any(|finding| finding.identity.name == "Layout"),
+                "{attribute} defines field order: {:?}",
+                delta.findings()
+            );
+        }
+
+        let transparent_enum = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "struct First; struct Second; #[repr(transparent)] pub enum Wrapper { Value { carrier: u8, first: First, second: Second } }\n",
+                "struct First; struct Second; #[repr(transparent)] pub enum Wrapper { Value { carrier: u8, second: Second, first: First } }\n",
+            ),
+        ]);
+        assert!(
+            transparent_enum.findings().is_empty(),
+            "a transparent single-variant enum follows its carrier rather than private ZST declaration order: {:?}",
+            transparent_enum.findings()
+        );
+
+        let primitive_enum = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[repr(u8)] pub enum Event { Value { first: u8, second: u32 } }\n",
+                "#[repr(u8)] pub enum Event { Value { second: u32, first: u8 } }\n",
+            ),
+        ]);
+        assert!(
+            primitive_enum
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Event"),
+            "primitive enum repr keeps payload field order ABI-sensitive"
+        );
+    }
+
+    #[test]
     fn alpha_normalization_never_collides_with_public_identifiers() {
         let swapped = repository_delta(&[
             (
@@ -3423,6 +3725,7 @@ mod tests {
 
     #[test]
     fn repository_backed_transforming_attribute_proof_binds_the_input_item() {
+        let lock = "version = 4\n";
         let changed = repository_delta(&[
             (
                 "Cargo.toml",
@@ -3434,6 +3737,7 @@ mod tests {
                 "#[derive(Custom)] pub struct Api { pub value: u8 }\n",
                 "#[derive(Custom)] pub struct Api { pub value: u16 }\n",
             ),
+            ("Cargo.lock", lock, lock),
         ]);
         assert!(changed.unknown.iter().any(|finding| {
             finding.identity.name == "MacroGeneratedItems"
@@ -3441,6 +3745,26 @@ mod tests {
                     .unknown_reason
                     .as_deref()
                     .is_some_and(|reason| reason.contains("input:"))
+        }));
+
+        let nested_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg_attr(feature=\"a\", cfg_attr(feature=\"b\", custom(before)))] pub struct Api;\n",
+                "#[cfg_attr(feature=\"a\", cfg_attr(feature=\"b\", custom(after)))] pub struct Api;\n",
+            ),
+            ("Cargo.lock", lock, lock),
+        ]);
+        assert!(nested_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("custom (before)") || reason.contains("custom (after)")
+                })
         }));
 
         let unchanged = repository_delta(&[
@@ -3454,11 +3778,1779 @@ mod tests {
                 "#[derive(Custom)] pub struct Api { pub value: u8 }\n",
                 "#[derive(Custom)] pub struct Api { pub value: u8 }\n",
             ),
+            ("Cargo.lock", lock, lock),
         ]);
         assert!(
-            unchanged.unknown.is_empty(),
-            "an unchanged transformer and unchanged input item neutralize"
+            unchanged.unknown.len() == 2,
+            "without a reachable local proc-macro implementation, a lock alone cannot resolve an arbitrary transformer: {:?}",
+            unchanged.findings()
         );
+    }
+
+    #[test]
+    fn repository_backed_derives_preserve_input_contracts_and_builtin_test_attrs_are_inert() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let built_in_field_add = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[derive(Debug)] pub struct Api { pub x: u8 }\n",
+                "#[derive(Debug)] pub struct Api { pub x: u8, pub y: u8 }\n",
+            ),
+        ]);
+        assert!(
+            built_in_field_add
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Api"),
+            "a built-in derive must not hide the confirmed input-item change: {:?}",
+            built_in_field_add.findings()
+        );
+        assert!(
+            !built_in_field_add
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "MacroGeneratedItems")
+        );
+
+        let built_in_unchanged = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[derive(Debug, Clone)] pub struct Api { pub x: u8 }\n",
+                "#[derive(Debug, Clone)] pub struct Api { pub x: u8 }\n",
+            ),
+        ]);
+        assert!(built_in_unchanged.findings().is_empty());
+
+        let unrelated_globs_do_not_shadow_builtins = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "mod private { use unrelated::*; } #[derive(Debug)] pub struct Api;\n",
+                "mod private { use unrelated::*; } #[derive(Debug)] pub struct Api;\n",
+            ),
+            (
+                "tests/fixture.rs",
+                "use another_unrelated::*;\n",
+                "use another_unrelated::*;\n",
+            ),
+        ]);
+        assert!(
+            unrelated_globs_do_not_shadow_builtins.findings().is_empty(),
+            "an unrelated file or sibling lexical scope must not shadow a builtin derive: {:?}",
+            unrelated_globs_do_not_shadow_builtins.findings()
+        );
+
+        let custom_manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n";
+        let custom_lock = "version = 4\n[[package]]\nname='serde'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='0000000000000000000000000000000000000000000000000000000000000000'\n[[package]]\nname='serde_derive'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='1111111111111111111111111111111111111111111111111111111111111111'\n";
+        let custom_field_add = repository_delta(&[
+            ("Cargo.toml", custom_manifest, custom_manifest),
+            ("Cargo.lock", custom_lock, custom_lock),
+            (
+                "src/lib.rs",
+                "#[derive(serde::Serialize)] pub struct Api { pub x: u8 }\n",
+                "#[derive(serde::Serialize)] pub struct Api { pub x: u8, pub y: u8 }\n",
+            ),
+        ]);
+        assert!(
+            custom_field_add
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Api"),
+            "a custom derive must not hide a confirmed input-item field change: {:?}",
+            custom_field_add.findings()
+        );
+        assert!(
+            custom_field_add
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "MacroGeneratedItems")
+        );
+
+        let custom_derive_add = repository_delta(&[
+            ("Cargo.toml", custom_manifest, custom_manifest),
+            ("Cargo.lock", custom_lock, custom_lock),
+            (
+                "src/lib.rs",
+                "pub struct Api { pub x: u8 }\n",
+                "#[derive(serde::Serialize)] pub struct Api { pub x: u8 }\n",
+            ),
+        ]);
+        assert!(
+            custom_derive_add.changed.is_empty(),
+            "an additive custom derive is uncertain generated output, not a confirmed input-item change: {:?}",
+            custom_derive_add.findings()
+        );
+        assert!(
+            custom_derive_add
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "MacroGeneratedItems")
+        );
+
+        let nested_custom_derive = repository_delta(&[
+            ("Cargo.toml", custom_manifest, custom_manifest),
+            ("Cargo.lock", custom_lock, custom_lock),
+            (
+                "src/lib.rs",
+                "#[cfg_attr(feature=\"a\", cfg_attr(feature=\"b\", derive(serde::Serialize)))] pub struct Api { pub x: u8 }\n",
+                "#[cfg_attr(feature=\"a\", cfg_attr(feature=\"b\", derive(serde::Serialize)))] pub struct Api { pub x: u16 }\n",
+            ),
+        ]);
+        assert!(nested_custom_derive.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("transform-kind:additive-derive"))
+        }));
+
+        let helper_only_change = repository_delta(&[
+            ("Cargo.toml", custom_manifest, custom_manifest),
+            ("Cargo.lock", custom_lock, custom_lock),
+            (
+                "src/lib.rs",
+                "#[derive(serde::Serialize)] pub struct Api { #[serde(rename=\"left\")] pub x: u8 }\n",
+                "#[derive(serde::Serialize)] pub struct Api { #[serde(rename=\"right\")] pub x: u8 }\n",
+            ),
+        ]);
+        assert!(
+            helper_only_change.changed.is_empty(),
+            "derive helper tokens belong to transform uncertainty, not the confirmed input contract: {:?}",
+            helper_only_change.findings()
+        );
+        assert!(
+            helper_only_change
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "MacroGeneratedItems")
+        );
+
+        let shadowed_builtin = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api','macros']\nresolver='2'\n",
+                "[workspace]\nmembers=['api','macros']\nresolver='2'\n",
+            ),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            (
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={path='../macros'}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={path='../macros'}\n",
+            ),
+            (
+                "api/src/lib.rs",
+                "use macros::Debug; #[derive(Debug)] pub struct Api;\n",
+                "use macros::Debug; #[derive(Debug)] pub struct Api;\n",
+            ),
+            (
+                "macros/Cargo.toml",
+                "[package]\nname='macros'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\nproc-macro=true\n",
+                "[package]\nname='macros'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\nproc-macro=true\n",
+            ),
+            (
+                "macros/src/lib.rs",
+                "#[proc_macro_derive(Debug)] pub fn debug(_: proc_macro::TokenStream) -> proc_macro::TokenStream { proc_macro::TokenStream::new() }\n",
+                "#[proc_macro_derive(Debug)] pub fn debug(_: proc_macro::TokenStream) -> proc_macro::TokenStream { \"impl Api { pub fn generated() {} }\".parse().unwrap() }\n",
+            ),
+        ]);
+        assert!(
+            shadowed_builtin.changed.is_empty(),
+            "an imported derive named like a compiler builtin must not become a confirmed builtin contract: {:?}",
+            shadowed_builtin.findings()
+        );
+        assert!(shadowed_builtin.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("macro-implementation-digest:sha256:"))
+        }));
+
+        let inert_test_attrs = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[cfg(test)] #[test] #[ignore] #[should_panic] fn smoke() {}\n",
+                "#[cfg(test)] #[test] #[ignore] #[should_panic] fn smoke() {}\n",
+            ),
+        ]);
+        assert!(
+            inert_test_attrs.findings().is_empty(),
+            "built-in test harness attributes are not arbitrary API transformers: {:?}",
+            inert_test_attrs.findings()
+        );
+    }
+
+    #[test]
+    fn repository_backed_builtin_default_and_rust_2024_unsafe_attrs_remain_confirmed_contracts() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let builtin_default = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[derive(Default)] pub enum Choice { #[default] A, B }\n",
+                "#[derive(Default)] pub enum Choice { A, #[default] B }\n",
+            ),
+        ]);
+        assert!(builtin_default.changed.iter().any(|finding| {
+            finding.identity.name == "Choice" && finding.confidence == ApiDeltaConfidence::Confirmed
+        }));
+
+        let conditional_default = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[cfg_attr(feature=\"x\", derive(Default))] pub enum Choice { #[cfg_attr(feature=\"x\", default)] A, B }\n",
+                "#[cfg_attr(feature=\"x\", derive(Default))] pub enum Choice { A, #[cfg_attr(feature=\"x\", default)] B }\n",
+            ),
+        ]);
+        assert!(conditional_default.changed.iter().any(|finding| {
+            finding.identity.name == "Choice" && finding.confidence == ApiDeltaConfidence::Confirmed
+        }));
+
+        let nested_conditional_default = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[cfg_attr(feature=\"a\", cfg_attr(feature=\"b\", derive(Default)))] pub enum Choice { #[cfg_attr(feature=\"a\", cfg_attr(feature=\"b\", default))] A, B }\n",
+                "#[cfg_attr(feature=\"a\", cfg_attr(feature=\"b\", derive(Default)))] pub enum Choice { A, #[cfg_attr(feature=\"a\", cfg_attr(feature=\"b\", default))] B }\n",
+            ),
+        ]);
+        assert!(nested_conditional_default.changed.iter().any(|finding| {
+            finding.identity.name == "Choice" && finding.confidence == ApiDeltaConfidence::Confirmed
+        }));
+
+        let equivalent_conditional_default = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[cfg_attr(feature=\"x\", derive(Default))] pub enum Choice { #[cfg_attr(all(feature=\"x\"), default)] A, B }\n",
+                "#[cfg_attr(feature=\"x\", derive(Default))] pub enum Choice { A, #[cfg_attr(all(feature=\"x\"), default)] B }\n",
+            ),
+        ]);
+        assert!(
+            equivalent_conditional_default
+                .changed
+                .iter()
+                .any(|finding| {
+                    finding.identity.name == "Choice"
+                        && finding.confidence == ApiDeltaConfidence::Confirmed
+                })
+        );
+
+        let unresolved_conditional_default = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[cfg_attr(feature=\"x\", derive(Default))] pub enum Choice { #[cfg_attr(feature=\"y\", default)] A, B }\n",
+                "#[cfg_attr(feature=\"x\", derive(Default))] pub enum Choice { A, #[cfg_attr(feature=\"y\", default)] B }\n",
+            ),
+        ]);
+        assert!(
+            unresolved_conditional_default
+                .unknown
+                .iter()
+                .any(|finding| {
+                    finding.identity.name == "CfgPredicate"
+                        && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                            reason.contains("conditional-default-coverage-unresolved")
+                        })
+                })
+        );
+
+        let unsafe_export = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[unsafe(export_name=\"before\")] pub extern \"C\" fn api() {}\n",
+                "#[unsafe(export_name=\"after\")] pub extern \"C\" fn api() {}\n",
+            ),
+        ]);
+        assert!(unsafe_export.changed.iter().any(|finding| {
+            finding.identity.name == "api" && finding.confidence == ApiDeltaConfidence::Confirmed
+        }));
+        assert!(
+            !unsafe_export
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "MacroGeneratedItems")
+        );
+
+        let private_binary_export = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[unsafe(no_mangle)] extern \"C\" fn binary_api(_: u8) {}\n",
+                "#[unsafe(no_mangle)] extern \"C\" fn binary_api(_: u16) {}\n",
+            ),
+        ]);
+        assert!(private_binary_export.unknown.iter().any(|finding| {
+            finding.identity.name == "UnsupportedExternResolution"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("private-binary-export"))
+        }));
+
+        for (before, after) in [
+            (
+                "#[cfg_attr(feature=\"ffi\", unsafe(no_mangle))] extern \"C\" fn binary_api(_: u8) {}\n",
+                "#[cfg_attr(feature=\"ffi\", unsafe(no_mangle))] extern \"C\" fn binary_api(_: u16) {}\n",
+            ),
+            (
+                "#[cfg_attr(feature=\"ffi\", cfg_attr(feature=\"named\", unsafe(export_name=\"binary_api\")))] extern \"C\" fn binary_api(_: u8) {}\n",
+                "#[cfg_attr(feature=\"ffi\", cfg_attr(feature=\"named\", unsafe(export_name=\"binary_api\")))] extern \"C\" fn binary_api(_: u16) {}\n",
+            ),
+        ] {
+            let conditional_binary_export = repository_delta(&[
+                ("Cargo.toml", manifest, manifest),
+                ("src/lib.rs", before, after),
+            ]);
+            assert!(conditional_binary_export.unknown.iter().any(|finding| {
+                finding.identity.name == "UnsupportedExternResolution"
+                    && finding
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("private-binary-export"))
+            }));
+        }
+    }
+
+    #[test]
+    fn repository_backed_conditional_macro_exports_and_macro_invocations_are_proven() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let lock = "version = 4\n";
+        for (before, after) in [
+            (
+                "#[cfg_attr(feature=\"public\", macro_export)] macro_rules! api { () => { 1 } }\n",
+                "#[cfg_attr(feature=\"public\", macro_export)] macro_rules! api { () => { 2 } }\n",
+            ),
+            (
+                "#[cfg_attr(feature=\"a\", cfg_attr(feature=\"b\", macro_export))] macro_rules! api { () => { 1 } }\n",
+                "#[cfg_attr(feature=\"a\", cfg_attr(feature=\"b\", macro_export))] macro_rules! api { () => { 2 } }\n",
+            ),
+        ] {
+            let delta = repository_delta(&[
+                ("Cargo.toml", manifest, manifest),
+                ("Cargo.lock", lock, lock),
+                ("src/lib.rs", before, after),
+            ]);
+            assert!(delta.changed.iter().any(|finding| {
+                finding.identity.name == "api"
+                    && finding.confidence == ApiDeltaConfidence::Confirmed
+            }));
+        }
+
+        let unchanged_invocation = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "macro_rules! make { () => { pub fn generated() -> u8 { 1 } } } make!();\n",
+                "macro_rules! make { () => { pub fn generated() -> u8 { 1 } } } make!();\n",
+            ),
+        ]);
+        assert!(
+            unchanged_invocation.findings().is_empty(),
+            "an unchanged invocation with a revision-backed implementation must neutralize: {:?}",
+            unchanged_invocation.findings()
+        );
+
+        let changed_invocation = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "macro_rules! make { () => { pub fn generated() -> u8 { 1 } } } make!();\n",
+                "macro_rules! make { () => { pub fn generated() -> u16 { 1 } } } make!();\n",
+            ),
+        ]);
+        assert!(changed_invocation.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("transform-boundary:macro-invocation")
+                        && reason.contains("declarative-implementation-digest:sha256:")
+                })
+        }));
+
+        let unlocked_changed_invocation = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "macro_rules! make { () => { pub fn generated() -> u8 { 1 } } } make!();\n",
+                "macro_rules! make { () => { pub fn generated() -> u16 { 1 } } } make!();\n",
+            ),
+        ]);
+        assert!(unlocked_changed_invocation.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("declarative-implementation-digest:unresolved:")
+                })
+        }));
+
+        let workspace = "[workspace]\nmembers=['api']\nexclude=['macros']\nresolver='2'\n";
+        let api_manifest = "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={path='../macros'}\n";
+        let macros_manifest = "[package]\nname='macros'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\nproc-macro=true\n";
+        let unresolved_proc_macro_invocation = repository_delta(&[
+            ("Cargo.toml", workspace, workspace),
+            ("Cargo.lock", lock, lock),
+            ("api/Cargo.toml", api_manifest, api_manifest),
+            (
+                "api/src/lib.rs",
+                "use macros::make; make!();\n",
+                "use macros::make; make!();\n",
+            ),
+            ("macros/Cargo.toml", macros_manifest, macros_manifest),
+            (
+                "macros/.cargo/config.toml",
+                "paths = ['../vendor']\n",
+                "paths = ['../vendor']\n",
+            ),
+            (
+                "macros/src/lib.rs",
+                "#[proc_macro] pub fn make(_: proc_macro::TokenStream) -> proc_macro::TokenStream { \"pub fn generated() -> u8 { 1 }\".parse().unwrap() }\n",
+                "#[proc_macro] pub fn make(_: proc_macro::TokenStream) -> proc_macro::TokenStream { \"pub fn generated() -> u16 { 1 }\".parse().unwrap() }\n",
+            ),
+        ]);
+        assert!(
+            unresolved_proc_macro_invocation
+                .unknown
+                .iter()
+                .any(|finding| {
+                    finding.identity.name == "MacroGeneratedItems"
+                        && finding
+                            .unknown_reason
+                            .as_deref()
+                            .is_some_and(|reason| {
+                                reason.contains(
+                                    "declarative-implementation-digest:unresolved:reachable transformer substrate",
+                                )
+                            })
+                }),
+            "an unresolved reachable proc-macro closure must never be neutralized by the opaque-return digest: {:?}",
+            unresolved_proc_macro_invocation.findings()
+        );
+    }
+
+    #[test]
+    fn custom_default_helper_stays_out_of_the_confirmed_enum_contract() {
+        let workspace = "[workspace]\nmembers=['api','macros']\nresolver='2'\n";
+        let api_manifest = "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={path='../macros'}\n";
+        let macro_manifest = "[package]\nname='macros'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\nproc-macro=true\n";
+        let macro_source = "#[proc_macro_derive(Default, attributes(default))] pub fn derive(_: proc_macro::TokenStream) -> proc_macro::TokenStream { proc_macro::TokenStream::new() }\n";
+        let delta = repository_delta(&[
+            ("Cargo.toml", workspace, workspace),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            ("api/Cargo.toml", api_manifest, api_manifest),
+            (
+                "api/src/lib.rs",
+                "use macros::Default; #[derive(Default)] pub enum Choice { #[default] A, B }\n",
+                "use macros::Default; #[derive(Default)] pub enum Choice { A, #[default] B }\n",
+            ),
+            ("macros/Cargo.toml", macro_manifest, macro_manifest),
+            ("macros/src/lib.rs", macro_source, macro_source),
+        ]);
+        assert!(
+            delta.changed.is_empty(),
+            "custom helper tokens must not manufacture a confirmed enum change: {:?}",
+            delta.findings()
+        );
+        assert!(
+            delta
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "MacroGeneratedItems")
+        );
+    }
+
+    #[test]
+    fn imported_custom_derive_can_shadow_a_builtin_name() {
+        let temp = tempfile::tempdir().expect("custom derive fixture tempdir");
+        let macro_source = temp.path().join("macros.rs");
+        fs::write(
+            &macro_source,
+            "extern crate proc_macro;\nuse proc_macro::TokenStream;\n#[proc_macro_derive(Debug)]\npub fn debug(_: TokenStream) -> TokenStream { \"impl Api { pub fn custom_marker() {} }\".parse().unwrap() }\n",
+        )
+        .expect("write custom derive fixture");
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let macro_output = Command::new(&rustc)
+            .args([
+                "--edition=2021",
+                "--crate-name=macros",
+                "--crate-type=proc-macro",
+            ])
+            .arg(&macro_source)
+            .arg("--out-dir")
+            .arg(temp.path())
+            .output()
+            .expect("compile custom derive fixture");
+        assert!(
+            macro_output.status.success(),
+            "custom derive fixture must compile: {}",
+            String::from_utf8_lossy(&macro_output.stderr)
+        );
+        let macro_artifact = fs::read_dir(temp.path())
+            .expect("read custom derive output")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("libmacros."))
+            })
+            .expect("find custom derive dynamic library");
+        let api_source = temp.path().join("api.rs");
+        fs::write(
+            &api_source,
+            "use macros::Debug;\n#[derive(Debug)] pub struct Api;\npub fn proves_custom_resolution() { Api::custom_marker(); }\n",
+        )
+        .expect("write custom derive consumer");
+        let api_output = Command::new(rustc)
+            .args(["--edition=2021", "--crate-type=lib"])
+            .arg(&api_source)
+            .arg("--extern")
+            .arg(format!("macros={}", macro_artifact.display()))
+            .arg("-o")
+            .arg(temp.path().join("libapi.rlib"))
+            .output()
+            .expect("compile custom derive consumer");
+        assert!(
+            api_output.status.success(),
+            "an explicit imported derive shadows the builtin name: {}",
+            String::from_utf8_lossy(&api_output.stderr)
+        );
+    }
+
+    #[test]
+    fn repository_backed_transform_proof_binds_proc_macro_implementation_closure() {
+        let workspace = "[workspace]\nmembers=['api','macros','helper']\nresolver='2'\n";
+        let api_manifest = "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={path='../macros'}\n";
+        let macro_manifest = "[package]\nname='macros'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\nproc-macro=true\n[dependencies]\nhelper={path='../helper'}\n";
+        let helper_manifest =
+            "[package]\nname='helper'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let lock = "version = 4\n";
+        let api = "#[macros::expose] pub struct Api;\n";
+        let macro_source = "#[proc_macro_attribute] pub fn expose(_: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream { helper::expand(input) }\n";
+
+        let changed = repository_delta(&[
+            ("Cargo.toml", workspace, workspace),
+            ("Cargo.lock", lock, lock),
+            ("api/Cargo.toml", api_manifest, api_manifest),
+            ("api/src/lib.rs", api, api),
+            ("macros/Cargo.toml", macro_manifest, macro_manifest),
+            ("macros/src/lib.rs", macro_source, macro_source),
+            ("helper/Cargo.toml", helper_manifest, helper_manifest),
+            (
+                "helper/src/lib.rs",
+                "pub fn expand(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n",
+                "pub fn expand(_: proc_macro::TokenStream) -> proc_macro::TokenStream { \"impl Api { pub fn generated() {} }\".parse().unwrap() }\n",
+            ),
+        ]);
+        assert!(changed.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("macro-implementation-digest:sha256:"))
+        }));
+        assert!(
+            changed.changed.is_empty(),
+            "an implementation-substrate change is uncertainty, not a confirmed API change: {:?}",
+            changed.findings()
+        );
+
+        let unchanged = repository_delta(&[
+            ("Cargo.toml", workspace, workspace),
+            ("Cargo.lock", lock, lock),
+            ("api/Cargo.toml", api_manifest, api_manifest),
+            ("api/src/lib.rs", api, api),
+            ("macros/Cargo.toml", macro_manifest, macro_manifest),
+            ("macros/src/lib.rs", macro_source, macro_source),
+            ("helper/Cargo.toml", helper_manifest, helper_manifest),
+            (
+                "helper/src/lib.rs",
+                "pub fn expand(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n",
+                "pub fn expand(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n",
+            ),
+        ]);
+        assert!(
+            unchanged.findings().is_empty(),
+            "identical transformer input and implementation closure must neutralize: {:?}",
+            unchanged.findings()
+        );
+
+        let external_root = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api','macros']\nresolver='2'\n",
+                "[workspace]\nmembers=['api','macros']\nresolver='2'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            ("api/Cargo.toml", api_manifest, api_manifest),
+            ("api/src/lib.rs", api, api),
+            (
+                "macros/Cargo.toml",
+                "[package]\nname='macros'\nversion='0.0.0'\n[lib]\npath='../macro_impl.rs'\nproc-macro=true\n",
+                "[package]\nname='macros'\nversion='0.0.0'\n[lib]\npath='../macro_impl.rs'\nproc-macro=true\n",
+            ),
+            (
+                "macro_impl.rs",
+                "#[proc_macro_attribute] pub fn expose(_: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n",
+                "#[proc_macro_attribute] pub fn expose(_: proc_macro::TokenStream, _: proc_macro::TokenStream) -> proc_macro::TokenStream { \"impl Api { pub fn generated() {} }\".parse().unwrap() }\n",
+            ),
+        ]);
+        assert!(external_root.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("macro-implementation-digest:sha256:"))
+        }));
+    }
+
+    #[test]
+    fn repository_backed_transform_proof_requires_the_product_lock_and_resolved_sources() {
+        let api = "#[derive(serde::Serialize)] pub struct Api;\n";
+        let without_effective_lock = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n",
+            ),
+            ("src/lib.rs", api, api),
+            (
+                "fixtures/demo/Cargo.toml",
+                "[package]\nname='demo'\nversion='0.0.0'\n",
+                "[package]\nname='demo'\nversion='0.0.0'\n",
+            ),
+            ("fixtures/demo/Cargo.lock", "version = 4\n", "version = 4\n"),
+        ]);
+        assert_eq!(without_effective_lock.unknown.len(), 2);
+        assert!(without_effective_lock.unknown.iter().all(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("macro-implementation-digest:unresolved:")
+                        && reason.contains("effective Cargo.lock")
+                })
+        }));
+
+        let stale_effective_lock = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n",
+            ),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            ("src/lib.rs", api, api),
+        ]);
+        assert_eq!(stale_effective_lock.unknown.len(), 2);
+        assert!(stale_effective_lock.unknown.iter().all(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("macro-implementation-digest:unresolved:")
+                    && reason.contains("does not contain dependency candidates: serde")
+            })
+        }));
+
+        let registry_without_checksum = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n[[package]]\nname='serde'\nversion='1.0.0'\nsource='registry+https://index.crates.io/'\n",
+                "version = 4\n[[package]]\nname='serde'\nversion='1.0.0'\nsource='registry+https://index.crates.io/'\n",
+            ),
+            ("src/lib.rs", api, api),
+        ]);
+        assert_eq!(registry_without_checksum.unknown.len(), 2);
+        assert!(registry_without_checksum.unknown.iter().all(|finding| {
+            finding
+                .unknown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("dependency candidates: serde 1"))
+        }));
+
+        let git_without_precise_commit = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={git='https://example.invalid/macros'}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={git='https://example.invalid/macros'}\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n[[package]]\nname='macros'\nversion='1.0.0'\nsource='git+https://example.invalid/macros'\n",
+                "version = 4\n[[package]]\nname='macros'\nversion='1.0.0'\nsource='git+https://example.invalid/macros#'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[derive(macros::Generate)] pub struct Api;\n",
+                "#[derive(macros::Generate)] pub struct Api;\n",
+            ),
+        ]);
+        assert_eq!(git_without_precise_commit.unknown.len(), 2);
+
+        let git_short_precise_commit = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={git='https://example.invalid/macros'}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={git='https://example.invalid/macros'}\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n[[package]]\nname='macros'\nversion='1.0.0'\nsource='git+https://example.invalid/macros#deadbee'\n",
+                "version = 4\n[[package]]\nname='macros'\nversion='1.0.0'\nsource='git+https://example.invalid/macros#deadbee'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[derive(macros::Generate)] pub struct Api;\n",
+                "#[derive(macros::Generate)] pub struct Api;\n",
+            ),
+        ]);
+        assert_eq!(git_short_precise_commit.unknown.len(), 2);
+
+        let same_name_local_package_does_not_cover_external = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api','serde']\nresolver='2'\n",
+                "[workspace]\nmembers=['api','serde']\nresolver='2'\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n[[package]]\nname='serde'\nversion='0.0.0'\n",
+                "version = 4\n[[package]]\nname='serde'\nversion='0.0.0'\n",
+            ),
+            (
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde_remote={package='serde',version='1',features=['derive']}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde_remote={package='serde',version='1',features=['derive']}\n",
+            ),
+            (
+                "api/src/lib.rs",
+                "#[derive(serde_remote::Serialize)] pub struct Api;\n",
+                "#[derive(serde_remote::Serialize)] pub struct Api;\n",
+            ),
+            (
+                "serde/Cargo.toml",
+                "[package]\nname='serde'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='serde'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("serde/src/lib.rs", "", ""),
+        ]);
+        assert_eq!(
+            same_name_local_package_does_not_cover_external
+                .unknown
+                .len(),
+            2
+        );
+        assert!(
+            same_name_local_package_does_not_cover_external
+                .unknown
+                .iter()
+                .all(|finding| {
+                    finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("macro-implementation-digest:unresolved:")
+                            && reason.contains("dependency candidates: serde 1")
+                    })
+                })
+        );
+
+        let reachable_member_config = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n[[package]]\nname='serde'\nversion='1.0.0'\nsource='registry+https://index.crates.io/'\nchecksum='0000000000000000000000000000000000000000000000000000000000000000'\n",
+                "version = 4\n[[package]]\nname='serde'\nversion='1.0.0'\nsource='registry+https://index.crates.io/'\nchecksum='0000000000000000000000000000000000000000000000000000000000000000'\n",
+            ),
+            (
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n",
+            ),
+            (
+                "api/.cargo/config.toml",
+                "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='../vendor-a'\n",
+                "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='../vendor-b'\n",
+            ),
+            (
+                "api/src/lib.rs",
+                "#[derive(serde::Serialize)] pub struct Api;\n",
+                "#[derive(serde::Serialize)] pub struct Api;\n",
+            ),
+        ]);
+        assert_eq!(reachable_member_config.unknown.len(), 2);
+        assert!(reachable_member_config.unknown.iter().all(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("api/.cargo/config.toml") && reason.contains("source replacement")
+            })
+        }));
+
+        let wrong_external_source = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={git='https://example.invalid/expected',rev='abc'}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={git='https://example.invalid/expected',rev='abc'}\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n[[package]]\nname='macros'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\n",
+                "version = 4\n[[package]]\nname='macros'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[derive(macros::Generate)] pub struct Api;\n",
+                "#[derive(macros::Generate)] pub struct Api;\n",
+            ),
+        ]);
+        assert_eq!(wrong_external_source.unknown.len(), 2);
+        assert!(wrong_external_source.unknown.iter().all(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("macro-implementation-digest:unresolved:")
+                    && reason.contains("dependency candidates: macros")
+            })
+        }));
+
+        let workspace_dependency_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api']\nresolver='2'\n[workspace.dependencies]\nserde={version='1',features=['derive']}\n",
+                "[workspace]\nmembers=['api']\nresolver='2'\n[workspace.dependencies]\nserde={version='1',features=['derive','rc']}\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n[[package]]\nname='serde'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='0000000000000000000000000000000000000000000000000000000000000000'\n",
+                "version = 4\n[[package]]\nname='serde'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='0000000000000000000000000000000000000000000000000000000000000000'\n",
+            ),
+            (
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={workspace=true}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={workspace=true}\n",
+            ),
+            ("api/src/lib.rs", api, api),
+        ]);
+        assert_eq!(workspace_dependency_changed.unknown.len(), 2);
+        assert!(workspace_dependency_changed.unknown.iter().all(|finding| {
+            finding
+                .unknown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("macro-implementation-digest:sha256:"))
+        }));
+
+        let external_lock = "version = 4\n[[package]]\nname='serde'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='0000000000000000000000000000000000000000000000000000000000000000'\n";
+        let config_environment_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n",
+            ),
+            ("Cargo.lock", external_lock, external_lock),
+            (
+                ".cargo/config.toml",
+                "[env]\nPRVIEW_MACRO_MODE='base'\n",
+                "[env]\nPRVIEW_MACRO_MODE='target'\n",
+            ),
+            ("src/lib.rs", api, api),
+        ]);
+        let config_proofs = config_environment_changed
+            .unknown
+            .iter()
+            .filter_map(|finding| finding.unknown_reason.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            config_proofs.len(),
+            2,
+            "effective Cargo config bytes must distinguish the two external macro substrates: {:?}",
+            config_environment_changed.findings()
+        );
+        assert!(
+            config_proofs
+                .iter()
+                .all(|reason| reason.contains("macro-implementation-digest:sha256:"))
+        );
+
+        let reachable_manifest_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api','helper']\nresolver='2'\n",
+                "[workspace]\nmembers=['api','helper']\nresolver='2'\n",
+            ),
+            ("Cargo.lock", external_lock, external_lock),
+            (
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nhelper={path='../helper'}\n",
+                "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nhelper={path='../helper'}\n",
+            ),
+            (
+                "api/src/lib.rs",
+                "#[derive(helper::Serialize)] pub struct Api;\n",
+                "#[derive(helper::Serialize)] pub struct Api;\n",
+            ),
+            (
+                "helper/Cargo.toml",
+                "[package]\nname='helper'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive']}\n",
+                "[package]\nname='helper'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde={version='1',features=['derive','rc']}\n",
+            ),
+            (
+                "helper/src/lib.rs",
+                "pub use serde::Serialize;\n",
+                "pub use serde::Serialize;\n",
+            ),
+        ]);
+        let reachable_proofs = reachable_manifest_changed
+            .unknown
+            .iter()
+            .filter_map(|finding| finding.unknown_reason.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            reachable_proofs.len(),
+            2,
+            "a reachable manifest change must distinguish the two external macro substrates: {:?}",
+            reachable_manifest_changed.findings()
+        );
+        assert!(
+            reachable_proofs
+                .iter()
+                .all(|reason| reason.contains("macro-implementation-digest:sha256:"))
+        );
+
+        let workspace = "[workspace]\nmembers=['api','macros']\nresolver='2'\n[patch.crates-io]\nmacro-helper={path='../../outside-helper'}\n";
+        let api_manifest = "[package]\nname='api'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nmacros={path='../macros'}\n";
+        let macro_manifest = "[package]\nname='macros'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\nproc-macro=true\n";
+        let macro_source = "#[proc_macro_attribute] pub fn expose(_: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n";
+        let attributed = "#[macros::expose] pub struct Api;\n";
+        let manifest_patch = repository_delta(&[
+            ("Cargo.toml", workspace, workspace),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            ("api/Cargo.toml", api_manifest, api_manifest),
+            ("api/src/lib.rs", attributed, attributed),
+            ("macros/Cargo.toml", macro_manifest, macro_manifest),
+            ("macros/src/lib.rs", macro_source, macro_source),
+        ]);
+        assert_eq!(manifest_patch.unknown.len(), 2);
+        assert!(manifest_patch.unknown.iter().all(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("macro-implementation-digest:unresolved:")
+                    && reason.contains("patch/replace")
+            })
+        }));
+
+        let workspace_without_patch = "[workspace]\nmembers=['api','macros']\nresolver='2'\n";
+        let cargo_source_replacement = repository_delta(&[
+            (
+                "Cargo.toml",
+                workspace_without_patch,
+                workspace_without_patch,
+            ),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            (
+                ".cargo/config.toml",
+                "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='vendor'\n",
+                "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='vendor'\n",
+            ),
+            ("api/Cargo.toml", api_manifest, api_manifest),
+            ("api/src/lib.rs", attributed, attributed),
+            ("macros/Cargo.toml", macro_manifest, macro_manifest),
+            ("macros/src/lib.rs", macro_source, macro_source),
+        ]);
+        assert_eq!(cargo_source_replacement.unknown.len(), 2);
+        assert!(cargo_source_replacement.unknown.iter().all(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("macro-implementation-digest:unresolved:")
+                    && reason.contains("source replacement")
+            })
+        }));
+    }
+
+    #[test]
+    fn repository_backed_private_transformers_stay_typed_unknown() {
+        let ordinary = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[custom] struct Hidden(u8);\n",
+                "#[custom] struct Hidden(u16);\n",
+            ),
+        ]);
+        assert!(ordinary.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("struct Hidden"))
+        }));
+
+        let inherent = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub struct Owner; impl Owner { #[custom] fn hidden(&self, _: u8) {} }\n",
+                "pub struct Owner; impl Owner { #[custom] fn hidden(&self, _: u16) {} }\n",
+            ),
+        ]);
+        assert!(inherent.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("fn hidden"))
+        }));
+
+        let private_owner = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "struct Hidden; impl Hidden { #[custom] fn helper(&self, _: u8) {} }\n",
+                "struct Hidden; impl Hidden { #[custom] fn helper(&self, _: u16) {} }\n",
+            ),
+        ]);
+        assert!(
+            private_owner.findings().is_empty(),
+            "an associated transformer on a private owner cannot expose caller-visible API: {:?}",
+            private_owner.findings()
+        );
+
+        let reexported_owner = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod inner { pub struct Owner; impl Owner { #[custom] fn hidden(&self, _: u8) {} } } pub use inner::Owner as PublicOwner;\n",
+                "mod inner { pub struct Owner; impl Owner { #[custom] fn hidden(&self, _: u16) {} } } pub use inner::Owner as PublicOwner;\n",
+            ),
+        ]);
+        assert!(reexported_owner.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("inherent-owner:Owner"))
+        }));
+    }
+
+    #[test]
+    fn repository_backed_associated_transforms_follow_aliases_macros_and_cfg_regions() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let alias_chain = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            (
+                "src/lib.rs",
+                "mod hidden { pub struct Owner; impl Owner { pub async fn api() {} } } type Mid = hidden::Owner; pub type Public = Mid;\n",
+                "mod hidden { pub struct Owner; impl Owner { pub async fn api() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); } } } type Mid = hidden::Owner; pub type Public = Mid;\n",
+            ),
+        ]);
+        assert!(alias_chain.unknown.iter().any(|finding| {
+            finding.identity.name == "UnresolvedInherentOwner"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("public-type-alias:Public"))
+        }));
+
+        let unchanged_declarative = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            (
+                "src/lib.rs",
+                "macro_rules! make { () => { pub fn generated() -> u8 { 1 } } } pub struct Owner; impl Owner { make!(); }\n",
+                "macro_rules! make { () => { pub fn generated() -> u8 { 1 } } } pub struct Owner; impl Owner { make!(); }\n",
+            ),
+        ]);
+        assert!(
+            unchanged_declarative.findings().is_empty(),
+            "an unchanged local macro_rules boundary has a revision-backed declarative proof: {:?}",
+            unchanged_declarative.findings()
+        );
+
+        let changed_declarative = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            (
+                "src/lib.rs",
+                "macro_rules! make { () => { pub fn generated() -> u8 { 1 } } } pub struct Owner; impl Owner { make!(); }\n",
+                "macro_rules! make { () => { pub fn generated() -> u16 { 1 } } } pub struct Owner; impl Owner { make!(); }\n",
+            ),
+        ]);
+        assert!(
+            changed_declarative
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "MacroGeneratedItems")
+        );
+
+        let unrelated_confirmed_change = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "pub struct Owner; impl Owner { #[custom] fn seed() {} } pub fn other(_: u8) {}\n",
+                "pub struct Owner; impl Owner { #[custom] fn seed() {} } pub fn other(_: u16) {}\n",
+            ),
+        ]);
+        assert!(unrelated_confirmed_change.changed.iter().any(|finding| {
+            finding.identity.name == "other" && finding.confidence == ApiDeltaConfidence::Confirmed
+        }));
+
+        let cfg_disjoint = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "#[cfg(unix)] struct Owner; #[cfg(windows)] pub use Owner as Public; #[cfg(unix)] impl Owner { #[custom] fn seed() {} }\n",
+                "#[cfg(unix)] struct Owner; #[cfg(windows)] pub use Owner as Public; #[cfg(unix)] impl Owner { #[custom] fn seed() {} }\n",
+            ),
+        ]);
+        assert!(
+            cfg_disjoint.findings().is_empty(),
+            "a cfg-disjoint owner exposure cannot inherit an impossible transform region: {:?}",
+            cfg_disjoint.findings()
+        );
+    }
+
+    #[test]
+    fn repository_backed_trait_macro_boundaries_follow_reexports_and_impls() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let reexported_trait = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            (
+                "src/lib.rs",
+                "macro_rules! make { () => { fn generated() -> u8; } } mod inner { pub trait T { make!(); } } pub use inner::T as PublicT;\n",
+                "macro_rules! make { () => { fn generated() -> u16; } } mod inner { pub trait T { make!(); } } pub use inner::T as PublicT;\n",
+            ),
+        ]);
+        assert!(reexported_trait.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("trait-owner:T"))
+        }));
+
+        let reexported_trait_attribute_input = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "mod inner { pub trait T { #[custom] fn value(_: u8); } } pub use inner::T as PublicT;\n",
+                "mod inner { pub trait T { #[custom] fn value(_: u16); } } pub use inner::T as PublicT;\n",
+            ),
+        ]);
+        assert!(
+            !reexported_trait_attribute_input
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "PublicT"),
+            "a replacement attribute keeps the reexported trait change typed unknown: {:?}",
+            reexported_trait_attribute_input.findings()
+        );
+        assert!(
+            reexported_trait_attribute_input
+                .unknown
+                .iter()
+                .any(|finding| {
+                    finding.identity.name == "PublicT"
+                        || finding.identity.name == "MacroGeneratedItems"
+                })
+        );
+
+        let trait_impl = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            (
+                "src/lib.rs",
+                "pub trait T { type Assoc; } pub struct Owner; macro_rules! fill { () => { type Assoc = u8; } } impl T for Owner { fill!(); }\n",
+                "pub trait T { type Assoc; } pub struct Owner; macro_rules! fill { () => { type Assoc = u16; } } impl T for Owner { fill!(); }\n",
+            ),
+        ]);
+        assert!(
+            trait_impl
+                .unknown
+                .iter()
+                .any(|finding| finding.identity.name == "TraitImplResolution")
+        );
+
+        let unlocked_trait_impl = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            (
+                "src/lib.rs",
+                "pub trait T { type Assoc; } pub struct Owner; macro_rules! fill { () => { type Assoc = u8; } } impl T for Owner { fill!(); }\n",
+                "pub trait T { type Assoc; } pub struct Owner; macro_rules! fill { () => { type Assoc = u16; } } impl T for Owner { fill!(); }\n",
+            ),
+        ]);
+        assert!(unlocked_trait_impl.unknown.iter().any(|finding| {
+            finding.identity.name == "TraitImplResolution"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("declarative-implementation-digest:unresolved:")
+                })
+        }));
+    }
+
+    #[test]
+    fn repository_backed_opaque_returns_preserve_body_dependent_auto_trait_uncertainty() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let lock = "version = 4\n";
+        let stale_external_lock = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde_remote={package='serde',version='1'}\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde_remote={package='serde',version='1'}\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n[[package]]\nname='serde'\nversion='0.0.0'\n",
+                "version = 4\n[[package]]\nname='serde'\nversion='0.0.0'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub async fn api() {}\n",
+                "pub async fn api() {}\n",
+            ),
+        ]);
+        assert_eq!(stale_external_lock.unknown.len(), 2);
+        assert!(stale_external_lock.unknown.iter().all(|finding| {
+            finding.identity.name == "OpaqueReturnAutoTraits"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("opaque-implementation-digest:unresolved:")
+                        && reason.contains("dependency candidates: serde 1")
+                })
+        }));
+
+        let async_changed = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub async fn fetch() { std::future::ready(()).await; }\n",
+                "pub async fn fetch() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); }\n",
+            ),
+        ]);
+        assert!(async_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "OpaqueReturnAutoTraits"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("body-digest:sha256:"))
+        }));
+        assert!(async_changed.changed.is_empty());
+
+        let rpit_changed = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub fn values() -> impl Iterator<Item = u8> { std::iter::once(1) }\n",
+                "pub fn values() -> impl Iterator<Item = u8> { let value = std::rc::Rc::new(1); std::iter::once_with(move || *value) }\n",
+            ),
+        ]);
+        assert!(rpit_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "OpaqueReturnAutoTraits"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("opaque-return:function"))
+        }));
+
+        let unchanged = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub async fn fetch() { std::future::ready(()).await; }\n",
+                "pub async fn fetch() { std::future::ready(()).await; }\n",
+            ),
+        ]);
+        assert!(unchanged.findings().is_empty());
+
+        let ordinary_body = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub fn calculate() -> u8 { 1 }\n",
+                "pub fn calculate() -> u8 { 2 }\n",
+            ),
+        ]);
+        assert!(ordinary_body.findings().is_empty());
+
+        let private_control = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "mod hidden { pub async fn fetch() { std::future::ready(()).await; } }\n",
+                "mod hidden { pub async fn fetch() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); } }\n",
+            ),
+        ]);
+        assert!(private_control.findings().is_empty());
+
+        let private_helper_changed = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "async fn helper() { std::future::ready(()).await; } pub async fn api() { helper().await; }\n",
+                "async fn helper() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); } pub async fn api() { helper().await; }\n",
+            ),
+        ]);
+        assert!(private_helper_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "OpaqueReturnAutoTraits"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("opaque-implementation-digest:sha256:"))
+        }));
+
+        let nonstandard_include_input = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub async fn api() { include!(\"../body.inc\"); }\n",
+                "pub async fn api() { include!(\"../body.inc\"); }\n",
+            ),
+            (
+                "body.inc",
+                "{ std::future::ready(()).await; }\n",
+                "{ let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); }\n",
+            ),
+        ]);
+        assert!(nonstandard_include_input.unknown.iter().any(|finding| {
+            finding.identity.name == "OpaqueReturnAutoTraits"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("opaque-implementation-digest:sha256:"))
+        }));
+
+        let binder_rename = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub async fn api<T: Default>() { let _: T = T::default(); }\n",
+                "pub async fn api<U: Default>() { let _: U = U::default(); }\n",
+            ),
+        ]);
+        assert!(
+            binder_rename.findings().is_empty(),
+            "generic binder spelling in an opaque body is not semantic: {:?}",
+            binder_rename.findings()
+        );
+
+        let value_parameter_rename = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub async fn api(value: u8) -> u8 { value }\n",
+                "pub async fn api(renamed: u8) -> u8 { renamed }\n",
+            ),
+        ]);
+        assert!(
+            value_parameter_rename.findings().is_empty(),
+            "value-parameter spelling in an opaque body is not semantic: {:?}",
+            value_parameter_rename.findings()
+        );
+
+        let local_destructure_and_shadow_rename = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub async fn api(input: (u8, u8)) -> u8 { let (left, right) = input; let left = left + right; left }\n",
+                "pub async fn api(values: (u8, u8)) -> u8 { let (first, second) = values; let first = first + second; first }\n",
+            ),
+        ]);
+        assert!(
+            local_destructure_and_shadow_rename.findings().is_empty(),
+            "destructuring and lexical shadow spelling in an opaque body are not semantic: {:?}",
+            local_destructure_and_shadow_rename.findings()
+        );
+
+        let forged_value_name = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "static __prview_v0: u8 = 0; pub async fn api() { let x = std::rc::Rc::new(()); drop(x); std::future::ready(()).await; let _ = __prview_v0; }\n",
+                "static __prview_v0: u8 = 0; pub async fn api() { let y = std::rc::Rc::new(()); drop(__prview_v0); std::future::ready(()).await; drop(y); }\n",
+            ),
+        ]);
+        assert!(
+            forged_value_name
+                .unknown
+                .iter()
+                .any(|finding| { finding.identity.name == "OpaqueReturnAutoTraits" })
+        );
+
+        let forged_type_name = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "struct __PrviewT0_0_0; pub async fn api<T: Default>() { let value = __PrviewT0_0_0; std::future::ready(()).await; drop(value); }\n",
+                "struct __PrviewT0_0_0; pub async fn api<T: Default>() { let value = T::default(); std::future::ready(()).await; drop(value); }\n",
+            ),
+        ]);
+        assert!(
+            forged_type_name
+                .unknown
+                .iter()
+                .any(|finding| { finding.identity.name == "OpaqueReturnAutoTraits" })
+        );
+
+        let shorthand_member_change = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub struct Pair { pub send: u8, pub nonsend: std::rc::Rc<()> } pub async fn api(pair: Pair) { let Pair { send, .. } = pair; std::future::ready(()).await; drop(send); }\n",
+                "pub struct Pair { pub send: u8, pub nonsend: std::rc::Rc<()> } pub async fn api(pair: Pair) { let Pair { nonsend, .. } = pair; std::future::ready(()).await; drop(nonsend); }\n",
+            ),
+        ]);
+        assert!(
+            shorthand_member_change
+                .unknown
+                .iter()
+                .any(|finding| { finding.identity.name == "OpaqueReturnAutoTraits" })
+        );
+
+        let module_path_change = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "mod send { pub async fn work() {} } mod nonsend { pub async fn work() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); } } pub async fn api() { let send = (); send::work().await; drop(send); }\n",
+                "mod send { pub async fn work() {} } mod nonsend { pub async fn work() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); } } pub async fn api() { let nonsend = (); nonsend::work().await; drop(nonsend); }\n",
+            ),
+        ]);
+        assert!(
+            module_path_change
+                .unknown
+                .iter()
+                .any(|finding| { finding.identity.name == "OpaqueReturnAutoTraits" })
+        );
+
+        let refutable_constants = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "const LEFT: u8 = 1; const RIGHT: u8 = 2; pub async fn api(value: u8) -> u8 { match value { LEFT => 10, _ => 0 } }\n",
+                "const LEFT: u8 = 1; const RIGHT: u8 = 2; pub async fn api(value: u8) -> u8 { match value { RIGHT => 10, _ => 0 } }\n",
+            ),
+        ]);
+        assert!(
+            refutable_constants
+                .unknown
+                .iter()
+                .any(|finding| { finding.identity.name == "OpaqueReturnAutoTraits" })
+        );
+
+        let synthetic_binder_control = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub async fn api(__prview_v0: u8) -> u8 { __prview_v0 }\n",
+                "pub async fn api(callback: u8) -> u8 { callback }\n",
+            ),
+        ]);
+        assert!(
+            synthetic_binder_control.findings().is_empty(),
+            "a user-spelled synthetic-looking binder remains alpha-equivalent: {:?}",
+            synthetic_binder_control.findings()
+        );
+    }
+
+    #[test]
+    fn opaque_return_regression_is_downstream_compiler_bound() {
+        let compile = |label: &str, source: &str| {
+            let temp = tempfile::tempdir().expect("rustc fixture tempdir");
+            let input = temp.path().join(format!("{label}.rs"));
+            let output = temp.path().join(format!("lib{label}.rlib"));
+            fs::write(&input, source).expect("write rustc fixture");
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            Command::new(rustc)
+                .args(["--edition=2021", "--crate-type=lib"])
+                .arg(&input)
+                .arg("-o")
+                .arg(output)
+                .output()
+                .expect("run rustc fixture")
+        };
+        let base = compile(
+            "opaque_send_base",
+            "async fn helper() { std::future::ready(()).await; }\n\
+             pub async fn api() { helper().await; }\n\
+             fn assert_send<T: Send>(_: T) {}\n\
+             pub fn downstream() { assert_send(api()); }\n",
+        );
+        assert!(
+            base.status.success(),
+            "base contract must compile: {}",
+            String::from_utf8_lossy(&base.stderr)
+        );
+        let target = compile(
+            "opaque_send_target",
+            "async fn helper() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); }\n\
+             pub async fn api() { helper().await; }\n\
+             fn assert_send<T: Send>(_: T) {}\n\
+             pub fn downstream() { assert_send(api()); }\n",
+        );
+        assert!(
+            !target.status.success(),
+            "target must falsify Send after only the private helper changes"
+        );
+        assert!(String::from_utf8_lossy(&target.stderr).contains("Send"));
+    }
+
+    #[test]
+    fn repository_backed_opaque_return_proofs_follow_public_origins_without_hiding_signatures() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let lock = "version = 4\n";
+        let reexported = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "mod hidden { pub async fn fetch() { std::future::ready(()).await; } } pub use hidden::fetch as public_fetch;\n",
+                "mod hidden { pub async fn fetch() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); } } pub use hidden::fetch as public_fetch;\n",
+            ),
+        ]);
+        assert!(reexported.unknown.iter().any(|finding| {
+            finding.identity.name == "OpaqueReturnAutoTraits"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("origin:Value:public_fetch"))
+        }));
+
+        let inherent = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub struct Owner; impl Owner { pub async fn fetch() { std::future::ready(()).await; } }\n",
+                "pub struct Owner; impl Owner { pub async fn fetch() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); } }\n",
+            ),
+        ]);
+        assert!(inherent.unknown.iter().any(|finding| {
+            finding.identity.name == "OpaqueReturnAutoTraits"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("opaque-return:inherent:fetch"))
+        }));
+
+        let signature_change = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub async fn fetch(_: u8) { std::future::ready(()).await; }\n",
+                "pub async fn fetch(_: u16) { std::future::ready(()).await; }\n",
+            ),
+        ]);
+        assert!(
+            signature_change
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "fetch"),
+            "item-local opaque uncertainty must not hide a confirmed signature change: {:?}",
+            signature_change.findings()
+        );
+
+        let added = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            ("src/lib.rs", "", "pub async fn added() {}\n"),
+        ]);
+        assert!(
+            added
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "added")
+        );
+        assert!(
+            added.unknown.is_empty(),
+            "a one-sided compatible addition must not carry redundant opaque uncertainty: {:?}",
+            added.findings()
+        );
+
+        let removed = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            ("src/lib.rs", "pub async fn removed() {}\n", ""),
+        ]);
+        assert!(
+            removed
+                .removed
+                .iter()
+                .any(|finding| finding.identity.name == "removed")
+        );
+        assert!(
+            removed.unknown.is_empty(),
+            "a confirmed removal must not carry redundant opaque uncertainty: {:?}",
+            removed.findings()
+        );
+    }
+
+    #[test]
+    fn repository_backed_trait_default_presence_and_opaque_body_are_distinct_contracts() {
+        let manifest = "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n";
+        let lock = "version = 4\n";
+        let removed_default = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub trait Contract { fn required() {} }\n",
+                "pub trait Contract { fn required(); }\n",
+            ),
+        ]);
+        assert!(
+            removed_default
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Contract"),
+            "removing a trait default makes downstream impls incomplete: {:?}",
+            removed_default.findings()
+        );
+
+        let added_default = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub trait Contract { fn optional(); }\n",
+                "pub trait Contract { fn optional() {} }\n",
+            ),
+        ]);
+        assert!(
+            added_default.findings().is_empty(),
+            "adding a trait default is compatible: {:?}",
+            added_default.findings()
+        );
+
+        let added_async_default = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub trait Contract { async fn optional(); }\n",
+                "pub trait Contract { async fn optional() {} }\n",
+            ),
+        ]);
+        assert!(
+            added_async_default.findings().is_empty(),
+            "adding an async trait default is compatible and must not leave a redundant opaque proof: {:?}",
+            added_async_default.findings()
+        );
+
+        let added_async_default_through_alias = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub mod inner { pub trait Contract { async fn optional(); } } pub use inner::Contract as Alias;\n",
+                "pub mod inner { pub trait Contract { async fn optional() {} } } pub use inner::Contract as Alias;\n",
+            ),
+        ]);
+        assert!(
+            added_async_default_through_alias.findings().is_empty(),
+            "a public trait alias must preserve the compatible default addition: {:?}",
+            added_async_default_through_alias.findings()
+        );
+
+        let added_default_with_changed_sibling = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub trait Contract { async fn optional(); async fn fetch() { std::future::ready(()).await; } }\n",
+                "pub trait Contract { async fn optional() {} async fn fetch() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); } }\n",
+            ),
+        ]);
+        assert!(
+            added_default_with_changed_sibling
+                .unknown
+                .iter()
+                .any(|finding| {
+                    finding.identity.name == "OpaqueReturnAutoTraits"
+                        && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                            reason.contains("opaque-return:trait-default:fetch")
+                        })
+                })
+        );
+        assert!(
+            !added_default_with_changed_sibling
+                .unknown
+                .iter()
+                .any(
+                    |finding| finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("opaque-return:trait-default:optional")
+                    })
+                ),
+            "only the newly added optional default proof is redundant: {:?}",
+            added_default_with_changed_sibling.findings()
+        );
+
+        let opaque_default = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub trait Contract { async fn fetch() { std::future::ready(()).await; } }\n",
+                "pub trait Contract { async fn fetch() { let value = std::rc::Rc::new(()); std::future::ready(()).await; drop(value); } }\n",
+            ),
+        ]);
+        assert!(opaque_default.unknown.iter().any(|finding| {
+            finding.identity.name == "OpaqueReturnAutoTraits"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("opaque-return:trait-default:fetch"))
+        }));
+        assert!(opaque_default.changed.is_empty());
+
+        let opaque_trait_impl = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub trait Contract { fn values(&self) -> impl Iterator<Item = u8>; } pub struct Owner; impl Contract for Owner { fn values(&self) -> impl Iterator<Item = u8> { std::iter::once(1) } }\n",
+                "pub trait Contract { fn values(&self) -> impl Iterator<Item = u8>; } pub struct Owner; impl Contract for Owner { fn values(&self) -> impl Iterator<Item = u8> { let value = std::rc::Rc::new(1); std::iter::once_with(move || *value) } }\n",
+            ),
+        ]);
+        assert!(opaque_trait_impl.unknown.iter().any(|finding| {
+            finding.identity.name == "TraitImplResolution"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("opaque-return:trait-impl:values"))
+        }));
+        assert!(opaque_trait_impl.changed.is_empty());
     }
 
     #[test]

@@ -52,6 +52,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Private Rust API dependency resolution follows `extern crate self as alias`
   back to the crate root, so a private layout or auto-trait change behind
   `alias::Type` cannot disappear as stable unresolved evidence.
+- Rust transforming-attribute uncertainty, including recursively nested
+  `cfg_attr`, is collected before visibility filtering and binds its annotated
+  input to lock-backed external dependency
+  identity or, for reachable local proc-macros, the complete live tracked-entry
+  substrate. Nonstandard crate roots, private annotated items, source
+  replacements, stale/unrelated lockfiles, and unproven symlink targets can no
+  longer hide generated public API uncertainty.
+- Derive macros are modeled as additive: the annotated item remains a confirmed
+  input contract while custom generated output stays typed uncertainty. Custom
+  derive/helper tokens cannot manufacture a confirmed break, and an imported
+  derive whose name shadows `Debug`, `Clone`, or another builtin remains
+  conservative instead of being misclassified as compiler-provided. Builtin
+  `Default` variant markers remain confirmed through nested, matching
+  `cfg_attr` predicates; unresolved conditional relationships stay typed
+  uncertainty, while a custom derive helper named `default` remains transform
+  input only. Associated transformers are materialized only when their
+  inherent or trait owner is externally reachable; public type-alias chains
+  remain typed owner uncertainty rather than invented confirmed methods.
+- External transformer proofs require an effective lock entry with an external
+  source, registry checksum or precise Git commit, and a version satisfying the
+  declared requirement; a stale lock containing only a same-name workspace
+  package cannot qualify. Reachable path manifests and effective
+  `.cargo/config` bytes from every reachable member invocation context
+  participate in the proof, and working-tree regular-to-symlink type changes
+  fail closed.
+- Public `async fn` and return-position `impl Trait` bodies retain item-local
+  opaque-return auto-trait uncertainty through public reexports and inherent
+  projections, bound to canonicalized repo-backed Rust plus all other live
+  tracked input identities and effective lock data so private helpers,
+  nonstandard includes, and build assets cannot disappear; tracked symlinks stay
+  unresolved. New/removed opaque items and newly added async trait defaults do
+  not gain redundant Unknown findings, including through public trait aliases.
+  Ordinary bodies remain outside confirmed contracts; adding a public
+  trait-method default is compatible, while removing one is a confirmed
+  contract change. Parameter, local irrefutable destructuring, closure, loop,
+  and lexical-shadow binder spellings are alpha-normalized in opaque bodies;
+  refutable pattern names stay conservative without name-resolution proof.
+- Rust 2024 `unsafe(no_mangle)`, `unsafe(export_name)`, and
+  `unsafe(link_section)` remain ordinary confirmed attributes on public items.
+  A private `no_mangle`/`export_name` function or static emits typed
+  binary-export uncertainty instead of disappearing from the API analysis,
+  including through nested `cfg_attr`. Conditional `macro_export` declarations
+  remain root API, and top-level function-like macro invocations bind their
+  input to a revision-backed implementation-substrate digest.
+- Rust named private-field order is preserved only when `repr(C)` defines it.
+  Pure reorders under `repr(transparent)` or standalone `repr(packed)` /
+  `repr(align)` are neutral, while private field types and semantic repr
+  attributes remain observable; `repr(C)` and primitive enum representations
+  stay order-sensitive.
 - TUI startup keeps its signal supervisor through the raw-mode transition and
   gives an already-pending interrupt priority during the explicit handoff to
   key events. `--tui` now rejects one fixed immutable

@@ -1550,26 +1550,105 @@ and unit struct constructors occupy Value; named-field structs remain Type-only.
 rustfmt, and lint attributes normalized away. Proc-macro crate exports use their
 external macro/derive names only for public functions declared at crate root;
 private or nested declarations become precise unknowns. Unresolved transforming
-attributes are checked on modules, impls and associated items, foreign
-blocks/items, macro declarations, and ordinary public projections. They
-suppress every dependent positive claim and emit `MacroGeneratedItems` evidence
-bound to the complete annotated input. An unchanged transformer therefore
-cannot neutralize a changed item. Foreign functions/statics inherit the parent
+attributes, including recursively nested `cfg_attr`, are checked on modules,
+impls and associated items, foreign blocks/items, macro declarations, and
+ordinary items before visibility filtering. A private annotated input can expand
+into public output, so it is not
+discarded merely because the source item is private. Replacement-style
+attribute boundaries suppress only claims for their annotated owner; an
+unrelated confirmed change in the same module remains visible. Derives are
+additive: the annotated input item remains a confirmed contract while custom generated
+output emits `MacroGeneratedItems` evidence bound to the complete input and to
+revision-backed transformer provenance. Custom derive/helper attributes are
+excluded from the confirmed input contract, and an unqualified builtin-looking
+derive is treated as custom whenever an import, glob, or `macro_use` can shadow
+that name. Builtin `Default` variant markers are retained only when the enum has
+a proven builtin derive, including matching nested conditional predicate
+lineage. Singleton `all`/`any` wrappers are normalized; any remaining
+unprovable helper/derive relationship emits typed `CfgPredicate` uncertainty
+instead of disappearing. Custom helper attributes stay outside the confirmed
+contract. Associated-item
+transform evidence is materialized only after its inherent or trait owner
+reaches the external API, directly or by reexport. Public type-alias chains are
+resolved transitively and conservatively emit owner uncertainty because source
+analysis does not prove generic specialization. Function-like associated
+macros, top-level macro invocations, and nested trait/trait-impl attributes bind
+both their invocation/input and the appropriate revision-backed implementation
+substrate. Conditional and nested `cfg_attr(..., macro_export)` declarations
+remain crate-root macro API. A lock-backed external candidate binds all
+reachable product/path manifests, effective Cargo config bytes, and lockfiles.
+When a reachable local proc-macro exists, the current safety floor additionally hashes
+the complete live tracked-entry inventory by Git object identity (excluding
+redundant directory-tree objects), including nonstandard `lib.path`, `#[path]`,
+gitlinks, and build assets outside a package directory. A lock-backed external
+candidate must also appear by actual package name, external registry/git source,
+and a version satisfying the declared requirement in the effective lock.
+Registry entries additionally require a valid checksum and Git entries a
+precise commit; a present but stale/empty lock or a same-name local workspace package does not
+qualify. Cargo config discovery covers each reachable manifest directory and
+its ancestors as well as the lock authority; running Cargo from a workspace
+member therefore cannot hide a member-local source replacement. Tracked
+symlinks, including working-tree regular-to-symlink type changes, remain
+`unresolved` because their Git blob pins only the target path, not the bytes of
+an outside-repository target. Exact attribute-to-crate resolution remains a
+future precision improvement; the local
+aggregate can therefore over-report after any tracked-file change. Missing
+effective product/workspace lock data, no transformer dependency candidate, or
+unresolved Cargo manifest/config source replacement (`patch`, `replace`,
+`source`, or `paths`) produces an explicit unresolved digest that never
+neutralizes. A lockfile owned only by an unrelated fixture cannot qualify the
+proof. An unchanged transformer therefore cannot neutralize a changed item or
+changed implementation substrate. Foreign functions/statics inherit the parent
 ABI, safety, and relevant attributes.
 
-Contracts are emitted from normalized `syn` ASTs. Function/default bodies and
-ordinary named private member names/order are excluded. Inherited and restricted
-field visibility are normalized to the same external-private form. Their anonymized type
-multiset remains observable because a private type can change public auto traits
-such as `Send`/`Sync`; only ABI-sensitive `repr(C)`, `repr(packed)`, and
-`repr(transparent)` retain declaration order as layout. `repr(Rust)` follows the
-ordinary order-insensitive contract. Tuple-field position and privacy remain
-structural because any private tuple element changes constructor callability and
-arity. ABI, qualifiers,
+Contracts are emitted from normalized `syn` ASTs. Ordinary function bodies are
+excluded from confirmed item contracts, although private implementation inputs
+can contribute to the conservative opaque-return digest described below. The
+presence of a public trait-method default remains a directional contract fact:
+removing the default can make downstream impls incomplete, while adding one is
+compatible.
+Bodies of caller-observable `async fn` and return-position `impl Trait` items
+also carry item-local `OpaqueReturnAutoTraits` evidence because their hidden
+types can change `Send`, `Sync`, and other auto traits without a signature edit.
+The proof binds a canonical body/signature to the effective product/workspace
+lock, canonicalized repo-backed Rust files, and cheap Git object identities for
+every other live tracked input. This covers nonstandard `include!`/`#[path]`
+files and build-script assets without rereading every blob; redundant directory
+tree objects are excluded so they do not defeat Rust canonicalization. Tracked
+symlinks keep the proof unresolved until their target provenance can be proven;
+pinned gitlinks remain object-bound. Free identifiers from the whole body are
+reserved before synthetic binders are allocated, and macro namespaces are not
+rewritten as type-generic uses. Public opaque bodies are alpha-normalized inside
+that substrate so generic binder
+spelling plus parameter/local irrefutable-destructuring/closure/loop/shadow
+binding names remain neutral; refutable match/`if let`/`while let` pattern names
+stay spelling-sensitive unless name resolution can prove they are bindings.
+Private helper changes remain observable. This conservative implementation
+closure can over-report after an unrelated tracked
+input changes. Missing lock-backed provenance or unresolved Cargo source
+replacement never neutralizes.
+Changed digests stay typed uncertainty rather than becoming a confirmed API
+change, and follow public reexports/inherent origins without suppressing an
+independent signature change. One-sided proofs for a wholly new or removed item
+are suppressed because the Added/Removed fact already carries the compatibility
+decision. Adding a trait-method default is compatible; removing one remains a
+confirmed contract change. Ordinary named private member names/order are
+excluded. Inherited and restricted field visibility are normalized to the same
+external-private form. Their anonymized type multiset remains observable because
+a private type can change public auto traits such as `Send`/`Sync`. Only
+`repr(C)` fixes named struct-field declaration order. `repr(transparent)` and
+standalone `repr(packed)`/`repr(align)` retain their semantic attributes and
+private field types but canonicalize named private-field order. `repr(Rust)`
+follows the same order-insensitive contract. Tuple-field position and privacy
+remain structural because any private tuple element changes constructor
+callability and arity. ABI, qualifiers,
 generics/bounds/where clauses, return types, public fields with structural tuple
 indices, enum variants/discriminants, trait headers and associated items, type
-aliases, public constants/statics, and relevant attributes remain. Inherent
-impls are collected independently of module reachability, resolve owners through
+aliases, public constants/statics, and relevant attributes remain. Rust 2024
+unsafe attribute wrappers are parsed structurally. Private functions or statics
+exported through direct or conditional `no_mangle`/`export_name` remain typed,
+guard-aware binary-symbol uncertainty rather than being omitted. Inherent impls
+are collected independently of module reachability, resolve owners through
 same-crate `self`/`super`/`crate` paths, and retain self type, specialization,
 impl generics/bounds/where clauses, and impl/item attributes before projection
 through every reachable type alias. Unprovable owners are typed unknowns.
@@ -1586,12 +1665,14 @@ evaluating host configuration.
 Union members are canonicalized as an order-independent set even under
 `repr(C)`: every member starts at offset zero, while names and types still
 determine source compatibility, size, alignment, and auto traits. Named
-enum-variant fields are order-neutral under `repr(Rust)` but retain declaration
-order when the enum has a layout-sensitive repr; tuple-variant order is always
+enum-variant fields are order-sensitive for `repr(C)` and primitive integer
+representations. They are order-neutral under `repr(Rust)`, `repr(transparent)`,
+and standalone `repr(align)`; tuple-variant order is always
 preserved.
 
-Function parameter patterns are canonicalized to `_`, and generic, const, and
-lifetime binders are alpha-normalized by declaration order across free, trait,
+Confirmed function contracts canonicalize parameter patterns to `_`. Generic,
+const, and lifetime binders are alpha-normalized by declaration order across
+free, trait,
 inherent, foreign, and higher-ranked function signatures as well as public
 structs, unions, enums, type aliases, and associated trait const/type members.
 The mapping is reused at every bound, type, and default occurrence, so renaming
@@ -1599,8 +1680,8 @@ a binder is neutral while generic order, types, ABI, and lifetime relationships
 remain part of the contract. Opaque macro invocation token bodies are not Rust
 AST to `syn`; binder references that exist only inside those tokens remain a
 source-parser limitation and are not presented as compiler-backed truth.
-Source-only analysis does
-not pretend to resolve trait selection or coherence: an impl whose trait and
+Source-only analysis does not pretend to resolve trait selection or coherence:
+an impl whose trait and
 owner are both externally reachable is retained as `TraitImplResolution`
 uncertainty with its normalized source contract until compiler-backed resolution
 exists, including impls written in a private helper module. Private/private

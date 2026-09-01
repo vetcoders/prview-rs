@@ -618,11 +618,13 @@ visibility-changed Rust facts are breaking; added-only facts are informational.
 Typed unknowns degrade confidence and require review without claiming a
 confirmed removal. Rust identities include ordinary type/value/macro items plus
 public modules, library crates, and Cargo features. Tuple-constructor privacy,
-ABI-sensitive `repr(C)`/`repr(packed)`/`repr(transparent)` private layout,
-primitive integer enum reprs, and exhaustive-enum variant additions are
-observable changes. `repr(Rust)` private field order is not, although private
-field types remain observable through auto traits; inherited and restricted
-field visibility are equivalent to an external caller. Appending a fieldless
+`repr(C)` named-field order, private field types under every repr, primitive
+integer enum reprs, and exhaustive-enum variant additions are observable
+changes. `repr(Rust)`, `repr(transparent)`, and standalone
+`repr(packed)`/`repr(align)` private named-field order is not; their attributes
+and private field types remain observable through layout and auto traits.
+Inherited and restricted field visibility are equivalent to an external caller.
+Appending a fieldless
 variant to an otherwise unchanged `#[non_exhaustive]` enum is informational
 unless an ABI-sensitive repr makes layout observable. A new payload-bearing
 variant, a fieldless variant inserted before an existing implicit discriminant,
@@ -635,11 +637,49 @@ public item instead reaches a transitive non-public local type, private alias,
 or local trait implementation whose compiler-derived effect cannot be proven
 from source, prview emits guard-aware `PrivateTypeDependency` uncertainty. It
 does not promote that evidence to a confirmed breaking change.
-Expression-position include macros retain included-byte digests, and
-transforming-attribute unknowns are bound to their annotated input. Legal
+Expression-position include macros retain included-byte digests.
+Transforming-attribute unknowns, including recursively nested `cfg_attr`, are
+collected before visibility filtering and bound both to their annotated input
+and to revision-backed transformer provenance. Derives are additive: confirmed
+input-item changes remain visible,
+while custom generated output stays Unknown; custom/helper tokens are not
+duplicated as confirmed breaking semantics, builtin-looking names shadowed by
+imports remain conservative, and associated transforms require an externally
+reachable inherent owner. Builtin `Default` helpers follow matching nested
+  conditional predicate lineage; relationships that cannot be proven remain
+  typed uncertainty. Lock-backed external candidates use reachable manifest,
+  effective Cargo config from every reachable member context, and lock identity;
+  their external source, registry checksum or precise Git commit, and locked
+version must satisfy the declared package requirement. When a local proc-macro
+is reachable, the conservative safety floor hashes every live
+tracked entry by Git object identity (excluding redundant directory-tree
+objects) so nonstandard crate roots, pinned gitlinks, and build assets do not
+disappear. Only the effective product/workspace lock qualifies; a fixture lock,
+stale lock missing a dependency candidate, or tracked symlink whose target bytes
+are not revision-proven does not. Missing lock/candidate provenance and
+unresolved manifest/config Cargo source replacement never neutralize, while the
+local aggregate may over-report after an unrelated tracked-file edit. Public
+trait-method defaults are directional: addition is compatible and removal is a
+confirmed contract change. Body or private-helper changes affecting a
+caller-observable `async fn` or return-position `impl Trait` produce item-local
+`OpaqueReturnAutoTraits` uncertainty bound to canonicalized repo-backed Rust,
+all other live tracked input identities, and effective lock data. This covers
+nonstandard include/path/build inputs without reading every tracked blob. A
+tracked symlink keeps this proof unresolved; a wholly new or removed opaque item
+relies on its Added/Removed fact instead of a redundant Unknown, and adding an
+async trait default is treated the same way. This conservative source closure
+may over-report after an unrelated tracked input
+changes, but it does not promote uncertainty to a confirmed break. Legal
 non-include macro invocation token bodies remain opaque to source-level binder
-normalization and are not compiler-backed semantic proof. Legal
-non-UTF-8 Git paths emit side-specific typed path uncertainty while valid sibling
+normalization. Their invocations bind to a revision-backed implementation
+substrate, and conditional `macro_export` declarations remain crate-root API.
+Rust-AST opaque bodies alpha-normalize generic, parameter, irrefutable local
+destructuring, closure, loop, and lexical-shadow binder spellings. Refutable
+match/`if let`/`while let` pattern names remain spelling-sensitive without name
+resolution; macro token bodies are not compiler-backed semantic proof. Private
+binary symbols exported by direct or conditional `no_mangle`/`export_name`
+produce guard-aware typed uncertainty. Legal non-UTF-8 Git paths emit
+side-specific typed path uncertainty while valid sibling
 files continue to be analyzed; their collision-free internal identity cannot be
 forged by a literal UTF-8 surrogate filename. Multiple independent workspace
 authorities in a rootless revision source emit `WorkspaceDiscovery` uncertainty
