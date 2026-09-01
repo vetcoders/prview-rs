@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/main.rs`, `src/bin/*.rs`, `src/bin/*/main.rs`, and `[[bin]]` entries,
   respecting `autobins`, target editions, explicit paths, and
   `required-features`. Binary targets keep a target-scoped analysis identity,
-  so their native-export evidence cannot inherit a same-named library's Rust
-  dependency projection.
+  preserving digit-prefixed and hyphen/underscore-distinct manifest target names, so
+  `foo-bar` and `foo_bar` cannot collide and native-export evidence cannot
+  inherit a same-named library's Rust dependency projection.
 - While the TUI waits for an in-process synchronous analysis stage to unwind,
   it continues reading raw terminal input. A second Ctrl-C now returns typed
   cancellation immediately, allowing terminal cleanup and the established exit

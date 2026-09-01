@@ -430,8 +430,9 @@ struct ModuleVisibilityProof {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CargoBinaryTarget {
     // A package's library and default binary normally share a Rust crate name.
-    // Native facts need a target-scoped key so the binary never inherits the
-    // library's Rust-linkable projection mode.
+    // Native facts need a target-scoped evidential key, preserving the exact
+    // Cargo target name, so the binary never inherits the library's
+    // Rust-linkable projection mode or collides after crate-name normalization.
     analysis_name: String,
     target_name: String,
     root_path: String,
@@ -10040,7 +10041,7 @@ fn cargo_binary_targets(
                 .map(|target| target.target_name.as_str())
                 .collect();
             discovery.errors.push(format!(
-                "binary target names {names:?} normalize to the same Rust crate identity"
+                "binary target names {names:?} share the same internal analysis identity"
             ));
             continue;
         }
@@ -10126,14 +10127,29 @@ fn binary_required_features(table: &toml::Table, index: usize) -> Result<Vec<Str
 
 fn binary_analysis_name(package_name: &str, target_name: &str) -> String {
     format!(
-        "{}#bin:{}",
-        normalize_identifier(package_name.replace('-', "_")),
-        normalize_identifier(target_name.replace('-', "_"))
+        "{}#bin:{target_name}",
+        normalize_identifier(package_name.replace('-', "_"))
     )
 }
 
 fn validate_binary_target_name(name: &str) -> Result<(), String> {
-    validate_package_name(name).map_err(|reason| reason.replace("package.name", "bin.name"))
+    if name.is_empty() {
+        return Err("bin.name must not be empty".to_owned());
+    }
+    if matches!(name, "deps" | "examples" | "build" | "incremental") {
+        return Err(format!(
+            "bin.name conflicts with Cargo's build directories: {name:?}"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|character| character.is_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(format!(
+            "bin.name contains unsupported characters: {name:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn is_live_binary_root_candidate(entry: &RevisionEntry) -> bool {
@@ -13809,6 +13825,43 @@ mod tests {
                 .all(|unknown| !unknown.evidence.contains("ignored_implicit"))
         );
 
+        let digit_prefixed = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nautobins=false\n[[bin]]\nname='123worker'\npath='cmd/123worker.rs'\n",
+            ),
+            (
+                "cmd/123worker.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn digit_export() {}",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&digit_prefixed);
+        assert!(snapshot.items.is_empty());
+        assert!(snapshot.declarations.is_empty());
+        assert!(snapshot.crates.is_empty());
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.crate_name.as_deref() == Some("fixture#bin:123worker")
+                && unknown.source_path == "cmd/123worker.rs"
+                && unknown.evidence.contains("digit_export")
+        }));
+
+        let auto_digit_prefixed = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n",
+            ),
+            (
+                "src/bin/123worker.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn auto_digit_export() {}",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&auto_digit_prefixed);
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.crate_name.as_deref() == Some("fixture#bin:123worker")
+                && unknown.source_path == "src/bin/123worker.rs"
+                && unknown.evidence.contains("auto_digit_export")
+        }));
+
         let explicit_claims_auto_path = MemorySource::new(&[
             (
                 "Cargo.toml",
@@ -13985,15 +14038,22 @@ mod tests {
             ),
         ]);
         let snapshot = snapshot_rust_api(&normalized_collision);
+        assert!(snapshot.items.is_empty());
+        assert!(snapshot.declarations.is_empty());
+        assert!(snapshot.crates.is_empty());
         assert!(snapshot.unknowns.iter().any(|unknown| {
-            unknown.kind == RustApiUnknownKind::ManifestParse
-                && unknown
-                    .evidence
-                    .contains("normalize to the same Rust crate identity")
+            unknown.crate_name.as_deref() == Some("fixture#bin:foo-bar")
+                && unknown.source_path == "cmd/dash.rs"
+                && unknown.evidence.contains("dash_export")
         }));
-        assert!(snapshot.unknowns.iter().all(|unknown| {
-            !unknown.evidence.contains("dash_export")
-                && !unknown.evidence.contains("underscore_export")
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.crate_name.as_deref() == Some("fixture#bin:foo_bar")
+                && unknown.source_path == "cmd/underscore.rs"
+                && unknown.evidence.contains("underscore_export")
+        }));
+        assert!(!snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::ManifestParse
+                && unknown.evidence.contains("binary target names")
         }));
 
         let explicit_edition = MemorySource::new(&[
@@ -17109,5 +17169,17 @@ mod tests {
         let opaque_error =
             opaque_implementation_digest(&source, &inventory, &manifests, &allowed).unwrap_err();
         assert!(opaque_error.contains("tracked symlink macros/schema.json"));
+    }
+
+    #[test]
+    fn binary_target_names_match_cargo_artifact_rules() {
+        assert!(validate_binary_target_name("123worker").is_ok());
+        assert!(validate_binary_target_name("foo-bar").is_ok());
+        assert!(validate_binary_target_name("foo_bar").is_ok());
+
+        for reserved in ["deps", "examples", "build", "incremental"] {
+            let error = validate_binary_target_name(reserved).unwrap_err();
+            assert!(error.contains("conflicts with Cargo's build directories"));
+        }
     }
 }

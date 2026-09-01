@@ -4608,6 +4608,58 @@ mod tests {
                 })
         }));
 
+        let digit_manifest = "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nautobins=false\n[[bin]]\nname='123worker'\npath='cmd/123worker.rs'\n";
+        let digit_prefixed = repository_delta(&[
+            ("Cargo.toml", digit_manifest, digit_manifest),
+            (
+                "cmd/123worker.rs",
+                "#[unsafe(no_mangle)] extern \"C\" fn digit_export(_: u8) {}\n",
+                "#[unsafe(no_mangle)] extern \"C\" fn digit_export(_: u16) {}\n",
+            ),
+        ]);
+        assert!(digit_prefixed.unknown.iter().any(|finding| {
+            finding.identity.crate_name == "fixture#bin:123worker"
+                && finding.identity.name == "UnsupportedExternResolution"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("digit_export"))
+        }));
+
+        let colliding_names_manifest = "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nautobins=false\n[[bin]]\nname='foo-bar'\npath='cmd/dash.rs'\n[[bin]]\nname='foo_bar'\npath='cmd/underscore.rs'\n";
+        let punctuation_distinct = repository_delta(&[
+            (
+                "Cargo.toml",
+                colliding_names_manifest,
+                colliding_names_manifest,
+            ),
+            (
+                "cmd/dash.rs",
+                "#[unsafe(no_mangle)] extern \"C\" fn dash_export(_: u8) {}\n",
+                "#[unsafe(no_mangle)] extern \"C\" fn dash_export(_: u16) {}\n",
+            ),
+            (
+                "cmd/underscore.rs",
+                "#[unsafe(no_mangle)] extern \"C\" fn underscore_export(_: u8) {}\n",
+                "#[unsafe(no_mangle)] extern \"C\" fn underscore_export(_: u8) {}\n",
+            ),
+        ]);
+        assert!(punctuation_distinct.unknown.iter().any(|finding| {
+            finding.identity.crate_name == "fixture#bin:foo-bar"
+                && finding.identity.name == "UnsupportedExternResolution"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("dash_export"))
+        }));
+        assert!(!punctuation_distinct.unknown.iter().any(|finding| {
+            finding.identity.crate_name == "fixture#bin:foo_bar"
+                && finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("underscore_export"))
+        }));
+
         let mixed_manifest = "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n";
         let mixed = repository_delta(&[
             ("Cargo.toml", mixed_manifest, mixed_manifest),

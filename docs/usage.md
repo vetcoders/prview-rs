@@ -634,8 +634,12 @@ layouts, and explicit `[[bin]]` tables with Cargo's `autobins`, edition, path,
 and `required-features` rules. An exact tracked binary-root symlink fails
 closed; symlinked parent directories such as `src/` or `src/bin/` are not
 separately classified by this discovery layer. Each binary has a target-scoped
-analysis identity separate from a same-named library. Proc-macro exports remain
-separate, and
+analysis identity separate from a same-named library. The identity preserves
+the manifest target name: digit-prefixed targets are accepted, Cargo's reserved
+build-directory names remain invalid, and names such as `foo-bar` and `foo_bar`
+remain distinct in prview despite normalizing to the same Rust crate name.
+This is an evidence identity only; it does not publish binary internals as Rust
+dependency API. Proc-macro exports remain separate, and
 native-only `cdylib`/`staticlib`/`bin` targets retain binary-export and target
 uncertainty, including exported associated functions in inherent and trait
 impls, without pretending that their internal `pub` items are dependency API.

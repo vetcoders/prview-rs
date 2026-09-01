@@ -1500,8 +1500,12 @@ metadata remains typed manifest uncertainty. An exact binary root that is
 itself a tracked symlink is retained as non-neutralizable typed uncertainty.
 Discovery does not separately model a symlinked parent directory such as
 `src/` or `src/bin/`; that bounded filesystem-shape residual remains outside
-this contract. Each binary uses a stable target-scoped analysis identity
-(`<package>#bin:<target>`), preventing
+this contract. A binary target name is validated as Cargo target metadata, not
+as a Rust dependency-crate identifier: a leading digit is valid, while Cargo's
+reserved build-directory names remain invalid. Each binary
+uses a stable target-scoped analysis identity (`<package>#bin:<target>`) that
+preserves the exact manifest target name, so `foo-bar` and `foo_bar` remain
+distinct while preventing
 the common same-named library and default binary from sharing projection,
 edition, cfg-authority, module-cache, or native-evidence state. These synthetic
 identities are evidence keys, not Rust dependency crates and not additions to
