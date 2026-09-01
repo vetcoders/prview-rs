@@ -103,10 +103,17 @@ pub(super) fn plan_python_run_with_env(
     mut inherited: impl FnMut(&str) -> Option<OsString>,
 ) -> Result<PythonRun> {
     let plan = plan_check_run(config)?;
+    let no_discovered_uv_config = uv_no_config_enabled(&mut inherited)?;
     let explicit_config = checked_uv_environment_with(&plan.scan_dir, &mut inherited)?;
-    metadata_stays_in_project(&plan.scan_dir, explicit_config.is_some())?;
-    let configured_limits =
-        project_uv_concurrency_limits(&plan.scan_dir, explicit_config.as_deref())?;
+    metadata_stays_in_project(
+        &plan.scan_dir,
+        explicit_config.is_some() || no_discovered_uv_config,
+    )?;
+    let configured_limits = project_uv_concurrency_limits(
+        &plan.scan_dir,
+        explicit_config.as_deref(),
+        no_discovered_uv_config,
+    )?;
     // Every `uv run`, not only the eager pre-sync, may synchronize or build the
     // environment. Keep all of uv's own pools and Cargo-backed PEP 517 builds
     // inside the same descendant envelope the run advertises. An operator's
@@ -910,14 +917,15 @@ fn pytest_probe_env(base_env: &[(String, String)]) -> Vec<(String, String)> {
 /// INSIDE the tree resolves back inside and passes. A path that cannot be
 /// canonicalised is simply not there: the tools reporting a missing project is a
 /// truthful failure of this tree, not a foreign one's verdict.
-fn metadata_stays_in_project(root: &Path, explicit_uv_config: bool) -> Result<()> {
+fn metadata_stays_in_project(root: &Path, ignore_discovered_uv_config: bool) -> Result<()> {
     let Ok(resolved_root) = root.canonicalize() else {
         return Ok(());
     };
     for name in PYTHON_PROJECT_METADATA {
-        if explicit_uv_config && *name == "uv.toml" {
-            // UV_CONFIG_FILE replaces discovery of uv.toml. The explicit file
-            // was already resolved and contained by checked_uv_environment_with.
+        if ignore_discovered_uv_config && *name == "uv.toml" {
+            // UV_CONFIG_FILE replaces discovery of uv.toml, while
+            // UV_NO_CONFIG disables discovery altogether. An explicit file was
+            // already resolved and contained by checked_uv_environment_with.
             continue;
         }
         let path = root.join(name);
@@ -934,6 +942,27 @@ fn metadata_stays_in_project(root: &Path, explicit_uv_config: bool) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Mirror uv's boolish environment parser for `--no-config`.
+///
+/// This must be decided before reading project-owned uv configuration: when the
+/// flag is enabled, uv ignores discovered `uv.toml` and `[tool.uv]` settings.
+/// Invalid values stay loud because uv would reject the invocation as well.
+fn uv_no_config_enabled(inherited: &mut impl FnMut(&str) -> Option<OsString>) -> Result<bool> {
+    let Some(value) = inherited("UV_NO_CONFIG") else {
+        return Ok(false);
+    };
+    let Some(value) = value.to_str() else {
+        anyhow::bail!("UV_NO_CONFIG is not valid UTF-8, so its uv boolean value is unknown");
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" | "on" | "1" => Ok(true),
+        "false" | "f" | "no" | "n" | "off" | "0" => Ok(false),
+        _ => anyhow::bail!(
+            "UV_NO_CONFIG must be a boolean understood by uv (true/false, yes/no, on/off, 1/0), got {value:?}"
+        ),
+    }
 }
 
 /// Resolve uv's environment-owned path selectors before a command can replace
@@ -1004,13 +1033,19 @@ fn resolve_uv_environment_path(
 
 /// Read only the project-owned scalar settings prview is about to override.
 /// uv.toml wins wholesale over `[tool.uv]` in pyproject.toml; UV_CONFIG_FILE,
-/// when present and contained, replaces both discovered authorities.
+/// when present and contained, replaces both discovered authorities. With
+/// UV_NO_CONFIG, neither discovered authority participates, while an explicit
+/// UV_CONFIG_FILE remains authoritative just as it does for uv itself.
 fn project_uv_concurrency_limits(
     root: &Path,
     explicit_config: Option<&Path>,
+    no_discovered_config: bool,
 ) -> Result<super::UvConcurrencyLimits> {
     if let Some(path) = explicit_config {
         return uv_concurrency_limits_from_file(path, false);
+    }
+    if no_discovered_config {
+        return Ok(super::UvConcurrencyLimits::default());
     }
 
     let uv_toml = root.join("uv.toml");
@@ -1977,6 +2012,136 @@ mod tests {
     }
 
     #[test]
+    fn invalid_text_uv_no_config_is_loud() {
+        let mut inherited =
+            |key: &str| (key == "UV_NO_CONFIG").then(|| OsString::from("sometimes"));
+        let error = uv_no_config_enabled(&mut inherited)
+            .expect_err("uv rejects values outside its boolish vocabulary");
+
+        assert!(
+            error.to_string().contains("UV_NO_CONFIG") && error.to_string().contains("boolean"),
+            "the refusal must identify the invalid uv boolean: {error}",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_uv_no_config_is_loud() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = OsString::from_vec(vec![0xff]);
+        let mut inherited = |key: &str| (key == "UV_NO_CONFIG").then(|| invalid.clone());
+        let error = uv_no_config_enabled(&mut inherited)
+            .expect_err("uv cannot parse a non-UTF-8 boolean environment value");
+
+        assert!(
+            error.to_string().contains("UV_NO_CONFIG")
+                && error.to_string().contains("not valid UTF-8"),
+            "the refusal must identify the undecodable uv boolean: {error}",
+        );
+    }
+
+    /// `UV_NO_CONFIG` is uv's environment spelling of `--no-config`: project
+    /// configuration is not discovered, so prview must neither reject an
+    /// ignored uv.toml symlink nor silently restore limits from `[tool.uv]`.
+    #[test]
+    #[cfg(unix)]
+    fn uv_no_config_ignores_discovered_configuration_before_planning() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"reviewed\"\n\n[tool.uv]\nconcurrent-builds = 2\n",
+        )
+        .expect("pyproject");
+        let foreign = outside.path().join("uv.toml");
+        std::fs::write(&foreign, "concurrent-builds = 1\n").expect("foreign config");
+        std::os::unix::fs::symlink(&foreign, root.path().join("uv.toml")).expect("uv.toml symlink");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = root.path().to_path_buf();
+        config.resource_plan.worker_limit = 4;
+        let run = plan_python_run_with_env(&config, |key| {
+            (key == "UV_NO_CONFIG").then(|| OsString::from("yes"))
+        })
+        .expect("ignored discovered config must not participate in the plan");
+
+        assert_eq!(
+            planned_env_value(&run, "UV_CONCURRENT_BUILDS"),
+            "4",
+            "the run envelope, not ignored uv.toml or [tool.uv], is authoritative",
+        );
+
+        let Err(error) = plan_python_run_with_env(&config, |key| {
+            (key == "UV_NO_CONFIG").then(|| OsString::from("false"))
+        }) else {
+            panic!("UV_NO_CONFIG=false must leave discovered uv.toml authoritative");
+        };
+        assert!(
+            error.to_string().contains("uv.toml"),
+            "the disabled flag must preserve containment of discovered config: {error}",
+        );
+    }
+
+    /// Disabling uv configuration discovery does not waive containment for the
+    /// project manifest: uv still consumes it as project/dependency metadata,
+    /// and ruff, mypy and pytest may consume their own tables from the file.
+    #[test]
+    #[cfg(unix)]
+    fn uv_no_config_keeps_independently_consumed_metadata_contained() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        let outside = tempfile::tempdir().expect("outside");
+        let foreign = outside.path().join("pyproject.toml");
+        std::fs::write(&foreign, "[project]\nname = \"foreign\"\n").expect("foreign project");
+        std::os::unix::fs::symlink(&foreign, root.path().join("pyproject.toml"))
+            .expect("pyproject symlink");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = root.path().to_path_buf();
+        let Err(error) = plan_python_run_with_env(&config, |key| {
+            (key == "UV_NO_CONFIG").then(|| OsString::from("1"))
+        }) else {
+            panic!("foreign project metadata remains outside the reviewed tree");
+        };
+
+        assert!(
+            error.to_string().contains("pyproject.toml"),
+            "the refusal must name the independently consumed metadata: {error}",
+        );
+    }
+
+    /// `--no-config` disables discovery; it does not disable an explicit
+    /// `--config-file`. uv gives UV_CONFIG_FILE the same semantics, so prview
+    /// must still contain and read it when both environment variables are set.
+    #[test]
+    fn uv_no_config_keeps_explicit_config_authoritative() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        std::fs::create_dir(root.path().join("config")).expect("config dir");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"reviewed\"\n\n[tool.uv]\nconcurrent-builds = 1\n",
+        )
+        .expect("pyproject");
+        std::fs::write(
+            root.path().join("config/explicit.toml"),
+            "concurrent-builds = 3\n",
+        )
+        .expect("explicit config");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = root.path().to_path_buf();
+        config.resource_plan.worker_limit = 4;
+        let run = plan_python_run_with_env(&config, |key| match key {
+            "UV_NO_CONFIG" => Some(OsString::from("true")),
+            "UV_CONFIG_FILE" => Some(OsString::from("config/explicit.toml")),
+            _ => None,
+        })
+        .expect("explicit config remains authoritative");
+
+        assert_eq!(planned_env_value(&run, "UV_CONCURRENT_BUILDS"), "3");
+    }
+
+    #[test]
     fn uv_path_redirects_must_stay_on_the_exact_reviewed_root() {
         let root = tempfile::tempdir().expect("reviewed root");
         let outside = tempfile::tempdir().expect("outside");
@@ -2029,7 +2194,7 @@ mod tests {
             "concurrent-builds = [\n",
         ] {
             std::fs::write(root.path().join("uv.toml"), contents).expect("uv.toml");
-            let error = project_uv_concurrency_limits(root.path(), None)
+            let error = project_uv_concurrency_limits(root.path(), None, false)
                 .expect_err("an unknown project ceiling must not become absent");
             assert!(
                 error.to_string().contains("uv configuration")
@@ -2043,7 +2208,7 @@ mod tests {
     fn non_utf8_uv_project_concurrency_is_loud() {
         let root = tempfile::tempdir().expect("reviewed root");
         std::fs::write(root.path().join("uv.toml"), b"\xff").expect("uv.toml");
-        let error = project_uv_concurrency_limits(root.path(), None)
+        let error = project_uv_concurrency_limits(root.path(), None, false)
             .expect_err("non-UTF-8 project policy must not become absent");
         assert!(error.to_string().contains("not UTF-8"));
     }
