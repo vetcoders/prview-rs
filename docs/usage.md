@@ -619,7 +619,17 @@ valid. Confirmed removed, changed, relocated, and
 visibility-changed Rust facts are breaking; added-only facts are informational.
 Typed unknowns degrade confidence and require review without claiming a
 confirmed removal. Rust identities include ordinary type/value/macro items plus
-public modules, library crates, and Cargo features. Tuple-constructor privacy,
+public modules, library crates, and Cargo features. An implicit library target
+is present only when Cargo auto-discovery is enabled for the effective edition
+and a live `src/lib.rs` exists; absence is not a `MissingLibRoot`, while an
+explicit unavailable `[lib]` root remains unknown. Ordinary Rust items are
+projected only for Rust-linkable `lib`/`rlib`/`dylib` outputs. Proc-macro
+exports remain separate, and native-only `cdylib`/`staticlib`/`bin` targets
+retain binary-export and target uncertainty without pretending that their
+internal `pub` items are dependency API. Exported declarative macro contracts
+bind the effective direct, workspace-inherited, or library-target edition; an
+edition change without such a macro does not create a synthetic break.
+Tuple-constructor privacy,
 `repr(C)` named-field order, private field types under every repr, primitive
 integer enum reprs, and exhaustive-enum variant additions are observable
 changes. `repr(Rust)`, `repr(transparent)`, and standalone
@@ -660,9 +670,23 @@ disappear. Only the effective product/workspace lock qualifies; a fixture lock,
 stale lock missing a dependency candidate, or tracked symlink whose target bytes
 are not revision-proven does not. Missing lock/candidate provenance and
 unresolved manifest/config Cargo source replacement never neutralize, while the
-local aggregate may over-report after an unrelated tracked-file edit. Public
-trait-method defaults are directional: addition is compatible and removal is a
-confirmed contract change. Body or private-helper changes affecting a
+local aggregate may over-report after an unrelated tracked-file edit. Custom
+cfg predicates bind revision-backed build-script or Cargo-config authority when
+present, including nested public contract positions. A declared build script
+must be a live revision file; only an effective repository-root config whose
+legal build/target rustflags or a concrete-target link-override rustc-cfg
+matching the package's `links` can define custom cfg qualifies. If both root
+config filenames exist, Cargo's extensionless `.cargo/config` precedence is
+preserved. The package must still own a live build script when it declares
+`package.links`.
+Child-process environment settings, nested configs, and lookalike keys in
+unrelated tables do not qualify. The conservative digest may likewise over-report, but a missing,
+invalid, included, or otherwise unresolved authority proof never cancels merely
+because both sides have the same diagnostic text. Public trait method and
+associated-const defaults are directional and structural: adding a default is
+compatible, while removal, const value/type/cfg changes, or moving a default
+between disjoint cfg-qualified members remains a confirmed contract change.
+Body or private-helper changes affecting a
 caller-observable `async fn` or return-position `impl Trait` produce item-local
 `OpaqueReturnAutoTraits` uncertainty bound to canonicalized repo-backed Rust,
 all other live tracked input identities, and effective lock data. This covers

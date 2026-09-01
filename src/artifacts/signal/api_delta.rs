@@ -7,6 +7,7 @@
 use super::api_surface::{
     RustApiDeclaration, RustApiItem, RustApiItemKey, RustApiSnapshot, RustApiUnknown,
     RustApiUnknownKind, RustNamespace, RustSourceCertainty, guards_proven_disjoint,
+    trait_member_cfg_key,
 };
 use super::revision_source::RevisionProvenance;
 use crate::git::{Diff, Repository};
@@ -588,45 +589,88 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
     }
 }
 
-fn trait_default_addition_is_compatible(before: &str, after: &str) -> bool {
-    fn defaults_and_contract(contract: &str) -> Option<(BTreeSet<String>, String)> {
-        let contract = contract
-            .split_once("\nreexport-origin:")
-            .map_or(contract, |(item, _)| item);
-        let syn::Item::Trait(mut item) = syn::parse_str::<syn::Item>(contract).ok()? else {
-            return None;
-        };
-        let mut defaults = BTreeSet::new();
-        for trait_item in &mut item.items {
-            let syn::TraitItem::Fn(function) = trait_item else {
-                continue;
-            };
-            let had_default = function
-                .attrs
-                .iter()
-                .any(|attribute| attribute.path().is_ident("prview_trait_default"));
-            if had_default {
-                defaults.insert(function.sig.ident.to_string());
-            }
-            function
-                .attrs
-                .retain(|attribute| !attribute.path().is_ident("prview_trait_default"));
-        }
-        Some((
-            defaults,
-            quote::ToTokens::to_token_stream(&item).to_string(),
-        ))
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TraitDefaultSlot {
+    Method { has_default: bool },
+    Const { default: Option<String> },
+}
 
-    let Some((before_defaults, before_without_defaults)) = defaults_and_contract(before) else {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraitDefaultContract {
+    skeleton: String,
+    slots: Vec<TraitDefaultSlot>,
+}
+
+fn trait_default_contract(contract: &str) -> Option<TraitDefaultContract> {
+    let contract = contract
+        .split_once("\nreexport-origin:")
+        .map_or(contract, |(item, _)| item);
+    let syn::Item::Trait(mut item) = syn::parse_str::<syn::Item>(contract).ok()? else {
+        return None;
+    };
+    let mut slots = Vec::new();
+    for trait_item in &mut item.items {
+        match trait_item {
+            syn::TraitItem::Fn(function) => {
+                let has_default = function
+                    .attrs
+                    .iter()
+                    .any(|attribute| attribute.path().is_ident("prview_trait_default"));
+                function
+                    .attrs
+                    .retain(|attribute| !attribute.path().is_ident("prview_trait_default"));
+                slots.push(TraitDefaultSlot::Method { has_default });
+            }
+            syn::TraitItem::Const(value) => {
+                let default = value.default.take().map(|(_, expression)| {
+                    quote::ToTokens::to_token_stream(&expression).to_string()
+                });
+                slots.push(TraitDefaultSlot::Const { default });
+            }
+            _ => {}
+        }
+    }
+    Some(TraitDefaultContract {
+        skeleton: quote::ToTokens::to_token_stream(&item).to_string(),
+        slots,
+    })
+}
+
+fn trait_default_addition_is_compatible(before: &str, after: &str) -> bool {
+    let Some(before) = trait_default_contract(before) else {
         return false;
     };
-    let Some((after_defaults, after_without_defaults)) = defaults_and_contract(after) else {
+    let Some(after) = trait_default_contract(after) else {
         return false;
     };
-    before_without_defaults == after_without_defaults
-        && before_defaults.is_subset(&after_defaults)
-        && before_defaults != after_defaults
+    if before.skeleton != after.skeleton || before.slots.len() != after.slots.len() {
+        return false;
+    }
+    let mut added_default = false;
+    for (before_slot, after_slot) in before.slots.iter().zip(&after.slots) {
+        match (before_slot, after_slot) {
+            (
+                TraitDefaultSlot::Method {
+                    has_default: before,
+                },
+                TraitDefaultSlot::Method { has_default: after },
+            ) => match (*before, *after) {
+                (false, true) => added_default = true,
+                (left, right) if left == right => {}
+                _ => return false,
+            },
+            (
+                TraitDefaultSlot::Const { default: before },
+                TraitDefaultSlot::Const { default: after },
+            ) => match (before, after) {
+                (None, Some(_)) => added_default = true,
+                (left, right) if left == right => {}
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    added_default
 }
 
 fn trait_default_methods(contract: &str) -> Option<BTreeSet<String>> {
@@ -647,7 +691,13 @@ fn trait_default_methods(contract: &str) -> Option<BTreeSet<String>> {
                     .attrs
                     .iter()
                     .any(|attribute| attribute.path().is_ident("prview_trait_default"))
-                    .then(|| function.sig.ident.to_string())
+                    .then(|| {
+                        format!(
+                            "{}\u{1f}{}",
+                            function.sig.ident,
+                            trait_member_cfg_key(&function.attrs)
+                        )
+                    })
             })
             .collect(),
     )
@@ -1445,6 +1495,14 @@ fn trait_default_only_transition(
     else {
         return false;
     };
+    let Some(member_cfg) = unknown
+        .evidence
+        .lines()
+        .find_map(|line| line.strip_prefix("trait-member-cfg:"))
+    else {
+        return false;
+    };
+    let method_key = format!("{method}\u{1f}{member_cfg}");
     let (Some(before), Some(after)) = (
         opaque_origin_item(base, unknown),
         opaque_origin_item(target, unknown),
@@ -1457,7 +1515,7 @@ fn trait_default_only_transition(
     let Some(after_defaults) = trait_default_methods(&after.contract) else {
         return false;
     };
-    before_defaults.contains(method) != after_defaults.contains(method)
+    before_defaults.contains(&method_key) != after_defaults.contains(&method_key)
         && (trait_default_addition_is_compatible(&before.contract, &after.contract)
             || trait_default_addition_is_compatible(&after.contract, &before.contract))
 }
@@ -1468,6 +1526,12 @@ fn unknown_proofs_match(
     target: &RustApiSnapshot,
     right: &RustApiUnknown,
 ) -> bool {
+    if left.kind == RustApiUnknownKind::CfgPredicate
+        && (left.evidence.contains("cfg-authority-digest:unresolved:")
+            || right.evidence.contains("cfg-authority-digest:unresolved:"))
+    {
+        return false;
+    }
     !matches!(
         left.kind,
         RustApiUnknownKind::PathNonUtf8 | RustApiUnknownKind::WorkspaceDiscovery
@@ -3162,10 +3226,15 @@ mod tests {
             ("src/lib.rs", "pub fn stable() {}\n", "pub fn stable() {}\n"),
         ]);
         assert!(
-            crate_type.changed.iter().any(|finding| {
+            crate_type.unknown.iter().any(|finding| {
+                finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("native-only library target") && reason.contains("cdylib")
+                })
+            }) && crate_type.unknown.iter().any(|finding| {
                 finding.identity.name == "fixture" && finding.identity.namespace == "crate"
             }),
-            "cdylib to rlib is a binary-contract change even when public items are unchanged"
+            "cdylib to rlib must retain the removed native target uncertainty and refuse to over-confirm the Rust dependency surface: {:?}",
+            crate_type.findings()
         );
 
         let root_move = repository_delta(&[
@@ -5468,6 +5537,71 @@ mod tests {
             added_async_default.findings()
         );
 
+        let cfg_mixed_default_swap = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub trait Contract { #[cfg(feature = \"a\")] fn f() {} #[cfg(not(feature = \"a\"))] fn f() {} fn g(); }\n",
+                "pub trait Contract { #[cfg(feature = \"a\")] fn f(); #[cfg(not(feature = \"a\"))] fn f() {} fn g() {} }\n",
+            ),
+        ]);
+        assert!(
+            cfg_mixed_default_swap
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Contract"),
+            "cfg-qualified default removal must not be hidden by a sibling default addition: {:?}",
+            cfg_mixed_default_swap.findings()
+        );
+
+        let associated_const_added_default = repository_delta(&[
+            ("Cargo.toml", manifest, manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub trait Contract { const LIMIT: u8; }\n",
+                "pub trait Contract { const LIMIT: u8 = 1; }\n",
+            ),
+        ]);
+        assert!(
+            associated_const_added_default.findings().is_empty(),
+            "adding an associated-const default is compatible: {:?}",
+            associated_const_added_default.findings()
+        );
+
+        for (before, after, label) in [
+            (
+                "pub trait Contract { const LIMIT: u8 = 1; }\n",
+                "pub trait Contract { const LIMIT: u8; }\n",
+                "associated-const default removal",
+            ),
+            (
+                "pub trait Contract { const LIMIT: u8 = 1; }\n",
+                "pub trait Contract { const LIMIT: u8 = 2; }\n",
+                "associated-const default value change",
+            ),
+            (
+                "pub trait Contract { #[cfg(feature = \"a\")] const LIMIT: u8; }\n",
+                "pub trait Contract { #[cfg(feature = \"b\")] const LIMIT: u8 = 1; }\n",
+                "associated-const cfg change",
+            ),
+        ] {
+            let delta = repository_delta(&[
+                ("Cargo.toml", manifest, manifest),
+                ("Cargo.lock", lock, lock),
+                ("src/lib.rs", before, after),
+            ]);
+            assert!(
+                delta
+                    .changed
+                    .iter()
+                    .any(|finding| finding.identity.name == "Contract"),
+                "{label} must remain breaking: {:?}",
+                delta.findings()
+            );
+        }
+
         let added_async_default_through_alias = repository_delta(&[
             ("Cargo.toml", manifest, manifest),
             ("Cargo.lock", lock, lock),
@@ -5551,6 +5685,402 @@ mod tests {
                     .is_some_and(|reason| reason.contains("opaque-return:trait-impl:values"))
         }));
         assert!(opaque_trait_impl.changed.is_empty());
+    }
+
+    #[test]
+    fn repository_backed_library_target_edition_and_cfg_authority_are_observable() {
+        let lock = "version = 4\n";
+        let edition_macro = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2021'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "#[macro_export] macro_rules! value { ($e:expr) => { $e } }\n",
+                "#[macro_export] macro_rules! value { ($e:expr) => { $e } }\n",
+            ),
+        ]);
+        assert!(edition_macro.changed.iter().any(|finding| {
+            finding.identity.name == "value"
+                && finding
+                    .before
+                    .as_ref()
+                    .is_some_and(|side| side.contract.contains("definition-edition:2021"))
+                && finding
+                    .after
+                    .as_ref()
+                    .is_some_and(|side| side.contract.contains("definition-edition:2024"))
+        }));
+
+        let edition_without_macro = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2021'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            ("src/lib.rs", "pub fn stable() {}\n", "pub fn stable() {}\n"),
+        ]);
+        assert!(
+            edition_without_macro.findings().is_empty(),
+            "edition is item-local to exported macro semantics: {:?}",
+            edition_without_macro.findings()
+        );
+
+        let inherited_edition = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api']\n[workspace.package]\nedition='2021'\n",
+                "[workspace]\nmembers=['api']\n[workspace.package]\nedition='2024'\n",
+            ),
+            (
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\nedition.workspace=true\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='api'\nversion='0.0.0'\nedition.workspace=true\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "api/src/lib.rs",
+                "#[macro_export] macro_rules! value { ($e:expr) => { $e } }\n",
+                "#[macro_export] macro_rules! value { ($e:expr) => { $e } }\n",
+            ),
+        ]);
+        assert!(
+            inherited_edition
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "value"),
+            "workspace-inherited edition must bind exported macro semantics: {:?}",
+            inherited_edition.findings()
+        );
+
+        let target_edition_override = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2021'\n[lib]\npath='src/lib.rs'\nedition='2021'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2021'\n[lib]\npath='src/lib.rs'\nedition='2024'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "#[macro_export] macro_rules! value { ($e:expr) => { $e } }\n",
+                "#[macro_export] macro_rules! value { ($e:expr) => { $e } }\n",
+            ),
+        ]);
+        assert!(
+            target_edition_override.changed.iter().any(|finding| {
+                finding.identity.name == "value"
+                    && finding
+                        .before
+                        .as_ref()
+                        .is_some_and(|side| side.contract.contains("definition-edition:2021"))
+                    && finding
+                        .after
+                        .as_ref()
+                        .is_some_and(|side| side.contract.contains("definition-edition:2024"))
+            }),
+            "the library target edition overrides package.edition for exported macro semantics: {:?}",
+            target_edition_override.findings()
+        );
+
+        let native_only = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "pub fn internal(value: u8) {}\n",
+                "pub fn internal(value: u16) {}\n",
+            ),
+        ]);
+        assert!(
+            native_only.findings().is_empty(),
+            "native-only libraries do not expose ordinary Rust dependency API: {:?}",
+            native_only.findings()
+        );
+
+        let custom_cfg_changed = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nbuild='build.rs'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nbuild='build.rs'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo::rustc-cfg=public_api\"); }\n",
+                "fn main() {}\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(custom_cfg_changed.unknown.iter().any(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("custom-cfg:")
+                    && reason.contains("public_api")
+                    && reason.contains("cfg-authority-digest:sha256:")
+            })
+        }));
+
+        let custom_cfg_unchanged = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nbuild='build.rs'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nbuild='build.rs'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo::rustc-cfg=public_api\"); }\n",
+                "fn main() { println!(\"cargo::rustc-cfg=public_api\"); }\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            custom_cfg_unchanged.findings().is_empty(),
+            "an unchanged complete cfg authority proof should neutralize: {:?}",
+            custom_cfg_unchanged.findings()
+        );
+
+        let custom_cfg_build_disabled = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nbuild=false\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nbuild=false\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo::rustc-cfg=public_api\"); }\n",
+                "fn main() {}\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(custom_cfg_build_disabled.unknown.iter().all(|finding| {
+            !finding
+                .unknown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cfg-authority-digest:sha256:"))
+        }));
+        assert!(custom_cfg_build_disabled.unknown.iter().any(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("cfg-authority-digest:unresolved:no-revision-backed-authority")
+            })
+        }));
+
+        for (config_path, config, label) in [
+            (
+                ".cargo/config.toml",
+                "[net]\noffline=true\n",
+                "an unrelated root Cargo config",
+            ),
+            (
+                "fixtures/.cargo/config.toml",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+                "a nested fixture Cargo config",
+            ),
+            (
+                ".cargo/config.toml",
+                "[unrelated]\nrustflags=['--cfg','public_api']\n",
+                "a lookalike key outside Cargo's config schema",
+            ),
+            (
+                ".cargo/config.toml",
+                "[env]\nRUSTFLAGS='--cfg public_api'\n",
+                "Cargo child-process environment does not feed Cargo's rustflags input",
+            ),
+            (
+                ".cargo/config.toml",
+                "[target.x86_64-unknown-linux-gnu.native]\nrustc-cfg=['public_api']\n",
+                "a links override without matching package.links",
+            ),
+        ] {
+            let delta = repository_delta(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                    "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("Cargo.lock", lock, lock),
+                (config_path, config, config),
+                (
+                    "src/lib.rs",
+                    "#[cfg(public_api)] pub fn api() {}\n",
+                    "#[cfg(public_api)] pub fn api() {}\n",
+                ),
+            ]);
+            assert!(
+                delta.unknown.iter().any(|finding| {
+                    finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains(
+                            "cfg-authority-digest:unresolved:no-revision-backed-authority",
+                        )
+                    })
+                }),
+                "{label} must not become complete cfg authority: {:?}",
+                delta.findings()
+            );
+        }
+
+        let root_cfg_authority = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                ".cargo/config.toml",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            root_cfg_authority.findings().is_empty(),
+            "an unchanged effective root rustflags authority can neutralize: {:?}",
+            root_cfg_authority.findings()
+        );
+
+        let target_cfg_rustflags = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                ".cargo/config.toml",
+                "[target.'cfg(unix)']\nrustflags=['--cfg','public_api']\n",
+                "[target.'cfg(unix)']\nrustflags=['--cfg','public_api']\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            target_cfg_rustflags.findings().is_empty(),
+            "unchanged target-specific rustflags are revision-backed cfg authority: {:?}",
+            target_cfg_rustflags.findings()
+        );
+
+        let extensionless_config_precedence = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                ".cargo/config",
+                "[net]\noffline=true\n",
+                "[net]\noffline=true\n",
+            ),
+            (
+                ".cargo/config.toml",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            extensionless_config_precedence
+                .unknown
+                .iter()
+                .any(|finding| {
+                    finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains(
+                            "cfg-authority-digest:unresolved:no-revision-backed-authority",
+                        )
+                    })
+                }),
+            "Cargo must ignore config.toml when extensionless config exists beside it: {:?}",
+            extensionless_config_precedence.findings()
+        );
+
+        let missing_declared_build = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nbuild='missing.rs'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nbuild='missing.rs'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(missing_declared_build.unknown.iter().any(|finding| {
+            finding.unknown_reason.as_deref().is_some_and(|reason| {
+                reason.contains("cfg-authority-digest:unresolved:build-script:")
+            })
+        }));
+
+        let private_helper = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "#[cfg(private_helper)] fn helper() {} pub fn api() {}\n",
+                "#[cfg(private_helper)] fn helper() {} pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            private_helper.findings().is_empty(),
+            "a non-exported private helper must not create permanent cfg uncertainty: {:?}",
+            private_helper.findings()
+        );
+
+        let target_abi = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "#[cfg(target_abi = \"eabihf\")] pub fn api() {}\n",
+                "#[cfg(target_abi = \"eabihf\")] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            target_abi.findings().is_empty(),
+            "rustc-provided target_abi is not custom cfg authority: {:?}",
+            target_abi.findings()
+        );
     }
 
     #[test]

@@ -129,7 +129,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. Synchronous Git/pipeline/context cleanup uses the live Job Object first
   and `taskkill` only as a fallback; a dual termination failure returns from
   cancellation instead of entering an unbounded wait. The `windows-latest` job
-  proves cancel and root-exits-first paths.
+  proves cancel and root-exits-first paths. Its process-tree fixture now uses
+  the native process-liveness probe instead of spawning `tasklist` for every
+  poll, accepts only newline-terminated stable PID publications before taking
+  descendant ownership, binds each captured PID to its native process-birth
+  identity before probing or cleanup, and reports captured PowerShell output
+  on a bounded 30-second readiness failure. This prevents stale ownership from
+  certifying a recycled runner PID and narrows failure cleanup to the recorded
+  process incarnation before invoking the PID-based tree-kill fallback.
 - Primitive integer enum representations (`repr(u8)` through `repr(isize)`) are
   ABI-sensitive in Rust API deltas, including non-exhaustive variant additions.
 - Unparseable and non-UTF-8 rootless Cargo manifests fail crate discovery closed
@@ -158,6 +165,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `prview state --tui` no longer starts a review from `r`.
 - Moving a library crate root (`src/lib.rs` → `lib.rs`) is not a public API
   change; the compared crate contract keeps `proc-macro` and `crate-type` only.
+  A package without an explicit `[lib]` and without a live implicit
+  `src/lib.rs` is now correctly treated as having no library target instead of
+  emitting `MissingLibRoot`; an explicit missing library root remains typed
+  uncertainty.
 - Cache hits take content and mtime from one open file handle, so a concurrent
   replacement cannot pair one entry's bytes with another's age.
 - A finished context-command child is unregistered before its output is read.
@@ -168,8 +179,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional Cargo dependencies without an explicit `[features]` table are
   implicit features in the repo-backed API contract, so removing or renaming
   them is a compared delta.
-- Library `[lib] crate-type` is part of the crate contract; `cdylib`/`staticlib`
-  collapsing to `rlib` is a parent crate `Changed` finding.
+- Library `[lib] crate-type` is part of the crate contract. Ordinary Rust API
+  projection is limited to Rust-linkable `lib`/`rlib`/`dylib` outputs,
+  procedural macros declared by either `proc-macro = true` or an effective
+  `crate-type = ["proc-macro"]` retain their separate export surface, and native-only
+  `cdylib`/`staticlib`/`bin` targets retain binary-export evidence plus typed
+  target uncertainty without inventing a Rust dependency API.
+- Exported declarative macro contracts bind the effective defining-crate
+  edition, including package, workspace-inherited, and library-target
+  authority. An edition change without an exported macro does not manufacture
+  a crate-level break.
+- Public custom `cfg` predicates, including nested fields, variants, trait or
+  impl members, and foreign items, bind revision-backed build-script and Cargo
+  config authority. Only a live declared/implicit build script or an effective
+  repository-root config that can actually supply `--cfg` qualifies; nested or
+  unrelated configs do not. Equal complete digests may neutralize; missing,
+  invalid, included, or otherwise unresolved authority never does. Compiler-set
+  `target_abi` remains a built-in predicate rather than custom cfg.
+- Trait-default comparison is structural and cfg-qualified. Adding a method or
+  associated-const default is compatible, while removing a default, changing a
+  const value/type/cfg, or swapping defaults between disjoint cfg branches
+  remains a parent `Changed` fact. Opaque-return proofs use the same member cfg
+  identity and cannot cross-cancel between same-named methods.
 - Adding a field to a `#[repr(C)]` (or packed/transparent) struct is a parent
   `Changed` ABI break even when the struct is `#[non_exhaustive]`.
 - `include!` / `include_str!` / `include_bytes!` unknowns carry a digest of the

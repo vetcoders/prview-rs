@@ -888,9 +888,30 @@ async fn run_capture_with_timeout_after_spawn(
 /// is failure cleanup only: successful tests first prove every captured PID is
 /// gone through the operation under test, then disarm cleanup.
 #[cfg(all(test, windows))]
+#[derive(Clone, Debug)]
+struct OwnedWindowsPid {
+    pid: u32,
+    birth_identity: String,
+}
+
+#[cfg(all(test, windows))]
+impl OwnedWindowsPid {
+    fn capture(pid: u32) -> std::io::Result<Self> {
+        Ok(Self {
+            pid,
+            birth_identity: crate::storage::process_birth_identity(pid)?,
+        })
+    }
+
+    fn still_owned(&self) -> bool {
+        crate::storage::process_birth_identity_matches(self.pid, &self.birth_identity)
+    }
+}
+
+#[cfg(all(test, windows))]
 pub(crate) struct WindowsProcessTree {
     root: std::process::Child,
-    pids: Vec<u32>,
+    pids: Vec<OwnedWindowsPid>,
     _tempdir: tempfile::TempDir,
     verified_gone: bool,
 }
@@ -903,13 +924,19 @@ impl WindowsProcessTree {
         let tempdir = tempfile::tempdir().expect("Windows process-tree tempdir");
         let child_pidfile = tempdir.path().join("child.pid");
         let grandchild_pidfile = tempdir.path().join("grandchild.pid");
+        let child_pid_tmp = tempdir.path().join("child.pid.tmp");
+        let grandchild_pid_tmp = tempdir.path().join("grandchild.pid.tmp");
         let child_script = tempdir.path().join("child.ps1");
         let parent_script = tempdir.path().join("parent.ps1");
+        let root_stdout = tempdir.path().join("root.stdout.log");
+        let root_stderr = tempdir.path().join("root.stderr.log");
 
         std::fs::write(
             &child_script,
             format!(
-                "$g = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60'\nSet-Content -LiteralPath '{}' -Value $g.Id\nWait-Process -Id $g.Id\n",
+                "$g = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60'\nSet-Content -LiteralPath '{}' -Value $g.Id -Encoding ascii\nMove-Item -LiteralPath '{}' -Destination '{}' -Force\nWait-Process -Id $g.Id\n",
+                grandchild_pid_tmp.display(),
+                grandchild_pid_tmp.display(),
                 grandchild_pidfile.display()
             ),
         )
@@ -917,70 +944,115 @@ impl WindowsProcessTree {
         std::fs::write(
             &parent_script,
             format!(
-                "$c = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','{}'\nSet-Content -LiteralPath '{}' -Value $c.Id\nWait-Process -Id $c.Id\n",
+                "$c = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','{}'\nSet-Content -LiteralPath '{}' -Value $c.Id -Encoding ascii\nMove-Item -LiteralPath '{}' -Destination '{}' -Force\nWait-Process -Id $c.Id\n",
                 child_script.display(),
+                child_pid_tmp.display(),
+                child_pid_tmp.display(),
                 child_pidfile.display()
             ),
         )
         .expect("write Windows parent script");
 
-        let root = std::process::Command::new("powershell.exe")
+        let mut root = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-File"])
             .arg(&parent_script)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&root_stdout).expect("root stdout log"))
+            .stderr(std::fs::File::create(&root_stderr).expect("root stderr log"))
             .spawn()
             .expect("spawn root PowerShell");
+        let root_pid = root.id();
+        let root_owner = OwnedWindowsPid::capture(root_pid).unwrap_or_else(|error| {
+            let _ = root.kill();
+            let _ = root.wait();
+            panic!("capture root PowerShell birth identity for PID {root_pid}: {error}");
+        });
 
         // Establish cleanup ownership before waiting for either descendant to
         // publish its PID. If setup times out or panics, Drop can already kill
         // the root with /T and therefore cannot orphan an unrecorded child.
         let mut tree = Self {
-            pids: vec![root.id()],
+            pids: vec![root_owner],
             root,
             _tempdir: tempdir,
             verified_gone: false,
         };
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut child_owner = None;
+        let mut grandchild_owner = None;
         let descendants = loop {
-            if let (Some(child), Some(grandchild)) = (
-                try_read_windows_pid(&child_pidfile),
-                try_read_windows_pid(&grandchild_pidfile),
-            ) && windows_pid_exists(child)
-                && windows_pid_exists(grandchild)
+            if child_owner.is_none()
+                && let Some(pid) = try_read_windows_pid(&child_pidfile)
+                && let Ok(owner) = OwnedWindowsPid::capture(pid)
             {
-                break [child, grandchild];
+                tree.pids.push(owner.clone());
+                child_owner = Some(owner);
             }
+            if grandchild_owner.is_none()
+                && let Some(pid) = try_read_windows_pid(&grandchild_pidfile)
+                && let Ok(owner) = OwnedWindowsPid::capture(pid)
+            {
+                tree.pids.push(owner.clone());
+                grandchild_owner = Some(owner);
+            }
+            let child_alive = child_owner
+                .as_ref()
+                .is_some_and(OwnedWindowsPid::still_owned);
+            let grandchild_alive = grandchild_owner
+                .as_ref()
+                .is_some_and(OwnedWindowsPid::still_owned);
+            if child_alive && grandchild_alive {
+                break [
+                    child_owner.expect("live child PID"),
+                    grandchild_owner.expect("live grandchild PID"),
+                ];
+            }
+            let root_status = tree.root.try_wait().expect("probe root PowerShell status");
+            let diagnostics = || {
+                format!(
+                    "root_status={root_status:?}; child_owner={child_owner:?}; child_alive={child_alive}; grandchild_owner={grandchild_owner:?}; grandchild_alive={grandchild_alive}; root_stdout={:?}; root_stderr={:?}",
+                    std::fs::read_to_string(&root_stdout).unwrap_or_default(),
+                    std::fs::read_to_string(&root_stderr).unwrap_or_default(),
+                )
+            };
             assert!(
-                std::time::Instant::now() < deadline,
-                "{label} did not publish a live child and grandchild within 10s"
+                root_status.is_none(),
+                "{label} root PowerShell exited before publishing a live tree: {}",
+                diagnostics()
             );
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "{label} did not publish a live child and grandchild within 30s: {}",
+                    diagnostics()
+                );
+            }
             sleep(Duration::from_millis(25));
         };
 
-        tree.pids.extend(descendants);
+        tree.pids = vec![
+            tree.pids[0].clone(),
+            descendants[0].clone(),
+            descendants[1].clone(),
+        ];
         tree.assert_all_running(label);
         tree
     }
 
     pub(crate) fn root_pid(&self) -> u32 {
-        self.pids[0]
+        self.pids[0].pid
     }
 
     pub(crate) fn pids(&self) -> [u32; 3] {
-        [self.pids[0], self.pids[1], self.pids[2]]
+        [self.pids[0].pid, self.pids[1].pid, self.pids[2].pid]
     }
 
     pub(crate) fn assert_all_running(&self, phase: &str) {
-        for (role, pid) in ["root", "child", "grandchild"]
-            .into_iter()
-            .zip(self.pids.iter().copied())
-        {
+        for (role, owner) in ["root", "child", "grandchild"].into_iter().zip(&self.pids) {
             assert!(
-                windows_pid_exists(pid),
-                "{phase}: captured {role} PID {pid} is not running"
+                owner.still_owned(),
+                "{phase}: captured {role} PID {} is not the recorded live process",
+                owner.pid
             );
         }
     }
@@ -993,8 +1065,9 @@ impl WindowsProcessTree {
             let _ = self.root.try_wait();
             let live: Vec<_> = ["root", "child", "grandchild"]
                 .into_iter()
-                .zip(self.pids.iter().copied())
-                .filter(|(_, pid)| windows_pid_exists(*pid))
+                .zip(&self.pids)
+                .filter(|(_, owner)| owner.still_owned())
+                .map(|(role, owner)| (role, owner.pid))
                 .collect();
             if live.is_empty() {
                 self.verified_gone = true;
@@ -1019,8 +1092,10 @@ impl Drop for WindowsProcessTree {
         // A failing assertion must not leave any known PowerShell descendant on
         // the shared runner. This cleanup is deliberately not part of the PASS
         // oracle: assert_all_gone disarms it only after the tested path succeeds.
-        for pid in self.pids.iter().copied().rev() {
-            terminate_process_tree(pid);
+        for owner in self.pids.iter().rev() {
+            if owner.still_owned() {
+                terminate_process_tree(owner.pid);
+            }
         }
         let _ = self.root.kill();
         let _ = self.root.wait();
@@ -1029,21 +1104,27 @@ impl Drop for WindowsProcessTree {
 
 #[cfg(all(test, windows))]
 fn try_read_windows_pid(path: &std::path::Path) -> Option<u32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    let first = std::fs::read_to_string(path).ok()?;
+    let second = std::fs::read_to_string(path).ok()?;
+    stable_windows_pid_from_reads(&first, &second)
+}
+
+#[cfg(all(test, windows))]
+fn stable_windows_pid_from_reads(first: &str, second: &str) -> Option<u32> {
+    if first != second || !first.ends_with('\n') {
+        return None;
+    }
+    let mut tokens = first.split_whitespace();
+    let pid = tokens.next()?.parse().ok()?;
+    if pid == 0 || tokens.next().is_some() {
+        return None;
+    }
+    Some(pid)
 }
 
 #[cfg(all(test, windows))]
 pub(crate) fn windows_pid_exists(pid: u32) -> bool {
-    let filter = format!("PID eq {pid}");
-    let output = std::process::Command::new("tasklist.exe")
-        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("tasklist must be available on a Windows runner");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .any(|line| line.contains(&format!("\"{pid}\"")))
+    crate::storage::is_process_alive(pid)
 }
 
 /// Read a test-owned Unix pidfile only after the producer has completed the
@@ -1099,6 +1180,27 @@ mod tests {
 
         std::fs::write(&pidfile, "987 32145 6\n").expect("extra pid payload");
         assert_eq!(read_published_unix_pids(&pidfile, 2), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn published_windows_pid_reader_rejects_partial_or_extra_payloads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("child.pid");
+
+        assert_eq!(try_read_windows_pid(&pidfile), None);
+        std::fs::write(&pidfile, "").expect("empty pid payload");
+        assert_eq!(try_read_windows_pid(&pidfile), None);
+        std::fs::write(&pidfile, "987").expect("partial pid payload");
+        assert_eq!(try_read_windows_pid(&pidfile), None);
+
+        std::fs::write(&pidfile, "987\r\n").expect("complete pid payload");
+        assert_eq!(try_read_windows_pid(&pidfile), Some(987));
+
+        std::fs::write(&pidfile, "987 32145\r\n").expect("extra pid payload");
+        assert_eq!(try_read_windows_pid(&pidfile), None);
+        assert_eq!(stable_windows_pid_from_reads("0\r\n", "0\r\n"), None);
+        assert_eq!(stable_windows_pid_from_reads("987\r\n", "9873\r\n"), None);
     }
 
     #[cfg(any(unix, windows))]

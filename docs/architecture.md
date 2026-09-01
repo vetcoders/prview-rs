@@ -1417,20 +1417,33 @@ but are separate from external semantic identity.
 
 Library discovery matches the exact `Cargo.toml` basename. It validates every
 consumed Cargo field (`package.name`, `[lib]`, `lib.name`, `lib.path`,
-`lib.proc-macro`, `lib.crate-type`, and `package.autolib`) instead of inventing
-defaults for an invalid schema. The crate contract includes the normalized
-`crate-type` set (default `["lib"]`) and `proc-macro`; the library root path
-stays in evidence/provenance, not in the compared contract. Optional normal/build/target
+`lib.proc-macro`, `lib.crate-type`, `package.autolib`, and effective edition)
+instead of inventing defaults for an invalid schema. Edition is resolved from a
+library-target override, direct package value, exact workspace-package
+inheritance, or Cargo's 2015 default. The crate contract includes the normalized
+`crate-type` set (default `["lib"]`, or `["proc-macro"]` for a proc-macro
+target) and `proc-macro`; the library root path and edition stay in
+evidence/provenance rather than globally changing every crate fact. Optional normal/build/target
 dependencies without an explicit `[features]` entry become implicit Cargo
 features unless suppressed through `dep:` references. Package and explicit
 library names must also be non-empty valid Cargo/crate identifiers; a TOML
 string alone is not semantic validation. A valid virtual workspace is
-non-crate; an implicit library is admitted only when `autolib != false` and
-its live default `src/lib.rs` can be read and parsed. Repository-relative
+non-crate; an implicit library exists only when effective `autolib` permits it
+and its live default `src/lib.rs` exists. Its absence is not a missing-root
+error, while an explicit `[lib]` whose effective root is unavailable remains
+typed `MissingLibRoot`. Repository-relative
 paths are normalized fallibly: absolute, prefixed, non-UTF-8, and escaping
 paths become manifest/source unknowns rather than being remapped. Missing,
 renamed-away, deleted, non-regular, non-UTF-8, unreadable, or parse-failed
 manifests and roots remain typed unknowns.
+
+Target projection follows Cargo/Rust linkage semantics. `lib`, `rlib`, and
+`dylib` outputs expose the ordinary downstream Rust item graph; proc-macro
+targets expose only supported procedural macro entry points. A target whose
+effective types are only `cdylib`, `staticlib`, or `bin` is not projected as a
+Rust dependency surface. Its public and private native exports are still
+scanned, and the native target remains typed uncertainty so a transition to or
+from a Rust-linkable target cannot be reported as falsely clean.
 
 Reachability starts at each library root. Ordinary inline modules and
 `mod foo;` files (`foo.rs` or `foo/mod.rs`) are walked as whole syntax trees.
@@ -1530,6 +1543,32 @@ semantic surface. A private `extern crate self as alias` is nevertheless a
 same-crate module binding for dependency resolution: `alias::Hidden` is followed
 back to the root `Hidden` declaration so its layout/auto-trait uncertainty stays
 attached to the public owner that exposes it.
+
+Custom cfg leaves are not assumed to be Cargo's built-in feature/target/runtime
+predicates. An externally relevant custom predicate on an item, field, variant,
+trait or impl member, or foreign item emits `CfgPredicate` evidence bound to a
+revision-backed authority digest whenever an active build script or repository
+Cargo config can supply `--cfg`. A declared build script must resolve to a live
+regular revision entry; `build = false` disables it. Only the effective
+repository-root Cargo config qualifies; when both names exist Cargo's legacy
+`.cargo/config` precedence over `.cargo/config.toml` is preserved. Authority is
+recognized only at legal schema paths (`build.rustflags`, target-specific
+`rustflags`, or a concrete-target link override's `rustc-cfg` when its key
+matches the package's `links`). Declaring `package.links` without a live build
+script is an invalid manifest, not a way to acquire config authority. Nested
+fixture/member configs and lookalike keys in unrelated sections such as `[net]`
+do not upgrade a proof. Config includes remain unresolved until their authority
+graph is source-backed. The current conservative digest covers the complete live
+revision inventory, so it may over-report after an unrelated tracked edit; it
+never executes `build.rs`. With no complete revision-backed authority, the proof
+is explicitly unresolved and cannot neutralize against the same text on the
+other side. A definitely private untransformed free helper does not create a
+standalone cfg unknown; any effect on an exposed opaque return remains covered
+by that public proof's implementation digest.
+Private non-function declarations with custom cfg currently remain
+conservative `CfgPredicate` uncertainty before a complete reachability proof.
+That is a known precision residual: it can add review noise, but it cannot
+certify a conditionally exposed contract as clean.
 Semantic proof comparison includes the public unknown's kind, crate/module
 location, exact evidence, and guards, while continuing to exclude private
 reexport target/origin spelling. Terminal `include_str!` / `include_bytes!`
@@ -1549,7 +1588,10 @@ therefore cannot disappear merely because no ordinary item changed. These
 container namespaces do not participate in Rust `use`-leaf resolution. Tuple
 and unit struct constructors occupy Value; named-field structs remain Type-only.
 `macro_export` is projected to the crate-root Macro namespace, with docs,
-rustfmt, and lint attributes normalized away. Proc-macro crate exports use their
+rustfmt, and lint attributes normalized away. Its item-local contract includes
+the effective edition of the defining library target because macro fragment
+semantics are edition-dependent; editions do not otherwise manufacture a
+crate-wide API change. Proc-macro crate exports use their
 external macro/derive names only for public functions declared at crate root;
 private or nested declarations become precise unknowns. Unresolved transforming
 attributes, including recursively nested `cfg_attr`, are checked on modules,
@@ -1605,10 +1647,14 @@ ABI, safety, and relevant attributes.
 
 Contracts are emitted from normalized `syn` ASTs. Ordinary function bodies are
 excluded from confirmed item contracts, although private implementation inputs
-can contribute to the conservative opaque-return digest described below. The
-presence of a public trait-method default remains a directional contract fact:
-removing the default can make downstream impls incomplete, while adding one is
-compatible.
+can contribute to the conservative opaque-return digest described below.
+Public trait method and associated-const defaults remain directional structural
+contract facts. Adding a default is compatible; removing one can make
+downstream impls incomplete, while changing a const default value/type/cfg
+remains a confirmed contract change. Member slots retain order, attributes, and
+canonical cfg identity, so a default cannot move between same-named disjoint
+cfg branches. Trait-default opaque proofs carry the same member cfg key and do
+not cross-cancel.
 Bodies of caller-observable `async fn` and return-position `impl Trait` items
 also carry item-local `OpaqueReturnAutoTraits` evidence because their hidden
 types can change `Send`, `Sync`, and other auto traits without a signature edit.
@@ -1758,6 +1804,9 @@ Standalone unknown findings retain their source side, source path, and revision
 provenance. Before those findings are emitted, identical one-to-one unknown
 proofs on base and target cancel out: kind, crate/module, cfg guard, evidence,
 and provenance class must match, and each proof must belong to its own snapshot.
+An unresolved custom-cfg authority proof is structurally non-neutralizable even
+when its diagnostic text matches on both sides. A complete unchanged authority
+digest may neutralize; a changed digest remains review-required uncertainty.
 Source path must also match for every unknown kind except terminal
 `include_str!` / `include_bytes!`, whose private donor file may move without
 changing the bound public proof. Changed,

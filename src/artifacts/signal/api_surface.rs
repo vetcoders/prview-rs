@@ -324,6 +324,12 @@ struct PendingOpaqueReturnProof {
     evidence: String,
 }
 
+#[derive(Debug, Clone)]
+struct OpaqueReturnEvidence {
+    cfg_guard: Vec<String>,
+    evidence: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PublicIncludeOrigin {
     module_path: Vec<String>,
@@ -432,6 +438,9 @@ struct SnapshotBuilder<'a> {
     completed_sources: BTreeMap<(String, String, Vec<String>, Vec<String>), bool>,
     active_sources: BTreeSet<(String, String)>,
     proc_macro_crates: BTreeSet<String>,
+    rust_linkable_crates: BTreeSet<String>,
+    crate_editions: BTreeMap<String, String>,
+    cfg_authority_digests: BTreeMap<String, String>,
     macro_implementation_digest: Option<String>,
     macro_invocation_implementation_digest: Option<String>,
     opaque_implementation_digest: Option<String>,
@@ -471,6 +480,9 @@ impl<'a> SnapshotBuilder<'a> {
             completed_sources: BTreeMap::new(),
             active_sources: BTreeSet::new(),
             proc_macro_crates: BTreeSet::new(),
+            rust_linkable_crates: BTreeSet::new(),
+            crate_editions: BTreeMap::new(),
+            cfg_authority_digests: BTreeMap::new(),
             macro_implementation_digest: None,
             macro_invocation_implementation_digest: None,
             opaque_implementation_digest: None,
@@ -1098,6 +1110,8 @@ impl<'a> SnapshotBuilder<'a> {
             .collect();
         let (allowed, workspace_ambiguity) =
             api_crate_manifests(self.source, &manifests, &inventory_dirs);
+        let parsed_manifest_authorities = parsed_manifest_authorities(self.source, &manifests);
+        let cfg_authority_digest = revision_cfg_authority_digest(&self.inventory);
         let macro_digest =
             proc_macro_implementation_digest(self.source, &self.inventory, &manifests, &allowed);
         let opaque_digest =
@@ -1229,6 +1243,24 @@ impl<'a> SnapshotBuilder<'a> {
                 },
                 None => None,
             };
+            let edition = match effective_library_edition(
+                &manifest_path,
+                &manifest,
+                lib,
+                &parsed_manifest_authorities,
+            ) {
+                Ok(edition) => edition,
+                Err(reason) => {
+                    self.unknown(
+                        RustApiUnknownKind::ManifestParse,
+                        None,
+                        &[],
+                        &manifest_path,
+                        reason,
+                    );
+                    continue;
+                }
+            };
             let autolib = match package.get("autolib") {
                 Some(value) => match value.as_bool() {
                     Some(value) => value,
@@ -1243,7 +1275,7 @@ impl<'a> SnapshotBuilder<'a> {
                         continue;
                     }
                 },
-                None => true,
+                None => default_autolib(&manifest, &edition),
             };
             let manifest_dir = parent_repo_path(&manifest_path);
             if lib.is_none() && !autolib {
@@ -1287,7 +1319,7 @@ impl<'a> SnapshotBuilder<'a> {
                 );
                 continue;
             }
-            let proc_macro = match optional_bool(lib, "proc-macro") {
+            let declared_proc_macro = match optional_bool(lib, "proc-macro") {
                 Ok(value) => value.unwrap_or(false),
                 Err(reason) => {
                     self.unknown(
@@ -1300,7 +1332,7 @@ impl<'a> SnapshotBuilder<'a> {
                     continue;
                 }
             };
-            let crate_types = match lib_crate_types(lib) {
+            let crate_types = match lib_crate_types(lib, declared_proc_macro) {
                 Ok(types) => types,
                 Err(reason) => {
                     self.unknown(
@@ -1313,6 +1345,8 @@ impl<'a> SnapshotBuilder<'a> {
                     continue;
                 }
             };
+            let proc_macro =
+                declared_proc_macro || crate_types.iter().any(|kind| kind.as_str() == "proc-macro");
             let root_path =
                 match safe_join_repo_path(&manifest_dir, explicit_root.unwrap_or("src/lib.rs")) {
                     Ok(path) => path,
@@ -1327,6 +1361,14 @@ impl<'a> SnapshotBuilder<'a> {
                         continue;
                     }
                 };
+            if lib.is_none()
+                && !self
+                    .inventory
+                    .get(&root_path)
+                    .is_some_and(is_live_regular_entry)
+            {
+                continue;
+            }
             let crate_name = normalize_identifier(
                 explicit_name
                     .map(str::to_owned)
@@ -1364,8 +1406,69 @@ impl<'a> SnapshotBuilder<'a> {
                 );
                 continue;
             }
+            let rust_linkable = crate_types
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "lib" | "rlib" | "dylib"));
+            let package_links = match package.get("links") {
+                Some(toml::Value::String(links)) => Some(links.as_str()),
+                Some(_) => {
+                    self.unknown(
+                        RustApiUnknownKind::ManifestParse,
+                        Some(&crate_name),
+                        &[],
+                        &manifest_path,
+                        "package.links must be a string".to_owned(),
+                    );
+                    continue;
+                }
+                None => None,
+            };
+            let repo_config_cfg_authority =
+                repository_cargo_cfg_authority(self.source, &self.inventory, package_links);
+            let build_script_cfg_authority =
+                match package_has_active_build_script(package, &manifest_dir, &self.inventory) {
+                    Ok(active) => Ok(active),
+                    Err(reason) => {
+                        self.unknown(
+                            RustApiUnknownKind::ManifestParse,
+                            Some(&crate_name),
+                            &[],
+                            &manifest_path,
+                            reason.clone(),
+                        );
+                        Err(reason)
+                    }
+                };
+            if package_links.is_some() && matches!(build_script_cfg_authority, Ok(false)) {
+                self.unknown(
+                    RustApiUnknownKind::ManifestParse,
+                    Some(&crate_name),
+                    &[],
+                    &manifest_path,
+                    "package.links requires a live build script".to_owned(),
+                );
+                continue;
+            }
+            let cfg_authority = match build_script_cfg_authority {
+                Ok(true) => Some(cfg_authority_digest.clone()),
+                Ok(false) => match &repo_config_cfg_authority {
+                    Ok(true) => Some(cfg_authority_digest.clone()),
+                    Ok(false) => None,
+                    Err(reason) => Some(format!("unresolved:cargo-config:{reason}")),
+                },
+                Err(reason) => Some(format!("unresolved:build-script:{reason}")),
+            };
             if proc_macro {
                 self.proc_macro_crates.insert(crate_name.clone());
+            }
+            if rust_linkable {
+                self.rust_linkable_crates.insert(crate_name.clone());
+            }
+            self.crate_editions
+                .insert(crate_name.clone(), edition.clone());
+            if let Some(cfg_authority) = cfg_authority {
+                self.cfg_authority_digests
+                    .insert(crate_name.clone(), cfg_authority);
             }
             let base_dir = parent_repo_path(&root_path);
             if !self.load_module(
@@ -1374,51 +1477,69 @@ impl<'a> SnapshotBuilder<'a> {
                 &root_path,
                 &base_dir,
                 ModuleVisibilityProof {
-                    externally_reachable: true,
+                    externally_reachable: rust_linkable,
                     declared_public: true,
                 },
                 Vec::new(),
             ) {
                 self.proc_macro_crates.remove(&crate_name);
+                self.rust_linkable_crates.remove(&crate_name);
+                self.crate_editions.remove(&crate_name);
+                self.cfg_authority_digests.remove(&crate_name);
                 continue;
             }
-            self.items.push(RustApiItem {
-                key: RustApiItemKey {
-                    crate_name: crate_name.clone(),
-                    module_path: Vec::new(),
-                    namespace: RustNamespace::Crate,
-                    external_name: crate_name.clone(),
-                },
-                kind: RustApiItemKind::Crate,
-                contract: format!("library proc_macro={proc_macro}; crate_types={crate_types:?}"),
-                cfg_guard: Vec::new(),
-                source_path: manifest_path.clone(),
-                evidence: format!(
-                    "library crate {crate_name} from {manifest_path}; root={root_path}"
-                ),
-                provenance: self.provenance.clone(),
-                certainty: RustSourceCertainty::Confirmed,
-                origin_module_path: Vec::new(),
-                origin_name: crate_name.clone(),
-            });
-            for (feature_name, feature_contract) in cargo_features {
+            if !rust_linkable && !proc_macro {
+                self.unknown(
+                    RustApiUnknownKind::UnsupportedExternResolution,
+                    Some(&crate_name),
+                    &[],
+                    &manifest_path,
+                    format!(
+                        "native-only library target is not a Rust dependency surface; crate_types={crate_types:?}"
+                    ),
+                );
+            }
+            if rust_linkable || proc_macro {
                 self.items.push(RustApiItem {
                     key: RustApiItemKey {
                         crate_name: crate_name.clone(),
                         module_path: Vec::new(),
-                        namespace: RustNamespace::CargoFeature,
-                        external_name: feature_name.clone(),
+                        namespace: RustNamespace::Crate,
+                        external_name: crate_name.clone(),
                     },
-                    kind: RustApiItemKind::CargoFeature,
-                    contract: feature_contract.clone(),
+                    kind: RustApiItemKind::Crate,
+                    contract: format!(
+                        "library proc_macro={proc_macro}; crate_types={crate_types:?}"
+                    ),
                     cfg_guard: Vec::new(),
                     source_path: manifest_path.clone(),
-                    evidence: feature_contract,
+                    evidence: format!(
+                        "library crate {crate_name} from {manifest_path}; root={root_path}"
+                    ),
                     provenance: self.provenance.clone(),
                     certainty: RustSourceCertainty::Confirmed,
                     origin_module_path: Vec::new(),
-                    origin_name: feature_name,
+                    origin_name: crate_name.clone(),
                 });
+                for (feature_name, feature_contract) in cargo_features {
+                    self.items.push(RustApiItem {
+                        key: RustApiItemKey {
+                            crate_name: crate_name.clone(),
+                            module_path: Vec::new(),
+                            namespace: RustNamespace::CargoFeature,
+                            external_name: feature_name.clone(),
+                        },
+                        kind: RustApiItemKind::CargoFeature,
+                        contract: feature_contract.clone(),
+                        cfg_guard: Vec::new(),
+                        source_path: manifest_path.clone(),
+                        evidence: feature_contract,
+                        provenance: self.provenance.clone(),
+                        certainty: RustSourceCertainty::Confirmed,
+                        origin_module_path: Vec::new(),
+                        origin_name: feature_name,
+                    });
+                }
             }
             self.crates.push(RustCrateSnapshot {
                 name: crate_name,
@@ -1531,6 +1652,7 @@ impl<'a> SnapshotBuilder<'a> {
         inherited_cfg: &[String],
         items: &[Item],
     ) {
+        let rust_linkable = self.rust_linkable_crates.contains(crate_name);
         let mut derive_name_ambiguity = derive_name_ambiguity_for_items(items);
         if self.macro_use_crates.contains(crate_name) {
             derive_name_ambiguity.all_unqualified = true;
@@ -1557,6 +1679,30 @@ impl<'a> SnapshotBuilder<'a> {
                     );
                 }
                 continue;
+            }
+            let custom_cfg_evidence = item_custom_cfg_evidence(item);
+            if !custom_cfg_evidence.is_empty()
+                && custom_cfg_can_affect_external_surface(
+                    item,
+                    self.proc_macro_crates.contains(crate_name),
+                )
+            {
+                let authority = self
+                    .cfg_authority_digests
+                    .get(crate_name)
+                    .map(String::as_str)
+                    .unwrap_or("unresolved:no-revision-backed-authority");
+                self.unknown_guarded(
+                    RustApiUnknownKind::CfgPredicate,
+                    Some(crate_name),
+                    module_path,
+                    source_path,
+                    &cfg_guard,
+                    format!(
+                        "custom-cfg:{}\ncfg-authority-digest:{authority}",
+                        custom_cfg_evidence.join(" && ")
+                    ),
+                );
             }
             // Derives preserve the annotated struct/enum/union and add impls.
             // Keep the input item's confirmed contract, while retaining typed
@@ -1634,18 +1780,20 @@ impl<'a> SnapshotBuilder<'a> {
                 }
                 continue;
             }
-            for (name, export_guard, evidence) in private_binary_exports(item) {
+            for (name, public, export_guard, evidence) in binary_exports(item, !rust_linkable) {
                 let effective_guard = combined_guards(&cfg_guard, &export_guard);
+                let visibility = if public { "public" } else { "private" };
                 self.unknown_guarded(
                     RustApiUnknownKind::UnsupportedExternResolution,
                     Some(crate_name),
                     module_path,
                     source_path,
                     &effective_guard,
-                    format!("public-owner:{name}\nprivate-binary-export:{evidence}"),
+                    format!("public-owner:{name}\n{visibility}-binary-export:{evidence}"),
                 );
             }
-            if let Item::Trait(item_trait) = item
+            if rust_linkable
+                && let Item::Trait(item_trait) = item
                 && is_public(&item_trait.vis)
             {
                 for boundary in trait_transform_boundaries(item_trait) {
@@ -1781,7 +1929,7 @@ impl<'a> SnapshotBuilder<'a> {
                         );
                     }
                 }
-                Item::Use(item_use) => {
+                Item::Use(item_use) if rust_linkable => {
                     let mut leaves = Vec::new();
                     flatten_use_tree(&item_use.tree, Vec::new(), &mut leaves);
                     let edge = UseEdge {
@@ -1801,7 +1949,7 @@ impl<'a> SnapshotBuilder<'a> {
                         self.private_uses.push(edge);
                     }
                 }
-                Item::ExternCrate(item_extern) => {
+                Item::ExternCrate(item_extern) if rust_linkable => {
                     if normalize_identifier(item_extern.ident.to_string()) == "self"
                         && let Some((_, alias)) = &item_extern.rename
                     {
@@ -1824,7 +1972,7 @@ impl<'a> SnapshotBuilder<'a> {
                         );
                     }
                 }
-                Item::Impl(item_impl) => self.collect_impl(
+                Item::Impl(item_impl) if rust_linkable => self.collect_impl(
                     crate_name,
                     module_path,
                     source_path,
@@ -1832,7 +1980,7 @@ impl<'a> SnapshotBuilder<'a> {
                     &cfg_guard,
                     item_impl,
                 ),
-                Item::ForeignMod(foreign) => {
+                Item::ForeignMod(foreign) if rust_linkable => {
                     for foreign_item in &foreign.items {
                         let mut foreign_guard = cfg_guard.clone();
                         let foreign_cfg = canonical_cfg(foreign_item_attrs(foreign_item));
@@ -2031,7 +2179,7 @@ impl<'a> SnapshotBuilder<'a> {
                         );
                     }
                 }
-                Item::Macro(item_macro) => {
+                Item::Macro(item_macro) if rust_linkable => {
                     let macro_name = item_macro
                         .mac
                         .path
@@ -2057,7 +2205,14 @@ impl<'a> SnapshotBuilder<'a> {
                                 name.clone(),
                                 RustNamespace::Macro,
                                 RustApiItemKind::Macro,
-                                normalized_macro_contract(item_macro),
+                                format!(
+                                    "{}\ndefinition-edition:{}",
+                                    normalized_macro_contract(item_macro),
+                                    self.crate_editions
+                                        .get(crate_name)
+                                        .map(String::as_str)
+                                        .unwrap_or("unresolved")
+                                ),
                             );
                         }
                         continue;
@@ -2098,7 +2253,7 @@ impl<'a> SnapshotBuilder<'a> {
                         );
                     }
                 }
-                _ => {
+                _ if rust_linkable => {
                     if transforming_attrs(item_attrs(item)).next().is_none()
                         && transforming_cfg_attrs(item_attrs(item)).is_empty()
                         && let Some((name, namespace, kind, contract, declared_public)) =
@@ -2177,6 +2332,7 @@ impl<'a> SnapshotBuilder<'a> {
                         }
                     }
                 }
+                _ => {}
             }
         }
     }
@@ -2208,7 +2364,7 @@ impl<'a> SnapshotBuilder<'a> {
         origin: SymbolKey,
         source_path: &str,
         cfg_guard: &[String],
-        evidence: Vec<String>,
+        evidence: Vec<OpaqueReturnEvidence>,
     ) {
         let implementation_digest = self
             .opaque_implementation_digest
@@ -2220,10 +2376,11 @@ impl<'a> SnapshotBuilder<'a> {
                     .into_iter()
                     .map(|evidence| PendingOpaqueReturnProof {
                         origin: origin.clone(),
-                        cfg_guard: cfg_guard.to_vec(),
+                        cfg_guard: combined_guards(cfg_guard, &evidence.cfg_guard),
                         source_path: source_path.to_owned(),
                         evidence: format!(
-                            "{evidence}\nopaque-implementation-digest:{implementation_digest}"
+                            "{}\nopaque-implementation-digest:{implementation_digest}",
+                            evidence.evidence
                         ),
                     }),
             );
@@ -2798,7 +2955,13 @@ impl<'a> SnapshotBuilder<'a> {
                 },
                 source_path,
                 &associated_cfg,
-                opaque_evidence,
+                opaque_evidence
+                    .into_iter()
+                    .map(|evidence| OpaqueReturnEvidence {
+                        cfg_guard: Vec::new(),
+                        evidence,
+                    })
+                    .collect(),
             );
             self.pending_assoc.push(PendingAssoc {
                 crate_name: crate_name.to_owned(),
@@ -5982,6 +6145,160 @@ fn normalized_foreign_contract(foreign: &syn::ItemForeignMod, item: &syn::Foreig
     canonical_tokens(quote!(#(#attrs)* #unsafety #abi { #item }))
 }
 
+pub(super) fn trait_member_cfg_key(attrs: &[Attribute]) -> String {
+    canonical_cfg(attrs).guards.join("&&")
+}
+
+fn cfg_has_custom_predicate(attrs: &[Attribute]) -> bool {
+    fn is_known_leaf(name: &str) -> bool {
+        matches!(
+            name,
+            "feature"
+                | "target_arch"
+                | "target_abi"
+                | "target_feature"
+                | "target_os"
+                | "target_env"
+                | "target_family"
+                | "target_vendor"
+                | "target_endian"
+                | "target_pointer_width"
+                | "target_has_atomic"
+                | "sanitize"
+                | "panic"
+                | "relocation_model"
+                | "code_model"
+                | "overflow_checks"
+                | "unix"
+                | "windows"
+                | "test"
+                | "debug_assertions"
+                | "proc_macro"
+                | "doc"
+                | "doctest"
+                | "miri"
+                | "target_thread_local"
+                | "ub_checks"
+        )
+    }
+
+    fn predicate_is_custom(meta: &Meta) -> bool {
+        let name = meta
+            .path()
+            .segments
+            .last()
+            .map(|segment| normalize_identifier(segment.ident.to_string()))
+            .unwrap_or_default();
+        match meta {
+            Meta::Path(_) | Meta::NameValue(_) => !is_known_leaf(&name),
+            Meta::List(list) if matches!(name.as_str(), "all" | "any" | "not") => {
+                let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+                parser
+                    .parse2(list.tokens.clone())
+                    .map(|parts| parts.iter().any(predicate_is_custom))
+                    .unwrap_or(true)
+            }
+            Meta::List(_) => true,
+        }
+    }
+
+    fn cfg_meta_has_custom(meta: &Meta) -> bool {
+        let name = meta
+            .path()
+            .segments
+            .last()
+            .map(|segment| normalize_identifier(segment.ident.to_string()));
+        let Meta::List(list) = meta else {
+            return false;
+        };
+        let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+        let Ok(parts) = parser.parse2(list.tokens.clone()) else {
+            return false;
+        };
+        match name.as_deref() {
+            Some("cfg") => parts.first().is_some_and(predicate_is_custom),
+            Some("cfg_attr") => {
+                parts.first().is_some_and(predicate_is_custom)
+                    || parts.iter().skip(1).any(cfg_meta_has_custom)
+            }
+            _ => false,
+        }
+    }
+
+    attrs.iter().any(|attr| cfg_meta_has_custom(&attr.meta))
+}
+
+fn item_custom_cfg_evidence(item: &Item) -> Vec<String> {
+    fn append(attrs: &[Attribute], evidence: &mut Vec<String>) {
+        evidence.extend(
+            attrs
+                .iter()
+                .filter(|attr| cfg_has_custom_predicate(std::slice::from_ref(*attr)))
+                .map(|attr| canonical_tokens(attr.to_token_stream())),
+        );
+    }
+
+    fn append_fields(fields: &syn::Fields, evidence: &mut Vec<String>) {
+        for field in fields {
+            append(&field.attrs, evidence);
+        }
+    }
+
+    let mut evidence = Vec::new();
+    append(item_attrs(item), &mut evidence);
+    match item {
+        Item::Struct(value) => append_fields(&value.fields, &mut evidence),
+        Item::Union(value) => {
+            for field in &value.fields.named {
+                append(&field.attrs, &mut evidence);
+            }
+        }
+        Item::Enum(value) => {
+            for variant in &value.variants {
+                append(&variant.attrs, &mut evidence);
+                append_fields(&variant.fields, &mut evidence);
+            }
+        }
+        Item::Trait(value) => {
+            for member in &value.items {
+                append(trait_item_attrs(member), &mut evidence);
+            }
+        }
+        Item::Impl(value) => {
+            for member in &value.items {
+                let attrs: &[Attribute] = match member {
+                    syn::ImplItem::Const(value) => &value.attrs,
+                    syn::ImplItem::Fn(value) => &value.attrs,
+                    syn::ImplItem::Type(value) => &value.attrs,
+                    syn::ImplItem::Macro(value) => &value.attrs,
+                    _ => &[],
+                };
+                append(attrs, &mut evidence);
+            }
+        }
+        Item::ForeignMod(value) => {
+            for member in &value.items {
+                append(foreign_item_attrs(member), &mut evidence);
+            }
+        }
+        _ => {}
+    }
+    evidence.sort();
+    evidence.dedup();
+    evidence
+}
+
+fn custom_cfg_can_affect_external_surface(item: &Item, proc_macro_crate: bool) -> bool {
+    let Item::Fn(function) = item else {
+        return true;
+    };
+    is_public(&function.vis)
+        || proc_macro_crate
+        || !binary_exports(item, true).is_empty()
+        || transforming_attrs(&function.attrs).next().is_some()
+        || !transforming_cfg_attrs(&function.attrs).is_empty()
+}
+
 fn canonical_cfg(attrs: &[Attribute]) -> CfgOutcome {
     let mut guards = Vec::new();
     let mut errors = Vec::new();
@@ -8895,12 +9212,280 @@ fn collect_optional_dependency_names(
     Ok(())
 }
 
-fn lib_crate_types(lib: Option<&toml::Table>) -> Result<Vec<String>, String> {
+fn parsed_manifest_authorities(
+    source: &dyn RevisionFileSource,
+    manifests: &[String],
+) -> BTreeMap<String, toml::Value> {
+    manifests
+        .iter()
+        .filter_map(|path| {
+            let RevisionRead::Bytes(bytes) = source.read(path).ok()? else {
+                return None;
+            };
+            let text = std::str::from_utf8(&bytes.bytes).ok()?;
+            toml::from_str(text)
+                .ok()
+                .map(|manifest| (path.clone(), manifest))
+        })
+        .collect()
+}
+
+fn validate_edition(edition: &str) -> Result<String, String> {
+    matches!(edition, "2015" | "2018" | "2021" | "2024")
+        .then(|| edition.to_owned())
+        .ok_or_else(|| format!("unsupported Rust edition {edition:?}"))
+}
+
+fn effective_library_edition(
+    manifest_path: &str,
+    manifest: &toml::Value,
+    lib: Option<&toml::Table>,
+    parsed: &BTreeMap<String, toml::Value>,
+) -> Result<String, String> {
+    if let Some(value) = lib.and_then(|table| table.get("edition")) {
+        let edition = value
+            .as_str()
+            .ok_or_else(|| "lib.edition must be a string".to_owned())?;
+        return validate_edition(edition);
+    }
+    let package = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "package must be a table".to_owned())?;
+    let Some(value) = package.get("edition") else {
+        return Ok("2015".to_owned());
+    };
+    if let Some(edition) = value.as_str() {
+        return validate_edition(edition);
+    }
+    let inherited = value
+        .as_table()
+        .and_then(|table| table.get("workspace"))
+        .and_then(toml::Value::as_bool);
+    if inherited != Some(true) {
+        return Err("package.edition must be a string or { workspace = true }".to_owned());
+    }
+
+    let manifest_dir = parent_repo_path(manifest_path);
+    let authority_path = if let Some(workspace) = package.get("workspace") {
+        let workspace = workspace
+            .as_str()
+            .ok_or_else(|| "package.workspace must be a string".to_owned())?;
+        let workspace_dir = safe_join_repo_path(&manifest_dir, workspace)
+            .map_err(|reason| format!("package.workspace cannot be resolved: {reason}"))?;
+        safe_join_repo_path(&workspace_dir, "Cargo.toml")
+            .map_err(|reason| format!("workspace manifest cannot be resolved: {reason}"))?
+    } else {
+        parsed
+            .iter()
+            .filter(|(path, candidate)| {
+                candidate
+                    .get("workspace")
+                    .and_then(toml::Value::as_table)
+                    .is_some()
+                    && workspace_relative_dir(&parent_manifest_dir(path), &manifest_dir).is_some()
+            })
+            .max_by_key(|(path, _)| parent_manifest_dir(path).len())
+            .map(|(path, _)| path.clone())
+            .ok_or_else(|| {
+                format!(
+                    "package.edition inherits from a workspace, but no workspace authority contains {manifest_path}"
+                )
+            })?
+    };
+    let authority = parsed.get(&authority_path).ok_or_else(|| {
+        format!("package.edition workspace authority {authority_path} is unavailable")
+    })?;
+    let edition = authority
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(toml::Value::as_table)
+        .and_then(|package| package.get("edition"))
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| {
+            format!("workspace authority {authority_path} has no workspace.package.edition string")
+        })?;
+    validate_edition(edition)
+}
+
+fn default_autolib(manifest: &toml::Value, edition: &str) -> bool {
+    edition != "2015"
+        || !["bin", "example", "test", "bench"]
+            .iter()
+            .any(|target| manifest.get(*target).is_some())
+}
+
+fn package_has_active_build_script(
+    package: &toml::Table,
+    manifest_dir: &str,
+    inventory: &BTreeMap<String, RevisionEntry>,
+) -> Result<bool, String> {
+    match package.get("build") {
+        Some(toml::Value::Boolean(false)) => Ok(false),
+        Some(toml::Value::Boolean(true)) => {
+            Err("package.build=true is not a valid Cargo build target".to_owned())
+        }
+        Some(toml::Value::String(path)) => {
+            let path = safe_join_repo_path(manifest_dir, path)
+                .map_err(|reason| format!("package.build cannot be resolved: {reason}"))?;
+            inventory
+                .get(&path)
+                .is_some_and(is_live_regular_entry)
+                .then_some(true)
+                .ok_or_else(|| format!("declared build script {path} is unavailable"))
+        }
+        Some(_) => Err("package.build must be a string or boolean".to_owned()),
+        None => safe_join_repo_path(manifest_dir, "build.rs")
+            .map(|path| inventory.get(&path).is_some_and(is_live_regular_entry)),
+    }
+}
+
+fn repository_cargo_cfg_authority(
+    source: &dyn RevisionFileSource,
+    inventory: &BTreeMap<String, RevisionEntry>,
+    package_links: Option<&str>,
+) -> Result<bool, String> {
+    // Cargo gives the legacy extensionless file precedence when both names
+    // exist in the same directory. Mirroring that rule matters here: binding
+    // the lower-precedence file could manufacture cfg authority Cargo ignores.
+    let path = [".cargo/config", ".cargo/config.toml"]
+        .into_iter()
+        .find(|path| inventory.get(*path).is_some_and(is_live_regular_entry));
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    let RevisionRead::Bytes(bytes) = source
+        .read(path)
+        .map_err(|reason| format!("cannot read {path}: {reason}"))?
+    else {
+        return Err(format!("{path} is not revision-backed regular bytes"));
+    };
+    let text =
+        std::str::from_utf8(&bytes.bytes).map_err(|_| format!("{path} is not valid UTF-8"))?;
+    let config: toml::Value =
+        toml::from_str(text).map_err(|reason| format!("cannot parse {path}: {reason}"))?;
+    cargo_config_can_define_custom_cfg(&config, package_links)
+}
+
+fn cargo_config_can_define_custom_cfg(
+    value: &toml::Value,
+    package_links: Option<&str>,
+) -> Result<bool, String> {
+    fn rustflags_define_cfg(value: &toml::Value) -> Result<bool, String> {
+        let tokens = match value {
+            toml::Value::String(value) => shlex::split(value)
+                .ok_or_else(|| "Cargo config rustflags string has invalid quoting".to_owned())?,
+            toml::Value::Array(values) => values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        "Cargo config rustflags array must contain strings".to_owned()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return Err("Cargo config rustflags must be a string or string array".to_owned()),
+        };
+        Ok(tokens.iter().enumerate().any(|(index, token)| {
+            token == "--cfg" && tokens.get(index + 1).is_some() || token.starts_with("--cfg=")
+        }))
+    }
+
+    fn rustc_cfg_is_configured(value: &toml::Value) -> Result<bool, String> {
+        match value {
+            toml::Value::String(value) => Ok(!value.trim().is_empty()),
+            toml::Value::Array(values) => {
+                for value in values {
+                    if value.as_str().is_none() {
+                        return Err(
+                            "Cargo target override rustc-cfg must contain strings".to_owned()
+                        );
+                    }
+                }
+                Ok(!values.is_empty())
+            }
+            _ => Err("Cargo target override rustc-cfg must be a string or string array".to_owned()),
+        }
+    }
+
+    let table = value
+        .as_table()
+        .ok_or_else(|| "Cargo config root must be a table".to_owned())?;
+    if table.contains_key("include") {
+        return Err("Cargo config include authority is not resolved".to_owned());
+    }
+
+    if let Some(build) = table.get("build") {
+        let build = build
+            .as_table()
+            .ok_or_else(|| "Cargo config build section must be a table".to_owned())?;
+        if let Some(rustflags) = build.get("rustflags")
+            && rustflags_define_cfg(rustflags)?
+        {
+            return Ok(true);
+        }
+    }
+
+    if let Some(targets) = table.get("target") {
+        let targets = targets
+            .as_table()
+            .ok_or_else(|| "Cargo config target section must be a table".to_owned())?;
+        for (target_key, target) in targets {
+            let target = target
+                .as_table()
+                .ok_or_else(|| "Cargo config target entry must be a table".to_owned())?;
+            if let Some(rustflags) = target.get("rustflags")
+                && rustflags_define_cfg(rustflags)?
+            {
+                return Ok(true);
+            }
+            if !target_key.trim_start().starts_with("cfg(")
+                && let Some(links) = package_links
+                && let Some(override_value) = target.get(links)
+            {
+                let override_value = override_value.as_table().ok_or_else(|| {
+                    format!("Cargo config target link override {links} must be a table")
+                })?;
+                if let Some(rustc_cfg) = override_value.get("rustc-cfg")
+                    && rustc_cfg_is_configured(rustc_cfg)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn revision_cfg_authority_digest(inventory: &BTreeMap<String, RevisionEntry>) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    for (path, entry) in inventory {
+        digest.update(path.as_bytes());
+        digest.update([0]);
+        digest.update(entry.baseline_object_id.as_deref().unwrap_or("<overlay>"));
+        digest.update([0]);
+        digest.update(format!(
+            "{:o}:{:?}:{:?}",
+            entry.mode, entry.kind, entry.state
+        ));
+        digest.update([0]);
+        if let RevisionProvenance::WorkingTreeOverlay { dirty_digest, .. } = &entry.provenance {
+            digest.update(dirty_digest.as_bytes());
+        }
+        digest.update([0xff]);
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn lib_crate_types(lib: Option<&toml::Table>, proc_macro: bool) -> Result<Vec<String>, String> {
     let Some(value) = lib.and_then(|table| table.get("crate-type")) else {
-        return Ok(vec!["lib".to_owned()]);
+        return Ok(vec![
+            if proc_macro { "proc-macro" } else { "lib" }.to_owned(),
+        ]);
     };
     let mut types = match value {
-        toml::Value::String(kind) => vec![kind.clone()],
         toml::Value::Array(kinds) => kinds
             .iter()
             .map(|kind| {
@@ -8909,12 +9494,35 @@ fn lib_crate_types(lib: Option<&toml::Table>) -> Result<Vec<String>, String> {
                     .ok_or_else(|| "lib.crate-type must contain only strings".to_owned())
             })
             .collect::<Result<Vec<_>, _>>()?,
-        _ => return Err("lib.crate-type must be a string or array of strings".to_owned()),
+        _ => return Err("lib.crate-type must be an array of strings".to_owned()),
     };
     types.sort();
     types.dedup();
     if types.is_empty() {
-        types.push("lib".to_owned());
+        return Err("lib.crate-type must not be empty".to_owned());
+    }
+    const SUPPORTED: &[&str] = &[
+        "bin",
+        "lib",
+        "rlib",
+        "dylib",
+        "cdylib",
+        "staticlib",
+        "proc-macro",
+    ];
+    if let Some(kind) = types
+        .iter()
+        .find(|kind| !SUPPORTED.contains(&kind.as_str()))
+    {
+        return Err(format!("unsupported lib.crate-type {kind:?}"));
+    }
+    if (proc_macro || types.iter().any(|kind| kind == "proc-macro"))
+        && types.as_slice() != ["proc-macro"]
+    {
+        return Err(
+            "proc-macro library targets require crate-type to be omitted or ['proc-macro']"
+                .to_owned(),
+        );
     }
     Ok(types)
 }
@@ -9024,10 +9632,14 @@ fn opaque_return_evidence(
     ))
 }
 
-fn public_item_opaque_return_evidence(item: &Item) -> Vec<String> {
+fn public_item_opaque_return_evidence(item: &Item) -> Vec<OpaqueReturnEvidence> {
     match item {
         Item::Fn(function) => opaque_return_evidence("function", &function.sig, &function.block)
             .into_iter()
+            .map(|evidence| OpaqueReturnEvidence {
+                cfg_guard: Vec::new(),
+                evidence,
+            })
             .collect(),
         Item::Trait(item_trait) => item_trait
             .items
@@ -9037,11 +9649,19 @@ fn public_item_opaque_return_evidence(item: &Item) -> Vec<String> {
                     return None;
                 };
                 let body = function.default.as_ref()?;
+                let member_cfg = canonical_cfg(&function.attrs);
                 opaque_return_evidence(
                     &format!("trait-default:{}", function.sig.ident),
                     &function.sig,
                     body,
                 )
+                .map(|evidence| OpaqueReturnEvidence {
+                    cfg_guard: member_cfg.guards,
+                    evidence: format!(
+                        "{evidence}\ntrait-member-cfg:{}",
+                        trait_member_cfg_key(&function.attrs)
+                    ),
+                })
             })
             .collect(),
         _ => Vec::new(),
@@ -10356,7 +10976,7 @@ fn is_binary_export_meta(meta: &Meta) -> bool {
     })
 }
 
-fn private_binary_exports(item: &Item) -> Vec<(String, Vec<String>, String)> {
+fn binary_exports(item: &Item, include_public: bool) -> Vec<(String, bool, Vec<String>, String)> {
     fn collect(meta: &Meta, inherited_guard: &[String], exports: &mut Vec<(Vec<String>, String)>) {
         if is_binary_export_meta(meta) {
             exports.push((
@@ -10404,7 +11024,7 @@ fn private_binary_exports(item: &Item) -> Vec<(String, Vec<String>, String)> {
         ),
         _ => return Vec::new(),
     };
-    if public {
+    if public && !include_public {
         return Vec::new();
     }
     let mut exports = Vec::new();
@@ -10416,6 +11036,7 @@ fn private_binary_exports(item: &Item) -> Vec<(String, Vec<String>, String)> {
         .map(|(guard, export)| {
             (
                 name.clone(),
+                public,
                 guard,
                 format!(
                     "{export}\ninput:{}",
@@ -11059,10 +11680,23 @@ mod tests {
             b"[package]\nname='fixture'\nversion='0.0.0'\n",
         )]);
         assert!(
-            snapshot_rust_api(&missing_default_root)
+            !snapshot_rust_api(&missing_default_root)
                 .unknowns
                 .iter()
-                .any(|unknown| unknown.kind == RustApiUnknownKind::MissingLibRoot)
+                .any(|unknown| unknown.kind == RustApiUnknownKind::MissingLibRoot),
+            "a package without [lib] or src/lib.rs has no implicit library target"
+        );
+
+        let missing_explicit_default_root = MemorySource::new(&[(
+            "Cargo.toml",
+            b"[package]\nname='fixture'\nversion='0.0.0'\n[lib]\n",
+        )]);
+        assert!(
+            snapshot_rust_api(&missing_explicit_default_root)
+                .unknowns
+                .iter()
+                .any(|unknown| unknown.kind == RustApiUnknownKind::MissingLibRoot),
+            "an explicit [lib] retains its default src/lib.rs requirement"
         );
 
         let parse_failed = snapshot_rust_api(&source("pub fn broken("));
@@ -11673,6 +12307,210 @@ mod tests {
             vec!["app", "implicit", "leaf"],
             "Cargo path dependencies inside the workspace become members transitively, while exclude and unrelated packages remain out"
         );
+    }
+
+    #[test]
+    fn rust_api_snapshot_respects_library_projection_modes() {
+        for crate_type in ["cdylib", "staticlib", "bin"] {
+            let manifest = format!(
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['{crate_type}']\n"
+            );
+            let source = MemorySource::new(&[
+                ("Cargo.toml", manifest.as_bytes()),
+                (
+                    "src/lib.rs",
+                    b"pub fn internal(value: u8) {} #[unsafe(no_mangle)] pub extern \"C\" fn exported() {}",
+                ),
+            ]);
+            let snapshot = snapshot_rust_api(&source);
+            assert!(
+                snapshot.items.is_empty(),
+                "{crate_type}-only targets are not Rust dependency surfaces: {:?}",
+                snapshot.items
+            );
+            assert!(snapshot.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::UnsupportedExternResolution
+                    && unknown.evidence.contains("exported")
+                    && unknown.evidence.contains("public-binary-export:")
+            }));
+        }
+
+        let mixed = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['rlib','cdylib']\n",
+            ),
+            ("src/lib.rs", b"pub fn visible(value: u8) {}"),
+        ]);
+        assert!(
+            snapshot_rust_api(&mixed)
+                .items
+                .iter()
+                .any(|item| item.key.external_name == "visible")
+        );
+
+        let proc_macro = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\nproc-macro=true\n",
+            ),
+            (
+                "src/lib.rs",
+                b"#[proc_macro] pub fn bang(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input } pub struct Internal;",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&proc_macro);
+        assert!(snapshot.items.iter().any(|item| {
+            item.key.namespace == RustNamespace::Crate
+                && item.contract.contains("crate_types=[\"proc-macro\"]")
+        }));
+        assert!(snapshot.items.iter().any(|item| {
+            item.key.namespace == RustNamespace::Macro && item.key.external_name == "bang"
+        }));
+        assert!(
+            !snapshot
+                .items
+                .iter()
+                .any(|item| item.key.external_name == "Internal")
+        );
+
+        let crate_type_proc_macro = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['proc-macro']\n",
+            ),
+            (
+                "src/lib.rs",
+                b"#[proc_macro] pub fn bang(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input } pub struct Internal;",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&crate_type_proc_macro);
+        assert!(snapshot.items.iter().any(|item| {
+            item.key.namespace == RustNamespace::Macro && item.key.external_name == "bang"
+        }));
+        assert!(
+            !snapshot
+                .items
+                .iter()
+                .any(|item| item.key.external_name == "Internal")
+        );
+        assert!(!snapshot.unknowns.iter().any(|unknown| {
+            unknown
+                .evidence
+                .contains("native-only library target is not a Rust dependency surface")
+        }));
+    }
+
+    #[test]
+    fn cargo_cfg_authority_respects_target_schema_and_package_links() {
+        let parses = |text: &str| toml::from_str::<toml::Value>(text).expect("valid Cargo config");
+
+        assert!(
+            cargo_config_can_define_custom_cfg(
+                &parses("[build]\nrustflags=['--cfg','public_api']\n"),
+                None,
+            )
+            .expect("build rustflags authority")
+        );
+        assert!(
+            cargo_config_can_define_custom_cfg(
+                &parses("[target.'cfg(unix)']\nrustflags=['--cfg','public_api']\n"),
+                None,
+            )
+            .expect("target rustflags authority")
+        );
+        let links_override =
+            parses("[target.x86_64-unknown-linux-gnu.native]\nrustc-cfg=['public_api']\n");
+        assert!(
+            cargo_config_can_define_custom_cfg(&links_override, Some("native"))
+                .expect("matching links override")
+        );
+        assert!(
+            !cargo_config_can_define_custom_cfg(&links_override, Some("other"))
+                .expect("mismatched links override")
+        );
+        assert!(
+            !cargo_config_can_define_custom_cfg(&links_override, None)
+                .expect("links override without package.links")
+        );
+        assert!(
+            !cargo_config_can_define_custom_cfg(
+                &parses("[target.'cfg(unix)'.native]\nrustc-cfg=['public_api']\n"),
+                Some("native"),
+            )
+            .expect("cfg selector cannot host links override")
+        );
+        assert!(
+            !cargo_config_can_define_custom_cfg(
+                &parses("[env]\nRUSTFLAGS='--cfg public_api'\n"),
+                None,
+            )
+            .expect("child-process environment is not Cargo rustflags authority")
+        );
+
+        let invalid_links = snapshot_rust_api(&MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nlinks='native'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", b"#[cfg(public_api)] pub fn api() {}"),
+        ]));
+        assert!(invalid_links.crates.is_empty());
+        assert!(invalid_links.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::ManifestParse
+                && unknown
+                    .evidence
+                    .contains("package.links requires a live build script")
+        }));
+    }
+
+    #[test]
+    fn rust_api_snapshot_binds_nested_custom_cfg_and_trait_member_proofs() {
+        let source = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nbuild='build.rs'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "build.rs",
+                b"fn main() { println!(\"cargo::rustc-cfg=public_api\"); }",
+            ),
+            (
+                "src/lib.rs",
+                b"pub struct Holder { #[cfg_attr(unix, cfg(public_api))] pub field: u8 } pub trait Contract { #[cfg(feature = \"a\")] async fn fetch() {} #[cfg(not(feature = \"a\"))] async fn fetch() {} }",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&source);
+        assert!(
+            snapshot.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::CfgPredicate
+                    && unknown.evidence.contains("public_api")
+                    && unknown.evidence.contains("cfg-authority-digest:sha256:")
+            }),
+            "nested custom cfg authority proof is missing: {:?}",
+            snapshot.unknowns
+        );
+
+        let opaque_proofs: Vec<_> = snapshot
+            .unknowns
+            .iter()
+            .filter(|unknown| unknown.kind == RustApiUnknownKind::OpaqueReturnAutoTraits)
+            .collect();
+        assert_eq!(
+            opaque_proofs.len(),
+            2,
+            "disjoint cfg-qualified trait methods must retain distinct opaque proofs: {opaque_proofs:?}"
+        );
+        assert!(opaque_proofs.iter().any(|unknown| {
+            unknown
+                .evidence
+                .contains("trait-member-cfg:feature = \"a\"")
+        }));
+        assert!(opaque_proofs.iter().any(|unknown| {
+            unknown
+                .evidence
+                .contains("trait-member-cfg:not(feature = \"a\")")
+        }));
     }
 
     #[test]

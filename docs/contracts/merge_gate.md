@@ -196,6 +196,22 @@ typechange to symlink) keeps the digest non-neutralizable. Additive derive
 unknowns do not suppress confirmed changes to their annotated input item; they
 cover only generated output.
 
+`CfgPredicate` evidence for a custom cfg leaf may include
+`cfg-authority-digest:sha256:<digest>` when an active revision-backed build
+script or Cargo config can define it. The digest is deliberately conservative
+and can over-report after unrelated tracked changes. With no revision-backed
+authority it is `cfg-authority-digest:unresolved:*`; unresolved cfg authority is
+non-neutralizable even when both sides carry identical evidence. Nested fields,
+variants, trait/impl members, and foreign items follow the same rule. A Cargo
+config qualifies only from the effective repository-root path. When both
+filenames exist, legacy `.cargo/config` takes precedence over
+`.cargo/config.toml`, matching Cargo. Only legal build/target rustflags and a
+concrete-target link-override rustc-cfg whose key matches the package's `links`
+can define custom cfg, and `package.links` still requires a live build script.
+Child-process environment settings, nested configs,
+lookalike keys in unrelated tables, and include-backed authority do not become
+a complete proof.
+
 ## `stale_cache_caveats`
 
 An additive, advisory list naming every gate row that had BLOCKING influence on

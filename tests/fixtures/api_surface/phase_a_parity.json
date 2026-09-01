@@ -2109,7 +2109,7 @@
       },
       "repo_backed_facts": [
         {
-          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"macro\",\"name\":\"Exported\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"macro\",\"name\":\"Exported\",\"cfg_region\":[]},\"after_contract\":\"# [macro_export] macro_rules ! __prview_name { () => { } }\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
+          "id": "api-delta:{\"kind\":\"added\",\"identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"macro\",\"name\":\"Exported\",\"cfg_region\":[]},\"before_identity\":null,\"before_contract\":null,\"before_declared_public\":null,\"after_identity\":{\"crate_name\":\"fixture\",\"module_path\":[],\"namespace\":\"macro\",\"name\":\"Exported\",\"cfg_region\":[]},\"after_contract\":\"# [macro_export] macro_rules ! __prview_name { () => { } }\\ndefinition-edition:2015\",\"after_declared_public\":true,\"unknown_reason\":null,\"unknown_source\":null}",
           "kind": "added",
           "identity": {
             "crate_name": "fixture",
@@ -2127,16 +2127,16 @@
               "name": "Exported",
               "cfg_region": []
             },
-            "contract": "# [macro_export] macro_rules ! __prview_name { () => { } }",
+            "contract": "# [macro_export] macro_rules ! __prview_name { () => { } }\ndefinition-edition:2015",
             "source_path": "src/lib.rs",
-            "evidence": "# [macro_export] macro_rules ! __prview_name { () => { } }",
+            "evidence": "# [macro_export] macro_rules ! __prview_name { () => { } }\ndefinition-edition:2015",
             "provenance": "git_tree:multiplicity_namespace_cfg/target",
             "declared_public": true
           },
           "analysis_source": "repo_backed_rust_api",
           "confidence": "confirmed",
           "evidence": [
-            "# [macro_export] macro_rules ! __prview_name { () => { } }"
+            "# [macro_export] macro_rules ! __prview_name { () => { } }\ndefinition-edition:2015"
           ]
         },
         {
