@@ -28,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed mixed-version invariant but exposes `recovery_required`, its exact
   path, and no retry timer. Permission, linked-path, and unsafe lock-file I/O
   failures surface as non-retryable `storage_corrupt`; an unparseable legacy
-  token remains unattributable stale evidence and uses explicit recovery.
+  token remains unattributable stale evidence and uses explicit recovery. A
+  failed legacy claim explicitly releases its v2 kernel lock before returning,
+  so documented manual recovery can retry immediately across platforms.
 - Python checks honor uv's `UV_NO_CONFIG` boolish contract before inspecting
   repository configuration: enabled values skip discovered `uv.toml` and
   `[tool.uv]` limits, false values preserve discovery, and an explicit contained

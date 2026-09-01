@@ -602,7 +602,15 @@ pub fn acquire_lock_at(path: &Path) -> Result<LockGuard> {
         }
     }
 
-    acquire_legacy_sentinel(&path, &token)?;
+    if let Err(error) = acquire_legacy_sentinel(&path, &token) {
+        // `flock`/LockFileEx ownership is normally released when `v2_file`
+        // drops, but make the failed-acquisition boundary explicit. In
+        // particular, a caller performing documented manual legacy recovery
+        // must be able to retry immediately on macOS rather than observe this
+        // same process as a transient v2 owner.
+        let _ = fs::File::unlock(&v2_file);
+        return Err(error);
+    }
     Ok(LockGuard {
         v2_file,
         legacy_path: path,

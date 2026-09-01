@@ -1316,6 +1316,9 @@ review will clear on retry. Unsafe or unreadable activation paths become
 `storage_corrupt`; they are not folded into lock contention. Lock opens reject
 symlinks/reparse points and, on Unix, shared hardlink inodes; journal/index/prune
 manifests are published via owned unique temp files and atomic rename.
+When the legacy claim fails, the contender explicitly releases its v2 kernel
+lock before returning the recovery error; operator recovery can therefore retry
+immediately instead of waiting for platform-specific close timing.
 The prune manifest is not path authority by itself: before recovery moves or
 deletes a payload, the payload root, its `00_summary` directory, and its
 `RUN.json` must each be owned non-link components, and RUN must identify the
