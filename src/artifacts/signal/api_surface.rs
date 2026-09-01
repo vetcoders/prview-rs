@@ -1530,7 +1530,7 @@ impl<'a> SnapshotBuilder<'a> {
                 .any(|kind| matches!(kind.as_str(), "lib" | "rlib" | "dylib"));
             let native_artifact = crate_types
                 .iter()
-                .any(|kind| matches!(kind.as_str(), "cdylib" | "staticlib" | "bin"));
+                .any(|kind| matches!(kind.as_str(), "dylib" | "cdylib" | "staticlib" | "bin"));
             let package_links = match package.get("links") {
                 Some(toml::Value::String(links)) => Some(links.as_str()),
                 Some(_) => {
@@ -1545,8 +1545,12 @@ impl<'a> SnapshotBuilder<'a> {
                 }
                 None => None,
             };
-            let repo_config_cfg_authority =
-                repository_cargo_cfg_authority(self.source, &self.inventory, package_links);
+            let repo_config_cfg_authority = repository_cargo_cfg_authority(
+                self.source,
+                &self.inventory,
+                &manifest_dir,
+                package_links,
+            );
             let build_script_cfg_authority =
                 match package_has_active_build_script(package, &manifest_dir, &self.inventory) {
                     Ok(active) => Ok(active),
@@ -1724,8 +1728,12 @@ impl<'a> SnapshotBuilder<'a> {
             }
             None => None,
         };
-        let repo_config_cfg_authority =
-            repository_cargo_cfg_authority(self.source, &self.inventory, package_links);
+        let repo_config_cfg_authority = repository_cargo_cfg_authority(
+            self.source,
+            &self.inventory,
+            &manifest_dir,
+            package_links,
+        );
         let build_script_cfg_authority =
             package_has_active_build_script(package, &manifest_dir, &self.inventory);
         let cfg_authority = match build_script_cfg_authority {
@@ -10180,28 +10188,138 @@ fn package_has_active_build_script(
 fn repository_cargo_cfg_authority(
     source: &dyn RevisionFileSource,
     inventory: &BTreeMap<String, RevisionEntry>,
+    manifest_dir: &str,
     package_links: Option<&str>,
 ) -> Result<bool, String> {
-    // Cargo gives the legacy extensionless file precedence when both names
-    // exist in the same directory. Mirroring that rule matters here: binding
-    // the lower-precedence file could manufacture cfg authority Cargo ignores.
-    let path = [".cargo/config", ".cargo/config.toml"]
-        .into_iter()
-        .find(|path| inventory.get(*path).is_some_and(is_live_regular_entry));
-    let Some(path) = path else {
+    // Model every repository-backed config Cargo can see when invoked from the
+    // package directory. Cargo merges ancestors from shallow to deep, with
+    // deeper scalars winning and arrays concatenating. Within one directory,
+    // the legacy extensionless filename takes precedence.
+    let mut paths = Vec::new();
+    let mut dir = manifest_dir.to_owned();
+    loop {
+        let mut selected = None;
+        for name in [".cargo/config", ".cargo/config.toml"] {
+            let path = safe_join_repo_path(&dir, name)
+                .expect("a normalized manifest directory stays inside the repository");
+            let Some(entry) = inventory.get(&path) else {
+                continue;
+            };
+            if matches!(
+                entry.state,
+                RevisionEntryState::Deleted | RevisionEntryState::Renamed { .. }
+            ) {
+                continue;
+            }
+            if !is_live_regular_entry(entry) {
+                return Err(format!(
+                    "effective Cargo config {path} is not revision-backed regular bytes"
+                ));
+            }
+            selected = Some(path);
+            break;
+        }
+        if let Some(path) = selected {
+            paths.push(path);
+        }
+        if dir.is_empty() {
+            break;
+        }
+        dir = parent_repo_path(&dir);
+    }
+    if paths.is_empty() {
         return Ok(false);
-    };
-    let RevisionRead::Bytes(bytes) = source
-        .read(path)
-        .map_err(|reason| format!("cannot read {path}: {reason}"))?
-    else {
-        return Err(format!("{path} is not revision-backed regular bytes"));
-    };
-    let text =
-        std::str::from_utf8(&bytes.bytes).map_err(|_| format!("{path} is not valid UTF-8"))?;
-    let config: toml::Value =
-        toml::from_str(text).map_err(|reason| format!("cannot parse {path}: {reason}"))?;
-    cargo_config_can_define_custom_cfg(&config, package_links)
+    }
+
+    let mut merged = toml::Value::Table(toml::Table::new());
+    for path in paths.into_iter().rev() {
+        let RevisionRead::Bytes(bytes) = source
+            .read(&path)
+            .map_err(|reason| format!("cannot read {path}: {reason}"))?
+        else {
+            return Err(format!("{path} is not revision-backed regular bytes"));
+        };
+        let text =
+            std::str::from_utf8(&bytes.bytes).map_err(|_| format!("{path} is not valid UTF-8"))?;
+        let config: toml::Value =
+            toml::from_str(text).map_err(|reason| format!("cannot parse {path}: {reason}"))?;
+        validate_cargo_config_value(&config, &path)?;
+        merge_cargo_config_value(&mut merged, config, "<config>")?;
+    }
+    cargo_config_can_define_custom_cfg(&merged, package_links)
+}
+
+fn merge_cargo_config_value(
+    lower: &mut toml::Value,
+    higher: toml::Value,
+    key_path: &str,
+) -> Result<(), String> {
+    match higher {
+        toml::Value::Table(higher) => {
+            let toml::Value::Table(lower) = lower else {
+                return Err(format!(
+                    "Cargo config merge has incompatible types at {key_path}"
+                ));
+            };
+            for (key, value) in higher {
+                match lower.get_mut(&key) {
+                    Some(existing) => {
+                        merge_cargo_config_value(existing, value, &format!("{key_path}.{key}"))?
+                    }
+                    None => {
+                        lower.insert(key, value);
+                    }
+                }
+            }
+        }
+        toml::Value::Array(higher) => {
+            let toml::Value::Array(lower) = lower else {
+                return Err(format!(
+                    "Cargo config merge has incompatible types at {key_path}"
+                ));
+            };
+            lower.extend(higher);
+        }
+        higher @ (toml::Value::String(_) | toml::Value::Integer(_) | toml::Value::Boolean(_)) => {
+            if !matches!(
+                lower,
+                toml::Value::String(_) | toml::Value::Integer(_) | toml::Value::Boolean(_)
+            ) {
+                return Err(format!(
+                    "Cargo config merge has incompatible types at {key_path}"
+                ));
+            }
+            *lower = higher;
+        }
+        toml::Value::Float(_) | toml::Value::Datetime(_) => {
+            return Err(format!(
+                "Cargo config contains an unsupported value type at {key_path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cargo_config_value(value: &toml::Value, key_path: &str) -> Result<(), String> {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, value) in table {
+                validate_cargo_config_value(value, &format!("{key_path}.{key}"))?;
+            }
+        }
+        toml::Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                validate_cargo_config_value(value, &format!("{key_path}[{index}]"))?;
+            }
+        }
+        toml::Value::Float(_) | toml::Value::Datetime(_) => {
+            return Err(format!(
+                "Cargo config contains an unsupported value type at {key_path}"
+            ));
+        }
+        toml::Value::String(_) | toml::Value::Integer(_) | toml::Value::Boolean(_) => {}
+    }
+    Ok(())
 }
 
 fn cargo_config_can_define_custom_cfg(
@@ -13695,6 +13813,29 @@ mod tests {
             }));
         }
 
+        let dylib = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['dylib']\n",
+            ),
+            (
+                "src/lib.rs",
+                b"pub fn rust_api() {} macro_rules! export { () => { #[unsafe(no_mangle)] extern \"C\" fn native() {} } } struct Hidden; impl Hidden { export!(); }",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&dylib);
+        assert!(snapshot.items.iter().any(|item| {
+            item.key.external_name == "rust_api" && item.certainty == RustSourceCertainty::Confirmed
+        }));
+        assert!(
+            snapshot.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::MacroGeneratedItems
+                    && unknown.evidence.contains("native-export-associated-macro")
+            }),
+            "a dylib must retain both its Rust dependency API and private native export boundaries: {:?}",
+            snapshot.unknowns
+        );
+
         let associated_exports = MemorySource::new(&[
             (
                 "Cargo.toml",
@@ -14227,6 +14368,77 @@ mod tests {
     #[test]
     fn cargo_cfg_authority_respects_target_schema_and_package_links() {
         let parses = |text: &str| toml::from_str::<toml::Value>(text).expect("valid Cargo config");
+
+        let mut merged = parses("[build]\nrustflags=['--cfg','root_api']\n");
+        merge_cargo_config_value(
+            &mut merged,
+            parses("[build]\nrustflags=['--cfg','member_api']\n"),
+            "<config>",
+        )
+        .expect("Cargo arrays concatenate across config layers");
+        assert!(
+            cargo_config_can_define_custom_cfg(&merged, None).expect("merged rustflags authority")
+        );
+
+        let mut scalar_override = parses("[build]\nrustflags='--cfg root_api'\n");
+        merge_cargo_config_value(
+            &mut scalar_override,
+            parses("[build]\nrustflags='--cap-lints warn'\n"),
+            "<config>",
+        )
+        .expect("a deeper Cargo scalar replaces its ancestor");
+        assert!(
+            !cargo_config_can_define_custom_cfg(&scalar_override, None)
+                .expect("overridden rustflags authority"),
+            "an overridden ancestor scalar must not manufacture cfg authority"
+        );
+
+        let mut primitive_override = parses("[build]\njobs=2\n");
+        merge_cargo_config_value(
+            &mut primitive_override,
+            parses("[build]\njobs='default'\n"),
+            "<config>",
+        )
+        .expect("Cargo permits a deeper supported primitive scalar type");
+        assert_eq!(
+            primitive_override
+                .get("build")
+                .and_then(|build| build.get("jobs"))
+                .and_then(toml::Value::as_str),
+            Some("default")
+        );
+
+        let mut array_scalar_collision = parses("[build]\nrustflags=['--cfg','root_api']\n");
+        assert!(
+            merge_cargo_config_value(
+                &mut array_scalar_collision,
+                parses("[build]\nrustflags='--cfg member_api'\n"),
+                "<config>",
+            )
+            .is_err(),
+            "Cargo rejects array/scalar collisions across config layers"
+        );
+
+        let mut incompatible = parses("[build]\nrustflags='--cfg root_api'\n");
+        assert!(
+            merge_cargo_config_value(
+                &mut incompatible,
+                parses("[build.rustflags]\nvalue='--cfg member_api'\n"),
+                "<config>",
+            )
+            .is_err(),
+            "Cargo rejects incompatible config value types instead of choosing one layer"
+        );
+
+        for unsupported in [
+            parses("[custom]\nvalue=1.5\n"),
+            parses("[custom]\nvalue=1979-05-27T07:32:00Z\n"),
+        ] {
+            assert!(
+                validate_cargo_config_value(&unsupported, "config.toml").is_err(),
+                "Cargo config float/datetime values stay unresolved"
+            );
+        }
 
         assert!(
             cargo_config_can_define_custom_cfg(

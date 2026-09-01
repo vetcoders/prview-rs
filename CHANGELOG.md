@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Rust API analysis now treats `dylib` as both Rust-linkable and
+  native-producing, so private macro boundaries that may synthesize exported
+  symbols cannot disappear from an otherwise ordinary Rust dependency
+  surface. Custom-cfg authority also follows repository-backed Cargo config
+  from each package directory through its ancestors, with Cargo's merge and
+  same-directory filename precedence, instead of recognizing only the
+  repository-root config.
 - MCP lifecycle readers no longer classify a possibly-active v2 review as
   stale merely because its process-birth identity is missing or the native
   identity probe is indeterminate. A live PID now retains the one-active-run
@@ -210,12 +217,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including through nested `cfg_attr`. In native-only targets, associated binary
   exports with a transforming attribute bind their complete macro-visible member
   input, a separate normalized owner/ABI contract, and the revision-backed
-  transformer implementation. Native-producing `cdylib`/`staticlib`/`bin`
-  targets, including mixed `rlib + cdylib` targets, also retain typed potential
-  export evidence when a custom associated attribute can synthesize the export
-  itself. The speculative associated-macro fallback is limited to those native
-  artifacts, so an internal macro on a private owner in an `rlib`-only crate does
-  not manufacture API uncertainty. Conditional `macro_export`
+  transformer implementation. Native-producing
+  `dylib`/`cdylib`/`staticlib`/`bin` targets, including mixed `rlib + cdylib`
+  targets, also retain typed potential export evidence when a custom associated
+  attribute can synthesize the export itself. The speculative associated-macro
+  fallback is limited to those native artifacts, so an internal macro on a
+  private owner in an `rlib`-only crate does not manufacture API uncertainty.
+  Conditional `macro_export`
   declarations remain root API, while item-position macro invocations in both
   Rust-linkable and native-only targets bind their input to a revision-backed
   implementation substrate; native-only `include!` also retains its included
@@ -323,9 +331,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a crate-level break.
 - Public custom `cfg` predicates, including nested fields, variants, trait or
   impl members, and foreign items, bind revision-backed build-script and Cargo
-  config authority. Only a live declared/implicit build script or an effective
-  repository-root config that can actually supply `--cfg` qualifies; nested or
-  unrelated configs do not. Equal complete digests may neutralize; missing,
+  config authority. Only a live declared/implicit build script or effective
+  repository-backed config in the package's manifest-directory ancestor chain
+  that can actually supply `--cfg` qualifies; sibling and descendant configs
+  do not. Equal complete digests may neutralize; missing,
   invalid, included, or otherwise unresolved authority never does. Compiler-set
   `target_abi` remains a built-in predicate rather than custom cfg.
 - Trait-default comparison is structural and cfg-qualified. Adding a method or

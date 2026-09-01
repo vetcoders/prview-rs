@@ -4924,6 +4924,28 @@ mod tests {
                 })
         }));
 
+        let dylib_manifest = "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['dylib']\n";
+        let dylib_private_changed = repository_delta(&[
+            ("Cargo.toml", dylib_manifest, dylib_manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native(value: u8) {} } } struct Hidden; impl Hidden { export!(); }\n",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native(value: u16) {} } } struct Hidden; impl Hidden { export!(); }\n",
+            ),
+        ]);
+        assert!(
+            dylib_private_changed.unknown.iter().any(|finding| {
+                finding.identity.name == "MacroGeneratedItems"
+                    && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("native-export-associated-macro")
+                            && reason.contains("declarative-implementation-digest:sha256:")
+                    })
+            }),
+            "a dylib is both Rust-linkable and native-producing, so a private macro-generated export cannot disappear: {:?}",
+            dylib_private_changed.findings()
+        );
+
         let included_changed = repository_delta(&[
             ("Cargo.toml", manifest, manifest),
             ("Cargo.lock", lock, lock),
@@ -6846,6 +6868,214 @@ mod tests {
             root_cfg_authority.findings().is_empty(),
             "an unchanged effective root rustflags authority can neutralize: {:?}",
             root_cfg_authority.findings()
+        );
+
+        let nested_cfg_authority = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "api/.cargo/config.toml",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+            ),
+            (
+                "api/src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            nested_cfg_authority.findings().is_empty(),
+            "an unchanged config beside a reachable member is effective from that member invocation context: {:?}",
+            nested_cfg_authority.findings()
+        );
+
+        let ancestor_cfg_authority = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['crates/api']\nresolver='2'\n",
+                "[workspace]\nmembers=['crates/api']\nresolver='2'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "crates/api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "crates/.cargo/config.toml",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+            ),
+            (
+                "crates/api/src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            ancestor_cfg_authority.findings().is_empty(),
+            "a config in an intermediate manifest ancestor is effective: {:?}",
+            ancestor_cfg_authority.findings()
+        );
+
+        let sibling_cfg_is_ignored = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "other/.cargo/config.toml",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+            ),
+            (
+                "api/src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            sibling_cfg_is_ignored.unknown.iter().any(|finding| {
+                finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("cfg-authority-digest:unresolved:no-revision-backed-authority")
+                })
+            }),
+            "a sibling package config must not become authority for api: {:?}",
+            sibling_cfg_is_ignored.findings()
+        );
+
+        let changed_nested_cfg_authority = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "api/.cargo/config.toml",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+                "[build]\nrustflags=['--cfg','other_api']\n",
+            ),
+            (
+                "api/src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            changed_nested_cfg_authority
+                .unknown
+                .iter()
+                .any(|finding| finding
+                    .unknown_reason
+                    .as_deref()
+                    .is_some_and(|reason| { reason.contains("cfg-authority-digest:sha256:") })),
+            "a changed member-local cfg authority must not neutralize: {:?}",
+            changed_nested_cfg_authority.findings()
+        );
+
+        let nested_extensionless_precedence = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "api/.cargo/config",
+                "[net]\noffline=true\n",
+                "[net]\noffline=true\n",
+            ),
+            (
+                "api/.cargo/config.toml",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+                "[build]\nrustflags=['--cfg','public_api']\n",
+            ),
+            (
+                "api/src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            nested_extensionless_precedence
+                .unknown
+                .iter()
+                .any(|finding| {
+                    finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains(
+                            "cfg-authority-digest:unresolved:no-revision-backed-authority",
+                        )
+                    })
+                }),
+            "the legacy filename must win beside a member just as it does at the repository root: {:?}",
+            nested_extensionless_precedence.findings()
+        );
+
+        let incompatible_config_hierarchy = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+                "[workspace]\nmembers=['api']\nresolver='2'\n",
+            ),
+            ("Cargo.lock", lock, lock),
+            (
+                ".cargo/config.toml",
+                "[build]\nrustflags='--cfg root_api'\n",
+                "[build]\nrustflags='--cfg root_api'\n",
+            ),
+            (
+                "api/Cargo.toml",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "api/.cargo/config.toml",
+                "[build.rustflags]\nvalue='--cfg member_api'\n",
+                "[build.rustflags]\nvalue='--cfg member_api'\n",
+            ),
+            (
+                "api/src/lib.rs",
+                "#[cfg(public_api)] pub fn api() {}\n",
+                "#[cfg(public_api)] pub fn api() {}\n",
+            ),
+        ]);
+        assert!(
+            incompatible_config_hierarchy.unknown.iter().any(|finding| {
+                finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("unresolved:cargo-config:")
+                        && reason.contains("incompatible types")
+                })
+            }),
+            "an invalid Cargo merge must stay typed unresolved: {:?}",
+            incompatible_config_hierarchy.findings()
         );
 
         let target_cfg_rustflags = repository_delta(&[

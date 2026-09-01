@@ -701,9 +701,9 @@ impls, without pretending that their internal `pub` items are dependency API.
 Native export signatures are bound to local type semantics so an alias-only ABI
 change cannot neutralize as unchanged evidence. Direct and associated function
 bodies are excluded from native ABI evidence; static initializers remain part
-of the observable native contract. Native-producing targets
-(including a mixed `rlib + cdylib`) also retain typed potential-export evidence
-when a custom associated attribute or item-position macro can generate the
+of the observable native contract. Native-producing targets (including `dylib`
+and a mixed `rlib + cdylib`) also retain typed potential-export evidence when a
+custom associated attribute or item-position macro can generate the
 native symbol; an
 internal associated macro in an `rlib`-only private owner remains outside the
 external contract. Exported declarative macro contracts
@@ -754,14 +754,18 @@ local aggregate may over-report after an unrelated tracked-file edit. Custom
 cfg predicates bind revision-backed build-script or Cargo-config authority when
 present, including nested public contract positions. A declared build script
 must be a live revision file; `build = true` selects the default `build.rs` and
-`build = false` disables discovery. Only an effective repository-root config
-whose legal build/target rustflags or a concrete-target link-override rustc-cfg
-matching the package's `links` can define custom cfg qualifies. If both root
-config filenames exist, Cargo's extensionless `.cargo/config` precedence is
-preserved. The package must still own a live build script when it declares
-`package.links`.
-Child-process environment settings, nested configs, and lookalike keys in
-unrelated tables do not qualify. The conservative digest may likewise over-report, but a missing,
+`build = false` disables discovery. For each package, prview merges the
+repository-backed Cargo config visible from that manifest directory through
+its in-repository ancestors. This models the package's direct Cargo invocation
+context; a Cargo command launched only from the workspace root sees a narrower
+set, but prview cannot assume that is the only supported invocation. Legal
+build/target rustflags or a concrete-target link-override rustc-cfg matching the
+package's `links` can define custom cfg.
+Deeper values follow Cargo precedence, and an extensionless `.cargo/config`
+wins over `.cargo/config.toml` in the same directory. The package must still
+own a live build script when it declares `package.links`. Child-process
+environment settings and lookalike keys in unrelated tables do not qualify.
+The conservative digest may likewise over-report, but a missing,
 invalid, included, or otherwise unresolved authority proof never cancels merely
 because both sides have the same diagnostic text. Public trait method and
 associated-const defaults are directional and structural: adding a default is

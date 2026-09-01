@@ -1649,13 +1649,14 @@ initializers remain observable because they can determine exported data.
 For ordinary Cargo binaries this scan starts from every discovered binary root;
 internal `pub` items remain absent from the dependency API surface, while native
 export signatures retain typed uncertainty bound to their local type semantics.
-In a native-producing target, including mixed `rlib + cdylib`, an associated
-binary export carrying a transforming attribute binds the full macro-visible
-member input, a separate normalized owner/ABI contract, and the revision-backed
-transformer implementation. A custom associated attribute may synthesize the
-`no_mangle`/`export_name` attribute during expansion; for `cdylib`, `staticlib`,
-or `bin` output that possibility remains typed macro-generated native-export
-evidence even when no export marker exists in the pre-expansion AST.
+In a native-producing target, including `dylib` and mixed `rlib + cdylib`, an
+associated binary export carrying a transforming attribute binds the full
+macro-visible member input, a separate normalized owner/ABI contract, and the
+revision-backed transformer implementation. A custom associated attribute may
+synthesize the `no_mangle`/`export_name` attribute during expansion; for
+`dylib`, `cdylib`, `staticlib`, or `bin` output that possibility remains typed
+macro-generated native-export evidence even when no export marker exists in the
+pre-expansion AST.
 Item-position invocations backed by `macro_rules!`, plus `include!`,
 `global_asm!`, and other opaque macro invocations, are native-export boundaries
 when the crate produces one of those native artifacts, even when the target is
@@ -1771,16 +1772,20 @@ trait or impl member, or foreign item emits `CfgPredicate` evidence bound to a
 revision-backed authority digest whenever an active build script or repository
 Cargo config can supply `--cfg`. A declared build script must resolve to a live
 regular revision entry; Cargo's `build = true` explicitly selects the default
-`build.rs`, while `build = false` disables it. Only the effective
-repository-root Cargo config qualifies; when both names exist Cargo's legacy
-`.cargo/config` precedence over `.cargo/config.toml` is preserved. Authority is
+`build.rs`, while `build = false` disables it. For each package, the effective
+repository-backed Cargo config is merged from the repository root through the
+manifest directory, modeling a direct invocation from that package rather than
+assuming every consumer launches Cargo only at the workspace root. Deeper
+values follow Cargo precedence; when both names exist in one directory Cargo's
+legacy `.cargo/config` precedence over `.cargo/config.toml` is preserved.
+Authority is
 recognized only at legal schema paths (`build.rustflags`, target-specific
 `rustflags`, or a concrete-target link override's `rustc-cfg` when its key
 matches the package's `links`). Declaring `package.links` without a live build
-script is an invalid manifest, not a way to acquire config authority. Nested
-fixture/member configs and lookalike keys in unrelated sections such as `[net]`
-do not upgrade a proof. Config includes remain unresolved until their authority
-graph is source-backed. The current conservative digest covers the complete live
+script is an invalid manifest, not a way to acquire config authority. Configs
+outside the package's ancestor chain and lookalike keys in unrelated sections
+such as `[net]` do not upgrade a proof. Config includes remain unresolved until
+their authority graph is source-backed. The current conservative digest covers the complete live
 revision inventory, so it may over-report after an unrelated tracked edit; it
 never executes `build.rs`. With no complete revision-backed authority, the proof
 is explicitly unresolved and cannot neutralize against the same text on the
