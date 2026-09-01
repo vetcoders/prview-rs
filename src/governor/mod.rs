@@ -387,8 +387,8 @@ impl ResourceGovernor {
             drop(inflight);
             let external_birth_identity = crate::proc::report_external_child_group_started(pid);
             if crate::proc::terminate_process_tree(pid)
-                && let Ok(crate::proc::ExternalChildGroupStart::Mirrored(identity)) =
-                    external_birth_identity
+                && let Ok(start) = external_birth_identity
+                && let Some(identity) = start.into_mirrored_identity()
             {
                 crate::proc::report_external_child_group_finished(pid, &identity);
             }
@@ -399,13 +399,11 @@ impl ResourceGovernor {
         // the registration so the external hard fallback never sees a live
         // registry entry without its corresponding pid.
         let external_birth_identity = match crate::proc::report_external_child_group_started(pid) {
-            Ok(crate::proc::ExternalChildGroupStart::NotMirrored) => None,
-            Ok(crate::proc::ExternalChildGroupStart::Mirrored(identity)) => Some(identity),
-            // The direct owner still holds an unreaped child handle, so this PID
-            // cannot be reused. Keep the PGID cancellable until ordinary owned-
-            // tree cleanup even though the dead leader had no birth identity to
-            // mirror; the parent's provisional row covers the external fallback.
-            Ok(crate::proc::ExternalChildGroupStart::ExitedBeforeMirror) => None,
+            // Exited-before-mirror also maps to no durable identity. The direct
+            // owner still holds an unreaped child handle, so its PID cannot be
+            // reused and the PGID remains cancellable until owned-tree cleanup;
+            // the parent's provisional row covers the external fallback.
+            Ok(start) => start.into_mirrored_identity(),
             Err(error) => {
                 drop(inflight);
                 // The MCP parent cannot prove ownership without the mirror.

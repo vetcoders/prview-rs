@@ -48,8 +48,22 @@ struct ExternalChildGroupIdentity {
 
 pub(crate) enum ExternalChildGroupStart {
     NotMirrored,
+    #[cfg(unix)]
     Mirrored(String),
+    #[cfg(unix)]
     ExitedBeforeMirror,
+}
+
+impl ExternalChildGroupStart {
+    pub(crate) fn into_mirrored_identity(self) -> Option<String> {
+        match self {
+            Self::NotMirrored => None,
+            #[cfg(unix)]
+            Self::Mirrored(identity) => Some(identity),
+            #[cfg(unix)]
+            Self::ExitedBeforeMirror => None,
+        }
+    }
 }
 
 #[cfg(unix)]
