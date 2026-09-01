@@ -362,6 +362,21 @@ fn stderr_tail(run_dir: &Path) -> String {
     tail.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
+fn with_containment_status(mut error: ToolError, containment_confirmed: bool) -> ToolError {
+    if let Some(extra) = error.extra.as_object_mut() {
+        extra.insert(
+            "containment_confirmed".to_string(),
+            serde_json::Value::Bool(containment_confirmed),
+        );
+    }
+    if !containment_confirmed {
+        error
+            .message
+            .push_str("; process-tree containment could not be confirmed");
+    }
+    error
+}
+
 /// Close the complete quick-review process tree after Tokio can no longer wait
 /// for its direct root. The marker deliberately remains on disk: once the root
 /// is reaped, lifecycle readers classify it as diagnostic `Stale` state without
@@ -369,18 +384,28 @@ fn stderr_tail(run_dir: &Path) -> String {
 async fn quick_wait_failure(
     child: &mut tokio::process::Child,
     child_pid: Option<u32>,
+    child_groups: &mut crate::proc::ExternalChildGroupTracker,
     error: std::io::Error,
 ) -> ToolError {
-    let reaped =
-        crate::proc::terminate_and_reap_tokio_child(child, child_pid, Duration::from_secs(5)).await;
+    let reaped = crate::proc::terminate_supervised_tokio_child(
+        child,
+        child_pid,
+        child_groups,
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    )
+    .await;
     if !reaped {
         eprintln!(
             "prview MCP: quick wait failure could not confirm process-tree termination and direct-root reap"
         );
     }
-    ToolError::new(
-        error_class::RUN_FAILED,
-        format!("failed to wait on prview: {error}"),
+    with_containment_status(
+        ToolError::new(
+            error_class::RUN_FAILED,
+            format!("failed to wait on prview: {error}"),
+        ),
+        reaped,
     )
 }
 
@@ -446,10 +471,24 @@ pub async fn start(
             // grandchildren), not just the wrapper — kill_on_drop/start_kill reap
             // only the direct child (PR #12 review).
             crate::proc::harden(&mut cmd);
+            let child_group_owner = run_dir.parent().unwrap_or(&run_dir);
+            let child_group_setup =
+                crate::proc::ExternalChildGroupTracker::attach(&mut cmd, child_group_owner)
+                    .map_err(|error| {
+                        ToolError::new(
+                            error_class::RUN_FAILED,
+                            format!("failed to establish quick-review process ownership: {error}"),
+                        )
+                    })?;
 
             let mut child = cmd.spawn().map_err(|e| {
                 ToolError::new(error_class::RUN_FAILED, format!("spawn prview failed: {e}"))
             })?;
+            // Declared after `child` so cancellation drops the tracker first:
+            // it can stop and census the still-live review root before Tokio's
+            // kill-on-drop wrapper tears down only that outer group.
+            let mut child_groups = child_group_setup;
+            child_groups.child_spawned(child.id());
             // Capture the pid (also the pgid, since the child leads its group)
             // before the borrow in `child.wait()`; needed to signal the group.
             let child_pid = child.id();
@@ -466,33 +505,40 @@ pub async fn start(
                 }) {
                 Ok(marker) => marker,
                 Err(error) => {
-                    let _ = crate::proc::terminate_and_reap_tokio_child(
+                    let containment_confirmed = crate::proc::terminate_supervised_tokio_child(
                         &mut child,
                         child_pid,
+                        &mut child_groups,
+                        Duration::from_secs(2),
                         Duration::from_secs(5),
                     )
                     .await;
-                    return Err(error);
+                    return Err(with_containment_status(error, containment_confirmed));
                 }
             };
             if let Err(error) = write_marker(&run_dir, &marker) {
-                let _ = crate::proc::terminate_and_reap_tokio_child(
+                let containment_confirmed = crate::proc::terminate_supervised_tokio_child(
                     &mut child,
                     child_pid,
+                    &mut child_groups,
+                    Duration::from_secs(2),
                     Duration::from_secs(5),
                 )
                 .await;
-                return Err(error);
+                return Err(with_containment_status(error, containment_confirmed));
             }
 
             let budget = quick_budget();
             match tokio::time::timeout(budget, child.wait()).await {
                 Err(_) => {
-                    // Kill the whole group first so the check-tool grandchildren
-                    // die, then reap the direct child.
-                    let reaped = crate::proc::terminate_and_reap_tokio_child(
+                    // Ask prview's governor to drain its exact group registry;
+                    // the parent-owned copy remains the hard fallback if the
+                    // root cannot complete that cooperative unwind.
+                    let reaped = crate::proc::terminate_supervised_tokio_child(
                         &mut child,
                         child_pid,
+                        &mut child_groups,
+                        Duration::from_secs(2),
                         Duration::from_secs(5),
                     )
                     .await;
@@ -509,6 +555,7 @@ pub async fn start(
                             "base_used": selection.bases,
                             "base_fallback": selection.base_fallback,
                             "caveats": selection.caveats,
+                            "containment_confirmed": reaped,
                             "retry_hint": {
                                 "profile": "deep",
                                 "reason": "quick exceeded its synchronous budget"
@@ -516,8 +563,23 @@ pub async fn start(
                         }),
                     ))
                 }
-                Ok(Err(e)) => Err(quick_wait_failure(&mut child, child_pid, e).await),
+                Ok(Err(e)) => {
+                    Err(quick_wait_failure(&mut child, child_pid, &mut child_groups, e).await)
+                }
                 Ok(Ok(status)) => {
+                    child_groups.root_reaped();
+                    if !child_groups
+                        .finalize_after_root_exit(Duration::from_secs(5))
+                        .await
+                    {
+                        return Err(with_containment_status(
+                            ToolError::new(
+                                error_class::RUN_FAILED,
+                                "prview exited but separately-grouped tools could not be fully terminated",
+                            ),
+                            false,
+                        ));
+                    }
                     // A BLOCK verdict may exit non-zero and still be a valid
                     // review. The success oracle is therefore not exit zero,
                     // but it must be stronger than SANITY: exact durable index
@@ -792,6 +854,23 @@ mod tests {
     const REAPER_FIXTURE_ENV: &str = "PRVIEW_MCP_REAPER_TEST_SIGNAL";
     #[cfg(unix)]
     const REAPER_GRANDCHILD_PID_ENV: &str = "PRVIEW_MCP_REAPER_TEST_GRANDCHILD_PID";
+    #[cfg(unix)]
+    const QUICK_NESTED_GROUP_FIXTURE_ENV: &str = "PRVIEW_MCP_QUICK_NESTED_GROUP_DIR";
+    #[cfg(unix)]
+    const QUICK_PREEXEC_GAP_FIXTURE_ENV: &str = "PRVIEW_MCP_QUICK_PREEXEC_GAP_DIR";
+
+    #[test]
+    fn unconfirmed_containment_is_part_of_the_mcp_error_contract() {
+        let error = with_containment_status(
+            ToolError::new(error_class::RUN_FAILED, "injected failure"),
+            false,
+        );
+        assert_eq!(
+            error.extra["containment_confirmed"],
+            serde_json::json!(false)
+        );
+        assert!(error.message.contains("containment could not be confirmed"));
+    }
 
     /// Subprocess-only fixture. The parent test launches this exact test under
     /// the test binary, then releases it through a file barrier so marker and
@@ -822,6 +901,108 @@ mod tests {
             std::process::exit(17);
         }
         std::process::exit(18);
+    }
+
+    /// Subprocess-only fixture for the spawn/registration boundary a flat
+    /// process-group test cannot model. The review root stops after OS spawn but
+    /// before governor registration; the tool already leads a distinct group
+    /// and owns a grandchild.
+    #[cfg(unix)]
+    #[test]
+    fn quick_nested_group_child_fixture() {
+        let Some(dir) = std::env::var_os(QUICK_NESTED_GROUP_FIXTURE_ENV) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        // SAFETY: this exact-test subprocess is single-purpose. Ignoring SIGINT
+        // forces the parent through the hard fallback instead of letting the
+        // fixture exit through the cooperative-success arm.
+        unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+        let grandchild_path = dir.join("grandchild.pid");
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "set -eu; test -z \"${PRVIEW_INTERNAL_CHILD_GROUP_FD+x}\"; test -z \"${PRVIEW_INTERNAL_CHILD_GROUP_TOKEN+x}\"; sleep 30 & printf '%s\n' \"$!\" > \"$PRVIEW_MCP_NESTED_GRANDCHILD\"; wait",
+            ])
+            .env("PRVIEW_MCP_NESTED_GRANDCHILD", &grandchild_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::proc::harden_std(&mut command);
+        let mut tool = command
+            .spawn()
+            .expect("spawn separately-grouped tool fixture");
+        let tool_pid = tool.id();
+        std::fs::write(dir.join("root.pid"), std::process::id().to_string()).unwrap();
+        std::fs::write(dir.join("tool.pid"), tool_pid.to_string()).unwrap();
+        // SAFETY: stop only this dedicated fixture root. The parent must close
+        // containment while governor registration has provably not happened.
+        unsafe { libc::raise(libc::SIGSTOP) };
+        let _ = tool.kill();
+        let _ = tool.wait();
+        panic!("spawn-gap fixture was unexpectedly resumed");
+    }
+
+    /// Subprocess-only fixture for a fork that has entered its dedicated group
+    /// but is stopped before the provisional sidecar write. `Command::spawn`
+    /// in this review root therefore remains blocked on Rust's exec handshake.
+    #[cfg(unix)]
+    #[test]
+    fn quick_preexec_gap_child_fixture() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let Some(dir) = std::env::var_os(QUICK_PREEXEC_GAP_FIXTURE_ENV) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        // SAFETY: single-purpose fixture; force the parent into hard fallback.
+        unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+        let pid_file =
+            std::fs::File::create(dir.join("preexec-tool.pid")).expect("create pre-exec pid file");
+        let pid_fd = pid_file.as_raw_fd();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        // Registered before `harden_std`, so this closure stops the child before
+        // hardening's provisional ledger write. Only async-signal-safe syscalls
+        // run between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let pid = libc::getpid() as u32;
+                let mut row = [0_u8; 12];
+                let mut digits = [0_u8; 10];
+                let mut value = pid;
+                let mut count = 0;
+                loop {
+                    digits[count] = b'0' + (value % 10) as u8;
+                    count += 1;
+                    value /= 10;
+                    if value == 0 {
+                        break;
+                    }
+                }
+                for index in 0..count {
+                    row[index] = digits[count - index - 1];
+                }
+                row[count] = b'\n';
+                if libc::write(pid_fd, row.as_ptr().cast(), count + 1) != (count + 1) as isize {
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                }
+                if libc::raise(libc::SIGSTOP) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        crate::proc::harden_std(&mut command);
+        if let Ok(mut tool) = command.spawn() {
+            let _ = tool.kill();
+            let _ = tool.wait();
+        }
+        panic!("pre-exec gap fixture was unexpectedly released");
     }
 
     fn spawn_reaper_fixture(signal: &Path) -> OwnedDetachedChild {
@@ -1115,7 +1296,12 @@ mod tests {
             ),
         ]);
         crate::proc::harden(&mut command);
+        let child_group_setup =
+            crate::proc::ExternalChildGroupTracker::attach(&mut command, fixture.path())
+                .expect("attach quick child-group tracker");
         let mut child = command.spawn().expect("spawn hardened quick-review tree");
+        let mut child_groups = child_group_setup;
+        child_groups.child_spawned(child.id());
         let child_pid = child.id();
         let marker = running_marker(
             child_pid.expect("quick fixture root pid"),
@@ -1148,6 +1334,7 @@ mod tests {
         let error = quick_wait_failure(
             &mut child,
             child_pid,
+            &mut child_groups,
             std::io::Error::other("injected quick wait failure"),
         )
         .await;
@@ -1168,6 +1355,237 @@ mod tests {
             active_run(repo_name, branch_key),
             None,
             "a reaped wait-error run must not block the next review"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_timeout_closes_spawn_before_registration_gap() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "mcp::run::tests::quick_nested_group_child_fixture",
+                "--nocapture",
+            ])
+            .env(QUICK_NESTED_GROUP_FIXTURE_ENV, fixture.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::proc::harden(&mut command);
+        let child_group_setup =
+            crate::proc::ExternalChildGroupTracker::attach(&mut command, fixture.path())
+                .expect("attach quick child-group tracker");
+        let mut child = command.spawn().expect("spawn quick review fixture");
+        let mut child_groups = child_group_setup;
+        child_groups.child_spawned(child.id());
+        let root_pid = child.id().expect("quick fixture root pid");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let read_pid = |name: &str| loop {
+            if let Ok(text) = std::fs::read_to_string(fixture.path().join(name))
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "quick nested-group fixture never published {name}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let reported_root = read_pid("root.pid");
+        let tool_pid = read_pid("tool.pid");
+        let grandchild_pid = read_pid("grandchild.pid");
+        assert_eq!(reported_root, root_pid);
+
+        // SAFETY: these are live fixture pids; getpgid is a read-only identity
+        // probe and a negative result fails the assertions below.
+        let root_pgid = unsafe { libc::getpgid(root_pid as i32) };
+        // SAFETY: same bounded fixture identity probe.
+        let tool_pgid = unsafe { libc::getpgid(tool_pid as i32) };
+        assert_eq!(root_pgid, root_pid as i32);
+        assert_eq!(tool_pgid, tool_pid as i32);
+        assert_ne!(root_pgid, tool_pgid, "the test must contain nested PGIDs");
+        assert!(crate::storage::is_process_alive(grandchild_pid));
+        let sidecar = std::fs::read_dir(fixture.path())
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".mcp-child-groups-")
+            })
+            .expect("quick-review ownership sidecar");
+        let sidecar_text = std::fs::read_to_string(sidecar.path()).unwrap();
+        let expected_provisional = format!("?{tool_pid}");
+        assert!(
+            sidecar_text
+                .lines()
+                .any(|line| line == expected_provisional),
+            "tool must publish its pre-exec provisional row before governor registration"
+        );
+
+        assert!(
+            crate::proc::terminate_supervised_tokio_child(
+                &mut child,
+                Some(root_pid),
+                &mut child_groups,
+                Duration::from_millis(50),
+                Duration::from_secs(2),
+            )
+            .await,
+            "MCP cleanup must own a tool group even before governor registration"
+        );
+        wait_until_process_is_reaped(root_pid);
+        wait_until_process_is_reaped(tool_pid);
+        wait_until_process_is_reaped(grandchild_pid);
+        drop(child_groups);
+        assert!(
+            std::fs::read_dir(fixture.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".mcp-child-groups-")),
+            "quick-review ownership sidecar must be removed after cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_quick_tracker_closes_nested_group_and_sidecar() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "mcp::run::tests::quick_nested_group_child_fixture",
+                "--nocapture",
+            ])
+            .env(QUICK_NESTED_GROUP_FIXTURE_ENV, fixture.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::proc::harden(&mut command);
+        let tracker_setup =
+            crate::proc::ExternalChildGroupTracker::attach(&mut command, fixture.path())
+                .expect("attach drop-path child-group tracker");
+        let mut child = command.spawn().expect("spawn drop-path review fixture");
+        let mut child_groups = tracker_setup;
+        child_groups.child_spawned(child.id());
+        let root_pid = child.id().expect("drop-path root pid");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let read_pid = |name: &str| loop {
+            if let Ok(text) = std::fs::read_to_string(fixture.path().join(name))
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drop-path fixture never published {name}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let tool_pid = read_pid("tool.pid");
+        let grandchild_pid = read_pid("grandchild.pid");
+        let sidecar = std::fs::read_dir(fixture.path())
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".mcp-child-groups-")
+            })
+            .expect("drop-path ownership sidecar")
+            .path();
+
+        drop(child_groups);
+        let _ = child.wait().await;
+        wait_until_process_is_reaped(root_pid);
+        wait_until_process_is_reaped(tool_pid);
+        wait_until_process_is_reaped(grandchild_pid);
+        assert!(
+            !sidecar.exists(),
+            "confirmed tracker Drop removes its ownership sidecar"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_timeout_waits_for_a_child_stopped_before_provisional_write() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "mcp::run::tests::quick_preexec_gap_child_fixture",
+                "--nocapture",
+            ])
+            .env(QUICK_PREEXEC_GAP_FIXTURE_ENV, fixture.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::proc::harden(&mut command);
+        let tracker_setup =
+            crate::proc::ExternalChildGroupTracker::attach(&mut command, fixture.path())
+                .expect("attach quick child-group tracker");
+        let mut child = command.spawn().expect("spawn pre-exec-gap review root");
+        let mut child_groups = tracker_setup;
+        child_groups.child_spawned(child.id());
+        let root_pid = child.id().expect("pre-exec-gap root pid");
+
+        let pidfile = fixture.path().join("preexec-tool.pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let tool_pid = loop {
+            if let Some(pids) = crate::proc::read_published_unix_pids(&pidfile, 1) {
+                break pids[0] as u32;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pre-exec child never published its pid"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let sidecar = std::fs::read_dir(fixture.path())
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".mcp-child-groups-")
+            })
+            .expect("quick-review ownership sidecar");
+        let unexpected_provisional = format!("?{tool_pid}");
+        assert!(
+            !std::fs::read_to_string(sidecar.path())
+                .unwrap()
+                .lines()
+                .any(|line| line == unexpected_provisional),
+            "fixture must remain before provisional registration"
+        );
+
+        assert!(
+            crate::proc::terminate_supervised_tokio_child(
+                &mut child,
+                Some(root_pid),
+                &mut child_groups,
+                Duration::from_millis(50),
+                Duration::from_secs(2),
+            )
+            .await,
+            "stopped-root census must own a child blocked before registration"
+        );
+        wait_until_process_is_reaped(root_pid);
+        wait_until_process_is_reaped(tool_pid);
+        drop(child_groups);
+        assert!(
+            !sidecar.path().exists(),
+            "confirmed cleanup removes its private ownership sidecar"
         );
     }
 
@@ -1447,6 +1865,7 @@ mod tests {
         assert_eq!(err.class, error_class::STORAGE_CORRUPT);
     }
 
-    // The quick-timeout tree kill uses crate::proc::terminate_process_tree,
-    // proven canonically on Unix and by a real Windows-only descendant test.
+    // Quick-timeout containment is exercised above with distinct Unix process
+    // groups; Windows recursive tree termination has its own real descendant
+    // test in `proc`.
 }

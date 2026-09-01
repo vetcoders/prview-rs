@@ -129,16 +129,39 @@ Generate a review pack.
 | `profile` | no | `"quick"` (default) or `"deep"`. An unknown value is a fail-loud `run_failed`. |
 
 **`quick` is synchronous.** It blocks until the pack is written, under a hard
-**120-second budget**. Exceeding the budget kills the whole review process tree
-and returns `run_timeout` with `retry_hint.profile: "deep"`. Success is defined
+**120-second budget**. Exceeding the budget runs bounded whole-tree containment
+and returns `run_timeout` with `retry_hint.profile: "deep"` plus
+`containment_confirmed`. Success is defined
 by a finalized pack plus its exact durable run-id/path index row, not by the
 child's exit code (prview exits non-zero on a `BLOCK` verdict, yet the run is a
 valid completed review). Response:
 
 If the synchronous child wait itself fails, the server routes it through the
-same bounded whole-tree termination and direct-root reap before returning
-`run_failed`. Its `RUNNING.json` remains as diagnostic `Stale` state after the
-root is reaped and does not block a later review.
+same bounded containment and direct-root reap before returning `run_failed`.
+On Unix, timeout and wait-error cleanup first sends Ctrl-C to let the review's
+governor drain its exact child registry. A private parent-owned sidecar mirrors
+each separately-grouped tool PID together with its native process-birth
+identity, so the MCP server can still terminate the exact owned groups before
+killing the root when cooperative unwind does not complete. To close the window
+before that full registration, each fork writes a provisional PGID in
+`pre_exec`; the inherited mode-0600 ledger remains locked until the review root
+and every in-flight pre-exec copy have closed it. The descriptor stays CLOEXEC
+in the multi-threaded MCP parent, is made inheritable only in the already-forked
+review root, and is restored to CLOEXEC before repository discovery or startup
+helpers. For hard fallback, the parent sends `SIGSTOP`,
+accepts a local process-table census only after the same snapshot reports the
+root stopped, and signals only direct hardened child groups or committed identities.
+A provisional PID is never signal authority by itself. The parent then kills
+and reaps the root, acquires the ledger lock, and accepts the final drain. The
+sidecar lives beside, never inside, the immutable run directory. Confirmed
+cleanup removes it; unconfirmed cleanup retains it and returns
+`containment_confirmed: false` instead of claiming success. Hardened tool
+children receive neither capability env nor ledger descriptor after exec;
+their descendants are already contained by the one tool group. This is
+required because one Unix process group cannot contain another. Windows uses
+recursive process-tree termination. The run's `RUNNING.json` remains as
+diagnostic `Stale` state after the root is reaped and does not block a later
+review.
 
 Completion requires durable publication into prview's run index. If the index
 is unreadable or the finished pack cannot be committed to discoverable history,
@@ -462,7 +485,7 @@ fields (e.g. `retry_after_ms`, `active_run_id`, `run_id`).
 | `repo_not_found` | The `repo` path does not exist. |
 | `not_a_git_repo` | The path exists but is not a readable git repository. |
 | `run_failed` | The review process failed to produce a completed pack (or an unknown `profile` was requested). |
-| `run_timeout` | A `quick` review exceeded the 120s budget. Carries `run_id` and `retry_hint.profile: "deep"`. |
+| `run_timeout` | A `quick` review exceeded the 120s budget. Carries `run_id`, `containment_confirmed`, and `retry_hint.profile: "deep"`. |
 | `run_not_found` | No run matches the given `run_id` / HEAD; call `run_review`. |
 | `artifact_missing` | The requested artifact does not exist within the run, is not UTF-8 text, or would escape the run directory. |
 | `tool_missing` | A required external tool is unavailable. |

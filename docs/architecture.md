@@ -1306,6 +1306,32 @@ returned guard unregisters on drop, so the success, timeout and error paths all
 leave the registry clean — a pid the governor still believes in is a pid it may
 signal, and pids are reused.
 
+An MCP `quick` review adds one cross-process ownership boundary around that
+in-process registry. The adapter cannot treat the review root's Unix process
+group as a recursive tree: checks intentionally lead distinct groups. It sends
+Ctrl-C first so the review governor performs its normal drain, while a private
+sidecar ledger mirrors group registration and completion to the MCP parent. A
+nonce-bound header rejects an incomplete or stale capability. The forked child
+first writes a provisional PGID in `pre_exec`, before it can run the tool;
+governor registration then upgrades that evidence with the native process-birth
+identity. The mode-0600 ledger descriptor remains CLOEXEC in the multi-threaded
+MCP parent, becomes inheritable only inside the already-forked review root, and
+is restored to CLOEXEC before repository discovery or startup helpers. It stays exclusively
+locked by the review root and any fork still in pre-exec. Hard fallback stops
+the root and accepts a finite local process-table census only when that same
+snapshot reports the root in stopped state. Only process groups led by proven
+direct children and committed native identities may be signalled; a provisional
+PID never authorizes a signal by itself. After killing and reaping the root, the
+MCP parent must acquire the lock before its final drain, so a child cannot
+disappear into the spawn-before-registration gap. The descriptor closes at
+tool exec, while every descendant is already contained by its tool group. The
+sidecar is a control file beside the run directory, never an input to its
+immutable manifest or ZIP. If the bounded unwind stalls, the parent terminates
+every still-owned group before killing and reaping the direct review root;
+tracker Drop repeats that cleanup. Confirmed cleanup unlinks the sidecar;
+unconfirmed containment retains it and is surfaced in the MCP error contract.
+Windows keeps native recursive `taskkill /T` and needs no mirror.
+
 **`--watch` ends on the first interrupt.** One `App`, and therefore one governor,
 is shared by every iteration, and `Semaphore::close` is one-way — so a cancelled
 watcher can never grant work again. The iteration used to report any failure of
@@ -1365,10 +1391,11 @@ every response carries `schema_version`, and every failure is fail-loud. See
 `docs/mcp.md` for the tool reference.
 
 Synchronous quick reviews retain their hardened child through the bounded wait.
-A timeout or child-wait error routes through bounded whole-tree termination and
-direct-root reap before the RPC returns. Failed quick runs retain `RUNNING.json`
-as diagnostic `Stale` state, which lifecycle readers do not treat as an active
-run.
+A timeout or child-wait error first requests the root's ordinary cancellation
+unwind, then uses the parent-owned child-group sidecar described above before
+hard-killing and reaping the direct root. Failed quick runs retain
+`RUNNING.json` as diagnostic `Stale` state, which lifecycle readers do not treat
+as an active run.
 
 Deep reviews are asynchronous at the RPC boundary, not unowned processes. A
 dedicated waiter thread retains each `Child` and reaps its direct root, including

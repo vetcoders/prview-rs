@@ -762,6 +762,11 @@ impl Config {
 
     /// Create Config from CLI arguments
     pub fn from_cli(cli: &Cli) -> Result<Self> {
+        // An MCP quick-review root inherits one locked ownership descriptor.
+        // Adopt it before repository discovery or any startup Git/GitHub probe;
+        // adoption restores CLOEXEC and closes the root-side handoff window.
+        crate::proc::initialize_external_child_group_capability()
+            .context("failed to initialize parent-owned child-group capability")?;
         let repo_root = find_repo_root()?;
         let manifest = PrviewManifest::load_from(&repo_root);
 

@@ -37,9 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. Direct or internal config construction under a run scope no longer
   mislabels cancellation as a missing GitHub CLI.
 - MCP quick reviews route Tokio child-wait errors through the same bounded
-  whole-tree termination and direct-root reap used for timeouts. Their running
-  marker remains as non-blocking diagnostic stale state instead of substituting
-  stale-marker expiry for explicit cleanup before the next review.
+  containment and direct-root reap used for timeouts. On Unix the adapter first
+  requests cooperative Ctrl-C, then uses a parent-owned, incarnation-bound
+  sidecar ledger to reach every separately-grouped tool if the review root
+  cannot unwind. A pre-exec provisional row, stopped-root descendant census,
+  and inherited ledger-lock barrier close the spawn-before-registration gap;
+  a provisional PID is never trusted as signal authority by itself. The ledger
+  FD stays CLOEXEC in the MCP parent and is handed off only inside the forked
+  review root. Killing the root process group alone cannot contain nested Cargo
+  or Semgrep groups. The mode-0600 sidecar lives outside the immutable pack;
+  confirmed cleanup removes it, while an unconfirmed cleanup retains it and
+  returns `containment_confirmed: false`. Running markers remain non-blocking
+  diagnostic stale state instead of substituting stale-marker expiry for
+  explicit cleanup.
 - MCP active-run discovery filters markerless history and the completed-run
   `latest` alias before lifecycle probing. Runs without `SANITY.json` no longer
   reload the global publication index while they are polled, while completed

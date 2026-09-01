@@ -205,15 +205,21 @@ impl GovernorPermit {
 }
 
 /// The run's single budget, plus the registry of processes spawned under it.
+struct InflightChild {
+    pid: u32,
+    external_birth_identity: Option<String>,
+}
+
 pub struct ResourceGovernor {
     semaphore: Arc<Semaphore>,
     total_budget: u32,
     heavy_cost: u32,
     plan: ResourcePlan,
-    /// Live children, keyed by a caller-chosen label. The value is the pid,
-    /// which is also the pgid — every child prview spawns leads its own group
-    /// (see [`crate::proc::harden`]), so one signal reaches its grandchildren.
-    inflight: Mutex<HashMap<String, u32>>,
+    /// Live children, keyed by a caller-chosen label. Every child pid is also
+    /// its pgid — each child prview spawns leads its own group (see
+    /// [`crate::proc::harden`]), so one signal reaches its grandchildren. MCP
+    /// quick reviews additionally retain the external incarnation identity.
+    inflight: Mutex<HashMap<String, InflightChild>>,
     cancelled: Arc<AtomicBool>,
     /// Cancellation as something a dispatcher loop can `select!` on. The atomic
     /// answers the cheap question ("is it over?"); this answers the blocking one
@@ -351,17 +357,51 @@ impl ResourceGovernor {
         let mut inflight = self.lock_inflight();
         if self.cancelled.load(Ordering::SeqCst) {
             drop(inflight);
-            crate::proc::terminate_process_tree(pid);
+            let external_birth_identity = crate::proc::report_external_child_group_started(pid);
+            if crate::proc::terminate_process_tree(pid)
+                && let Ok(Some(identity)) = external_birth_identity
+            {
+                crate::proc::report_external_child_group_finished(pid, &identity);
+            }
             return false;
         }
-        inflight.insert(key.into(), pid);
+        // An MCP quick-review parent cannot discover this separately-grouped
+        // tool after killing the review root. Report ownership before exposing
+        // the registration so the external hard fallback never sees a live
+        // registry entry without its corresponding pid.
+        let external_birth_identity = match crate::proc::report_external_child_group_started(pid) {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(inflight);
+                // The MCP parent cannot prove ownership without the mirror.
+                // Fail closed by cancelling the run before refusing this child.
+                eprintln!(
+                    "prview: failed to register child group {pid} with its external owner: {error}"
+                );
+                self.cancel();
+                crate::proc::terminate_process_tree(pid);
+                return false;
+            }
+        };
+        inflight.insert(
+            key.into(),
+            InflightChild {
+                pid,
+                external_birth_identity,
+            },
+        );
         true
     }
 
     /// Forget a child that has exited. A pid the governor still believes in is a
     /// pid it may signal, and pids are reused.
     pub fn unregister_child(&self, key: &str) {
-        self.lock_inflight().remove(key);
+        let child = self.lock_inflight().remove(key);
+        if let Some(child) = child
+            && let Some(identity) = child.external_birth_identity.as_deref()
+        {
+            crate::proc::report_external_child_group_finished(child.pid, identity);
+        }
     }
 
     /// How many children the governor currently believes are alive.
@@ -388,8 +428,12 @@ impl ResourceGovernor {
         self.cancel_tx.send_replace(true);
 
         let children = std::mem::take(&mut *self.lock_inflight());
-        for pid in children.into_values() {
-            crate::proc::terminate_process_tree(pid);
+        for child in children.into_values() {
+            if crate::proc::terminate_process_tree(child.pid)
+                && let Some(identity) = child.external_birth_identity.as_deref()
+            {
+                crate::proc::report_external_child_group_finished(child.pid, identity);
+            }
         }
     }
 
@@ -436,7 +480,7 @@ impl ResourceGovernor {
 
     /// The registry, recovering from a poisoned lock rather than propagating it:
     /// a panicking task must not turn the run's kill-switch into an error.
-    fn lock_inflight(&self) -> std::sync::MutexGuard<'_, HashMap<String, u32>> {
+    fn lock_inflight(&self) -> std::sync::MutexGuard<'_, HashMap<String, InflightChild>> {
         self.inflight.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }

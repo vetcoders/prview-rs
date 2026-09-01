@@ -20,6 +20,722 @@ use tokio::process::Command as TokioCommand;
 
 const OWNED_DIRECT_ROOT_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(unix)]
+const EXTERNAL_CHILD_GROUP_TOKEN_ENV: &str = "PRVIEW_INTERNAL_CHILD_GROUP_TOKEN";
+#[cfg(unix)]
+const EXTERNAL_CHILD_GROUP_FD_ENV: &str = "PRVIEW_INTERNAL_CHILD_GROUP_FD";
+#[cfg(unix)]
+const EXTERNAL_CHILD_GROUP_HEADER: &str = "prview-child-groups-v1";
+
+#[cfg(unix)]
+struct ExternalChildGroupWriter {
+    file: std::sync::Mutex<std::fs::File>,
+}
+
+#[cfg(unix)]
+enum ExternalChildGroupWriterState {
+    Disabled,
+    Ready(ExternalChildGroupWriter),
+    Broken(String),
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ExternalChildGroupIdentity {
+    pid: u32,
+    birth_identity: String,
+}
+
+#[cfg(unix)]
+static EXTERNAL_CHILD_GROUP_WRITER: std::sync::OnceLock<ExternalChildGroupWriterState> =
+    std::sync::OnceLock::new();
+#[cfg(unix)]
+static EXTERNAL_CHILD_GROUP_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(unix)]
+static PROCESS_TABLE_CAPTURE_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(unix)]
+const PROCESS_TABLE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(unix)]
+static PROCESS_TABLE_REAPER_QUARANTINE: std::sync::OnceLock<
+    std::sync::Mutex<Vec<std::process::Child>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+fn external_child_group_writer() -> std::io::Result<Option<&'static ExternalChildGroupWriter>> {
+    use std::io::{Read as _, Seek as _};
+
+    let state = EXTERNAL_CHILD_GROUP_WRITER.get_or_init(|| {
+        let (token, ledger_fd) = match (
+            std::env::var(EXTERNAL_CHILD_GROUP_TOKEN_ENV).ok(),
+            std::env::var(EXTERNAL_CHILD_GROUP_FD_ENV).ok(),
+        ) {
+            (None, None) => return ExternalChildGroupWriterState::Disabled,
+            (Some(token), Some(ledger_fd)) => (token, ledger_fd),
+            _ => {
+                return ExternalChildGroupWriterState::Broken(
+                    "incomplete parent-owned child-group capability".to_string(),
+                );
+            }
+        };
+        let open = || -> std::io::Result<ExternalChildGroupWriter> {
+            use std::os::fd::FromRawFd as _;
+
+            let ledger_fd = ledger_fd.parse::<libc::c_int>().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid child-group ledger descriptor",
+                )
+            })?;
+            validate_external_child_group_fd(ledger_fd)?;
+            set_close_on_exec(ledger_fd)?;
+            // SAFETY: the MCP parent transfers one inherited, locked ledger
+            // descriptor to the quick-review root. This process is its sole
+            // Rust owner after the parent closes its copy post-spawn.
+            let mut file = unsafe { std::fs::File::from_raw_fd(ledger_fd) };
+            let expected = format!("{EXTERNAL_CHILD_GROUP_HEADER} {token}\n");
+            file.seek(std::io::SeekFrom::Start(0))?;
+            let mut header = vec![0_u8; expected.len()];
+            file.read_exact(&mut header)?;
+            if header != expected.as_bytes() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "parent-owned child-group ledger header mismatch",
+                ));
+            }
+            Ok(ExternalChildGroupWriter {
+                file: std::sync::Mutex::new(file),
+            })
+        };
+        match open() {
+            Ok(writer) => ExternalChildGroupWriterState::Ready(writer),
+            Err(error) => ExternalChildGroupWriterState::Broken(error.to_string()),
+        }
+    });
+    match state {
+        ExternalChildGroupWriterState::Disabled => Ok(None),
+        ExternalChildGroupWriterState::Ready(writer) => Ok(Some(writer)),
+        ExternalChildGroupWriterState::Broken(error) => Err(std::io::Error::other(error.clone())),
+    }
+}
+
+/// Validate and adopt an MCP parent's child-group capability before this
+/// process can launch any startup helper. The inherited descriptor is made
+/// close-on-exec by `external_child_group_writer`, so later un-hardened probes
+/// cannot accidentally extend the parent's spawn barrier.
+pub(crate) fn initialize_external_child_group_capability() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = external_child_group_writer()?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_close_on_exec(fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: fcntl reads and updates descriptor flags for an owned, non-negative
+    // descriptor. No pointer or borrowed memory crosses the syscall boundary.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: same descriptor and integer-only flag update as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_external_child_group_fd(fd: libc::c_int) -> std::io::Result<()> {
+    if fd <= libc::STDERR_FILENO {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "child-group ledger aliases a standard descriptor",
+        ));
+    }
+    // SAFETY: `stat` is valid writable storage and fstat only inspects `fd`.
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd, &mut stat) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "child-group ledger descriptor is not a regular file",
+        ));
+    }
+    // SAFETY: integer-only descriptor flag query for the validated pipe.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let access_mode = flags & libc::O_ACCMODE;
+    if !matches!(access_mode, libc::O_WRONLY | libc::O_RDWR) || flags & libc::O_APPEND == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "child-group ledger descriptor is not appendable",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn clear_close_on_exec(fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: fcntl reads and updates descriptor flags for an owned descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: integer-only descriptor flag update for the same descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn lock_external_child_group_ledger(fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: flock operates on the owned regular-file descriptor only.
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn try_lock_external_child_group_ledger(fd: libc::c_int) -> std::io::Result<bool> {
+    // SAFETY: same non-blocking advisory-lock operation as above.
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+    ) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn external_child_group_pre_exec_fd() -> std::io::Result<Option<libc::c_int>> {
+    use std::os::fd::AsRawFd as _;
+
+    Ok(external_child_group_writer()?.map(|writer| {
+        writer
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_raw_fd()
+    }))
+}
+
+/// Async-signal-safe provisional registration for the forked child. It runs
+/// after the child has entered its dedicated process group and before `exec`.
+#[cfg(unix)]
+fn write_external_child_group_provisional(fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: setpgid(0, 0) moves only this pre-exec child into the group whose
+    // id is its own pid. Repeating CommandExt::process_group(0) is idempotent and
+    // makes the registration ordering explicit rather than stdlib-dependent.
+    if unsafe { libc::setpgid(0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // A decimal u32 plus the event byte and newline fits comfortably.
+    let mut row = [0_u8; 16];
+    row[0] = b'?';
+    // SAFETY: getpid has no arguments or memory effects visible to Rust.
+    let pid = unsafe { libc::getpid() as u32 };
+    let mut digits = [0_u8; 10];
+    let mut value = pid;
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for index in 0..count {
+        row[1 + index] = digits[count - index - 1];
+    }
+    row[1 + count] = b'\n';
+    let length = count + 2;
+    // SAFETY: `row[..length]` is initialized stack memory and `fd` is the
+    // inherited O_APPEND ledger descriptor. One write keeps the provisional
+    // record contiguous with concurrent registrations.
+    let written = unsafe { libc::write(fd, row.as_ptr().cast(), length) };
+    if written == length as isize {
+        Ok(())
+    } else if written == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
+    }
+}
+
+#[cfg(unix)]
+fn report_external_child_group(
+    writer: &ExternalChildGroupWriter,
+    event: char,
+    pid: u32,
+    birth_identity: &str,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = writer
+        .file
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let row = format!("{event}{pid}\t{birth_identity}\n");
+    file.write_all(row.as_bytes())
+}
+
+pub(crate) fn report_external_child_group_started(pid: u32) -> std::io::Result<Option<String>> {
+    #[cfg(unix)]
+    {
+        let Some(writer) = external_child_group_writer()? else {
+            return Ok(None);
+        };
+        let birth_identity = crate::storage::process_birth_identity(pid)?;
+        report_external_child_group(writer, '+', pid, &birth_identity)?;
+        Ok(Some(birth_identity))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Ok(None)
+    }
+}
+
+pub(crate) fn report_external_child_group_finished(pid: u32, birth_identity: &str) {
+    #[cfg(unix)]
+    {
+        let result = external_child_group_writer().and_then(|writer| {
+            let Some(writer) = writer else {
+                return Ok(());
+            };
+            report_external_child_group(writer, '-', pid, birth_identity)
+        });
+        if let Err(error) = result {
+            eprintln!("prview: failed to update the parent-owned child-group registry: {error}");
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, birth_identity);
+    }
+}
+
+/// Parent-side mirror of the separately-grouped tools owned by an MCP quick
+/// review. Windows already has recursive `taskkill /T`; Unix needs this explicit
+/// registry because a process group does not contain another process group.
+pub(crate) struct ExternalChildGroupTracker {
+    root_pid: Option<u32>,
+    #[cfg(unix)]
+    path: std::path::PathBuf,
+    #[cfg(unix)]
+    reader: std::fs::File,
+    #[cfg(unix)]
+    pending: Vec<u8>,
+    #[cfg(unix)]
+    active: std::collections::BTreeMap<ExternalChildGroupIdentity, usize>,
+    #[cfg(unix)]
+    settled_by_parent: std::collections::BTreeMap<ExternalChildGroupIdentity, usize>,
+    #[cfg(unix)]
+    provisional: std::collections::BTreeMap<u32, usize>,
+    #[cfg(unix)]
+    settled_provisional: std::collections::BTreeMap<u32, usize>,
+    #[cfg(unix)]
+    proven_terminated_groups: std::collections::BTreeSet<u32>,
+    #[cfg(unix)]
+    ledger_writer: Option<std::fs::File>,
+}
+
+impl ExternalChildGroupTracker {
+    pub(crate) fn attach(
+        cmd: &mut TokioCommand,
+        owner_dir: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::io::{Seek as _, Write as _};
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let sequence =
+                EXTERNAL_CHILD_GROUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let token = format!("{}-{nonce}-{sequence}", std::process::id());
+            let path = owner_dir.join(format!(".mcp-child-groups-{token}"));
+            let header = format!("{EXTERNAL_CHILD_GROUP_HEADER} {token}\n");
+            let mut writer = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            if let Err(error) = writer
+                .write_all(header.as_bytes())
+                .and_then(|()| writer.sync_data())
+            {
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+            if let Err(error) = set_close_on_exec(writer.as_raw_fd())
+                .and_then(|()| lock_external_child_group_ledger(writer.as_raw_fd()))
+            {
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+
+            let mut reader = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(reader) => reader,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = reader.seek(std::io::SeekFrom::Start(header.len() as u64)) {
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+            if let Err(error) = set_close_on_exec(reader.as_raw_fd()) {
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+            let writer_fd = writer.as_raw_fd();
+            cmd.env(EXTERNAL_CHILD_GROUP_TOKEN_ENV, &token)
+                .env(EXTERNAL_CHILD_GROUP_FD_ENV, writer_fd.to_string());
+            // Keep the descriptor CLOEXEC in the multi-threaded MCP parent.
+            // Only the already-forked review root may clear the bit immediately
+            // before its exec; unrelated concurrent spawns can never inherit it.
+            // SAFETY: fcntl on one inherited integer descriptor is
+            // async-signal-safe and the closure allocates no state.
+            unsafe {
+                cmd.pre_exec(move || clear_close_on_exec(writer_fd));
+            }
+            Ok(Self {
+                root_pid: None,
+                path,
+                reader,
+                pending: Vec::new(),
+                active: std::collections::BTreeMap::new(),
+                settled_by_parent: std::collections::BTreeMap::new(),
+                provisional: std::collections::BTreeMap::new(),
+                settled_provisional: std::collections::BTreeMap::new(),
+                proven_terminated_groups: std::collections::BTreeSet::new(),
+                ledger_writer: Some(writer),
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (cmd, owner_dir);
+            Ok(Self { root_pid: None })
+        }
+    }
+
+    /// Release the MCP parent's copy of the locked ledger once the review root
+    /// has inherited it. Later lock acquisition proves that the root and every
+    /// fork caught in pre-exec have closed their copies.
+    pub(crate) fn child_spawned(&mut self, root_pid: Option<u32>) {
+        self.root_pid = root_pid;
+        #[cfg(unix)]
+        {
+            drop(self.ledger_writer.take());
+        }
+    }
+
+    async fn wait_for_spawn_barrier(&mut self, timeout: Duration) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            drop(self.ledger_writer.take());
+            let Some(deadline) = std::time::Instant::now().checked_add(timeout) else {
+                return false;
+            };
+            loop {
+                match try_lock_external_child_group_ledger(self.reader.as_raw_fd()) {
+                    Ok(true) => return true,
+                    Ok(false) => {
+                        if std::time::Instant::now() >= deadline {
+                            return false;
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return false,
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = timeout;
+            true
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_spawn_barrier_blocking(&mut self, timeout: Duration) -> bool {
+        use std::os::fd::AsRawFd as _;
+
+        drop(self.ledger_writer.take());
+        let Some(deadline) = std::time::Instant::now().checked_add(timeout) else {
+            return false;
+        };
+        loop {
+            match try_lock_external_child_group_ledger(self.reader.as_raw_fd()) {
+                Ok(true) => return true,
+                Ok(false) => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    pub(crate) async fn finalize_after_root_exit(&mut self, timeout: Duration) -> bool {
+        let barrier_closed = self.wait_for_spawn_barrier(timeout).await;
+        let groups_terminated = self.terminate_active_groups(true);
+        barrier_closed && groups_terminated
+    }
+
+    pub(crate) fn root_reaped(&mut self) {
+        self.root_pid = None;
+    }
+
+    #[cfg(unix)]
+    fn drain(&mut self, final_read: bool) -> bool {
+        use std::io::Read as _;
+
+        let mut complete = true;
+        let mut buffer = Vec::new();
+        if self.reader.read_to_end(&mut buffer).is_err() {
+            complete = false;
+        }
+        self.pending.extend_from_slice(&buffer);
+
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=newline).collect();
+            let Some((&event, identity)) = line.split_first() else {
+                complete = false;
+                continue;
+            };
+            let payload = identity.strip_suffix(b"\n").unwrap_or(identity);
+            let Ok(text) = std::str::from_utf8(payload) else {
+                complete = false;
+                continue;
+            };
+            match event {
+                b'?' => {
+                    let Ok(pid) = text.parse::<u32>() else {
+                        complete = false;
+                        continue;
+                    };
+                    *self.provisional.entry(pid).or_default() += 1;
+                }
+                b'+' | b'-' => {
+                    let Some((pid, birth_identity)) = text.split_once('\t') else {
+                        complete = false;
+                        continue;
+                    };
+                    let Ok(pid) = pid.parse::<u32>() else {
+                        complete = false;
+                        continue;
+                    };
+                    let identity = ExternalChildGroupIdentity {
+                        pid,
+                        birth_identity: birth_identity.to_string(),
+                    };
+                    if event == b'+' {
+                        self.consume_provisional(pid);
+                        *self.active.entry(identity).or_default() += 1;
+                    } else if let Some(count) = self.active.get_mut(&identity) {
+                        *count -= 1;
+                        if *count == 0 {
+                            let _ = self.active.remove(&identity);
+                        }
+                    } else if let Some(count) = self.settled_by_parent.get_mut(&identity) {
+                        *count -= 1;
+                        if *count == 0 {
+                            let _ = self.settled_by_parent.remove(&identity);
+                        }
+                    } else {
+                        complete = false;
+                    }
+                }
+                _ => complete = false,
+            }
+        }
+        complete && (!final_read || self.pending.is_empty())
+    }
+
+    pub(crate) fn terminate_active_groups(&mut self, final_read: bool) -> bool {
+        #[cfg(unix)]
+        {
+            let mut complete = self.drain(final_read);
+            let provisional: Vec<u32> = self.provisional.keys().copied().collect();
+            for pid in provisional {
+                if self.proven_terminated_groups.contains(&pid) || !unix_process_group_exists(pid) {
+                    self.settle_provisional(pid);
+                } else {
+                    // A provisional row proves only what the forked child
+                    // claimed before exec. Never signal a possibly recycled
+                    // PGID unless the stopped-root descendant census proved it.
+                    complete = false;
+                }
+            }
+            let active: Vec<ExternalChildGroupIdentity> = self.active.keys().cloned().collect();
+            for identity in active {
+                let exact_leader = crate::storage::process_birth_identity_matches(
+                    identity.pid,
+                    &identity.birth_identity,
+                );
+                let leader_alive = crate::storage::is_process_alive(identity.pid);
+                let group_exists = unix_process_group_exists(identity.pid);
+                if exact_leader || (!leader_alive && group_exists) {
+                    // If the leader is gone while its group remains, POSIX keeps
+                    // that PGID attached to the original surviving members; it
+                    // cannot name a newly-created group until the old one is
+                    // empty. A live different-birth leader is the reuse case and
+                    // deliberately does not enter this branch.
+                    if terminate_process_tree(identity.pid) {
+                        self.settle_identity(identity);
+                    } else {
+                        complete = false;
+                    }
+                } else if !leader_alive && !group_exists {
+                    // The exact leader is gone and no member retains its group;
+                    // ownership is complete without risking a recycled PID.
+                    self.settle_identity(identity);
+                } else {
+                    // A group still exists but its leader no longer matches the
+                    // recorded incarnation. Never signal a possibly reused
+                    // target; report containment as unconfirmed instead.
+                    complete = false;
+                }
+            }
+            complete
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = final_read;
+            true
+        }
+    }
+
+    #[cfg(unix)]
+    fn settle_identity(&mut self, identity: ExternalChildGroupIdentity) {
+        if let Some(count) = self.active.remove(&identity) {
+            *self.settled_by_parent.entry(identity).or_default() += count;
+        }
+    }
+
+    #[cfg(unix)]
+    fn consume_provisional(&mut self, pid: u32) {
+        if let Some(count) = self.provisional.get_mut(&pid) {
+            *count -= 1;
+            if *count == 0 {
+                let _ = self.provisional.remove(&pid);
+            }
+        } else if let Some(count) = self.settled_provisional.get_mut(&pid) {
+            *count -= 1;
+            if *count == 0 {
+                let _ = self.settled_provisional.remove(&pid);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn settle_provisional(&mut self, pid: u32) {
+        if let Some(count) = self.provisional.remove(&pid) {
+            *self.settled_provisional.entry(pid).or_default() += count;
+        }
+    }
+
+    #[cfg(unix)]
+    fn terminate_proven_descendant_groups(&mut self, groups: &[u32]) -> bool {
+        let mut complete = true;
+        for &pgid in groups {
+            if terminate_process_tree(pgid) {
+                self.proven_terminated_groups.insert(pgid);
+            } else {
+                complete = false;
+            }
+        }
+        complete
+    }
+}
+
+impl Drop for ExternalChildGroupTracker {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let mut containment_confirmed = true;
+            if let Some(pid) = self.root_pid.take() {
+                let root_suspended = suspend_process_group(pid);
+                let descendants_terminated = root_suspended
+                    && match unix_stopped_descendant_process_groups(pid, Duration::from_secs(1)) {
+                        Ok(groups) => self.terminate_proven_descendant_groups(&groups),
+                        Err(error) => {
+                            eprintln!(
+                                "prview: could not prove quick-review descendant groups during cleanup: {error}"
+                            );
+                            false
+                        }
+                    };
+                let registered_terminated = self.terminate_active_groups(false);
+                let root_terminated = terminate_process_tree(pid);
+                containment_confirmed &= root_suspended
+                    && descendants_terminated
+                    && registered_terminated
+                    && root_terminated;
+            }
+
+            // Drop is the ownership fallback for an aborted MCP future. It may
+            // block briefly, but it must not abandon a forked pre-exec writer
+            // after an arbitrary scheduler-dependent 100 ms window.
+            let barrier_closed = self.wait_for_spawn_barrier_blocking(Duration::from_secs(5));
+            let final_groups_terminated = self.terminate_active_groups(true);
+            containment_confirmed &= barrier_closed && final_groups_terminated;
+            if containment_confirmed {
+                let _ = std::fs::remove_file(&self.path);
+            } else {
+                eprintln!(
+                    "prview: quick-review cleanup remains unconfirmed; retained ownership sidecar {}",
+                    self.path.display()
+                );
+            }
+        }
+
+        #[cfg(not(unix))]
+        if let Some(pid) = self.root_pid.take() {
+            let _ = terminate_process_tree(pid);
+        }
+    }
+}
+
 #[cfg(windows)]
 fn system_taskkill_path() -> std::path::PathBuf {
     let windows_dir = std::env::var_os("SystemRoot")
@@ -78,6 +794,341 @@ pub fn sigkill_process_group(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
+fn unix_process_group_exists(pid: u32) -> bool {
+    // SAFETY: signal 0 is a read-only existence/permission probe for the
+    // recorded process-group id.
+    let result = unsafe { libc::kill(-(pid as i32), 0) };
+    if result == 0 {
+        true
+    } else {
+        !matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        )
+    }
+}
+
+/// Ask a Unix process group to enter prview's ordinary Ctrl-C unwind.
+#[cfg(unix)]
+fn interrupt_process_group(pid: u32) -> bool {
+    // SAFETY: plain kill(2) against the dedicated review process group. SIGINT
+    // is handled by prview's supervisor and does not target the MCP server.
+    let result = unsafe { libc::kill(-(pid as i32), libc::SIGINT) };
+    unix_group_kill_succeeded(result, std::io::Error::last_os_error().raw_os_error())
+}
+
+/// Freeze the review root group before the hard fallback inventories its
+/// separately-grouped descendants. Once stopped, the root cannot begin or reap
+/// another spawn while the parent consumes provisional registrations.
+#[cfg(unix)]
+fn suspend_process_group(pid: u32) -> bool {
+    // SAFETY: SIGSTOP targets only the dedicated review process group. ESRCH is
+    // success-shaped because there is no root left to create another child.
+    let result = unsafe { libc::kill(-(pid as i32), libc::SIGSTOP) };
+    unix_group_kill_succeeded(result, std::io::Error::last_os_error().raw_os_error())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnixProcessRow {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    state: String,
+}
+
+/// Parse the deliberately header-free `ps` shape used by timeout containment.
+/// A malformed non-empty row invalidates the census instead of silently
+/// weakening the ownership proof.
+#[cfg(unix)]
+fn parse_unix_process_table(stdout: &[u8]) -> std::io::Result<Vec<UnixProcessRow>> {
+    let text = std::str::from_utf8(stdout).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("process table is not UTF-8: {error}"),
+        )
+    })?;
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let parse = |field: Option<&str>, name: &str| -> std::io::Result<u32> {
+                field
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("process table row lacks {name}: {line:?}"),
+                        )
+                    })?
+                    .parse::<u32>()
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid {name} in process table row {line:?}: {error}"),
+                        )
+                    })
+            };
+            let row = UnixProcessRow {
+                pid: parse(fields.next(), "pid")?,
+                ppid: parse(fields.next(), "ppid")?,
+                pgid: parse(fields.next(), "pgid")?,
+                state: fields
+                    .next()
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("process table row lacks state: {line:?}"),
+                        )
+                    })?
+                    .to_string(),
+            };
+            if fields.next().is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("process table row has extra fields: {line:?}"),
+                ));
+            }
+            Ok(row)
+        })
+        .collect()
+}
+
+/// Return only process groups led by direct children of the stopped review
+/// root. Those are exactly prview's hardened tool roots. A transitive child may
+/// still be reaped by its running parent between snapshot and signal; a direct
+/// child cannot be reaped while the review root itself remains stopped.
+#[cfg(unix)]
+fn direct_child_process_groups(rows: &[UnixProcessRow], root_pid: u32) -> Vec<u32> {
+    rows.iter()
+        .filter(|row| {
+            row.pid == row.pgid
+                && row.ppid == root_pid
+                && row.pgid != root_pid
+                && row.pgid > 0
+                && row.pgid <= i32::MAX as u32
+        })
+        .map(|row| row.pgid)
+        .collect()
+}
+
+#[cfg(unix)]
+fn unlinked_process_table_capture() -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let sequence = PROCESS_TABLE_CAPTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!(
+        ".prview-process-table-{}-{nonce}-{sequence}",
+        std::process::id()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    if let Err(error) = std::fs::remove_file(&path) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn reap_quarantined_process_table_helpers() {
+    let Some(quarantine) = PROCESS_TABLE_REAPER_QUARANTINE.get() else {
+        return;
+    };
+    quarantine
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain_mut(|child| {
+            let pid = child.id();
+            let _ = terminate_process_tree(pid);
+            let _ = child.kill();
+            !matches!(child.try_wait(), Ok(Some(_)))
+        });
+}
+
+#[cfg(unix)]
+fn quarantine_process_table_helper(child: std::process::Child) {
+    PROCESS_TABLE_REAPER_QUARANTINE
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(child);
+}
+
+#[cfg(unix)]
+fn terminate_bounded_process_table_helper(
+    mut child: std::process::Child,
+    pid: u32,
+    timeout: Duration,
+) {
+    let _ = terminate_process_tree(pid);
+    let _ = child.kill();
+    let deadline = std::time::Instant::now().checked_add(timeout);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if deadline.is_some_and(|deadline| std::time::Instant::now() < deadline) => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    // The caller's ordinary timeout remains finite even under a pathological
+    // wait(2) delay. The shared slot keeps ownership recoverable until the
+    // reaper thread has actually started.
+    let owned = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let reaper_owned = std::sync::Arc::clone(&owned);
+    let spawn = std::thread::Builder::new()
+        .name("prview-ps-reaper".to_string())
+        .spawn(move || {
+            let child = reaper_owned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let Some(mut child) = child else {
+                return;
+            };
+            let _ = terminate_process_tree(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+    match spawn {
+        Ok(handle) => drop(handle),
+        Err(error) => {
+            eprintln!("prview: failed to launch process-table helper reaper: {error}");
+            let child = owned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(child) = child {
+                // Thread creation failure is already a system-level resource
+                // failure. Preserve non-blocking ownership in a process-wide
+                // quarantine; each later census retries kill + try_wait.
+                quarantine_process_table_helper(child);
+            }
+        }
+    }
+}
+
+/// Take one finite local process-table snapshot. The `ps` helper owns its own
+/// group and writes to an already-unlinked mode-0600 file, so output volume
+/// cannot fill a pipe. Timeout transfers any slow reap to a dedicated owner.
+#[cfg(unix)]
+fn bounded_unix_process_table(timeout: Duration) -> std::io::Result<Vec<UnixProcessRow>> {
+    use std::io::{Read as _, Seek as _};
+    use std::os::unix::process::CommandExt as _;
+
+    reap_quarantined_process_table_helpers();
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| std::io::Error::other("process-table timeout overflow"))?;
+    let mut capture = unlinked_process_table_capture()?;
+    let stdout = capture.try_clone()?;
+    let mut command = std::process::Command::new("/bin/ps");
+    command
+        .args(["-axo", "pid=,ppid=,pgid=,state="])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    drop(command);
+    let pid = child.id();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(None) => {
+                terminate_bounded_process_table_helper(child, pid, Duration::from_millis(100));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "/bin/ps exceeded the process-table snapshot budget",
+                ));
+            }
+            Err(error) => {
+                terminate_bounded_process_table_helper(child, pid, Duration::from_millis(100));
+                return Err(error);
+            }
+        }
+    };
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "/bin/ps exited with {} during timeout containment",
+            status
+        )));
+    }
+    let captured_len = capture.metadata()?.len();
+    if captured_len > PROCESS_TABLE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "/bin/ps process table exceeds the {} byte safety cap",
+                PROCESS_TABLE_MAX_BYTES
+            ),
+        ));
+    }
+    capture.seek(std::io::SeekFrom::Start(0))?;
+    let mut stdout = Vec::new();
+    capture.read_to_end(&mut stdout)?;
+    parse_unix_process_table(&stdout)
+}
+
+/// Wait for one process-table snapshot that both proves the review root has
+/// reached stopped state and inventories its descendants. The same snapshot
+/// supplies both facts, so the root cannot create or reap between proof and
+/// census. Failure is fail-closed and never authorizes a provisional-PID kill.
+#[cfg(unix)]
+fn unix_stopped_descendant_process_groups(
+    root_pid: u32,
+    timeout: Duration,
+) -> std::io::Result<Vec<u32>> {
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| std::io::Error::other("stopped-root census timeout overflow"))?;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "review root did not reach stopped state before census deadline",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let rows = match bounded_unix_process_table(remaining.min(Duration::from_millis(250))) {
+            Ok(rows) => rows,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::TimedOut
+                    && std::time::Instant::now() < deadline =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let root = rows.iter().find(|row| row.pid == root_pid).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "review root disappeared before stopped-state census",
+            )
+        })?;
+        if root.state.starts_with('T') {
+            return Ok(direct_child_process_groups(&rows, root_pid));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(unix)]
 fn unix_group_kill_succeeded(result: i32, errno: Option<i32>) -> bool {
     result == 0 || (result == -1 && errno == Some(libc::ESRCH))
 }
@@ -130,18 +1181,128 @@ pub async fn terminate_and_reap_tokio_child(
     (tree_terminated || direct_kill_started) && root_reaped
 }
 
+/// Stop an MCP-owned quick review whose tools may lead process groups distinct
+/// from the review root's group.
+///
+/// Unix first delivers Ctrl-C so the in-process governor can drain its precise
+/// child registry. If that bounded unwind does not finish, the MCP-side sidecar
+/// supplies committed and pre-exec provisional tool groups to the hard fallback.
+/// Its inherited lock cannot be acquired until every in-flight pre-exec child
+/// has either published its PGID or failed the spawn. Windows uses its native
+/// recursive tree termination and needs no side ledger.
+pub(crate) async fn terminate_supervised_tokio_child(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    tracker: &mut ExternalChildGroupTracker,
+    cooperative_grace: Duration,
+    reap_timeout: Duration,
+) -> bool {
+    #[cfg(not(unix))]
+    let _ = cooperative_grace;
+
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        let _ = interrupt_process_group(pid);
+        if matches!(
+            tokio::time::timeout(cooperative_grace, child.wait()).await,
+            Ok(Ok(_))
+        ) {
+            tracker.root_reaped();
+            return tracker.finalize_after_root_exit(reap_timeout).await;
+        }
+    }
+
+    #[cfg(unix)]
+    let root_suspended = pid.is_none_or(suspend_process_group);
+    #[cfg(not(unix))]
+    let root_suspended = true;
+    #[cfg(unix)]
+    let descendant_groups = match pid {
+        Some(pid) if root_suspended => {
+            let census = tokio::task::spawn_blocking(move || {
+                unix_stopped_descendant_process_groups(pid, Duration::from_secs(1))
+            });
+            match tokio::time::timeout(Duration::from_millis(1_250), census).await {
+                Ok(Ok(Ok(groups))) => Some(groups),
+                Ok(Ok(Err(error))) => {
+                    eprintln!(
+                        "prview: could not prove quick-review descendant groups during cleanup: {error}"
+                    );
+                    None
+                }
+                Ok(Err(error)) => {
+                    eprintln!("prview: stopped-root census worker failed: {error}");
+                    None
+                }
+                Err(_) => {
+                    eprintln!("prview: stopped-root census exceeded its outer scheduling budget");
+                    None
+                }
+            }
+        }
+        Some(_) => None,
+        None => Some(Vec::new()),
+    };
+    #[cfg(unix)]
+    let descendant_groups_terminated = descendant_groups
+        .as_deref()
+        .is_some_and(|groups| tracker.terminate_proven_descendant_groups(groups));
+    #[cfg(not(unix))]
+    let descendant_groups_terminated = true;
+    let nested_before_root = tracker.terminate_active_groups(false);
+    let root_reaped = terminate_and_reap_tokio_child(child, pid, reap_timeout).await;
+    if root_reaped {
+        tracker.root_reaped();
+    }
+    // Root reap closes its locked ledger writer. Acquiring that lock proves
+    // every child already forked into pre-exec has written a provisional PGID
+    // or failed its spawn.
+    let finalized_after_root = tracker.finalize_after_root_exit(reap_timeout).await;
+    root_suspended
+        && descendant_groups_terminated
+        && nested_before_root
+        && root_reaped
+        && finalized_after_root
+}
+
 /// Apply the standard rails to `cmd`: detached stdin, `kill_on_drop`, and (unix)
-/// its own process group. Stdout/stderr are left to the caller — piped for
+/// its own process group. A quick-review child inherits the MCP ledger only for
+/// its async-signal-safe provisional write; the descriptor and capability env
+/// are closed/removed at exec. The tool's whole group is then represented by
+/// that one registration. Stdout/stderr are left to the caller — piped for
 /// captured runs, redirected to files for detached packs.
 pub fn harden(cmd: &mut TokioCommand) {
     cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
     // unix: own process group so one signal to -pgid reaches the whole tree.
     #[cfg(unix)]
-    cmd.process_group(0);
+    {
+        match external_child_group_pre_exec_fd() {
+            Ok(Some(fd)) => {
+                // SAFETY: the closure performs only getpid/write on inherited
+                // descriptors before exec; it captures one integer by value.
+                unsafe {
+                    cmd.pre_exec(move || write_external_child_group_provisional(fd));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("prview: child-group pre-exec ownership is unavailable: {error}");
+                // SAFETY: a configured but broken ownership channel must make
+                // spawn fail before an untracked process can exec.
+                unsafe {
+                    cmd.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EIO)));
+                }
+            }
+        }
+        cmd.process_group(0)
+            .env_remove(EXTERNAL_CHILD_GROUP_TOKEN_ENV)
+            .env_remove(EXTERNAL_CHILD_GROUP_FD_ENV);
+    }
 }
 
 /// The half of [`harden`] that a synchronous [`std::process::Command`] can take:
-/// detached stdin and, on unix, its own process group.
+/// detached stdin, the same capability boundary, and, on unix, its own process
+/// group.
 ///
 /// `kill_on_drop` has no std equivalent — a caller here owns the `Child` and
 /// reaps it itself. The process group is the half that matters anyway: the
@@ -153,7 +1314,26 @@ pub fn harden_std(cmd: &mut std::process::Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+        match external_child_group_pre_exec_fd() {
+            Ok(Some(fd)) => {
+                // SAFETY: same bounded pre-exec registration as [`harden`].
+                unsafe {
+                    cmd.pre_exec(move || write_external_child_group_provisional(fd));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("prview: child-group pre-exec ownership is unavailable: {error}");
+                // SAFETY: fail the spawn before exec rather than create an
+                // untracked process under a broken ownership capability.
+                unsafe {
+                    cmd.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EIO)));
+                }
+            }
+        }
+        cmd.process_group(0)
+            .env_remove(EXTERNAL_CHILD_GROUP_TOKEN_ENV)
+            .env_remove(EXTERNAL_CHILD_GROUP_FD_ENV);
     }
 }
 
@@ -1162,6 +2342,236 @@ pub(crate) fn read_published_unix_pids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    const BROKEN_CHILD_GROUP_FIXTURE_ENV: &str = "PRVIEW_BROKEN_CHILD_GROUP_FIXTURE";
+    #[cfg(unix)]
+    const CHILD_GROUP_FD_FIXTURE_ENV: &str = "PRVIEW_CHILD_GROUP_FD_FIXTURE";
+    #[cfg(unix)]
+    const CHILD_GROUP_FD_EXPECT_ENV: &str = "PRVIEW_CHILD_GROUP_FD_EXPECT";
+    #[cfg(unix)]
+    const CHILD_GROUP_FD_IDENTITY_ENV: &str = "PRVIEW_CHILD_GROUP_FD_IDENTITY";
+
+    #[cfg(unix)]
+    #[test]
+    fn external_child_group_fd_fixture() {
+        let Some(fd) = std::env::var_os(CHILD_GROUP_FD_FIXTURE_ENV) else {
+            return;
+        };
+        let fd = fd
+            .to_string_lossy()
+            .parse::<libc::c_int>()
+            .expect("numeric fixture fd");
+        let expected = std::env::var(CHILD_GROUP_FD_EXPECT_ENV).expect("fd expectation");
+        let expected_identity =
+            std::env::var(CHILD_GROUP_FD_IDENTITY_ENV).expect("ledger identity expectation");
+        let descriptor_identity = || -> Option<String> {
+            // SAFETY: `stat` is writable storage and fstat only inspects the
+            // numeric fixture descriptor.
+            let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+            (unsafe { libc::fstat(fd, &mut stat) } == 0)
+                .then(|| format!("{}:{}", stat.st_dev, stat.st_ino))
+        };
+        // SAFETY: F_GETFD only inspects the numeric fixture descriptor.
+        let before = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        match expected.as_str() {
+            "closed" => {
+                assert_ne!(
+                    descriptor_identity().as_deref(),
+                    Some(expected_identity.as_str()),
+                    "unrelated exec inherited the ledger descriptor"
+                );
+            }
+            "open" => {
+                assert_ne!(before, -1, "quick-review root lost the ledger fd");
+                assert_eq!(
+                    descriptor_identity().as_deref(),
+                    Some(expected_identity.as_str()),
+                    "quick-review root inherited a different descriptor at the reused fd number"
+                );
+                initialize_external_child_group_capability()
+                    .expect("quick-review root adopts inherited capability");
+                // SAFETY: same descriptor after initialization.
+                let after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                assert_ne!(after, -1);
+                assert_ne!(after & libc::FD_CLOEXEC, 0, "root restores CLOEXEC");
+            }
+            other => panic!("unexpected fd expectation {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_child_group_fd_is_inherited_only_by_the_attached_root() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut root = TokioCommand::new(std::env::current_exe().unwrap());
+        root.args([
+            "--exact",
+            "proc::tests::external_child_group_fd_fixture",
+            "--nocapture",
+        ])
+        .env(CHILD_GROUP_FD_EXPECT_ENV, "open");
+        harden(&mut root);
+        let tracker_setup = ExternalChildGroupTracker::attach(&mut root, tmp.path())
+            .expect("attach child-group tracker");
+        let ledger_fd = tracker_setup
+            .ledger_writer
+            .as_ref()
+            .expect("parent writer")
+            .as_raw_fd();
+        let metadata = std::fs::metadata(&tracker_setup.path).expect("ledger metadata");
+        let ledger_identity = format!("{}:{}", metadata.dev(), metadata.ino());
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "proc::tests::external_child_group_fd_fixture",
+                "--nocapture",
+            ])
+            .env(CHILD_GROUP_FD_FIXTURE_ENV, ledger_fd.to_string())
+            .env(CHILD_GROUP_FD_EXPECT_ENV, "closed")
+            .env(CHILD_GROUP_FD_IDENTITY_ENV, &ledger_identity)
+            .status()
+            .expect("spawn unrelated sentinel");
+        assert!(status.success(), "unrelated sentinel validates CLOEXEC");
+
+        root.env(CHILD_GROUP_FD_FIXTURE_ENV, ledger_fd.to_string())
+            .env(CHILD_GROUP_FD_IDENTITY_ENV, &ledger_identity);
+        let mut child = root.spawn().expect("spawn attached quick root");
+        let mut tracker = tracker_setup;
+        tracker.child_spawned(child.id());
+        let status = child.wait().await.expect("wait attached quick root");
+        assert!(status.success());
+        tracker.root_reaped();
+        assert!(
+            tracker
+                .finalize_after_root_exit(Duration::from_secs(2))
+                .await,
+            "root closes its inherited writer after adopting the capability"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_external_child_group_capability_fixture() {
+        if std::env::var_os(BROKEN_CHILD_GROUP_FIXTURE_ENV).is_none() {
+            return;
+        }
+
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        harden_std(&mut command);
+        let error = command
+            .spawn()
+            .expect_err("a broken parent ledger must fail before child exec");
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_external_child_group_capability_fails_closed() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "proc::tests::broken_external_child_group_capability_fixture",
+            "--nocapture",
+        ]);
+        harden_std(&mut command);
+        command
+            .env(BROKEN_CHILD_GROUP_FIXTURE_ENV, "1")
+            .env(EXTERNAL_CHILD_GROUP_TOKEN_ENV, "test-token")
+            .env(EXTERNAL_CHILD_GROUP_FD_ENV, "999999");
+        let status = command.status().expect("run broken-capability fixture");
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_child_group_tracker_rejects_a_truncated_final_record() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut command = TokioCommand::new("true");
+        let mut tracker = ExternalChildGroupTracker::attach(&mut command, tmp.path())
+            .expect("attach child-group tracker");
+        let mode = std::fs::metadata(&tracker.path)
+            .expect("child-group sidecar metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "sidecar must not grant group/other access");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&tracker.path)
+            .expect("open child-group sidecar")
+            .write_all(b"+123\ttruncated")
+            .expect("write truncated child-group record");
+
+        assert!(
+            !tracker.terminate_active_groups(true),
+            "a partial final registration must keep containment unconfirmed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_child_group_tracker_accepts_late_finish_after_parent_cleanup() {
+        use std::io::Write as _;
+
+        const ABSENT_PID: u32 = i32::MAX as u32;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut command = TokioCommand::new("true");
+        let mut tracker = ExternalChildGroupTracker::attach(&mut command, tmp.path())
+            .expect("attach child-group tracker");
+        let mut sidecar = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&tracker.path)
+            .expect("open child-group sidecar");
+        sidecar
+            .write_all(format!("+{ABSENT_PID}\ttest-birth\n").as_bytes())
+            .expect("write registration");
+        assert!(tracker.terminate_active_groups(false));
+
+        sidecar
+            .write_all(format!("-{ABSENT_PID}\ttest-birth\n").as_bytes())
+            .expect("write late completion");
+        assert!(
+            tracker.terminate_active_groups(true),
+            "a late child unwind after parent cleanup is coherent, not an unknown finish"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descendant_group_census_requires_a_direct_child_group_leader() {
+        let rows = parse_unix_process_table(
+            b"100 1 100 T\n250 100 250 S\n300 200 300 S\n200 100 100 S\n301 300 300 S\n400 1 400 S\n500 200 400 S\n",
+        )
+        .expect("parse process table");
+        assert_eq!(direct_child_process_groups(&rows, 100), vec![250]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_table_parser_rejects_partial_and_extra_rows() {
+        assert!(parse_unix_process_table(b"100 1\n").is_err());
+        assert!(parse_unix_process_table(b"100 1 100 S extra\n").is_err());
+        assert!(parse_unix_process_table(&[0xff, b'\n']).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_process_table_snapshot_contains_the_current_process() {
+        let rows = bounded_unix_process_table(Duration::from_secs(2))
+            .expect("read bounded local process table");
+        assert!(
+            rows.iter().any(|row| row.pid == std::process::id()),
+            "process-table snapshot must contain its caller"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
