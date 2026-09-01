@@ -1291,7 +1291,7 @@ mod tests {
         command.args([
             "-c",
             &format!(
-                "sleep 30 & printf '%s\\n' \"$!\" > '{}'; wait",
+                "trap '' INT; sleep 30 & printf '%s\\n' \"$!\" > '{}'; wait",
                 pidfile.display()
             ),
         ]);
@@ -1341,6 +1341,11 @@ mod tests {
 
         assert_eq!(error.class, error_class::RUN_FAILED);
         assert!(error.message.contains("injected quick wait failure"));
+        assert_eq!(
+            error.extra["containment_confirmed"],
+            serde_json::json!(true),
+            "an injected wait failure must drive the parent-owned hard fallback to completion"
+        );
         wait_until_process_is_reaped(child_pid.unwrap());
         wait_until_process_is_reaped(grandchild);
         assert!(
