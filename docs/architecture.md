@@ -1004,10 +1004,13 @@ deleted when `run_all` returned. A `--pr` run therefore had its gates judge the
 reviewed snapshot while `30_context/*` was produced from whatever the operator
 had checked out locally (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). Every context
 command's cwd and every filesystem probe that decides which commands to plan now
-read the reviewed tree; a local review resolves to the repo root, which *is* the
-reviewed tree, so its behaviour is unchanged. Cargo context commands resolve
-their directory through `checks::planned_cargo_cwd`, the same resolution the
-cargo gates use, so a workspace member is not collapsed to the snapshot root.
+read the reviewed tree. Static Tauri discovery, its source walk, and the
+repo-relative mapping used to compare head commands with the base commit use
+that same tree and repository view. A local review resolves to the repo root,
+which *is* the reviewed tree, so its behaviour is unchanged. Cargo context
+commands resolve their directory through `checks::planned_cargo_cwd`, the same
+resolution the cargo gates use, so a workspace member is not collapsed to the
+snapshot root.
 
 ### governor/mod.rs
 
@@ -1442,8 +1445,13 @@ as an active run.
 
 Deep reviews are asynchronous at the RPC boundary, not unowned processes. A
 dedicated waiter thread retains each `Child` and reaps its direct root, including
-an immediate failure. After normal root exit it also terminates residual Unix
-process-group members; Windows retains the complete Job Object until wait.
+an immediate failure. The review root inherits the same parent-owned child-group
+sidecar used by synchronous quick reviews, so after root exit the waiter also
+drains separately hardened Cargo, Semgrep, and other nested groups. It removes
+`RUNNING.json` only when publication is complete and full containment has been
+confirmed; otherwise the marker remains explicit diagnostic state. Residual
+Unix root-group members are terminated as part of that proof, while Windows
+retains the complete Job Object until wait.
 The caller also captures the exact publication-index path before starting the
 waiter, so background completion never re-resolves a different storage home.
 Active-run discovery rejects markerless history and the completed-run `latest`
@@ -2706,7 +2714,10 @@ cleanup (file/storage/S3 artifact deletion).
 #### signal/tauri_commands.rs — Tauri command surface
 
 `generate_tauri_commands(...)` analyzes the Tauri command surface exposed by the
-changed files, for Tauri (mixed JS + Rust) projects.
+changed files, for Tauri (mixed JS + Rust) projects. Its head-side directory,
+filesystem walk, and changed-file mapping come from the run-wide reviewed tree;
+the base side is read from the exact Git objects. An off-HEAD review therefore
+cannot leak commands or layout from the operator's current checkout.
 
 #### signal/test_helpers.rs — shared test fixtures (`#[cfg(test)]`)
 

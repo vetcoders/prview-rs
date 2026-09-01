@@ -75,7 +75,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reload the global publication index while they are polled, while completed
   publication still wins over a lingering live marker.
 - MCP deep reviews retain and reap every detached direct child, including an
-  immediately failing process, so a zombie cannot keep a later review blocked.
+  immediately failing process, and inherit the parent-owned child-group ledger
+  used by quick reviews. After the root exits, the reaper drains separately
+  hardened Cargo, Semgrep, and other tool groups before it may remove the
+  running marker; unconfirmed containment remains explicit diagnostic state.
+  A zombie or surviving nested group therefore cannot be mistaken for a
+  completed detached review or keep a later review blocked.
   Versioned running markers bind the PID to its native process-birth identity
   across Linux, macOS, and Windows; recycled v2 PIDs become stale, while a live
   legacy PID blocks conservatively until it exits. Marker or reaper setup
@@ -622,7 +627,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   describe two different revisions. The run's shared target snapshot is now
   owned by the task ledger and stays alive through artifact generation, and
   every context command's working directory — plus the filesystem probes that
-  decide which commands to plan at all — follows it. Local reviews are
+  decide which commands to plan at all, static Tauri command discovery, and its
+  diff mapping — follows it. Local reviews are
   unaffected: there the repo root is the reviewed tree.
 
 - The human-readable `PRVIEW CONFIG` panel now caps itself to the active

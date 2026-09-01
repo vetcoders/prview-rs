@@ -241,6 +241,11 @@ exist for the run; `pack` is absolute, the rest are pack-relative.
 }
 ```
 
+Detached does not mean unowned. The MCP parent retains the root child and a
+parent-owned child-group ledger; its reaper drains separately hardened nested
+tool groups after the root exits and removes the running marker only after both
+complete publication and confirmed process-tree containment.
+
 Poll [`verdict`](#verdict) with that `run_id` until `status` is `completed`.
 
 **One active run per repo branch.** A second `run_review` while one is in flight
