@@ -359,6 +359,7 @@ type PrivateTypeKey = (String, Vec<String>, String);
 type PrivateModuleAliasKey = (String, Vec<String>);
 type GuardedPrivateModuleTarget = (Vec<String>, Vec<String>);
 type GuardedPrivateTypeTarget = (PrivateTypeKey, Vec<String>);
+type BinaryExport = (String, bool, Vec<String>, String, BTreeSet<PrivateTypeKey>);
 
 #[derive(Debug, Clone)]
 struct GuardedImplEvidence {
@@ -1338,7 +1339,6 @@ impl<'a> SnapshotBuilder<'a> {
                 &manifest,
                 package,
                 package_name,
-                &manifest_dir,
                 &parsed_manifest_authorities,
                 &cfg_authority_digest,
             );
@@ -1682,16 +1682,16 @@ impl<'a> SnapshotBuilder<'a> {
         manifest: &toml::Value,
         package: &toml::Table,
         package_name: &str,
-        manifest_dir: &str,
         parsed_manifest_authorities: &BTreeMap<String, toml::Value>,
         cfg_authority_digest: &str,
     ) {
+        let manifest_dir = parent_repo_path(manifest_path);
         let discovery = cargo_binary_targets(
             manifest_path,
             manifest,
             package,
             package_name,
-            manifest_dir,
+            &manifest_dir,
             parsed_manifest_authorities,
             &self.inventory,
         );
@@ -12087,7 +12087,7 @@ fn binary_exports(
     include_public_direct: bool,
     crate_name: &str,
     module_path: &[String],
-) -> Vec<(String, bool, Vec<String>, String, BTreeSet<PrivateTypeKey>)> {
+) -> Vec<BinaryExport> {
     let direct = |name: String, attrs: &[Attribute], public: bool, input: String| {
         if public && !include_public_direct {
             return Vec::new();

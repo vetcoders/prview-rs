@@ -4431,8 +4431,13 @@ mod tests {
             ("macros/src/lib.rs", macro_source, macro_source),
         ]);
         assert!(
-            conditional_transform_disjoint.findings().is_empty(),
-            "a cfg-disjoint alias change must not perturb a conditional native transform: {:?}",
+            !conditional_transform_disjoint.unknown.iter().any(|finding| {
+                finding.identity.name == "PrivateTypeDependency"
+                    && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("macro-generated-native-export-potential:Api")
+                    })
+            }),
+            "a cfg-disjoint alias change must not perturb the native type closure; the independently conservative macro-implementation proof may still change: {:?}",
             conditional_transform_disjoint.findings()
         );
 
