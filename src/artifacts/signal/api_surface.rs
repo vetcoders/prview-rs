@@ -442,6 +442,7 @@ struct SnapshotBuilder<'a> {
     active_sources: BTreeSet<(String, String)>,
     proc_macro_crates: BTreeSet<String>,
     rust_linkable_crates: BTreeSet<String>,
+    native_artifact_crates: BTreeSet<String>,
     crate_editions: BTreeMap<String, String>,
     cfg_authority_digests: BTreeMap<String, String>,
     macro_implementation_digest: Option<String>,
@@ -484,6 +485,7 @@ impl<'a> SnapshotBuilder<'a> {
             active_sources: BTreeSet::new(),
             proc_macro_crates: BTreeSet::new(),
             rust_linkable_crates: BTreeSet::new(),
+            native_artifact_crates: BTreeSet::new(),
             crate_editions: BTreeMap::new(),
             cfg_authority_digests: BTreeMap::new(),
             macro_implementation_digest: None,
@@ -1416,6 +1418,9 @@ impl<'a> SnapshotBuilder<'a> {
             let rust_linkable = crate_types
                 .iter()
                 .any(|kind| matches!(kind.as_str(), "lib" | "rlib" | "dylib"));
+            let native_artifact = crate_types
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "cdylib" | "staticlib" | "bin"));
             let package_links = match package.get("links") {
                 Some(toml::Value::String(links)) => Some(links.as_str()),
                 Some(_) => {
@@ -1471,6 +1476,9 @@ impl<'a> SnapshotBuilder<'a> {
             if rust_linkable {
                 self.rust_linkable_crates.insert(crate_name.clone());
             }
+            if native_artifact {
+                self.native_artifact_crates.insert(crate_name.clone());
+            }
             self.crate_editions
                 .insert(crate_name.clone(), edition.clone());
             if let Some(cfg_authority) = cfg_authority {
@@ -1491,6 +1499,7 @@ impl<'a> SnapshotBuilder<'a> {
             ) {
                 self.proc_macro_crates.remove(&crate_name);
                 self.rust_linkable_crates.remove(&crate_name);
+                self.native_artifact_crates.remove(&crate_name);
                 self.crate_editions.remove(&crate_name);
                 self.cfg_authority_digests.remove(&crate_name);
                 continue;
@@ -1660,6 +1669,7 @@ impl<'a> SnapshotBuilder<'a> {
         items: &[Item],
     ) {
         let rust_linkable = self.rust_linkable_crates.contains(crate_name);
+        let native_artifact = self.native_artifact_crates.contains(crate_name);
         let mut derive_name_ambiguity = derive_name_ambiguity_for_items(items);
         if self.macro_use_crates.contains(crate_name) {
             derive_name_ambiguity.all_unqualified = true;
@@ -1753,9 +1763,6 @@ impl<'a> SnapshotBuilder<'a> {
                         continue;
                     };
                     let binary_exports = binary_export_attributes(&function.attrs);
-                    if binary_exports.is_empty() {
-                        continue;
-                    }
                     let member_cfg = canonical_cfg(&function.attrs);
                     let member_guard = combined_guards(&cfg_guard, &member_cfg.guards);
                     for evidence in &member_cfg.errors {
@@ -1790,6 +1797,30 @@ impl<'a> SnapshotBuilder<'a> {
                     }
                     let member_name = normalize_identifier(function.sig.ident.to_string());
                     let owner_contract = normalized_associated_contract(item_impl, member, false);
+                    if binary_exports.is_empty() {
+                        if !native_artifact {
+                            continue;
+                        }
+                        for boundary in &transform_boundaries {
+                            let mut evidence = bind_associated_native_transform_evidence(
+                                boundary,
+                                &member_name,
+                                member,
+                                &owner_contract,
+                                self.macro_implementation_digest.as_deref(),
+                            );
+                            evidence.push_str("\nmacro-generated-native-export-potential");
+                            self.unknown_guarded(
+                                RustApiUnknownKind::MacroGeneratedItems,
+                                Some(crate_name),
+                                module_path,
+                                source_path,
+                                &member_guard,
+                                evidence,
+                            );
+                        }
+                        continue;
+                    }
                     let export_guards = binary_exports
                         .into_iter()
                         .map(|(guard, _)| guard)
@@ -1818,6 +1849,9 @@ impl<'a> SnapshotBuilder<'a> {
                     let syn::ImplItem::Macro(macro_item) = member else {
                         continue;
                     };
+                    if !native_artifact {
+                        continue;
+                    }
                     let member_cfg = canonical_cfg(&macro_item.attrs);
                     let member_guard = combined_guards(&cfg_guard, &member_cfg.guards);
                     if !member_cfg.errors.is_empty() {

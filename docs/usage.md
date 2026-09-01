@@ -630,7 +630,11 @@ items are projected only for Rust-linkable `lib`/`rlib`/`dylib` outputs. Proc-ma
 exports remain separate, and native-only `cdylib`/`staticlib`/`bin` targets
 retain binary-export and target uncertainty, including exported associated
 functions in inherent and trait impls, without pretending that their
-internal `pub` items are dependency API. Exported declarative macro contracts
+internal `pub` items are dependency API. Native-producing targets (including a
+mixed `rlib + cdylib`) also retain typed potential-export evidence when a custom
+associated attribute or item-position macro can generate the native symbol; an
+internal associated macro in an `rlib`-only private owner remains outside the
+external contract. Exported declarative macro contracts
 bind the effective direct, workspace-inherited, or library-target edition; an
 edition change without such a macro does not create a synthetic break.
 Tuple-constructor privacy,

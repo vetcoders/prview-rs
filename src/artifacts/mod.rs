@@ -1020,9 +1020,10 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
 
     // The shared snapshot is required through the last context/pack read, but it
     // must be gone before this run becomes discoverable as completed. Cleanup
-    // owns cancellable `git worktree remove/prune` children; publishing first
-    // would let Ctrl-C return 130 after `latest` and the index already exposed a
-    // verdict. Drop is only the early-return backstop.
+    // owns a cancellable `git worktree remove` child plus its path-exact
+    // in-process rollback; publishing first would let Ctrl-C return 130 after
+    // `latest` and the index already exposed a verdict. Drop is only the
+    // early-return backstop.
     if let Err(error) = ledger.cleanup_shared_snapshot() {
         if governor.is_cancelled() {
             ensure_generation_active(

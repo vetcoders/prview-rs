@@ -104,7 +104,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including through nested `cfg_attr`. In native-only targets, associated binary
   exports with a transforming attribute bind their complete macro-visible member
   input, a separate normalized owner/ABI contract, and the revision-backed
-  transformer implementation. Conditional `macro_export`
+  transformer implementation. Native-producing `cdylib`/`staticlib`/`bin`
+  targets, including mixed `rlib + cdylib` targets, also retain typed potential
+  export evidence when a custom associated attribute can synthesize the export
+  itself. The speculative associated-macro fallback is limited to those native
+  artifacts, so an internal macro on a private owner in an `rlib`-only crate does
+  not manufacture API uncertainty. Conditional `macro_export`
   declarations remain root API, while item-position macro invocations in both
   Rust-linkable and native-only targets bind their input to a revision-backed
   implementation substrate; native-only `include!` also retains its included
@@ -424,6 +429,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps its own quit path. A Loctree worker reaped on the narrow
   cancel-versus-wait seam remains a typed cancellation rather than leaking a
   platform-specific wait error.
+- Temporary review worktrees arm a path-exact in-process registration rollback
+  before `git worktree add`. Cancellation or timeout after Git has written
+  common-dir metadata, and cleanup of an already-created snapshot under a
+  cancelled run, remove only that snapshot's administrative entry without
+  spawning an ungoverned child or waiting for a future global prune.
 
 ### Changed
 

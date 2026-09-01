@@ -4353,6 +4353,40 @@ mod tests {
                 })
         );
 
+        let rust_only_manifest = "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['rlib']\n";
+        let rust_only_private_changed = repository_delta(&[
+            ("Cargo.toml", rust_only_manifest, rust_only_manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "macro_rules! helper { () => { fn private(value: u8) {} } } struct Hidden; impl Hidden { helper!(); }\n",
+                "macro_rules! helper { () => { fn private(value: u16) {} } } struct Hidden; impl Hidden { helper!(); }\n",
+            ),
+        ]);
+        assert!(
+            rust_only_private_changed.findings().is_empty(),
+            "an rlib-only associated macro on a private owner is not a native-export fallback: {:?}",
+            rust_only_private_changed.findings()
+        );
+
+        let mixed_manifest = "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['rlib','cdylib']\n";
+        let mixed_private_changed = repository_delta(&[
+            ("Cargo.toml", mixed_manifest, mixed_manifest),
+            ("Cargo.lock", lock, lock),
+            (
+                "src/lib.rs",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native(value: u8) {} } } struct Hidden; impl Hidden { export!(); }\n",
+                "macro_rules! export { () => { #[unsafe(no_mangle)] pub extern \"C\" fn native(value: u16) {} } } struct Hidden; impl Hidden { export!(); }\n",
+            ),
+        ]);
+        assert!(mixed_private_changed.unknown.iter().any(|finding| {
+            finding.identity.name == "MacroGeneratedItems"
+                && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("native-export-associated-macro")
+                        && reason.contains("declarative-implementation-digest:sha256:")
+                })
+        }));
+
         let included_changed = repository_delta(&[
             ("Cargo.toml", manifest, manifest),
             ("Cargo.lock", lock, lock),
@@ -4598,6 +4632,61 @@ mod tests {
                         && reason.contains("macro-implementation-digest:sha256:")
                 })
         }));
+
+        let generated_export_source =
+            "struct Hidden; impl Hidden { #[macros::expose] pub extern \"C\" fn generated(value: u8) {} }\n";
+        let generated_export_before = "#[proc_macro_attribute] pub fn expose(_: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream { let mut output: proc_macro::TokenStream = \"#[unsafe(no_mangle)]\".parse().unwrap(); output.extend(input); output }\n";
+        let generated_export_after = "#[proc_macro_attribute] pub fn expose(_: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n";
+        for generated_manifest in [api_manifest, mixed_api_manifest] {
+            let generated_export_changed = repository_delta(&[
+                ("Cargo.toml", workspace, workspace),
+                ("Cargo.lock", "version = 4\n", "version = 4\n"),
+                ("api/Cargo.toml", generated_manifest, generated_manifest),
+                (
+                    "api/src/lib.rs",
+                    generated_export_source,
+                    generated_export_source,
+                ),
+                ("macros/Cargo.toml", macro_manifest, macro_manifest),
+                (
+                    "macros/src/lib.rs",
+                    generated_export_before,
+                    generated_export_after,
+                ),
+            ]);
+            assert!(generated_export_changed.unknown.iter().any(|finding| {
+                finding.identity.name == "MacroGeneratedItems"
+                    && finding.unknown_reason.as_deref().is_some_and(|reason| {
+                        reason.contains("native-export-associated-function:generated")
+                            && reason.contains("macro-generated-native-export-potential")
+                            && reason.contains("input:# [macros :: expose]")
+                            && reason.contains("associated-owner-contract:impl Hidden")
+                            && reason.contains("macro-implementation-digest:sha256:")
+                    })
+            }));
+        }
+
+        let generated_export_unchanged = repository_delta(&[
+            ("Cargo.toml", workspace, workspace),
+            ("Cargo.lock", "version = 4\n", "version = 4\n"),
+            ("api/Cargo.toml", api_manifest, api_manifest),
+            (
+                "api/src/lib.rs",
+                generated_export_source,
+                generated_export_source,
+            ),
+            ("macros/Cargo.toml", macro_manifest, macro_manifest),
+            (
+                "macros/src/lib.rs",
+                generated_export_before,
+                generated_export_before,
+            ),
+        ]);
+        assert!(
+            generated_export_unchanged.findings().is_empty(),
+            "an unchanged associated native export-generation boundary must neutralize: {:?}",
+            generated_export_unchanged.findings()
+        );
 
         let external_manifest = "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\ncrate-type=['cdylib']\n[dependencies]\nmacros='1'\n";
         let external_lock = "version = 4\n[[package]]\nname='macros'\nversion='1.0.0'\nsource='registry+https://index.crates.io/'\nchecksum='0000000000000000000000000000000000000000000000000000000000000000'\n";

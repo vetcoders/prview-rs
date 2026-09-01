@@ -1168,8 +1168,13 @@ machine is testable without raising a real signal at the test harness.
 Cancelling rather than aborting is the whole point: the supervisor could simply
 drop the run future, but returning through the ordinary error path is what lets
 the destructors on the way out remove the temporary worktrees a killed process
-would leave on disk. A **second** interrupt is the operator declining to wait for
-that and exits immediately.
+would leave on disk. Worktree creation arms a path-exact libgit2 rollback before
+`git worktree add` starts, covering the interval in which Git has registered the
+path but its governed child has not returned. The same in-process fallback
+deregisters an already-created snapshot when a cancelled run refuses to spawn
+`git worktree remove`; it never runs a global prune or touches a sibling
+worktree. `TempDir` remains the filesystem owner. A **second** interrupt is the
+operator declining to wait for the ordinary unwind and exits immediately.
 
 **Cancel ⇒ never a verdict.** Only the checks stage watches
 `governor.cancelled()` itself, and it is one stage of several: a cancel arriving
@@ -1458,15 +1463,22 @@ targets expose only supported procedural macro entry points. A target whose
 effective types are only `cdylib`, `staticlib`, or `bin` is not projected as a
 Rust dependency surface. Its public and private native exports are still
 scanned, including exported associated functions in inherent and trait impls.
-In a native-only target, an associated binary export carrying a transforming
-attribute binds the full macro-visible member input, a separate normalized
-owner/ABI contract, and the revision-backed transformer implementation.
+In a native-producing target, including mixed `rlib + cdylib`, an associated
+binary export carrying a transforming attribute binds the full macro-visible
+member input, a separate normalized owner/ABI contract, and the revision-backed
+transformer implementation. A custom associated attribute may synthesize the
+`no_mangle`/`export_name` attribute during expansion; for `cdylib`, `staticlib`,
+or `bin` output that possibility remains typed macro-generated native-export
+evidence even when no export marker exists in the pre-expansion AST.
 Item-position invocations backed by `macro_rules!`, plus `include!`,
 `global_asm!`, and other opaque macro invocations, are native-export boundaries
-even when the target is not Rust-linkable; their invocation, included source,
-or implementation proof therefore cannot neutralize after the generated native
-surface changes. The native target remains typed uncertainty, so a transition
-to or from a Rust-linkable target cannot be reported as falsely clean.
+when the crate produces one of those native artifacts, even when the target is
+not Rust-linkable; their invocation, included source, or implementation proof
+therefore cannot neutralize after the generated native surface changes. The
+fallback is not applied to private owners in `rlib`-only crates, whose associated
+transform evidence still materializes only after external Rust reachability is
+proven. The native target remains typed uncertainty, so a transition to or from
+a Rust-linkable target cannot be reported as falsely clean.
 
 Reachability starts at each library root. Ordinary inline modules and
 `mod foo;` files (`foo.rs` or `foo/mod.rs`) are walked as whole syntax trees.
@@ -1639,10 +1651,11 @@ contract. Associated-item
 transform evidence is materialized only after its inherent or trait owner
 reaches the external API, directly or by reexport. Public type-alias chains are
 resolved transitively and conservatively emit owner uncertainty because source
-analysis does not prove generic specialization. Function-like associated
-macros, top-level macro invocations (including native-only item-position
-boundaries), and nested trait/trait-impl attributes bind both their
-invocation/input and the appropriate revision-backed implementation substrate.
+analysis does not prove generic specialization. Function-like associated macros
+on externally reachable Rust owners, native-artifact item-position boundaries
+(including private owners), top-level macro invocations, and nested
+trait/trait-impl attributes bind both their invocation/input and the appropriate
+revision-backed implementation substrate.
 Conditional and nested `cfg_attr(..., macro_export)` declarations remain
 crate-root macro API only for Rust-linkable targets. A lock-backed external
 candidate binds all reachable product/path manifests, effective Cargo config
