@@ -30,15 +30,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared literal subset, and Pytest is explicitly unfiltered.
 - Repo-backed Rust API analysis now discovers Cargo's real binary targets from
   `src/main.rs`, `src/bin/*.rs`, `src/bin/*/main.rs`, and `[[bin]]` entries,
-  respecting `autobins`, target editions, explicit paths, and
-  `required-features`. Binary targets keep a target-scoped analysis identity,
+  respecting the per-target-category edition-2015 `autobins` default, explicit
+  paths, and `required-features`. Implicit libraries remain independent of
+  explicit binary/example/test/bench targets unless `autolib = false`.
+  Cargo-valid special library identities (`self`, `crate`, `super`, and `Self`)
+  remain analyzable as manifest identities even though they cannot be written
+  as raw Rust identifiers. Binary targets keep a target-scoped analysis identity,
   preserving digit-prefixed and hyphen/underscore-distinct manifest target names, so
   `foo-bar` and `foo_bar` cannot collide and native-export evidence cannot
-  inherit a same-named library's Rust dependency projection.
+  inherit a same-named library's Rust dependency projection. Direct native
+  function evidence excludes implementation bodies, matching associated
+  exports, while static initializers remain observable.
 - While the TUI waits for an in-process synchronous analysis stage to unwind,
   it continues reading raw terminal input. A second Ctrl-C now returns typed
   cancellation immediately, allowing terminal cleanup and the established exit
-  130 path instead of trapping the operator in the cancel join.
+  130 path instead of trapping the operator in the cancel join. Headless and
+  TUI cancellation both split the synchronous cancel transition from blocking
+  process-tree termination, so the second interrupt stays live even while a
+  Windows `taskkill` is still running. A ready interrupt is drained before a
+  completed work future can publish a verdict.
 - The opt-in balanced resource plan no longer creates two parent permits on a
   one-core host; parent permits now stay within the detected logical-core count,
   preserving the advertised single-heavy-tool envelope on constrained runners.
@@ -75,8 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Off-HEAD Python pre-sync now runs on the shared reviewed snapshot with the
   same per-commit `UV_PROJECT_ENVIRONMENT` as Ruff, Mypy, and Pytest; it no
   longer mutates the operator checkout's environment or warms a venv the gates
-  do not use. Every later `uv run` inherits the same `UV_CONCURRENT_*` and
-  `CARGO_BUILD_JOBS` caps, so a failed pre-sync cannot retry an unbounded build.
+  do not use. `uv.toml` is contained like `pyproject.toml` and `uv.lock`, while
+  ambient uv config/project/working-directory redirects fail closed when they
+  would leave the exact reviewed root. Repository `uv.toml` or `[tool.uv]`
+  concurrency limits are ceilings alongside inherited environment values and
+  the resource plan. Every later `uv run` inherits the same resolved
+  `UV_CONCURRENT_*` and `CARGO_BUILD_JOBS` caps, so a failed pre-sync cannot
+  retry an unbounded build or override a stricter project limit.
   Pytest is pinned to the single config selected inside the reviewed root (or
   an explicit empty config), preventing ambient parent options from changing
   the run. An isolated probe of the actual project pytest selects the supported

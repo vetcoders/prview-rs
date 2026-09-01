@@ -222,7 +222,17 @@ falls back to the operator home rather than being mistaken for the reviewed cwd.
 Cold Python environment setup and every later `uv run` apply the same cap to
 `UV_CONCURRENT_DOWNLOADS`, `UV_CONCURRENT_BUILDS`,
 `UV_CONCURRENT_INSTALLS`, and `CARGO_BUILD_JOBS` for Rust-backed Python
-packages. Pytest also receives
+packages. Each uv pool is the minimum of the run plan, a positive inherited
+environment value, and the matching project value from `uv.toml` or
+`[tool.uv]`; `uv.toml` wins when both project files exist. Invalid or
+unreadable concurrency authority fails closed instead of widening the run.
+`pyproject.toml`, `uv.lock`, and any discovered `uv.toml` must resolve inside the
+reviewed tree. An explicit in-tree `UV_CONFIG_FILE` replaces discovery, matching
+uv's precedence. `UV_PROJECT`, `UV_WORKING_DIR`, and the legacy
+`UV_WORKING_DIRECTORY` are refused when they redirect execution away from the
+exact reviewed root; an in-tree explicit config remains the concurrency
+authority uv will actually use. User- and system-level uv configuration is not
+currently reproduced by this project-level resolver. Pytest also receives
 `PYTEST_XDIST_AUTO_NUM_WORKERS`; when project or inherited addopts request
 xdist (`-n auto`, `logical`, or explicit `-n N`), prview caps only a dynamic or
 too-large pool. An explicit smaller count and `-n 0` remain unchanged. A short,
@@ -652,16 +662,20 @@ visibility-changed Rust facts are breaking; added-only facts are informational.
 Typed unknowns degrade confidence and require review without claiming a
 confirmed removal. Rust identities include ordinary type/value/macro items plus
 public modules, library crates, and Cargo features. An implicit library target
-is present only when Cargo auto-discovery is enabled for the effective edition
-and a live `src/lib.rs` exists; absence is not a `MissingLibRoot`, while an
-explicit unavailable `[lib]` root remains unknown. A tracked symlink in the
-implicit root position is not followed and remains non-neutralizable typed
+is present whenever a live `src/lib.rs` exists unless `package.autolib = false`;
+explicit targets and the package edition do not turn it off. Absence is not a
+`MissingLibRoot`, while an explicit unavailable `[lib]` root remains unknown. A
+tracked symlink in the implicit root position is not followed and remains non-neutralizable typed
 uncertainty on both sides. Cargo-valid keyword package and library names that
-can be addressed as raw identifiers remain part of the census. Ordinary Rust
+can be addressed as raw identifiers remain part of the census, as do Cargo-valid
+special identities `self`, `crate`, `super`, and `Self`; these remain manifest
+identity strings rather than synthetic Rust paths. Ordinary Rust
 items are projected only for Rust-linkable `lib`/`rlib`/`dylib` outputs. Real
 Cargo binary roots are discovered from `src/main.rs`, both supported `src/bin`
 layouts, and explicit `[[bin]]` tables with Cargo's `autobins`, edition, path,
-and `required-features` rules. An exact tracked binary-root symlink fails
+and `required-features` rules. For edition 2015, only explicit `[[bin]]` metadata
+disables implicit binary discovery by default; unrelated explicit
+examples, tests, benches, or libraries do not. An exact tracked binary-root symlink fails
 closed; symlinked parent directories such as `src/` or `src/bin/` are not
 separately classified by this discovery layer. Each binary has a target-scoped
 analysis identity separate from a same-named library. The identity preserves
@@ -674,7 +688,9 @@ native-only `cdylib`/`staticlib`/`bin` targets retain binary-export and target
 uncertainty, including exported associated functions in inherent and trait
 impls, without pretending that their internal `pub` items are dependency API.
 Native export signatures are bound to local type semantics so an alias-only ABI
-change cannot neutralize as unchanged evidence. Native-producing targets
+change cannot neutralize as unchanged evidence. Direct and associated function
+bodies are excluded from native ABI evidence; static initializers remain part
+of the observable native contract. Native-producing targets
 (including a mixed `rlib + cdylib`) also retain typed potential-export evidence
 when a custom associated attribute or item-position macro can generate the
 native symbol; an

@@ -337,12 +337,19 @@ exists, through that same `plan_python_run()`. Its cwd and
 `UV_PROJECT_ENVIRONMENT` are therefore identical to the later gates; it never
 syncs an off-HEAD dependency set into the operator checkout. uv download/build/
 install pools and Cargo-backed PEP 517 builds inherit the run's child limit.
-The cap remains on every later `uv run`, so an unsuccessful pre-sync cannot
-retry outside the envelope. Before collection, a plugin-disabled, null-config
-`--version` probe uses the same pytest launcher, reviewed cwd, and bounded
-environment as the real check. Its actual major and minor select the pytest
-6.0-7.1, 7.2-8.0, 8.1-8.x, or 9.x discovery contract; unsupported versions fail
-closed instead of guessing.
+Before exporting higher-precedence `UV_CONCURRENT_*` values, the plan reads the
+project-scoped authority selected by uv's explicit/discovery precedence: an
+in-tree `UV_CONFIG_FILE`, otherwise `uv.toml`, otherwise `[tool.uv]` from
+`pyproject.toml`. Each pool takes the
+minimum of that project ceiling, inherited environment, and the run plan;
+malformed, unreadable, non-UTF-8, wrong-type, or non-positive authority fails
+closed. User- and system-level uv config remains outside this deliberately
+project-scoped resolver. The cap remains on every later `uv run`, so an
+unsuccessful pre-sync cannot retry outside the envelope. Before collection, a
+plugin-disabled, null-config `--version` probe uses the same pytest launcher,
+reviewed cwd, and bounded environment as the real check. Its actual major and
+minor select the pytest 6.0-7.1, 7.2-8.0, 8.1-8.x, or 9.x discovery contract;
+unsupported versions fail closed instead of guessing.
 Pytest is then explicitly bound to the one highest-precedence config inside the
 reviewed root (including pytest 9 TOML and hidden variants), or to an empty
 config when the root has none, so it never walks into an ambient parent project.
@@ -405,14 +412,20 @@ Nothing is pre-created — uv rejects an existing directory that is not a valid
 environment, so the directory tree only ever comes from uv itself.
 
 The tools read the project **files**, not the directory, so `plan_python_run()`
-also refuses a `pyproject.toml` or `uv.lock` that resolves outside the tree being
-judged — the Python counterpart of the Cargo manifest guards. A reviewed commit
+also refuses a `pyproject.toml`, discovered `uv.toml`, or `uv.lock` that resolves
+outside the tree being judged — the Python counterpart of the Cargo manifest
+guards. A reviewed commit
 that tracks either as a link to an external file would have ruff, mypy and pytest
 configure themselves, and uv resolve dependencies, from another project, while
 provenance recorded an exact `snapshot` scan and the cache filed the verdict
 under the reviewed commit (`uv run` is given neither `--no-project` nor
 `--locked`, so nothing downstream re-asks). Metadata linked to a real file inside
 the tree resolves back inside and passes: escape is the target, not symlinks.
+Ambient `UV_CONFIG_FILE`, `UV_PROJECT`, `UV_WORKING_DIR`, and legacy
+`UV_WORKING_DIRECTORY` are checked at the same boundary. A config file may stay
+inside the tree, but a project or working-directory redirect must resolve to the
+exact reviewed root; prview reports a planning error instead of silently
+neutralizing an operator setting and certifying a different execution.
 
 The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,
 `Cargo audit`, `Cargo geiger`) run in the snapshot as well, but with one extra
@@ -1154,13 +1167,16 @@ Admission is what makes the distinction real, so the run reports it:
 ```
 governor::with_cancellation(work, governor, CtrlC)
       │
-      ├─ tokio::spawn(supervise)  ── a SEPARATE task, aborted when work returns
+      ├─ tokio::spawn(supervise)
+      │        └── a SEPARATE task, drained by an explicit stop handoff
       │        │  first interrupt
       │        ▼
-      │   governor.cancel()
+      │   governor.begin_cancel()
       │        ├─► semaphore.close()  ── refuses newcomers AND tasks already waiting
       │        ├─► watch::send(true)  ── wakes the dispatcher's select! arm
-      │        └─► kill process tree  ── SIGKILL -pgid (Unix) / Job Object + taskkill fallback (Windows)
+      │        └─► drain children into an owned termination batch
+      │                 └─► blocking tree kill runs off the async interrupt owner
+      │                      (SIGKILL -pgid / Job Object + taskkill fallback)
       │        │  second interrupt
       │        ▼
       │   Interrupts::abandon_run()   ── exit(130) without waiting for the unwind
@@ -1190,6 +1206,15 @@ the stage is about to block so the interrupt supervisor (headless) and the
 event loop (TUI q/Escape) keep a thread to be polled on. The interrupt source
 is the `Interrupts` trait rather than a direct `ctrl_c()` call, so the state
 machine is testable without raising a real signal at the test harness.
+
+Cancellation has a synchronous truth boundary and a blocking cleanup half.
+`begin_cancel()` publishes the cancelled state, closes admission, and drains
+the child registry before the work future can finish. The owned termination
+batch then runs outside the async signal owner, which keeps polling a second
+interrupt while a platform tree killer is blocked. Headless completion uses the
+same biased `InterruptSupervisor::stop().await` handoff as TUI startup: an
+already-ready signal is drained, cancellation is re-checked, and no successful
+work value can cross the verdict boundary after Ctrl-C.
 
 `blocking_stage` makes the surrounding runtime responsive; it does not preempt
 the in-process libgit2 closure itself. After the TUI's first quit request cancels
@@ -1518,12 +1543,13 @@ and edition stay in evidence/provenance rather than globally changing every
 crate fact. Optional normal/build/target
 dependencies without an explicit `[features]` entry become implicit Cargo
 features unless suppressed through `dep:` references. Package and explicit
-library names must also be non-empty valid Cargo/crate identifiers, including
-Cargo-valid keyword names that Rust can address as raw identifiers; reserved
-path keywords such as `crate`, `self`, `Self`, and `super` remain invalid. A
-TOML string alone is not semantic validation. A valid virtual workspace is
-non-crate; an implicit library exists only when effective `autolib` permits it
-and its live default `src/lib.rs` exists. Its absence is not a missing-root
+library names must also be non-empty Cargo-valid identities. Keywords addressable
+as raw identifiers and Cargo-valid special values `crate`, `self`, `Self`, and
+`super` remain string identities in the census; prview does not synthesize an
+invalid Rust path from them. A TOML string alone is not semantic validation. A
+valid virtual workspace is non-crate; an implicit library exists whenever its
+live default `src/lib.rs` exists unless `package.autolib = false`, independently
+of edition and unrelated explicit targets. Its absence is not a missing-root
 error, while an explicit `[lib]` whose effective root is unavailable remains
 typed `MissingLibRoot`. A tracked symlink at an implicit library root is not
 followed: its compiler-visible source and module base are revision-ambiguous,
@@ -1537,8 +1563,9 @@ manifests and roots remain typed unknowns.
 Real binary-target discovery is separate from the library early-exit. It
 recognizes Cargo's implicit `src/main.rs`, `src/bin/*.rs`, and
 `src/bin/*/main.rs` roots plus explicit `[[bin]]` entries; applies the edition
-2015 auto-discovery default and `package.autobins`; and validates target name,
-explicit or inferred path, target edition, and `required-features`. Explicit
+2015 auto-discovery default per binary target category (only explicit `[[bin]]`
+metadata disables implicit bins by default) and `package.autobins`; and validates
+target name, explicit or inferred path, target edition, and `required-features`. Explicit
 targets claim their roots so the same source is not also invented as an
 auto-discovered target. Malformed, unavailable, duplicate, or ambiguous target
 metadata remains typed manifest uncertainty. An exact binary root that is
@@ -1562,6 +1589,9 @@ targets expose only supported procedural macro entry points. A target whose
 effective types are only `cdylib`, `staticlib`, or `bin` is not projected as a
 Rust dependency surface. Its public and private native exports are still
 scanned, including exported associated functions in inherent and trait impls.
+Direct and associated native function evidence contains the normalized
+signature and export attributes but not the implementation block; static
+initializers remain observable because they can determine exported data.
 For ordinary Cargo binaries this scan starts from every discovered binary root;
 internal `pub` items remain absent from the dependency API surface, while native
 export signatures retain typed uncertainty bound to their local type semantics.
