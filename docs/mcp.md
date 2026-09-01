@@ -262,7 +262,9 @@ automatic takeover could race a paused legacy contender, so the response is
 non-retryable `storage_locked` with `recovery_required: true`, the exact
 `lock_path`, and a recovery instruction. Remove only that path, and only after
 verifying that no pre-0.8 prview process is using the same storage root.
-Permission, link, and malformed-lock failures return non-retryable
+An unparseable legacy token is also unattributable stale evidence and follows
+that explicit recovery path. Permission, non-regular-file, symlink/reparse,
+hardlink, and other unsafe lock-file failures return non-retryable
 `storage_corrupt` instead of pretending that another review is live.
 
 The launcher exclusively reserves the future pack directory before spawning so

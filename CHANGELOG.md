@@ -26,8 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "another review is running" response. Live contention carries
   `retryable: true`; a stale legacy-compatible `.active.lock` preserves the
   fail-closed mixed-version invariant but exposes `recovery_required`, its exact
-  path, and no retry timer. Permission, link, and malformed-lock failures surface
-  as non-retryable `storage_corrupt`.
+  path, and no retry timer. Permission, linked-path, and unsafe lock-file I/O
+  failures surface as non-retryable `storage_corrupt`; an unparseable legacy
+  token remains unattributable stale evidence and uses explicit recovery.
 - Python checks honor uv's `UV_NO_CONFIG` boolish contract before inspecting
   repository configuration: enabled values skip discovered `uv.toml` and
   `[tool.uv]` limits, false values preserve discovery, and an explicit contained

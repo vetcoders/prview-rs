@@ -213,6 +213,11 @@ The merge decision is a single enum — `PASS`, `CONDITIONAL`, or `BLOCK` — so
 
 Agents don't have to drive the CLI and parse files. prview ships a native MCP (Model Context Protocol) server so an agent can run a review and consume the verdict and artifacts through tools. The server speaks JSON-RPC over stdio:
 
+MCP `run_review` is supported on Linux, macOS, and Windows, where prview can bind
+its durable running marker to a native PID-reuse-safe process identity. Other
+source-buildable targets can use the CLI directly; see
+[`docs/mcp.md`](docs/mcp.md#run_review) for the lifecycle boundary.
+
 ```bash
 prview mcp
 ```
