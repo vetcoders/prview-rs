@@ -122,6 +122,7 @@ fn activation_lock_failure(
     error: anyhow::Error,
     active_run_id: Option<&str>,
 ) -> ToolError {
+    let lock_path = path.to_string_lossy().into_owned();
     if crate::storage::lock_is_busy(&error) {
         return locked(active_run_id);
     }
@@ -129,7 +130,7 @@ fn activation_lock_failure(
     if crate::storage::lock_requires_manual_recovery(&error) {
         let recovery = format!(
             "verify that no pre-0.8 prview process is using this storage root, then remove exactly {} and retry",
-            path.display()
+            lock_path
         );
         return ToolError::with_extra(
             error_class::STORAGE_LOCKED,
@@ -138,7 +139,7 @@ fn activation_lock_failure(
                 "active_run_id": null,
                 "retryable": false,
                 "recovery_required": true,
-                "lock_path": path,
+                "lock_path": lock_path,
                 "detail": error.to_string(),
                 "recovery": recovery,
             }),
@@ -150,7 +151,7 @@ fn activation_lock_failure(
         format!("failed to acquire branch activation lock: {error}"),
         serde_json::json!({
             "retryable": false,
-            "lock_path": path,
+            "lock_path": lock_path,
         }),
     )
 }
@@ -1001,10 +1002,11 @@ mod tests {
 
     #[test]
     fn activation_lock_failure_distinguishes_busy_recovery_and_storage_errors() {
-        let path = Path::new("review/.active.lock");
+        let temp = tempfile::tempdir().expect("activation fixture");
+        let path = temp.path().join(".active.lock");
 
         let busy = activation_lock_failure(
-            path,
+            &path,
             anyhow::anyhow!("Index lock held by another live process (42) at lock.v2"),
             None,
         );
@@ -1012,34 +1014,50 @@ mod tests {
         assert_eq!(busy.extra["retryable"], serde_json::json!(true));
         assert_eq!(busy.extra["retry_after_ms"], serde_json::json!(5000));
 
-        let stale = activation_lock_failure(
-            path,
-            anyhow::anyhow!(
-                "Stale legacy index lock at review/.active.lock (42:1) requires manual removal"
-            ),
-            None,
-        );
+        std::fs::write(&path, "not-a-lock-token").expect("malformed legacy sentinel");
+        let acquire_error = crate::storage::acquire_lock_at(&path)
+            .expect_err("an unattributable legacy sentinel must fail closed");
+        let stale = activation_lock_failure(&path, acquire_error, None);
         assert_eq!(stale.class, error_class::STORAGE_LOCKED);
         assert_eq!(stale.extra["retryable"], serde_json::json!(false));
         assert_eq!(stale.extra["recovery_required"], serde_json::json!(true));
         assert_eq!(
             stale.extra["lock_path"],
-            serde_json::json!("review/.active.lock")
+            serde_json::json!(path.to_string_lossy())
         );
         assert!(
             stale.extra["recovery"]
                 .as_str()
-                .is_some_and(|value| value.contains("review/.active.lock"))
+                .is_some_and(|value| value.contains(".active.lock"))
         );
         assert!(stale.extra.get("retry_after_ms").is_none());
 
         let unsafe_path = activation_lock_failure(
-            path,
+            &path,
             anyhow::anyhow!("lock path is not a regular file"),
             None,
         );
         assert_eq!(unsafe_path.class, error_class::STORAGE_CORRUPT);
         assert_eq!(unsafe_path.extra["retryable"], serde_json::json!(false));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn activation_lock_failure_serializes_non_utf8_paths_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"review/non-utf8-\xff/.active.lock".to_vec(),
+        ));
+        let error = activation_lock_failure(
+            &path,
+            anyhow::anyhow!("Stale legacy index lock requires manual removal"),
+            None,
+        );
+
+        assert_eq!(error.class, error_class::STORAGE_LOCKED);
+        assert_eq!(error.extra["recovery_required"], serde_json::json!(true));
+        assert!(error.extra["lock_path"].is_string());
     }
 
     #[test]
