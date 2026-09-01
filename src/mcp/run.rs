@@ -416,11 +416,29 @@ async fn quick_wait_failure(
 
 /// Start a review. Returns the ready success body (without `schema_version`,
 /// which the tool layer stamps).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn ensure_run_review_platform_supported() -> Result<(), ToolError> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn ensure_run_review_platform_supported() -> Result<(), ToolError> {
+    Err(ToolError::new(
+        error_class::RUN_FAILED,
+        "MCP run_review requires a native PID-reuse-safe process identity and is supported only on Linux, macOS, and Windows; use the prview CLI directly on this target",
+    ))
+}
+
 pub async fn start(
     repo: &Path,
     base: Option<String>,
     profile: Profile,
 ) -> Result<serde_json::Value, ToolError> {
+    // A durable RUNNING.json marker must name one process incarnation, not
+    // merely a recyclable PID. Refuse before taking a lock or spawning the
+    // review when this target has no native birth-identity implementation.
+    ensure_run_review_platform_supported()?;
+
     let repo_name = crate::config::repo_name_from_root(repo);
     let branch_key = crate::config::storage_branch_key(repo);
 
@@ -917,6 +935,21 @@ mod tests {
     const QUICK_PREEXEC_GAP_FIXTURE_ENV: &str = "PRVIEW_MCP_QUICK_PREEXEC_GAP_DIR";
     #[cfg(unix)]
     const DEEP_NESTED_GROUP_FIXTURE_ENV: &str = "PRVIEW_MCP_DEEP_NESTED_GROUP_DIR";
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn run_review_platform_gate_accepts_native_identity_targets() {
+        ensure_run_review_platform_supported().expect("this target has native process identity");
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    fn run_review_platform_gate_refuses_before_spawn_on_other_targets() {
+        let error = ensure_run_review_platform_supported()
+            .expect_err("unsupported targets must fail before spawn");
+        assert_eq!(error.class, error_class::RUN_FAILED);
+        assert!(error.message.contains("Linux, macOS, and Windows"));
+    }
 
     #[test]
     fn unconfirmed_containment_is_part_of_the_mcp_error_contract() {
