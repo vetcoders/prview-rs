@@ -106,13 +106,17 @@ pub async fn run_tui(config: Config) -> Result<()> {
     .await;
 
     let cleanup_result = cleanup_terminal(&mut terminal);
+    finish_tui_run(run_result, cleanup_result)
+}
+
+fn finish_tui_run(run_result: Result<()>, cleanup_result: Result<()>) -> Result<()> {
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(run_err), Ok(())) => Err(run_err),
         (Ok(()), Err(cleanup_err)) => Err(cleanup_err),
-        (Err(run_err), Err(cleanup_err)) => Err(anyhow::anyhow!(
-            "{run_err}; terminal cleanup failed: {cleanup_err}"
-        )),
+        (Err(run_err), Err(cleanup_err)) => {
+            Err(run_err.context(format!("terminal cleanup failed: {cleanup_err}")))
+        }
     }
 }
 
@@ -281,6 +285,11 @@ async fn join_cancelled_analysis(
 ) -> Result<()> {
     let cancel = cancel_analysis(analysis).await;
     match (result, cancel) {
+        // A second raw-mode Ctrl-C is the operator declining to wait for an
+        // in-process synchronous stage to unwind. Preserve typed cancellation
+        // over an earlier UI error so `run_tui` restores the terminal and main
+        // exits through the established 130 path.
+        (_, Err(err)) if crate::governor::is_cancellation(&err) => Err(err),
         (Ok(()), Ok(())) => Ok(()),
         (Err(err), _) => Err(err),
         (Ok(()), Err(err)) => Err(err),
@@ -321,12 +330,44 @@ async fn cancel_analysis(analysis: &mut Option<AnalysisTask>) -> Result<()> {
     };
 
     task.governor.cancel();
-    match task.handle.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) if crate::governor::is_cancellation(&err) => Ok(()),
-        Ok(Err(err)) => Err(err),
-        Err(join_err) => Err(anyhow::anyhow!("analysis task aborted: {join_err}")),
+    let mut handle = task.handle;
+    loop {
+        tokio::select! {
+            biased;
+            joined = &mut handle => {
+                return match joined {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(err)) if crate::governor::is_cancellation(&err) => Ok(()),
+                    Ok(Err(err)) => Err(err),
+                    Err(join_err) => Err(anyhow::anyhow!("analysis task aborted: {join_err}")),
+                };
+            }
+            input = next_terminal_event(Duration::from_millis(100)) => {
+                if is_raw_ctrl_c(input?.as_ref()) {
+                    // `blocking_stage` deliberately keeps non-Send libgit2 work
+                    // in-process and cannot preempt that closure. Aborting marks
+                    // the task cancelled once the closure returns to the async
+                    // task; the typed error first returns through `run_tui` so
+                    // raw mode and the alternate screen are restored, then main
+                    // exits 130.
+                    handle.abort();
+                    return Err(crate::governor::Cancelled.into());
+                }
+            }
+        }
     }
+}
+
+fn is_raw_ctrl_c(event: Option<&Event>) -> bool {
+    matches!(
+        event,
+        Some(Event::Key(key))
+            if key.kind == KeyEventKind::Press
+                && key.code == crossterm::event::KeyCode::Char('c')
+                && key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
+    )
 }
 
 /// Handle async TUI events
@@ -459,14 +500,7 @@ pub async fn run_tui_state(config: Config, repo_state: crate::state::RepoState) 
     .await;
 
     let cleanup_result = cleanup_terminal(&mut terminal);
-    match (run_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(run_err), Ok(())) => Err(run_err),
-        (Ok(()), Err(cleanup_err)) => Err(cleanup_err),
-        (Err(run_err), Err(cleanup_err)) => Err(anyhow::anyhow!(
-            "{run_err}; terminal cleanup failed: {cleanup_err}"
-        )),
-    }
+    finish_tui_run(run_result, cleanup_result)
 }
 
 /// Run the full analysis pipeline asynchronously.
@@ -658,6 +692,47 @@ mod tests {
             .expect_err("a late startup interrupt must not become TUI success");
 
         assert!(crate::governor::is_cancellation(&error), "{error:#}");
+    }
+
+    #[test]
+    fn terminal_cleanup_context_preserves_typed_cancellation() {
+        let error = finish_tui_run(
+            Err(crate::governor::Cancelled.into()),
+            Err(anyhow::anyhow!("raw-mode cleanup failed")),
+        )
+        .expect_err("cleanup context must not erase cancellation");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+        assert!(
+            error.to_string().contains("terminal cleanup failed"),
+            "cleanup failure remains visible: {error:#}"
+        );
+    }
+
+    #[test]
+    fn reported_repeat_or_release_does_not_force_cancel() {
+        let pressed = Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert!(is_raw_ctrl_c(Some(&pressed)));
+
+        let mut repeated = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        repeated.kind = KeyEventKind::Repeat;
+        assert!(
+            !is_raw_ctrl_c(Some(&Event::Key(repeated))),
+            "a terminal-reported repeat is not a second interrupt"
+        );
+
+        let mut released = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        released.kind = KeyEventKind::Release;
+        assert!(!is_raw_ctrl_c(Some(&Event::Key(released))));
     }
 
     struct ChannelInterrupts(tokio::sync::mpsc::UnboundedReceiver<()>);
@@ -919,6 +994,107 @@ mod tests {
                 "cancelled analysis must not publish a completion/verdict event"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn second_ctrl_c_escapes_a_synchronous_analysis_join() {
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        let oracle_governor = Arc::clone(&governor);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let handle = tokio::spawn(async move {
+            crate::governor::blocking_stage(|| {
+                entered_tx.send(()).expect("publish blocking-stage entry");
+                release_rx.recv().expect("release blocking-stage barrier");
+                finished_tx
+                    .send(())
+                    .expect("publish blocking-stage completion");
+            });
+            Err(crate::governor::Cancelled.into())
+        });
+
+        // The closure must already own the sole original worker before input is
+        // delivered. `blocking_stage` should let Tokio run this test/event loop
+        // on a replacement worker, but cancellation cannot preempt the closure.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match entered_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("blocking-stage entry sender disconnected")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("blocking stage did not start");
+
+        let mut analysis = Some(AnalysisTask { governor, handle });
+        let mut state = TuiState::new(default_config());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(press(crossterm::event::KeyCode::Char('q')))
+            .expect("inject graceful quit key");
+        input_tx
+            .send(Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )))
+            .expect("inject forced quit key");
+
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            TEST_INPUT_EVENTS.scope(
+                std::cell::RefCell::new(input_rx),
+                run_event_loop(&mut terminal, &mut state, &tx, &mut rx, &mut analysis),
+            ),
+        )
+        .await
+        .expect("second Ctrl-C did not escape the synchronous join")
+        .expect_err("second Ctrl-C must return typed cancellation");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+        assert!(
+            oracle_governor.is_cancelled(),
+            "the graceful quit must cancel the analysis governor first"
+        );
+        assert!(state.should_quit);
+        assert!(analysis.is_none());
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, TuiEvent::AnalysisComplete { .. }),
+                "forced cancellation must not publish a completion/verdict event"
+            );
+        }
+
+        // The second Ctrl-C returned while the closure was still blocked. Let
+        // the detached block-in-place task finish so the test leaves no worker
+        // behind; production main exits 130 after terminal cleanup instead.
+        release_tx
+            .send(())
+            .expect("release blocking-stage barrier after escape");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match finished_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("blocking-stage completion sender disconnected")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("blocking stage did not finish after release");
     }
 
     fn press(code: crossterm::event::KeyCode) -> Event {

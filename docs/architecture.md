@@ -1173,6 +1173,27 @@ event loop (TUI q/Escape) keep a thread to be polled on. The interrupt source
 is the `Interrupts` trait rather than a direct `ctrl_c()` call, so the state
 machine is testable without raising a real signal at the test harness.
 
+`blocking_stage` makes the surrounding runtime responsive; it does not preempt
+the in-process libgit2 closure itself. After the TUI's first quit request cancels
+the governor, the cancel join therefore keeps polling raw input while it waits
+for that closure to unwind. A second Ctrl-C aborts the task wait and returns
+typed cancellation through `run_tui`, so terminal cleanup runs before the
+established exit-130 path. The in-process closure itself continues until it
+returns naturally or the process exits. Before the durable publication commit,
+cancellation prevents a completion/verdict publication. After that commit the
+pack, `latest`, and index row remain valid by design; a hard second interrupt can
+therefore win the narrow return window and exit 130 even though that already
+committed pack remains discoverable.
+
+The first raw-mode Ctrl-C deliberately shares the TUI's existing cooperative
+quit result with q/Escape: after the join and terminal cleanup it returns
+success. A second Ctrl-C key event selects the typed forced-cancellation path.
+When a terminal reports event kinds, reported repeat/release events from the
+first press do not count. Without keyboard-enhancement negotiation, however,
+some Unix terminals encode autorepeated ETX bytes as ordinary press events;
+this bounded escape hatch cannot distinguish those bytes from a physically new
+press.
+
 Cancelling rather than aborting is the whole point: the supervisor could simply
 drop the run future, but returning through the ordinary error path is what lets
 the destructors on the way out remove the temporary worktrees a killed process
@@ -1320,14 +1341,16 @@ nevertheless held to the same contract as the headless one — same
 copy that had drifted back into both of the bugs above while still claiming to
 mirror `run_all`. Artifact generation on the TUI path uses the same
 `blocking_stage` wrapper as headless, so a single-worker runtime can still
-poll q/Escape while the pack is being written. The initial repository/ref
-preflight is the exception: it runs before raw mode under a temporary Ctrl-C
-signal supervisor, so a slow fetch cannot enter a window where signals are
-disabled but the terminal event reader does not yet exist. The supervisor stays
-alive until raw mode is enabled, then completes an explicit biased handoff that
-consumes any already-pending signal before key events take ownership. Both the
-post-stage and post-handoff checks convert a late interrupt into typed
-cancellation.
+poll q/Escape while the pack is being written. After that first quit stops the
+ordinary event loop, the cancel join remains a terminal-input owner: it waits
+cooperatively for the analysis task but treats a second Ctrl-C as typed forced
+cancellation. The initial repository/ref preflight is the exception: it runs
+before raw mode under a temporary Ctrl-C signal supervisor, so a slow fetch
+cannot enter a window where signals are disabled but the terminal event reader
+does not yet exist. The supervisor stays alive until raw mode is enabled, then
+completes an explicit biased handoff that consumes any already-pending signal
+before key events take ownership. Both the post-stage and post-handoff checks
+convert a late interrupt into typed cancellation.
 
 **Operator surface.** `--resource-budget safe|balanced` selects the plan; preflight
 prints requested/effective budget, parent permits, child-worker cap, current-load

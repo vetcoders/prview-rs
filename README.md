@@ -121,6 +121,11 @@ one expensive tool and one supported child worker at a time. The preflight names
 the effective budget, expensive checks, and schedule; `balanced` remains capped
 and falls back to `safe` under load.
 
+In TUI raw mode, `q`, Escape, or the first Ctrl-C follows the TUI's cooperative
+quit path and returns normally after cleanup. If an in-process Git analysis
+stage is still unwinding, a second Ctrl-C event is the immediate escape hatch:
+the terminal is restored before prview exits 130.
+
 ## Quality gate
 
 `prview gate` runs the standard fast gate profile, reads the verdict from the
@@ -132,7 +137,7 @@ generated merge-gate artifact, and exits with the automation contract:
 | `1` | `BLOCK` |
 | `2` | Review-required under `--strict`, or warnings-only with `--strict --fail-on-warnings` |
 | `3` | Gate execution failed before a trustworthy verdict was available |
-| `130` | The operator cancelled the run (Ctrl-C); it produced no verdict |
+| `130` | A headless/preflight Ctrl-C or second raw-mode TUI Ctrl-C event forced cancellation; the CLI reports no new verdict, while any pack already durably committed remains discoverable |
 
 Use `prview gate --json` for schema-friendly stdout with the verdict, caveats,
 blocking issues, typed `enforcement_disposition`, and artifact paths. A strict

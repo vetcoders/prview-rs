@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- While the TUI waits for an in-process synchronous analysis stage to unwind,
+  it continues reading raw terminal input. A second Ctrl-C now returns typed
+  cancellation immediately, allowing terminal cleanup and the established exit
+  130 path instead of trapping the operator in the cancel join.
 - The opt-in balanced resource plan no longer creates two parent permits on a
   one-core host; parent permits now stay within the detected logical-core count,
   preserving the advertised single-heavy-tool envelope on constrained runners.
