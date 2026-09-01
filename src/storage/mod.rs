@@ -543,10 +543,14 @@ mod publication_lock_wait_test_hook {
 #[cfg(test)]
 pub(crate) use publication_lock_wait_test_hook::WaitGuard as PublicationLockWaitGuard;
 
-fn lock_is_busy(error: &anyhow::Error) -> bool {
+pub(crate) fn lock_is_busy(error: &anyhow::Error) -> bool {
     error
         .to_string()
         .starts_with("Index lock held by another live process")
+}
+
+pub(crate) fn lock_requires_manual_recovery(error: &anyhow::Error) -> bool {
+    error.to_string().starts_with("Stale legacy index lock")
 }
 
 /// Acquire a file lock at an explicit path.

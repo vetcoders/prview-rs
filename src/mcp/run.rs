@@ -111,7 +111,46 @@ fn locked(active_run_id: Option<&str>) -> ToolError {
         "another review is already running for this repo branch",
         serde_json::json!({
             "active_run_id": active_run_id,
+            "retryable": true,
             "retry_after_ms": 5000,
+        }),
+    )
+}
+
+fn activation_lock_failure(
+    path: &Path,
+    error: anyhow::Error,
+    active_run_id: Option<&str>,
+) -> ToolError {
+    if crate::storage::lock_is_busy(&error) {
+        return locked(active_run_id);
+    }
+
+    if crate::storage::lock_requires_manual_recovery(&error) {
+        let recovery = format!(
+            "verify that no pre-0.8 prview process is using this storage root, then remove exactly {} and retry",
+            path.display()
+        );
+        return ToolError::with_extra(
+            error_class::STORAGE_LOCKED,
+            "the branch activation lock is stale and requires operator recovery",
+            serde_json::json!({
+                "active_run_id": null,
+                "retryable": false,
+                "recovery_required": true,
+                "lock_path": path,
+                "detail": error.to_string(),
+                "recovery": recovery,
+            }),
+        );
+    }
+
+    ToolError::with_extra(
+        error_class::STORAGE_CORRUPT,
+        format!("failed to acquire branch activation lock: {error}"),
+        serde_json::json!({
+            "retryable": false,
+            "lock_path": path,
         }),
     )
 }
@@ -445,17 +484,26 @@ pub async fn start(
     // mcp-3/TOCTOU: the R2b "one active run" rule was a check-then-act — two
     // concurrent starts could both see no active run and both proceed. Serialize
     // activation for this repo branch behind the storage layer's OS file lock.
-    // The handle is released by the kernel even if the owner process dies. Held for
-    // the whole quick run and until a deep run's marker is on disk, so the
-    // window between "check" and "marker visible to `active_run`" is closed.
-    let _activation = match crate::storage::acquire_lock_at(&branch_activation_lock_path(
-        &repo_name,
-        &branch_key,
-    )) {
+    // The v2 handle is released by the kernel even if the owner process dies.
+    // Its legacy-compatible sentinel remains deliberately fail-closed and is
+    // surfaced as explicit recovery evidence below. The guard is held for the
+    // whole quick run and until a deep run's marker is on disk, so the window
+    // between "check" and "marker visible to `active_run`" is closed.
+    let activation_path = branch_activation_lock_path(&repo_name, &branch_key);
+    let _activation = match crate::storage::acquire_lock_at(&activation_path) {
         Ok(guard) => guard,
         // Another activation is in flight; surface the current run id if its
-        // marker already landed, else a bare storage_locked.
-        Err(_) => return Err(locked(active_run(&repo_name, &branch_key).as_deref())),
+        // marker already landed. A stale compatibility sentinel instead carries
+        // an explicit, non-retryable recovery contract; unrelated filesystem
+        // failures must not impersonate a live review.
+        Err(error) => {
+            let active_run_id = active_run(&repo_name, &branch_key);
+            return Err(activation_lock_failure(
+                &activation_path,
+                error,
+                active_run_id.as_deref(),
+            ));
+        }
     };
 
     // R2b: one active run per repo branch (now race-free under the lock above).
@@ -949,6 +997,49 @@ mod tests {
             .expect_err("unsupported targets must fail before spawn");
         assert_eq!(error.class, error_class::RUN_FAILED);
         assert!(error.message.contains("Linux, macOS, and Windows"));
+    }
+
+    #[test]
+    fn activation_lock_failure_distinguishes_busy_recovery_and_storage_errors() {
+        let path = Path::new("review/.active.lock");
+
+        let busy = activation_lock_failure(
+            path,
+            anyhow::anyhow!("Index lock held by another live process (42) at lock.v2"),
+            None,
+        );
+        assert_eq!(busy.class, error_class::STORAGE_LOCKED);
+        assert_eq!(busy.extra["retryable"], serde_json::json!(true));
+        assert_eq!(busy.extra["retry_after_ms"], serde_json::json!(5000));
+
+        let stale = activation_lock_failure(
+            path,
+            anyhow::anyhow!(
+                "Stale legacy index lock at review/.active.lock (42:1) requires manual removal"
+            ),
+            None,
+        );
+        assert_eq!(stale.class, error_class::STORAGE_LOCKED);
+        assert_eq!(stale.extra["retryable"], serde_json::json!(false));
+        assert_eq!(stale.extra["recovery_required"], serde_json::json!(true));
+        assert_eq!(
+            stale.extra["lock_path"],
+            serde_json::json!("review/.active.lock")
+        );
+        assert!(
+            stale.extra["recovery"]
+                .as_str()
+                .is_some_and(|value| value.contains("review/.active.lock"))
+        );
+        assert!(stale.extra.get("retry_after_ms").is_none());
+
+        let unsafe_path = activation_lock_failure(
+            path,
+            anyhow::anyhow!("lock path is not a regular file"),
+            None,
+        );
+        assert_eq!(unsafe_path.class, error_class::STORAGE_CORRUPT);
+        assert_eq!(unsafe_path.extra["retryable"], serde_json::json!(false));
     }
 
     #[test]
