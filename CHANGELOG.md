@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- MCP deep reviews retain and reap every detached direct child, including an
+  immediately failing process, so a zombie cannot keep a later review blocked.
+  Versioned running markers bind the PID to its native process-birth identity
+  across Linux, macOS, and Windows; recycled v2 PIDs become stale, while a live
+  legacy PID blocks conservatively until it exits. Marker or reaper setup
+  failures terminate and reap the child tree before the RPC returns
+  `run_failed`.
 - Off-HEAD Python pre-sync now runs on the shared reviewed snapshot with the
   same per-commit `UV_PROJECT_ENVIRONMENT` as Ruff, Mypy, and Pytest; it no
   longer mutates the operator checkout's environment or warms a venv the gates
@@ -84,8 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a manifest cannot combine `[workspace]` with `package.workspace`.
 - Inherited, `pub(crate)`, and `pub(super)` fields share one external-private
   Rust API visibility while their types and tuple positions remain observable.
-- `uv sync` preserves an operator's stricter inherited `UV_CONCURRENT_*` caps
-  instead of raising them to the prview worker limit.
+- `uv sync` preserves an operator's stricter inherited `UV_CONCURRENT_*` caps,
+  and direct Cargo gates preserve a stricter inherited `CARGO_BUILD_JOBS`,
+  instead of raising either to the prview worker limit.
 - Snapshot extraction preserves the `git archive` stdout pipe after applying
   hardened subprocess defaults, so `tar` receives the archive instead of an
   empty stdin and the producer no longer exits through SIGPIPE.
@@ -201,8 +209,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   renaming `impl<T> Trait for Wrapper<T>` to `impl<U> Trait for Wrapper<U>`
   is not a review-required unknown delta.
 - Public trait associated const/type members reuse the same alpha-normalized
-  binder scopes, and named fields added to a variant-level `#[non_exhaustive]`
-  variant remain informational rather than a parent breaking change.
+  binder scopes. Rust API additions remain informational only when they cannot
+  add an auto-trait input or shift an existing implicit discriminant: an
+  appended fieldless variant on an otherwise unchanged `#[non_exhaustive]` enum
+  qualifies; inserted or payload variants and fields added to existing structs
+  or variants retain a parent `Changed` finding.
+- A check admitted by the resource governor but unable to launch its target
+  command is recorded as ledger `skipped`, not as live `run` coverage. Checks
+  that actually execute before returning a runtime skip remain `run`.
 - `include!`, `include_str!` and `include_bytes!` dependencies in every public
   contract position carry their source digest, including declarations exposed
   through private-module reexports, without degrading unreachable declarations

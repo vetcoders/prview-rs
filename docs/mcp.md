@@ -142,6 +142,16 @@ matching durable row is never exposed as completed. Synchronous launch fails
 loud; later readers report failed or stale according to the surviving control
 marker instead of fabricating completion from SANITY alone.
 
+**`deep` is asynchronous but still process-owned.** The MCP server keeps the
+spawned child handle in a dedicated waiter until the direct process is reaped;
+an immediately failing review therefore cannot remain as a zombie or block the
+next review. On Unix, normal root exit also terminates residual members of the
+root's dedicated process group; Windows retains the complete Job Object. The
+`running` response is returned only after `RUNNING.json` has
+been written and that reaper has started. If process-identity capture, marker
+publication, or reaper setup fails, prview terminates the spawned process tree,
+reaps its direct root, and returns `run_failed`.
+
 ```json
 {
   "run_id": "20260701-120000-a1b2c3d",
@@ -344,7 +354,13 @@ Completed response:
 ```
 
 While a `deep` run is in flight or after it dies, `verdict` reports liveness via
-the run's `RUNNING.json` marker instead of a decision:
+the run's versioned `RUNNING.json` marker instead of a decision. Marker v2 binds
+the PID to a native process-birth identity (Linux boot UUID plus start ticks,
+macOS process start time, or Windows creation FILETIME), so PID recycling cannot
+make a v2 run appear live. A PID-only legacy marker with a live PID deliberately
+blocks as `running` until that PID exits; without a birth token, preserving the
+one-active-run invariant is safer than starting a second heavy review. A legacy
+marker becomes `stale` once its PID is dead:
 
 | `status` | Meaning | Extra fields |
 |----------|---------|--------------|

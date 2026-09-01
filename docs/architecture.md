@@ -876,6 +876,12 @@ overwritten with the current run's substrate. An unknown key survives only where
 the run genuinely resolved no substrate (nothing needed a shared snapshot), which
 is what `TaskLedger::lookup_tool`'s fallback still covers.
 
+Admission is not itself proof that a target command executed. If a non-security
+check is admitted but its launcher returns a missing/unlaunchable-tool error,
+its no-command provenance is recorded as `Skipped` with both queue timestamps.
+A tool that did start, inspect the substrate, and later returns a runtime
+`Skipped` result remains `Run`; status text alone cannot erase live coverage.
+
 Context commands that actually execute are recorded too, by
 `artifacts::context_artifacts::record_context_runs`, once the runtime knows their
 duration: `Run` for anything that started (including a failure or a timeout — the
@@ -1077,7 +1083,9 @@ Job Object contract cannot disappear with an unrelated dependency change.
   which defaults to `Exclusive`. Rustfmt opts into `Light`; Cargo/rustc, Vitest
   and Semgrep opt into `Heavy` because they receive `CARGO_BUILD_JOBS`,
   `--maxWorkers`, and `--jobs` respectively. TSC, ESLint, Stylelint, Python gates
-  and other uncapped pools stay `Exclusive`.
+  and other uncapped pools stay `Exclusive`. Cargo's child cap is the minimum of
+  the active resource plan and any positive inherited `CARGO_BUILD_JOBS`, so an
+  operator's stricter limit is never raised.
 - **Context commands** (`artifacts::context_artifacts`) take a permit before each
   spawn, via the synchronous `try_acquire` — `artifacts::generate` is a blocking
   pipeline with a poll loop and has nothing to `.await` on. The weight comes from
@@ -1313,6 +1321,18 @@ It adds no review logic: tools spawn `prview` as a subprocess to produce a pack
 and read truth back from storage. Every tool takes an explicit `repo` path,
 every response carries `schema_version`, and every failure is fail-loud. See
 `docs/mcp.md` for the tool reference.
+
+Deep reviews are asynchronous at the RPC boundary, not unowned processes. A
+dedicated waiter thread retains each `Child` and reaps its direct root, including
+an immediate failure. After normal root exit it also terminates residual Unix
+process-group members; Windows retains the complete Job Object until wait.
+`RUNNING.json` protocol v2 pairs the PID with the native
+process creation identity; liveness requires both values to match, while legacy
+PID-only markers fail closed by blocking while their PID is live, then become
+stale after it exits. The server returns `status: running` for a new review only
+after identity capture, marker publication, and reaper installation all succeed.
+Failure at any setup seam terminates the child tree, reaps the direct root, and
+fails the RPC instead of publishing an untracked run.
 
 ### artifacts/mod.rs
 
@@ -1610,28 +1630,28 @@ reachable `items` remain the API surface.
 
 Named-struct field projection is policy-aware. A public field added to an
 existing exhaustive struct is a `Changed` parent contract because downstream
-struct literals and exhaustive patterns stop compiling. The same field on an
-existing `#[non_exhaustive]` struct remains an informational `Added` field, and
-a wholly new public struct remains an added item; neither case inherits the
-existing-exhaustive breaking rule. That exception is proven by subtracting only
-the added public field and comparing the complete parent remainder: attrs,
-generics, repr policy, and normalized private-field semantics must still match.
-A simultaneous parent/private change therefore retains `Changed`. Public fields
-are selected by external visibility, not by the legal identifier prefix used in
-the internal private-field projection, so a user field named
-`__prview_private_field_*` cannot disappear from the field map.
+struct literals and exhaustive patterns stop compiling. It remains a parent
+`Changed` on an existing `#[non_exhaustive]` struct: callers cannot construct
+or exhaustively match that type, but the field type can still remove
+compiler-derived auto traits from the parent. A wholly new public struct remains
+an added item. Public fields are selected by external visibility, not by the
+legal identifier prefix used in the internal private-field projection, so a
+user field named `__prview_private_field_*` cannot disappear from the field map.
 
 Enum projection applies the corresponding exhaustiveness policy independently:
 adding variants to an exhaustive public enum changes the parent contract, while
-an otherwise unchanged public `#[non_exhaustive]` enum exposes each new variant
-as informational `Added`. ABI-sensitive `#[repr(...)]` enums, including
-primitive integer reprs from `u8` through `isize`, remain on the parent `Changed`
-path even when they are non-exhaustive, because payload growth can change size
-or alignment. Adding a named field to an existing variant-level
-`#[non_exhaustive]` variant is likewise informational: downstream callers cannot
-construct it and must match with `..`. Exhaustive variants, tuple variants,
-field removals/type changes, and enum header/policy changes stay on the
-conservative parent `Changed` path.
+an otherwise unchanged public `#[non_exhaustive]` enum exposes an appended
+fieldless variant as informational `Added`. A fieldless variant inserted before
+an existing variant stays `Changed` because it shifts implicit numeric
+discriminants; payload-bearing variants stay `Changed` because their field types
+can change auto traits. ABI-sensitive
+`#[repr(...)]` enums, including primitive integer reprs from `u8` through
+`isize`, remain on the parent `Changed` path even when they are non-exhaustive,
+because payload growth can change size or alignment. Adding a field to an
+existing variant-level `#[non_exhaustive]` variant also stays on the parent
+`Changed` path: `..` protects matching syntax, not auto-trait compatibility.
+Exhaustive variants, field removals/type changes, and enum header/policy changes
+remain conservative as well.
 
 Exact identity is grouped on both sides before any fact is consumed: only a
 `1 ↔ 1` component may become a confirmed change, while wider components are

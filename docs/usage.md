@@ -203,7 +203,8 @@ at most two capped heavy parents; Cargo/rustc receive `CARGO_BUILD_JOBS`, Vitest
 receives `--maxWorkers`, and Semgrep receives `--jobs`. Tools without a stable
 portable cap (including tsc and ESLint across supported project versions) remain
 serialized. High current load, or an unavailable load reading, backpressures the
-effective plan to `safe`.
+effective plan to `safe`. A positive inherited `CARGO_BUILD_JOBS` remains an
+operator ceiling: prview may lower it to the active plan, but never raises it.
 
 Cold Python environment setup and every later `uv run` apply the same cap to
 `UV_CONCURRENT_DOWNLOADS`, `UV_CONCURRENT_BUILDS`,
@@ -619,13 +620,14 @@ ABI-sensitive `repr(C)`/`repr(packed)`/`repr(transparent)` private layout,
 primitive integer enum reprs, and exhaustive-enum variant additions are
 observable changes. `repr(Rust)` private field order is not, although private
 field types remain observable through auto traits; inherited and restricted
-field visibility are equivalent to an external caller. Additions to an
-otherwise unchanged `#[non_exhaustive]` enum, and named
-fields added to a variant-level `#[non_exhaustive]` variant, are informational
-unless an ABI-sensitive repr makes layout observable. That informational rule
-applies only when the rest of the struct contract is unchanged: a simultaneous
-repr, generic, attribute, or private-field semantic change retains a parent
-`Changed` finding.
+field visibility are equivalent to an external caller. Appending a fieldless
+variant to an otherwise unchanged `#[non_exhaustive]` enum is informational
+unless an ABI-sensitive repr makes layout observable. A new payload-bearing
+variant, a fieldless variant inserted before an existing implicit discriminant,
+a field added to an existing variant, or a field added to an existing public
+struct remains a parent `Changed`: non-exhaustive syntax prevents exhaustive
+construction and matching, but does not prove stable auto traits or numeric
+discriminants.
 Direct private-field types remain in that confirmed parent contract. When a
 public item instead reaches a transitive non-public local type, private alias,
 or local trait implementation whose compiler-derived effect cannot be proven

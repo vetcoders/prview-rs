@@ -854,6 +854,157 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// Return a native, per-process creation token suitable for pairing with a
+/// PID in a durable liveness marker. PIDs are recyclable; the tuple
+/// `(pid, process_birth_identity(pid))` names one operating-system process
+/// incarnation rather than whichever process happens to own that PID later.
+///
+/// The representation is deliberately opaque and platform-prefixed. Callers
+/// persist and compare it byte-for-byte; it is not a timestamp contract.
+pub(crate) fn process_birth_identity(pid: u32) -> std::io::Result<String> {
+    if pid == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pid 0 has no process birth identity",
+        ));
+    }
+    platform_process_birth_identity(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn platform_process_birth_identity(pid: u32) -> std::io::Result<String> {
+    // /proc/<pid>/stat field 22 is the process start time in clock ticks
+    // since boot. The command name in field 2 may contain spaces or ')',
+    // so split only after its final closing `) ` delimiter.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| std::io::Error::other("malformed /proc pid stat"))?;
+    let start_ticks = fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| std::io::Error::other("missing /proc pid start time"))?;
+    // Start ticks reset at boot, so bind them to the kernel boot UUID. A
+    // marker surviving a reboot must not match a same-PID/same-tick process
+    // from the new boot.
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let boot_id = boot_id.trim();
+    if boot_id.is_empty() {
+        return Err(std::io::Error::other("empty Linux boot id"));
+    }
+    Ok(format!("linux-boot-start:{boot_id}:{start_ticks}"))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_process_birth_identity(pid: u32) -> std::io::Result<String> {
+    const PROC_PIDTBSDINFO: i32 = 3;
+    const MAXCOMLEN: usize = 16;
+
+    #[repr(C)]
+    struct ProcBsdInfo {
+        _pbi_flags: u32,
+        _pbi_status: u32,
+        _pbi_xstatus: u32,
+        _pbi_pid: u32,
+        _pbi_ppid: u32,
+        _pbi_uid: u32,
+        _pbi_gid: u32,
+        _pbi_ruid: u32,
+        _pbi_rgid: u32,
+        _pbi_svuid: u32,
+        _pbi_svgid: u32,
+        _rfu_1: u32,
+        _pbi_comm: [libc::c_char; MAXCOMLEN],
+        _pbi_name: [libc::c_char; 2 * MAXCOMLEN],
+        _pbi_nfiles: u32,
+        _pbi_pgid: u32,
+        _pbi_pjobc: u32,
+        _e_tdev: u32,
+        _e_tpgid: u32,
+        _pbi_nice: i32,
+        pbi_start_tvsec: u64,
+        pbi_start_tvusec: u64,
+    }
+
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::uninit();
+    let expected = std::mem::size_of::<ProcBsdInfo>();
+    // SAFETY: `info` points to writable storage of exactly `expected`
+    // bytes. PROC_PIDTBSDINFO initializes that fixed public Darwin struct;
+    // the value is read only when proc_pidinfo reports the complete size.
+    let written = unsafe {
+        proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected as libc::c_int,
+        )
+    };
+    if written != expected as libc::c_int {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the complete struct was initialized as established above.
+    let info = unsafe { info.assume_init() };
+    Ok(format!(
+        "macos-start-time:{}:{}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(windows)]
+fn platform_process_birth_identity(pid: u32) -> std::io::Result<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: the call receives a non-zero PID, requests query-only access,
+    // and does not inherit the returned process handle.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: all FILETIME pointers are valid writable values and `handle`
+    // is an open process handle with query permission.
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    // SAFETY: `handle` was returned by OpenProcess and is closed once.
+    let _ = unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    Ok(format!("windows-creation-filetime:{ticks}"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn platform_process_birth_identity(_pid: u32) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process birth identity is unsupported on this platform",
+    ))
+}
+
+/// True only when `pid` is alive and still denotes the exact process
+/// incarnation recorded in `expected`. Probe failures fail closed.
+pub(crate) fn process_birth_identity_matches(pid: u32, expected: &str) -> bool {
+    is_process_alive(pid) && process_birth_identity(pid).is_ok_and(|observed| observed == expected)
+}
+
 #[cfg(unix)]
 fn unix_process_alive_with(mut probe: impl FnMut() -> Result<(), Option<i32>>) -> bool {
     loop {
@@ -2374,6 +2525,19 @@ mod tests {
     fn process_liveness_reports_zero_and_current_process_truthfully() {
         assert!(!is_process_alive(0));
         assert!(is_process_alive(std::process::id()));
+    }
+
+    #[test]
+    fn process_birth_identity_matches_only_the_recorded_incarnation() {
+        let pid = std::process::id();
+        let identity = process_birth_identity(pid).expect("current process has an identity");
+
+        assert!(process_birth_identity_matches(pid, &identity));
+        assert!(!process_birth_identity_matches(
+            pid,
+            "definitely-not-this-process"
+        ));
+        assert!(!process_birth_identity_matches(0, &identity));
     }
 
     #[cfg(windows)]

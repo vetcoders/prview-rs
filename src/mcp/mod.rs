@@ -881,7 +881,11 @@ mod tests {
         std::fs::write(
             read::running_marker_path(run_dir),
             serde_json::to_string(&read::RunningMarker {
+                schema_version: read::RUNNING_MARKER_SCHEMA_VERSION,
                 pid: std::process::id(),
+                process_birth_id: Some(
+                    crate::storage::process_birth_identity(std::process::id()).unwrap(),
+                ),
                 started_at: started_at.to_string(),
                 profile: "deep".to_string(),
                 commit: run_id_commit.to_string(),

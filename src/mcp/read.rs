@@ -132,11 +132,19 @@ pub fn read_bases(run_dir: &Path) -> Vec<String> {
 // Run lifecycle status (pid-liveness)
 // ---------------------------------------------------------------------------
 
+/// Current durable marker protocol. Version 1 contained only a PID; a still-live
+/// legacy PID blocks conservatively because it may be a pre-upgrade review.
+pub const RUNNING_MARKER_SCHEMA_VERSION: u32 = 2;
+
 /// Marker written by the MCP layer before a deep run detaches. Lets a later
 /// call derive liveness without any in-memory state (design spec section 3).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunningMarker {
+    #[serde(default)]
+    pub schema_version: u32,
     pub pid: u32,
+    #[serde(default)]
+    pub process_birth_id: Option<String>,
     pub started_at: String,
     pub profile: String,
     pub commit: String,
@@ -145,8 +153,9 @@ pub struct RunningMarker {
 }
 
 /// Deterministic run status. Completion requires both finalized pack bytes and
-/// the exact durable index row. Otherwise liveness is derived from the marker's
-/// pid — a dead publisher is `Stale`, never a fake completed run.
+/// the exact durable index row. Otherwise liveness requires both the marker's
+/// PID and its native process-birth identity. A dead/recycled v2 publisher is
+/// `Stale`; a live legacy PID remains conservatively active until it exits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
     Completed,
@@ -185,7 +194,17 @@ pub fn run_status(run_dir: &Path) -> RunStatus {
 
     match read_running_marker(run_dir) {
         Some(marker) => {
-            if crate::storage::is_process_alive(marker.pid) {
+            let current_identity_matches = marker.schema_version == RUNNING_MARKER_SCHEMA_VERSION
+                && marker.process_birth_id.as_deref().is_some_and(|birth_id| {
+                    crate::storage::process_birth_identity_matches(marker.pid, birth_id)
+                });
+            // A v1 marker cannot distinguish its original process from a
+            // recycled PID. While that PID is live, preserve the one-active-run
+            // invariant and block conservatively; treating it as stale would
+            // launch a second heavy review during a real pre-upgrade run.
+            let legacy_pid_still_live = marker.schema_version < RUNNING_MARKER_SCHEMA_VERSION
+                && crate::storage::is_process_alive(marker.pid);
+            if current_identity_matches || legacy_pid_still_live {
                 RunStatus::Running { pid: marker.pid }
             } else {
                 RunStatus::Stale {
@@ -1537,7 +1556,9 @@ mod tests {
 
     fn write_marker(run_dir: &Path, pid: u32) {
         let marker = RunningMarker {
+            schema_version: RUNNING_MARKER_SCHEMA_VERSION,
             pid,
+            process_birth_id: crate::storage::process_birth_identity(pid).ok(),
             started_at: "2026-07-01T12:00:00Z".to_string(),
             profile: "deep".to_string(),
             commit: "abc1234".to_string(),
@@ -1546,6 +1567,21 @@ mod tests {
         std::fs::write(
             running_marker_path(run_dir),
             serde_json::to_string(&marker).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_legacy_marker(run_dir: &Path, pid: u32) {
+        std::fs::write(
+            running_marker_path(run_dir),
+            serde_json::to_string(&serde_json::json!({
+                "pid": pid,
+                "started_at": "2026-07-01T12:00:00Z",
+                "profile": "deep",
+                "commit": "abc1234",
+                "base_used": ["main"]
+            }))
+            .unwrap(),
         )
         .unwrap();
     }
@@ -1648,6 +1684,34 @@ mod tests {
     fn run_status_running_for_live_pid() {
         let dir = tempfile::tempdir().unwrap();
         write_marker(dir.path(), std::process::id());
+        assert_eq!(
+            run_status(dir.path()),
+            RunStatus::Running {
+                pid: std::process::id()
+            }
+        );
+    }
+
+    #[test]
+    fn run_status_stale_for_live_pid_with_wrong_birth_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        write_marker(dir.path(), std::process::id());
+        let mut marker = read_running_marker(dir.path()).unwrap();
+        marker.process_birth_id = Some("not-this-process-incarnation".to_string());
+        std::fs::write(
+            running_marker_path(dir.path()),
+            serde_json::to_string(&marker).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(run_status(dir.path()), RunStatus::Stale { .. }));
+    }
+
+    #[test]
+    fn run_status_legacy_live_pid_fails_closed_as_running() {
+        let dir = tempfile::tempdir().unwrap();
+        write_legacy_marker(dir.path(), std::process::id());
+
         assert_eq!(
             run_status(dir.path()),
             RunStatus::Running {

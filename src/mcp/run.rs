@@ -10,7 +10,10 @@ use crate::mcp::read;
 use crate::mcp::types::{ToolError, error_class};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+type OwnedDetachedChild = Box<dyn process_wrap::std::ChildWrapper>;
 
 /// Review depth requested by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,10 +129,42 @@ fn active_run(repo_name: &str, branch_key: &str) -> Option<String> {
     None
 }
 
-fn write_marker(run_dir: &Path, marker: &read::RunningMarker) {
-    if let Ok(text) = serde_json::to_string_pretty(marker) {
-        let _ = std::fs::write(read::running_marker_path(run_dir), text);
-    }
+fn running_marker(
+    pid: u32,
+    profile: Profile,
+    commit: String,
+    base_used: Vec<String>,
+) -> Result<read::RunningMarker, ToolError> {
+    let process_birth_id = crate::storage::process_birth_identity(pid).map_err(|error| {
+        ToolError::new(
+            error_class::RUN_FAILED,
+            format!("failed to capture spawned process identity: {error}"),
+        )
+    })?;
+    Ok(read::RunningMarker {
+        schema_version: read::RUNNING_MARKER_SCHEMA_VERSION,
+        pid,
+        process_birth_id: Some(process_birth_id),
+        started_at: chrono::Local::now().to_rfc3339(),
+        profile: profile.as_str().to_string(),
+        commit,
+        base_used,
+    })
+}
+
+fn write_marker(run_dir: &Path, marker: &read::RunningMarker) -> Result<(), ToolError> {
+    let text = serde_json::to_string_pretty(marker).map_err(|error| {
+        ToolError::new(
+            error_class::RUN_FAILED,
+            format!("failed to serialize MCP running marker: {error}"),
+        )
+    })?;
+    std::fs::write(read::running_marker_path(run_dir), text).map_err(|error| {
+        ToolError::new(
+            error_class::RUN_FAILED,
+            format!("failed to write MCP running marker: {error}"),
+        )
+    })
 }
 
 fn normalize_origin_branch(value: &str) -> Option<String> {
@@ -385,18 +420,36 @@ pub async fn start(
             // before the borrow in `child.wait()`; needed to signal the group.
             let child_pid = child.id();
 
-            // Marker with the real child pid: on timeout it is left behind with a
-            // now-dead pid, which reads as `stale` — fail-loud, not eternal running.
-            write_marker(
-                &run_dir,
-                &read::RunningMarker {
-                    pid: child_pid.unwrap_or(0),
-                    started_at: chrono::Local::now().to_rfc3339(),
-                    profile: profile.as_str().to_string(),
-                    commit: commit.clone(),
-                    base_used: selection.bases.clone(),
-                },
-            );
+            // Marker setup is part of child ownership. If PID identity capture
+            // or durable publication fails, terminate the tree and reap the
+            // direct root before failing the RPC; no untracked child escapes.
+            let marker = match child_pid
+                .ok_or_else(|| {
+                    ToolError::new(error_class::RUN_FAILED, "spawned prview has no process id")
+                })
+                .and_then(|pid| {
+                    running_marker(pid, profile, commit.clone(), selection.bases.clone())
+                }) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    let _ = crate::proc::terminate_and_reap_tokio_child(
+                        &mut child,
+                        child_pid,
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = write_marker(&run_dir, &marker) {
+                let _ = crate::proc::terminate_and_reap_tokio_child(
+                    &mut child,
+                    child_pid,
+                    Duration::from_secs(5),
+                )
+                .await;
+                return Err(error);
+            }
 
             let budget = quick_budget();
             match tokio::time::timeout(budget, child.wait()).await {
@@ -461,17 +514,14 @@ pub async fn start(
             }
         }
         Profile::Deep => {
-            let pid = spawn_detached(repo, &args, &output_reservation, out_file, err_file)?;
-            write_marker(
+            let child = spawn_detached(repo, &args, &output_reservation, out_file, err_file)?;
+            activate_detached_child(
                 &run_dir,
-                &read::RunningMarker {
-                    pid,
-                    started_at: chrono::Local::now().to_rfc3339(),
-                    profile: profile.as_str().to_string(),
-                    commit: commit.clone(),
-                    base_used: selection.bases.clone(),
-                },
-            );
+                child,
+                profile,
+                commit.clone(),
+                selection.bases.clone(),
+            )?;
             let mut body = serde_json::json!({
                 "run_id": run_id,
                 "status": "running",
@@ -485,16 +535,16 @@ pub async fn start(
     }
 }
 
-/// Spawn a fully detached deep run (own process group on unix) and return its
-/// pid. The MCP server does not wait on it — the handle is dropped so the child
-/// keeps running independently.
+/// Spawn a deep run in its own process group on Unix. The caller still owns the
+/// returned handle and must either install the detached reaper or terminate and
+/// reap it before returning.
 fn spawn_detached(
     repo: &Path,
     args: &[String],
     output_reservation: &str,
     out_file: File,
     err_file: File,
-) -> Result<u32, ToolError> {
+) -> Result<OwnedDetachedChild, ToolError> {
     let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e| {
         ToolError::new(error_class::RUN_FAILED, format!("current_exe failed: {e}"))
     })?);
@@ -504,23 +554,115 @@ fn spawn_detached(
             crate::artifacts::MCP_OUTPUT_RESERVATION_ENV,
             output_reservation,
         )
-        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(out_file))
         .stderr(std::process::Stdio::from(err_file));
+    crate::proc::harden_std(&mut cmd);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-
-    let child = cmd.spawn().map_err(|e| {
+    // Windows uses the same durable Job Object ownership as the other sync
+    // process paths, so descendants remain owned even if the direct root exits.
+    crate::proc::spawn_owned_std_child(cmd).map_err(|e| {
         ToolError::new(
             error_class::RUN_FAILED,
             format!("spawn detached prview failed: {e}"),
         )
-    })?;
-    Ok(child.id())
+    })
+}
+
+/// Terminate the complete detached tree and reap its direct root. A child that
+/// already exited is also explicitly waited, so immediate failure cannot leave
+/// a zombie in the long-lived MCP server.
+fn terminate_and_reap_detached_child(child: &mut OwnedDetachedChild) -> bool {
+    crate::proc::terminate_and_reap_owned_std_child(child.as_mut())
+}
+
+/// Transfer a child into one detached waiter thread without losing ownership
+/// if thread creation fails. The parent retains the same shared slot until the
+/// builder succeeds; only the running reaper may take the child afterwards.
+fn install_detached_reaper(
+    child: OwnedDetachedChild,
+    run_dir: PathBuf,
+) -> Result<(), (std::io::Error, OwnedDetachedChild)> {
+    let owned = Arc::new(Mutex::new(Some(child)));
+    let reaper_owned = Arc::clone(&owned);
+    let spawn = std::thread::Builder::new()
+        .name("prview-mcp-deep-reaper".to_string())
+        .spawn(move || {
+            let child = reaper_owned
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let Some(mut child) = child else {
+                return;
+            };
+            let pid = child.id();
+            let _ = child.wait();
+            // On Unix the direct root may exit while a background descendant
+            // remains in the process group created by `harden_std`. Reaping
+            // the root is not tree ownership: close the residual group before
+            // declaring the marker non-blocking. Windows' wrapper wait owns the
+            // complete Job Object lifecycle.
+            #[cfg(unix)]
+            let _ = crate::proc::sigkill_process_group(pid);
+            // Successful publication is the only state that may discard the
+            // marker. Failed children retain a stale diagnostic marker, but no
+            // zombie and no active-run lockout.
+            if read::run_status(&run_dir) == read::RunStatus::Completed {
+                let _ = std::fs::remove_file(read::running_marker_path(&run_dir));
+            }
+        });
+
+    match spawn {
+        Ok(handle) => {
+            drop(handle);
+            Ok(())
+        }
+        Err(error) => {
+            let child = owned
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("reaper child remains owned when thread spawn fails");
+            Err((error, child))
+        }
+    }
+}
+
+/// Publish the v2 identity marker and install the waiter that owns the child
+/// for the remainder of its lifetime. Any setup failure is fail-closed: the
+/// child tree is terminated and the direct root reaped before the RPC fails.
+fn activate_detached_child(
+    run_dir: &Path,
+    mut child: OwnedDetachedChild,
+    profile: Profile,
+    commit: String,
+    base_used: Vec<String>,
+) -> Result<u32, ToolError> {
+    let pid = child.id();
+    let marker = match running_marker(pid, profile, commit, base_used) {
+        Ok(marker) => marker,
+        Err(error) => {
+            let _ = terminate_and_reap_detached_child(&mut child);
+            return Err(error);
+        }
+    };
+    if let Err(error) = write_marker(run_dir, &marker) {
+        let _ = terminate_and_reap_detached_child(&mut child);
+        return Err(error);
+    }
+    if let Err((error, mut child)) = install_detached_reaper(child, run_dir.to_path_buf()) {
+        let reaped = terminate_and_reap_detached_child(&mut child);
+        let _ = std::fs::remove_file(read::running_marker_path(run_dir));
+        let detail = if reaped {
+            String::new()
+        } else {
+            "; process-tree termination/direct-root reap could not be confirmed".to_string()
+        };
+        return Err(ToolError::new(
+            error_class::RUN_FAILED,
+            format!("failed to start detached prview reaper: {error}{detail}"),
+        ));
+    }
+    Ok(pid)
 }
 
 /// Build the completed-run response body (quick sync path).
@@ -606,6 +748,85 @@ fn run_stats(run_id: &str, run_dir: &Path) -> (usize, usize, usize) {
 mod tests {
     use super::*;
 
+    const REAPER_FIXTURE_ENV: &str = "PRVIEW_MCP_REAPER_TEST_SIGNAL";
+    #[cfg(unix)]
+    const REAPER_GRANDCHILD_PID_ENV: &str = "PRVIEW_MCP_REAPER_TEST_GRANDCHILD_PID";
+
+    /// Subprocess-only fixture. The parent test launches this exact test under
+    /// the test binary, then releases it through a file barrier so marker and
+    /// reaper setup are deterministic before the child exits immediately.
+    #[test]
+    fn detached_reaper_child_fixture() {
+        let Some(signal) = std::env::var_os(REAPER_FIXTURE_ENV) else {
+            return;
+        };
+        let signal = PathBuf::from(signal);
+        #[cfg(unix)]
+        if let Some(pidfile) = std::env::var_os(REAPER_GRANDCHILD_PID_ENV) {
+            let status = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "sleep 30 & echo $! > \"$PRVIEW_MCP_REAPER_TEST_GRANDCHILD_PID\"",
+                ])
+                .env(REAPER_GRANDCHILD_PID_ENV, &pidfile)
+                .status()
+                .expect("spawn background-grandchild fixture");
+            assert!(status.success());
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !signal.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if signal.exists() {
+            std::process::exit(17);
+        }
+        std::process::exit(18);
+    }
+
+    fn spawn_reaper_fixture(signal: &Path) -> OwnedDetachedChild {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "mcp::run::tests::detached_reaper_child_fixture",
+                "--nocapture",
+            ])
+            .env(REAPER_FIXTURE_ENV, signal)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::proc::harden_std(&mut command);
+        crate::proc::spawn_owned_std_child(command).expect("spawn detached reaper fixture")
+    }
+
+    #[cfg(unix)]
+    fn spawn_reaper_fixture_with_grandchild(signal: &Path, pidfile: &Path) -> OwnedDetachedChild {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "mcp::run::tests::detached_reaper_child_fixture",
+                "--nocapture",
+            ])
+            .env(REAPER_FIXTURE_ENV, signal)
+            .env(REAPER_GRANDCHILD_PID_ENV, pidfile)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::proc::harden_std(&mut command);
+        crate::proc::spawn_owned_std_child(command)
+            .expect("spawn detached reaper fixture with grandchild")
+    }
+
+    fn wait_until_process_is_reaped(pid: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while crate::storage::is_process_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !crate::storage::is_process_alive(pid),
+            "detached direct child {pid} was not reaped"
+        );
+    }
+
     #[test]
     fn profile_parse_defaults_quick_and_rejects_unknown() {
         assert_eq!(Profile::parse(None).unwrap(), Profile::Quick);
@@ -613,6 +834,107 @@ mod tests {
         assert_eq!(Profile::parse(Some("deep")).unwrap(), Profile::Deep);
         let err = Profile::parse(Some("turbo")).unwrap_err();
         assert_eq!(err.class, error_class::RUN_FAILED);
+    }
+
+    #[test]
+    fn detached_fast_failure_is_reaped_and_does_not_block_second_run() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let repo_name = "mcp-reaper-test";
+        let branch_key = "main";
+        let run_dir = home
+            .path()
+            .join("runs")
+            .join(repo_name)
+            .join(branch_key)
+            .join("fast-failure");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let signal_dir = tempfile::tempdir().unwrap();
+        let signal = signal_dir.path().join("exit-now");
+        let child = spawn_reaper_fixture(&signal);
+
+        let pid = activate_detached_child(
+            &run_dir,
+            child,
+            Profile::Deep,
+            "abc1234".to_string(),
+            vec!["main".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            active_run(repo_name, branch_key).as_deref(),
+            Some("fast-failure")
+        );
+
+        std::fs::write(&signal, b"go").unwrap();
+        wait_until_process_is_reaped(pid);
+        assert!(matches!(
+            read::run_status(&run_dir),
+            read::RunStatus::Stale { .. }
+        ));
+        assert_eq!(
+            active_run(repo_name, branch_key),
+            None,
+            "a failed deep child must not block the next run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_reaper_terminates_residual_process_group() {
+        let run_dir = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let signal = fixture.path().join("exit-now");
+        let pidfile = fixture.path().join("grandchild.pid");
+        let child = spawn_reaper_fixture_with_grandchild(&signal, &pidfile);
+
+        let pid = activate_detached_child(
+            run_dir.path(),
+            child,
+            Profile::Deep,
+            "abc1234".to_string(),
+            vec!["main".to_string()],
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !pidfile.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild: u32 = std::fs::read_to_string(&pidfile)
+            .expect("fixture records grandchild pid")
+            .trim()
+            .parse()
+            .expect("numeric grandchild pid");
+        assert!(crate::storage::is_process_alive(grandchild));
+
+        std::fs::write(&signal, b"go").unwrap();
+        wait_until_process_is_reaped(pid);
+        wait_until_process_is_reaped(grandchild);
+    }
+
+    #[test]
+    fn marker_write_failure_terminates_and_reaps_detached_child() {
+        let run_dir = tempfile::tempdir().unwrap();
+        // A directory at the marker path makes the durable write fail without
+        // relying on platform-specific permission semantics.
+        std::fs::create_dir(read::running_marker_path(run_dir.path())).unwrap();
+        let signal_dir = tempfile::tempdir().unwrap();
+        let child = spawn_reaper_fixture(&signal_dir.path().join("never-release"));
+        let pid = child.id();
+
+        let error = activate_detached_child(
+            run_dir.path(),
+            child,
+            Profile::Deep,
+            "abc1234".to_string(),
+            vec!["main".to_string()],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.class, error_class::RUN_FAILED);
+        assert!(error.message.contains("running marker"));
+        wait_until_process_is_reaped(pid);
     }
 
     #[test]

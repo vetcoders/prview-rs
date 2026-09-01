@@ -1,8 +1,9 @@
 //! Rust/Cargo checks
 
 use super::{
-    Check, CheckResult, CheckStatus, ProvenanceBuilder, TEST_TIMEOUT_SECS, has_tool_crash,
-    off_head_target_commit, plan_check_run, run_command_with_env, run_command_with_timeout_and_env,
+    Check, CheckResult, CheckStatus, ProvenanceBuilder, TEST_TIMEOUT_SECS,
+    bounded_descendant_limit, has_tool_crash, off_head_target_commit, plan_check_run,
+    run_command_with_env, run_command_with_timeout_and_env,
 };
 use crate::Config;
 use crate::cache;
@@ -119,9 +120,19 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
 }
 
 fn cargo_jobs_env(config: &Config) -> (String, String) {
+    cargo_jobs_env_with(config.resource_plan.worker_limit, |key| {
+        std::env::var(key).ok()
+    })
+}
+
+fn cargo_jobs_env_with(
+    worker_limit: u32,
+    mut inherited: impl FnMut(&str) -> Option<String>,
+) -> (String, String) {
     (
         "CARGO_BUILD_JOBS".to_string(),
-        config.resource_plan.worker_limit.to_string(),
+        bounded_descendant_limit(worker_limit, inherited("CARGO_BUILD_JOBS").as_deref())
+            .to_string(),
     )
 }
 
@@ -1993,6 +2004,20 @@ mod tests {
             check.check_eligibility(&config),
             super::super::CheckEligibility::Skip(_)
         ));
+    }
+
+    #[test]
+    fn cargo_jobs_never_raises_a_stricter_operator_limit() {
+        let value = |worker_limit, inherited: Option<&str>| {
+            cargo_jobs_env_with(worker_limit, |_| inherited.map(str::to_owned)).1
+        };
+
+        assert_eq!(value(4, Some("1")), "1");
+        assert_eq!(value(4, Some("8")), "4");
+        assert_eq!(value(4, None), "4");
+        assert_eq!(value(4, Some("0")), "4");
+        assert_eq!(value(4, Some("not-a-limit")), "4");
+        assert_eq!(value(0, None), "1");
     }
 
     #[test]

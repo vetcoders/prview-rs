@@ -441,31 +441,29 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
                 .cloned()
                 .collect::<Vec<_>>();
             let outer_variant_addition_allowed = new_variants.is_empty()
-                || (before_enum.non_exhaustive && after_enum.non_exhaustive);
-            let mut added_variant_fields = Vec::new();
+                || (before_enum.non_exhaustive
+                    && after_enum.non_exhaustive
+                    && after_enum
+                        .variant_order
+                        .starts_with(&before_enum.variant_order)
+                    && new_variants.iter().all(|name| {
+                        after_enum
+                            .variants
+                            .get(name)
+                            .is_some_and(|contract| variant_is_fieldless(contract))
+                    }));
             let existing_variants_compatible = before_enum.variants.iter().all(|(name, before)| {
                 let Some(after) = after_enum.variants.get(name) else {
                     return false;
                 };
-                if before == after {
-                    return true;
-                }
-                let Some(fields) = additive_non_exhaustive_variant_fields(before, after) else {
-                    return false;
-                };
-                added_variant_fields.extend(
-                    fields
-                        .into_iter()
-                        .map(|(field, contract)| (name.clone(), field, contract)),
-                );
-                true
+                before == after
             });
             let additive_non_exhaustive = !before_enum.layout_sensitive
                 && !after_enum.layout_sensitive
                 && before_enum.header == after_enum.header
                 && outer_variant_addition_allowed
                 && existing_variants_compatible
-                && (!new_variants.is_empty() || !added_variant_fields.is_empty());
+                && !new_variants.is_empty();
             if additive_non_exhaustive {
                 for (name, contract) in after_enum
                     .variants
@@ -478,23 +476,6 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
                         after_variant.identity.clone(),
                         None,
                         Some(after_variant),
-                    ));
-                }
-                for (variant, field, contract) in added_variant_fields {
-                    let after_variant = variant_side(
-                        after,
-                        &variant,
-                        after_enum
-                            .variants
-                            .get(&variant)
-                            .expect("compatible variant remains present"),
-                    );
-                    let after_field = field_side(&after_variant, &field, &contract);
-                    delta.added.push(known_finding(
-                        ApiDeltaKind::Added,
-                        after_field.identity.clone(),
-                        None,
-                        Some(after_field),
                     ));
                 }
             } else {
@@ -541,15 +522,13 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
         .fields
         .keys()
         .any(|name| !before_struct.fields.contains_key(name));
-    let exhaustive_field_added = !before_struct.non_exhaustive && field_added;
-    let layout_field_added =
-        (before_struct.layout_sensitive || after_struct.layout_sensitive) && field_added;
     let parent_policy_changed = before_struct.non_exhaustive != after_struct.non_exhaustive;
     let parent_contract_changed = before_struct.parent_contract != after_struct.parent_contract;
-    let mut emitted = exhaustive_field_added
-        || parent_policy_changed
-        || layout_field_added
-        || parent_contract_changed;
+    // `#[non_exhaustive]` prevents downstream construction and exhaustive
+    // matching, but a newly added field still contributes to compiler-derived
+    // auto traits of the parent type. Without compiler-backed proof for that
+    // input, every field addition to an existing public struct is Changed.
+    let mut emitted = field_added || parent_policy_changed || parent_contract_changed;
     if emitted {
         delta.changed.push(known_finding(
             ApiDeltaKind::Changed,
@@ -577,10 +556,9 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
             (Some(left), Some(right)) if left.contract == right.contract => continue,
             (Some(_), Some(_)) => ApiDeltaKind::Changed,
             (Some(_), None) => ApiDeltaKind::Removed,
-            // Existing exhaustive structs are constructed and matched by
-            // downstream callers. Their added field is represented by the
-            // parent Changed finding above, not by an informational field add.
-            (None, Some(_)) if exhaustive_field_added || layout_field_added => continue,
+            // An added field is represented by the parent Changed finding
+            // above, never only by an informational child fact.
+            (None, Some(_)) if field_added => continue,
             (None, Some(_)) => ApiDeltaKind::Added,
             (None, None) => unreachable!(),
         };
@@ -607,82 +585,16 @@ fn push_contract_changes(delta: &mut ApiDelta, before: &ApiFactSide, after: &Api
     }
 }
 
-/// Return fields added to an existing variant that explicitly opted downstream
-/// callers out of exhaustive construction and matching.
-///
-/// This first cut is deliberately named-field only. Tuple arity has additional
-/// constructor and pattern ergonomics, so it stays on the conservative parent
-/// `Changed` path until its exact compatibility contract is proven separately.
-fn additive_non_exhaustive_variant_fields(
-    before: &str,
-    after: &str,
-) -> Option<Vec<(String, String)>> {
-    fn parse_variant(contract: &str) -> Option<syn::Variant> {
-        let item =
-            syn::parse_str::<syn::ItemEnum>(&format!("enum __Prview {{ {contract} }}")).ok()?;
-        item.variants.into_iter().next()
-    }
-
-    let before = parse_variant(before)?;
-    let after = parse_variant(after)?;
-    let is_non_exhaustive = |variant: &syn::Variant| {
-        variant
-            .attrs
-            .iter()
-            .any(|attribute| attribute.path().is_ident("non_exhaustive"))
-    };
-    if !is_non_exhaustive(&before) || !is_non_exhaustive(&after) {
-        return None;
-    }
-
-    let syn::Fields::Named(before_fields) = &before.fields else {
-        return None;
-    };
-    let syn::Fields::Named(after_fields) = &after.fields else {
-        return None;
-    };
-
-    let mut before_header = before.clone();
-    before_header.fields = syn::Fields::Unit;
-    let mut after_header = after.clone();
-    after_header.fields = syn::Fields::Unit;
-    if quote::ToTokens::to_token_stream(&before_header).to_string()
-        != quote::ToTokens::to_token_stream(&after_header).to_string()
-    {
-        return None;
-    }
-
-    let field_map = |fields: &syn::FieldsNamed| {
-        fields
-            .named
-            .iter()
-            .filter_map(|field| {
-                Some((
-                    field.ident.as_ref()?.to_string(),
-                    quote::ToTokens::to_token_stream(field).to_string(),
-                ))
-            })
-            .collect::<BTreeMap<_, _>>()
-    };
-    let before_fields = field_map(before_fields);
-    let after_fields = field_map(after_fields);
-    if after_fields.len() <= before_fields.len()
-        || !before_fields
-            .iter()
-            .all(|(name, contract)| after_fields.get(name) == Some(contract))
-    {
-        return None;
-    }
-    Some(
-        after_fields
-            .into_iter()
-            .filter(|(name, _)| !before_fields.contains_key(name))
-            .collect(),
-    )
+fn variant_is_fieldless(contract: &str) -> bool {
+    syn::parse_str::<syn::ItemEnum>(&format!("enum __Prview {{ {contract} }}"))
+        .ok()
+        .and_then(|item| item.variants.into_iter().next())
+        .is_some_and(|variant| matches!(variant.fields, syn::Fields::Unit))
 }
 
 struct PublicEnumContract {
     variants: BTreeMap<String, String>,
+    variant_order: Vec<String>,
     non_exhaustive: bool,
     layout_sensitive: bool,
     header: String,
@@ -697,6 +609,11 @@ fn public_enum_contract(contract: &str) -> Option<PublicEnumContract> {
         .iter()
         .any(|attribute| attribute.path().is_ident("non_exhaustive"));
     let layout_sensitive = item.attrs.iter().any(attr_is_layout_sensitive_repr);
+    let variant_order = item
+        .variants
+        .iter()
+        .map(|variant| variant.ident.to_string())
+        .collect();
     let variants = item
         .variants
         .iter()
@@ -711,6 +628,7 @@ fn public_enum_contract(contract: &str) -> Option<PublicEnumContract> {
     header.variants.clear();
     Some(PublicEnumContract {
         variants,
+        variant_order,
         non_exhaustive,
         layout_sensitive,
         header: quote::ToTokens::to_token_stream(&header).to_string(),
@@ -724,11 +642,9 @@ fn variant_side(parent: &ApiFactSide, name: &str, contract: &str) -> ApiFactSide
 struct PublicStructContract {
     fields: BTreeMap<String, String>,
     non_exhaustive: bool,
-    layout_sensitive: bool,
     /// The complete parent contract after removing only externally public
     /// fields. It retains attrs, generics and normalized private-field
-    /// semantics, so an informational non-exhaustive field addition cannot
-    /// mask an unrelated parent change.
+    /// semantics, so a field addition cannot mask an unrelated parent change.
     parent_contract: String,
 }
 
@@ -740,7 +656,6 @@ fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
         .attrs
         .iter()
         .any(|attribute| attribute.path().is_ident("non_exhaustive"));
-    let layout_sensitive = item.attrs.iter().any(attr_is_layout_sensitive_repr);
     let syn::Fields::Named(fields) = &item.fields else {
         return None;
     };
@@ -782,7 +697,6 @@ fn public_struct_contract(contract: &str) -> Option<PublicStructContract> {
     Some(PublicStructContract {
         fields: public_fields,
         non_exhaustive,
-        layout_sensitive,
         parent_contract: quote::ToTokens::to_token_stream(&parent).to_string(),
     })
 }
@@ -2107,13 +2021,19 @@ mod tests {
                 "target",
             )),
         );
-        assert!(non_exhaustive.changed.is_empty());
         assert!(
             non_exhaustive
+                .changed
+                .iter()
+                .any(|finding| finding.identity.name == "Options"),
+            "a new field can change compiler-derived auto traits even when construction is non-exhaustive"
+        );
+        assert!(
+            !non_exhaustive
                 .added
                 .iter()
                 .any(|finding| finding.identity.name == "b"),
-            "non_exhaustive opts downstream callers out of exhaustive construction"
+            "the auto-trait risk must not survive only as an informational field"
         );
 
         let new_item = compare_rust_api(
@@ -2198,15 +2118,15 @@ mod tests {
                 "target",
             )),
         );
-        assert!(
-            delta.changed.is_empty(),
-            "a pure non-exhaustive public field addition remains informational: {:?}",
-            delta.findings()
-        );
-        assert!(delta.added.iter().any(|finding| {
-            finding.identity.name == "__prview_private_field_2"
-                && finding.identity.module_path == ["Options".to_owned()]
+        assert!(delta.changed.iter().any(|finding| {
+            finding.identity.name == "Options" && finding.identity.module_path.is_empty()
         }));
+        assert!(
+            !delta
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "__prview_private_field_2")
+        );
     }
 
     #[test]
@@ -2226,7 +2146,10 @@ mod tests {
         assert!(delta.changed.iter().any(|finding| {
             finding.identity.name == "Options" && finding.identity.namespace == "type"
         }));
-        assert!(delta.added.iter().any(|finding| {
+        assert!(delta.changed.iter().any(|finding| {
+            finding.identity.name == "Flexible" && finding.identity.namespace == "type"
+        }));
+        assert!(!delta.added.iter().any(|finding| {
             finding.identity.name == "b" && finding.identity.module_path == ["Flexible".to_owned()]
         }));
         assert!(
@@ -2323,6 +2246,45 @@ mod tests {
         }));
         assert!(delta.changed.iter().any(|finding| {
             finding.identity.name == "Strict" && finding.identity.namespace == "type"
+        }));
+
+        let payload_delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[non_exhaustive] pub enum Flexible { A }\n",
+                "#[non_exhaustive] pub enum Flexible { A, B(std::rc::Rc<()>) }\n",
+            ),
+        ]);
+        assert!(payload_delta.changed.iter().any(|finding| {
+            finding.identity.name == "Flexible" && finding.identity.namespace == "type"
+        }));
+        assert!(!payload_delta.added.iter().any(|finding| {
+            finding.identity.name == "B" && finding.identity.module_path == ["Flexible".to_owned()]
+        }));
+
+        let inserted_unit_delta = repository_delta(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[non_exhaustive] pub enum Flexible { A, B }\n",
+                "#[non_exhaustive] pub enum Flexible { A, Inserted, B }\n",
+            ),
+        ]);
+        assert!(inserted_unit_delta.changed.iter().any(|finding| {
+            finding.identity.name == "Flexible" && finding.identity.namespace == "type"
+        }));
+        assert!(!inserted_unit_delta.added.iter().any(|finding| {
+            finding.identity.name == "Inserted"
+                && finding.identity.module_path == ["Flexible".to_owned()]
         }));
 
         let repr_delta = repository_delta(&[
@@ -2436,8 +2398,8 @@ mod tests {
     }
 
     #[test]
-    fn variant_level_non_exhaustive_named_field_addition_is_informational() {
-        let additive = repository_delta(&[
+    fn variant_level_non_exhaustive_named_field_addition_preserves_auto_trait_risk() {
+        let changed = repository_delta(&[
             (
                 "Cargo.toml",
                 "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
@@ -2446,16 +2408,18 @@ mod tests {
             (
                 "src/lib.rs",
                 "pub enum Message { #[non_exhaustive] Data { value: u8 } }\n",
-                "pub enum Message { #[non_exhaustive] Data { value: u8, extra: u16 } }\n",
+                "pub enum Message { #[non_exhaustive] Data { value: u8, extra: std::rc::Rc<()> } }\n",
             ),
         ]);
-        assert!(additive.added.iter().any(|finding| {
-            finding.identity.name == "extra"
-                && finding.identity.module_path == ["Message".to_owned(), "Data".to_owned()]
-        }));
-        assert!(!additive.changed.iter().any(|finding| {
+        assert!(changed.changed.iter().any(|finding| {
             finding.identity.name == "Message" && finding.identity.namespace == "type"
         }));
+        assert!(
+            !changed
+                .added
+                .iter()
+                .any(|finding| finding.identity.name == "extra")
+        );
 
         for (before, after) in [
             (
@@ -4071,6 +4035,12 @@ mod tests {
                 "mod model { pub struct Hidden(std::rc::Rc<()>); } use model as alias; pub struct Holder { inner: alias::Hidden }\n",
                 "Holder",
                 "a private module-prefix alias must resolve the dependent type",
+            ),
+            (
+                "extern crate self as alias; struct Hidden(u8); pub struct Api(pub alias::Hidden);\n",
+                "extern crate self as alias; struct Hidden(std::rc::Rc<()>); pub struct Api(pub alias::Hidden);\n",
+                "Api",
+                "an extern-crate self alias must resolve the private root type in Git-tree revisions",
             ),
             (
                 "#[cfg(unix)] pub struct Hidden(u8); #[cfg(windows)] struct Hidden(u8); #[cfg(windows)] pub fn make() -> Hidden { Hidden(0) }\n",

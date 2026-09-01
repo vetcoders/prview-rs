@@ -775,7 +775,7 @@ async fn run_all_checks(
                         execute_live_check(check, config.as_ref(), cache.as_ref()),
                     )
                     .await;
-                    record_executed_check(&result, ledger, queued_at, started_at);
+                    record_completed_check(&result, ledger, queued_at, started_at);
                     Ok::<_, Cancelled>((queued_name, result))
                 }
             })
@@ -1004,7 +1004,6 @@ fn uv_concurrency_env_with(
     worker_limit: u32,
     mut inherited: impl FnMut(&str) -> Option<String>,
 ) -> Vec<(String, String)> {
-    let run_limit = worker_limit.max(1);
     [
         "UV_CONCURRENT_DOWNLOADS",
         "UV_CONCURRENT_BUILDS",
@@ -1016,13 +1015,21 @@ fn uv_concurrency_env_with(
     ]
     .into_iter()
     .map(|key| {
-        let limit = inherited(key)
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|value| *value > 0)
-            .map_or(run_limit, |operator_limit| operator_limit.min(run_limit));
+        let limit = bounded_descendant_limit(worker_limit, inherited(key).as_deref());
         (key.to_owned(), limit.to_string())
     })
     .collect()
+}
+
+/// Resolve a child-process worker cap without ever raising a stricter limit
+/// supplied by the operator. Invalid and zero values are not useful process
+/// limits, so they fall back to the run plan's non-zero minimum.
+pub(super) fn bounded_descendant_limit(worker_limit: u32, inherited: Option<&str>) -> u32 {
+    let run_limit = worker_limit.max(1);
+    inherited
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .map_or(run_limit, |operator_limit| operator_limit.min(run_limit))
 }
 
 /// Callback type for check events (used by TUI)
@@ -1200,7 +1207,7 @@ where
                         execute_live_check(check, config.as_ref(), cache.as_ref()),
                     )
                     .await;
-                    record_executed_check(&result, ledger, queued_at, started_at);
+                    record_completed_check(&result, ledger, queued_at, started_at);
                     Ok::<_, Cancelled>((queued_name, result))
                 }
             })
@@ -1374,28 +1381,43 @@ fn errored_check_provenance(
     )
 }
 
-/// Record a check that actually executed, keyed on the tree its own provenance
-/// says it read.
+/// Record a check after admission, keyed on the tree its own provenance says it
+/// was going to read.
 ///
 /// `queued_at` is when the check entered the execution set and `started_at` when
 /// the resource governor admitted it — the gap between them is time the check
 /// spent waiting for the machine, which is exactly the fact a reader comparing
 /// two runs of the same gate needs and cannot reconstruct from the duration.
-fn record_executed_check(
+fn record_completed_check(
     result: &CheckResult,
     ledger: &TaskLedger,
     queued_at: std::time::Instant,
     started_at: std::time::Instant,
 ) {
+    let state = if result.status == CheckStatus::Skipped
+        && result
+            .provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.command == NO_COMMAND_RECORDED)
+    {
+        TaskState::Skipped {
+            reason: result.output.clone(),
+        }
+    } else {
+        // Some tools execute and inspect the substrate before deciding that
+        // their own result is Skipped. Those remain honest live coverage; only
+        // the explicit no-command provenance above proves pre-spawn failure.
+        TaskState::Run {
+            duration: result.duration,
+        }
+    };
     ledger.record(TaskEntry {
         key: TaskKey::new(
             &result.name,
             ledger_substrate(result.provenance.as_ref(), ledger),
         ),
         kind: TaskKind::Check,
-        state: TaskState::Run {
-            duration: result.duration,
-        },
+        state,
         queued_at: Some(queued_at),
         started_at: Some(started_at),
     });
@@ -3474,6 +3496,68 @@ test result: ok. 2 passed; 0 failed
             provenance: None,
         };
         assert!(!result.is_failure(), "Skipped must not count as a failure");
+    }
+
+    #[test]
+    fn ledger_distinguishes_pre_spawn_skip_from_executed_skip() {
+        use crate::ledger::{SubstrateKey, TaskKey, TaskState};
+
+        let ledger = TaskLedger::new();
+        let now = std::time::Instant::now();
+        let launcher_error = "Failed to run mypy: No such file or directory (os error 2)";
+        let pre_spawn = CheckResult {
+            name: "Mypy".to_string(),
+            status: CheckStatus::Skipped,
+            duration: Duration::from_millis(2),
+            output: launcher_error.to_string(),
+            cached: false,
+            provenance: errored_check_provenance(
+                "Mypy",
+                &rust_config(false, true, true),
+                None,
+                launcher_error,
+                chrono::Local::now().to_rfc3339(),
+            ),
+        };
+        let pre_spawn_key = TaskKey::new(
+            "Mypy",
+            ledger_substrate(pre_spawn.provenance.as_ref(), &ledger),
+        );
+        record_completed_check(&pre_spawn, &ledger, now, now);
+
+        let entry = ledger
+            .lookup(&pre_spawn_key)
+            .expect("pre-spawn skip ledger row");
+        assert_eq!(
+            entry.state,
+            TaskState::Skipped {
+                reason: launcher_error.to_string()
+            }
+        );
+        assert!(
+            entry.queued_at.is_some() && entry.started_at.is_some(),
+            "the task was admitted even though its target command did not spawn"
+        );
+
+        let executed_skip = CheckResult {
+            name: "Runtime skip".to_string(),
+            status: CheckStatus::Skipped,
+            duration: Duration::from_millis(7),
+            output: "tool inspected the tree, then ruled itself out".to_string(),
+            cached: false,
+            provenance: None,
+        };
+        record_completed_check(&executed_skip, &ledger, now, now);
+        assert_eq!(
+            ledger
+                .lookup(&TaskKey::new("Runtime skip", SubstrateKey::default()))
+                .expect("executed skip ledger row")
+                .state,
+            TaskState::Run {
+                duration: Duration::from_millis(7)
+            },
+            "status Skipped alone is not proof that no command ran"
+        );
     }
 
     #[cfg(unix)]
