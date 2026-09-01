@@ -18,10 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `MERGE_GATE.json.stale_cache_caveats` now dates old cached passing rows as
+  well as failures/blockers. A stale PASS can support a clean verdict after a
+  compiler or toolchain change just as a stale failure can hold a merge; the
+  caveat remains additive and never changes the decision by itself.
 - MCP quick reviews no longer cancel when a short-lived hardened helper exits
   between spawn and governor registration. A non-reaping wait-status probe
   distinguishes that completed child from an ambiguous identity failure while
-  preserving its PID/PGID for owned-tree cancellation until normal cleanup.
+  preserving its PID/PGID until registration. If another member still occupies
+  that exited leader's group, registration terminates the group while the
+  leader remains unreaped; a provisional-only PGID is never left for the MCP
+  parent to guess about after PID reuse becomes possible.
 - MCP `run_review` now rejects source-buildable targets without a native
   PID-reuse-safe process-birth identity before taking the activation lock or
   spawning a review. Linux, macOS, and Windows remain the explicitly supported
@@ -39,7 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repository configuration: enabled values skip discovered `uv.toml` and
   `[tool.uv]` limits, false values preserve discovery, and an explicit contained
   `UV_CONFIG_FILE` remains authoritative. Invalid and non-UTF-8 values fail loud
-  instead of manufacturing a resource ceiling.
+  instead of manufacturing a resource ceiling. When uv is unavailable and
+  prview invokes Ruff, Mypy, or Pytest directly, uv-only files and environment
+  selectors no longer participate in planning or break an otherwise runnable
+  direct gate.
 - Direct Cargo gates preserve the effective repository `[build].jobs` ceiling
   visible from the exact reviewed cwd, including remote snapshots, instead of
   overriding a stricter project limit with prview's resource-plan width.

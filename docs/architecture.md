@@ -347,7 +347,10 @@ minimum of that project ceiling, inherited environment, and the run plan;
 malformed, unreadable, non-UTF-8, wrong-type, or non-positive authority fails
 closed. User- and system-level uv config remains outside this deliberately
 project-scoped resolver. The cap remains on every later `uv run`, so an
-unsuccessful pre-sync cannot retry outside the envelope. Before collection, a
+unsuccessful pre-sync cannot retry outside the envelope. A direct Ruff, Mypy,
+or Pytest fallback selected because uv is unavailable skips uv-only files and
+environment selectors altogether; it still contains the generic Python
+metadata it reads and retains the Cargo descendant cap. Before collection, a
 plugin-disabled, null-config `--version` probe uses the same pytest launcher,
 reviewed cwd, and bounded environment as the real check. Its actual major and
 minor select the pytest 6.0-7.1, 7.2-8.0, 8.1-8.x, or 9.x discovery contract;
@@ -1383,6 +1386,11 @@ PID never authorizes a signal by itself. After killing and reaping the root, the
 MCP parent must acquire the lock before its final drain, so a child cannot
 disappear into the spawn-before-registration gap. The descriptor closes at
 tool exec, while every descendant is already contained by its tool group. The
+review root also handles the macOS gap where a very short-lived group leader is
+already waitable but no longer exposes its native birth identity: because the
+owned leader remains unreaped, registration can safely terminate that exact
+PGID and any surviving members before PID reuse becomes possible. The parent
+then settles the provisional row without treating it as signal authority. The
 sidecar is a control file beside the run directory, never an input to its
 immutable manifest or ZIP. If the bounded unwind stalls, the parent terminates
 every still-owned group before killing and reaping the direct review root;
@@ -1503,11 +1511,13 @@ before a reboot co-authored a `BLOCK`, and the pack said only `cached: true` —
 nothing named the age of the evidence.
 
 `generate_merge_gate` therefore reads the run's ledger (the only place that
-carries `cache_age_secs`, see [ledger/mod.rs](#ledgermodrs)) and, for every gate
-row with BLOCKING influence on the verdict — policy conclusion `Block`, or a raw
-`failed`/`error` status, which gates `quality_pass` — emits one entry per row
-whose replay is older than `STALE_CACHE_CAVEAT_MAX_AGE_SECS` (7 days, a constant
-in `src/artifacts/merge_gate.rs`; a CLI knob is a follow-up):
+carries `cache_age_secs`, see [ledger/mod.rs](#ledgermodrs)) and emits one entry
+for every gate row whose replay is older than
+`STALE_CACHE_CAVEAT_MAX_AGE_SECS` (7 days, a constant in
+`src/artifacts/merge_gate.rs`; a CLI knob is a follow-up). This includes stale
+passes: unchanged source keys do not bind the compiler or every tool version,
+so an old positive result can support a clean verdict the current toolchain
+would reject:
 
 ```json
 "stale_cache_caveats": [
@@ -1521,8 +1531,7 @@ outside `decision`: that object is closed by contract and every field in it rank
 the verdict, so a report ABOUT the pack must not live there. A stale replay
 changes no verdict, no exit code, and no other field — pinned by
 `the_stale_cache_caveat_moves_no_other_field`, which diffs the whole `decision`,
-`checks`, and `inline_findings` of a stale run against a fresh one. A stale
-PASSING row raises nothing: only blocking evidence is worth dating.
+`checks`, and `inline_findings` of a stale run against a fresh one.
 
 ### artifacts/signal/ (module directory)
 

@@ -160,7 +160,12 @@ accepts a local process-table census only after the same snapshot reports the
 root stopped, and signals only direct hardened child groups or committed identities.
 A provisional PID is never signal authority by itself. The parent then kills
 and reaps the root, acquires the ledger lock, and accepts the final drain. The
-sidecar lives beside, never inside, the immutable run directory. Confirmed
+macOS review root additionally handles a leader that exits before its native
+birth identity can be mirrored: while the owned leader is still unreaped and
+its PGID cannot be reused, registration terminates any surviving member of that
+group. The parent can then settle the provisional row without ever signalling
+from provisional evidence. The sidecar lives beside, never inside, the
+immutable run directory. Confirmed
 cleanup removes it; unconfirmed cleanup retains it and returns
 `containment_confirmed: false` instead of claiming success. Hardened tool
 children receive neither capability env nor ledger descriptor after exec;

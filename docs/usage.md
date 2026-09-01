@@ -237,8 +237,11 @@ consume them independently of uv configuration discovery. `UV_PROJECT`,
 redirect execution away from the exact reviewed root; an in-tree explicit
 config remains the concurrency authority uv will actually use. User- and
 system-level uv configuration is not currently reproduced by this project-level
-resolver. Pytest also receives
-`PYTEST_XDIST_AUTO_NUM_WORKERS`; when project or inherited addopts request
+resolver. When uv is unavailable, direct Ruff, Mypy, and Pytest invocations do
+not parse `uv.toml`, `uv.lock`, `[tool.uv]`, or uv-only environment selectors;
+those inputs cannot affect a process that will not consume them. Generic Python
+metadata and the run's `CARGO_BUILD_JOBS` descendant cap remain in force.
+Pytest also receives `PYTEST_XDIST_AUTO_NUM_WORKERS`; when project or inherited addopts request
 xdist (`-n auto`, `logical`, or explicit `-n N`), prview caps only a dynamic or
 too-large pool. An explicit smaller count and `-n 0` remain unchanged. A short,
 isolated probe of the actual project pytest selects the matching supported
