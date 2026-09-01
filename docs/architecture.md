@@ -1461,15 +1461,16 @@ revision bytes like other live entries; there is no checkout or HEAD fallback.
 Evidence paths, source states, private origins, and provenance remain traceable
 but are separate from external semantic identity.
 
-Library discovery matches the exact `Cargo.toml` basename. It validates every
-consumed Cargo field (`package.name`, `[lib]`, `lib.name`, `lib.path`,
-`lib.proc-macro`, `lib.crate-type`, `package.autolib`, and effective edition)
-instead of inventing defaults for an invalid schema. Edition is resolved from a
-library-target override, direct package value, exact workspace-package
-inheritance, or Cargo's 2015 default. The crate contract includes the normalized
-`crate-type` set (default `["lib"]`, or `["proc-macro"]` for a proc-macro
-target) and `proc-macro`; the library root path and edition stay in
-evidence/provenance rather than globally changing every crate fact. Optional normal/build/target
+Cargo target discovery matches the exact `Cargo.toml` basename. Library
+discovery validates every consumed field (`package.name`, `[lib]`, `lib.name`,
+`lib.path`, `lib.proc-macro`, `lib.crate-type`, `package.autolib`, and effective
+edition) instead of inventing defaults for an invalid schema. Edition is
+resolved from a library-target override, direct package value, exact
+workspace-package inheritance, or Cargo's 2015 default. The crate contract
+includes the normalized `crate-type` set (default `["lib"]`, or
+`["proc-macro"]` for a proc-macro target) and `proc-macro`; the library root path
+and edition stay in evidence/provenance rather than globally changing every
+crate fact. Optional normal/build/target
 dependencies without an explicit `[features]` entry become implicit Cargo
 features unless suppressed through `dep:` references. Package and explicit
 library names must also be non-empty valid Cargo/crate identifiers, including
@@ -1488,12 +1489,33 @@ paths become manifest/source unknowns rather than being remapped. Missing,
 renamed-away, deleted, non-regular, non-UTF-8, unreadable, or parse-failed
 manifests and roots remain typed unknowns.
 
+Real binary-target discovery is separate from the library early-exit. It
+recognizes Cargo's implicit `src/main.rs`, `src/bin/*.rs`, and
+`src/bin/*/main.rs` roots plus explicit `[[bin]]` entries; applies the edition
+2015 auto-discovery default and `package.autobins`; and validates target name,
+explicit or inferred path, target edition, and `required-features`. Explicit
+targets claim their roots so the same source is not also invented as an
+auto-discovered target. Malformed, unavailable, duplicate, or ambiguous target
+metadata remains typed manifest uncertainty. An exact binary root that is
+itself a tracked symlink is retained as non-neutralizable typed uncertainty.
+Discovery does not separately model a symlinked parent directory such as
+`src/` or `src/bin/`; that bounded filesystem-shape residual remains outside
+this contract. Each binary uses a stable target-scoped analysis identity
+(`<package>#bin:<target>`), preventing
+the common same-named library and default binary from sharing projection,
+edition, cfg-authority, module-cache, or native-evidence state. These synthetic
+identities are evidence keys, not Rust dependency crates and not additions to
+the public crate census.
+
 Target projection follows Cargo/Rust linkage semantics. `lib`, `rlib`, and
 `dylib` outputs expose the ordinary downstream Rust item graph; proc-macro
 targets expose only supported procedural macro entry points. A target whose
 effective types are only `cdylib`, `staticlib`, or `bin` is not projected as a
 Rust dependency surface. Its public and private native exports are still
 scanned, including exported associated functions in inherent and trait impls.
+For ordinary Cargo binaries this scan starts from every discovered binary root;
+internal `pub` items remain absent from the dependency API surface, while native
+export signatures retain typed uncertainty bound to their local type semantics.
 In a native-producing target, including mixed `rlib + cdylib`, an associated
 binary export carrying a transforming attribute binds the full macro-visible
 member input, a separate normalized owner/ABI contract, and the revision-backed

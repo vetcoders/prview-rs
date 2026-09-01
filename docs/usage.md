@@ -628,13 +628,22 @@ explicit unavailable `[lib]` root remains unknown. A tracked symlink in the
 implicit root position is not followed and remains non-neutralizable typed
 uncertainty on both sides. Cargo-valid keyword package and library names that
 can be addressed as raw identifiers remain part of the census. Ordinary Rust
-items are projected only for Rust-linkable `lib`/`rlib`/`dylib` outputs. Proc-macro
-exports remain separate, and native-only `cdylib`/`staticlib`/`bin` targets
-retain binary-export and target uncertainty, including exported associated
-functions in inherent and trait impls, without pretending that their
-internal `pub` items are dependency API. Native-producing targets (including a
-mixed `rlib + cdylib`) also retain typed potential-export evidence when a custom
-associated attribute or item-position macro can generate the native symbol; an
+items are projected only for Rust-linkable `lib`/`rlib`/`dylib` outputs. Real
+Cargo binary roots are discovered from `src/main.rs`, both supported `src/bin`
+layouts, and explicit `[[bin]]` tables with Cargo's `autobins`, edition, path,
+and `required-features` rules. An exact tracked binary-root symlink fails
+closed; symlinked parent directories such as `src/` or `src/bin/` are not
+separately classified by this discovery layer. Each binary has a target-scoped
+analysis identity separate from a same-named library. Proc-macro exports remain
+separate, and
+native-only `cdylib`/`staticlib`/`bin` targets retain binary-export and target
+uncertainty, including exported associated functions in inherent and trait
+impls, without pretending that their internal `pub` items are dependency API.
+Native export signatures are bound to local type semantics so an alias-only ABI
+change cannot neutralize as unchanged evidence. Native-producing targets
+(including a mixed `rlib + cdylib`) also retain typed potential-export evidence
+when a custom associated attribute or item-position macro can generate the
+native symbol; an
 internal associated macro in an `rlib`-only private owner remains outside the
 external contract. Exported declarative macro contracts
 bind the effective direct, workspace-inherited, or library-target edition; an

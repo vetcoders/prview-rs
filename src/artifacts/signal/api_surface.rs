@@ -368,6 +368,17 @@ struct GuardedImplEvidence {
     declaring_module_path: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct NativeDependencySubject {
+    crate_name: String,
+    module_path: Vec<String>,
+    source_path: String,
+    cfg_guard: Vec<String>,
+    export_name: String,
+    raw_roots: BTreeSet<PrivateTypeKey>,
+    crate_type_substrate: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GuardedPrivateTypeKey {
     key: PrivateTypeKey,
@@ -415,6 +426,24 @@ struct ModuleVisibilityProof {
     declared_public: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoBinaryTarget {
+    // A package's library and default binary normally share a Rust crate name.
+    // Native facts need a target-scoped key so the binary never inherits the
+    // library's Rust-linkable projection mode.
+    analysis_name: String,
+    target_name: String,
+    root_path: String,
+    edition: String,
+    cfg_guard: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct CargoBinaryDiscovery {
+    targets: Vec<CargoBinaryTarget>,
+    errors: Vec<String>,
+}
+
 struct SnapshotBuilder<'a> {
     source: &'a dyn RevisionFileSource,
     provenance: RevisionProvenance,
@@ -424,6 +453,8 @@ struct SnapshotBuilder<'a> {
     module_aliases: Vec<RustModuleAlias>,
     items: Vec<RustApiItem>,
     declarations: Vec<RustApiDeclaration>,
+    native_declarations: Vec<RustApiDeclaration>,
+    native_dependency_subjects: Vec<NativeDependencySubject>,
     reexports: Vec<RustApiReexport>,
     unknowns: Vec<RustApiUnknown>,
     symbols: BTreeMap<SymbolKey, Vec<RawSymbol>>,
@@ -467,6 +498,8 @@ impl<'a> SnapshotBuilder<'a> {
             module_aliases: Vec::new(),
             items: Vec::new(),
             declarations: Vec::new(),
+            native_declarations: Vec::new(),
+            native_dependency_subjects: Vec::new(),
             reexports: Vec::new(),
             unknowns: Vec::new(),
             symbols: BTreeMap::new(),
@@ -650,6 +683,16 @@ impl<'a> SnapshotBuilder<'a> {
     fn record_private_type_dependencies(&mut self) {
         use sha2::{Digest, Sha256};
 
+        // Native-only targets deliberately do not publish ordinary Rust items
+        // or declarations through `RustApiSnapshot`. Their local declarations
+        // still participate here so an exported ABI signature can bind to the
+        // exact alias/declaration closure that defines its layout.
+        let all_declarations = self
+            .declarations
+            .iter()
+            .chain(&self.native_declarations)
+            .cloned()
+            .collect::<Vec<_>>();
         let mut public_origins: BTreeMap<PrivateTypeKey, Vec<Vec<String>>> = BTreeMap::new();
         for item in self
             .items
@@ -666,7 +709,7 @@ impl<'a> SnapshotBuilder<'a> {
                 .push(item.cfg_guard.clone());
         }
         let mut declarations: BTreeMap<PrivateTypeKey, Vec<RustApiDeclaration>> = BTreeMap::new();
-        for declaration in self.declarations.iter().filter(|declaration| {
+        for declaration in all_declarations.iter().filter(|declaration| {
             if declaration.key.namespace != RustNamespace::Type {
                 return false;
             }
@@ -702,7 +745,7 @@ impl<'a> SnapshotBuilder<'a> {
         let (private_aliases, private_module_aliases) = private_alias_graph(
             &self.private_uses,
             &self.self_crate_aliases,
-            &self.declarations,
+            &all_declarations,
         );
 
         let mut implementation_evidence: BTreeMap<PrivateTypeKey, Vec<GuardedImplEvidence>> =
@@ -816,28 +859,8 @@ impl<'a> SnapshotBuilder<'a> {
             }
         }
 
-        let mut dependency_unknowns = Vec::new();
-        for item in &self.items {
-            let raw_roots = if let Ok(parsed) = syn::parse_str::<Item>(&item.contract) {
-                LocalTypeDependencyCollector::collect_item_types(
-                    &item.key.crate_name,
-                    &item.origin_module_path,
-                    &parsed,
-                )
-            } else if let Ok(parsed) = syn::parse_str::<syn::ItemImpl>(&item.contract) {
-                LocalTypeDependencyCollector::collect_impl_types(
-                    &item.key.crate_name,
-                    &item.origin_module_path,
-                    &parsed,
-                )
-            } else {
-                BTreeSet::new()
-            };
-            if raw_roots.is_empty() {
-                continue;
-            }
-
-            let initial_guard = combined_guards(&item.cfg_guard, &[]);
+        let collect_dependency_closure =
+            |raw_roots: BTreeSet<PrivateTypeKey>, initial_guard: Vec<String>| {
             let mut roots: BTreeSet<GuardedPrivateTypeKey> = raw_roots
                 .into_iter()
                 .map(|key| GuardedPrivateTypeKey {
@@ -959,11 +982,39 @@ impl<'a> SnapshotBuilder<'a> {
                     }
                 }
             }
+            closure.sort();
+            closure.dedup();
+            (closure, alias_resolution_exhausted)
+        };
+
+        let mut dependency_unknowns = Vec::new();
+        for item in &self.items {
+            let raw_roots = if let Ok(parsed) = syn::parse_str::<Item>(&item.contract) {
+                LocalTypeDependencyCollector::collect_item_types(
+                    &item.key.crate_name,
+                    &item.origin_module_path,
+                    &parsed,
+                )
+            } else if let Ok(parsed) = syn::parse_str::<syn::ItemImpl>(&item.contract) {
+                LocalTypeDependencyCollector::collect_impl_types(
+                    &item.key.crate_name,
+                    &item.origin_module_path,
+                    &parsed,
+                )
+            } else {
+                BTreeSet::new()
+            };
+            if raw_roots.is_empty() {
+                continue;
+            }
+
+            let (closure, alias_resolution_exhausted) = collect_dependency_closure(
+                raw_roots,
+                combined_guards(&item.cfg_guard, &[]),
+            );
             if closure.is_empty() && !alias_resolution_exhausted {
                 continue;
             }
-            closure.sort();
-            closure.dedup();
             let digest = format!("sha256:{:x}", Sha256::digest(closure.join("\n--\n")));
             dependency_unknowns.push(RustApiUnknown {
                 kind: RustApiUnknownKind::PrivateTypeDependency,
@@ -980,6 +1031,54 @@ impl<'a> SnapshotBuilder<'a> {
                     format!(
                         "public {:?} {} depends on non-public local type semantics ({digest})",
                         item.kind, item.key.external_name
+                    )
+                },
+                resolution_exhausted: alias_resolution_exhausted,
+                provenance: self.provenance.clone(),
+            });
+        }
+        for subject in &self.native_dependency_subjects {
+            let mut raw_roots = subject.raw_roots.clone();
+            if subject.crate_type_substrate {
+                raw_roots.extend(
+                    declarations
+                        .keys()
+                        .filter(|(crate_name, _, _)| crate_name == &subject.crate_name)
+                        .cloned(),
+                );
+                raw_roots.extend(
+                    private_aliases
+                        .keys()
+                        .filter(|(crate_name, _, _)| crate_name == &subject.crate_name)
+                        .cloned(),
+                );
+            }
+            if raw_roots.is_empty() {
+                continue;
+            }
+            let (closure, alias_resolution_exhausted) = collect_dependency_closure(
+                raw_roots,
+                combined_guards(&subject.cfg_guard, &[]),
+            );
+            if closure.is_empty() && !alias_resolution_exhausted {
+                continue;
+            }
+            let digest = format!("sha256:{:x}", Sha256::digest(closure.join("\n--\n")));
+            dependency_unknowns.push(RustApiUnknown {
+                kind: RustApiUnknownKind::PrivateTypeDependency,
+                crate_name: Some(subject.crate_name.clone()),
+                module_path: subject.module_path.clone(),
+                source_path: subject.source_path.clone(),
+                cfg_guard: subject.cfg_guard.clone(),
+                evidence: if alias_resolution_exhausted {
+                    format!(
+                        "native export {} has local type semantics whose alias resolution exceeded its finite graph bound ({digest})",
+                        subject.export_name
+                    )
+                } else {
+                    format!(
+                        "native export {} depends on local type semantics ({digest})",
+                        subject.export_name
                     )
                 },
                 resolution_exhausted: alias_resolution_exhausted,
@@ -1232,6 +1331,16 @@ impl<'a> SnapshotBuilder<'a> {
                 );
                 continue;
             }
+            let manifest_dir = parent_repo_path(&manifest_path);
+            self.discover_binary_crates(
+                &manifest_path,
+                &manifest,
+                package,
+                package_name,
+                &manifest_dir,
+                &parsed_manifest_authorities,
+                &cfg_authority_digest,
+            );
             let lib = match manifest.get("lib") {
                 Some(value) => match value.as_table() {
                     Some(table) => Some(table),
@@ -1282,7 +1391,6 @@ impl<'a> SnapshotBuilder<'a> {
                 },
                 None => default_autolib(&manifest, &edition),
             };
-            let manifest_dir = parent_repo_path(&manifest_path);
             if lib.is_none() && !autolib {
                 continue;
             }
@@ -1567,6 +1675,152 @@ impl<'a> SnapshotBuilder<'a> {
         }
     }
 
+    fn discover_binary_crates(
+        &mut self,
+        manifest_path: &str,
+        manifest: &toml::Value,
+        package: &toml::Table,
+        package_name: &str,
+        manifest_dir: &str,
+        parsed_manifest_authorities: &BTreeMap<String, toml::Value>,
+        cfg_authority_digest: &str,
+    ) {
+        let discovery = cargo_binary_targets(
+            manifest_path,
+            manifest,
+            package,
+            package_name,
+            manifest_dir,
+            parsed_manifest_authorities,
+            &self.inventory,
+        );
+        let package_crate_name = normalize_identifier(package_name.replace('-', "_"));
+        for error in discovery.errors {
+            self.unknown(
+                RustApiUnknownKind::ManifestParse,
+                Some(&package_crate_name),
+                &[],
+                manifest_path,
+                error,
+            );
+        }
+        if discovery.targets.is_empty() {
+            return;
+        }
+
+        let package_links = match package.get("links") {
+            Some(toml::Value::String(links)) => Some(links.as_str()),
+            Some(_) => {
+                self.unknown(
+                    RustApiUnknownKind::ManifestParse,
+                    Some(&package_crate_name),
+                    &[],
+                    manifest_path,
+                    "package.links must be a string".to_owned(),
+                );
+                None
+            }
+            None => None,
+        };
+        let repo_config_cfg_authority =
+            repository_cargo_cfg_authority(self.source, &self.inventory, package_links);
+        let build_script_cfg_authority =
+            package_has_active_build_script(package, manifest_dir, &self.inventory);
+        let cfg_authority = match build_script_cfg_authority {
+            Ok(true) => Some(cfg_authority_digest.to_owned()),
+            Ok(false) if package_links.is_some() => {
+                self.unknown(
+                    RustApiUnknownKind::ManifestParse,
+                    Some(&package_crate_name),
+                    &[],
+                    manifest_path,
+                    "package.links requires a live build script".to_owned(),
+                );
+                Some("unresolved:package-links-build-script".to_owned())
+            }
+            Ok(false) => match repo_config_cfg_authority {
+                Ok(true) => Some(cfg_authority_digest.to_owned()),
+                Ok(false) => None,
+                Err(reason) => Some(format!("unresolved:cargo-config:{reason}")),
+            },
+            Err(reason) => {
+                self.unknown(
+                    RustApiUnknownKind::ManifestParse,
+                    Some(&package_crate_name),
+                    &[],
+                    manifest_path,
+                    reason.clone(),
+                );
+                Some(format!("unresolved:build-script:{reason}"))
+            }
+        };
+
+        for target in discovery.targets {
+            let root_entry = self.inventory.get(&target.root_path);
+            if !root_entry.is_some_and(is_live_regular_entry) {
+                let state = root_entry
+                    .map(|entry| format!("{:?} {:?}", entry.kind, entry.state))
+                    .unwrap_or_else(|| "missing inventory entry".to_owned());
+                let evidence = if root_entry.is_some_and(is_live_symlink_entry) {
+                    format!(
+                        "{NON_NEUTRALIZABLE_SYMLINK_ROOT}{}\nbinary target {} declared by {manifest_path} is a tracked symlink whose compiler-visible source and module base cannot be proven from revision bytes: {state}",
+                        target.root_path, target.target_name
+                    )
+                } else {
+                    format!(
+                        "binary target {} declared by {manifest_path} has unavailable root {}: {state}",
+                        target.target_name, target.root_path
+                    )
+                };
+                self.unknown(
+                    RustApiUnknownKind::ManifestParse,
+                    Some(&target.analysis_name),
+                    &[],
+                    &target.root_path,
+                    evidence,
+                );
+                continue;
+            }
+
+            self.native_artifact_crates
+                .insert(target.analysis_name.clone());
+            self.crate_editions
+                .insert(target.analysis_name.clone(), target.edition.clone());
+            if let Some(cfg_authority) = &cfg_authority {
+                self.cfg_authority_digests
+                    .insert(target.analysis_name.clone(), cfg_authority.clone());
+            }
+            let base_dir = parent_repo_path(&target.root_path);
+            if !self.load_module(
+                &target.analysis_name,
+                Vec::new(),
+                &target.root_path,
+                &base_dir,
+                ModuleVisibilityProof {
+                    externally_reachable: false,
+                    declared_public: true,
+                },
+                target.cfg_guard.clone(),
+            ) {
+                self.native_artifact_crates.remove(&target.analysis_name);
+                self.crate_editions.remove(&target.analysis_name);
+                self.cfg_authority_digests.remove(&target.analysis_name);
+                continue;
+            }
+            self.unknown_guarded(
+                RustApiUnknownKind::UnsupportedExternResolution,
+                Some(&target.analysis_name),
+                &[],
+                manifest_path,
+                &target.cfg_guard,
+                format!(
+                    "native binary target is not a Rust dependency surface; target={}; root={}; crate_types=[\"bin\"]",
+                    target.target_name, target.root_path
+                ),
+            );
+        }
+    }
+
     fn load_module(
         &mut self,
         crate_name: &str,
@@ -1696,6 +1950,53 @@ impl<'a> SnapshotBuilder<'a> {
                     );
                 }
                 continue;
+            }
+            // Capture ABI type roots before any opaque transform boundary can
+            // short-circuit ordinary item handling. The transform unknown and
+            // this declaration-closure unknown prove different things: a
+            // macro may rewrite the item, while an unchanged exported
+            // signature may still change ABI through a local alias.
+            let item_binary_exports = binary_exports(
+                item,
+                !rust_linkable || !module_reachable,
+                crate_name,
+                module_path,
+            );
+            for (name, _, export_guard, _, raw_roots) in &item_binary_exports {
+                if raw_roots.is_empty() {
+                    continue;
+                }
+                self.native_dependency_subjects
+                    .push(NativeDependencySubject {
+                        crate_name: crate_name.to_owned(),
+                        module_path: module_path.to_vec(),
+                        source_path: source_path.to_owned(),
+                        cfg_guard: combined_guards(&cfg_guard, export_guard),
+                        export_name: name.clone(),
+                        raw_roots: raw_roots.clone(),
+                        crate_type_substrate: false,
+                    });
+            }
+            if native_artifact {
+                for (name, potential_guard, raw_roots, crate_type_substrate) in
+                    native_transform_dependency_subjects(item, crate_name, module_path)
+                {
+                    if raw_roots.is_empty() && !crate_type_substrate {
+                        continue;
+                    }
+                    self.native_dependency_subjects
+                        .push(NativeDependencySubject {
+                            crate_name: crate_name.to_owned(),
+                            module_path: module_path.to_vec(),
+                            source_path: source_path.to_owned(),
+                            cfg_guard: combined_guards(&cfg_guard, &potential_guard),
+                            export_name: format!(
+                                "macro-generated-native-export-potential:{name}"
+                            ),
+                            raw_roots,
+                            crate_type_substrate,
+                        });
+                }
             }
             let custom_cfg_evidence = item_custom_cfg_evidence(item);
             if !custom_cfg_evidence.is_empty()
@@ -1955,9 +2256,7 @@ impl<'a> SnapshotBuilder<'a> {
                 }
                 continue;
             }
-            for (name, public, export_guard, evidence) in
-                binary_exports(item, !rust_linkable || !module_reachable)
-            {
+            for (name, public, export_guard, evidence, _) in item_binary_exports {
                 let effective_guard = combined_guards(&cfg_guard, &export_guard);
                 let visibility = if public { "public" } else { "private" };
                 self.unknown_guarded(
@@ -2106,7 +2405,7 @@ impl<'a> SnapshotBuilder<'a> {
                         );
                     }
                 }
-                Item::Use(item_use) if rust_linkable => {
+                Item::Use(item_use) if rust_linkable || native_artifact => {
                     let mut leaves = Vec::new();
                     flatten_use_tree(&item_use.tree, Vec::new(), &mut leaves);
                     let edge = UseEdge {
@@ -2117,16 +2416,21 @@ impl<'a> SnapshotBuilder<'a> {
                         source_path: source_path.to_owned(),
                         leaves,
                     };
-                    if is_public(&item_use.vis) {
-                        self.uses.push(edge.clone());
-                        if !module_reachable {
-                            self.private_uses.push(edge);
+                    if rust_linkable {
+                        if is_public(&item_use.vis) {
+                            self.uses.push(edge.clone());
+                            if !module_reachable {
+                                self.private_uses.push(edge.clone());
+                            }
+                        } else {
+                            self.private_uses.push(edge.clone());
                         }
-                    } else {
+                    }
+                    if native_artifact && !rust_linkable {
                         self.private_uses.push(edge);
                     }
                 }
-                Item::ExternCrate(item_extern) if rust_linkable => {
+                Item::ExternCrate(item_extern) if rust_linkable || native_artifact => {
                     if normalize_identifier(item_extern.ident.to_string()) == "self"
                         && let Some((_, alias)) = &item_extern.rename
                     {
@@ -2138,7 +2442,7 @@ impl<'a> SnapshotBuilder<'a> {
                             cfg_guard: cfg_guard.clone(),
                         });
                     }
-                    if module_reachable && is_public(&item_extern.vis) {
+                    if rust_linkable && module_reachable && is_public(&item_extern.vis) {
                         self.unknown_guarded(
                             RustApiUnknownKind::UnsupportedExternResolution,
                             Some(crate_name),
@@ -2430,14 +2734,14 @@ impl<'a> SnapshotBuilder<'a> {
                         );
                     }
                 }
-                _ if rust_linkable => {
+                _ if rust_linkable || native_artifact => {
                     if transforming_attrs(item_attrs(item)).next().is_none()
                         && transforming_cfg_attrs(item_attrs(item)).is_empty()
                         && let Some((name, namespace, kind, contract, declared_public)) =
                             ordinary_item_contract(item, &derive_name_ambiguity)
                     {
                         let evidence = contract.clone();
-                        self.declarations.push(RustApiDeclaration {
+                        let declaration = RustApiDeclaration {
                             key: RustApiItemKey {
                                 crate_name: crate_name.to_owned(),
                                 module_path: module_path.to_vec(),
@@ -2453,9 +2757,15 @@ impl<'a> SnapshotBuilder<'a> {
                             certainty: RustSourceCertainty::Confirmed,
                             declared_public,
                             parent_externally_reachable: module_reachable,
-                        });
+                        };
+                        if rust_linkable {
+                            self.declarations.push(declaration);
+                        } else {
+                            self.native_declarations.push(declaration);
+                        }
                     }
-                    if let Some((name, namespace, kind, contract)) =
+                    if rust_linkable
+                        && let Some((name, namespace, kind, contract)) =
                         public_item_contract(item, &derive_name_ambiguity)
                     {
                         let origin = SymbolKey {
@@ -6471,7 +6781,7 @@ fn custom_cfg_can_affect_external_surface(item: &Item, proc_macro_crate: bool) -
     };
     is_public(&function.vis)
         || proc_macro_crate
-        || !binary_exports(item, true).is_empty()
+        || !binary_export_attributes(&function.attrs).is_empty()
         || transforming_attrs(&function.attrs).next().is_some()
         || !transforming_cfg_attrs(&function.attrs).is_empty()
 }
@@ -9509,6 +9819,344 @@ fn default_autolib(manifest: &toml::Value, edition: &str) -> bool {
             .any(|target| manifest.get(*target).is_some())
 }
 
+fn cargo_binary_targets(
+    manifest_path: &str,
+    manifest: &toml::Value,
+    package: &toml::Table,
+    package_name: &str,
+    manifest_dir: &str,
+    parsed_manifest_authorities: &BTreeMap<String, toml::Value>,
+    inventory: &BTreeMap<String, RevisionEntry>,
+) -> CargoBinaryDiscovery {
+    let mut discovery = CargoBinaryDiscovery::default();
+    let conventional = conventional_cargo_binary_roots(manifest_dir, package_name, inventory);
+    if manifest.get("bin").is_none()
+        && conventional.is_empty()
+        && package.get("autobins").is_none()
+    {
+        return discovery;
+    }
+    let package_edition = match effective_library_edition(
+        manifest_path,
+        manifest,
+        None,
+        parsed_manifest_authorities,
+    ) {
+        Ok(edition) => edition,
+        Err(reason) => {
+            discovery.errors.push(reason);
+            return discovery;
+        }
+    };
+    let manual_target_exists = ["lib", "bin", "example", "test", "bench"]
+        .iter()
+        .any(|target| manifest.get(*target).is_some());
+    let autobins = match package.get("autobins") {
+        Some(toml::Value::Boolean(value)) => *value,
+        Some(_) => {
+            discovery
+                .errors
+                .push("package.autobins must be a boolean".to_owned());
+            return discovery;
+        }
+        None => package_edition != "2015" || !manual_target_exists,
+    };
+    if manifest.get("bin").is_none() && (!autobins || conventional.is_empty()) {
+        return discovery;
+    }
+    let known_features: BTreeSet<_> = match cargo_feature_contracts(manifest) {
+        Ok(features) => features.into_iter().map(|(name, _)| name).collect(),
+        Err(reason) => {
+            discovery
+                .errors
+                .push(format!("binary target features are invalid: {reason}"));
+            return discovery;
+        }
+    };
+    let mut targets_by_name = BTreeMap::new();
+
+    if let Some(value) = manifest.get("bin") {
+        let Some(entries) = value.as_array() else {
+            discovery
+                .errors
+                .push("bin must be an array of tables".to_owned());
+            return discovery;
+        };
+        for (index, value) in entries.iter().enumerate() {
+            let Some(table) = value.as_table() else {
+                discovery
+                    .errors
+                    .push(format!("bin[{index}] must be a table"));
+                continue;
+            };
+            let Some(target_name) = table.get("name").and_then(toml::Value::as_str) else {
+                discovery
+                    .errors
+                    .push(format!("bin[{index}].name must be a string"));
+                continue;
+            };
+            if let Err(reason) = validate_binary_target_name(target_name) {
+                discovery.errors.push(format!("bin[{index}]: {reason}"));
+                continue;
+            }
+            if targets_by_name.contains_key(target_name) {
+                discovery.errors.push(format!(
+                    "bin target name {target_name:?} is declared more than once"
+                ));
+                continue;
+            }
+            let root_path = match table.get("path") {
+                Some(toml::Value::String(path)) => {
+                    match safe_join_repo_path(manifest_dir, path) {
+                        Ok(path) => path,
+                        Err(reason) => {
+                            discovery.errors.push(format!(
+                                "bin[{index}].path cannot be resolved: {reason}"
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                Some(_) => {
+                    discovery
+                        .errors
+                        .push(format!("bin[{index}].path must be a string"));
+                    continue;
+                }
+                None => match conventional.get(target_name).map(Vec::as_slice) {
+                    Some([path]) => path.clone(),
+                    Some(paths) => {
+                        discovery.errors.push(format!(
+                            "bin[{index}] target {target_name:?} has ambiguous inferred roots: {paths:?}"
+                        ));
+                        continue;
+                    }
+                    None => {
+                        discovery.errors.push(format!(
+                            "bin[{index}] target {target_name:?} has no inferable source root"
+                        ));
+                        continue;
+                    }
+                },
+            };
+            let edition = match table.get("edition") {
+                Some(toml::Value::String(edition)) => match validate_edition(edition) {
+                    Ok(edition) => edition,
+                    Err(reason) => {
+                        discovery
+                            .errors
+                            .push(format!("bin[{index}].edition: {reason}"));
+                        continue;
+                    }
+                },
+                Some(_) => {
+                    discovery
+                        .errors
+                        .push(format!("bin[{index}].edition must be a string"));
+                    continue;
+                }
+                None => package_edition.clone(),
+            };
+            let required_features = match binary_required_features(table, index) {
+                Ok(features) => features,
+                Err(reason) => {
+                    discovery.errors.push(reason);
+                    continue;
+                }
+            };
+            let missing_features: Vec<_> = required_features
+                .iter()
+                .filter(|feature| !known_features.contains(feature.as_str()))
+                .cloned()
+                .collect();
+            if !missing_features.is_empty() {
+                discovery.errors.push(format!(
+                    "bin[{index}].required-features references undefined features: {missing_features:?}"
+                ));
+                continue;
+            }
+            let cfg_guard = required_features
+                .iter()
+                .map(|feature| format!("feature = {feature:?}"))
+                .collect();
+            targets_by_name.insert(
+                target_name.to_owned(),
+                CargoBinaryTarget {
+                    analysis_name: binary_analysis_name(package_name, target_name),
+                    target_name: target_name.to_owned(),
+                    root_path,
+                    edition,
+                    cfg_guard,
+                },
+            );
+        }
+    }
+
+    if autobins {
+        let explicitly_claimed_roots: BTreeSet<String> = targets_by_name
+            .values()
+            .map(|target| target.root_path.clone())
+            .collect();
+        for (target_name, paths) in conventional {
+            if targets_by_name.contains_key(&target_name) {
+                continue;
+            }
+            if let Err(reason) = validate_binary_target_name(&target_name) {
+                discovery.errors.push(format!(
+                    "auto-discovered bin target {target_name:?}: {reason}"
+                ));
+                continue;
+            }
+            let unclaimed_paths: Vec<_> = paths
+                .iter()
+                .filter(|path| !explicitly_claimed_roots.contains(path.as_str()))
+                .cloned()
+                .collect();
+            let [root_path] = unclaimed_paths.as_slice() else {
+                if unclaimed_paths.is_empty() {
+                    continue;
+                }
+                discovery.errors.push(format!(
+                    "auto-discovered bin target {target_name:?} has ambiguous roots: {unclaimed_paths:?}"
+                ));
+                continue;
+            };
+            targets_by_name.insert(
+                target_name.clone(),
+                CargoBinaryTarget {
+                    analysis_name: binary_analysis_name(package_name, &target_name),
+                    target_name,
+                    root_path: root_path.clone(),
+                    edition: package_edition.clone(),
+                    cfg_guard: Vec::new(),
+                },
+            );
+        }
+    }
+
+    let mut targets_by_analysis_name = BTreeMap::<String, Vec<CargoBinaryTarget>>::new();
+    for target in targets_by_name.into_values() {
+        targets_by_analysis_name
+            .entry(target.analysis_name.clone())
+            .or_default()
+            .push(target);
+    }
+    for targets in targets_by_analysis_name.into_values() {
+        if targets.len() != 1 {
+            let names: Vec<_> = targets
+                .iter()
+                .map(|target| target.target_name.as_str())
+                .collect();
+            discovery.errors.push(format!(
+                "binary target names {names:?} normalize to the same Rust crate identity"
+            ));
+            continue;
+        }
+        discovery.targets.extend(targets);
+    }
+    discovery.targets.sort_by(|left, right| {
+        (&left.analysis_name, &left.root_path).cmp(&(&right.analysis_name, &right.root_path))
+    });
+    discovery
+}
+
+fn conventional_cargo_binary_roots(
+    manifest_dir: &str,
+    package_name: &str,
+    inventory: &BTreeMap<String, RevisionEntry>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut candidates = BTreeMap::<String, Vec<String>>::new();
+    let main = safe_join_repo_path(manifest_dir, "src/main.rs")
+        .expect("constant Cargo main path stays inside the repository");
+    if inventory
+        .get(&main)
+        .is_some_and(is_live_binary_root_candidate)
+    {
+        candidates
+            .entry(package_name.to_owned())
+            .or_default()
+            .push(main);
+    }
+
+    let bin_dir = safe_join_repo_path(manifest_dir, "src/bin")
+        .expect("constant Cargo bin path stays inside the repository");
+    let prefix = format!("{bin_dir}/");
+    for (path, entry) in inventory {
+        if !is_live_binary_root_candidate(entry) {
+            continue;
+        }
+        let Some(relative) = path.strip_prefix(&prefix) else {
+            continue;
+        };
+        let parts: Vec<_> = relative.split('/').collect();
+        let target_name = match parts.as_slice() {
+            [file] if file.ends_with(".rs") => file.strip_suffix(".rs"),
+            [directory, "main.rs"] => Some(*directory),
+            _ => None,
+        };
+        let Some(target_name) = target_name.filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        candidates
+            .entry(target_name.to_owned())
+            .or_default()
+            .push(path.clone());
+    }
+    for paths in candidates.values_mut() {
+        paths.sort();
+        paths.dedup();
+    }
+    candidates
+}
+
+fn binary_required_features(
+    table: &toml::Table,
+    index: usize,
+) -> Result<Vec<String>, String> {
+    let Some(value) = table.get("required-features") else {
+        return Ok(Vec::new());
+    };
+    let Some(features) = value.as_array() else {
+        return Err(format!(
+            "bin[{index}].required-features must be an array of strings"
+        ));
+    };
+    let mut required = Vec::new();
+    for feature in features {
+        let Some(feature) = feature.as_str() else {
+            return Err(format!(
+                "bin[{index}].required-features must contain only strings"
+            ));
+        };
+        required.push(feature.to_owned());
+    }
+    required.sort();
+    required.dedup();
+    Ok(required)
+}
+
+fn binary_analysis_name(package_name: &str, target_name: &str) -> String {
+    format!(
+        "{}#bin:{}",
+        normalize_identifier(package_name.replace('-', "_")),
+        normalize_identifier(target_name.replace('-', "_"))
+    )
+}
+
+fn validate_binary_target_name(name: &str) -> Result<(), String> {
+    validate_package_name(name).map_err(|reason| reason.replace("package.name", "bin.name"))
+}
+
+fn is_live_binary_root_candidate(entry: &RevisionEntry) -> bool {
+    matches!(
+        entry.state,
+        RevisionEntryState::Present
+            | RevisionEntryState::Added
+            | RevisionEntryState::RenamedFrom { .. }
+            | RevisionEntryState::NonRegular { .. }
+    )
+}
+
 fn package_has_active_build_script(
     package: &toml::Table,
     manifest_dir: &str,
@@ -10236,6 +10884,215 @@ impl LocalTypeDependencyCollector {
     ) -> BTreeSet<(String, Vec<String>, String)> {
         let mut collector = Self::new(crate_name, module_path);
         collector.fold_item_impl(item.clone());
+        collector.dependencies
+    }
+
+    fn collect_native_item_types(
+        crate_name: &str,
+        module_path: &[String],
+        item: &Item,
+    ) -> BTreeSet<PrivateTypeKey> {
+        let mut collector = Self::new(crate_name, module_path);
+        match item {
+            Item::Fn(function) => {
+                collector.fold_signature(function.sig.clone());
+            }
+            Item::Static(value) => {
+                collector.fold_type((*value.ty).clone());
+            }
+            _ => {}
+        }
+        collector.dependencies
+    }
+
+    fn collect_native_transform_item_types(
+        crate_name: &str,
+        module_path: &[String],
+        item: &Item,
+    ) -> BTreeSet<PrivateTypeKey> {
+        let mut collector = Self::new(crate_name, module_path);
+        match item {
+            Item::Const(value) => collector.fold_type((*value.ty).clone()),
+            Item::Enum(value) => {
+                collector.fold_generics(value.generics.clone());
+                for variant in &value.variants {
+                    for field in &variant.fields {
+                        collector.fold_type(field.ty.clone());
+                    }
+                }
+            }
+            Item::Fn(value) => collector.fold_signature(value.sig.clone()),
+            Item::ForeignMod(value) => {
+                for foreign in &value.items {
+                    match foreign {
+                        syn::ForeignItem::Fn(value) => {
+                            collector.fold_signature(value.sig.clone());
+                        }
+                        syn::ForeignItem::Static(value) => {
+                            collector.fold_type((*value.ty).clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Item::Impl(value) => {
+                collector.fold_generics(value.generics.clone());
+                collector.fold_type((*value.self_ty).clone());
+                if let Some((_, trait_path, _)) = &value.trait_ {
+                    collector.fold_path(trait_path.clone());
+                }
+                for member in &value.items {
+                    match member {
+                        syn::ImplItem::Const(value) => {
+                            collector.fold_generics(value.generics.clone());
+                            collector.fold_type(value.ty.clone());
+                        }
+                        syn::ImplItem::Fn(value) => {
+                            collector.fold_signature(value.sig.clone());
+                        }
+                        syn::ImplItem::Type(value) => {
+                            collector.fold_generics(value.generics.clone());
+                            collector.fold_type(value.ty.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Item::Static(value) => collector.fold_type((*value.ty).clone()),
+            Item::Mod(value) => {
+                if let Some((_, items)) = &value.content {
+                    for nested in items {
+                        collector.dependencies.extend(
+                            Self::collect_native_transform_item_types(
+                                crate_name,
+                                module_path,
+                                nested,
+                            ),
+                        );
+                    }
+                }
+            }
+            Item::Struct(value) => {
+                collector.fold_generics(value.generics.clone());
+                for field in &value.fields {
+                    collector.fold_type(field.ty.clone());
+                }
+            }
+            Item::Trait(value) => {
+                collector.fold_generics(value.generics.clone());
+                for bound in &value.supertraits {
+                    collector.fold_type_param_bound(bound.clone());
+                }
+                for member in &value.items {
+                    match member {
+                        syn::TraitItem::Const(value) => {
+                            collector.fold_generics(value.generics.clone());
+                            collector.fold_type(value.ty.clone());
+                        }
+                        syn::TraitItem::Fn(value) => {
+                            collector.fold_signature(value.sig.clone());
+                        }
+                        syn::TraitItem::Type(value) => {
+                            collector.fold_generics(value.generics.clone());
+                            for bound in &value.bounds {
+                                collector.fold_type_param_bound(bound.clone());
+                            }
+                            if let Some((_, default)) = &value.default {
+                                collector.fold_type(default.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Item::TraitAlias(value) => {
+                collector.fold_generics(value.generics.clone());
+                for bound in &value.bounds {
+                    collector.fold_type_param_bound(bound.clone());
+                }
+            }
+            Item::Type(value) => {
+                collector.fold_generics(value.generics.clone());
+                collector.fold_type((*value.ty).clone());
+            }
+            Item::Union(value) => {
+                collector.fold_generics(value.generics.clone());
+                for field in &value.fields.named {
+                    collector.fold_type(field.ty.clone());
+                }
+            }
+            _ => {}
+        }
+        collector.dependencies
+    }
+
+    fn collect_native_macro_types(
+        crate_name: &str,
+        module_path: &[String],
+        macro_call: &syn::Macro,
+    ) -> Option<BTreeSet<PrivateTypeKey>> {
+        let mut collector = Self::new(crate_name, module_path);
+        if let Ok(ty) = syn::parse2::<syn::Type>(macro_call.tokens.clone()) {
+            collector.fold_type(ty);
+            return Some(collector.dependencies);
+        }
+        let parser = Punctuated::<syn::Type, Token![,]>::parse_terminated;
+        let Ok(types) = parser.parse2(macro_call.tokens.clone()) else {
+            return None;
+        };
+        for ty in types {
+            collector.fold_type(ty);
+        }
+        Some(collector.dependencies)
+    }
+
+    fn collect_native_associated_types(
+        crate_name: &str,
+        module_path: &[String],
+        item_impl: &syn::ItemImpl,
+        function: &syn::ImplItemFn,
+        bind_transform_owner: bool,
+    ) -> BTreeSet<PrivateTypeKey> {
+        let mut collector = Self::new(crate_name, module_path);
+        collector.fold_signature(function.sig.clone());
+        let signature_dependencies = collector.dependencies.clone();
+        let has_receiver = function
+            .sig
+            .inputs
+            .iter()
+            .any(|input| matches!(input, syn::FnArg::Receiver(_)));
+        let uses_self = signature_dependencies
+            .iter()
+            .any(|(_, _, name)| name == "Self");
+        let generic_names = item_impl
+            .generics
+            .params
+            .iter()
+            .filter_map(|parameter| match parameter {
+                syn::GenericParam::Type(value) => Some(value.ident.to_string()),
+                syn::GenericParam::Const(value) => Some(value.ident.to_string()),
+                syn::GenericParam::Lifetime(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let uses_impl_generic = signature_dependencies
+            .iter()
+            .any(|(_, _, name)| generic_names.contains(name));
+
+        if bind_transform_owner || has_receiver || uses_self {
+            collector.fold_type((*item_impl.self_ty).clone());
+        }
+        if bind_transform_owner || uses_impl_generic {
+            // Once a signature actually names an impl generic, its bounds are
+            // part of the conservative native contract. A static associated
+            // export that names no impl generic must not inherit unrelated
+            // owner/generic layout merely because it lives in the impl block.
+            collector.fold_generics(item_impl.generics.clone());
+        }
+        if bind_transform_owner
+            && let Some((_, trait_path, _)) = &item_impl.trait_
+        {
+            collector.fold_path(trait_path.clone());
+        }
         collector.dependencies
     }
 
@@ -11235,11 +12092,21 @@ fn binary_export_attributes(attrs: &[Attribute]) -> Vec<(Vec<String>, String)> {
 fn binary_exports(
     item: &Item,
     include_public_direct: bool,
-) -> Vec<(String, bool, Vec<String>, String)> {
+    crate_name: &str,
+    module_path: &[String],
+) -> Vec<(
+    String,
+    bool,
+    Vec<String>,
+    String,
+    BTreeSet<PrivateTypeKey>,
+)> {
     let direct = |name: String, attrs: &[Attribute], public: bool, input: String| {
         if public && !include_public_direct {
             return Vec::new();
         }
+        let raw_roots =
+            LocalTypeDependencyCollector::collect_native_item_types(crate_name, module_path, item);
         binary_export_attributes(attrs)
             .into_iter()
             .map(|(guard, export)| {
@@ -11248,6 +12115,7 @@ fn binary_exports(
                     public,
                     guard,
                     format!("{export}\ninput:{input}"),
+                    raw_roots.clone(),
                 )
             })
             .collect()
@@ -11267,17 +12135,7 @@ fn binary_exports(
             canonical_tokens(item.to_token_stream()),
         ),
         Item::Impl(item_impl) => {
-            let normalized_impl =
-                CanonicalFold.fold_item_impl(normalized_trait_impl_item(item_impl));
-            let owner = if let Some((_, trait_path, _)) = &normalized_impl.trait_ {
-                format!(
-                    "<{} as {}>",
-                    canonical_tokens(normalized_impl.self_ty.to_token_stream()),
-                    canonical_tokens(trait_path.to_token_stream())
-                )
-            } else {
-                canonical_tokens(normalized_impl.self_ty.to_token_stream())
-            };
+            let owner = normalized_impl_owner(item_impl);
             item_impl
                 .items
                 .iter()
@@ -11295,6 +12153,14 @@ fn binary_exports(
                         normalize_identifier(function.sig.ident.to_string())
                     );
                     let input = normalized_associated_contract(item_impl, member, false);
+                    let raw_roots =
+                        LocalTypeDependencyCollector::collect_native_associated_types(
+                            crate_name,
+                            module_path,
+                            item_impl,
+                            function,
+                            false,
+                        );
                     Some(binary_export_attributes(&function.attrs).into_iter().map(
                         move |(guard, export)| {
                             (
@@ -11302,6 +12168,7 @@ fn binary_exports(
                                 public,
                                 combined_guards(&member_cfg.guards, &guard),
                                 format!("{export}\ninput:{input}"),
+                                raw_roots.clone(),
                             )
                         },
                     ))
@@ -11311,6 +12178,165 @@ fn binary_exports(
         }
         _ => Vec::new(),
     }
+}
+
+fn normalized_impl_owner(item_impl: &syn::ItemImpl) -> String {
+    let normalized_impl = CanonicalFold.fold_item_impl(normalized_trait_impl_item(item_impl));
+    if let Some((_, trait_path, _)) = &normalized_impl.trait_ {
+        format!(
+            "<{} as {}>",
+            canonical_tokens(normalized_impl.self_ty.to_token_stream()),
+            canonical_tokens(trait_path.to_token_stream())
+        )
+    } else {
+        canonical_tokens(normalized_impl.self_ty.to_token_stream())
+    }
+}
+
+fn transforming_attribute_guards(attrs: &[Attribute]) -> Vec<Vec<String>> {
+    fn collect(meta: &Meta, inherited_guard: &[String], guards: &mut BTreeSet<Vec<String>>) {
+        if let Meta::List(list) = meta
+            && list.path.is_ident("cfg_attr")
+        {
+            let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+            let Ok(parts) = parser.parse2(list.tokens.clone()) else {
+                return;
+            };
+            let mut parts = parts.iter();
+            let Some(predicate) = parts
+                .next()
+                .and_then(|predicate| canonical_meta_checked(predicate).ok())
+            else {
+                return;
+            };
+            let mut effective_guard = inherited_guard.to_vec();
+            effective_guard.push(predicate);
+            effective_guard.sort();
+            effective_guard.dedup();
+            for nested in parts {
+                collect(nested, &effective_guard, guards);
+            }
+            return;
+        }
+        if !is_known_contract_meta(meta) {
+            guards.insert(inherited_guard.to_vec());
+        }
+    }
+
+    let mut guards = BTreeSet::new();
+    for attr in attrs {
+        collect(&attr.meta, &[], &mut guards);
+    }
+    guards.into_iter().collect()
+}
+
+fn native_transform_item_name(item: &Item) -> Option<String> {
+    match item {
+        Item::Const(value) => Some(normalize_identifier(value.ident.to_string())),
+        Item::Enum(value) => Some(normalize_identifier(value.ident.to_string())),
+        Item::Fn(value) => Some(normalize_identifier(value.sig.ident.to_string())),
+        Item::ForeignMod(_) => Some("foreign-mod".to_owned()),
+        Item::Impl(value) => Some(format!("impl:{}", normalized_impl_owner(value))),
+        Item::Mod(value) => Some(normalize_identifier(value.ident.to_string())),
+        Item::Static(value) => Some(normalize_identifier(value.ident.to_string())),
+        Item::Struct(value) => Some(normalize_identifier(value.ident.to_string())),
+        Item::Trait(value) => Some(normalize_identifier(value.ident.to_string())),
+        Item::TraitAlias(value) => Some(normalize_identifier(value.ident.to_string())),
+        Item::Type(value) => Some(normalize_identifier(value.ident.to_string())),
+        Item::Union(value) => Some(normalize_identifier(value.ident.to_string())),
+        _ => None,
+    }
+}
+
+fn native_transform_dependency_subjects(
+    item: &Item,
+    crate_name: &str,
+    module_path: &[String],
+) -> Vec<(String, Vec<String>, BTreeSet<PrivateTypeKey>, bool)> {
+    let mut subjects = Vec::new();
+    if let Some(name) = native_transform_item_name(item) {
+        let raw_roots = LocalTypeDependencyCollector::collect_native_transform_item_types(
+            crate_name,
+            module_path,
+            item,
+        );
+        subjects.extend(
+            transforming_attribute_guards(item_attrs(item))
+                .into_iter()
+                .map(|guard| (name.clone(), guard, raw_roots.clone(), false)),
+        );
+    }
+
+    match item {
+        Item::Impl(item_impl) => {
+            let owner = normalized_impl_owner(item_impl);
+            for member in &item_impl.items {
+                match member {
+                    syn::ImplItem::Fn(function) => {
+                        let member_cfg = canonical_cfg(&function.attrs);
+                        let raw_roots =
+                            LocalTypeDependencyCollector::collect_native_associated_types(
+                                crate_name,
+                                module_path,
+                                item_impl,
+                                function,
+                                true,
+                            );
+                        let name = format!(
+                            "{owner}::{}",
+                            normalize_identifier(function.sig.ident.to_string())
+                        );
+                        subjects.extend(
+                            transforming_attribute_guards(&function.attrs)
+                                .into_iter()
+                                .map(|guard| {
+                                    (
+                                        name.clone(),
+                                        combined_guards(&member_cfg.guards, &guard),
+                                        raw_roots.clone(),
+                                        false,
+                                    )
+                                }),
+                        );
+                    }
+                    syn::ImplItem::Macro(macro_item) if !macro_is_include(&macro_item.mac) => {
+                        let member_cfg = canonical_cfg(&macro_item.attrs);
+                        let invocation = canonical_tokens(macro_item.mac.to_token_stream());
+                        let parsed = LocalTypeDependencyCollector::collect_native_macro_types(
+                            crate_name,
+                            module_path,
+                            &macro_item.mac,
+                        );
+                        subjects.push((
+                            format!("{owner}::macro-invocation:{invocation}"),
+                            member_cfg.guards,
+                            parsed.clone().unwrap_or_default(),
+                            parsed.is_none(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Item::Macro(item_macro)
+            if item_macro.ident.is_none() && !macro_is_include(&item_macro.mac) =>
+        {
+            let invocation = canonical_tokens(item_macro.mac.to_token_stream());
+            let parsed = LocalTypeDependencyCollector::collect_native_macro_types(
+                crate_name,
+                module_path,
+                &item_macro.mac,
+            );
+            subjects.push((
+                format!("macro-invocation:{invocation}"),
+                Vec::new(),
+                parsed.clone().unwrap_or_default(),
+                parsed.is_none(),
+            ));
+        }
+        _ => {}
+    }
+    subjects
 }
 
 fn macro_export_guards(attrs: &[Attribute]) -> Vec<Vec<String>> {
@@ -12742,6 +13768,353 @@ mod tests {
                 .evidence
                 .contains("native-only library target is not a Rust dependency surface")
         }));
+    }
+
+    #[test]
+    fn rust_api_snapshot_discovers_real_cargo_binary_roots_without_projection_collisions() {
+        let implicit_main = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n",
+            ),
+            (
+                "src/main.rs",
+                b"pub fn internal() {} #[unsafe(no_mangle)] extern \"C\" fn main_export(value: u8) {}",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&implicit_main);
+        assert!(snapshot.items.is_empty());
+        assert!(snapshot.declarations.is_empty());
+        assert!(snapshot.crates.is_empty());
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.crate_name.as_deref() == Some("fixture#bin:fixture")
+                && unknown.source_path == "src/main.rs"
+                && unknown.evidence.contains("main_export")
+                && unknown.evidence.contains("private-binary-export:")
+        }));
+
+        let explicit_only = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nautobins=false\n[features]\nffi=[]\n[[bin]]\nname='worker'\npath='cmd/worker.rs'\nrequired-features=['ffi']\n",
+            ),
+            (
+                "src/main.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn ignored_implicit() {}",
+            ),
+            (
+                "cmd/worker.rs",
+                b"#[unsafe(export_name=\"worker_api\")] pub extern \"C\" fn exported() {}",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&explicit_only);
+        assert!(snapshot.crates.is_empty());
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.crate_name.as_deref() == Some("fixture#bin:worker")
+                && unknown.source_path == "cmd/worker.rs"
+                && unknown.cfg_guard.len() == 1
+                && unknown.cfg_guard[0] == "feature = \"ffi\""
+                && unknown.evidence.contains("worker_api")
+        }));
+        assert!(
+            snapshot
+                .unknowns
+                .iter()
+                .all(|unknown| !unknown.evidence.contains("ignored_implicit"))
+        );
+
+        let explicit_claims_auto_path = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[[bin]]\nname='worker'\npath='src/bin/tool.rs'\n",
+            ),
+            (
+                "src/bin/tool.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn claimed_export() {}",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&explicit_claims_auto_path);
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.crate_name.as_deref() == Some("fixture#bin:worker")
+                && unknown.evidence.contains("claimed_export")
+        }));
+        assert!(
+            snapshot
+                .unknowns
+                .iter()
+                .all(|unknown| unknown.crate_name.as_deref() != Some("fixture#bin:tool"))
+        );
+
+        let mixed = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", b"pub fn library_api() {}"),
+            (
+                "src/main.rs",
+                b"pub fn binary_internal() {} #[unsafe(no_mangle)] pub extern \"C\" fn mixed_export() {}",
+            ),
+            (
+                "src/bin/helper.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn helper_export() {}",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&mixed);
+        assert_eq!(
+            snapshot
+                .crates
+                .iter()
+                .map(|crate_snapshot| crate_snapshot.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fixture"]
+        );
+        assert!(snapshot.items.iter().any(|item| {
+            item.key.crate_name == "fixture" && item.key.external_name == "library_api"
+        }));
+        assert!(!snapshot.items.iter().any(|item| {
+            item.key.crate_name.contains("#bin:")
+                || item.key.external_name == "binary_internal"
+        }));
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.crate_name.as_deref() == Some("fixture#bin:fixture")
+                && unknown.evidence.contains("mixed_export")
+        }));
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.crate_name.as_deref() == Some("fixture#bin:helper")
+                && unknown.evidence.contains("helper_export")
+        }));
+
+        let directory_bin = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n",
+            ),
+            (
+                "src/bin/named/main.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn directory_export() {}",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&directory_bin);
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.crate_name.as_deref() == Some("fixture#bin:named")
+                && unknown.source_path == "src/bin/named/main.rs"
+                && unknown.evidence.contains("directory_export")
+        }));
+
+        let edition_2015_manual_target = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2015'\n[[example]]\nname='demo'\npath='examples/demo.rs'\n",
+            ),
+            (
+                "src/main.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn default_off() {}",
+            ),
+        ]);
+        assert!(snapshot_rust_api(&edition_2015_manual_target)
+            .unknowns
+            .iter()
+            .all(|unknown| !unknown.evidence.contains("default_off")));
+
+        let edition_2015_opt_in = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2015'\nautobins=true\n[[example]]\nname='demo'\npath='examples/demo.rs'\n",
+            ),
+            (
+                "src/main.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn opted_in() {}",
+            ),
+        ]);
+        assert!(snapshot_rust_api(&edition_2015_opt_in)
+            .unknowns
+            .iter()
+            .any(|unknown| {
+                unknown.crate_name.as_deref() == Some("fixture#bin:fixture")
+                    && unknown.evidence.contains("opted_in")
+            }));
+
+        let explicit_without_path = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nautobins=false\n[[bin]]\nname='fixture'\n",
+            ),
+            (
+                "src/main.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn inferred_explicit() {}",
+            ),
+        ]);
+        assert!(snapshot_rust_api(&explicit_without_path)
+            .unknowns
+            .iter()
+            .any(|unknown| {
+                unknown.crate_name.as_deref() == Some("fixture#bin:fixture")
+                    && unknown.source_path == "src/main.rs"
+                    && unknown.evidence.contains("inferred_explicit")
+            }));
+    }
+
+    #[test]
+    fn rust_api_snapshot_binary_discovery_fails_closed_on_ambiguous_or_malformed_targets() {
+        let ambiguous = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n",
+            ),
+            ("src/bin/tool.rs", b"fn main() {}"),
+            ("src/bin/tool/main.rs", b"fn main() {}"),
+        ]);
+        let snapshot = snapshot_rust_api(&ambiguous);
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::ManifestParse
+                && unknown
+                    .evidence
+                    .contains("auto-discovered bin target \"tool\" has ambiguous roots")
+        }));
+        assert!(
+            snapshot
+                .unknowns
+                .iter()
+                .all(|unknown| unknown.crate_name.as_deref() != Some("fixture#bin:tool"))
+        );
+
+        let normalized_collision = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nautobins=false\n[[bin]]\nname='foo-bar'\npath='cmd/dash.rs'\n[[bin]]\nname='foo_bar'\npath='cmd/underscore.rs'\n",
+            ),
+            (
+                "cmd/dash.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn dash_export() {}",
+            ),
+            (
+                "cmd/underscore.rs",
+                b"#[unsafe(no_mangle)] extern \"C\" fn underscore_export() {}",
+            ),
+        ]);
+        let snapshot = snapshot_rust_api(&normalized_collision);
+        assert!(snapshot.unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::ManifestParse
+                && unknown
+                    .evidence
+                    .contains("normalize to the same Rust crate identity")
+        }));
+        assert!(snapshot.unknowns.iter().all(|unknown| {
+            !unknown.evidence.contains("dash_export")
+                && !unknown.evidence.contains("underscore_export")
+        }));
+
+        let explicit_edition = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\nautobins=false\n[[bin]]\nname='worker'\npath='cmd/worker.rs'\nedition='2018'\n",
+            ),
+            ("cmd/worker.rs", b"fn main() {}"),
+        ]);
+        let manifest = toml::from_str::<toml::Value>(
+            std::str::from_utf8(explicit_edition.files.get("Cargo.toml").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let inventory = explicit_edition
+            .entries()
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let authorities = BTreeMap::from([("Cargo.toml".to_owned(), manifest.clone())]);
+        let discovery = cargo_binary_targets(
+            "Cargo.toml",
+            &manifest,
+            manifest.get("package").and_then(toml::Value::as_table).unwrap(),
+            "fixture",
+            "",
+            &authorities,
+            &inventory,
+        );
+        assert!(discovery.errors.is_empty());
+        assert_eq!(discovery.targets.len(), 1);
+        assert_eq!(discovery.targets[0].edition, "2018");
+
+        let missing_root = MemorySource::new(&[(
+            "Cargo.toml",
+            b"[package]\nname='fixture'\nversion='0.0.0'\nautobins=false\n[[bin]]\nname='worker'\npath='cmd/missing.rs'\n",
+        )]);
+        assert!(snapshot_rust_api(&missing_root).unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::ManifestParse
+                && unknown.crate_name.as_deref() == Some("fixture#bin:worker")
+                && unknown.source_path == "cmd/missing.rs"
+                && unknown.evidence.contains("unavailable root")
+        }));
+
+        let mut symlink_root = MemorySource::new(&[
+            (
+                "Cargo.toml",
+                b"[package]\nname='fixture'\nversion='0.0.0'\nautobins=false\n[[bin]]\nname='worker'\npath='cmd/worker.rs'\n",
+            ),
+            ("cmd/worker.rs", b"src/real.rs"),
+        ]);
+        symlink_root.states.insert(
+            "cmd/worker.rs".to_owned(),
+            RevisionEntryState::NonRegular {
+                kind: RevisionEntryKind::Symlink,
+            },
+        );
+        assert!(snapshot_rust_api(&symlink_root).unknowns.iter().any(|unknown| {
+            unknown.kind == RustApiUnknownKind::ManifestParse
+                && unknown.crate_name.as_deref() == Some("fixture#bin:worker")
+                && unknown.source_path == "cmd/worker.rs"
+                && unknown
+                    .evidence
+                    .contains(NON_NEUTRALIZABLE_SYMLINK_ROOT)
+        }));
+
+        for implicit_root in [
+            "src/main.rs",
+            "src/bin/tool.rs",
+            "src/bin/tool/main.rs",
+        ] {
+            let mut source = MemorySource::new(&[
+                (
+                    "Cargo.toml",
+                    b"[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n",
+                ),
+                (implicit_root, b"src/real.rs"),
+            ]);
+            source.states.insert(
+                implicit_root.to_owned(),
+                RevisionEntryState::NonRegular {
+                    kind: RevisionEntryKind::Symlink,
+                },
+            );
+            assert!(snapshot_rust_api(&source).unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::ManifestParse
+                    && unknown.source_path == implicit_root
+                    && unknown
+                        .evidence
+                        .contains(NON_NEUTRALIZABLE_SYMLINK_ROOT)
+            }), "implicit exact binary root {implicit_root} must reach typed symlink validation");
+        }
+
+        for manifest in [
+            "[package]\nname='fixture'\nversion='0.0.0'\nautobins='yes'\n",
+            "[package]\nname='fixture'\nversion='0.0.0'\n[[bin]]\npath='src/main.rs'\n",
+            "[package]\nname='fixture'\nversion='0.0.0'\n[[bin]]\nname='tool'\npath=1\n",
+            "[package]\nname='fixture'\nversion='0.0.0'\n[[bin]]\nname='tool'\nrequired-features='ffi'\n",
+            "[package]\nname='fixture'\nversion='0.0.0'\n[[bin]]\nname='fixture'\nrequired-features=['ffi']\n",
+        ] {
+            let source = MemorySource::new(&[
+                ("Cargo.toml", manifest.as_bytes()),
+                (
+                    "src/main.rs",
+                    b"#[unsafe(no_mangle)] extern \"C\" fn export() {}",
+                ),
+            ]);
+            assert!(snapshot_rust_api(&source).unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::ManifestParse
+                    && (unknown.evidence.contains("autobins")
+                        || unknown.evidence.contains("bin[0]"))
+            }));
+        }
     }
 
     #[test]
