@@ -197,6 +197,15 @@ pub(crate) fn run_status_with_index(run_dir: &Path, index_path: &Path) -> RunSta
     })
 }
 
+fn run_status_with_loaded_index(run_dir: &Path, index: &RunIndex) -> RunStatus {
+    run_status_with_publication_probe(run_dir, |run_id, run_dir| {
+        index
+            .entries()
+            .iter()
+            .any(|entry| Some(entry.id.as_str()) == run_id && same_run_path(&entry.path, run_dir))
+    })
+}
+
 fn run_status_with_publication_probe(
     run_dir: &Path,
     is_published: impl FnOnce(Option<&str>, &Path) -> bool,
@@ -377,7 +386,12 @@ pub(crate) fn require_published_run(run_dir: &Path, run_id: &str) -> Result<RunE
 /// Filters to `RunStatus::Running` (a live pid, no completion marker), exactly
 /// what the `state` tool reports as "the current run", so `verdict` and `state`
 /// agree. A stale marker or a durably completed run does not qualify here.
-fn running_run_for_head(repo_name: &str, branch_key: &str, head: &str) -> Option<ResolvedRun> {
+fn running_run_for_head(
+    repo_name: &str,
+    branch_key: &str,
+    head: &str,
+    index: &RunIndex,
+) -> Option<ResolvedRun> {
     let base = crate::config::prview_home()
         .join("runs")
         .join(repo_name)
@@ -403,7 +417,10 @@ fn running_run_for_head(repo_name: &str, branch_key: &str, head: &str) -> Option
         // directories cannot qualify, so reject them before the durable
         // publication probe. Keep the status check after the marker: a
         // published pack must still beat a lingering live marker.
-        if !matches!(run_status(&run_dir), RunStatus::Running { .. }) {
+        if !matches!(
+            run_status_with_loaded_index(&run_dir, index),
+            RunStatus::Running { .. }
+        ) {
             continue;
         }
         let Some(run_id) = run_dir.file_name().and_then(|n| n.to_str()) else {
@@ -517,7 +534,7 @@ pub fn resolve_run(root: &Path, run_id: Option<&str>) -> Result<ResolvedRun, Too
                     commit: e.commit.clone(),
                 }
             });
-            let running = running_run_for_head(&repo_name, &branch_key, &state.head);
+            let running = running_run_for_head(&repo_name, &branch_key, &state.head, &index);
             match choose_head_run(indexed, running) {
                 Some(run) => Ok(run),
                 None => Err(ToolError::new(
@@ -1766,7 +1783,55 @@ mod tests {
         std::os::unix::fs::symlink("published-run", branch_dir.join("latest")).unwrap();
 
         assert_eq!(run_status(&run_dir), RunStatus::Completed);
-        assert!(running_run_for_head("demo", "main", "abc1234").is_none());
+        let index = RunIndex::load_from(&home.path().join("index.jsonl"));
+        assert!(running_run_for_head("demo", "main", "abc1234", &index).is_none());
+    }
+
+    #[test]
+    fn running_run_for_head_reuses_the_preloaded_publication_index() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let branch_dir = home.path().join("runs/demo/main");
+        let mut published = Vec::new();
+
+        for (run_id, started_at) in [
+            ("older-run", "2026-07-01T12:00:00Z"),
+            ("newer-run", "2026-07-01T12:01:00Z"),
+        ] {
+            let run_dir = branch_dir.join(run_id);
+            std::fs::create_dir_all(run_dir.join("00_summary")).unwrap();
+            std::fs::write(run_dir.join("00_summary/SANITY.json"), "{}").unwrap();
+            write_marker(&run_dir, std::process::id());
+            let mut marker = read_running_marker(&run_dir).unwrap();
+            marker.started_at = started_at.to_string();
+            std::fs::write(
+                running_marker_path(&run_dir),
+                serde_json::to_string(&marker).unwrap(),
+            )
+            .unwrap();
+
+            let mut row = entry(run_id, "abc1234", started_at);
+            row.path = run_dir;
+            published.push(row);
+        }
+        std::fs::write(
+            home.path().join("index.jsonl"),
+            published
+                .iter()
+                .map(|entry| serde_json::to_string(entry).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        // The global index says both finalized directories are published. An
+        // empty preloaded snapshot deliberately disagrees: the scanner must
+        // use this one snapshot for every candidate instead of reloading the
+        // global index once per `run_status` call.
+        let (_index_dir, preloaded) = index_from(&[]);
+        let resolved = running_run_for_head("demo", "main", "abc1234", &preloaded).unwrap();
+        assert_eq!(resolved.run_id, "newer-run");
     }
 
     #[test]
