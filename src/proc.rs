@@ -18,6 +18,8 @@ use std::process::Output;
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 
+const OWNED_DIRECT_ROOT_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[cfg(windows)]
 fn system_taskkill_path() -> std::path::PathBuf {
     let windows_dir = std::env::var_os("SystemRoot")
@@ -166,6 +168,38 @@ pub(crate) fn spawn_owned_std_child(
     wrapped.spawn()
 }
 
+/// Poll only the direct process beneath the ownership wrapper.
+///
+/// On Windows, `JobObjectChild::try_wait` also consumes one completion-port
+/// notification before it polls the root. If that notification is the final
+/// job-completion signal, a later blocking `JobObjectChild::wait` can wait for
+/// an event that was already consumed. The owner needs the wrapper intact for
+/// tree termination, but root-exit detection must bypass it.
+fn try_wait_direct_std_child(
+    child: &mut dyn process_wrap::std::ChildWrapper,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    child.inner_mut().try_wait()
+}
+
+fn reap_direct_std_child_within(
+    child: &mut dyn process_wrap::std::ChildWrapper,
+    timeout: Duration,
+) -> bool {
+    let Some(deadline) = std::time::Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    loop {
+        match try_wait_direct_std_child(child) {
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) => return false,
+        }
+    }
+}
+
 /// Terminate every process owned by a synchronous child wrapper, including the
 /// descendants of a Windows root process that has already exited.
 pub fn terminate_owned_std_child(child: &mut dyn process_wrap::std::ChildWrapper) -> bool {
@@ -198,13 +232,21 @@ pub fn terminate_owned_std_child(child: &mut dyn process_wrap::std::ChildWrapper
     }
 }
 
-/// Terminate and reap a synchronous owned child without waiting forever after
-/// both Windows termination mechanisms failed. Returning after that rare dual
-/// failure may leave an OS-owned process to finish naturally, but it preserves
-/// the operator's cancellation contract instead of hanging inside `wait()`.
+/// Terminate and reap a synchronous owned child without an unbounded wrapper
+/// wait. Windows uses the Job Object only as the tree-termination handle, then
+/// reaps the direct root through the raw child layer within a finite budget;
+/// completion-port notifications are not treated as a durable completion
+/// ledger.
 pub fn terminate_and_reap_owned_std_child(child: &mut dyn process_wrap::std::ChildWrapper) -> bool {
     if terminate_owned_std_child(child) {
-        child.wait().is_ok()
+        #[cfg(windows)]
+        {
+            reap_direct_std_child_within(child, OWNED_DIRECT_ROOT_REAP_TIMEOUT)
+        }
+        #[cfg(not(windows))]
+        {
+            child.wait().is_ok()
+        }
     } else {
         // Cancellation may have won through the governor milliseconds before
         // this owner reached its own cleanup path. A second group kill can then
@@ -214,16 +256,7 @@ pub fn terminate_and_reap_owned_std_child(child: &mut dyn process_wrap::std::Chi
         // still preserves the distinction between a confirmed tree termination
         // and this best-effort direct-root reap; a root that exits only after
         // the deadline is not claimed as reaped.
-        let deadline = std::time::Instant::now() + Duration::from_millis(250);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => break,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Ok(None) => break,
-            }
-        }
+        let _ = reap_direct_std_child_within(child, Duration::from_millis(250));
         false
     }
 }
@@ -372,7 +405,7 @@ fn output_governed_inner(
                 "{label} timed out and its process tree could not be terminated"
             ));
         }
-        match child.try_wait() {
+        match try_wait_direct_std_child(child.as_mut()) {
             Ok(Some(status)) => {
                 // The direct wrapper can exit before a descendant. Tear down
                 // the still-owned group/job before joining pipe readers.
@@ -385,7 +418,15 @@ fn output_governed_inner(
                         "failed to terminate descendants of completed {label}"
                     ));
                 }
-                let _ = child.wait();
+                if !reap_direct_std_child_within(child.as_mut(), OWNED_DIRECT_ROOT_REAP_TIMEOUT) {
+                    drop(stdout_reader);
+                    drop(stderr_reader);
+                    drop(stdin_writer.take());
+                    drop(registration.take());
+                    return Err(anyhow::anyhow!(
+                        "failed to reap direct root of completed {label}"
+                    ));
+                }
                 drop(registration.take());
                 break StopReason::Completed(status);
             }
@@ -454,7 +495,7 @@ pub fn spawn_wait_governed(
             terminate_and_reap_owned_std_child(child.as_mut());
             return Err(crate::governor::Cancelled.into());
         }
-        match child.try_wait() {
+        match try_wait_direct_std_child(child.as_mut()) {
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(error) => {
@@ -463,9 +504,9 @@ pub fn spawn_wait_governed(
             }
         }
     };
-    // `JobObjectChild::wait` waits for the whole Windows job. Polling the root
-    // above lets us detect root-exits-first, then terminate the still-owned job
-    // before that wait; Unix applies the equivalent process-group cleanup.
+    // Polling the direct root above lets Windows terminate the still-owned Job
+    // Object without relying on its completion-port wait; Unix applies the
+    // equivalent process-group cleanup.
     if !terminate_and_reap_owned_std_child(child.as_mut()) {
         return Err(anyhow::anyhow!(
             "failed to terminate descendants of completed {label}"
@@ -540,7 +581,7 @@ pub fn run_pipeline_governed(
         }
 
         if producer_status.is_none() {
-            match producer.try_wait() {
+            match try_wait_direct_std_child(producer.as_mut()) {
                 Ok(Some(status)) => {
                     if !terminate_and_reap_owned_std_child(producer.as_mut()) {
                         terminate_and_reap_owned_std_child(consumer.as_mut());
@@ -563,7 +604,7 @@ pub fn run_pipeline_governed(
         }
 
         if consumer_status.is_none() {
-            match consumer.try_wait() {
+            match try_wait_direct_std_child(consumer.as_mut()) {
                 Ok(Some(status)) => {
                     if !terminate_and_reap_owned_std_child(consumer.as_mut()) {
                         terminate_and_reap_owned_std_child(producer.as_mut());
@@ -609,11 +650,24 @@ async fn wait_for_direct_child_exit(
     child: &mut dyn process_wrap::tokio::ChildWrapper,
 ) -> std::io::Result<std::process::ExitStatus> {
     loop {
-        if let Some(status) = child.try_wait()? {
+        // Keep the Windows Job Object completion stream untouched until the
+        // owner terminates and reaps the complete tree.
+        if let Some(status) = child.inner_mut().try_wait()? {
             return Ok(status);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[cfg(windows)]
+async fn reap_direct_tokio_child_within(
+    child: &mut dyn process_wrap::tokio::ChildWrapper,
+    timeout: Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, child.inner_mut().wait()).await,
+        Ok(Ok(_))
+    )
 }
 
 async fn terminate_owned_tokio_child(
@@ -652,11 +706,8 @@ async fn terminate_owned_tokio_child(
         },
     };
     #[cfg(windows)]
-    if terminated {
-        let _ = child.wait().await;
-    }
-    #[cfg(windows)]
-    return terminated;
+    return terminated
+        && reap_direct_tokio_child_within(child, OWNED_DIRECT_ROOT_REAP_TIMEOUT).await;
     #[cfg(not(windows))]
     {
         let direct_terminated = child.start_kill().is_ok();

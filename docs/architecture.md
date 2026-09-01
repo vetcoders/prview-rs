@@ -1034,10 +1034,12 @@ pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
 - **`cancel()` force-terminates each registered process tree.** Unix uses
   immediate `SIGKILL` on the child's process group. Windows children are
   attached to Job Objects before execution; synchronous wrappers terminate the
-  live Job Object and use native `taskkill /T /F` only as a fallback. If both
-  mechanisms fail, cancellation returns without an unbounded `wait()` rather
-  than turning a kill failure into a hung CLI. Windows-runner tests cover
-  child+grandchild, root-exits-first, and cancellation paths.
+  live Job Object and use native `taskkill /T /F` only as a fallback. After a
+  successful tree kill, prview reaps the direct root through the raw child
+  handle with a finite budget; it does not block on the Job Object completion
+  port. If both mechanisms fail, cancellation returns without an unbounded
+  `wait()` rather than turning a kill failure into a hung CLI. Windows-runner
+  tests cover child+grandchild, root-exits-first, and cancellation paths.
   It is idempotent in the strong sense: the registry is DRAINED, so a
   second cancel signals nothing — a pid whose process died in between may by then
   belong to another program. Registration checks cancellation while holding that
