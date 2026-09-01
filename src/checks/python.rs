@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Local;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -63,7 +64,7 @@ pub(super) struct PythonRun {
     /// Directory to run the tool in — the reviewed snapshot in `--pr`/`--remote`
     /// mode, the local checkout otherwise.
     pub(super) cwd: PathBuf,
-    /// Extra child environment (`UV_PROJECT_ENVIRONMENT`), empty for a local run.
+    /// Bounded child pools plus `UV_PROJECT_ENVIRONMENT` for an off-HEAD run.
     pub(super) env: Vec<(String, String)>,
     /// Ephemeral snapshot, kept alive until the check finishes.
     _snapshot: Option<crate::git::WorktreeSnapshot>,
@@ -91,16 +92,30 @@ pub(super) struct PythonRun {
 /// keeping the environment warm across runs of the SAME commit, which is the
 /// case that pays for itself (re-review, `--watch`).
 ///
-/// A local review (target == `HEAD`) sets no environment override and behaves
-/// exactly as before.
+/// A local review (target == `HEAD`) keeps its checkout environment directory;
+/// only the bounded descendant pools are added.
 pub(super) fn plan_python_run(config: &Config) -> Result<PythonRun> {
+    plan_python_run_with_env(config, |key| std::env::var_os(key))
+}
+
+pub(super) fn plan_python_run_with_env(
+    config: &Config,
+    mut inherited: impl FnMut(&str) -> Option<OsString>,
+) -> Result<PythonRun> {
     let plan = plan_check_run(config)?;
-    metadata_stays_in_project(&plan.scan_dir)?;
+    let explicit_config = checked_uv_environment_with(&plan.scan_dir, &mut inherited)?;
+    metadata_stays_in_project(&plan.scan_dir, explicit_config.is_some())?;
+    let configured_limits =
+        project_uv_concurrency_limits(&plan.scan_dir, explicit_config.as_deref())?;
     // Every `uv run`, not only the eager pre-sync, may synchronize or build the
     // environment. Keep all of uv's own pools and Cargo-backed PEP 517 builds
     // inside the same descendant envelope the run advertises. An operator's
-    // stricter inherited cap still wins (see `uv_concurrency_env_with`).
-    let mut env = super::uv_concurrency_env(config.resource_plan.worker_limit);
+    // stricter inherited or project-owned cap still wins.
+    let mut env = super::uv_concurrency_env_with(
+        config.resource_plan.worker_limit,
+        configured_limits,
+        &mut inherited,
+    )?;
     if plan.scan_dir != config.repo_root {
         let env_dir = config.uv_env_dir_for(&reviewed_env_token(config, &plan.scan_dir));
         mark_and_prune_uv_envs(&config.uv_env_root(), &env_dir);
@@ -119,12 +134,14 @@ pub(super) fn plan_python_run(config: &Config) -> Result<PythonRun> {
 /// The files that decide what a Python run actually reads.
 ///
 /// `pyproject.toml` is the project itself — ruff, mypy and pytest take their
-/// configuration from it, and uv discovers the project through it. `uv.lock`
-/// pins the dependency set that gets installed and imported. Dedicated pytest
-/// configs are included because the selected one controls collection and worker
-/// count just as directly; none may escape the reviewed tree through a symlink.
+/// configuration from it, and uv discovers the project through it. `uv.toml`
+/// overrides `[tool.uv]` in that project file. `uv.lock` pins the dependency set
+/// that gets installed and imported. Dedicated pytest configs are included
+/// because the selected one controls collection and worker count just as
+/// directly; none may escape the reviewed tree through a symlink.
 const PYTHON_PROJECT_METADATA: &[&str] = &[
     "pyproject.toml",
+    "uv.toml",
     "uv.lock",
     "pytest.toml",
     ".pytest.toml",
@@ -893,11 +910,16 @@ fn pytest_probe_env(base_env: &[(String, String)]) -> Vec<(String, String)> {
 /// INSIDE the tree resolves back inside and passes. A path that cannot be
 /// canonicalised is simply not there: the tools reporting a missing project is a
 /// truthful failure of this tree, not a foreign one's verdict.
-fn metadata_stays_in_project(root: &Path) -> Result<()> {
+fn metadata_stays_in_project(root: &Path, explicit_uv_config: bool) -> Result<()> {
     let Ok(resolved_root) = root.canonicalize() else {
         return Ok(());
     };
     for name in PYTHON_PROJECT_METADATA {
+        if explicit_uv_config && *name == "uv.toml" {
+            // UV_CONFIG_FILE replaces discovery of uv.toml. The explicit file
+            // was already resolved and contained by checked_uv_environment_with.
+            continue;
+        }
         let path = root.join(name);
         let Ok(resolved) = path.canonicalize() else {
             continue;
@@ -912,6 +934,164 @@ fn metadata_stays_in_project(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve uv's environment-owned path selectors before a command can replace
+/// the reviewed substrate. A path is resolved from uv's exact command cwd. An
+/// explicit config may name any file inside the tree; project/cwd redirects
+/// must resolve to the root itself because even a nested project would change
+/// which dependencies and source `uv run ... .` judges.
+fn checked_uv_environment_with(
+    root: &Path,
+    inherited: &mut impl FnMut(&str) -> Option<OsString>,
+) -> Result<Option<PathBuf>> {
+    let resolved_root = root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve reviewed Python root {}", root.display()))?;
+
+    let explicit_config = inherited("UV_CONFIG_FILE")
+        .map(|value| resolve_uv_environment_path(root, &resolved_root, "UV_CONFIG_FILE", value))
+        .transpose()?;
+    if let Some(path) = explicit_config.as_ref()
+        && !path.starts_with(&resolved_root)
+    {
+        anyhow::bail!(
+            "UV_CONFIG_FILE resolves outside the tree under review ({}), so uv would read foreign configuration",
+            path.display(),
+        );
+    }
+
+    for key in ["UV_PROJECT", "UV_WORKING_DIR", "UV_WORKING_DIRECTORY"] {
+        let Some(value) = inherited(key) else {
+            continue;
+        };
+        let path = resolve_uv_environment_path(root, &resolved_root, key, value)?;
+        if path != resolved_root {
+            anyhow::bail!(
+                "{key} resolves to {} instead of the exact reviewed Python root {}, so uv would judge another substrate",
+                path.display(),
+                resolved_root.display(),
+            );
+        }
+    }
+
+    Ok(explicit_config)
+}
+
+fn resolve_uv_environment_path(
+    root: &Path,
+    resolved_root: &Path,
+    key: &str,
+    value: OsString,
+) -> Result<PathBuf> {
+    if value.is_empty() {
+        anyhow::bail!("{key} is empty, so its uv path authority is ambiguous");
+    }
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    path.canonicalize().with_context(|| {
+        format!(
+            "{key} points to {} which cannot be resolved from the reviewed Python root {}",
+            path.display(),
+            resolved_root.display(),
+        )
+    })
+}
+
+/// Read only the project-owned scalar settings prview is about to override.
+/// uv.toml wins wholesale over `[tool.uv]` in pyproject.toml; UV_CONFIG_FILE,
+/// when present and contained, replaces both discovered authorities.
+fn project_uv_concurrency_limits(
+    root: &Path,
+    explicit_config: Option<&Path>,
+) -> Result<super::UvConcurrencyLimits> {
+    if let Some(path) = explicit_config {
+        return uv_concurrency_limits_from_file(path, false);
+    }
+
+    let uv_toml = root.join("uv.toml");
+    if uv_toml
+        .try_exists()
+        .with_context(|| format!("cannot inspect {}", uv_toml.display()))?
+    {
+        return uv_concurrency_limits_from_file(&uv_toml, false);
+    }
+
+    let pyproject = root.join("pyproject.toml");
+    if pyproject
+        .try_exists()
+        .with_context(|| format!("cannot inspect {}", pyproject.display()))?
+    {
+        return uv_concurrency_limits_from_file(&pyproject, true);
+    }
+    Ok(super::UvConcurrencyLimits::default())
+}
+
+fn uv_concurrency_limits_from_file(
+    path: &Path,
+    embedded_in_pyproject: bool,
+) -> Result<super::UvConcurrencyLimits> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read uv configuration {}", path.display()))?;
+    let contents = std::str::from_utf8(&bytes)
+        .with_context(|| format!("uv configuration {} is not UTF-8", path.display()))?;
+    let parsed = toml::from_str::<toml::Value>(contents)
+        .with_context(|| format!("failed to parse uv configuration {}", path.display()))?;
+
+    let table = if embedded_in_pyproject {
+        let Some(tool) = parsed.get("tool") else {
+            return Ok(super::UvConcurrencyLimits::default());
+        };
+        let Some(tool) = tool.as_table() else {
+            anyhow::bail!("{} has a non-table [tool] authority", path.display());
+        };
+        let Some(uv) = tool.get("uv") else {
+            return Ok(super::UvConcurrencyLimits::default());
+        };
+        uv.as_table().ok_or_else(|| {
+            anyhow::anyhow!("{} has a non-table [tool.uv] authority", path.display())
+        })?
+    } else {
+        parsed
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("{} is not a uv configuration table", path.display()))?
+    };
+
+    Ok(super::UvConcurrencyLimits {
+        downloads: positive_uv_concurrency_limit(table, "concurrent-downloads", path)?,
+        builds: positive_uv_concurrency_limit(table, "concurrent-builds", path)?,
+        installs: positive_uv_concurrency_limit(table, "concurrent-installs", path)?,
+    })
+}
+
+fn positive_uv_concurrency_limit(
+    table: &toml::value::Table,
+    key: &str,
+    path: &Path,
+) -> Result<Option<u32>> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    let Some(integer) = value.as_integer() else {
+        anyhow::bail!(
+            "{key} in {} must be a positive integer, got {value}",
+            path.display(),
+        );
+    };
+    let limit = u32::try_from(integer)
+        .ok()
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{key} in {} must be a positive integer, got {value}",
+                path.display(),
+            )
+        })?;
+    Ok(Some(limit))
 }
 
 /// Name of the environment for the substrate this run analyses.
@@ -1366,6 +1546,13 @@ mod tests {
             .build()
     }
 
+    fn planned_env_value<'a>(run: &'a PythonRun, key: &str) -> &'a str {
+        run.env
+            .iter()
+            .find_map(|(actual, value)| (actual == key).then_some(value.as_str()))
+            .unwrap_or_else(|| panic!("missing {key} in Python run environment"))
+    }
+
     /// Two commits: the reviewed one carries no Python at all, the checked-out
     /// one does. Returns (repo, reviewed commit).
     fn repo_whose_target_dropped_python() -> (tempfile::TempDir, String) {
@@ -1533,7 +1720,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn python_metadata_linked_out_of_the_snapshot_is_refused() {
-        for name in ["pyproject.toml", "uv.lock", "pytest.ini", "pytest.toml"] {
+        for name in [
+            "pyproject.toml",
+            "uv.toml",
+            "uv.lock",
+            "pytest.ini",
+            "pytest.toml",
+        ] {
             let repo_root = tempfile::tempdir().expect("repo_root tempdir");
             let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
             let outside = tempfile::tempdir().expect("outside tempdir");
@@ -1558,6 +1751,79 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn git_backed_uv_toml_linked_out_of_an_off_head_snapshot_is_refused() {
+        let home = tempfile::tempdir().expect("prview home");
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let repo = tempfile::tempdir().expect("repo");
+        let outside = tempfile::tempdir().expect("outside");
+        let root = repo.path();
+        run_git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"reviewed\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("pyproject");
+        run_git(root, &["add", "pyproject.toml"]);
+        run_git(
+            root,
+            &[
+                "-c",
+                "user.name=prview test",
+                "-c",
+                "user.email=prview@example.test",
+                "commit",
+                "-q",
+                "-m",
+                "python project",
+            ],
+        );
+
+        let foreign = outside.path().join("foreign-uv.toml");
+        std::fs::write(&foreign, "concurrent-builds = 1\n").expect("foreign config");
+        std::os::unix::fs::symlink(&foreign, root.join("uv.toml")).expect("uv.toml symlink");
+        run_git(root, &["add", "uv.toml"]);
+        run_git(
+            root,
+            &[
+                "-c",
+                "user.name=prview test",
+                "-c",
+                "user.email=prview@example.test",
+                "commit",
+                "-q",
+                "-m",
+                "foreign uv config",
+            ],
+        );
+        let target = String::from_utf8(
+            crate::git::git_cmd()
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("UTF-8 sha")
+        .trim()
+        .to_owned();
+
+        std::fs::remove_file(root.join("uv.toml")).expect("remove symlink");
+        write_commit(root, "uv.toml", "concurrent-builds = 2\n");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = root.to_path_buf();
+        config.target = Some(target);
+        let Err(error) = plan_python_run_with_env(&config, |_| None) else {
+            panic!("the target's external uv.toml must not earn a verdict");
+        };
+        assert!(
+            error.to_string().contains("uv.toml"),
+            "the refusal must name the escaping authority: {error}",
+        );
+    }
+
     /// The guard is about escape, not about symlinks: metadata that resolves
     /// back inside the reviewed tree is the tree's own.
     #[test]
@@ -1576,6 +1842,210 @@ mod tests {
         config.scan_dir_override = Some(scan_dir.path().to_path_buf());
 
         assert_eq!(plan_python_run(&config).expect("plan").cwd, scan_dir.path(),);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn uv_toml_linked_inside_the_snapshot_is_accepted() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        let config_dir = root.path().join("config");
+        std::fs::create_dir(&config_dir).expect("config dir");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"reviewed\"\n",
+        )
+        .expect("pyproject");
+        std::fs::write(config_dir.join("limits.toml"), "concurrent-builds = 1\n").expect("limits");
+        std::os::unix::fs::symlink(config_dir.join("limits.toml"), root.path().join("uv.toml"))
+            .expect("uv.toml symlink");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = root.path().to_path_buf();
+        config.resource_plan.worker_limit = 4;
+        let run = plan_python_run_with_env(&config, |_| None).expect("contained uv.toml");
+        assert_eq!(planned_env_value(&run, "UV_CONCURRENT_BUILDS"), "1");
+    }
+
+    #[test]
+    fn uv_project_concurrency_obeys_authority_and_per_pool_precedence() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"reviewed\"\n\n[tool.uv]\nconcurrent-downloads = 1\nconcurrent-builds = 1\nconcurrent-installs = 1\n",
+        )
+        .expect("pyproject");
+        std::fs::write(
+            root.path().join("uv.toml"),
+            "concurrent-builds = 2\nconcurrent-installs = 8\n",
+        )
+        .expect("uv.toml");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = root.path().to_path_buf();
+        config.resource_plan.worker_limit = 4;
+        let run = plan_python_run_with_env(&config, |_| None).expect("project uv limits");
+
+        assert_eq!(
+            planned_env_value(&run, "UV_CONCURRENT_DOWNLOADS"),
+            "4",
+            "uv.toml wins wholesale; a missing key must not fall through to [tool.uv]",
+        );
+        assert_eq!(planned_env_value(&run, "UV_CONCURRENT_BUILDS"), "2");
+        assert_eq!(planned_env_value(&run, "UV_CONCURRENT_INSTALLS"), "4");
+        assert_eq!(
+            planned_env_value(&run, "CARGO_BUILD_JOBS"),
+            "4",
+            "uv configuration does not own Cargo's backend pool",
+        );
+    }
+
+    #[test]
+    fn pyproject_tool_uv_concurrency_is_a_project_ceiling() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"reviewed\"\n\n[tool.uv]\nconcurrent-downloads = 3\nconcurrent-builds = 1\nconcurrent-installs = 8\n",
+        )
+        .expect("pyproject");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = root.path().to_path_buf();
+        config.resource_plan.worker_limit = 4;
+        let run = plan_python_run_with_env(&config, |_| None).expect("[tool.uv] limits");
+
+        assert_eq!(planned_env_value(&run, "UV_CONCURRENT_DOWNLOADS"), "3");
+        assert_eq!(planned_env_value(&run, "UV_CONCURRENT_BUILDS"), "1");
+        assert_eq!(planned_env_value(&run, "UV_CONCURRENT_INSTALLS"), "4");
+    }
+
+    #[test]
+    fn safe_explicit_uv_config_is_the_concurrency_authority() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        std::fs::create_dir(root.path().join("config")).expect("config dir");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"reviewed\"\n\n[tool.uv]\nconcurrent-builds = 1\n",
+        )
+        .expect("pyproject");
+        std::fs::write(root.path().join("uv.toml"), "concurrent-builds = 2\n").expect("uv.toml");
+        std::fs::write(
+            root.path().join("config/explicit.toml"),
+            "concurrent-builds = 3\n",
+        )
+        .expect("explicit config");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = root.path().to_path_buf();
+        config.resource_plan.worker_limit = 4;
+        let run = plan_python_run_with_env(&config, |key| {
+            (key == "UV_CONFIG_FILE").then(|| OsString::from("config/explicit.toml"))
+        })
+        .expect("contained explicit config");
+        assert_eq!(planned_env_value(&run, "UV_CONCURRENT_BUILDS"), "3");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn safe_explicit_uv_config_replaces_discovered_uv_toml() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir(root.path().join("config")).expect("config dir");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"reviewed\"\n",
+        )
+        .expect("pyproject");
+        std::fs::write(
+            root.path().join("config/explicit.toml"),
+            "concurrent-builds = 3\n",
+        )
+        .expect("explicit config");
+        let foreign = outside.path().join("uv.toml");
+        std::fs::write(&foreign, "concurrent-builds = 1\n").expect("foreign config");
+        std::os::unix::fs::symlink(&foreign, root.path().join("uv.toml"))
+            .expect("discovered uv.toml symlink");
+
+        let mut config = create_test_config(true, true, true);
+        config.repo_root = root.path().to_path_buf();
+        config.resource_plan.worker_limit = 4;
+        let run = plan_python_run_with_env(&config, |key| {
+            (key == "UV_CONFIG_FILE").then(|| OsString::from("config/explicit.toml"))
+        })
+        .expect("safe explicit config replaces discovered uv.toml");
+
+        assert_eq!(planned_env_value(&run, "UV_CONCURRENT_BUILDS"), "3");
+    }
+
+    #[test]
+    fn uv_path_redirects_must_stay_on_the_exact_reviewed_root() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"reviewed\"\n",
+        )
+        .expect("pyproject");
+        let foreign_config = outside.path().join("uv.toml");
+        std::fs::write(&foreign_config, "concurrent-builds = 1\n").expect("foreign config");
+
+        for (key, value) in [
+            ("UV_CONFIG_FILE", foreign_config.as_os_str()),
+            ("UV_PROJECT", outside.path().as_os_str()),
+            ("UV_WORKING_DIR", outside.path().as_os_str()),
+            ("UV_WORKING_DIRECTORY", outside.path().as_os_str()),
+        ] {
+            let mut config = create_test_config(true, true, true);
+            config.repo_root = root.path().to_path_buf();
+            let value = value.to_os_string();
+            let Err(error) = plan_python_run_with_env(&config, |candidate| {
+                (candidate == key).then(|| value.clone())
+            }) else {
+                panic!("a foreign {key} selector must fail closed");
+            };
+            assert!(
+                error.to_string().contains(key),
+                "the refusal must name {key}: {error}",
+            );
+        }
+
+        for key in ["UV_PROJECT", "UV_WORKING_DIR", "UV_WORKING_DIRECTORY"] {
+            let mut config = create_test_config(true, true, true);
+            config.repo_root = root.path().to_path_buf();
+            let value = root.path().as_os_str().to_os_string();
+            plan_python_run_with_env(&config, |candidate| {
+                (candidate == key).then(|| value.clone())
+            })
+            .unwrap_or_else(|error| panic!("exact {key} must be accepted: {error}"));
+        }
+    }
+
+    #[test]
+    fn invalid_uv_project_concurrency_is_loud() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        for contents in [
+            "concurrent-builds = 0\n",
+            "concurrent-builds = -1\n",
+            "concurrent-builds = \"many\"\n",
+            "concurrent-builds = [\n",
+        ] {
+            std::fs::write(root.path().join("uv.toml"), contents).expect("uv.toml");
+            let error = project_uv_concurrency_limits(root.path(), None)
+                .expect_err("an unknown project ceiling must not become absent");
+            assert!(
+                error.to_string().contains("uv configuration")
+                    || error.to_string().contains("concurrent-builds"),
+                "the error must identify uv's invalid authority: {error}",
+            );
+        }
+    }
+
+    #[test]
+    fn non_utf8_uv_project_concurrency_is_loud() {
+        let root = tempfile::tempdir().expect("reviewed root");
+        std::fs::write(root.path().join("uv.toml"), b"\xff").expect("uv.toml");
+        let error = project_uv_concurrency_limits(root.path(), None)
+            .expect_err("non-UTF-8 project policy must not become absent");
+        assert!(error.to_string().contains("not UTF-8"));
     }
 
     /// One environment per repository was still shared state: two prview

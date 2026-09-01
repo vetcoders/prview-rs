@@ -996,29 +996,56 @@ fn plan_python_presync(config: &Config) -> Result<python::PythonRun> {
     python::plan_python_run(config)
 }
 
-pub(super) fn uv_concurrency_env(worker_limit: u32) -> Vec<(String, String)> {
-    uv_concurrency_env_with(worker_limit, |key| std::env::var(key).ok())
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct UvConcurrencyLimits {
+    pub(super) downloads: Option<u32>,
+    pub(super) builds: Option<u32>,
+    pub(super) installs: Option<u32>,
 }
 
-fn uv_concurrency_env_with(
+pub(super) fn uv_concurrency_env_with(
     worker_limit: u32,
-    mut inherited: impl FnMut(&str) -> Option<String>,
-) -> Vec<(String, String)> {
-    [
-        "UV_CONCURRENT_DOWNLOADS",
-        "UV_CONCURRENT_BUILDS",
-        "UV_CONCURRENT_INSTALLS",
-        // uv caps simultaneous source builds, not the pool inside one
-        // Rust-backed PEP 517 backend. An arbitrary backend may still expose a
-        // different private knob, but Cargo-backed builds stay in the plan.
-        "CARGO_BUILD_JOBS",
-    ]
-    .into_iter()
-    .map(|key| {
-        let limit = bounded_descendant_limit(worker_limit, inherited(key).as_deref());
-        (key.to_owned(), limit.to_string())
-    })
-    .collect()
+    configured: UvConcurrencyLimits,
+    mut inherited: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> Result<Vec<(String, String)>> {
+    let run_limit = worker_limit.max(1);
+    let mut env = Vec::with_capacity(4);
+    for (key, configured_limit) in [
+        ("UV_CONCURRENT_DOWNLOADS", configured.downloads),
+        ("UV_CONCURRENT_BUILDS", configured.builds),
+        ("UV_CONCURRENT_INSTALLS", configured.installs),
+    ] {
+        let inherited_limit = match inherited(key) {
+            None => u32::MAX,
+            Some(value) => {
+                let Some(value) = value.to_str() else {
+                    anyhow::bail!("{key} is not valid UTF-8, so its worker limit is unknown");
+                };
+                value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|limit| *limit > 0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{key} must be a positive integer, got {value:?}")
+                    })?
+            }
+        };
+        let limit = run_limit
+            .min(inherited_limit)
+            .min(configured_limit.unwrap_or(u32::MAX));
+        env.push((key.to_owned(), limit.to_string()));
+    }
+
+    // uv caps simultaneous source builds, not the pool inside one Rust-backed
+    // PEP 517 backend. Keep Cargo's inherited knob on its existing, independent
+    // seam: a repository's uv configuration must never become Cargo policy.
+    let inherited_cargo_jobs =
+        inherited("CARGO_BUILD_JOBS").and_then(|value| value.into_string().ok());
+    env.push((
+        "CARGO_BUILD_JOBS".to_owned(),
+        bounded_descendant_limit(worker_limit, inherited_cargo_jobs.as_deref()).to_string(),
+    ));
+    Ok(env)
 }
 
 /// Resolve a child-process worker cap without ever raising a stricter limit
@@ -2797,8 +2824,14 @@ mod tests {
         config.scan_dir_override = Some(snapshot.path().to_path_buf());
 
         let plan = plan_python_presync(&config).expect("presync plan");
+        let later = python::plan_python_run(&config).expect("later gate plan");
 
         assert_eq!(plan.cwd, snapshot.path());
+        assert_eq!(plan.cwd, later.cwd);
+        assert_eq!(
+            plan.env, later.env,
+            "pre-sync and every later uv run must consume one exact environment plan",
+        );
         assert!(plan.env.iter().any(|(key, value)| {
             key == "UV_PROJECT_ENVIRONMENT" && !std::path::Path::new(value).starts_with(repo.path())
         }));
@@ -2820,7 +2853,8 @@ mod tests {
     #[test]
     fn uv_sync_preserves_the_stricter_descendant_cap() {
         assert_eq!(
-            uv_concurrency_env_with(2, |_| None),
+            uv_concurrency_env_with(2, UvConcurrencyLimits::default(), |_| None)
+                .expect("unconfigured limits"),
             vec![
                 ("UV_CONCURRENT_DOWNLOADS".to_string(), "2".to_string()),
                 ("UV_CONCURRENT_BUILDS".to_string(), "2".to_string()),
@@ -2829,26 +2863,84 @@ mod tests {
             ]
         );
         assert!(
-            uv_concurrency_env_with(0, |_| None)
+            uv_concurrency_env_with(0, UvConcurrencyLimits::default(), |_| None)
+                .expect("zero plan is clamped")
                 .iter()
                 .all(|(_, value)| value == "1"),
             "invalid zero plans still produce uv's required non-zero cap"
         );
         assert_eq!(
-            uv_concurrency_env_with(4, |key| match key {
-                "UV_CONCURRENT_BUILDS" => Some("1".to_string()),
-                "UV_CONCURRENT_INSTALLS" => Some("8".to_string()),
-                "CARGO_BUILD_JOBS" => Some("1".to_string()),
-                _ => Some("not-a-limit".to_string()),
-            }),
+            uv_concurrency_env_with(
+                4,
+                UvConcurrencyLimits {
+                    downloads: Some(3),
+                    builds: Some(2),
+                    installs: Some(8),
+                },
+                |key| match key {
+                    "UV_CONCURRENT_BUILDS" => Some("1".into()),
+                    "UV_CONCURRENT_INSTALLS" => Some("8".into()),
+                    "CARGO_BUILD_JOBS" => Some("1".into()),
+                    _ => None,
+                },
+            )
+            .expect("valid inherited and project limits"),
             vec![
-                ("UV_CONCURRENT_DOWNLOADS".to_string(), "4".to_string()),
+                ("UV_CONCURRENT_DOWNLOADS".to_string(), "3".to_string()),
                 ("UV_CONCURRENT_BUILDS".to_string(), "1".to_string()),
                 ("UV_CONCURRENT_INSTALLS".to_string(), "4".to_string()),
                 ("CARGO_BUILD_JOBS".to_string(), "1".to_string()),
             ],
-            "prview may lower an inherited uv cap but must never raise it",
+            "project, inherited, and run limits are independent ceilings",
         );
+    }
+
+    #[test]
+    fn uv_project_limits_never_become_cargo_build_policy() {
+        let env = uv_concurrency_env_with(
+            4,
+            UvConcurrencyLimits {
+                downloads: Some(1),
+                builds: Some(1),
+                installs: Some(1),
+            },
+            |_| None,
+        )
+        .expect("valid project limits");
+
+        assert_eq!(
+            env.iter()
+                .find_map(|(key, value)| (key == "CARGO_BUILD_JOBS").then_some(value.as_str())),
+            Some("4"),
+            "uv config owns uv pools only; Cargo keeps its separate inherited seam",
+        );
+    }
+
+    #[test]
+    fn invalid_inherited_uv_limit_fails_closed() {
+        for value in ["", "0", "-1", "many"] {
+            let error = uv_concurrency_env_with(4, UvConcurrencyLimits::default(), |key| {
+                (key == "UV_CONCURRENT_BUILDS").then(|| value.into())
+            })
+            .expect_err("an invalid inherited uv limit must stay visible");
+            assert!(
+                error.to_string().contains("UV_CONCURRENT_BUILDS"),
+                "the error must name the invalid authority: {error}",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_inherited_uv_limit_fails_closed() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+        let error = uv_concurrency_env_with(4, UvConcurrencyLimits::default(), |key| {
+            (key == "UV_CONCURRENT_INSTALLS").then(|| invalid.clone())
+        })
+        .expect_err("non-UTF-8 uv policy cannot be treated as absent");
+        assert!(error.to_string().contains("UV_CONCURRENT_INSTALLS"));
     }
 
     #[tokio::test]
