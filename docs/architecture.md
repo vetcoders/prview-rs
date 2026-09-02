@@ -2125,6 +2125,21 @@ Duplicate exact base/target
 OID pairs are coalesced in stable first-seen order before either snapshot is
 built; distinct multi-base comparisons each retain their own revision evidence
 and comparison-qualified finding ID.
+
+Private dependency analysis is one explicit guarded graph per snapshot. It
+preparses declaration and impl edges once, keys nodes by canonical private type
+plus effective cfg guard, expands each node once, and caches closures by their
+exact guarded root set. The finite measure is the set of not-yet-expanded
+guarded states; the settled postcondition is the complete reachable evidence
+set plus the propagated alias-exhaustion bit. Cycles terminate through state
+deduplication, cfg-overlap filtering remains edge-local, and alias exhaustion
+stays a typed non-neutralizable unknown rather than becoming empty evidence.
+Module aliases are resolved only along prefixes of the current module path, so
+unrelated repository aliases do not multiply item cost. The run governor is
+checked between snapshot stages, during alias work, and on every dependency
+node. Artifact generation exposes `rust-api.base-snapshot`,
+`rust-api.target-snapshot`, and `rust-api.compare` before starting each phase
+and records their per-phase totals in `RUN.json.timings`.
 `breaking_changes_view` and `public_api_diff_view` are pure deterministic
 projections over the same delta. Their shared counts, IDs, confidence, evidence,
 unknown reasons, and provenance therefore cannot drift through independent

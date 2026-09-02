@@ -787,7 +787,17 @@ use std::time::Duration;
 #[test]
 fn api_delta_no_diff_only_runtime() {
     let production = include_str!("mod.rs");
-    assert!(production.contains("compare_rust_api_revisions(&repo, diffs)"));
+    assert!(production.contains("compare_rust_api_revisions_with_runtime("));
+    for phase in [
+        "rust-api.base-snapshot",
+        "rust-api.target-snapshot",
+        "rust-api.compare",
+    ] {
+        assert!(
+            production.contains(phase),
+            "the active Rust API phase and RUN timing must name {phase}"
+        );
+    }
     assert!(production.contains("analyze_js_ts_public_api_diff(&patch_texts)"));
     assert!(production.contains("analyze_js_ts_breaking_changes(&patch_texts)"));
     assert!(production.contains("analyze_rust_env_requirements(&patch_texts)"));

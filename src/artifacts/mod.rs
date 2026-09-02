@@ -555,10 +555,35 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
             .iter()
             .flat_map(|diff| diff.files.iter())
             .any(|file| file.path.ends_with(".rs"));
-    let rust_api_delta = has_rust_scope
-        .then(|| api_delta::compare_rust_api_revisions(&repo, diffs))
-        .transpose()?
-        .flatten();
+    let rust_api_delta = if has_rust_scope {
+        let (delta, timings) = api_delta::compare_rust_api_revisions_with_runtime(
+            &repo,
+            diffs,
+            Some(governor),
+            |phase| {
+                if emit_human_stdout {
+                    println!("  · {phase} (active)");
+                }
+            },
+        )?;
+        stage_timings.extend([
+            StageTiming {
+                label: "rust-api.base-snapshot".to_owned(),
+                duration_secs: timings.base_snapshot_secs,
+            },
+            StageTiming {
+                label: "rust-api.target-snapshot".to_owned(),
+                duration_secs: timings.target_snapshot_secs,
+            },
+            StageTiming {
+                label: "rust-api.compare".to_owned(),
+                duration_secs: timings.compare_secs,
+            },
+        ]);
+        delta
+    } else {
+        None
+    };
     let rust_breaking_view = rust_api_delta
         .as_ref()
         .map(api_delta::breaking_changes_view);

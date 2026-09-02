@@ -678,6 +678,18 @@ decoded Git header identity; incoherent, truncated, or markerless hunk sections
 are discarded fail-closed, while coherent mode-only add/delete metadata remains
 valid. Confirmed removed, changed, relocated, and
 visibility-changed Rust facts are breaking; added-only facts are informational.
+
+The ordinary `prview --pr <number>` workflow always performs this repo-backed
+Rust analysis when the profile contains Cargo or the change contains Rust; it
+does not require `--deep` and is not skipped by the standard fast remote-only
+profile. During artifact generation the CLI announces
+`rust-api.base-snapshot`, `rust-api.target-snapshot`, and `rust-api.compare` as
+active phases. The same labels carry separate non-zero durations in
+`00_summary/RUN.json.timings`. Ctrl-C is checked inside snapshot and guarded
+closure work, returns exit 130, and follows the incomplete-pack/publication
+rules above. Repeated public items reuse the same canonical guarded graph state;
+finite alias exhaustion remains typed unknown evidence, so it degrades the
+decision and cannot yield a PASS by appearing as an empty scan.
 Typed unknowns degrade confidence and require review without claiming a
 confirmed removal. Rust identities include ordinary type/value/macro items plus
 public modules, library crates, and Cargo features. An implicit library target

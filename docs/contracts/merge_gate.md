@@ -172,6 +172,14 @@ when `breaking_escalation` is enabled. Unknown facts degrade analysis confidence
 and require review; they never masquerade as confirmed removals. Review caveats
 carry the same IDs, so consumers can join directly to this structure.
 
+`PrivateTypeDependency` findings retain the canonical guarded declaration,
+alias, and impl evidence that produced them. If finite alias resolution is
+exhausted, the finding remains `Unknown` with explicit finite-graph-bound
+evidence; it is never serialized as Added, omitted as an empty scan, or allowed
+to coexist with a clean PASS. Runtime-only phase timings are intentionally
+outside this semantic view and live in `RUN.json.timings` under
+`rust-api.base-snapshot`, `rust-api.target-snapshot`, and `rust-api.compare`.
+
 Unknown classifier names are an additive, open vocabulary rather than a closed
 client enum. `OpaqueReturnAutoTraits` identifies a caller-observable `async fn`
 or return-position `impl Trait` whose unchanged signature does not prove that

@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Repo-backed Rust API snapshot construction now preparses private declarations
+  and impl contracts once, expands each canonical `(private type, effective cfg)`
+  state once per snapshot, and reuses exact-root closures across public items.
+  Module-alias lookup follows only applicable path prefixes instead of scanning
+  the repository-wide alias map for every item. Ordinary `prview --pr` keeps the
+  full Rust evidence; base snapshot, target snapshot, and comparison are now
+  visible active phases with separate `RUN.json` timings, and in-process graph
+  work observes typed cancellation before any completed pack can be published.
 - Cargo resource planning now opens only bounded regular configuration files
   and refuses final symlinks, devices, FIFOs, and oversized inputs before any
   synchronous read. A malicious off-HEAD `.cargo/config*` can therefore lower

@@ -296,29 +296,76 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
 /// compared exactly once and then folded into one deterministic delta consumed
 /// by both artifact views.
 pub fn compare_rust_api_revisions(repo: &Repository, diffs: &[Diff]) -> Result<Option<ApiDelta>> {
-    use super::api_surface::snapshot_rust_api;
+    compare_rust_api_revisions_with_runtime(repo, diffs, None, |_| {})
+        .map(|(delta, _timings)| delta)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RustApiPhaseTimings {
+    pub(crate) base_snapshot_secs: f32,
+    pub(crate) target_snapshot_secs: f32,
+    pub(crate) compare_secs: f32,
+}
+
+pub(crate) fn compare_rust_api_revisions_with_runtime(
+    repo: &Repository,
+    diffs: &[Diff],
+    governor: Option<&crate::governor::ResourceGovernor>,
+    mut phase_started: impl FnMut(&'static str),
+) -> Result<(Option<ApiDelta>, RustApiPhaseTimings)> {
+    use super::api_surface::{snapshot_rust_api, snapshot_rust_api_cancellable};
     use super::revision_source::GitTree;
+    use std::time::Instant;
 
     if diffs.is_empty() {
-        return Ok(None);
+        return Ok((None, RustApiPhaseTimings::default()));
     }
 
     let unique_diffs = unique_exact_revision_pairs(diffs);
     let mut target_snapshots = BTreeMap::new();
     let mut comparisons = Vec::with_capacity(diffs.len());
+    let mut timings = RustApiPhaseTimings::default();
     for diff in unique_diffs {
-        let base = snapshot_rust_api(&GitTree::new(repo, &diff.base_commit_id)?);
+        if governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled) {
+            return Err(crate::governor::Cancelled.into());
+        }
+        phase_started("rust-api.base-snapshot");
+        let started = Instant::now();
+        let base_source = GitTree::new(repo, &diff.base_commit_id)?;
+        let base = if let Some(governor) = governor {
+            snapshot_rust_api_cancellable(&base_source, governor)?
+        } else {
+            snapshot_rust_api(&base_source)
+        };
+        timings.base_snapshot_secs += started.elapsed().as_secs_f32();
         if !target_snapshots.contains_key(&diff.target_commit_id) {
-            let target = snapshot_rust_api(&GitTree::new(repo, &diff.target_commit_id)?);
+            if governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled) {
+                return Err(crate::governor::Cancelled.into());
+            }
+            phase_started("rust-api.target-snapshot");
+            let started = Instant::now();
+            let target_source = GitTree::new(repo, &diff.target_commit_id)?;
+            let target = if let Some(governor) = governor {
+                snapshot_rust_api_cancellable(&target_source, governor)?
+            } else {
+                snapshot_rust_api(&target_source)
+            };
+            timings.target_snapshot_secs += started.elapsed().as_secs_f32();
             target_snapshots.insert(diff.target_commit_id.clone(), target);
         }
         let target = target_snapshots
             .get(&diff.target_commit_id)
             .expect("target snapshot inserted for exact OID");
+        if governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled) {
+            return Err(crate::governor::Cancelled.into());
+        }
+        phase_started("rust-api.compare");
+        let started = Instant::now();
         comparisons.push(compare_rust_api(&base, target));
+        timings.compare_secs += started.elapsed().as_secs_f32();
     }
 
-    Ok(Some(merge_comparisons(comparisons)))
+    Ok((Some(merge_comparisons(comparisons)), timings))
 }
 
 fn unique_exact_revision_pairs(diffs: &[Diff]) -> Vec<&Diff> {
@@ -1930,6 +1977,72 @@ mod tests {
         compare_rust_api_revisions(&repo, &[make_diff_with_ids(base, target, Vec::new())])
             .expect("repository-backed comparison")
             .expect("Rust revisions")
+    }
+
+    #[test]
+    fn rust_api_revision_runtime_records_base_target_and_compare_timings() {
+        let (_tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "struct Hidden(u8); pub fn api() -> Hidden { todo!() }\n",
+                "struct Hidden(u16); pub fn api() -> Hidden { todo!() }\n",
+            ),
+        ]);
+        let governor = crate::governor::ResourceGovernor::new();
+        let mut phases = Vec::new();
+        let (delta, timings) = compare_rust_api_revisions_with_runtime(
+            &repo,
+            &[make_diff_with_ids(base, target, Vec::new())],
+            Some(&governor),
+            |phase| phases.push(phase),
+        )
+        .expect("runtime-observed comparison");
+
+        assert!(delta.is_some());
+        assert_eq!(
+            phases,
+            [
+                "rust-api.base-snapshot",
+                "rust-api.target-snapshot",
+                "rust-api.compare",
+            ]
+        );
+        assert!(timings.base_snapshot_secs > 0.0);
+        assert!(timings.target_snapshot_secs > 0.0);
+        assert!(timings.compare_secs > 0.0);
+    }
+
+    #[test]
+    fn rust_api_revision_runtime_cancels_before_base_and_target_snapshot_work() {
+        let (_tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "pub fn old() {}\n", "pub fn new() {}\n"),
+        ]);
+        let diff = make_diff_with_ids(base, target, Vec::new());
+        for cancel_phase in ["rust-api.base-snapshot", "rust-api.target-snapshot"] {
+            let governor = crate::governor::ResourceGovernor::new();
+            let error = compare_rust_api_revisions_with_runtime(
+                &repo,
+                std::slice::from_ref(&diff),
+                Some(&governor),
+                |phase| {
+                    if phase == cancel_phase {
+                        governor.cancel();
+                    }
+                },
+            )
+            .expect_err("cancellation must stop the active snapshot phase");
+            assert!(crate::governor::is_cancellation(&error), "{error:#}");
+        }
     }
 
     fn git_with_input(repo: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {

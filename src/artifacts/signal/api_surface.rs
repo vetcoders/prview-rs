@@ -201,6 +201,15 @@ pub fn snapshot_rust_api(source: &dyn RevisionFileSource) -> RustApiSnapshot {
     SnapshotBuilder::new(source).build()
 }
 
+pub(crate) fn snapshot_rust_api_cancellable(
+    source: &dyn RevisionFileSource,
+    governor: &crate::governor::ResourceGovernor,
+) -> Result<RustApiSnapshot, crate::governor::Cancelled> {
+    SnapshotBuilder::new(source)
+        .with_governor(governor)
+        .try_build()
+}
+
 #[cfg(test)]
 fn snapshot_rust_api_with_resolution_budget(
     source: &dyn RevisionFileSource,
@@ -363,10 +372,30 @@ type BinaryExport = (String, bool, Vec<String>, String, BTreeSet<PrivateTypeKey>
 
 #[derive(Debug, Clone)]
 struct GuardedImplEvidence {
-    raw_contract: String,
     semantic_evidence: String,
     cfg_guard: Vec<String>,
-    declaring_module_path: Vec<String>,
+    dependencies: BTreeSet<PrivateTypeKey>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedPrivateDeclaration {
+    declaration: RustApiDeclaration,
+    dependencies: BTreeSet<PrivateTypeKey>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PrivateDependencyNode {
+    evidence: Vec<String>,
+    alias_successors: BTreeSet<GuardedPrivateTypeKey>,
+    dependency_successors: BTreeSet<GuardedPrivateTypeKey>,
+    alias_depth_exhausted: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PrivateDependencyClosure {
+    evidence_digest: String,
+    evidence_empty: bool,
+    resolution_exhausted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -386,12 +415,333 @@ struct GuardedPrivateTypeKey {
     cfg_guard: Vec<String>,
 }
 
+#[cfg(test)]
+mod private_dependency_test_observer {
+    use super::GuardedPrivateTypeKey;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct ObservationState {
+        counts: BTreeMap<GuardedPrivateTypeKey, usize>,
+        total: usize,
+        cancel_after: Option<usize>,
+        governor: Option<Arc<crate::governor::ResourceGovernor>>,
+    }
+
+    thread_local! {
+        static STATE_EXPANSIONS: RefCell<Option<ObservationState>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(super) struct ObservationGuard;
+
+    impl ObservationGuard {
+        pub(super) fn start() -> Self {
+            STATE_EXPANSIONS.with(|counts| {
+                *counts.borrow_mut() = Some(ObservationState::default());
+            });
+            Self
+        }
+
+        pub(super) fn start_cancelling(
+            governor: Arc<crate::governor::ResourceGovernor>,
+            cancel_after: usize,
+        ) -> Self {
+            STATE_EXPANSIONS.with(|counts| {
+                *counts.borrow_mut() = Some(ObservationState {
+                    cancel_after: Some(cancel_after),
+                    governor: Some(governor),
+                    ..ObservationState::default()
+                });
+            });
+            Self
+        }
+
+        pub(super) fn state_expansions(&self) -> BTreeMap<GuardedPrivateTypeKey, usize> {
+            STATE_EXPANSIONS.with(|counts| {
+                counts
+                    .borrow()
+                    .as_ref()
+                    .map(|state| state.counts.clone())
+                    .unwrap_or_default()
+            })
+        }
+    }
+
+    impl Drop for ObservationGuard {
+        fn drop(&mut self) {
+            STATE_EXPANSIONS.with(|counts| {
+                *counts.borrow_mut() = None;
+            });
+        }
+    }
+
+    pub(super) fn observe_state(state: &GuardedPrivateTypeKey) {
+        let cancel = STATE_EXPANSIONS.with(|counts| {
+            let mut counts = counts.borrow_mut();
+            let observation = counts.as_mut()?;
+            *observation.counts.entry(state.clone()).or_default() += 1;
+            observation.total += 1;
+            (observation.cancel_after == Some(observation.total))
+                .then(|| observation.governor.clone())
+                .flatten()
+        });
+        if let Some(governor) = cancel {
+            governor.cancel();
+        }
+    }
+}
+
+/// One snapshot-owned dependency graph. A guarded state is expanded at most
+/// once, then every public item reuses the settled node and exact-root closure.
+/// The finite measure is the set of previously unseen
+/// `(canonical private type, effective cfg guard)` states. Each expansion adds
+/// one state to `nodes`; alias expansion has its own graph-derived bound, and
+/// all declaration/impl edges only add guards from the finite parsed corpus.
+/// A settled closure contains every reachable evidence row and propagates any
+/// alias exhaustion bit, which is the postcondition consumed by typed unknowns.
+struct PrivateDependencyGraph<'a> {
+    declarations: &'a BTreeMap<PrivateTypeKey, Vec<PreparedPrivateDeclaration>>,
+    implementations: &'a BTreeMap<PrivateTypeKey, Vec<GuardedImplEvidence>>,
+    private_aliases: &'a BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
+    private_module_aliases: &'a BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
+    alias_limits: PrivateAliasResolutionLimits,
+    alias_digest_context: PrivateAliasDigestContext,
+    alias_exhaustion_digests: BTreeMap<GuardedPrivateTypeKey, String>,
+    governor: Option<&'a crate::governor::ResourceGovernor>,
+    nodes: BTreeMap<GuardedPrivateTypeKey, PrivateDependencyNode>,
+    closures: BTreeMap<BTreeSet<GuardedPrivateTypeKey>, PrivateDependencyClosure>,
+}
+
+impl<'a> PrivateDependencyGraph<'a> {
+    fn new(
+        declarations: &'a BTreeMap<PrivateTypeKey, Vec<PreparedPrivateDeclaration>>,
+        implementations: &'a BTreeMap<PrivateTypeKey, Vec<GuardedImplEvidence>>,
+        private_aliases: &'a BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
+        private_module_aliases: &'a BTreeMap<
+            PrivateModuleAliasKey,
+            Vec<GuardedPrivateModuleTarget>,
+        >,
+        alias_limits: PrivateAliasResolutionLimits,
+        governor: Option<&'a crate::governor::ResourceGovernor>,
+    ) -> Self {
+        Self {
+            declarations,
+            implementations,
+            private_aliases,
+            private_module_aliases,
+            alias_limits,
+            alias_digest_context: PrivateAliasDigestContext::new(
+                private_aliases,
+                private_module_aliases,
+            ),
+            alias_exhaustion_digests: BTreeMap::new(),
+            governor,
+            nodes: BTreeMap::new(),
+            closures: BTreeMap::new(),
+        }
+    }
+
+    fn ensure_active(&self) -> Result<(), crate::governor::Cancelled> {
+        if self
+            .governor
+            .is_some_and(crate::governor::ResourceGovernor::is_cancelled)
+        {
+            Err(crate::governor::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn expand_state(
+        &self,
+        state: &GuardedPrivateTypeKey,
+    ) -> Result<PrivateDependencyNode, crate::governor::Cancelled> {
+        self.ensure_active()?;
+        #[cfg(test)]
+        private_dependency_test_observer::observe_state(state);
+
+        let governor = self.governor;
+        let (alias_successors, alias_depth_exhausted) = private_alias_successors(
+            state,
+            self.private_aliases,
+            self.private_module_aliases,
+            self.alias_limits,
+            || governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled),
+        )?;
+        let mut node = PrivateDependencyNode {
+            alias_successors,
+            alias_depth_exhausted,
+            ..PrivateDependencyNode::default()
+        };
+
+        if let Some(impls) = self.implementations.get(&state.key) {
+            for implementation in impls.iter().filter(|implementation| {
+                !guards_proven_disjoint(&implementation.cfg_guard, &state.cfg_guard)
+            }) {
+                let effective_guard = combined_guards(&state.cfg_guard, &implementation.cfg_guard);
+                node.evidence.push(format!(
+                    "impl-cfg:{effective_guard:?}\n{}",
+                    implementation.semantic_evidence
+                ));
+                node.dependency_successors
+                    .extend(implementation.dependencies.iter().cloned().map(|key| {
+                        GuardedPrivateTypeKey {
+                            key,
+                            cfg_guard: effective_guard.clone(),
+                        }
+                    }));
+            }
+        }
+        for candidate in self
+            .declarations
+            .get(&state.key)
+            .into_iter()
+            .flatten()
+            .filter(|candidate| {
+                !guards_proven_disjoint(&candidate.declaration.cfg_guard, &state.cfg_guard)
+            })
+        {
+            let declaration = &candidate.declaration;
+            let effective_guard = combined_guards(&state.cfg_guard, &declaration.cfg_guard);
+            node.evidence.push(format!(
+                "declaration:{}::{:?}::{}\neffective-cfg:{:?}\n{}",
+                state.key.0, state.key.1, state.key.2, effective_guard, declaration.contract
+            ));
+            node.dependency_successors
+                .extend(
+                    candidate
+                        .dependencies
+                        .iter()
+                        .cloned()
+                        .map(|key| GuardedPrivateTypeKey {
+                            key,
+                            cfg_guard: effective_guard.clone(),
+                        }),
+                );
+        }
+        Ok(node)
+    }
+
+    fn has_local_evidence(&self, state: &GuardedPrivateTypeKey) -> bool {
+        self.declarations.get(&state.key).is_some_and(|candidates| {
+            candidates.iter().any(|candidate| {
+                !guards_proven_disjoint(&candidate.declaration.cfg_guard, &state.cfg_guard)
+            })
+        }) || self
+            .implementations
+            .get(&state.key)
+            .is_some_and(|implementations| {
+                implementations.iter().any(|implementation| {
+                    !guards_proven_disjoint(&implementation.cfg_guard, &state.cfg_guard)
+                })
+            })
+    }
+
+    fn closure(
+        &mut self,
+        roots: BTreeSet<GuardedPrivateTypeKey>,
+    ) -> Result<PrivateDependencyClosure, crate::governor::Cancelled> {
+        use sha2::{Digest, Sha256};
+
+        if let Some(cached) = self.closures.get(&roots).cloned() {
+            return Ok(cached);
+        }
+        let cache_key = roots.clone();
+        let mut pending = roots;
+        let mut visited = BTreeSet::new();
+        let mut evidence = Vec::new();
+        let mut alias_targets = BTreeSet::new();
+        let mut reverse_aliases: BTreeMap<GuardedPrivateTypeKey, BTreeSet<GuardedPrivateTypeKey>> =
+            BTreeMap::new();
+        let mut exhausted_states = BTreeSet::new();
+        while let Some(state) = pending.pop_first() {
+            self.ensure_active()?;
+            if !visited.insert(state.clone()) {
+                continue;
+            }
+            if !self.nodes.contains_key(&state) {
+                let node = self.expand_state(&state)?;
+                self.nodes.insert(state.clone(), node);
+            }
+            let node = self
+                .nodes
+                .get(&state)
+                .expect("expanded private dependency state is cached");
+            evidence.extend(node.evidence.iter().cloned());
+            if node.alias_depth_exhausted {
+                exhausted_states.insert(state.clone());
+            }
+            for successor in &node.alias_successors {
+                alias_targets.insert(successor.clone());
+                reverse_aliases
+                    .entry(successor.clone())
+                    .or_default()
+                    .insert(state.clone());
+                pending.insert(successor.clone());
+            }
+            pending.extend(node.dependency_successors.iter().cloned());
+        }
+
+        let mut exhaustion_pending = exhausted_states.clone();
+        while let Some(state) = exhaustion_pending.pop_first() {
+            if let Some(predecessors) = reverse_aliases.get(&state) {
+                for predecessor in predecessors {
+                    if exhausted_states.insert(predecessor.clone()) {
+                        exhaustion_pending.insert(predecessor.clone());
+                    }
+                }
+            }
+        }
+        for state in &exhausted_states {
+            let digest = if let Some(cached) = self.alias_exhaustion_digests.get(state) {
+                cached.clone()
+            } else {
+                let digest = self.alias_digest_context.digest(state);
+                self.alias_exhaustion_digests
+                    .insert(state.clone(), digest.clone());
+                digest
+            };
+            evidence.push(format!("alias-resolution-exhausted:{digest}"));
+        }
+        for terminal in alias_targets {
+            let node = self
+                .nodes
+                .get(&terminal)
+                .expect("visited alias target is expanded");
+            if node.alias_successors.is_empty() && !self.has_local_evidence(&terminal) {
+                evidence.push(format!(
+                    "alias-target:{}::{:?}::{}\neffective-cfg:{:?}",
+                    terminal.key.0, terminal.key.1, terminal.key.2, terminal.cfg_guard
+                ));
+            }
+        }
+        evidence.sort();
+        evidence.dedup();
+        let settled = PrivateDependencyClosure {
+            evidence_digest: format!("sha256:{:x}", Sha256::digest(evidence.join("\n--\n"))),
+            evidence_empty: evidence.is_empty(),
+            resolution_exhausted: !exhausted_states.is_empty(),
+        };
+        self.closures.insert(cache_key, settled.clone());
+        Ok(settled)
+    }
+}
+
 #[derive(Debug)]
 struct PrivateAliasResolution {
     states: BTreeSet<GuardedPrivateTypeKey>,
     terminals: BTreeSet<GuardedPrivateTypeKey>,
     exhausted: bool,
     exhaustion_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrivateAliasResolutionLimits {
+    budget: usize,
+    max_depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -483,6 +833,7 @@ struct SnapshotBuilder<'a> {
     opaque_implementation_digest: Option<String>,
     macro_use_crates: BTreeSet<String>,
     reexport_iteration_budget: Option<usize>,
+    governor: Option<&'a crate::governor::ResourceGovernor>,
 }
 
 impl<'a> SnapshotBuilder<'a> {
@@ -528,7 +879,13 @@ impl<'a> SnapshotBuilder<'a> {
             opaque_implementation_digest: None,
             macro_use_crates: BTreeSet::new(),
             reexport_iteration_budget: None,
+            governor: None,
         }
+    }
+
+    fn with_governor(mut self, governor: &'a crate::governor::ResourceGovernor) -> Self {
+        self.governor = Some(governor);
+        self
     }
 
     #[cfg(test)]
@@ -537,18 +894,41 @@ impl<'a> SnapshotBuilder<'a> {
         self
     }
 
-    fn build(mut self) -> RustApiSnapshot {
+    fn build(self) -> RustApiSnapshot {
+        self.try_build()
+            .expect("an uncancellable Rust API snapshot cannot be cancelled")
+    }
+
+    fn ensure_analysis_active(&self) -> Result<(), crate::governor::Cancelled> {
+        if self
+            .governor
+            .is_some_and(crate::governor::ResourceGovernor::is_cancelled)
+        {
+            Err(crate::governor::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn try_build(mut self) -> Result<RustApiSnapshot, crate::governor::Cancelled> {
+        self.ensure_analysis_active()?;
         self.record_inventory_path_unknowns();
+        self.ensure_analysis_active()?;
         self.discover_crates();
+        self.ensure_analysis_active()?;
         self.resolve_reexports();
+        self.ensure_analysis_active()?;
         self.resolve_trait_transforms();
         self.resolve_trait_impls();
+        self.ensure_analysis_active()?;
         self.resolve_inherent_items();
         self.resolve_include_proofs();
         self.resolve_opaque_return_proofs();
+        self.ensure_analysis_active()?;
         self.materialize_public_modules();
         self.attach_public_reexport_origins();
-        self.record_private_type_dependencies();
+        self.record_private_type_dependencies()?;
+        self.ensure_analysis_active()?;
         self.crates.sort_by(|left, right| {
             (&left.name, &left.manifest_path, &left.root_path).cmp(&(
                 &right.name,
@@ -665,7 +1045,7 @@ impl<'a> SnapshotBuilder<'a> {
                 ))
         });
         self.unknowns.dedup();
-        RustApiSnapshot {
+        Ok(RustApiSnapshot {
             provenance: self.provenance,
             crates: self.crates,
             modules: self.modules,
@@ -674,7 +1054,7 @@ impl<'a> SnapshotBuilder<'a> {
             declarations: self.declarations,
             reexports: self.reexports,
             unknowns: self.unknowns,
-        }
+        })
     }
 
     /// A local type that is not itself externally reachable can still affect a
@@ -682,9 +1062,7 @@ impl<'a> SnapshotBuilder<'a> {
     /// source parser cannot prove the compiler-derived consequence, so retain
     /// a typed unknown whose evidence fingerprints the transitive declarations
     /// and local trait impls instead of claiming a confirmed breaking change.
-    fn record_private_type_dependencies(&mut self) {
-        use sha2::{Digest, Sha256};
-
+    fn record_private_type_dependencies(&mut self) -> Result<(), crate::governor::Cancelled> {
         // Native-only targets deliberately do not publish ordinary Rust items
         // or declarations through `RustApiSnapshot`. Their local declarations
         // still participate here so an exported ABI signature can bind to the
@@ -710,7 +1088,8 @@ impl<'a> SnapshotBuilder<'a> {
                 .or_default()
                 .push(item.cfg_guard.clone());
         }
-        let mut declarations: BTreeMap<PrivateTypeKey, Vec<RustApiDeclaration>> = BTreeMap::new();
+        let mut declarations: BTreeMap<PrivateTypeKey, Vec<PreparedPrivateDeclaration>> =
+            BTreeMap::new();
         for declaration in all_declarations.iter().filter(|declaration| {
             if declaration.key.namespace != RustNamespace::Type {
                 return false;
@@ -734,6 +1113,15 @@ impl<'a> SnapshotBuilder<'a> {
                 })
             })
         }) {
+            let dependencies = syn::parse_str::<Item>(&declaration.contract)
+                .map(|parsed| {
+                    LocalTypeDependencyCollector::collect_item_types(
+                        &declaration.key.crate_name,
+                        &declaration.key.module_path,
+                        &parsed,
+                    )
+                })
+                .unwrap_or_default();
             declarations
                 .entry((
                     declaration.key.crate_name.clone(),
@@ -741,7 +1129,10 @@ impl<'a> SnapshotBuilder<'a> {
                     declaration.key.external_name.clone(),
                 ))
                 .or_default()
-                .push(declaration.clone());
+                .push(PreparedPrivateDeclaration {
+                    declaration: declaration.clone(),
+                    dependencies,
+                });
         }
 
         let (private_aliases, private_module_aliases) = private_alias_graph(
@@ -749,10 +1140,13 @@ impl<'a> SnapshotBuilder<'a> {
             &self.self_crate_aliases,
             &all_declarations,
         );
+        let alias_limits =
+            private_alias_resolution_limits(&private_aliases, &private_module_aliases);
 
         let mut implementation_evidence: BTreeMap<PrivateTypeKey, Vec<GuardedImplEvidence>> =
             BTreeMap::new();
         let mut alias_resolution_unknowns = Vec::new();
+        let governor = self.governor;
         for pending in self
             .pending_trait_impls
             .iter()
@@ -763,7 +1157,17 @@ impl<'a> SnapshotBuilder<'a> {
                 pending.owner_module_path.clone(),
                 pending.owner_name.clone(),
             );
-            let trait_resolution = resolve_private_type_alias_keys(
+            self.ensure_analysis_active()?;
+            let dependencies = syn::parse_str::<syn::ItemImpl>(&pending.evidence)
+                .map(|parsed| {
+                    LocalTypeDependencyCollector::collect_impl_types(
+                        &pending.crate_name,
+                        &pending.declaring_module_path,
+                        &parsed,
+                    )
+                })
+                .unwrap_or_default();
+            let trait_resolution = resolve_private_type_alias_keys_with_limits(
                 (
                     pending.crate_name.clone(),
                     pending.trait_module_path.clone(),
@@ -772,18 +1176,22 @@ impl<'a> SnapshotBuilder<'a> {
                 &pending.cfg_guard,
                 &private_aliases,
                 &private_module_aliases,
-            );
+                alias_limits,
+                || governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled),
+            )?;
             let trait_targets = if trait_resolution.terminals.is_empty() {
                 &trait_resolution.states
             } else {
                 &trait_resolution.terminals
             };
-            let owner_resolution = resolve_private_type_alias_keys(
+            let owner_resolution = resolve_private_type_alias_keys_with_limits(
                 initial_key,
                 &pending.cfg_guard,
                 &private_aliases,
                 &private_module_aliases,
-            );
+                alias_limits,
+                || governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled),
+            )?;
             if owner_resolution.exhausted {
                 alias_resolution_unknowns.push(RustApiUnknown {
                     kind: RustApiUnknownKind::PrivateTypeDependency,
@@ -807,7 +1215,10 @@ impl<'a> SnapshotBuilder<'a> {
                 let has_overlapping_declaration =
                     declarations.get(&owner.key).is_some_and(|candidates| {
                         candidates.iter().any(|declaration| {
-                            !guards_proven_disjoint(&declaration.cfg_guard, &owner.cfg_guard)
+                            !guards_proven_disjoint(
+                                &declaration.declaration.cfg_guard,
+                                &owner.cfg_guard,
+                            )
                         })
                     });
                 if has_overlapping_declaration {
@@ -833,10 +1244,9 @@ impl<'a> SnapshotBuilder<'a> {
                             .entry(owner.key.clone())
                             .or_default()
                             .push(GuardedImplEvidence {
-                                raw_contract: pending.evidence.clone(),
                                 semantic_evidence: resolved_impl_evidence,
                                 cfg_guard: effective_guard,
-                                declaring_module_path: pending.declaring_module_path.clone(),
+                                dependencies: dependencies.clone(),
                             });
                         recorded_pair = true;
                     }
@@ -848,151 +1258,26 @@ impl<'a> SnapshotBuilder<'a> {
                     };
                     implementation_evidence.entry(owner.key).or_default().push(
                         GuardedImplEvidence {
-                            raw_contract: pending.evidence.clone(),
                             semantic_evidence: format!(
                                 "{}\n{}\ntrait-alias-resolution-exhausted:{digest}",
                                 pending.semantic_evidence, owner_evidence,
                             ),
                             cfg_guard: owner.cfg_guard,
-                            declaring_module_path: pending.declaring_module_path.clone(),
+                            dependencies: dependencies.clone(),
                         },
                     );
                 }
             }
         }
 
-        let collect_dependency_closure =
-            |raw_roots: BTreeSet<PrivateTypeKey>, initial_guard: Vec<String>| {
-                let mut roots: BTreeSet<GuardedPrivateTypeKey> = raw_roots
-                    .into_iter()
-                    .map(|key| GuardedPrivateTypeKey {
-                        key,
-                        cfg_guard: initial_guard.clone(),
-                    })
-                    .collect();
-
-                let mut visited = BTreeSet::new();
-                let mut closure = Vec::new();
-                let mut alias_resolution_exhausted = false;
-                while let Some(state) = roots.pop_first() {
-                    if !visited.insert(state.clone()) {
-                        continue;
-                    }
-                    let alias_resolution = resolve_private_type_alias_keys(
-                        state.key.clone(),
-                        &state.cfg_guard,
-                        &private_aliases,
-                        &private_module_aliases,
-                    );
-                    alias_resolution_exhausted |= alias_resolution.exhausted;
-                    if let Some(digest) = &alias_resolution.exhaustion_digest {
-                        closure.push(format!("alias-resolution-exhausted:{digest}"));
-                    }
-                    for terminal in &alias_resolution.terminals {
-                        if terminal == &state {
-                            continue;
-                        }
-                        let has_local_declaration =
-                            declarations.get(&terminal.key).is_some_and(|candidates| {
-                                candidates.iter().any(|declaration| {
-                                    !guards_proven_disjoint(
-                                        &declaration.cfg_guard,
-                                        &terminal.cfg_guard,
-                                    )
-                                })
-                            });
-                        let has_local_impl = implementation_evidence
-                            .get(&terminal.key)
-                            .is_some_and(|impls| {
-                                impls.iter().any(|implementation| {
-                                    !guards_proven_disjoint(
-                                        &implementation.cfg_guard,
-                                        &terminal.cfg_guard,
-                                    )
-                                })
-                            });
-                        if !has_local_declaration && !has_local_impl {
-                            closure.push(format!(
-                                "alias-target:{}::{:?}::{}\neffective-cfg:{:?}",
-                                terminal.key.0, terminal.key.1, terminal.key.2, terminal.cfg_guard
-                            ));
-                        }
-                    }
-                    roots.extend(
-                        alias_resolution
-                            .states
-                            .into_iter()
-                            .filter(|alias| alias != &state),
-                    );
-                    if let Some(impls) = implementation_evidence.get(&state.key) {
-                        for implementation in impls.iter().filter(|implementation| {
-                            !guards_proven_disjoint(&implementation.cfg_guard, &state.cfg_guard)
-                        }) {
-                            let effective_guard =
-                                combined_guards(&state.cfg_guard, &implementation.cfg_guard);
-                            closure.push(format!(
-                                "impl-cfg:{effective_guard:?}\n{}",
-                                implementation.semantic_evidence
-                            ));
-                            if let Ok(parsed) =
-                                syn::parse_str::<syn::ItemImpl>(&implementation.raw_contract)
-                            {
-                                roots.extend(
-                                    LocalTypeDependencyCollector::collect_impl_types(
-                                        &state.key.0,
-                                        &implementation.declaring_module_path,
-                                        &parsed,
-                                    )
-                                    .into_iter()
-                                    .map(|key| {
-                                        GuardedPrivateTypeKey {
-                                            key,
-                                            cfg_guard: effective_guard.clone(),
-                                        }
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                    for declaration in
-                        declarations
-                            .get(&state.key)
-                            .into_iter()
-                            .flatten()
-                            .filter(|declaration| {
-                                !guards_proven_disjoint(&declaration.cfg_guard, &state.cfg_guard)
-                            })
-                    {
-                        let effective_guard =
-                            combined_guards(&state.cfg_guard, &declaration.cfg_guard);
-                        closure.push(format!(
-                            "declaration:{}::{:?}::{}\neffective-cfg:{:?}\n{}",
-                            state.key.0,
-                            state.key.1,
-                            state.key.2,
-                            effective_guard,
-                            declaration.contract
-                        ));
-                        if let Ok(parsed) = syn::parse_str::<Item>(&declaration.contract) {
-                            roots.extend(
-                                LocalTypeDependencyCollector::collect_item_types(
-                                    &state.key.0,
-                                    &state.key.1,
-                                    &parsed,
-                                )
-                                .into_iter()
-                                .map(|key| GuardedPrivateTypeKey {
-                                    key,
-                                    cfg_guard: effective_guard.clone(),
-                                }),
-                            );
-                        }
-                    }
-                }
-                closure.sort();
-                closure.dedup();
-                (closure, alias_resolution_exhausted)
-            };
+        let mut dependency_graph = PrivateDependencyGraph::new(
+            &declarations,
+            &implementation_evidence,
+            &private_aliases,
+            &private_module_aliases,
+            alias_limits,
+            self.governor,
+        );
 
         let mut dependency_unknowns = Vec::new();
         for item in &self.items {
@@ -1015,30 +1300,36 @@ impl<'a> SnapshotBuilder<'a> {
                 continue;
             }
 
-            let (closure, alias_resolution_exhausted) =
-                collect_dependency_closure(raw_roots, combined_guards(&item.cfg_guard, &[]));
-            if closure.is_empty() && !alias_resolution_exhausted {
+            let initial_guard = combined_guards(&item.cfg_guard, &[]);
+            let roots = raw_roots
+                .into_iter()
+                .map(|key| GuardedPrivateTypeKey {
+                    key,
+                    cfg_guard: initial_guard.clone(),
+                })
+                .collect();
+            let closure = dependency_graph.closure(roots)?;
+            if closure.evidence_empty && !closure.resolution_exhausted {
                 continue;
             }
-            let digest = format!("sha256:{:x}", Sha256::digest(closure.join("\n--\n")));
             dependency_unknowns.push(RustApiUnknown {
                 kind: RustApiUnknownKind::PrivateTypeDependency,
                 crate_name: Some(item.key.crate_name.clone()),
                 module_path: item.key.module_path.clone(),
                 source_path: item.source_path.clone(),
                 cfg_guard: item.cfg_guard.clone(),
-                evidence: if alias_resolution_exhausted {
+                evidence: if closure.resolution_exhausted {
                     format!(
-                        "public {:?} {} has non-public local type semantics whose alias resolution exceeded its finite graph bound ({digest})",
-                        item.kind, item.key.external_name
+                        "public {:?} {} has non-public local type semantics whose alias resolution exceeded its finite graph bound ({})",
+                        item.kind, item.key.external_name, closure.evidence_digest
                     )
                 } else {
                     format!(
-                        "public {:?} {} depends on non-public local type semantics ({digest})",
-                        item.kind, item.key.external_name
+                        "public {:?} {} depends on non-public local type semantics ({})",
+                        item.kind, item.key.external_name, closure.evidence_digest
                     )
                 },
-                resolution_exhausted: alias_resolution_exhausted,
+                resolution_exhausted: closure.resolution_exhausted,
                 provenance: self.provenance.clone(),
             });
         }
@@ -1061,35 +1352,42 @@ impl<'a> SnapshotBuilder<'a> {
             if raw_roots.is_empty() {
                 continue;
             }
-            let (closure, alias_resolution_exhausted) =
-                collect_dependency_closure(raw_roots, combined_guards(&subject.cfg_guard, &[]));
-            if closure.is_empty() && !alias_resolution_exhausted {
+            let initial_guard = combined_guards(&subject.cfg_guard, &[]);
+            let roots = raw_roots
+                .into_iter()
+                .map(|key| GuardedPrivateTypeKey {
+                    key,
+                    cfg_guard: initial_guard.clone(),
+                })
+                .collect();
+            let closure = dependency_graph.closure(roots)?;
+            if closure.evidence_empty && !closure.resolution_exhausted {
                 continue;
             }
-            let digest = format!("sha256:{:x}", Sha256::digest(closure.join("\n--\n")));
             dependency_unknowns.push(RustApiUnknown {
                 kind: RustApiUnknownKind::PrivateTypeDependency,
                 crate_name: Some(subject.crate_name.clone()),
                 module_path: subject.module_path.clone(),
                 source_path: subject.source_path.clone(),
                 cfg_guard: subject.cfg_guard.clone(),
-                evidence: if alias_resolution_exhausted {
+                evidence: if closure.resolution_exhausted {
                     format!(
-                        "native export {} has local type semantics whose alias resolution exceeded its finite graph bound ({digest})",
-                        subject.export_name
+                        "native export {} has local type semantics whose alias resolution exceeded its finite graph bound ({})",
+                        subject.export_name, closure.evidence_digest
                     )
                 } else {
                     format!(
-                        "native export {} depends on local type semantics ({digest})",
-                        subject.export_name
+                        "native export {} depends on local type semantics ({})",
+                        subject.export_name, closure.evidence_digest
                     )
                 },
-                resolution_exhausted: alias_resolution_exhausted,
+                resolution_exhausted: closure.resolution_exhausted,
                 provenance: self.provenance.clone(),
             });
         }
         self.unknowns.extend(alias_resolution_unknowns);
         self.unknowns.extend(dependency_unknowns);
+        Ok(())
     }
 
     fn record_inventory_path_unknowns(&mut self) {
@@ -9479,6 +9777,37 @@ fn resolve_private_type_alias_keys(
     private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
     private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
 ) -> PrivateAliasResolution {
+    resolve_private_type_alias_keys_cancellable(
+        initial,
+        guard,
+        private_aliases,
+        private_module_aliases,
+        || false,
+    )
+    .expect("an uncancellable private alias resolution cannot be cancelled")
+}
+
+fn resolve_private_type_alias_keys_cancellable(
+    initial: PrivateTypeKey,
+    guard: &[String],
+    private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
+    private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
+    is_cancelled: impl Fn() -> bool,
+) -> Result<PrivateAliasResolution, crate::governor::Cancelled> {
+    resolve_private_type_alias_keys_with_limits(
+        initial,
+        guard,
+        private_aliases,
+        private_module_aliases,
+        private_alias_resolution_limits(private_aliases, private_module_aliases),
+        is_cancelled,
+    )
+}
+
+fn private_alias_resolution_limits(
+    private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
+    private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
+) -> PrivateAliasResolutionLimits {
     let node_count = private_aliases
         .len()
         .saturating_add(private_module_aliases.len())
@@ -9516,6 +9845,76 @@ fn resolve_private_type_alias_keys(
     let max_depth = base_depth
         .saturating_add(private_module_aliases.len().min(256))
         .saturating_add(2);
+    PrivateAliasResolutionLimits { budget, max_depth }
+}
+
+fn private_alias_successors(
+    state: &GuardedPrivateTypeKey,
+    private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
+    private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
+    limits: PrivateAliasResolutionLimits,
+    is_cancelled: impl Fn() -> bool,
+) -> Result<(BTreeSet<GuardedPrivateTypeKey>, bool), crate::governor::Cancelled> {
+    if is_cancelled() {
+        return Err(crate::governor::Cancelled);
+    }
+    let mut successors = BTreeSet::new();
+    let mut depth_exhausted = false;
+    if let Some(targets) = private_aliases.get(&state.key) {
+        for (target, target_guard) in targets
+            .iter()
+            .filter(|(_, target_guard)| !guards_proven_disjoint(target_guard, &state.cfg_guard))
+        {
+            if is_cancelled() {
+                return Err(crate::governor::Cancelled);
+            }
+            if target.1.len() <= limits.max_depth {
+                successors.insert(GuardedPrivateTypeKey {
+                    key: target.clone(),
+                    cfg_guard: combined_guards(&state.cfg_guard, target_guard),
+                });
+            } else {
+                depth_exhausted = true;
+            }
+        }
+    }
+    for prefix_len in 0..=state.key.1.len() {
+        if is_cancelled() {
+            return Err(crate::governor::Cancelled);
+        }
+        let alias_key = (state.key.0.clone(), state.key.1[..prefix_len].to_vec());
+        let Some(targets) = private_module_aliases.get(&alias_key) else {
+            continue;
+        };
+        let suffix = &state.key.1[prefix_len..];
+        for (target_path, target_guard) in targets
+            .iter()
+            .filter(|(_, target_guard)| !guards_proven_disjoint(target_guard, &state.cfg_guard))
+        {
+            let mut module_path = target_path.clone();
+            module_path.extend_from_slice(suffix);
+            if module_path.len() <= limits.max_depth {
+                successors.insert(GuardedPrivateTypeKey {
+                    key: (state.key.0.clone(), module_path, state.key.2.clone()),
+                    cfg_guard: combined_guards(&state.cfg_guard, target_guard),
+                });
+            } else {
+                depth_exhausted = true;
+            }
+        }
+    }
+    Ok((successors, depth_exhausted))
+}
+
+fn resolve_private_type_alias_keys_with_limits(
+    initial: PrivateTypeKey,
+    guard: &[String],
+    private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
+    private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
+    limits: PrivateAliasResolutionLimits,
+    is_cancelled: impl Fn() -> bool,
+) -> Result<PrivateAliasResolution, crate::governor::Cancelled> {
+    let PrivateAliasResolutionLimits { budget, max_depth } = limits;
 
     let initial_state = GuardedPrivateTypeKey {
         key: initial,
@@ -9527,6 +9926,9 @@ fn resolve_private_type_alias_keys(
     let mut exhausted = false;
     let mut visited = 0usize;
     while let Some(state) = pending.pop_first() {
+        if is_cancelled() {
+            return Err(crate::governor::Cancelled);
+        }
         if !resolved.insert(state.clone()) {
             continue;
         }
@@ -9551,11 +9953,15 @@ fn resolve_private_type_alias_keys(
                 }
             }
         }
-        for ((crate_name, alias_path), targets) in private_module_aliases {
-            if crate_name != &state.key.0 || !state.key.1.starts_with(alias_path) {
+        // Only module aliases that are prefixes of this state can apply. The
+        // former whole-map scan made every public item pay for every alias in
+        // the repository even when none shared its crate/path.
+        for prefix_len in 0..=state.key.1.len() {
+            let alias_key = (state.key.0.clone(), state.key.1[..prefix_len].to_vec());
+            let Some(targets) = private_module_aliases.get(&alias_key) else {
                 continue;
-            }
-            let suffix = &state.key.1[alias_path.len()..];
+            };
+            let suffix = &state.key.1[prefix_len..];
             for (target_path, target_guard) in targets
                 .iter()
                 .filter(|(_, target_guard)| !guards_proven_disjoint(target_guard, &state.cfg_guard))
@@ -9584,12 +9990,12 @@ fn resolve_private_type_alias_keys(
     let exhaustion_digest = exhausted.then(|| {
         private_alias_graph_digest(&initial_state, private_aliases, private_module_aliases)
     });
-    PrivateAliasResolution {
+    Ok(PrivateAliasResolution {
         states: resolved,
         terminals,
         exhausted,
         exhaustion_digest,
-    }
+    })
 }
 
 fn guarded_private_type_evidence(label: &str, state: &GuardedPrivateTypeKey) -> String {
@@ -9604,28 +10010,54 @@ fn private_alias_graph_digest(
     private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
     private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
 ) -> String {
-    use sha2::{Digest, Sha256};
+    PrivateAliasDigestContext::new(private_aliases, private_module_aliases).digest(initial)
+}
 
-    let mut rows = vec![guarded_private_type_evidence("initial", initial)];
-    for (source, targets) in private_aliases {
-        for (target, guard) in targets {
-            rows.push(format!(
-                "type-edge:{source:?}->{target:?}\ncfg:{:?}",
-                combined_guards(guard, &[])
-            ));
+struct PrivateAliasDigestContext {
+    serialized_rows: String,
+}
+
+impl PrivateAliasDigestContext {
+    fn new(
+        private_aliases: &BTreeMap<PrivateTypeKey, Vec<GuardedPrivateTypeTarget>>,
+        private_module_aliases: &BTreeMap<PrivateModuleAliasKey, Vec<GuardedPrivateModuleTarget>>,
+    ) -> Self {
+        let mut rows = Vec::new();
+        for (source, targets) in private_aliases {
+            for (target, guard) in targets {
+                rows.push(format!(
+                    "type-edge:{source:?}->{target:?}\ncfg:{:?}",
+                    combined_guards(guard, &[])
+                ));
+            }
+        }
+        for (source, targets) in private_module_aliases {
+            for (target, guard) in targets {
+                rows.push(format!(
+                    "module-edge:{source:?}->{target:?}\ncfg:{:?}",
+                    combined_guards(guard, &[])
+                ));
+            }
+        }
+        rows.sort();
+        rows.dedup();
+        Self {
+            serialized_rows: rows.join("\n--\n"),
         }
     }
-    for (source, targets) in private_module_aliases {
-        for (target, guard) in targets {
-            rows.push(format!(
-                "module-edge:{source:?}->{target:?}\ncfg:{:?}",
-                combined_guards(guard, &[])
-            ));
+
+    fn digest(&self, initial: &GuardedPrivateTypeKey) -> String {
+        use sha2::{Digest, Sha256};
+
+        let initial_row = guarded_private_type_evidence("initial", initial);
+        let mut hasher = Sha256::new();
+        hasher.update(initial_row.as_bytes());
+        if !self.serialized_rows.is_empty() {
+            hasher.update(b"\n--\n");
+            hasher.update(self.serialized_rows.as_bytes());
         }
+        format!("sha256:{:x}", hasher.finalize())
     }
-    rows.sort();
-    rows.dedup();
-    format!("sha256:{:x}", Sha256::digest(rows.join("\n--\n")))
 }
 
 fn impl_path_is_external_public(crate_name: &str, module_path: &[String]) -> bool {
@@ -15640,6 +16072,166 @@ mod tests {
             })
             .evidence
             .clone()
+    }
+
+    #[test]
+    fn private_alias_digest_streaming_matches_materialized_rows() {
+        let initial = GuardedPrivateTypeKey {
+            key: (
+                "fixture".to_owned(),
+                vec!["nested".to_owned()],
+                "Hidden".to_owned(),
+            ),
+            cfg_guard: vec!["unix".to_owned()],
+        };
+        let private_aliases = BTreeMap::from([(
+            initial.key.clone(),
+            vec![(
+                (
+                    "fixture".to_owned(),
+                    vec!["target".to_owned()],
+                    "Hidden".to_owned(),
+                ),
+                vec!["feature = \"x\"".to_owned()],
+            )],
+        )]);
+        let private_module_aliases = BTreeMap::from([(
+            ("fixture".to_owned(), vec!["nested".to_owned()]),
+            vec![(vec!["target".to_owned()], vec!["unix".to_owned()])],
+        )]);
+        let mut rows = vec![guarded_private_type_evidence("initial", &initial)];
+        for (source, targets) in &private_aliases {
+            for (target, guard) in targets {
+                rows.push(format!(
+                    "type-edge:{source:?}->{target:?}\ncfg:{:?}",
+                    combined_guards(guard, &[])
+                ));
+            }
+        }
+        for (source, targets) in &private_module_aliases {
+            for (target, guard) in targets {
+                rows.push(format!(
+                    "module-edge:{source:?}->{target:?}\ncfg:{:?}",
+                    combined_guards(guard, &[])
+                ));
+            }
+        }
+        rows.sort();
+        rows.dedup();
+        let materialized = format!("sha256:{:x}", sha2::Sha256::digest(rows.join("\n--\n")));
+
+        assert_eq!(
+            PrivateAliasDigestContext::new(&private_aliases, &private_module_aliases)
+                .digest(&initial),
+            materialized
+        );
+    }
+
+    fn shared_private_dependency_fixture(leaf_type: &str) -> String {
+        let mut source = format!(
+            "struct Leaf({leaf_type});\n\
+             struct Other(u32);\n\
+             struct Shared(Leaf);\n\
+             type SharedAlias = Shared;\n\
+             trait Local {{ type Assoc; }}\n\
+             impl Local for Shared {{ type Assoc = Leaf; }}\n\
+             struct DistinctA(Leaf);\n\
+             struct DistinctB(Other);\n\
+             type CycleA = CycleB;\n\
+             type CycleB = CycleA;\n\
+             #[cfg(unix)] struct Guarded(Leaf);\n\
+             #[cfg(windows)] struct Guarded(Other);\n\
+             pub fn distinct_a() -> DistinctA {{ todo!() }}\n\
+             pub fn distinct_b() -> DistinctB {{ todo!() }}\n\
+             pub fn cycle() -> CycleA {{ todo!() }}\n\
+             #[cfg(unix)] pub fn guarded() -> Guarded {{ todo!() }}\n"
+        );
+        for index in 0..48 {
+            source.push_str(&format!(
+                "pub fn shared_{index}() -> SharedAlias {{ todo!() }}\n"
+            ));
+        }
+        source.push_str(
+            "mod a { pub mod b { pub struct T; } }\n\
+             use a::b as a;\n\
+             trait ExhaustedLocal {}\n\
+             impl ExhaustedLocal for a::T {}\n\
+             pub fn exhausted() -> a::T { todo!() }\n",
+        );
+        source
+    }
+
+    #[test]
+    fn private_dependency_closure_work_is_graph_bounded() {
+        let (before, before_counts) = {
+            let observer = private_dependency_test_observer::ObservationGuard::start();
+            let snapshot = snapshot_rust_api(&source(&shared_private_dependency_fixture("u8")));
+            (snapshot, observer.state_expansions())
+        };
+        let (after, after_counts) = {
+            let observer = private_dependency_test_observer::ObservationGuard::start();
+            let snapshot = snapshot_rust_api(&source(&shared_private_dependency_fixture("u16")));
+            (snapshot, observer.state_expansions())
+        };
+        let delta = crate::artifacts::api_delta::compare_rust_api(&before, &after);
+
+        let snapshot_hash = format!("sha256:{:x}", sha2::Sha256::digest(format!("{before:#?}")));
+        let delta_hash = format!("sha256:{:x}", sha2::Sha256::digest(format!("{delta:#?}")));
+        let max_expansions = after_counts.values().copied().max().unwrap_or(0);
+        eprintln!(
+            "private-closure-counter states={} expansions={} max_per_state={} snapshot={} delta={}",
+            after_counts.len(),
+            after_counts.values().sum::<usize>(),
+            max_expansions,
+            snapshot_hash,
+            delta_hash
+        );
+
+        assert!(
+            before.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::PrivateTypeDependency
+                    && unknown.evidence.contains("shared_0")
+            }),
+            "the source-realistic corpus must retain shared-root private evidence"
+        );
+        assert!(
+            before.unknowns.iter().any(|unknown| {
+                unknown.kind == RustApiUnknownKind::PrivateTypeDependency
+                    && unknown.evidence.contains("finite graph bound")
+            }),
+            "the exhaustion control must remain typed and fail-honest"
+        );
+        assert_eq!(
+            before_counts.values().sum::<usize>(),
+            after_counts.values().sum::<usize>(),
+            "changing one declaration's leaf type must not change total graph-work accounting"
+        );
+        assert_eq!(
+            max_expansions, 1,
+            "each canonical guarded state must be expanded once per snapshot, independent of public items sharing it"
+        );
+    }
+
+    #[test]
+    fn private_dependency_closure_observes_in_process_cancellation() {
+        let governor = std::sync::Arc::new(crate::governor::ResourceGovernor::new());
+        let observer = private_dependency_test_observer::ObservationGuard::start_cancelling(
+            governor.clone(),
+            3,
+        );
+        let error = snapshot_rust_api_cancellable(
+            &source(&shared_private_dependency_fixture("u8")),
+            &governor,
+        )
+        .expect_err("the snapshot must stop inside private dependency closure work");
+
+        assert_eq!(error, crate::governor::Cancelled);
+        assert!(governor.is_cancelled());
+        assert_eq!(
+            observer.state_expansions().values().sum::<usize>(),
+            3,
+            "the closure must not expand a fourth state after cancellation"
+        );
     }
 
     #[test]
