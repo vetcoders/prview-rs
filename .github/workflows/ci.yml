@@ -112,12 +112,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: write
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # audit-check@v2 installs the newest cargo-audit without --locked. That
+      # made this job depend on a moving transitive graph and broke when its
+      # unlocked tinyvec selection stopped compiling. Keep both the tool and
+      # its published lockfile exact.
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
       # WHY: quick-xml 0.39 sits in Cargo.lock only through comrak's target-gated (wasm) syntect variant; it is NOT part of the build graph on any release target (proof: cargo tree -i quick-xml empty on x86_64-unknown-linux-gnu and aarch64-apple-darwin) and prview parses no external XML.
       # WHEN TO REMOVE: when plist releases quick-xml >=0.41 support (RUSTSEC-2026-0194/0195 patched there) — bump the chain and drop this ignore.
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
+      - name: Audit dependencies
+        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
