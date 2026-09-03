@@ -201,6 +201,7 @@ pub fn snapshot_rust_api(source: &dyn RevisionFileSource) -> RustApiSnapshot {
     SnapshotBuilder::new(source).build()
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot_rust_api_cancellable(
     source: &dyn RevisionFileSource,
     governor: &crate::governor::ResourceGovernor,
@@ -883,6 +884,7 @@ impl<'a> SnapshotBuilder<'a> {
         }
     }
 
+    #[cfg(test)]
     fn with_governor(mut self, governor: &'a crate::governor::ResourceGovernor) -> Self {
         self.governor = Some(governor);
         self

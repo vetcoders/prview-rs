@@ -966,6 +966,10 @@ Everything the pack already reported — `checks[].cached`, `context_artifacts[]
 consumer that ignores `ledger` cannot tell the section exists. That is why the
 pack's `schema_version` does not move (the precedent `CheckProvenance` set) and
 why the view versions itself instead.
+After context commands finish, `context_artifacts[].generated` is reconciled
+against the command outcome and the expected file in the pack. Planning intent
+cannot survive a timeout, spawn failure, missing runnable command, or missing
+output as a false claim that an artifact was generated.
 
 The context runtime also retains an internal admission fact. Two commands may
 both display `timed_out` in the stable `context_commands[]` contract, but only
@@ -1304,9 +1308,13 @@ now guards every substantial orchestration/artifact seam. External context tools
 finish before merge/report generation. If cancellation reaches artifact
 generation, success-shaped verdict/report/RUN/MANIFEST/SANITY surfaces are
 removed and `00_summary/INCOMPLETE.json` records `status=incomplete`, the reason,
-and the interrupted stage. The `latest` symlink and the run-index row are one
-publication transaction under a global lock, not two best-effort writes. Before
-retargeting `latest`, prview fsyncs a durable recovery journal containing the
+and the interrupted stage. An unexpected invalid SANITY result is also fatal
+before ZIP and publication; its directory and `SANITY.json` are retained for
+diagnosis, while `latest`, the run index, and successful completion output
+remain untouched.
+The `latest` symlink and the run-index row are one publication transaction under
+a global lock, not two best-effort writes. Before retargeting `latest`, prview
+fsyncs a durable recovery journal containing the
 predecessor; the next publisher reconciles a crash from the committed index and
 clears the journal. Invalid journal state is quarantined without mutating the
 advertised alias, so stale or tampered recovery evidence cannot deny all future
@@ -2126,20 +2134,16 @@ OID pairs are coalesced in stable first-seen order before either snapshot is
 built; distinct multi-base comparisons each retain their own revision evidence
 and comparison-qualified finding ID.
 
-Private dependency analysis is one explicit guarded graph per snapshot. It
-preparses declaration and impl edges once, keys nodes by canonical private type
-plus effective cfg guard, expands each node once, and caches closures by their
-exact guarded root set. The finite measure is the set of not-yet-expanded
-guarded states; the settled postcondition is the complete reachable evidence
-set plus the propagated alias-exhaustion bit. Cycles terminate through state
-deduplication, cfg-overlap filtering remains edge-local, and alias exhaustion
-stays a typed non-neutralizable unknown rather than becoming empty evidence.
-Module aliases are resolved only along prefixes of the current module path, so
-unrelated repository aliases do not multiply item cost. The run governor is
-checked between snapshot stages, during alias work, and on every dependency
-node. Artifact generation exposes `rust-api.base-snapshot`,
-`rust-api.target-snapshot`, and `rust-api.compare` before starting each phase
-and records their per-phase totals in `RUN.json.timings`.
+Private dependency analysis remains part of the exact-tree snapshot engine, but
+production artifact generation never enters that engine in the parent process.
+The fast remote-only standard preset emits a typed, exact-revision unknown and
+does not launch the engine. Local standard, deep, and CI runs launch one private
+same-binary worker for all unique base/target pairs under one 30-second total
+deadline. The governed process group inherits Ctrl-C and cleanup semantics.
+Timeout, nonzero exit, or malformed JSON yields one typed unknown per exact
+comparison instead of an empty scan. Artifact generation records the honest
+`rust-api.fast-preset-unknown` or `rust-api.isolated-worker` stage in
+`RUN.json.timings`.
 `breaking_changes_view` and `public_api_diff_view` are pure deterministic
 projections over the same delta. Their shared counts, IDs, confidence, evidence,
 unknown reasons, and provenance therefore cannot drift through independent

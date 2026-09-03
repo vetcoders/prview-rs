@@ -178,7 +178,10 @@ exhausted, the finding remains `Unknown` with explicit finite-graph-bound
 evidence; it is never serialized as Added, omitted as an empty scan, or allowed
 to coexist with a clean PASS. Runtime-only phase timings are intentionally
 outside this semantic view and live in `RUN.json.timings` under
-`rust-api.base-snapshot`, `rust-api.target-snapshot`, and `rust-api.compare`.
+`rust-api.fast-preset-unknown` or `rust-api.isolated-worker`. The former does
+not launch full analysis. The latter covers one isolated worker and one
+30-second total deadline across all comparisons; timeout, nonzero exit, or
+malformed JSON remains review-required uncertainty.
 
 Unknown classifier names are an additive, open vocabulary rather than a closed
 client enum. `OpaqueReturnAutoTraits` identifies a caller-observable `async fn`

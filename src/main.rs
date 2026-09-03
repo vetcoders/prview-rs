@@ -59,6 +59,14 @@ fn display_error(err: &anyhow::Error) {
 }
 
 async fn run() -> Result<()> {
+    // Private same-binary worker protocol. It must be selected before public
+    // CLI parsing so no user-facing flag or subcommand can activate it.
+    if std::env::var_os("PRVIEW_INTERNAL_RUST_API_WORKER").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        return run_private_rust_api_worker();
+    }
+
     // Loctree's library scan is synchronous and cannot be cooperatively
     // cancelled once entered. The parent review launches this private mode as
     // a governed child process so Ctrl-C can terminate the scan itself.
@@ -189,6 +197,45 @@ async fn run() -> Result<()> {
     }
 
     std::process::exit(exit_code);
+}
+
+#[derive(serde::Deserialize)]
+struct RustApiWorkerPair {
+    base_revision: String,
+    target_revision: String,
+}
+
+fn run_private_rust_api_worker() -> Result<()> {
+    let repo_root = std::env::var_os("PRVIEW_INTERNAL_RUST_API_REPO")
+        .map(PathBuf::from)
+        .context("missing private Rust API worker repository")?;
+    let pairs_json = std::env::var("PRVIEW_INTERNAL_RUST_API_PAIRS")
+        .context("missing private Rust API worker revision pairs")?;
+    let pairs: Vec<RustApiWorkerPair> =
+        serde_json::from_str(&pairs_json).context("parse private Rust API worker request")?;
+    anyhow::ensure!(
+        !pairs.is_empty(),
+        "private Rust API worker request is empty"
+    );
+
+    let repo = prview::git::Repository::open(&repo_root)?;
+    let diffs = pairs
+        .into_iter()
+        .map(|pair| prview::git::Diff {
+            base: pair.base_revision.clone(),
+            target: pair.target_revision.clone(),
+            base_commit_id: pair.base_revision,
+            target_commit_id: pair.target_revision,
+            files: Vec::new(),
+            stats: Default::default(),
+            commits: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let delta = prview::artifacts::api_delta::compare_rust_api_revisions(&repo, &diffs)?
+        .context("private Rust API worker received no comparisons")?;
+    serde_json::to_writer(std::io::stdout().lock(), &delta)
+        .context("write private Rust API worker result")?;
+    Ok(())
 }
 
 async fn supervised_config(cli: &Cli) -> Result<Config> {

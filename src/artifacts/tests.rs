@@ -787,15 +787,12 @@ use std::time::Duration;
 #[test]
 fn api_delta_no_diff_only_runtime() {
     let production = include_str!("mod.rs");
-    assert!(production.contains("compare_rust_api_revisions_with_runtime("));
-    for phase in [
-        "rust-api.base-snapshot",
-        "rust-api.target-snapshot",
-        "rust-api.compare",
-    ] {
+    assert!(production.contains("compare_rust_api_revisions_isolated("));
+    assert!(!production.contains("compare_rust_api_revisions("));
+    for phase in ["rust-api.fast-preset-unknown", "rust-api.isolated-worker"] {
         assert!(
             production.contains(phase),
-            "the active Rust API phase and RUN timing must name {phase}"
+            "the Rust API stage and RUN timing must name {phase}"
         );
     }
     assert!(production.contains("analyze_js_ts_public_api_diff(&patch_texts)"));
@@ -809,6 +806,17 @@ fn api_delta_no_diff_only_runtime() {
         !production.contains("analyze_all_breaking_changes(&patch_texts)"),
         "Rust production must never return to the diff-only BREAKING backend"
     );
+}
+
+#[test]
+fn rust_api_worker_activation_precedes_public_cli_parsing() {
+    let main = include_str!("../main.rs");
+    let worker = main
+        .find("PRVIEW_INTERNAL_RUST_API_WORKER")
+        .expect("private worker activation");
+    let cli_parse = main.find("Cli::parse()").expect("public CLI parser");
+    assert!(worker < cli_parse);
+    assert!(main.contains("run_private_rust_api_worker()"));
 }
 
 #[test]
@@ -6398,6 +6406,41 @@ fn sanity_passes_when_completed_command_output_exists() {
         "existing output must pass; failures: {:?}",
         result.failures
     );
+}
+
+#[test]
+fn invalid_sanity_is_rejected_before_publication_helper() {
+    let sanity = SanityResult {
+        valid: false,
+        checks_run: 5,
+        checks_passed: 4,
+        failures: vec!["completed context artifact is missing".to_owned()],
+    };
+    let publication_started = std::cell::Cell::new(false);
+
+    let result = (|| -> Result<()> {
+        ensure_sanity_valid(&sanity)?;
+        publication_started.set(true);
+        Ok(())
+    })();
+
+    let error = result.expect_err("invalid SANITY must abort finalization");
+    assert!(error.to_string().contains("4/5 checks passed"));
+    assert!(error.to_string().contains("context artifact is missing"));
+    assert!(!publication_started.get());
+
+    let production = include_str!("mod.rs");
+    let sanity_guard = production
+        .find("ensure_sanity_valid(&sanity)?")
+        .expect("production sanity guard");
+    let zip = production
+        .find("if config.create_zip")
+        .expect("ZIP finalization");
+    let publication = production
+        .find("begin_latest_publication(&publication, &out_dir)")
+        .expect("publication helper");
+    assert!(sanity_guard < zip);
+    assert!(sanity_guard < publication);
 }
 
 #[test]

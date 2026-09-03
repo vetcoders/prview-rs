@@ -1280,7 +1280,7 @@ pub fn print_config(config: &Config, target: &ResolvedRef, bases: &[ResolvedRef]
         style: ConfigLineStyle::Label("Schedule"),
     });
     if config.is_fast_remote_only_standard() {
-        let note = "fast remote-only preset skips tests and heuristics; use --with-tests, --with-lint, or --deep for a heavier pass";
+        let note = "fast remote-only preset skips tests, heuristics, and full repo-backed Rust API analysis; use --deep or a local/CI run for the bounded full analysis";
         rows.push(ConfigRow::Line {
             plain: format!("    note: {}", note),
             style: ConfigLineStyle::Note,
@@ -2578,7 +2578,7 @@ mod tests {
             },
             ConfigRow::Rule,
             ConfigRow::Line {
-                plain: "    note: fast remote-only preset skips tests and heuristics; use --with-tests, --with-lint, or --deep for a heavier pass"
+                plain: "    note: fast remote-only preset skips tests, heuristics, and full repo-backed Rust API analysis; use --deep or a local/CI run for the bounded full analysis"
                     .to_string(),
                 style: ConfigLineStyle::Note,
             },

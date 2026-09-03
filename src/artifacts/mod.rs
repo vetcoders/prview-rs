@@ -495,7 +495,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let context_scan_root = ledger
         .scan_dir()
         .unwrap_or_else(|| config.repo_root.clone());
-    let context_artifacts =
+    let mut context_artifacts =
         plan_context_artifacts(config, &context_scan_root, diffs, &all_checks, ledger);
 
     let emit_human_stdout = !config.json && !config.quiet;
@@ -546,40 +546,36 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     stage_timings.push(finish_timing(emit_human_stdout, "full.patch", t));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::DiffGeneration)?;
 
-    // Rust API truth is computed once from the exact revision trees named by
-    // each Diff. The same delta feeds both artifact views and every verdict
-    // projection. JS/TS remains on its legacy diff parser behind a structural
-    // language boundary.
+    // Rust API truth is either an explicit fast-preset unknown or the output of
+    // one bounded private child covering all exact revision pairs. The parent
+    // never enters the repo-backed snapshot engine. The same delta feeds both
+    // artifact views and every verdict projection.
     let has_rust_scope = config.profile.has_cargo
         || diffs
             .iter()
             .flat_map(|diff| diff.files.iter())
             .any(|file| file.path.ends_with(".rs"));
     let rust_api_delta = if has_rust_scope {
-        let (delta, timings) = api_delta::compare_rust_api_revisions_with_runtime(
-            &repo,
-            diffs,
-            Some(governor),
-            |phase| {
-                if emit_human_stdout {
-                    println!("  · {phase} (active)");
-                }
-            },
-        )?;
-        stage_timings.extend([
-            StageTiming {
-                label: "rust-api.base-snapshot".to_owned(),
-                duration_secs: timings.base_snapshot_secs,
-            },
-            StageTiming {
-                label: "rust-api.target-snapshot".to_owned(),
-                duration_secs: timings.target_snapshot_secs,
-            },
-            StageTiming {
-                label: "rust-api.compare".to_owned(),
-                duration_secs: timings.compare_secs,
-            },
-        ]);
+        let fast_preset = config.is_fast_remote_only_standard();
+        let phase = if fast_preset {
+            "rust-api.fast-preset-unknown"
+        } else {
+            "rust-api.isolated-worker"
+        };
+        if emit_human_stdout {
+            if fast_preset {
+                println!("  · {phase}");
+            } else {
+                println!("  · {phase} (active; 30s total)");
+            }
+        }
+        let started = Instant::now();
+        let delta =
+            api_delta::compare_rust_api_revisions_isolated(fast_preset, repo.path(), diffs)?;
+        stage_timings.push(StageTiming {
+            label: phase.to_owned(),
+            duration_secs: started.elapsed().as_secs_f32(),
+        });
         delta
     } else {
         None
@@ -732,6 +728,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         &context_artifacts,
         governor,
     )?;
+    reconcile_context_artifacts(&mut context_artifacts, &context_command_timings, &out_dir);
     stage_timings.push(finish_timing(emit_human_stdout, "context-tools", t));
     ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::ContextTools)?;
 
@@ -1035,6 +1032,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
             }
         }
     }
+    ensure_sanity_valid(&sanity)?;
 
     // Create ZIP LAST, after RUN.json + MANIFEST + SANITY have all been written
     // to disk. The shipped pack is a portable copy of the run, so it must carry
@@ -1428,6 +1426,18 @@ fn finish_timing(emit: bool, label: &str, start: Instant) -> StageTiming {
         label: label.to_string(),
         duration_secs: elapsed,
     }
+}
+
+fn ensure_sanity_valid(sanity: &SanityResult) -> Result<()> {
+    if sanity.valid {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "artifact pack sanity is invalid ({}/{} checks passed): {}",
+        sanity.checks_passed,
+        sanity.checks_run,
+        sanity.failures.join("; ")
+    )
 }
 
 fn generate_metadata(

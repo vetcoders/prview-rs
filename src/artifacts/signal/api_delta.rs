@@ -1,8 +1,8 @@
 //! Canonical comparison of two revision-backed Rust API snapshots.
 //!
-//! This module is intentionally side-effect free. It computes one typed delta
-//! from exact repository revisions and exposes deterministic projections used
-//! by both production Rust API artifacts.
+//! It computes one typed delta from exact repository revisions, owns the
+//! private isolated-worker protocol, and exposes deterministic projections
+//! used by both production Rust API artifacts.
 
 use super::api_surface::{
     NON_NEUTRALIZABLE_SYMLINK_ROOT, RustApiDeclaration, RustApiItem, RustApiItemKey,
@@ -11,12 +11,17 @@ use super::api_surface::{
 };
 use super::revision_source::RevisionProvenance;
 use crate::git::{Diff, Repository};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
 
 pub const REPO_BACKED_RUST_API_SOURCE: &str = "repo_backed_rust_api";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiDeltaKind {
     Added,
@@ -27,28 +32,32 @@ pub enum ApiDeltaKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiDeltaConfidence {
     Confirmed,
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiSnapshotSide {
     Base,
     Target,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ApiUnknownSource {
     pub side: ApiSnapshotSide,
     pub source_path: String,
     pub provenance: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ApiIdentity {
     pub crate_name: String,
     pub module_path: Vec<String>,
@@ -67,7 +76,7 @@ impl ApiIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ApiFactSide {
     pub identity: ApiIdentity,
     pub contract: String,
@@ -77,13 +86,14 @@ pub struct ApiFactSide {
     pub declared_public: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ApiDeltaFinding {
     pub id: String,
     pub kind: ApiDeltaKind,
     pub identity: ApiIdentity,
     pub before: Option<ApiFactSide>,
     pub after: Option<ApiFactSide>,
+    #[serde(skip_deserializing, default = "repo_backed_analysis_source")]
     pub analysis_source: &'static str,
     pub confidence: ApiDeltaConfidence,
     pub evidence: Vec<String>,
@@ -93,8 +103,9 @@ pub struct ApiDeltaFinding {
     pub unknown_source: Option<ApiUnknownSource>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ApiDelta {
+    #[serde(skip_deserializing, default = "repo_backed_analysis_source")]
     pub analysis_source: &'static str,
     pub base_revision: String,
     pub target_revision: String,
@@ -104,6 +115,10 @@ pub struct ApiDelta {
     pub relocated: Vec<ApiDeltaFinding>,
     pub visibility_changed: Vec<ApiDeltaFinding>,
     pub unknown: Vec<ApiDeltaFinding>,
+}
+
+fn repo_backed_analysis_source() -> &'static str {
+    REPO_BACKED_RUST_API_SOURCE
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -296,76 +311,243 @@ pub fn compare_rust_api(base: &RustApiSnapshot, target: &RustApiSnapshot) -> Api
 /// compared exactly once and then folded into one deterministic delta consumed
 /// by both artifact views.
 pub fn compare_rust_api_revisions(repo: &Repository, diffs: &[Diff]) -> Result<Option<ApiDelta>> {
-    compare_rust_api_revisions_with_runtime(repo, diffs, None, |_| {})
-        .map(|(delta, _timings)| delta)
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct RustApiPhaseTimings {
-    pub(crate) base_snapshot_secs: f32,
-    pub(crate) target_snapshot_secs: f32,
-    pub(crate) compare_secs: f32,
-}
-
-pub(crate) fn compare_rust_api_revisions_with_runtime(
-    repo: &Repository,
-    diffs: &[Diff],
-    governor: Option<&crate::governor::ResourceGovernor>,
-    mut phase_started: impl FnMut(&'static str),
-) -> Result<(Option<ApiDelta>, RustApiPhaseTimings)> {
-    use super::api_surface::{snapshot_rust_api, snapshot_rust_api_cancellable};
+    use super::api_surface::snapshot_rust_api;
     use super::revision_source::GitTree;
-    use std::time::Instant;
 
     if diffs.is_empty() {
-        return Ok((None, RustApiPhaseTimings::default()));
+        return Ok(None);
     }
 
     let unique_diffs = unique_exact_revision_pairs(diffs);
     let mut target_snapshots = BTreeMap::new();
     let mut comparisons = Vec::with_capacity(diffs.len());
-    let mut timings = RustApiPhaseTimings::default();
     for diff in unique_diffs {
-        if governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled) {
-            return Err(crate::governor::Cancelled.into());
-        }
-        phase_started("rust-api.base-snapshot");
-        let started = Instant::now();
         let base_source = GitTree::new(repo, &diff.base_commit_id)?;
-        let base = if let Some(governor) = governor {
-            snapshot_rust_api_cancellable(&base_source, governor)?
-        } else {
-            snapshot_rust_api(&base_source)
-        };
-        timings.base_snapshot_secs += started.elapsed().as_secs_f32();
+        let base = snapshot_rust_api(&base_source);
         if !target_snapshots.contains_key(&diff.target_commit_id) {
-            if governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled) {
-                return Err(crate::governor::Cancelled.into());
-            }
-            phase_started("rust-api.target-snapshot");
-            let started = Instant::now();
             let target_source = GitTree::new(repo, &diff.target_commit_id)?;
-            let target = if let Some(governor) = governor {
-                snapshot_rust_api_cancellable(&target_source, governor)?
-            } else {
-                snapshot_rust_api(&target_source)
-            };
-            timings.target_snapshot_secs += started.elapsed().as_secs_f32();
+            let target = snapshot_rust_api(&target_source);
             target_snapshots.insert(diff.target_commit_id.clone(), target);
         }
         let target = target_snapshots
             .get(&diff.target_commit_id)
             .expect("target snapshot inserted for exact OID");
-        if governor.is_some_and(crate::governor::ResourceGovernor::is_cancelled) {
-            return Err(crate::governor::Cancelled.into());
-        }
-        phase_started("rust-api.compare");
-        let started = Instant::now();
         comparisons.push(compare_rust_api(&base, target));
-        timings.compare_secs += started.elapsed().as_secs_f32();
     }
 
-    Ok((Some(merge_comparisons(comparisons)), timings))
+    Ok(Some(merge_comparisons(comparisons)))
+}
+
+const RUST_API_WORKER_ENV: &str = "PRVIEW_INTERNAL_RUST_API_WORKER";
+const RUST_API_WORKER_REPO_ENV: &str = "PRVIEW_INTERNAL_RUST_API_REPO";
+const RUST_API_WORKER_PAIRS_ENV: &str = "PRVIEW_INTERNAL_RUST_API_PAIRS";
+const RUST_API_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_WORKER_DIAGNOSTIC_BYTES: usize = 2_048;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RustApiRevisionPair {
+    base_revision: String,
+    target_revision: String,
+}
+
+#[derive(Debug)]
+struct RustApiWorkerOutput {
+    success: bool,
+    status: String,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Production entrypoint for revision-backed Rust API analysis. Fast remote
+/// runs are intentionally fail-honest without launching the expensive engine;
+/// every other run gives one private child one total deadline for all bases.
+pub(crate) fn compare_rust_api_revisions_isolated(
+    fast_remote_only_standard: bool,
+    repo_root: &Path,
+    diffs: &[Diff],
+) -> Result<Option<ApiDelta>> {
+    compare_rust_api_revisions_with_worker(
+        fast_remote_only_standard,
+        repo_root,
+        diffs,
+        RUST_API_WORKER_TIMEOUT,
+        |repo_root, pairs_json, timeout| {
+            let executable = std::env::current_exe().context("locate current prview executable")?;
+            let mut command = Command::new(executable);
+            command
+                .env(RUST_API_WORKER_ENV, "1")
+                .env(RUST_API_WORKER_REPO_ENV, repo_root)
+                .env(RUST_API_WORKER_PAIRS_ENV, pairs_json);
+            let output = crate::proc::output_governed_with_timeout(
+                command,
+                "isolated Rust API analysis",
+                timeout,
+            )?;
+            Ok(RustApiWorkerOutput {
+                success: output.status.success(),
+                status: output.status.to_string(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        },
+    )
+}
+
+fn compare_rust_api_revisions_with_worker(
+    fast_remote_only_standard: bool,
+    repo_root: &Path,
+    diffs: &[Diff],
+    timeout: Duration,
+    runner: impl FnOnce(&Path, &str, Duration) -> Result<RustApiWorkerOutput>,
+) -> Result<Option<ApiDelta>> {
+    let pairs = revision_pairs(diffs);
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    if fast_remote_only_standard {
+        return Ok(Some(unavailable_delta(
+            &pairs,
+            "full repo-backed Rust API analysis was skipped by the fast remote-only preset",
+            None,
+        )));
+    }
+
+    let pairs_json = serde_json::to_string(&pairs).context("serialize Rust API worker request")?;
+    let output = match runner(repo_root, &pairs_json, timeout) {
+        Ok(output) => output,
+        Err(error) if crate::governor::is_cancellation(&error) => return Err(error),
+        Err(error) => {
+            return Ok(Some(unavailable_delta(
+                &pairs,
+                "isolated Rust API analysis did not complete within its bounded execution",
+                Some(&sanitize_worker_diagnostic(error.to_string().as_bytes())),
+            )));
+        }
+    };
+    if !output.success {
+        let diagnostic = sanitize_worker_diagnostic(&output.stderr);
+        return Ok(Some(unavailable_delta(
+            &pairs,
+            &format!("isolated Rust API worker exited with {}", output.status),
+            (!diagnostic.is_empty()).then_some(diagnostic.as_str()),
+        )));
+    }
+
+    match serde_json::from_slice::<ApiDelta>(&output.stdout) {
+        Ok(delta) if delta_revisions_match(&delta, &pairs) => Ok(Some(delta)),
+        Ok(_) => Ok(Some(unavailable_delta(
+            &pairs,
+            "isolated Rust API worker returned mismatched revision provenance",
+            None,
+        ))),
+        Err(error) => Ok(Some(unavailable_delta(
+            &pairs,
+            "isolated Rust API worker returned malformed JSON",
+            Some(&sanitize_worker_diagnostic(error.to_string().as_bytes())),
+        ))),
+    }
+}
+
+fn delta_revisions_match(delta: &ApiDelta, pairs: &[RustApiRevisionPair]) -> bool {
+    let expected_base = aggregate_revisions(
+        pairs
+            .iter()
+            .map(|pair| canonical_git_tree_revision(&pair.base_revision)),
+    );
+    let expected_target = aggregate_revisions(
+        pairs
+            .iter()
+            .map(|pair| canonical_git_tree_revision(&pair.target_revision)),
+    );
+    delta.base_revision == expected_base && delta.target_revision == expected_target
+}
+
+fn canonical_git_tree_revision(commit_oid: &str) -> String {
+    provenance_id(&RevisionProvenance::GitTree {
+        commit_oid: commit_oid.to_owned(),
+    })
+}
+
+fn aggregate_revisions(revisions: impl IntoIterator<Item = String>) -> String {
+    let revisions = revisions.into_iter().collect::<BTreeSet<_>>();
+    if revisions.len() == 1 {
+        revisions.into_iter().next().expect("one revision")
+    } else {
+        format!(
+            "multiple:[{}]",
+            revisions.into_iter().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+fn revision_pairs(diffs: &[Diff]) -> Vec<RustApiRevisionPair> {
+    unique_exact_revision_pairs(diffs)
+        .into_iter()
+        .map(|diff| RustApiRevisionPair {
+            base_revision: diff.base_commit_id.clone(),
+            target_revision: diff.target_commit_id.clone(),
+        })
+        .collect()
+}
+
+fn unavailable_delta(
+    pairs: &[RustApiRevisionPair],
+    reason: &str,
+    diagnostic: Option<&str>,
+) -> ApiDelta {
+    let comparisons = pairs
+        .iter()
+        .map(|pair| {
+            let base_revision = canonical_git_tree_revision(&pair.base_revision);
+            let target_revision = canonical_git_tree_revision(&pair.target_revision);
+            let comparison = format!("{base_revision} -> {target_revision}");
+            let mut finding = pairing_unknown(
+                ApiIdentity {
+                    crate_name: "<workspace>".to_owned(),
+                    module_path: Vec::new(),
+                    namespace: "analysis".to_owned(),
+                    name: "repo-backed-rust-api".to_owned(),
+                    cfg_region: Vec::new(),
+                },
+                None,
+                None,
+                reason,
+            );
+            finding.evidence = vec![format!("revision comparison: {comparison}")];
+            if let Some(diagnostic) = diagnostic {
+                finding
+                    .evidence
+                    .push(format!("worker diagnostic: {diagnostic}"));
+            }
+            finding.id = stable_finding_id(&finding);
+            ApiDelta {
+                analysis_source: REPO_BACKED_RUST_API_SOURCE,
+                base_revision,
+                target_revision,
+                added: Vec::new(),
+                removed: Vec::new(),
+                changed: Vec::new(),
+                relocated: Vec::new(),
+                visibility_changed: Vec::new(),
+                unknown: vec![finding],
+            }
+        })
+        .collect();
+    merge_comparisons(comparisons)
+}
+
+fn sanitize_worker_diagnostic(bytes: &[u8]) -> String {
+    let printable = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_WORKER_DIAGNOSTIC_BYTES)])
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    printable.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn unique_exact_revision_pairs(diffs: &[Diff]) -> Vec<&Diff> {
@@ -382,24 +564,17 @@ fn merge_comparisons(mut comparisons: Vec<ApiDelta>) -> ApiDelta {
         return comparisons.pop().expect("one comparison");
     }
 
-    let base_revisions = comparisons
-        .iter()
-        .map(|delta| delta.base_revision.as_str())
-        .collect::<BTreeSet<_>>();
-    let target_revisions = comparisons
-        .iter()
-        .map(|delta| delta.target_revision.as_str())
-        .collect::<BTreeSet<_>>();
+    let base_revision =
+        aggregate_revisions(comparisons.iter().map(|delta| delta.base_revision.clone()));
+    let target_revision = aggregate_revisions(
+        comparisons
+            .iter()
+            .map(|delta| delta.target_revision.clone()),
+    );
     let mut merged = ApiDelta {
         analysis_source: REPO_BACKED_RUST_API_SOURCE,
-        base_revision: format!(
-            "multiple:[{}]",
-            base_revisions.into_iter().collect::<Vec<_>>().join(",")
-        ),
-        target_revision: format!(
-            "multiple:[{}]",
-            target_revisions.into_iter().collect::<Vec<_>>().join(",")
-        ),
+        base_revision,
+        target_revision,
         added: Vec::new(),
         removed: Vec::new(),
         changed: Vec::new(),
@@ -1980,45 +2155,97 @@ mod tests {
     }
 
     #[test]
-    fn rust_api_revision_runtime_records_base_target_and_compare_timings() {
-        let (_tmp, repo, base, target) = make_test_repo(&[
-            (
-                "Cargo.toml",
-                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
-                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
-            ),
-            (
-                "src/lib.rs",
-                "struct Hidden(u8); pub fn api() -> Hidden { todo!() }\n",
-                "struct Hidden(u16); pub fn api() -> Hidden { todo!() }\n",
-            ),
-        ]);
-        let governor = crate::governor::ResourceGovernor::new();
-        let mut phases = Vec::new();
-        let (delta, timings) = compare_rust_api_revisions_with_runtime(
-            &repo,
-            &[make_diff_with_ids(base, target, Vec::new())],
-            Some(&governor),
-            |phase| phases.push(phase),
+    fn fast_remote_only_returns_typed_unknown_without_launching_worker() {
+        let diff = make_diff_with_ids("base-oid".into(), "target-oid".into(), Vec::new());
+        let delta = compare_rust_api_revisions_with_worker(
+            true,
+            Path::new("/unused"),
+            &[diff],
+            Duration::from_secs(30),
+            |_, _, _| panic!("fast preset must not launch the Rust API worker"),
         )
-        .expect("runtime-observed comparison");
+        .expect("fast preset result")
+        .expect("typed delta");
 
-        assert!(delta.is_some());
-        assert_eq!(
-            phases,
-            [
-                "rust-api.base-snapshot",
-                "rust-api.target-snapshot",
-                "rust-api.compare",
-            ]
+        assert_eq!(delta.base_revision, "git_tree:base-oid");
+        assert_eq!(delta.target_revision, "git_tree:target-oid");
+        assert_eq!(delta.unknown.len(), 1);
+        assert!(
+            delta.unknown[0]
+                .unknown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("fast remote-only preset"))
         );
-        assert!(timings.base_snapshot_secs > 0.0);
-        assert!(timings.target_snapshot_secs > 0.0);
-        assert!(timings.compare_secs > 0.0);
+        let mut confidence = crate::policy::engine::AnalysisStatus::Complete;
+        let mut merge = crate::policy::engine::MergeRecommendation::Approve;
+        let disposition = crate::artifacts::apply_rust_api_delta_outcome(
+            true,
+            Some(&breaking_changes_view(&delta)),
+            &mut confidence,
+            &mut merge,
+        );
+        assert_eq!(confidence, crate::policy::engine::AnalysisStatus::Degraded);
+        assert_eq!(
+            merge,
+            crate::policy::engine::MergeRecommendation::ReviewRequired
+        );
+        assert_eq!(disposition.as_str(), "review_required");
     }
 
     #[test]
-    fn rust_api_revision_runtime_cancels_before_base_and_target_snapshot_work() {
+    fn worker_timeout_failure_and_malformed_output_are_review_required_unknowns() {
+        use crate::policy::engine::{AnalysisStatus, MergeRecommendation};
+
+        let diff = make_diff_with_ids("base-oid".into(), "target-oid".into(), Vec::new());
+        let cases = [
+            Err(anyhow::anyhow!("isolated Rust API analysis timed out")),
+            Ok(RustApiWorkerOutput {
+                success: false,
+                status: "exit status: 9".to_owned(),
+                stdout: Vec::new(),
+                stderr: b"worker failed\nwith noisy spacing".to_vec(),
+            }),
+            Ok(RustApiWorkerOutput {
+                success: true,
+                status: "exit status: 0".to_owned(),
+                stdout: b"not-json".to_vec(),
+                stderr: Vec::new(),
+            }),
+        ];
+        for output in cases {
+            let delta = compare_rust_api_revisions_with_worker(
+                false,
+                Path::new("/unused"),
+                std::slice::from_ref(&diff),
+                Duration::from_secs(30),
+                |_, _, _| output,
+            )
+            .expect("worker failure becomes a delta")
+            .expect("typed delta");
+            assert_eq!(delta.base_revision, "git_tree:base-oid");
+            assert_eq!(delta.target_revision, "git_tree:target-oid");
+            assert_eq!(delta.unknown.len(), 1);
+            assert!(delta.unknown[0].evidence.iter().any(|evidence| {
+                evidence.contains("revision comparison: git_tree:base-oid -> git_tree:target-oid")
+            }));
+
+            let view = breaking_changes_view(&delta);
+            let mut confidence = AnalysisStatus::Complete;
+            let mut merge = MergeRecommendation::Approve;
+            let disposition = crate::artifacts::apply_rust_api_delta_outcome(
+                true,
+                Some(&view),
+                &mut confidence,
+                &mut merge,
+            );
+            assert_eq!(confidence, AnalysisStatus::Degraded);
+            assert_eq!(merge, MergeRecommendation::ReviewRequired);
+            assert_eq!(disposition.as_str(), "review_required");
+        }
+    }
+
+    #[test]
+    fn successful_worker_json_roundtrips_real_git_tree_revision_provenance() {
         let (_tmp, repo, base, target) = make_test_repo(&[
             (
                 "Cargo.toml",
@@ -2027,22 +2254,80 @@ mod tests {
             ),
             ("src/lib.rs", "pub fn old() {}\n", "pub fn new() {}\n"),
         ]);
-        let diff = make_diff_with_ids(base, target, Vec::new());
-        for cancel_phase in ["rust-api.base-snapshot", "rust-api.target-snapshot"] {
-            let governor = crate::governor::ResourceGovernor::new();
-            let error = compare_rust_api_revisions_with_runtime(
-                &repo,
-                std::slice::from_ref(&diff),
-                Some(&governor),
-                |phase| {
-                    if phase == cancel_phase {
-                        governor.cancel();
-                    }
-                },
-            )
-            .expect_err("cancellation must stop the active snapshot phase");
-            assert!(crate::governor::is_cancellation(&error), "{error:#}");
-        }
+        let diff = make_diff_with_ids(base.clone(), target.clone(), Vec::new());
+        let expected = compare_rust_api_revisions(&repo, std::slice::from_ref(&diff))
+            .expect("real repository comparison")
+            .expect("delta");
+        assert_eq!(expected.base_revision, format!("git_tree:{base}"));
+        assert_eq!(expected.target_revision, format!("git_tree:{target}"));
+        let actual = compare_rust_api_revisions_with_worker(
+            false,
+            repo.path(),
+            &[diff],
+            Duration::from_secs(30),
+            |_, _, _| {
+                Ok(RustApiWorkerOutput {
+                    success: true,
+                    status: "exit status: 0".to_owned(),
+                    stdout: serde_json::to_vec(&expected).unwrap(),
+                    stderr: Vec::new(),
+                })
+            },
+        )
+        .expect("worker result")
+        .expect("delta");
+        assert_eq!(actual, expected);
+        assert!(
+            actual
+                .findings()
+                .iter()
+                .all(|finding| finding.analysis_source == REPO_BACKED_RUST_API_SOURCE)
+        );
+    }
+
+    #[test]
+    fn multi_base_worker_uses_one_total_deadline() {
+        let diffs = (0..128)
+            .map(|index| {
+                make_diff_with_ids(
+                    format!("base-{index}"),
+                    "shared-target".to_owned(),
+                    Vec::new(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let launches = std::cell::Cell::new(0);
+        let delta = compare_rust_api_revisions_with_worker(
+            false,
+            Path::new("/unused"),
+            &diffs,
+            Duration::from_secs(30),
+            |_, pairs_json, timeout| {
+                launches.set(launches.get() + 1);
+                let pairs: Vec<RustApiRevisionPair> = serde_json::from_str(pairs_json).unwrap();
+                assert_eq!(pairs.len(), 128);
+                assert_eq!(timeout, Duration::from_secs(30));
+                Err(anyhow::anyhow!("timed out"))
+            },
+        )
+        .expect("timeout becomes unknown")
+        .expect("delta");
+        assert_eq!(launches.get(), 1);
+        assert_eq!(delta.unknown.len(), 128);
+    }
+
+    #[test]
+    fn worker_cancellation_is_not_laundered_into_unknown() {
+        let diff = make_diff_with_ids("base-oid".into(), "target-oid".into(), Vec::new());
+        let error = compare_rust_api_revisions_with_worker(
+            false,
+            Path::new("/unused"),
+            &[diff],
+            Duration::from_secs(30),
+            |_, _, _| Err(crate::governor::Cancelled.into()),
+        )
+        .expect_err("cancellation must abort artifact generation");
+        assert!(crate::governor::is_cancellation(&error));
     }
 
     fn git_with_input(repo: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {

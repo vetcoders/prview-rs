@@ -549,6 +549,9 @@ New run ids use a timestamp plus short HEAD suffix, for example
 On Unix, a `latest` symlink points at the most recent **completed** run in
 `$PRVIEW_HOME/runs/<repo>/<branch>/latest` or
 `$HOME/.prview/runs/<repo>/<branch>/latest` when `PRVIEW_HOME` is unset.
+An unexpected invalid `00_summary/SANITY.json` is a fatal generation result:
+the diagnostic directory and SANITY evidence remain on disk, but no ZIP,
+`latest` update, index row, or successful completion message is produced.
 A cancellation observed before the durable publication commit writes
 `00_summary/INCOMPLETE.json` and does not update `latest` or the run index. If
 cancellation is observed after `latest` has
@@ -679,17 +682,17 @@ are discarded fail-closed, while coherent mode-only add/delete metadata remains
 valid. Confirmed removed, changed, relocated, and
 visibility-changed Rust facts are breaking; added-only facts are informational.
 
-The ordinary `prview --pr <number>` workflow always performs this repo-backed
-Rust analysis when the profile contains Cargo or the change contains Rust; it
-does not require `--deep` and is not skipped by the standard fast remote-only
-profile. During artifact generation the CLI announces
-`rust-api.base-snapshot`, `rust-api.target-snapshot`, and `rust-api.compare` as
-active phases. The same labels carry separate non-zero durations in
-`00_summary/RUN.json.timings`. Ctrl-C is checked inside snapshot and guarded
-closure work, returns exit 130, and follows the incomplete-pack/publication
-rules above. Repeated public items reuse the same canonical guarded graph state;
-finite alias exhaustion remains typed unknown evidence, so it degrades the
-decision and cannot yield a PASS by appearing as an empty scan.
+The ordinary remote `prview --pr <number>` fast preset does not enter the full
+repo-backed Rust engine. It emits an exact-revision typed unknown instead, so
+the run is degraded and requires review rather than reporting a clean scan.
+Local standard, deep, and CI modes run all exact base/target comparisons in one
+private same-binary worker with a single 30-second total deadline. Artifact
+generation announces and records `rust-api.fast-preset-unknown` or
+`rust-api.isolated-worker` in `00_summary/RUN.json.timings`. Worker timeout,
+failure, or malformed output becomes an exact-comparison typed unknown.
+Headless Ctrl-C terminates the governed child and remains cancellation with
+exit 130; the TUI retains the first/second-interrupt semantics documented in
+the architecture guide.
 Typed unknowns degrade confidence and require review without claiming a
 confirmed removal. Rust identities include ordinary type/value/macro items plus
 public modules, library crates, and Cargo features. An implicit library target

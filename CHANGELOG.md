@@ -18,14 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Repo-backed Rust API snapshot construction now preparses private declarations
-  and impl contracts once, expands each canonical `(private type, effective cfg)`
-  state once per snapshot, and reuses exact-root closures across public items.
-  Module-alias lookup follows only applicable path prefixes instead of scanning
-  the repository-wide alias map for every item. Ordinary `prview --pr` keeps the
-  full Rust evidence; base snapshot, target snapshot, and comparison are now
-  visible active phases with separate `RUN.json` timings, and in-process graph
-  work observes typed cancellation before any completed pack can be published.
+- Context artifact planning is reconciled with the command outcome and actual
+  output file, so a timeout or unavailable command cannot remain recorded as
+  generated. Invalid SANITY results now abort before ZIP and publication while
+  retaining the incomplete directory for diagnosis.
+- Fast remote-only runs no longer enter repo-backed Rust API snapshot analysis;
+  they emit exact-revision typed unknowns that degrade the gate and require
+  review. Heavier modes isolate all base/target comparisons in one governed
+  same-binary worker with one 30-second total deadline. Worker timeout, failure,
+  or malformed output remains typed uncertainty. Headless Ctrl-C remains exit
+  130; the TUI keeps its documented cooperative first-interrupt behavior.
 - Cargo resource planning now opens only bounded regular configuration files
   and refuses final symlinks, devices, FIFOs, and oversized inputs before any
   synchronous read. A malicious off-HEAD `.cargo/config*` can therefore lower
