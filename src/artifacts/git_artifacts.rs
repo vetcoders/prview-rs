@@ -294,6 +294,18 @@ fn quarantine_invalid_latest_publication_record(
     Ok(quarantine)
 }
 
+#[cfg(unix)]
+fn is_rejected_publication_journal_input(path: &Path, error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::InvalidData || error.raw_os_error() == Some(libc::ELOOP)
+    {
+        return true;
+    }
+
+    fs::symlink_metadata(path)
+        .map(|metadata| !metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
 /// Reconcile a hard-crashed publication to the durable index.
 ///
 /// The index is the canonical ordered publication ledger. If it contains a
@@ -307,10 +319,7 @@ pub(crate) fn recover_latest_publication(
     let bytes = match read_bounded_publication_journal(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error)
-            if error.kind() == std::io::ErrorKind::InvalidData
-                || error.raw_os_error() == Some(libc::ELOOP) =>
-        {
+        Err(error) if is_rejected_publication_journal_input(&path, &error) => {
             let error = anyhow::Error::new(error).context(format!(
                 "Unsafe publication transaction object {}",
                 path.display()
@@ -1292,11 +1301,13 @@ mod latest_tests {
     fn publication_recovery_quarantines_unsafe_journals_and_allows_next_run() {
         use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
 
-        for case in ["symlink", "fifo", "directory", "oversized"] {
+        for case in ["symlink", "fifo", "socket", "directory", "oversized"] {
             let home = tempfile::tempdir().unwrap();
             let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
             let journal = latest_publication_record_path();
+            let mut socket = None;
             match case {
                 "symlink" => symlink("/dev/zero", &journal).unwrap(),
                 "fifo" => {
@@ -1304,6 +1315,7 @@ mod latest_tests {
                     // SAFETY: fifo_path is a NUL-terminated path inside this test's TempDir.
                     assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
                 }
+                "socket" => socket = Some(UnixListener::bind(&journal).unwrap()),
                 "directory" => fs::create_dir(&journal).unwrap(),
                 "oversized" => fs::write(
                     &journal,
@@ -1335,6 +1347,7 @@ mod latest_tests {
             let transaction = begin_latest_publication(&publication, &next)
                 .expect("the next valid publisher must proceed after quarantine");
             finish_latest_publication(&transaction).unwrap();
+            drop(socket);
         }
     }
 

@@ -71,7 +71,7 @@ pub async fn with_cancellation<T>(
     governor: &Arc<ResourceGovernor>,
     interrupts: impl Interrupts,
 ) -> Result<T> {
-    with_cancellation_policy(work, governor, interrupts, false).await
+    with_cancellation_policy(work, governor, interrupts).await
 }
 
 /// Supervise work whose selected successful returns prove that their durable
@@ -102,7 +102,6 @@ async fn with_cancellation_policy<T>(
     work: impl Future<Output = Result<T>>,
     governor: &Arc<ResourceGovernor>,
     interrupts: impl Interrupts,
-    preserve_committed_success: bool,
 ) -> Result<T> {
     // A normal value/error finishes through the explicit biased handoff below:
     // an interrupt already ready when `work` completes must cancel the run, not
@@ -111,9 +110,8 @@ async fn with_cancellation_policy<T>(
     // watcher cleanup.
     let supervisor = InterruptSupervisor::start(Arc::clone(governor), interrupts);
     let result = work.await;
-    let committed_success = preserve_committed_success && result.is_ok();
     supervisor.stop().await;
-    if governor.is_cancelled() && !committed_success {
+    if governor.is_cancelled() {
         Err(super::Cancelled.into())
     } else {
         result
