@@ -270,16 +270,16 @@ pub(crate) fn read_pack_warning_tally(
     let policy_caveat_count = caveats.len();
     let policy_mode = read_pack_policy_mode(policy, required, caveats);
     let mut metadata_unreadable = caveats.len() != policy_caveat_count;
-    let mut failure_details: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    let mut preexisting_warning_details: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut warning_details: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut failed_check_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut warning_check_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut failure_details: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut preexisting_warning_details: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut warning_details: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut failed_check_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut warning_check_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     let mut has_new_quality_failure_signal = false;
     match quality_failure_details {
         Some(serde_json::Value::Array(details)) => {
@@ -1413,6 +1413,40 @@ mod tests {
         assert_eq!(gate_exit_code(GateVerdict::Conditional, true), 2);
         assert_eq!(gate_exit_code(GateVerdict::Block, false), 1);
         assert_eq!(gate_exit_code(GateVerdict::Block, true), 1);
+    }
+
+    #[test]
+    fn multi_name_reconciliation_caveats_are_deterministic() {
+        let checks = serde_json::json!([]);
+        let policy = serde_json::json!({"mode": "shadow"});
+        let details = serde_json::json!([
+            {"name": "Zulu", "classification": "introduced", "origin": "failure"},
+            {"name": "Echo", "classification": "introduced", "origin": "failure"},
+            {"name": "Bravo", "classification": "introduced", "origin": "failure"},
+            {"name": "Mike", "classification": "introduced", "origin": "failure"},
+            {"name": "Alpha", "classification": "introduced", "origin": "failure"},
+            {"name": "Kilo", "classification": "introduced", "origin": "failure"}
+        ]);
+        let mut caveats = Vec::new();
+
+        read_pack_warning_tally(
+            Some(&checks),
+            None,
+            Some(&policy),
+            Some(&details),
+            true,
+            &mut caveats,
+        );
+
+        let reconciliation = caveats
+            .iter()
+            .filter(|caveat| caveat.starts_with("unmatched_quality_failure_detail:"))
+            .collect::<Vec<_>>();
+        let expected = ["Alpha", "Bravo", "Echo", "Kilo", "Mike", "Zulu"];
+        assert_eq!(reconciliation.len(), expected.len());
+        for (caveat, name) in reconciliation.into_iter().zip(expected) {
+            assert!(caveat.contains(name), "{caveat}");
+        }
     }
 
     #[test]
