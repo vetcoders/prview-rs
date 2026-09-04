@@ -13,18 +13,21 @@ env:
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   gate-shadow:
     name: Gate Shadow
     runs-on: ubuntu-latest
     continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@master
+      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
