@@ -568,7 +568,10 @@ retarget `latest`: prview preserves it as a uniquely named
 publication instead of permanently denying every later run. A valid journal is
 not discarded when the durable index is unreadable: transactional readers
 reject any invalid JSONL row, preserve the journal, and fail the run rather than
-reconstructing or saving a partial ledger. Likewise, failure to commit the
+reconstructing or saving a partial ledger. Journal reads are capped at 64 KiB
+and refuse final symlinks and non-regular files, so a FIFO, device, or oversized
+record cannot block recovery while the global publication lock is held.
+Likewise, failure to commit the
 finished pack into the index is fatal; a pack is not reported as completed when
 `state`/`verdict` could not discover it. The compatibility lock
 serializes the index critical section with pre-0.8 binaries, but it cannot

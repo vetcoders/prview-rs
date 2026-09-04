@@ -7,6 +7,9 @@ use anyhow::Context;
 #[cfg(unix)]
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+const MAX_PUBLICATION_JOURNAL_BYTES: u64 = 64 * 1024;
+
 /// Durable intent for the only cross-file part of run publication.
 ///
 /// `index.jsonl` and the per-branch `latest` symlink cannot be replaced in one
@@ -248,8 +251,9 @@ fn clear_latest_publication_record() -> Result<()> {
 }
 
 /// Preserve an invalid crash journal as evidence without letting it permanently
-/// deny every later publication. The destination is an owned create-new file,
-/// so the rename cannot overwrite an operator file even if names collide.
+/// deny every later publication. The destination is an owned create-new entry
+/// with the same directory shape as the source, so the rename cannot overwrite
+/// an operator file even if names collide.
 #[cfg(unix)]
 fn quarantine_invalid_latest_publication_record(
     path: &Path,
@@ -258,11 +262,21 @@ fn quarantine_invalid_latest_publication_record(
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("publication transaction has no parent"))?;
-    let (quarantine, placeholder) =
-        crate::storage::create_owned_temp_file(parent, "publication-transaction.invalid")?;
-    drop(placeholder);
+    let source_is_dir = fs::symlink_metadata(path)?.file_type().is_dir();
+    let quarantine = if source_is_dir {
+        crate::storage::create_owned_temp_dir(parent, "publication-transaction.invalid")?
+    } else {
+        let (quarantine, placeholder) =
+            crate::storage::create_owned_temp_file(parent, "publication-transaction.invalid")?;
+        drop(placeholder);
+        quarantine
+    };
     if let Err(error) = fs::rename(path, &quarantine) {
-        let _ = fs::remove_file(&quarantine);
+        if source_is_dir {
+            let _ = fs::remove_dir(&quarantine);
+        } else {
+            let _ = fs::remove_file(&quarantine);
+        }
         return Err(error).with_context(|| {
             format!(
                 "Failed to quarantine invalid publication transaction {}",
@@ -280,6 +294,18 @@ fn quarantine_invalid_latest_publication_record(
     Ok(quarantine)
 }
 
+#[cfg(unix)]
+fn is_rejected_publication_journal_input(path: &Path, error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::InvalidData || error.raw_os_error() == Some(libc::ELOOP)
+    {
+        return true;
+    }
+
+    fs::symlink_metadata(path)
+        .map(|metadata| !metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
 /// Reconcile a hard-crashed publication to the durable index.
 ///
 /// The index is the canonical ordered publication ledger. If it contains a
@@ -290,9 +316,17 @@ pub(crate) fn recover_latest_publication(
     _publication: &crate::storage::RunPublicationLock,
 ) -> Result<()> {
     let path = latest_publication_record_path();
-    let bytes = match fs::read(&path) {
+    let bytes = match read_bounded_publication_journal(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if is_rejected_publication_journal_input(&path, &error) => {
+            let error = anyhow::Error::new(error).context(format!(
+                "Unsafe publication transaction object {}",
+                path.display()
+            ));
+            quarantine_invalid_latest_publication_record(&path, &error)?;
+            return Ok(());
+        }
         Err(error) => return Err(error.into()),
     };
     let record: LatestPublicationRecord = match serde_json::from_slice(&bytes)
@@ -317,6 +351,37 @@ pub(crate) fn recover_latest_publication(
             Ok(())
         }
     }
+}
+
+/// Read a crash journal without following a final link or blocking on a FIFO,
+/// device, or attacker-sized file while the global publication lock is held.
+#[cfg(unix)]
+fn read_bounded_publication_journal(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_PUBLICATION_JOURNAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "publication transaction is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_PUBLICATION_JOURNAL_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PUBLICATION_JOURNAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "publication transaction exceeds the bounded read limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(unix)]
@@ -1230,6 +1295,60 @@ mod latest_tests {
         let written: LatestPublicationRecord =
             serde_json::from_slice(&fs::read(destination).unwrap()).unwrap();
         assert_eq!(written.schema, 1);
+    }
+
+    #[test]
+    fn publication_recovery_quarantines_unsafe_journals_and_allows_next_run() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        for case in ["symlink", "fifo", "socket", "directory", "oversized"] {
+            let home = tempfile::tempdir().unwrap();
+            let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+            let journal = latest_publication_record_path();
+            let mut socket = None;
+            match case {
+                "symlink" => symlink("/dev/zero", &journal).unwrap(),
+                "fifo" => {
+                    let fifo_path = std::ffi::CString::new(journal.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: fifo_path is a NUL-terminated path inside this test's TempDir.
+                    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+                }
+                "socket" => socket = Some(UnixListener::bind(&journal).unwrap()),
+                "directory" => fs::create_dir(&journal).unwrap(),
+                "oversized" => fs::write(
+                    &journal,
+                    vec![b'x'; MAX_PUBLICATION_JOURNAL_BYTES as usize + 1],
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+
+            let publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+            let started = std::time::Instant::now();
+            recover_latest_publication(&publication)
+                .expect("unsafe journal must be quarantined, not deny later publishers");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{case} recovery must remain bounded"
+            );
+            assert!(!journal.exists(), "{case} source path must be quarantined");
+            assert!(fs::read_dir(home.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("publication-transaction.invalid")
+            }));
+
+            let next = home.path().join("runs/repo/main/next");
+            write_pack_identity(&next);
+            let transaction = begin_latest_publication(&publication, &next)
+                .expect("the next valid publisher must proceed after quarantine");
+            finish_latest_publication(&transaction).unwrap();
+            drop(socket);
+        }
     }
 
     #[test]

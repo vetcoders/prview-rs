@@ -1106,6 +1106,34 @@ pub(crate) fn create_owned_temp_file(parent: &Path, prefix: &str) -> Result<(Pat
     )
 }
 
+/// Create a uniquely named, owned empty temp directory without replacing an
+/// existing entry. This is the directory-shaped counterpart to
+/// [`create_owned_temp_file`].
+#[cfg(unix)]
+pub(crate) fn create_owned_temp_dir(parent: &Path, prefix: &str) -> Result<PathBuf> {
+    fs::create_dir_all(parent)?;
+    for _ in 0..16 {
+        let nonce = TEMP_FILE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{prefix}.{}.{}.{nonce}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!(
+        "failed to create a unique owned temp directory in {}",
+        parent.display()
+    )
+}
+
 /// Atomically publish an owned temp file over its destination.
 pub(crate) fn atomic_replace_file(temp: &Path, destination: &Path) -> Result<()> {
     fs::rename(temp, destination).with_context(|| {

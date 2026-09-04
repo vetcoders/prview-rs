@@ -438,6 +438,11 @@ fn ensure_generation_active(
         return Ok(());
     }
 
+    mark_generation_cancelled(out_dir, seam)?;
+    Err(crate::governor::Cancelled.into())
+}
+
+fn mark_generation_cancelled(out_dir: &Path, seam: ArtifactGenerationSeam) -> Result<()> {
     for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
         let _ = fs::remove_file(out_dir.join(relative));
     }
@@ -453,7 +458,7 @@ fn ensure_generation_active(
             "stage": seam.label(),
         }))?,
     )?;
-    Err(crate::governor::Cancelled.into())
+    Ok(())
 }
 
 fn preserve_primary_error_after_latest_rollback(
@@ -465,6 +470,40 @@ fn preserve_primary_error_after_latest_rollback(
         Err(rollback_error) => primary.context(format!(
             "latest publication rollback also failed: {rollback_error:#}"
         )),
+    }
+}
+
+fn publication_failure_after_rollback(
+    publication_error: anyhow::Error,
+    cancellation_before_rollback: bool,
+    rollback: Result<()>,
+    governor: &crate::governor::ResourceGovernor,
+    out_dir: &Path,
+) -> anyhow::Error {
+    if cancellation_before_rollback || governor.is_cancelled() {
+        let cancellation = if crate::governor::is_cancellation(&publication_error) {
+            publication_error
+        } else {
+            anyhow::Error::new(crate::governor::Cancelled).context(format!(
+                "run publication failed and cancellation was observed before rollback completion: {publication_error:#}"
+            ))
+        };
+        let cancellation = preserve_primary_error_after_latest_rollback(cancellation, rollback);
+        return match mark_generation_cancelled(out_dir, ArtifactGenerationSeam::IndexCommit) {
+            Ok(()) => cancellation,
+            Err(cleanup_error) => cancellation.context(format!(
+                "failed to mark the cancelled pack incomplete: {cleanup_error:#}"
+            )),
+        };
+    }
+
+    match rollback {
+        Ok(()) => publication_error.context(
+            "run publication failed; generated files were not committed to discoverable history",
+        ),
+        Err(rollback_error) => anyhow::anyhow!(
+            "run publication failed ({publication_error:#}) and its durable alias/index reconciliation also failed ({rollback_error:#})"
+        ),
     }
 }
 
@@ -1194,17 +1233,17 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
                     "run publication failed with an unconfirmed index rollback; durable recovery journal retained",
                 ));
             }
-            if let Err(rollback_error) = rollback_latest_publication(&latest_transaction) {
-                return Err(anyhow::anyhow!(
-                    "run publication failed ({e:#}) and its durable alias/index reconciliation also failed ({rollback_error:#})"
-                ));
-            }
-            if governor.is_cancelled() {
-                ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)?;
-                unreachable!("a cancelled governor fails the index seam");
-            }
-            return Err(e.context(
-                "run publication failed; generated files were not committed to discoverable history",
+            let cancellation_before_rollback =
+                governor.is_cancelled() || crate::governor::is_cancellation(&e);
+            #[cfg(all(test, unix))]
+            publication_rollback_test_hook::observe_and_maybe_cancel(governor);
+            let rollback = rollback_latest_publication(&latest_transaction);
+            return Err(publication_failure_after_rollback(
+                e,
+                cancellation_before_rollback,
+                rollback,
+                governor,
+                &out_dir,
             ));
         } else if let Err(error) = finish_latest_publication(&latest_transaction) {
             // Index and alias are already consistent. Keep the journal for the
@@ -2742,6 +2781,41 @@ mod publication_commit_test_hook {
 
     pub(super) fn observe_and_maybe_cancel(governor: &ResourceGovernor) {
         CANCEL_AFTER_COMMIT.with(|enabled| {
+            if enabled.get() {
+                governor.cancel();
+            }
+        });
+    }
+}
+
+#[cfg(all(test, unix))]
+mod publication_rollback_test_hook {
+    use crate::governor::ResourceGovernor;
+    use std::cell::Cell;
+
+    thread_local! {
+        static CANCEL_BEFORE_ROLLBACK: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) struct RollbackGuard;
+
+    impl RollbackGuard {
+        pub(super) fn install() -> Self {
+            CANCEL_BEFORE_ROLLBACK.with(|enabled| {
+                assert!(!enabled.replace(true), "nested publication rollback probe");
+            });
+            Self
+        }
+    }
+
+    impl Drop for RollbackGuard {
+        fn drop(&mut self) {
+            CANCEL_BEFORE_ROLLBACK.with(|enabled| enabled.set(false));
+        }
+    }
+
+    pub(super) fn observe_and_maybe_cancel(governor: &ResourceGovernor) {
+        CANCEL_BEFORE_ROLLBACK.with(|enabled| {
             if enabled.get() {
                 governor.cancel();
             }
