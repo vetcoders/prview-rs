@@ -594,9 +594,10 @@ restart recovery is independent of a later process's working directory. An
 explicit output path must not already exist: it is atomically claimed for one
 immutable pack and cannot be reused for a later run. This prevents stale files
 and multiple history rows from pretending that one mutable directory contains
-several historical packs. `--watch` and `--tui` therefore cannot be combined
-with an explicit `--output-dir`: each watch iteration and each interactive TUI
-rerun emits a separate immutable pack through the default unique allocator. MCP
+several historical packs. `--watch` and `--tui` are mutually exclusive because
+they are separate run controllers; neither can be combined with an explicit
+`--output-dir`. Each watch iteration and each interactive TUI rerun emits a
+separate immutable pack through the default unique allocator. MCP
 keeps the same invariant
 through a private, one-shot reservation that only its child process can claim;
 ordinary CLI callers cannot adopt an existing directory.

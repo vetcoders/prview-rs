@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The CLI now rejects `--watch` together with `--tui` instead of silently
+  entering TUI mode and ignoring the requested watcher.
 - Context artifact planning is reconciled with the command outcome and actual
   output file, so a timeout or unavailable command cannot remain recorded as
   generated. Invalid SANITY results now abort before ZIP and publication while

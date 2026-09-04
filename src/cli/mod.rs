@@ -258,7 +258,7 @@ pub struct Cli {
     pub bridge_stage: u8,
 
     /// Run in interactive TUI mode instead of streaming text output
-    #[arg(long)]
+    #[arg(long, conflicts_with = "watch")]
     pub tui: bool,
 
     /// Override the artifacts output directory (default: ~/.prview/runs/<repo>/<branch>/<run_id>/)
@@ -718,6 +718,20 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("--tui"), "got: {rendered}");
         assert!(rendered.contains("--output-dir"), "got: {rendered}");
+    }
+
+    #[test]
+    fn tui_and_watch_are_mutually_exclusive() {
+        for args in [
+            ["prview", "--tui", "--watch"],
+            ["prview", "--watch", "--tui"],
+        ] {
+            let error = Cli::try_parse_from(args)
+                .expect_err("interactive TUI and headless watch cannot own one run together");
+            let rendered = error.to_string();
+            assert!(rendered.contains("--tui"), "got: {rendered}");
+            assert!(rendered.contains("--watch"), "got: {rendered}");
+        }
     }
 
     #[test]
