@@ -126,9 +126,9 @@ const DOMAIN_ZONES: &[(&str, &[&str])] = &[
 /// take the first 10, but verdict-level aggregation must see the full set.
 ///
 /// Test-only convenience wrapper: every runtime caller goes through
-/// `compute_file_risk_scores_with_root` (context_artifacts.rs, merge_gate.rs)
-/// with an explicit repo root; only the unit tests below and the signal
-/// facade test exercise the rootless form.
+/// `compute_file_risk_scores_with_api` with the canonical Rust API view and an
+/// explicit repo root; only the unit tests below and the signal facade test
+/// exercise the rootless form.
 #[cfg(test)]
 pub fn compute_file_risk_scores(
     diffs: &[Diff],
