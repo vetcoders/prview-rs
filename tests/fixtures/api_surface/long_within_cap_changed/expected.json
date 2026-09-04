@@ -1,0 +1,23 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "long_within_cap_changed",
+  "family": "line_limit",
+  "legacy_expectation": "positive",
+  "legacy_positive_sibling": null,
+  "repo_backed_records": [
+    {
+      "kind": "changed",
+      "symbol": "long",
+      "namespace": "crate",
+      "before": "pub fn long(... a01: u8 ...)",
+      "after": "pub fn long(... a01: u16 ...)",
+      "provenance": {
+        "base_revision": "fixture://long_within_cap_changed/base",
+        "target_revision": "fixture://long_within_cap_changed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

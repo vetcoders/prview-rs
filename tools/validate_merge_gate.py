@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate MERGE_GATE.json contract (schema 1.0/2.0/2.1/2.2)."""
+"""Validate MERGE_GATE.json contract (schema 1.0/2.0/2.1/2.2/2.3)."""
 
 from __future__ import annotations
 
@@ -45,6 +45,19 @@ VALID_QUALITY_FAILURE_CLASSES = {
 # field folds case because its writer has shipped legacy spellings; this one has
 # only ever emitted lowercase.
 VALID_CHECK_STATUSES = {"passed", "failed", "warnings", "skipped", "error"}
+VALID_EXECUTION_STATES = {"executed", "skipped", "unavailable", "unknown"}
+VALID_TOOL_OUTCOMES = {
+    "passed",
+    "findings_failed",
+    "findings_warning",
+    "system_error",
+    "skipped",
+    "unavailable",
+    "unknown",
+}
+VALID_POLICY_CONCLUSIONS = {"satisfied", "advisory", "blocked"}
+VALID_CONFIDENCE_IMPACTS = {"complete", "degraded", "incomplete"}
+VALID_MERGE_IMPACTS = {"approve", "review_required", "block"}
 # The two enum axes of `decision`, spelled exactly as serde writes them. Mirror
 # `AnalysisStatus` and `MergeRecommendation` in src/policy/engine.rs -- both
 # `#[serde(rename_all = "snake_case")]`, and a test there pins every variant to
@@ -57,6 +70,14 @@ VALID_CHECK_STATUSES = {"passed", "failed", "warnings", "skipped", "error"}
 # written these.
 VALID_ANALYSIS_STATUSES = {"complete", "degraded", "incomplete"}
 VALID_MERGE_RECOMMENDATIONS = {"approve", "review_required", "block"}
+# Schema 2.3 separates strict enforcement from the stable verdict vocabulary.
+# Mirrors `EnforcementDisposition` in src/policy/engine.rs.
+VALID_ENFORCEMENT_DISPOSITIONS = {
+    "clean",
+    "warnings_only",
+    "review_required",
+    "block",
+}
 # Conservativeness rank of one decision axis: 1 = clean pass, 2 = held below a
 # pass, 3 = blocked. Mirrors `rank_from_verdict`, `rank_from_merge_rec` and
 # `rank_from_analysis_status` in src/gate.rs, which both readers reconcile
@@ -337,6 +358,34 @@ def normalize_inline_status(value: Any) -> str | None:
     return value.strip().replace("_", "").lower()
 
 
+def inline_class_counts_coherent(
+    status: str,
+    effective_class: str,
+    findings: int,
+    introduced: int,
+    preexisting: int,
+) -> bool:
+    """Whether the aggregate tuple is possible, without deriving its class."""
+    if introduced + preexisting > findings:
+        return False
+    if status in {"passed", "notrun"}:
+        return findings == 0 and effective_class == "PASS"
+    if status == "warnings" and findings > 0:
+        if effective_class == "INFO":
+            return True
+        if effective_class == "PASS":
+            return introduced == 0 and findings == preexisting
+        return False
+    if status == "failed" and findings > 0:
+        if effective_class == "FAIL":
+            return True
+        if effective_class == "INFO":
+            return findings >= 2 and preexisting >= 1
+        if effective_class == "PASS":
+            return introduced == 0 and findings == preexisting
+    return False
+
+
 def validate(path: Path) -> list[str]:
     issues: list[str] = []
     try:
@@ -371,8 +420,10 @@ def validate(path: Path) -> list[str]:
 
     if not isinstance(data["schema_version"], str):
         issues.append("schema_version must be a string")
-    elif data["schema_version"] not in ("1.0", "2.0", "2.1", "2.2"):
-        issues.append("schema_version must be '1.0', '2.0', '2.1', or '2.2'")
+    elif data["schema_version"] not in ("1.0", "2.0", "2.1", "2.2", "2.3"):
+        issues.append(
+            "schema_version must be '1.0', '2.0', '2.1', '2.2', or '2.3'"
+        )
     require_iso_datetime(data["generated_at"], "generated_at", issues)
     if (
         isinstance(data["bridge_stage"], bool)
@@ -414,6 +465,41 @@ def validate(path: Path) -> list[str]:
             issues.append("policy.default_severity must be one of block|warn|ignore")
         require_non_empty_string(policy.get("source"), "policy.source", issues)
 
+    policy_mode = policy.get("mode") if isinstance(policy, dict) else None
+    raw_decision = data.get("decision")
+    raw_quality_details = (
+        raw_decision.get("quality_failure_details")
+        if isinstance(raw_decision, dict)
+        else None
+    )
+    failure_details_by_name: dict[str, list[str]] = {}
+    preexisting_warning_details: dict[str, int] = {}
+    warning_details_by_name: dict[str, int] = {}
+    for detail in raw_quality_details if isinstance(raw_quality_details, list) else []:
+        if (
+            isinstance(detail, dict)
+            and isinstance(detail.get("name"), str)
+            and isinstance(detail.get("classification"), str)
+            and detail.get("origin") == "failure"
+        ):
+            failure_details_by_name.setdefault(detail["name"], []).append(
+                detail["classification"]
+            )
+        elif (
+            isinstance(detail, dict)
+            and isinstance(detail.get("name"), str)
+            and detail.get("classification") in VALID_QUALITY_FAILURE_CLASSES
+            and detail.get("origin") == "warning"
+        ):
+            warning_details_by_name[detail["name"]] = (
+                warning_details_by_name.get(detail["name"], 0) + 1
+            )
+            if detail.get("classification") == "pre-existing":
+                preexisting_warning_details[detail["name"]] = (
+                    preexisting_warning_details.get(detail["name"], 0) + 1
+                )
+    failed_check_counts: dict[str, int] = {}
+    warning_check_counts: dict[str, int] = {}
     checks = data["checks"]
     if not isinstance(checks, list):
         issues.append("checks must be an array")
@@ -452,6 +538,199 @@ def validate(path: Path) -> list[str]:
             require_boolean(check.get("blocking"), f"{ctx}.blocking", issues)
             require_non_negative_number(check.get("duration_secs"), f"{ctx}.duration_secs", issues)
             require_non_empty_string(check.get("evidence"), f"{ctx}.evidence", issues)
+            if schema_at_least(data.get("schema_version"), (2, 3)):
+                issues.extend(
+                    ensure_keys(
+                        check,
+                        [
+                            "execution_state",
+                            "outcome",
+                            "policy_conclusion",
+                            "confidence_impact",
+                            "merge_impact",
+                        ],
+                        ctx,
+                    )
+                )
+                for field, vocabulary in [
+                    ("execution_state", VALID_EXECUTION_STATES),
+                    ("outcome", VALID_TOOL_OUTCOMES),
+                    ("policy_conclusion", VALID_POLICY_CONCLUSIONS),
+                    ("confidence_impact", VALID_CONFIDENCE_IMPACTS),
+                    ("merge_impact", VALID_MERGE_IMPACTS),
+                ]:
+                    if check.get(field) not in vocabulary:
+                        issues.append(
+                            f"{ctx}.{field} must be one of {sorted(vocabulary)} (schema 2.3)"
+                        )
+                status_outcomes = {
+                    "passed": {"passed"},
+                    "failed": {"findings_failed"},
+                    "warnings": {"findings_warning"},
+                    "error": {"system_error"},
+                    "skipped": {"skipped", "unavailable", "unknown"},
+                }
+                execution_outcomes = {
+                    "executed": {
+                        "passed",
+                        "findings_failed",
+                        "findings_warning",
+                        "system_error",
+                    },
+                    "skipped": {"skipped"},
+                    "unavailable": {"unavailable"},
+                    "unknown": {"unknown"},
+                }
+                if check.get("outcome") not in status_outcomes.get(
+                    check.get("status"), set()
+                ):
+                    issues.append(
+                        f"{ctx}.status and outcome are not an emitted pair"
+                    )
+                if check.get("outcome") not in execution_outcomes.get(
+                    check.get("execution_state"), set()
+                ):
+                    issues.append(
+                        f"{ctx}.execution_state and outcome are not an emitted pair"
+                    )
+                if check.get("outcome") == "system_error" and (
+                    check.get("confidence_impact") != "incomplete"
+                    or check.get("policy_conclusion") == "satisfied"
+                ):
+                    issues.append(
+                        f"{ctx}.system_error requires incomplete confidence and a non-satisfied conclusion"
+                    )
+                if check.get("outcome") in {
+                    "findings_failed",
+                    "findings_warning",
+                    "system_error",
+                } and check.get("policy_conclusion") == "satisfied":
+                    issues.append(
+                        f"{ctx}.finding/error outcome cannot have policy_conclusion=satisfied"
+                    )
+                expected_class = {
+                    "passed": "PASS",
+                    "failed": "FAIL",
+                    "warnings": "INFO",
+                    "skipped": "SKIP",
+                    "error": "FAIL",
+                }.get(check.get("status"))
+                if expected_class is not None and check.get("class") != expected_class:
+                    issues.append(
+                        f"{ctx}.class must agree with status ({expected_class})"
+                    )
+                typed_preexisting = (
+                    check.get("status") in {"failed", "error"}
+                    and failure_details_by_name.get(check.get("name"))
+                    == ["pre-existing"]
+                ) or (
+                    check.get("status") == "warnings"
+                    and preexisting_warning_details.get(check.get("name")) == 1
+                )
+                preexisting_downgrade = (
+                    typed_preexisting
+                    and check.get("policy_conclusion") == "advisory"
+                    and check.get("merge_impact") == "approve"
+                    and check.get("blocking") is False
+                )
+                if check.get("status") in {"failed", "error"}:
+                    check_name = check.get("name")
+                    if isinstance(check_name, str):
+                        failed_check_counts[check_name] = (
+                            failed_check_counts.get(check_name, 0) + 1
+                        )
+                    matched_details = failure_details_by_name.get(check_name, [])
+                    if len(matched_details) != 1:
+                        issues.append(
+                            f"{ctx} requires exactly one same-name origin=failure quality_failure_details entry"
+                        )
+                    if check.get("merge_impact") == "approve" and not preexisting_downgrade:
+                        issues.append(
+                            f"{ctx} may approve a failed/error result only with typed pre-existing failure provenance"
+                        )
+                elif check.get("status") == "warnings" and isinstance(
+                    check.get("name"), str
+                ):
+                    check_name = check["name"]
+                    warning_check_counts[check_name] = (
+                        warning_check_counts.get(check_name, 0) + 1
+                    )
+                conclusion_merge_coherent = (
+                    check.get("policy_conclusion") == "blocked"
+                    and check.get("merge_impact") == "block"
+                ) or (
+                    check.get("policy_conclusion") == "advisory"
+                    and check.get("merge_impact") == "review_required"
+                ) or (
+                    check.get("policy_conclusion") == "satisfied"
+                    and check.get("merge_impact") in {"approve", "review_required"}
+                ) or preexisting_downgrade
+                if not conclusion_merge_coherent:
+                    issues.append(
+                        f"{ctx}.policy_conclusion and merge_impact are not an emitted pair"
+                    )
+                if preexisting_downgrade:
+                    expected_check_blocking = False
+                elif check.get("status") != "skipped":
+                    expected_check_blocking = {
+                        "shadow": False,
+                        "warn": check.get("class") == "FAIL"
+                        and check.get("severity") == "block",
+                        "block": check.get("class") == "FAIL"
+                        and check.get("severity") in {"block", "warn"},
+                    }.get(policy_mode)
+                else:
+                    expected_check_blocking = None
+                if (
+                    expected_check_blocking is not None
+                    and check.get("blocking") is not expected_check_blocking
+                ):
+                    issues.append(
+                        f"{ctx}.blocking contradicts policy.mode, severity, class, and typed provenance"
+                    )
+                if check.get("status") == "skipped" and check.get(
+                    "execution_state"
+                ) in {"unavailable", "unknown"}:
+                    expected_skip_tuple = {
+                        "warn": ("advisory", "degraded", "review_required"),
+                        "ignore": ("satisfied", "complete", "approve"),
+                        "block": ("blocked", "incomplete", "block"),
+                    }.get(check.get("severity"))
+                    actual_skip_tuple = (
+                        check.get("policy_conclusion"),
+                        check.get("confidence_impact"),
+                        check.get("merge_impact"),
+                    )
+                    if expected_skip_tuple is not None and (
+                        actual_skip_tuple != expected_skip_tuple
+                    ):
+                        issues.append(
+                            f"{ctx}.unavailable/unknown skip policy tuple contradicts severity"
+                        )
+                block_tuple = (
+                    check.get("blocking") is True,
+                    check.get("policy_conclusion") == "blocked",
+                    check.get("merge_impact") == "block",
+                )
+                if block_tuple not in {(False, False, False), (True, True, True)}:
+                    issues.append(
+                        f"{ctx} requires policy_conclusion=blocked iff merge_impact=block iff blocking=true"
+                    )
+
+        if schema_at_least(data.get("schema_version"), (2, 3)):
+            for name, classifications in failure_details_by_name.items():
+                if failed_check_counts.get(name, 0) != len(classifications):
+                    issues.append(
+                        "decision.quality_failure_details origin=failure rows must map one-to-one "
+                        f"to failed/error checks for {name!r}"
+                    )
+            for name, detail_count in warning_details_by_name.items():
+                if warning_check_counts.get(name, 0) != detail_count:
+                    issues.append(
+                        "decision.quality_failure_details origin=warning rows "
+                        "must map one-to-one to warning checks "
+                        f"for {name!r}"
+                    )
 
     inline = data["inline_findings"]
     if not isinstance(inline, dict):
@@ -489,6 +768,91 @@ def validate(path: Path) -> list[str]:
         require_non_negative_integer(
             findings_count, "inline_findings.findings_count", issues
         )
+        if schema_at_least(data.get("schema_version"), (2, 3)):
+            issues.extend(
+                ensure_keys(
+                    inline,
+                    [
+                        "effective_class",
+                        "enforcement_disposition",
+                        "introduced_count",
+                        "preexisting_count",
+                    ],
+                    "inline_findings",
+                )
+            )
+            effective_class = inline.get("effective_class")
+            inline_disposition = inline.get("enforcement_disposition")
+            introduced_count = inline.get("introduced_count")
+            preexisting_count = inline.get("preexisting_count")
+            if effective_class not in {"PASS", "INFO", "FAIL"}:
+                issues.append(
+                    "inline_findings.effective_class must be one of PASS|INFO|FAIL (schema 2.3)"
+                )
+            if inline_disposition not in VALID_ENFORCEMENT_DISPOSITIONS:
+                issues.append(
+                    "inline_findings.enforcement_disposition must be one of "
+                    f"{sorted(VALID_ENFORCEMENT_DISPOSITIONS)} (schema 2.3)"
+                )
+            require_non_negative_integer(
+                introduced_count, "inline_findings.introduced_count", issues
+            )
+            require_non_negative_integer(
+                preexisting_count, "inline_findings.preexisting_count", issues
+            )
+            normalized_status = normalize_inline_status(inline.get("status"))
+            expected_inline_blocking = {
+                "shadow": False,
+                "warn": effective_class == "FAIL" and inline.get("severity") == "block",
+                "block": effective_class == "FAIL"
+                and inline.get("severity") in {"block", "warn"},
+            }.get(policy_mode)
+            if (
+                expected_inline_blocking is not None
+                and inline.get("blocking") is not expected_inline_blocking
+            ):
+                issues.append(
+                    "inline_findings.blocking contradicts policy.mode, severity, and effective_class"
+                )
+            expected_inline_disposition = None
+            if expected_inline_blocking is True:
+                expected_inline_disposition = "block"
+            elif effective_class == "FAIL":
+                expected_inline_disposition = "review_required"
+            elif effective_class == "INFO" or normalized_status == "warnings":
+                expected_inline_disposition = "warnings_only"
+            elif effective_class == "PASS":
+                expected_inline_disposition = "clean"
+            if (
+                expected_inline_disposition is not None
+                and inline_disposition != expected_inline_disposition
+            ):
+                issues.append(
+                    "inline_findings effective_class/status/blocking contradict "
+                    "inline_findings.enforcement_disposition"
+                )
+            if (
+                isinstance(findings_count, int)
+                and not isinstance(findings_count, bool)
+                and isinstance(introduced_count, int)
+                and not isinstance(introduced_count, bool)
+                and isinstance(preexisting_count, int)
+                and not isinstance(preexisting_count, bool)
+            ):
+                if introduced_count + preexisting_count > findings_count:
+                    issues.append(
+                        "inline_findings introduced_count + preexisting_count must not exceed findings_count"
+                    )
+                if not inline_class_counts_coherent(
+                    normalized_status,
+                    effective_class,
+                    findings_count,
+                    introduced_count,
+                    preexisting_count,
+                ):
+                    issues.append(
+                        "inline_findings status/counts cannot accompany effective_class"
+                    )
 
     decision = data["decision"]
     if not isinstance(decision, dict):
@@ -590,6 +954,121 @@ def validate(path: Path) -> list[str]:
                             f"{sorted(VALID_QUALITY_FAILURE_ORIGINS)} (schema 2.2)"
                         )
                 issues.extend(check_quality_pass_agrees_with_details(decision, details))
+
+        if schema_at_least(data.get("schema_version"), (2, 3)):
+            typed_checks = data.get("checks") if isinstance(data.get("checks"), list) else []
+            typed_inline = (
+                data.get("inline_findings")
+                if isinstance(data.get("inline_findings"), dict)
+                else {}
+            )
+            explicit_warning = any(
+                isinstance(check, dict)
+                and check.get("status") == "warnings"
+                and check.get("outcome") == "findings_warning"
+                for check in typed_checks
+            ) or typed_inline.get("enforcement_disposition") == "warnings_only"
+            typed_confidence_review_source = any(
+                isinstance(check, dict)
+                and check.get("confidence_impact") in {"degraded", "incomplete"}
+                for check in typed_checks
+            )
+            typed_merge_review_source = any(
+                isinstance(check, dict)
+                and check.get("outcome") != "findings_warning"
+                and check.get("merge_impact") == "review_required"
+                for check in typed_checks
+            ) or typed_inline.get("enforcement_disposition") == "review_required"
+            typed_review_source = (
+                typed_confidence_review_source or typed_merge_review_source
+            )
+            typed_blocking_source = any(
+                isinstance(check, dict)
+                and (
+                    check.get("blocking") is True
+                    or check.get("policy_conclusion") == "blocked"
+                    or check.get("merge_impact") == "block"
+                )
+                for check in typed_checks
+            ) or (
+                typed_inline.get("blocking") is True
+                or typed_inline.get("enforcement_disposition") == "block"
+            )
+            issues.extend(
+                ensure_keys(decision, ["enforcement_disposition"], "decision")
+            )
+            disposition = decision.get("enforcement_disposition")
+            if disposition not in VALID_ENFORCEMENT_DISPOSITIONS:
+                issues.append(
+                    "decision.enforcement_disposition must be one of "
+                    f"{sorted(VALID_ENFORCEMENT_DISPOSITIONS)} (schema 2.3)"
+                )
+            elif verdict in VALID_VERDICTS:
+                expected_verdicts = {
+                    "clean": {"PASS"},
+                    "warnings_only": {"PASS", "CONDITIONAL"},
+                    "review_required": {"CONDITIONAL"},
+                    "block": {"BLOCK"},
+                }
+                if verdict not in expected_verdicts[disposition]:
+                    issues.append(
+                        "decision.enforcement_disposition contradicts decision.verdict: "
+                        f"{disposition!r} cannot accompany {verdict!r}"
+                    )
+            if disposition == "warnings_only":
+                if not explicit_warning:
+                    issues.append(
+                        "decision.enforcement_disposition warnings_only requires a typed warning fact"
+                    )
+                if decision.get("quality_pass") is not True:
+                    issues.append(
+                        "decision.enforcement_disposition warnings_only requires quality_pass=true"
+                    )
+                if decision.get("analysis_status") != "complete":
+                    issues.append(
+                        "decision.enforcement_disposition warnings_only requires analysis_status=complete"
+                    )
+                if decision.get("blocking_issues"):
+                    issues.append(
+                        "decision.enforcement_disposition warnings_only requires no blocking_issues"
+                    )
+                if typed_blocking_source:
+                    issues.append(
+                        "decision.enforcement_disposition warnings_only cannot accompany a typed blocking source"
+                    )
+            elif disposition == "clean":
+                if explicit_warning:
+                    issues.append(
+                        "decision.enforcement_disposition clean cannot hide a typed warning fact"
+                    )
+            if typed_review_source and (
+                verdict == "PASS"
+                or decision.get("allow_merge") is not False
+                or disposition not in {"review_required", "block"}
+            ):
+                issues.append(
+                    "a typed degraded/incomplete or non-warning review check requires a "
+                    "non-PASS decision and enforcement_disposition review_required or block"
+                )
+            if typed_merge_review_source and decision.get(
+                "merge_recommendation"
+            ) not in {"review_required", "block"}:
+                issues.append(
+                    "a typed check or inline merge review source requires "
+                    "merge_recommendation review_required or block"
+                )
+            if typed_blocking_source and (
+                verdict != "BLOCK"
+                or decision.get("merge_recommendation") != "block"
+                or decision.get("allow_merge") is not False
+                or decision.get("policy_allow_merge") is not False
+                or disposition != "block"
+            ):
+                issues.append(
+                    "a typed blocking check or inline finding requires verdict=BLOCK, "
+                    "merge_recommendation=block, allow_merge=false, "
+                    "policy_allow_merge=false, and enforcement_disposition=block"
+                )
 
         if not isinstance(decision.get("blocking_issues"), list):
             issues.append("decision.blocking_issues must be an array")

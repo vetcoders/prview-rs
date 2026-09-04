@@ -1,0 +1,23 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "backslash_literal_changed",
+  "family": "backslash_continuation",
+  "legacy_expectation": "positive",
+  "legacy_positive_sibling": null,
+  "repo_backed_records": [
+    {
+      "kind": "changed",
+      "symbol": "VALUE",
+      "namespace": "crate",
+      "before": "pub const VALUE: &str = \"left\";",
+      "after": "pub const VALUE: &str = \"right\";",
+      "provenance": {
+        "base_revision": "fixture://backslash_literal_changed/base",
+        "target_revision": "fixture://backslash_literal_changed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

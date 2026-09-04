@@ -1,0 +1,23 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "reexport_removed",
+  "family": "reexport",
+  "legacy_expectation": "positive",
+  "legacy_positive_sibling": null,
+  "repo_backed_records": [
+    {
+      "kind": "removed",
+      "symbol": "api",
+      "namespace": "crate",
+      "before": "pub use inner::api",
+      "after": null,
+      "provenance": {
+        "base_revision": "fixture://reexport_removed/base",
+        "target_revision": "fixture://reexport_removed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

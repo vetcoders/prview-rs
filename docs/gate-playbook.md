@@ -9,9 +9,9 @@ they must not parse stdout.
 
 | Exit code | Meaning | Default hook effect |
 |-----------|---------|---------------------|
-| `0` | `PASS`, or `CONDITIONAL` without `--strict` | Allow |
+| `0` | `PASS`, advisory `CONDITIONAL`, or typed warnings-only under `--strict` | Allow |
 | `1` | `BLOCK` | Block in Warn and Required |
-| `2` | `CONDITIONAL` with `--strict` | Block in Required |
+| `2` | Review-required under `--strict`, or warnings-only with `--strict --fail-on-warnings` | Block in Required |
 | `3` | Gate execution failed before a trustworthy verdict was available | Block in Warn and Required |
 
 Use `prview gate --json` when CI needs a machine-readable summary, artifact
@@ -25,12 +25,13 @@ re-derives a verdict when the gate artifact cannot be read.
 
 ## Breaking-change escalation
 
-A genuine breaking API change in the diff — a removed public symbol, a changed
-public signature, or a newly required environment variable — escalates the
+A genuine breaking API change — a confirmed removed, changed, relocated, or
+visibility-changed public Rust fact; a legacy JS/TS break; or a newly required
+environment variable — escalates the
 verdict to at least `CONDITIONAL` (never `BLOCK` on its own, and never lowering a
-verdict already raised for another reason). Under `--strict` a `CONDITIONAL`
-verdict exits `2`, so a breaking change fails a Required gate until an owner
-acknowledges it.
+verdict already raised for another reason). Its typed disposition is
+`review_required`, so `prview gate --strict` exits `2`; a warning-only
+`CONDITIONAL` remains the distinct strict-accepted exception.
 
 The escalation is on by default and controlled by the `[gate]
 breaking_escalation` knob in `prview.toml` (see `docs/configuration.md`). Set it
@@ -39,6 +40,11 @@ effect on the verdict — useful for repositories that intentionally ship breaki
 changes on a cadence. Whether on or off, the reason
 (`breaking API change detected: <n> finding(s)`) is reported identically on the
 console, in `report.json`, and in `MERGE_GATE.json`.
+
+Added-only Rust API touch is informational. A typed Rust unknown is not called a
+break; it degrades analysis confidence and requires review because the exact
+repository trees could not prove the counterpart. MERGE_GATE embeds the same
+structured `rust_api_delta` IDs/counts/evidence as both API artifacts.
 
 ### Which command enforces it
 
@@ -52,10 +58,15 @@ which command you run. Two contract lines, deliberately distinct:
   change with breaking-change escalation. Warning-level checks are advisory and
   do not break the quality gate, so a warnings-only run exits `0`; add
   `--fail-on-warnings` to opt into exit `1` for them. Both `--ci` exits hold
-  whatever preset the run resolves to — `--ci --update` is still strict, and an
-  `--update` run with no new commits takes its exit from the pack it reused.
-* **`prview gate`** — the contractual enforcement path. `CONDITIONAL` exits `1`,
-  and `prview gate --strict` exits `2` (see the exit-code contract above).
+  whatever preset the run resolves to — `--ci --update` is still CI-enabled,
+  and an `--update` run with no new commits takes its exit from the pack it
+  reused.
+* **`prview gate`** — the contractual enforcement path. Advisory mode accepts
+  `CONDITIONAL`; `prview gate --strict` exits `2` for the typed
+  `review_required` disposition but accepts `warnings_only`. Add
+  `--fail-on-warnings` (which requires `--strict`) to make that warning-only
+  lane exit `2` too. The disposition is emitted from typed policy facts; the
+  adapter never infers it by parsing caveat prose.
 
 So a breaking change never fails `prview --ci` on its own — to block CI on a
 breaking change, run **`prview gate --strict`** as the Required check.
@@ -68,7 +79,8 @@ Start advisory. A gate that blocks too early trains people to bypass it.
 |-------|---------|-------------|-------------------|
 | Shadow / advisory | `prview gate` | Report only; hook exits `0` even when the gate exits non-zero | At least 7 days of runs, no false `BLOCK`, no repeated exit `3`, and runtime fits the team budget |
 | Warn | `prview gate` | Block only `BLOCK` (`1`) and execution errors (`3`); `CONDITIONAL` remains exit `0` | At least 14 days of runs, false-block rate under 2%, flaky tools fixed, and caveats are triaged quickly |
-| Block / required | `prview gate --strict` | Required CI check; blocks `BLOCK`, `CONDITIONAL`, and execution errors | Keep only after owners agree that `CONDITIONAL` is actionable enough to block merges |
+| Block / required | `prview gate --strict` | Required CI check; blocks `BLOCK`, typed review-required, and execution errors; warnings-only remains accepted | Keep only after owners agree that breaking/degraded/quality review requirements are actionable enough to block merges |
+| Warning-clean required | `prview gate --strict --fail-on-warnings` | The Block stage plus exit `2` for a canonical warning tally | Use only where every warning is actionable and owned |
 
 Measured baselines from the initial gate profile:
 
@@ -269,15 +281,19 @@ prview gate --strict
 Use the composite Action for the final required stage:
 
 ```yaml
-- uses: vetcoders/prview-rs@v0.6.0 # pin to a released tag
+- uses: vetcoders/prview-rs@v0.8.0 # typed warning policy requires 0.8+
   id: prview
   with:
     strict: "true"
+    fail-on-warnings: "false"
     version: "latest"
 ```
 
 Use `strict: "false"` during advisory CI rollout. `CONDITIONAL` remains exit
-`0`, while `BLOCK` remains exit `1`.
+`0`, while `BLOCK` remains exit `1`. In strict mode, set
+`fail-on-warnings: "true"` only for a warning-clean Required check. That input
+requires both the Action and installed `prview` to be `0.8.0` or newer; older
+pins expose the historical verdict-only gate and must omit it.
 
 ## Troubleshooting
 
@@ -285,7 +301,7 @@ Use `strict: "false"` during advisory CI rollout. `CONDITIONAL` remains exit
 |---------|--------------|-----|
 | Hook blocks with exit `3` | `prview` is missing, the repo is not a valid git checkout, or a required tool failed before a verdict was produced | Install `prview`, run `prview gate` manually, and inspect the printed error |
 | Hook blocks with exit `1` | Merge gate verdict is `BLOCK` | Open the generated run directory and read `00_summary/MERGE_GATE.json` and `PR_REVIEW.md` |
-| Required CI blocks with exit `2` | Verdict is `CONDITIONAL` and CI uses `--strict` | Either fix the caveat or move the repo back to Warn until conditionals are actionable |
+| Required CI blocks with exit `2` | The typed disposition is `review_required`, or warnings-only is running with `--fail-on-warnings` | Fix the typed cause, remove the warning-clean opt-in, or move the repo back to Warn until the signal is actionable |
 | Hook is too slow | Semgrep or language checks dominate the measured budget | Stay in Shadow, tune policy/check scope, then re-measure before Warn |
 | SARIF is missing | No inline findings/advisories were produced | This is normal; upload only when `30_context/INLINE_FINDINGS.sarif` exists |
 

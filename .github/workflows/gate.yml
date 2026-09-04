@@ -13,18 +13,23 @@ env:
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   gate-shadow:
     name: Gate Shadow
     runs-on: ubuntu-latest
     continue-on-error: true
+    outputs:
+      sarif_available: ${{ steps.gate.outputs.sarif_available }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@master
+          persist-credentials: false
+      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
@@ -46,10 +51,12 @@ jobs:
           echo "json_path=${json_path}" >> "$GITHUB_OUTPUT"
 
           verdict=""
+          enforcement_disposition=""
           output_dir=""
           sarif_path=""
           if command -v jq >/dev/null 2>&1 && [ -s "$json_path" ]; then
             verdict="$(jq -r '.verdict // empty' "$json_path" 2>/dev/null || true)"
+            enforcement_disposition="$(jq -r '.enforcement_disposition // empty' "$json_path" 2>/dev/null || true)"
             output_dir="$(jq -r '.output_dir // empty' "$json_path" 2>/dev/null || true)"
           fi
 
@@ -57,11 +64,16 @@ jobs:
             sarif_path="${output_dir}/30_context/INLINE_FINDINGS.sarif"
           fi
           echo "sarif_path=${sarif_path}" >> "$GITHUB_OUTPUT"
+          if [ -n "$sarif_path" ]; then
+            echo "sarif_available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sarif_available=false" >> "$GITHUB_OUTPUT"
+          fi
 
           case "$status" in
-            0) result="PASS or non-strict CONDITIONAL" ;;
+            0) result="PASS, advisory CONDITIONAL, or accepted typed warnings-only" ;;
             1) result="BLOCK" ;;
-            2) result="strict CONDITIONAL" ;;
+            2) result="strict review-required or warning-clean rejection" ;;
             3) result="internal gate execution error" ;;
             *) result="unexpected exit code" ;;
           esac
@@ -78,6 +90,9 @@ jobs:
             if [ -n "$verdict" ]; then
               echo "| JSON verdict | \`${verdict}\` |"
             fi
+            if [ -n "$enforcement_disposition" ]; then
+              echo "| Enforcement disposition | \`${enforcement_disposition}\` |"
+            fi
             if [ -n "$sarif_path" ]; then
               echo "| SARIF | \`${sarif_path}\` |"
             else
@@ -86,9 +101,48 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           exit 0
-      - name: Upload SARIF
+      - name: Stage constrained SARIF artifact
         if: ${{ steps.gate.outputs.sarif_path != '' }}
-        uses: github/codeql-action/upload-sarif@v3
-        continue-on-error: true
+        env:
+          SARIF_SOURCE: ${{ steps.gate.outputs.sarif_path }}
+        run: |
+          install -d "$RUNNER_TEMP/prview-sarif"
+          cp -- "$SARIF_SOURCE" "$RUNNER_TEMP/prview-sarif/INLINE_FINDINGS.sarif"
+      - name: Upload constrained SARIF artifact
+        if: ${{ steps.gate.outputs.sarif_path != '' }}
+        uses: actions/upload-artifact@v4
         with:
-          sarif_file: ${{ steps.gate.outputs.sarif_path }}
+          name: prview-inline-sarif-${{ github.run_id }}
+          path: ${{ runner.temp }}/prview-sarif/INLINE_FINDINGS.sarif
+          if-no-files-found: error
+          retention-days: 1
+
+  upload-sarif:
+    name: Upload trusted SARIF
+    needs: gate-shadow
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.gate-shadow.outputs.sarif_available == 'true' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Download constrained SARIF artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: prview-inline-sarif-${{ github.run_id }}
+          path: ${{ runner.temp }}/prview-sarif
+      - name: Validate constrained SARIF artifact
+        shell: bash
+        run: |
+          sarif="$RUNNER_TEMP/prview-sarif/INLINE_FINDINGS.sarif"
+          test -f "$sarif"
+          test ! -L "$sarif"
+          test "$(wc -c < "$sarif")" -le 10485760
+          jq -e '.version == "2.1.0" and (.runs | type == "array")' "$sarif" >/dev/null
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ runner.temp }}/prview-sarif/INLINE_FINDINGS.sarif
+          category: prview-inline

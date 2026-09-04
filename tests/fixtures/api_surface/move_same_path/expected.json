@@ -1,0 +1,8 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "move_same_path",
+  "family": "move",
+  "legacy_expectation": "negative",
+  "legacy_positive_sibling": null,
+  "repo_backed_records": []
+}

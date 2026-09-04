@@ -1,0 +1,38 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "reexport_changed",
+  "family": "reexport",
+  "legacy_expectation": "accepted_zero",
+  "legacy_positive_sibling": "reexport_removed",
+  "legacy_delta_rationale": "the legacy breaking detector deliberately ignored changed pub-use edges",
+  "repo_backed_records": [
+    {
+      "kind": "removed",
+      "symbol": "Config",
+      "namespace": "crate",
+      "before": "pub use inner::Config",
+      "after": null,
+      "provenance": {
+        "base_revision": "fixture://reexport_changed/base",
+        "target_revision": "fixture://reexport_changed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    },
+    {
+      "kind": "added",
+      "symbol": "Settings",
+      "namespace": "crate",
+      "before": null,
+      "after": "pub use inner::Settings",
+      "provenance": {
+        "base_revision": "fixture://reexport_changed/base",
+        "target_revision": "fixture://reexport_changed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

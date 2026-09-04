@@ -142,6 +142,7 @@ a valid completed review). Response:
   "base_used": ["main"],
   "base_fallback": false,
   "verdict": "PASS",
+  "enforcement_disposition": "clean",
   "merge_recommendation": "approve",
   "allow_merge": true,
   "blocking_issues": [],
@@ -212,9 +213,21 @@ The single decision truth for a run. Default: the latest run for the current
 The decision surface is normalized so callers read one vocabulary:
 
 - `verdict` — `PASS`, `CONDITIONAL`, or `BLOCK`.
+- `enforcement_disposition` — `clean`, `warnings_only`, `review_required`, or
+  `block`. This is an orthogonal process-policy axis, not another verdict rank:
+  a warning-bearing pack may remain `PASS`/`allow_merge: true` while reporting
+  `warnings_only`.
 - `merge_recommendation` — `approve`, `review_required`, or `block`.
-- `allow_merge` — boolean, **derived** conservatively: it is `true` only for a
-  clean `PASS`. A permissive flag on disk can never override a block/hold signal.
+- `allow_merge` — boolean, derived from the normalized verdict:
+  `allow_merge == (verdict == "PASS")`. This includes a valid `PASS` carrying
+  `warnings_only`.
+
+`enforcement_disposition` independently controls process-lane acceptance. A
+strict gate rejects `review_required` while accepting `warnings_only`; a
+warnings-clean lane additionally rejects `warnings_only` even when the verdict
+is `PASS` and `allow_merge` is true. The CLI and MCP `verdict` response expose
+these normalized fields. The GitHub Action reports the verdict and disposition,
+but maps its pass/fail result from the gate process exit code.
 
 If the stored gate emits contradictory signals (for example `allow_merge: true`
 alongside a block recommendation, or a clean approval alongside
@@ -233,6 +246,15 @@ into the `PASS` / `CONDITIONAL` surface rather than failing loud. That fold is
 `gate::canonical_verdict`, shared by this adapter, the CLI summary and
 `prview gate`, and it ignores case: a stored `"pass"` reads as `PASS` on every
 surface instead of approving on one and normalizing to `BLOCK` on another.
+
+Schema 2.3 makes the disposition and its typed proof mandatory. The shared
+CLI/MCP reader cross-checks check execution/outcome/confidence/merge axes,
+effective inline class/disposition, policy blocking, and typed quality-failure
+provenance. Only literal warning proof can preserve `warnings_only`; missing,
+unknown, contradictory, or amputated additive proof raises enforcement to
+`review_required` with a caveat without rewriting an otherwise readable
+canonical `PASS`/`CONDITIONAL`/`BLOCK`. Packs through schema 2.2 cannot unlock
+the warning exception, even if an unknown writer injected the new field.
 
 Anything the adapter could not read is named rather than dropped, and every such
 case sets `normalized: true`:
@@ -283,6 +305,7 @@ Completed response:
   "merge_recommendation": "approve",
   "allow_merge": true,
   "verdict": "PASS",
+  "enforcement_disposition": "clean",
   "blocking_issues": [],
   "caveats": [],
   "gates": [

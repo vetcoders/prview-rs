@@ -4,6 +4,7 @@
 //! All data the dashboard needs is serialized here; the HTML renderer
 //! reads from embedded JSON rather than parsing multiple text files.
 
+use super::api_delta;
 use super::parsers::cargo_test::extract_failed_test_names;
 use super::signal::BreakingKind;
 use super::{
@@ -505,6 +506,11 @@ struct BreakingSection {
     removed_public_symbols_count: usize,
     signature_changes_count: usize,
     new_env_vars_count: usize,
+    relocated_count: usize,
+    visibility_changed_count: usize,
+    unknown_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rust_api_delta: Option<api_delta::ApiArtifactView>,
 }
 
 #[derive(Serialize)]
@@ -943,18 +949,37 @@ fn build_report(input: &ReportInput<'_>) -> Report {
     };
 
     let breaking_breakdown = breaking_change_breakdown(&ctx.breaking);
+    let rust_counts = ctx.rust_api_delta.as_ref().map(|view| &view.counts);
+    let rust_breaking_count = rust_counts.map_or(0, |counts| {
+        counts.removed + counts.changed + counts.relocated + counts.visibility_changed
+    });
 
     let quality = Quality {
         breaking_changes: BreakingSection {
-            has_breaking: !ctx.breaking.is_empty(),
+            has_breaking: !ctx.breaking.is_empty() || rust_breaking_count > 0,
             summary: breaking_breakdown.summary().or_else(|| {
-                (!ctx.breaking.is_empty())
-                    .then(|| format!("{} breaking findings", ctx.breaking.len()))
+                (rust_breaking_count > 0)
+                    .then(|| {
+                        format!(
+                            "{} confirmed Rust API breaking findings",
+                            rust_breaking_count
+                        )
+                    })
+                    .or_else(|| {
+                        (!ctx.breaking.is_empty())
+                            .then(|| format!("{} breaking findings", ctx.breaking.len()))
+                    })
             }),
             md_path: "20_quality/BREAKING_CHANGES.md",
-            removed_public_symbols_count: removed_symbols,
-            signature_changes_count: signature_changes,
+            removed_public_symbols_count: removed_symbols
+                + rust_counts.map_or(0, |counts| counts.removed),
+            signature_changes_count: signature_changes
+                + rust_counts.map_or(0, |counts| counts.changed),
             new_env_vars_count: new_env_vars,
+            relocated_count: rust_counts.map_or(0, |counts| counts.relocated),
+            visibility_changed_count: rust_counts.map_or(0, |counts| counts.visibility_changed),
+            unknown_count: rust_counts.map_or(0, |counts| counts.unknown),
+            rust_api_delta: ctx.rust_api_delta.clone(),
         },
         coverage: CoverageSection {
             // 0/0 must serialize as null + measured:false, never as a 1.0 that
@@ -1317,6 +1342,7 @@ test result: FAILED. 0 passed; 1 failed
                 severity: "warn",
             }],
             breaking: vec![],
+            rust_api_delta: None,
             coverage: CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
@@ -1422,6 +1448,7 @@ test result: FAILED. 0 passed; 1 failed
                 severity: "warn",
             }],
             breaking: vec![],
+            rust_api_delta: None,
             coverage: CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
@@ -1539,6 +1566,7 @@ test result: FAILED. 0 passed; 1 failed
                 severity: "warn",
             }],
             breaking: vec![],
+            rust_api_delta: None,
             coverage: CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
@@ -1634,6 +1662,7 @@ test result: FAILED. 0 passed; 1 failed
                 class: "PASS",
                 severity: "warn",
             }],
+            rust_api_delta: None,
             breaking: vec![
                 BreakingFinding {
                     file: "src/lib.rs".to_string(),
@@ -1760,6 +1789,7 @@ test result: FAILED. 0 passed; 1 failed
                 severity: "warn",
             }],
             breaking: vec![],
+            rust_api_delta: None,
             coverage: crate::artifacts::signal::CoverageDelta {
                 total_source: 0,
                 covered_count: 0,
@@ -1879,6 +1909,7 @@ test result: FAILED. 0 passed; 1 failed
             policy_mode: "warn",
             blocking_issues: vec![],
             check_gates: vec![],
+            rust_api_delta: None,
             breaking: vec![],
             coverage,
             findings: vec![],
@@ -2125,6 +2156,7 @@ test result: FAILED. 0 passed; 1 failed
                 severity: "warn",
             }],
             breaking: vec![],
+            rust_api_delta: None,
             coverage: crate::artifacts::signal::CoverageDelta {
                 total_source: 0,
                 covered_count: 0,

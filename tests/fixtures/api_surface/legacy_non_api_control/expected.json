@@ -1,0 +1,8 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "legacy_non_api_control",
+  "family": "legacy_control",
+  "legacy_expectation": "negative",
+  "legacy_positive_sibling": null,
+  "repo_backed_records": []
+}

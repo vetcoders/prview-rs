@@ -138,7 +138,11 @@ async fn run() -> Result<()> {
     let exit_code = if cli.soft_exit {
         0
     } else {
-        prview::output::compute_exit_code(&cli_summary, cli.ci, cli.fail_on_warnings)
+        prview::output::compute_exit_code(
+            &cli_summary,
+            app.config.enforcement_mode.is_strict(),
+            app.config.enforcement_mode.fails_on_warnings(),
+        )
     };
 
     // A human unchanged run prints "Nothing to update." and no verdict, so say
@@ -174,7 +178,11 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     run_cli.fail_on_warnings = false;
 
     let mut config = Config::from_cli(&run_cli)?;
-    config.apply_gate_profile();
+    let enforcement_mode = prview::policy::engine::EnforcementMode::from_gate_flags(
+        args.strict,
+        args.fail_on_warnings,
+    );
+    config.apply_gate_profile(enforcement_mode);
     let app = App::from_config(config)?;
     let report = app.run().await.context("gate review run failed")?;
     let cli_summary = prview::output::build_cli_json_summary(&app.config, &report)?;
@@ -182,8 +190,11 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
         .artifacts_dir
         .join("00_summary")
         .join("MERGE_GATE.json");
-    let summary =
-        prview::gate::build_gate_json_output(&cli_summary, &merge_gate_path, args.strict)?;
+    let summary = prview::gate::build_gate_json_output(
+        &cli_summary,
+        &merge_gate_path,
+        app.config.enforcement_mode,
+    )?;
 
     if args.json || cli.json {
         println!("{}", serde_json::to_string_pretty(&summary)?);

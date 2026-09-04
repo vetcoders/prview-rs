@@ -1,6 +1,7 @@
 //! Breaking changes manifest — heuristic scan for API-breaking changes.
 
-use super::common::{ReviewFileCategory, classify_review_file};
+use super::api_delta::{ApiArtifactView, ApiDeltaConfidence, ApiDeltaKind};
+use super::common::{ReviewFileCategory, classify_review_file, js_ts_patch_sections};
 use anyhow::Result;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -57,6 +58,77 @@ pub fn analyze_all_breaking_changes(patch_texts: &[String]) -> Vec<BreakingFindi
     }
     reclassify_relocated_symbols(&mut all, &added_symbols);
     all
+}
+
+/// Run the unchanged legacy breaking analyzer over JS/TS sections only.
+/// Rust sections are removed before parsing, so production Rust facts cannot
+/// leak back into the diff-only engine after the repo-backed takeover.
+pub fn analyze_js_ts_breaking_changes(patch_texts: &[String]) -> Vec<BreakingFinding> {
+    let js_ts_patches = patch_texts
+        .iter()
+        .map(|patch| js_ts_patch_sections(patch))
+        .filter(|patch| !patch.is_empty())
+        .collect::<Vec<_>>();
+    analyze_all_breaking_changes(&js_ts_patches)
+}
+
+/// Preserve the legacy non-API environment-requirement signal for Rust without
+/// invoking the superseded Rust API analyzer. This parser owns only added-line
+/// env markers; it cannot emit public symbol/signature findings.
+pub fn analyze_rust_env_requirements(patch_texts: &[String]) -> Vec<BreakingFinding> {
+    let mut findings = Vec::new();
+    for patch in patch_texts {
+        let mut current_file = String::new();
+        let mut scan_rust = false;
+        for line in patch.lines() {
+            if let Some(rest) = line.strip_prefix("diff --git a/") {
+                if let Some(space_idx) = rest.find(" b/") {
+                    current_file = rest[space_idx + 3..].to_owned();
+                    scan_rust = current_file.ends_with(".rs")
+                        && matches!(
+                            classify_review_file(&current_file),
+                            ReviewFileCategory::Code
+                        );
+                }
+                continue;
+            }
+            if scan_rust
+                && let Some(content) = line.strip_prefix('+')
+                && !line.starts_with("+++")
+            {
+                findings.extend(new_env_requirement_findings(&current_file, content.trim()));
+            }
+        }
+    }
+    findings
+}
+
+fn new_env_requirement_findings(file: &str, trimmed: &str) -> Vec<BreakingFinding> {
+    if !trimmed.contains("REQUIRED_ENV") && !trimmed.contains(".env") {
+        return Vec::new();
+    }
+    let mut findings = Vec::new();
+    for word in trimmed.split_whitespace() {
+        for candidate in word.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            if candidate.len() > 3
+                && candidate != "REQUIRED_ENV"
+                && candidate.contains('_')
+                && candidate
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_')
+            {
+                findings.push(BreakingFinding {
+                    file: file.to_owned(),
+                    kind: BreakingKind::NewEnvRequirement {
+                        variable: candidate.to_owned(),
+                    },
+                    line: trimmed.to_owned(),
+                    risk_level: compute_breaking_risk(file),
+                });
+            }
+        }
+    }
+    findings
 }
 
 /// Public-symbol declaration prefixes and the symbol-type label they map to.
@@ -456,6 +528,7 @@ fn reclassify_relocated_symbols(
 }
 
 /// Write pre-computed breaking change findings to `BREAKING_CHANGES.md`.
+#[cfg(test)]
 pub fn write_breaking_changes(dir: &Path, findings: &[BreakingFinding]) -> Result<()> {
     if findings.is_empty() {
         return Ok(());
@@ -464,6 +537,94 @@ pub fn write_breaking_changes(dir: &Path, findings: &[BreakingFinding]) -> Resul
     let md = format_breaking_changes(findings);
     fs::write(dir.join("BREAKING_CHANGES.md"), md)?;
 
+    Ok(())
+}
+
+/// Write the production Rust repo-backed view and the retained JS/TS legacy
+/// findings. The JSON is the lossless machine contract; the existing Markdown
+/// filename remains the human compatibility surface.
+pub fn write_breaking_changes_with_api(
+    dir: &Path,
+    rust_view: Option<&ApiArtifactView>,
+    js_ts_findings: &[BreakingFinding],
+) -> Result<()> {
+    if rust_view.is_none() && js_ts_findings.is_empty() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(dir)?;
+    if let Some(view) = rust_view {
+        fs::write(
+            dir.join("BREAKING_CHANGES.json"),
+            serde_json::to_string_pretty(view)?,
+        )?;
+    }
+
+    let mut md = String::from("# Breaking Changes (auto-detected)\n\n");
+    if let Some(view) = rust_view {
+        md.push_str(
+            "> Rust facts are derived from exact revision-backed repository trees. Unknown regions remain explicit; no diff-only Rust fallback is used.\n\n",
+        );
+        let _ = writeln!(
+            md,
+            "- Analysis source: `{}`\n- Base: `{}`\n- Target: `{}`\n- Counts: removed={}, changed={}, relocated={}, visibility_changed={}, unknown={}\n",
+            view.analysis_source,
+            view.base_revision,
+            view.target_revision,
+            view.counts.removed,
+            view.counts.changed,
+            view.counts.relocated,
+            view.counts.visibility_changed,
+            view.counts.unknown,
+        );
+
+        for kind in [
+            ApiDeltaKind::Removed,
+            ApiDeltaKind::Changed,
+            ApiDeltaKind::Relocated,
+            ApiDeltaKind::VisibilityChanged,
+            ApiDeltaKind::Unknown,
+            ApiDeltaKind::Added,
+        ] {
+            let rows = view
+                .findings
+                .iter()
+                .filter(|finding| finding.kind == kind)
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                continue;
+            }
+            let heading = match kind {
+                ApiDeltaKind::Removed => "Removed Public API",
+                ApiDeltaKind::Changed => "Changed Public API",
+                ApiDeltaKind::Relocated => "Relocated Public API",
+                ApiDeltaKind::VisibilityChanged => "Visibility Changed",
+                ApiDeltaKind::Unknown => "Unknown / Unprovable",
+                ApiDeltaKind::Added => "Added Public API (informational)",
+            };
+            let _ = writeln!(md, "## {heading}\n");
+            for finding in rows {
+                let confidence = match finding.confidence {
+                    ApiDeltaConfidence::Confirmed => "confirmed",
+                    ApiDeltaConfidence::Unknown => "unknown",
+                };
+                let _ = writeln!(
+                    md,
+                    "- `{}` `{}` ({confidence}) — {}",
+                    finding.id,
+                    finding.identity.name,
+                    finding.evidence.join("; ")
+                );
+            }
+            md.push('\n');
+        }
+    }
+
+    if !js_ts_findings.is_empty() {
+        md.push_str("## JavaScript / TypeScript legacy diff signal\n\n");
+        md.push_str(&format_breaking_changes(js_ts_findings));
+    }
+    fs::write(dir.join("BREAKING_CHANGES.md"), md)?;
     Ok(())
 }
 
@@ -643,41 +804,7 @@ fn analyze_patch_for_breaking_changes(patch: &str) -> Vec<BreakingFinding> {
 
             after_scope.feed(content);
 
-            // New env requirements
-            if trimmed.contains("REQUIRED_ENV") || trimmed.contains(".env") {
-                for word in trimmed.split_whitespace() {
-                    // Segment each word on non-identifier boundaries (anything
-                    // outside `[A-Za-z0-9_]`) so a glued token yields the bare
-                    // candidate identifier(s) instead of a smeared string:
-                    //   `"MY_VAR";`                  -> ["", "MY_VAR", ""]
-                    //   `MY_VAR=value`               -> ["MY_VAR", "value"]
-                    //   `process.env.MY_DB_TOKEN;`   -> ["process","env","MY_DB_TOKEN",""]
-                    // Cleaning the whole word instead would fuse the value into
-                    // the name (`MY_VARvalue`) and lose the match entirely.
-                    for candidate in word.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
-                        // Skip the trigger keyword itself: `REQUIRED_ENV` is the
-                        // marker we grep for, not a variable being introduced.
-                        // The all-uppercase check keeps the existing semantics of
-                        // rejecting names with digits (e.g. `MY_VAR2`).
-                        if candidate.len() > 3
-                            && candidate != "REQUIRED_ENV"
-                            && candidate.contains('_')
-                            && candidate
-                                .chars()
-                                .all(|c| c.is_ascii_uppercase() || c == '_')
-                        {
-                            findings.push(BreakingFinding {
-                                file: current_file.clone(),
-                                kind: BreakingKind::NewEnvRequirement {
-                                    variable: candidate.to_string(),
-                                },
-                                line: trimmed.to_string(),
-                                risk_level: compute_breaking_risk(&current_file),
-                            });
-                        }
-                    }
-                }
-            }
+            findings.extend(new_env_requirement_findings(&current_file, trimmed));
             continue;
         }
 
@@ -1617,8 +1744,150 @@ fn format_breaking_changes(findings: &[BreakingFinding]) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod historical_scenarios {
+    use super::{BreakingFinding, BreakingKind};
+
+    #[derive(
+        Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    )]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum HistoricalTestId {
+        FeatureGatedSignatureDedup,
+        DifferentInlineModuleRemoval,
+        LongSignatureBelowOldCap,
+        CrossFileRelocation,
+        SameInlineModulePairingNoop,
+        IdenticalRemoveReaddNoop,
+    }
+
+    #[derive(
+        Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    )]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum HistoricalFactKind {
+        Removed,
+        Relocated,
+        Changed,
+        NewEnvRequirement,
+    }
+
+    pub(crate) struct HistoricalScenario {
+        pub(crate) id: HistoricalTestId,
+        pub(crate) patches: Vec<String>,
+        pub(crate) expected_kinds: Vec<HistoricalFactKind>,
+    }
+
+    pub(crate) fn actual_kinds(findings: &[BreakingFinding]) -> Vec<HistoricalFactKind> {
+        let mut kinds: Vec<_> = findings
+            .iter()
+            .map(|finding| match finding.kind {
+                BreakingKind::RemovedSymbol { .. } => HistoricalFactKind::Removed,
+                BreakingKind::RelocatedSymbol { .. } => HistoricalFactKind::Relocated,
+                BreakingKind::ChangedSignature { .. } => HistoricalFactKind::Changed,
+                BreakingKind::NewEnvRequirement { .. } => HistoricalFactKind::NewEnvRequirement,
+            })
+            .collect();
+        kinds.sort();
+        kinds
+    }
+
+    fn one_file_patch(file: &str, body: &[&str]) -> String {
+        format!(
+            "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -1,1 +1,1 @@\n{}\n",
+            body.join("\n")
+        )
+    }
+
+    pub(crate) fn scenario(id: HistoricalTestId) -> HistoricalScenario {
+        let (patches, expected_kinds) = match id {
+            HistoricalTestId::FeatureGatedSignatureDedup => {
+                let mk = |before_args: &str, after_open: &str| {
+                    format!(
+                        "diff --git a/src/vector_index.rs b/src/vector_index.rs\n--- a/src/vector_index.rs\n+++ b/src/vector_index.rs\n@@ -1,1 +1,1 @@\n-pub fn query_index({before_args}) -> Result<Vec<QueryHit>> {{\n+pub fn query_index({after_open}) -> Result<QueryHit> {{\n"
+                    )
+                };
+                (
+                    vec![
+                        mk("project: Option<&str>", "project: Option<&str>"),
+                        mk("project: Option<&str>", "project: Option<&str>"),
+                        mk("_project: Option<&str>", "_project: Option<&str>"),
+                        mk("_project: Option<&str>", "_project: Option<&str>"),
+                    ],
+                    vec![HistoricalFactKind::Changed; 4],
+                )
+            }
+            HistoricalTestId::DifferentInlineModuleRemoval => (
+                vec![one_file_patch(
+                    "src/model.rs",
+                    &[
+                        " pub mod a {",
+                        "-    pub struct Config {",
+                        "-        pub x: u32,",
+                        "-    }",
+                        " }",
+                        " pub mod b {",
+                        "+    pub struct Config {",
+                        "+        pub x: u32,",
+                        "+    }",
+                        " }",
+                    ],
+                )],
+                vec![HistoricalFactKind::Removed],
+            ),
+            HistoricalTestId::LongSignatureBelowOldCap => {
+                let mut body = Vec::new();
+                for (side, ret) in [("-", "u8"), ("+", "u16")] {
+                    body.push(format!("{side}pub fn build("));
+                    for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+                        body.push(format!("{side}    {name}: u8,"));
+                    }
+                    body.push(format!("{side}) -> {ret} {{"));
+                }
+                let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+                (
+                    vec![one_file_patch("src/model.rs", &refs)],
+                    vec![HistoricalFactKind::Changed],
+                )
+            }
+            HistoricalTestId::CrossFileRelocation => (
+                vec![
+                    "diff --git a/src/artifacts/signal.rs b/src/artifacts/signal.rs\n--- a/src/artifacts/signal.rs\n+++ b/src/artifacts/signal.rs\n@@ -1,3 +0,0 @@\n-pub fn compute_coverage_signal(diffs: &[Diff]) -> CoverageSignal {\n-}\n".to_owned(),
+                    "diff --git a/src/artifacts/signal/coverage.rs b/src/artifacts/signal/coverage.rs\n--- a/src/artifacts/signal/coverage.rs\n+++ b/src/artifacts/signal/coverage.rs\n@@ -0,0 +1,2 @@\n+pub fn compute_coverage_signal(diffs: &[Diff]) -> CoverageSignal {\n+}\n".to_owned(),
+                ],
+                vec![HistoricalFactKind::Relocated],
+            ),
+            HistoricalTestId::SameInlineModulePairingNoop => (
+                vec![one_file_patch(
+                    "src/model.rs",
+                    &[
+                        " pub mod a {",
+                        "-    pub struct Config {",
+                        "-        pub x: u32,",
+                        "+    pub struct Config {",
+                        "+        pub x: u64,",
+                        "     }",
+                        " }",
+                    ],
+                )],
+                Vec::new(),
+            ),
+            HistoricalTestId::IdenticalRemoveReaddNoop => (
+                vec!["diff --git a/src/paths.rs b/src/paths.rs\n--- a/src/paths.rs\n+++ b/src/paths.rs\n@@ -1,3 +1,3 @@\n-pub fn read_within(root: &Path, requested: &Path) -> Result<Vec<u8>> {\n-    old_impl()\n+pub fn read_within(root: &Path, requested: &Path) -> Result<Vec<u8>> {\n+    open_file_within(root, requested)\n }\n".to_owned()],
+                Vec::new(),
+            ),
+        };
+        HistoricalScenario {
+            id,
+            patches,
+            expected_kinds,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::regression::tests::is_test_file;
 
     #[test]
@@ -1829,23 +2098,14 @@ mod tests {
         // A module split: `compute_coverage_signal` leaves signal.rs and
         // reappears in signal/coverage.rs. It must be classified as relocated
         // (non-breaking re-export), not a removed public symbol (P1-08).
-        let removed = "diff --git a/src/artifacts/signal.rs b/src/artifacts/signal.rs\n\
-             --- a/src/artifacts/signal.rs\n\
-             +++ b/src/artifacts/signal.rs\n\
-             @@ -1,3 +0,0 @@\n\
-             -pub fn compute_coverage_signal(diffs: &[Diff]) -> CoverageSignal {\n\
-             -}\n"
-            .to_string();
-        let added =
-            "diff --git a/src/artifacts/signal/coverage.rs b/src/artifacts/signal/coverage.rs\n\
-             --- a/src/artifacts/signal/coverage.rs\n\
-             +++ b/src/artifacts/signal/coverage.rs\n\
-             @@ -0,0 +1,2 @@\n\
-             +pub fn compute_coverage_signal(diffs: &[Diff]) -> CoverageSignal {\n\
-             +}\n"
-                .to_string();
-
-        let findings = analyze_all_breaking_changes(&[removed, added]);
+        let scenario = historical_scenarios::scenario(
+            historical_scenarios::HistoricalTestId::CrossFileRelocation,
+        );
+        let findings = analyze_all_breaking_changes(&scenario.patches);
+        assert_eq!(
+            historical_scenarios::actual_kinds(&findings),
+            scenario.expected_kinds
+        );
 
         assert!(
             findings.iter().any(|f| matches!(
@@ -1890,18 +2150,14 @@ mod tests {
         // paths.rs case (P1-10): a `pub fn` body is rewritten to delegate, so
         // the diff emits the unchanged signature line as both - and +. It is
         // neither a removal nor a signature change.
-        let patch = "diff --git a/src/paths.rs b/src/paths.rs\n\
-             --- a/src/paths.rs\n\
-             +++ b/src/paths.rs\n\
-             @@ -1,3 +1,3 @@\n\
-             -pub fn read_within(root: &Path, requested: &Path) -> Result<Vec<u8>> {\n\
-             -    old_impl()\n\
-             +pub fn read_within(root: &Path, requested: &Path) -> Result<Vec<u8>> {\n\
-             +    open_file_within(root, requested)\n\
-             }\n"
-        .to_string();
-
-        let findings = analyze_all_breaking_changes(&[patch]);
+        let scenario = historical_scenarios::scenario(
+            historical_scenarios::HistoricalTestId::IdenticalRemoveReaddNoop,
+        );
+        let findings = analyze_all_breaking_changes(&scenario.patches);
+        assert_eq!(
+            historical_scenarios::actual_kinds(&findings),
+            scenario.expected_kinds
+        );
         assert!(
             !findings.iter().any(|f| matches!(
                 &f.kind,
@@ -2629,26 +2885,14 @@ mod tests {
         // #[cfg(feature = ...)] variant). The Changed Signatures section must
         // collapse them into a single row with a variant-count note, not 4
         // identical rows (BUG-4 / TOOLING-15).
-        let mk = |before_args: &str, after_open: &str| {
-            format!(
-                "diff --git a/src/vector_index.rs b/src/vector_index.rs\n\
-                 --- a/src/vector_index.rs\n\
-                 +++ b/src/vector_index.rs\n\
-                 @@ -1,1 +1,1 @@\n\
-                 -pub fn query_index({before_args}) -> Result<Vec<QueryHit>> {{\n\
-                 +pub fn query_index({after_open}) -> Result<QueryHit> {{\n"
-            )
-        };
-        // Two cfg variants (real + stubbed `_`-prefixed), each emitted twice by
-        // the diff — the kind of duplication seen in feature-gated code.
-        let patches = vec![
-            mk("project: Option<&str>", "project: Option<&str>"),
-            mk("project: Option<&str>", "project: Option<&str>"),
-            mk("_project: Option<&str>", "_project: Option<&str>"),
-            mk("_project: Option<&str>", "_project: Option<&str>"),
-        ];
-
-        let findings = analyze_all_breaking_changes(&patches);
+        let scenario = historical_scenarios::scenario(
+            historical_scenarios::HistoricalTestId::FeatureGatedSignatureDedup,
+        );
+        let findings = analyze_all_breaking_changes(&scenario.patches);
+        assert_eq!(
+            historical_scenarios::actual_kinds(&findings),
+            scenario.expected_kinds
+        );
         let changed_count = findings
             .iter()
             .filter(|f| matches!(&f.kind, BreakingKind::ChangedSignature { .. }))
@@ -2713,23 +2957,14 @@ mod tests {
         // `a::Config` is deleted while a same-named `b::Config` is added in the
         // same file. Pairing on (file, kind, name) alone cancelled a genuine
         // removal: the `a::Config` path is gone for every downstream consumer.
-        let patch = one_file_patch(
-            "src/model.rs",
-            &[
-                " pub mod a {",
-                "-    pub struct Config {",
-                "-        pub x: u32,",
-                "-    }",
-                " }",
-                " pub mod b {",
-                "+    pub struct Config {",
-                "+        pub x: u32,",
-                "+    }",
-                " }",
-            ],
+        let scenario = historical_scenarios::scenario(
+            historical_scenarios::HistoricalTestId::DifferentInlineModuleRemoval,
         );
-
-        let findings = analyze_all_breaking_changes(&[patch]);
+        let findings = analyze_all_breaking_changes(&scenario.patches);
+        assert_eq!(
+            historical_scenarios::actual_kinds(&findings),
+            scenario.expected_kinds
+        );
         assert!(
             removed_symbol_types(&findings).contains(&"struct".to_string()),
             "removal from mod a must survive an unrelated add in mod b, got: {:?}",
@@ -3730,20 +3965,14 @@ mod tests {
     fn same_name_in_the_same_inline_module_still_pairs() {
         // Guard against the module tracker over-reaching: a remove+re-add inside
         // ONE module is still the phantom-removal case it always was.
-        let patch = one_file_patch(
-            "src/model.rs",
-            &[
-                " pub mod a {",
-                "-    pub struct Config {",
-                "-        pub x: u32,",
-                "+    pub struct Config {",
-                "+        pub x: u64,",
-                "     }",
-                " }",
-            ],
+        let scenario = historical_scenarios::scenario(
+            historical_scenarios::HistoricalTestId::SameInlineModulePairingNoop,
         );
-
-        let findings = analyze_all_breaking_changes(&[patch]);
+        let findings = analyze_all_breaking_changes(&scenario.patches);
+        assert_eq!(
+            historical_scenarios::actual_kinds(&findings),
+            scenario.expected_kinds
+        );
         assert!(
             !findings.iter().any(|f| matches!(
                 &f.kind,
@@ -3823,18 +4052,14 @@ mod tests {
         // finalized to the SAME truncated text, so the exact-match pass paired
         // them, consumed the addition and dropped the removal — the changed
         // return type on the tenth line produced no finding at all.
-        let mut body = Vec::new();
-        for (side, ret) in [("-", "u8"), ("+", "u16")] {
-            body.push(format!("{side}pub fn build("));
-            for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
-                body.push(format!("{side}    {name}: u8,"));
-            }
-            body.push(format!("{side}) -> {ret} {{"));
-        }
-        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
-        let patch = one_file_patch("src/model.rs", &refs);
-
-        let findings = analyze_all_breaking_changes(&[patch]);
+        let scenario = historical_scenarios::scenario(
+            historical_scenarios::HistoricalTestId::LongSignatureBelowOldCap,
+        );
+        let findings = analyze_all_breaking_changes(&scenario.patches);
+        assert_eq!(
+            historical_scenarios::actual_kinds(&findings),
+            scenario.expected_kinds
+        );
         assert!(
             findings.iter().any(|f| matches!(
                 &f.kind,
@@ -4383,5 +4608,281 @@ mod tests {
         assert!(!is_test_file("src/lib.rs"));
         assert!(!is_test_file("src/main.rs"));
         assert!(!is_test_file("src/config/mod.rs"));
+    }
+}
+// API_SURFACE_CORPUS_HARNESS
+#[cfg(test)]
+mod api_surface_corpus_tests {
+    use super::super::public_api::api_surface_corpus_contract::{
+        ApiConfidence, ApiDeltaKind, CorpusExpectation, CorpusExpected, CorpusManifest,
+        CorpusPolarity,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
+    use std::path::Path;
+
+    const CORPUS_SCHEMA: &str = "prview.api_surface_corpus.v1";
+    const EXPECTED_SCHEMA: &str = "prview.api_surface_expected.v1";
+
+    fn legacy_breaking_tests() -> BTreeSet<String> {
+        let source = include_str!("breaking.rs")
+            .split("// API_SURFACE_CORPUS_HARNESS")
+            .next()
+            .expect("harness marker exists");
+        let mut names = BTreeSet::new();
+        let mut test_attribute_seen = false;
+
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed == "#[test]" {
+                test_attribute_seen = true;
+                continue;
+            }
+            if test_attribute_seen {
+                if let Some(rest) = trimmed.strip_prefix("fn ")
+                    && let Some((name, _)) = rest.split_once('(')
+                {
+                    names.insert(name.to_string());
+                }
+                test_attribute_seen = false;
+            }
+        }
+
+        names
+    }
+
+    fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> T {
+        let bytes = fs::read(path).unwrap_or_else(|error| {
+            panic!("failed to read corpus file {}: {error}", path.display())
+        });
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!("failed to parse corpus file {}: {error}", path.display())
+        })
+    }
+
+    #[test]
+    fn api_surface_corpus() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/api_surface");
+        let manifest: CorpusManifest = read_json(&root.join("manifest.json"));
+        assert_eq!(manifest.schema, CORPUS_SCHEMA);
+
+        let registered: BTreeSet<_> = manifest.cells.iter().map(|cell| cell.id.as_str()).collect();
+        assert_eq!(
+            registered.len(),
+            manifest.cells.len(),
+            "corpus cell ids must be unique"
+        );
+
+        let fixture_dirs: BTreeSet<String> = fs::read_dir(&root)
+            .expect("api-surface fixture root exists")
+            .filter_map(|entry| {
+                let entry = entry.expect("fixture directory entry is readable");
+                entry
+                    .file_type()
+                    .expect("fixture entry type is readable")
+                    .is_dir()
+                    .then(|| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+        let registered_owned: BTreeSet<String> =
+            registered.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            fixture_dirs, registered_owned,
+            "every fixture directory must be registered, and every registration must exist"
+        );
+
+        let by_id: BTreeMap<_, _> = manifest
+            .cells
+            .iter()
+            .map(|cell| (cell.id.as_str(), cell))
+            .collect();
+        let mut expected_by_id = BTreeMap::new();
+
+        for cell in &manifest.cells {
+            let dir = root.join(&cell.id);
+            for revision in ["base", "head"] {
+                let manifest = dir.join(revision).join("Cargo.toml");
+                let source = dir.join(revision).join("src/lib.rs");
+                assert!(
+                    manifest.is_file(),
+                    "missing repo-shaped manifest {}",
+                    manifest.display()
+                );
+                assert!(
+                    source.is_file(),
+                    "missing repo-shaped source {}",
+                    source.display()
+                );
+                assert!(
+                    !fs::read(&source)
+                        .expect("fixture source is readable")
+                        .is_empty(),
+                    "fixture source must not be empty: {}",
+                    source.display()
+                );
+            }
+
+            let expected: CorpusExpected = read_json(&dir.join("expected.json"));
+            assert_eq!(expected.schema, EXPECTED_SCHEMA, "cell {}", cell.id);
+            assert_eq!(expected.cell, cell.id);
+            assert_eq!(expected.family, cell.family);
+            assert_eq!(expected.legacy_expectation, cell.legacy_expectation);
+            assert_eq!(
+                expected.legacy_positive_sibling,
+                cell.legacy_positive_sibling
+            );
+            assert_eq!(expected.legacy_delta_rationale, cell.legacy_delta_rationale);
+
+            for delta in &expected.repo_backed_records {
+                assert!(
+                    !delta.symbol.trim().is_empty(),
+                    "cell {} has an empty symbol",
+                    cell.id
+                );
+                assert!(
+                    !delta.namespace.trim().is_empty(),
+                    "cell {} has an empty namespace",
+                    cell.id
+                );
+                assert_eq!(
+                    delta.provenance.base_revision,
+                    format!("fixture://{}/base", cell.id)
+                );
+                assert_eq!(
+                    delta.provenance.target_revision,
+                    format!("fixture://{}/head", cell.id)
+                );
+                assert_eq!(delta.provenance.source_kind, "repo_revision_pair");
+
+                let is_unknown = delta.kind == ApiDeltaKind::Unknown
+                    || delta.confidence == ApiConfidence::Unknown;
+                assert_eq!(
+                    delta
+                        .unknown_reason
+                        .as_deref()
+                        .is_some_and(|reason| !reason.trim().is_empty()),
+                    is_unknown,
+                    "cell {} must explain unknowns and only unknowns",
+                    cell.id
+                );
+
+                match delta.kind {
+                    ApiDeltaKind::Added => assert!(delta.after.is_some()),
+                    ApiDeltaKind::Removed => assert!(delta.before.is_some()),
+                    ApiDeltaKind::Changed
+                    | ApiDeltaKind::Relocated
+                    | ApiDeltaKind::VisibilityChanged => {
+                        assert!(delta.before.is_some() && delta.after.is_some())
+                    }
+                    ApiDeltaKind::Unknown => {}
+                }
+            }
+
+            if expected.legacy_expectation == CorpusExpectation::AcceptedZero {
+                assert!(
+                    expected
+                        .legacy_delta_rationale
+                        .as_deref()
+                        .is_some_and(|rationale| !rationale.trim().is_empty()),
+                    "legacy accepted-zero cell {} needs a delta rationale",
+                    cell.id
+                );
+                assert!(
+                    expected.repo_backed_records.iter().all(|delta| {
+                        delta.kind != ApiDeltaKind::Unknown
+                            && delta.confidence == ApiConfidence::Confirmed
+                    }),
+                    "legacy accepted-zero cell {} must encode confirmed repo-backed truth, not invented unknowns",
+                    cell.id
+                );
+            }
+
+            expected_by_id.insert(cell.id.as_str(), expected);
+        }
+
+        for cell in &manifest.cells {
+            if cell.legacy_expectation != CorpusExpectation::AcceptedZero {
+                continue;
+            }
+            let sibling_id = cell.legacy_positive_sibling.as_deref().unwrap_or_else(|| {
+                panic!("accepted zero cell {} lacks a positive sibling", cell.id)
+            });
+            let sibling = by_id.get(sibling_id).unwrap_or_else(|| {
+                panic!(
+                    "accepted zero cell {} names missing sibling {sibling_id}",
+                    cell.id
+                )
+            });
+            assert_eq!(sibling.family, cell.family);
+            assert_eq!(sibling.legacy_expectation, CorpusExpectation::Positive);
+        }
+
+        for family in &manifest.required_families {
+            let family_cells: Vec<_> = manifest
+                .cells
+                .iter()
+                .filter(|cell| cell.family == *family)
+                .collect();
+            assert!(
+                family_cells
+                    .iter()
+                    .any(|cell| !expected_by_id[cell.id.as_str()]
+                        .repo_backed_records
+                        .is_empty()),
+                "required family {family} lacks a repo-backed positive cell"
+            );
+            assert!(
+                family_cells
+                    .iter()
+                    .any(|cell| expected_by_id[cell.id.as_str()]
+                        .repo_backed_records
+                        .is_empty()),
+                "required family {family} lacks a repo-backed negative cell"
+            );
+        }
+
+        let legacy = legacy_breaking_tests();
+        let mapped: BTreeSet<_> = manifest.historical_regressions.keys().cloned().collect();
+        assert_eq!(
+            mapped, legacy,
+            "every legacy breaking regression must be mapped"
+        );
+        for (test, mapping) in &manifest.historical_regressions {
+            let expected = expected_by_id
+                .get(mapping.cell.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "historical regression {test} maps to unknown cell {}",
+                        mapping.cell
+                    )
+                });
+            let actual_polarity = if expected.repo_backed_records.is_empty() {
+                CorpusPolarity::Negative
+            } else {
+                CorpusPolarity::Positive
+            };
+            assert_eq!(
+                mapping.expected_polarity, actual_polarity,
+                "historical regression {test} declares the wrong semantic polarity for {}",
+                mapping.cell
+            );
+            let actual_kinds: BTreeSet<_> = expected
+                .repo_backed_records
+                .iter()
+                .map(|delta| delta.kind.clone())
+                .collect();
+            let declared_kinds: BTreeSet<_> =
+                mapping.expected_delta_kinds.iter().cloned().collect();
+            assert_eq!(
+                mapping.expected_delta_kinds.len(),
+                declared_kinds.len(),
+                "historical regression {test} repeats a declared delta kind"
+            );
+            assert_eq!(
+                declared_kinds, actual_kinds,
+                "historical regression {test} declares delta kinds that disagree with {}",
+                mapping.cell
+            );
+        }
     }
 }

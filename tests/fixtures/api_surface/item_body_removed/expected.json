@@ -1,0 +1,24 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "item_body_removed",
+  "family": "item_body",
+  "legacy_expectation": "accepted_zero",
+  "legacy_positive_sibling": "item_opener_removed",
+  "legacy_delta_rationale": "the diff-only detector missed a public field removal when the item opener was unchanged",
+  "repo_backed_records": [
+    {
+      "kind": "removed",
+      "symbol": "field",
+      "namespace": "crate::Public",
+      "before": "pub field: u8",
+      "after": null,
+      "provenance": {
+        "base_revision": "fixture://item_body_removed/base",
+        "target_revision": "fixture://item_body_removed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

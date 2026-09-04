@@ -1,0 +1,23 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "function_removed",
+  "family": "removal",
+  "legacy_expectation": "positive",
+  "legacy_positive_sibling": null,
+  "repo_backed_records": [
+    {
+      "kind": "removed",
+      "symbol": "removed",
+      "namespace": "crate",
+      "before": "pub fn removed()",
+      "after": null,
+      "provenance": {
+        "base_revision": "fixture://function_removed/base",
+        "target_revision": "fixture://function_removed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

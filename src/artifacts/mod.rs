@@ -6,6 +6,7 @@ mod dashboard;
 pub mod parsers;
 pub(crate) mod report;
 pub(crate) mod signal;
+pub use signal::{api_delta, api_surface, revision_source};
 
 mod context_artifacts;
 mod findings;
@@ -163,6 +164,7 @@ struct MergeGateInput<'a> {
     heuristics: Option<&'a HeuristicsResult>,
     inline: &'a InlineFindingsSummary,
     breaking: &'a [BreakingFinding],
+    rust_api_delta: Option<&'a api_delta::ApiArtifactView>,
     coverage: &'a CoverageDelta,
     diffs: &'a [Diff],
     skipped_checks: &'a [crate::checks::SkippedCheck],
@@ -180,6 +182,7 @@ pub(crate) struct DashboardContextInput<'a> {
     heuristics: Option<&'a HeuristicsResult>,
     inline: &'a InlineFindingsSummary,
     breaking: Vec<BreakingFinding>,
+    rust_api_delta: Option<api_delta::ApiArtifactView>,
     coverage: CoverageDelta,
     diff_dir: &'a Path,
     skipped_checks: Vec<crate::checks::SkippedCheck>,
@@ -376,8 +379,29 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let patch_texts = generate_full_patch(&diff_dir, &repo, diffs)?;
     stage_timings.push(finish_timing(emit_human_stdout, "full.patch", t));
 
-    // Heuristics generation early for MERGE_GATE (bind them to the truth pipeline)
-    if let Some(api) = signal::generate_public_api_diff(&quality_dir, &patch_texts)? {
+    // Rust API truth is computed once from the exact revision trees named by
+    // each Diff. The same delta feeds both artifact views and every verdict
+    // projection. JS/TS remains on its legacy diff parser behind a structural
+    // language boundary.
+    let has_rust_scope = config.profile.has_cargo
+        || diffs
+            .iter()
+            .flat_map(|diff| diff.files.iter())
+            .any(|file| file.path.ends_with(".rs"));
+    let rust_api_delta = has_rust_scope
+        .then(|| api_delta::compare_rust_api_revisions(&repo, diffs))
+        .transpose()?
+        .flatten();
+    let rust_breaking_view = rust_api_delta
+        .as_ref()
+        .map(api_delta::breaking_changes_view);
+    let rust_public_api_view = rust_api_delta.as_ref().map(api_delta::public_api_diff_view);
+    let js_ts_public_api = signal::analyze_js_ts_public_api_diff(&patch_texts);
+    if let Some(api) = signal::write_public_api_diff(
+        &quality_dir,
+        js_ts_public_api,
+        rust_public_api_view.as_ref(),
+    )? {
         all_checks.push(api);
     }
     if let Some(uns) = signal::generate_unsafe_audit(&context_dir, diffs, &repo)? {
@@ -407,8 +431,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     generate_checks_log(&quality_dir, &all_checks)?;
     signal::generate_checks_errors_log(&quality_dir, &all_checks)?;
     // Compute breaking changes once, reuse for file-write + dashboard
-    let breaking_findings = signal::analyze_all_breaking_changes(&patch_texts);
-    signal::write_breaking_changes(&quality_dir, &breaking_findings)?;
+    let mut breaking_findings = signal::analyze_js_ts_breaking_changes(&patch_texts);
+    breaking_findings.extend(signal::analyze_rust_env_requirements(&patch_texts));
+    signal::write_breaking_changes_with_api(
+        &quality_dir,
+        rust_breaking_view.as_ref(),
+        &breaking_findings,
+    )?;
     // Compute coverage signal ONCE — all consumers (text, gate, dashboard, report)
     // use this same result to guarantee consistency.
     let coverage_signal =
@@ -501,6 +530,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         heuristics,
         inline: &inline_summary,
         breaking: &breaking_findings,
+        rust_api_delta: rust_breaking_view.as_ref(),
         coverage: &coverage_delta,
         diffs,
         skipped_checks: &skipped_checks,
@@ -635,6 +665,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         heuristics,
         inline: &inline_summary,
         breaking: breaking_findings,
+        rust_api_delta: rust_breaking_view,
         coverage: coverage_delta.clone(),
         diff_dir: &diff_dir,
         // Cloned: PROVENANCE.json records the same skips further down, and the

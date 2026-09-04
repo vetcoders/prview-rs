@@ -2189,7 +2189,7 @@ mod tests {
         let mut config = rust_config(true, true, true);
         config.execution_mode = ExecutionMode::Deep;
         config.security_full = true;
-        config.apply_gate_profile();
+        config.apply_gate_profile(crate::policy::engine::EnforcementMode::Advisory);
 
         let checks = get_checks_for_profile(&config);
         let check_names: Vec<String> = checks

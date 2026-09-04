@@ -138,6 +138,7 @@ pub(super) fn effective_inline_gate_class(
 pub(super) struct InlineGateOutcome {
     pub severity: crate::policy::PolicySeverity,
     pub blocking: bool,
+    pub class: GateClass,
 }
 
 pub(super) fn record_blocking_issue(
@@ -166,7 +167,11 @@ pub(super) fn apply_inline_gate_outcome(
             format!("INLINE_FINDINGS ({})", inline.status),
         );
     }
-    InlineGateOutcome { severity, blocking }
+    InlineGateOutcome {
+        severity,
+        blocking,
+        class,
+    }
 }
 
 pub(super) fn gate_class_for_check(status: crate::checks::CheckStatus) -> GateClass {
@@ -275,7 +280,11 @@ pub(super) use crate::check_id::check_id_from_name;
 pub(super) fn build_heuristics_gate_check(
     config: &Config,
     heuristics: Option<&HeuristicsResult>,
-) -> (serde_json::Value, Option<String>) {
+) -> (
+    serde_json::Value,
+    Option<String>,
+    crate::policy::engine::EnforcementDisposition,
+) {
     use serde_json::json;
     let result = super::build_heuristics_check(heuristics, config);
     let evaluation = crate::policy::engine::PolicyEngine::new(config).evaluate_run(&result);
@@ -288,6 +297,9 @@ pub(super) fn build_heuristics_gate_check(
     } else {
         None
     };
+    let disposition = crate::policy::engine::EnforcementDisposition::from_evaluations(
+        std::slice::from_ref(&evaluation),
+    );
 
     let check = json!({
         "id": evaluation.check_id,
@@ -308,7 +320,7 @@ pub(super) fn build_heuristics_gate_check(
         "log": "20_quality/heuristics_loctree.log",
     });
 
-    (check, blocking_issue)
+    (check, blocking_issue, disposition)
 }
 
 pub(super) fn generate_inline_findings(

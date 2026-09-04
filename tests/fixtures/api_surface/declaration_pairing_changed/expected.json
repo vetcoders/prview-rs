@@ -1,0 +1,23 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "declaration_pairing_changed",
+  "family": "declaration_pairing",
+  "legacy_expectation": "positive",
+  "legacy_positive_sibling": null,
+  "repo_backed_records": [
+    {
+      "kind": "changed",
+      "symbol": "paired",
+      "namespace": "crate",
+      "before": "pub fn paired(x: u8)",
+      "after": "pub fn paired(x: u16)",
+      "provenance": {
+        "base_revision": "fixture://declaration_pairing_changed/base",
+        "target_revision": "fixture://declaration_pairing_changed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

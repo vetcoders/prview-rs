@@ -69,14 +69,17 @@ project-specific artifacts (for example bundler output).
 Tunes how the merge-gate verdict reacts to structural signals.
 
 * **`breaking_escalation`** (default `true`): when a genuine breaking API change
-  is detected (a removed public symbol, a changed public signature, or a new
-  required environment variable), the verdict is raised to at least
+  is detected (a removed, changed, relocated, or visibility-changed public Rust
+  fact; a legacy JS/TS break; or a new required environment variable), the verdict is raised to at least
   `CONDITIONAL`. It never forces a `BLOCK` on its own and never lowers a verdict
   that is already `CONDITIONAL`/`BLOCK` for another reason. Set to `false` to
   keep the breaking findings visible as an **informational caveat only**, with
   no effect on the verdict. The escalation and its reason
   (`breaking API change detected: <n> finding(s)`) appear identically on the
   console summary, `report.json`'s gate block, and `MERGE_GATE.json`'s decision.
+  Added-only Rust API touch is informational. Typed unknown Rust regions are a
+  confidence failure rather than a confirmed break: they require review even
+  when breaking escalation is disabled, but never force `BLOCK` by themselves.
 
 ---
 

@@ -668,6 +668,35 @@ are being written; doing so could report a different reason from the run that
 actually happened. Pre-run skip provenance remains in `PROVENANCE.json` as
 described above.
 
+`MERGE_GATE.json` schema 2.3 adds a typed enforcement layer beside those stable
+decision axes. `decision.enforcement_disposition` is emitted from effective
+policy evaluations, legacy breaking ratchets, and the repo-backed Rust
+`ApiDelta`; it never re-ranks canonical `PASS` / `CONDITIONAL` / `BLOCK` or
+`allow_merge`. Consequently a pack with only warnings can remain a canonical
+`PASS` while carrying `warnings_only`. Pure Rust API additions are neutral;
+confirmed/potential breaking facts (when the existing escalation knob is on)
+and unknown/degraded analysis raise `review_required`. The Rust backend keeps
+using the language-neutral `RevisionFileSource` substrate described below, and
+the legacy JS/TS analyzer remains unchanged.
+
+The 2.3 proof is deliberately complete at the artifact boundary. Each check row
+states execution, outcome, class, policy conclusion, confidence, merge impact,
+severity, and blocking; `inline_findings` additionally states its effective
+class and per-source enforcement disposition. Typed quality-failure details
+prove the one legal pre-existing downgrade of a raw failure. The validator and
+one shared CLI/MCP reader cross-check those relations, so a missing or
+contradictory additive field becomes review-required uncertainty rather than a
+warning-only permission. Older packs remain readable, but a schema through 2.2
+cannot opt into the new warning exception.
+
+Exit policy is an adapter after that read boundary. `prview gate --strict`
+accepts `clean` and `warnings_only`, rejects `review_required` with exit 2, and
+keeps `block` at exit 1; its explicit `--fail-on-warnings` lane rejects the
+canonical warning tally as exit 2. Top-level `prview --ci` intentionally keeps
+the historical quality/block contract (exit 1 for Block or failed quality),
+with its own `--fail-on-warnings` opt-in. The two commands therefore share typed
+facts and parsing, but not an accidentally conflated enforcement mode.
+
 The worktree state is frozen **per run**, and a `--watch` iteration is a run:
 each iteration re-reads the working tree before its checks, so the pack it emits
 describes the tree that iteration analysed rather than the tree as it looked
@@ -706,7 +735,7 @@ The core artifact generator. Builds the numbered directory layout
 - Root: `PR_REVIEW.md`, `dashboard.html`, `artifacts.zip`
 - `00_summary/`: `RUN.json`, `PROVENANCE.json`, `FAILURES_SUMMARY.md`, `MANIFEST.json`, `SANITY.json`, `MERGE_GATE.json/md`, metadata
 - `10_diff/`: `full.patch`, `per-commit-diffs/` (batching + thematic labels), `per-file-diffs/` (hotspots)
-- `20_quality/`: per-check `*.result.json` + `*.log`, `full-checks.log`, `checks-errors.log`, `coverage-delta.txt`, `BREAKING_CHANGES.md`
+- `20_quality/`: per-check `*.result.json` + `*.log`, `full-checks.log`, `checks-errors.log`, `coverage-delta.txt`, `PUBLIC_API_DIFF.json/md`, `BREAKING_CHANGES.json/md`
 - `30_context/`: optional `INLINE_FINDINGS.sarif`, `changed-tests.txt`, profile-specific (`cargo-tree`, `tsc-trace`, `eslint`, `vitest`)
 - `latest` symlink in the parent dir
 
@@ -716,6 +745,227 @@ Domain-specific signal generators, each producing an artifact **only when** it
 has meaningful data. Originally a single 3400+ LOC `signal.rs` file, now split
 into 16 focused modules under `src/artifacts/signal/`. The facade (`mod.rs`)
 re-exports everything public, so callers continue to use `signal::*` unchanged.
+
+The language-neutral revision substrate is the one intentionally public seam:
+`prview::artifacts::revision_source`. It binds every exact-tree or tracked
+working-tree-overlay entry/read to explicit provenance. Overlay inventory is the
+path-sorted union of the target tree and overlay-only paths reported by tracked
+Git status; unrelated untracked paths are neither inventoried nor readable.
+The 0.8 Rust language backend is exposed narrowly as
+`prview::artifacts::api_surface`; its production comparison seam is exposed as
+`prview::artifacts::api_delta`, while the rest of the signal facade remains
+crate-private. `snapshot_rust_api(&dyn RevisionFileSource)` creates one
+`RustApiSnapshot` only. It does not compare revisions, write artifacts, affect
+policy, or replace the production diff scanner.
+
+`RustApiSnapshot` carries the source provenance and path-sorted records for
+library crates, parsed module variants, reachable module aliases, externally
+reachable items, explicit reexports, and guarded typed unknowns. A crate or
+module receives `RustSourceCertainty::Confirmed` only after its exact live
+regular UTF-8 source has been read through `RevisionFileSource` and the complete
+file has parsed successfully. Active recursion and completed source outcomes are
+separate state: successful variants may be reused, while failed reads, UTF-8
+decodes, and parses stay failed on every later lookup and can never manufacture
+a crate or module. `Added` and `RenamedFrom` roots/modules consume the exact
+revision bytes like other live entries; there is no checkout or HEAD fallback.
+Evidence paths, source states, private origins, and provenance remain traceable
+but are separate from external semantic identity.
+
+Library discovery matches the exact `Cargo.toml` basename. It validates every
+consumed Cargo field (`package.name`, `[lib]`, `lib.name`, `lib.path`,
+`lib.proc-macro`, and `package.autolib`) instead of inventing defaults for an
+invalid schema. Package and explicit library names must also be non-empty valid
+Cargo/crate identifiers; a TOML string alone is not semantic validation. A
+valid virtual workspace is non-crate; an implicit library is
+admitted only when `autolib != false` and its live default `src/lib.rs` can be
+read and parsed. Repository-relative paths are normalized fallibly: absolute,
+prefixed, non-UTF-8, and escaping paths become manifest/source unknowns rather
+than being remapped. Missing, renamed-away, deleted, non-regular, non-UTF-8,
+unreadable, or parse-failed manifests and roots remain typed unknowns.
+
+Reachability starts at each library root. Ordinary inline modules and
+`mod foo;` files (`foo.rs` or `foo/mod.rs`) are walked as whole syntax trees.
+Candidate selection distinguishes live (`Present`, `Added`, `RenamedFrom`)
+sources from unavailable old-side states, and a recursion stack is distinct
+from stable `(crate, source, module path, cfg guard)` variant identity. Safe,
+single-literal `#[path = "..."]` modules are source-backed. The walker keeps
+the physical declaring-file directory separate from the logical module
+directory: a direct `#[path]` in `a.rs` uses the file's directory, ordinary
+`mod child;` uses `a/`, and an inline module's own `#[path]` becomes the base for
+its children. Conditional `cfg_attr(..., path = ...)` cannot be selected without
+a feature/target matrix, so it emits a guarded path unknown and suppresses an
+arbitrary default candidate. Malformed, multiple, escaping, or unavailable
+paths are likewise unknowns. Both ordinary module
+candidates, neither candidate, non-regular/read-failed sources, parse failures,
+and actual active cycles are likewise explicit unknowns. Rust compiler behavior
+for `#[path]` on non-`mod.rs` external modules may evolve; the backend records
+the currently tested declaring-file rule and does not speculate beyond an
+executable current-rustc result.
+
+A textual `pub` item is external only when every enclosing module is reachable.
+An explicit public reexport can expose an item or the public-edge descendants of
+a public child below a private implementation parent. Every module declaration
+retains its parent-relative visibility separately from absolute reachability;
+therefore a private module cannot be reexported illegally and a private child
+cannot leak through a legal alias. Positive admission and private veto are
+separate proofs. A public declaration contributes only when its guards are
+contained in the symbol's effective guard lineage. Any private proof for the
+same module segment vetoes that positive unless `guards_proven_disjoint` proves
+the regions disjoint; a different feature predicate is potentially overlapping,
+not a disjointness proof. An overlap whose residual public region cannot be
+represented emits guarded `AmbiguousReexport` and no broad `Confirmed` record.
+A public Unix declaration may therefore remain visible beside a private Windows
+variant, while public `feature = "a"` and private `feature = "b"` do not produce
+an overbroad positive when both features can be active. Item aliases, internal
+resolver-only module aliases, externally reachable module aliases (including
+nested `self as alias`), constructors, and chains through `crate`, `self`, and
+`super` resolve in one finite stable-set closure. Internal aliases never enter
+the semantic snapshot.
+Declaration and every intermediate reexport guard are merged before an alias
+enters the graph. Relative/root candidates that source-level resolution cannot
+select uniquely become `AmbiguousReexport`, not two positives. Module/type,
+Value, and Macro candidates for one `use` leaf are resolved independently, so
+success or ambiguity in one namespace cannot erase a valid sibling namespace.
+Ambiguous module and symbolic alias identities become monotonic tombstones. The
+resolver retains the complete set of normalized origins for each module-alias
+identity and for each symbolic identity in Type, Value, and Macro independently.
+It records every overlapping conflicting pair in deterministic order; each
+pair's guards describe that pair's overlap, rather than combining unrelated
+alternative origins into one false conjunction. A tombstoned identity remains
+eligible for origin collection but cannot contribute a positive, so later
+declarations complete the conflict component without resurrecting the alias.
+
+Each new tombstone restarts projection from separately retained, source-backed
+items and use edges, clearing all derived module aliases, symbolic aliases,
+projected items, and reexports first. Consequently invalidation follows the
+causal proof graph rather than the output path: a result renamed to `Other` or
+through multiple aliases disappears when its ambiguous root disappears. The
+old shared 128-pass constant is not part of the contract. Completion is bounded
+by a measure derived from the finite non-glob use-leaf graph: a leaf can own one
+module-alias identity and one identity in each of the three Rust namespaces,
+and a continuing pass must add a monotonic tombstone or a previously absent
+leaf-to-leaf derived relation. If implementation drift ever exhausts that
+graph-derived budget without the explicit no-rebuild/no-progress postcondition,
+the resolver clears every derived positive and emits typed `ResolutionLimit`
+instead of returning a partial or silently truncated API.
+
+Guard regions are assumed to overlap unless the backend has an explicit proof
+of disjointness. The currently proved family is the tested Unix/Windows target
+family split; different feature strings and composite `all`/`any` expressions
+are not disjointness proof. Conflicting overlapping origins suppress all
+positives for that external key and emit deterministic pairwise guarded
+ambiguities for the complete conflict component. Malformed or
+unsupported cfg syntax inherits all already-proved outer guards, emits
+`CfgPredicate`, and suppresses the affected item/module/reexport. Documentation
+and lint-only `cfg_attr` branches are semantic no-ops; conditional cfg, shape,
+ABI, path, and transforming branches retain their distinct meaning. Globs, true
+cycles, external/prelude paths, `include!`, and unexpanded macro-generated items
+remain typed unknowns. A reachable `pub extern crate` is likewise retained as
+guarded `UnsupportedExternResolution` until external/prelude resolution exists;
+private or unreachable declarations do not create external semantic surface.
+Semantic proof comparison includes the public unknown's kind, crate/module
+location, exact evidence, and guards, while continuing to exclude source paths,
+provenance, and private reexport target/origin spelling.
+
+Item identity is `crate + external module path + Rust namespace + NFC external
+name`. Value, type, and macro namespaces are separate. Tuple and unit struct
+constructors also occupy Value; named-field structs remain Type-only.
+`macro_export` is projected to the crate-root Macro namespace, with docs,
+rustfmt, and lint attributes normalized away. Proc-macro crate exports use their
+external macro/derive names only for public functions declared at crate root;
+private or nested declarations become precise unknowns. Unresolved transforming
+attributes are checked on modules, impls and associated items, foreign
+blocks/items, macro declarations, and ordinary public projections. They
+suppress every dependent positive claim and emit exact `MacroGeneratedItems`
+evidence. Foreign functions/statics inherit the parent ABI, safety, and relevant
+attributes.
+
+Contracts are emitted from normalized `syn` ASTs. Function/default bodies and
+private member types are excluded, while ABI, qualifiers,
+generics/bounds/where clauses, return types, public fields with structural tuple
+indices, enum variants/discriminants, trait headers and associated items, type
+aliases, public constants/statics, and relevant attributes remain. Inherent
+impls are collected independently of module reachability, resolve owners through
+same-crate `self`/`super`/`crate` paths, and retain self type, specialization,
+impl generics/bounds/where clauses, and impl/item attributes before projection
+through every reachable type alias. Unprovable owners are typed unknowns.
+Documentation, rustfmt, and lint-control attributes are recursively discarded;
+shape/ABI attributes remain. Raw identifiers and NFC-equivalent identifiers
+share semantic names. Nested `cfg`/`cfg_attr` use the same recursive sorted and
+deduplicated `all(...)`/`any(...)` canonicalization as top-level guards, without
+evaluating host configuration.
+
+#### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
+
+The W2-01 backend compares each exact base and target
+`RustApiSnapshot` exactly once. `ApiDelta` is the single typed owner of added,
+removed, changed, relocated, visibility-changed, and unknown facts. Identity is
+crate + external module path + Rust namespace + normalized name + compatible
+cfg region. Pairing is one-to-one and conservative: ambiguous identities or
+relocations become typed unknowns, an unknown snapshot region suppresses a
+confirmed removal/change, and a proven relocation cannot also appear as an
+addition/removal. Parsed ordinary declarations include private counterparts
+only as evidence for a proven public/non-public transition; externally
+reachable `items` remain the API surface.
+
+Exact identity is grouped on both sides before any fact is consumed: only a
+`1 ↔ 1` component may become a confirmed change, while wider components are
+consumed as deterministic typed ambiguity, including one-sided duplicate
+components before the final add/remove pass. Cfg-region changes are paired only
+when the guards may overlap. The comparison reuses the snapshot resolver's
+single conservative disjointness proof (currently Unix versus Windows), so
+different feature guards remain potentially co-active. One shared pair-certainty
+check tests both identities and both source paths against the unknown regions
+from both revisions before any exact, cfg, relocation, or visibility fact can
+be confirmed. A glob, include, source-parse, or other relevant unknown therefore
+blocks a contradictory confirmed fact at either the source or destination.
+Standalone unknown findings retain their source side, source path, and revision
+provenance. Finding IDs preserve Rust identifier case and serialize the complete
+semantic identity, including both sides' cfg regions, contracts, and typed
+unknown provenance; legal ambiguous input is data, never an assertion failure.
+
+`compare_rust_api_revisions` constructs snapshots only from the exact
+`Diff.base_commit_id` and `Diff.target_commit_id` Git trees. It never reads a
+checkout, working-tree overlay, or patch fallback. Duplicate exact base/target
+OID pairs are coalesced in stable first-seen order before either snapshot is
+built; distinct multi-base comparisons each retain their own revision evidence
+and comparison-qualified finding ID.
+`breaking_changes_view` and `public_api_diff_view` are pure deterministic
+projections over the same delta. Their shared counts, IDs, confidence, evidence,
+unknown reasons, and provenance therefore cannot drift through independent
+re-pairing.
+
+Production keeps the existing artifact filenames and old
+`PUBLIC_API_DIFF.json` added/removed/changed rows, then adds the complete Rust
+view under `rust_api_delta`. `BREAKING_CHANGES.json` is the lossless Rust view;
+both Markdown files are presentations of that same data. MERGE_GATE and
+`report.json` serialize the same view directly. Confirmed Removed, Changed,
+Relocated, and VisibilityChanged facts use the existing `breaking_escalation`
+knob; Added-only is informational. Unknown facts degrade confidence and require
+review without changing policy defaults or becoming a confirmed break.
+
+`tests/fixtures/api_surface/phase_a_parity.json` is the deterministic,
+byte-locked v3 machine ledger for all 32 W0 positive/mutant cells. Its test
+executes both legacy Rust analyzers on the same normalized repo-shaped patch,
+executes the repo-backed delta on the exact base/head fixture trees, and keeps
+the complete structured facts rather than polarity labels: multiplicity,
+namespace, cfg, contracts, before/after sides, provenance, evidence,
+confidence, and unknown reasons survive serialization. Five controlled cases
+byte-lock include-macro, glob-reexport, source-parse, namespace/cfg
+multiplicity, and zero-fact revision provenance.
+
+Operator-row relationships are derived from executed structured observations:
+3 genuine legacy blind spots, 6 inaccurate historical-fixture transfers, and
+23 current W0 fixtures that match their declared mapping. The exact six
+transferred mappings use stable typed scenario IDs and one patch helper shared
+by the original legacy regression test and the parity harness. Each ledger row
+stores the historical scenario's expected fact kinds separately from its full
+actual legacy facts, as well as the distinct current W0 legacy and repo-backed
+facts. This is the deliberately bounded historical proof surface; the remaining
+23 matches are derived from current W0 actual-versus-declared data. Recommended
+disposition and the actual Phase B product effect remain separate operator
+decision fields. Historical regressions are executed, not silently re-baselined
+by the W0 ledger.
 
 #### signal/mod.rs — re-export facade
 
@@ -742,16 +992,27 @@ Types and functions used across multiple signal modules:
 
 #### signal/breaking.rs — breaking changes detection
 
-Heuristic scan of diffs for API-breaking changes:
+Legacy diff scan retained only for JavaScript/TypeScript API changes and the
+separate non-API Rust environment-requirement signal:
 
 - `BreakingRisk` enum (`High`, `Medium`, `Low`) — publicness heuristic based on file path depth and barrel/re-export file detection
 - `BreakingFinding` struct with `BreakingKind` (`RemovedSymbol`, `RelocatedSymbol`, `ChangedSignature`, `NewEnvRequirement`)
-- `analyze_all_breaking_changes(patches)` — returns all findings from multiple patch texts
-- `write_breaking_changes(dir, findings)` — writes `BREAKING_CHANGES.md` if findings are non-empty
+- `analyze_js_ts_breaking_changes(patches)` — legacy API facts after structural JS/TS-only filtering
+- `analyze_rust_env_requirements(patches)` — added-line env markers only; cannot emit Rust API facts
+- `write_breaking_changes_with_api(...)` — writes lossless Rust JSON and the compatible Markdown view
 
-Scans for removed `pub` symbols (fn, struct, enum, trait, type, const, static),
-JS/TS `export` removals, signature changes, and new environment variable
-requirements. Only scans code files (not tests, config, docs).
+Production Rust public symbols no longer enter this diff-only API analyzer.
+JS/TS `export` removals/signature changes remain here. Rust env requirements are
+preserved by a dedicated parser because they are not API surface facts. Only
+code files are scanned (not tests, config, docs). The shared patch boundary is
+side-aware for renames: JS/TS→JS/TS keeps both sides, Rust→JS/TS keeps only the
+added JS/TS side, JS/TS→Rust keeps only the removed JS/TS side, and a non-JS
+pair is discarded. Quoted Git paths are decoded structurally before the
+normalized legacy header is emitted. The decoded `diff --git` paths own section
+identity: `---`/`+++` markers must match them exactly, `/dev/null` requires the
+corresponding new/deleted-file mode, and a hunk without both markers is
+discarded fail-closed. Marker-free metadata-only rename/copy and mode-only
+add/delete sections remain valid.
 
 Remove + re-add pairing (applies to every `pub` symbol kind above, not just
 functions): when a declaration is removed and re-added for the same name and
@@ -761,14 +1022,12 @@ silent re-addition. A re-add in a *different* file is a module move and becomes
 `RelocatedSymbol`, which is reported but deliberately excluded from breaking
 escalation.
 
-**Accepted limit (deferred to 0.8).** The scan sees only the declaration LINES a
-diff emitted. An enum variant, a trait method or a struct field removed below an
-unchanged `pub enum` / `pub trait` / `pub struct` opener is a breaking change
-prview does not report: the opener was never emitted as `-`/`+`, so nothing
-enters pairing to begin with. Reporting it needs the item's body from BOTH
-commits, which a diff-only scanner does not have — the fix is the repo-backed
-breaking analysis planned for 0.8, and this limit was reviewed and accepted
-deliberately rather than papered over with a deeper heuristic.
+The old Rust limitation below is historical only: a diff-only scanner could not
+see an enum variant, trait method, or public struct field removed beneath an
+unchanged item opener. Production Rust now reads both exact repository trees,
+so those contracts participate in `ApiDelta`. The bounded declaration-line
+logic that follows remains relevant only to the retained JS/TS legacy backend
+and test-only historical compatibility fixtures.
 
 Declarations are compared on their FULL text, continuation lines joined, up to
 `MAX_DECL_CONTINUATION_LINES` (32) — a runaway bound for static bodies and
@@ -1293,9 +1552,12 @@ target commit and builds a set of line numbers inside test blocks, using string/
 brace counting. This correctly classifies additions inside pre-existing test modules
 even when the `#[cfg(test)]` annotation is outside the patch hunk.
 
-#### signal/public_api.rs — heuristic public API surface diff
+#### signal/public_api.rs — hybrid public API artifact writer
 
-Heuristic diff of the public API surface exposed by changed files:
+The writer preserves the legacy top-level JSON fields while embedding the full
+repo-backed Rust `ApiArtifactView` additively. Rust findings are projected only
+for old-reader compatibility; the embedded view is authoritative. Legacy
+analysis receives JS/TS patch sections only.
 
 - `PublicSymbol` struct — name, kind (`Fn`, `Struct`, `Enum`, `Trait`, `Type`, `Const`, `Static`),
   file path, and whether it was added or removed
@@ -1303,8 +1565,9 @@ Heuristic diff of the public API surface exposed by changed files:
   `pub` symbol declarations, then pairs added/removed names to identify renames and
   signature changes. Produces `PUBLIC_API_DIFF.json`.
 
-Only considers Rust `pub` symbols at this time. Non-code files (tests, config, assets)
-are excluded. Results are aggregated per file and sorted by kind for readability.
+Confirmed Rust facts include namespace, cfg, before/after contracts, source
+paths, provenance, confidence, evidence, and stable IDs. JS/TS remains a bounded
+text heuristic. Non-code files (tests, config, assets) are excluded.
 
 #### signal/deps.rs — dependency manifest diffing
 

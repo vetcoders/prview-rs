@@ -1,0 +1,9 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "cfg_operand_reordered",
+  "family": "cfg",
+  "legacy_expectation": "accepted_zero",
+  "legacy_positive_sibling": "cfg_guard_changed",
+  "legacy_delta_rationale": "the legacy detector accepted reordered commutative cfg operands",
+  "repo_backed_records": []
+}

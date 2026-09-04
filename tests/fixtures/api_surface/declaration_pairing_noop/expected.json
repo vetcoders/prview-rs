@@ -1,0 +1,8 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "declaration_pairing_noop",
+  "family": "declaration_pairing",
+  "legacy_expectation": "negative",
+  "legacy_positive_sibling": null,
+  "repo_backed_records": []
+}

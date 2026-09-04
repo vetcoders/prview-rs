@@ -265,6 +265,7 @@ impl PrviewMcp {
                     "merge_recommendation": decision.merge_recommendation,
                     "allow_merge": decision.allow_merge,
                     "verdict": decision.verdict,
+                    "enforcement_disposition": decision.enforcement_disposition,
                     "blocking_issues": decision.blocking_issues,
                     "caveats": decision.caveats,
                     "gates": read::read_gates(&resolved.run_dir),

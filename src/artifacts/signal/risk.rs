@@ -126,9 +126,9 @@ const DOMAIN_ZONES: &[(&str, &[&str])] = &[
 /// take the first 10, but verdict-level aggregation must see the full set.
 ///
 /// Test-only convenience wrapper: every runtime caller goes through
-/// `compute_file_risk_scores_with_root` (context_artifacts.rs, merge_gate.rs)
-/// with an explicit repo root; only the unit tests below and the signal
-/// facade test exercise the rootless form.
+/// `compute_file_risk_scores_with_api` with the canonical Rust API view and an
+/// explicit repo root; only the unit tests below and the signal facade test
+/// exercise the rootless form.
 #[cfg(test)]
 pub fn compute_file_risk_scores(
     diffs: &[Diff],
@@ -139,10 +139,24 @@ pub fn compute_file_risk_scores(
 }
 
 /// Compute risk scores with optional repo root for path normalization.
+#[cfg(test)]
 pub fn compute_file_risk_scores_with_root(
     diffs: &[Diff],
     coverage: &CoverageDelta,
     breaking: &[BreakingFinding],
+    repo_root: Option<&Path>,
+) -> Vec<FileRiskScore> {
+    compute_file_risk_scores_with_api(diffs, coverage, breaking, None, repo_root)
+}
+
+/// Production risk projection with the canonical Rust API view. Rust paths are
+/// consumed directly from lossless findings instead of recreating legacy
+/// `BreakingFinding` rows.
+pub fn compute_file_risk_scores_with_api(
+    diffs: &[Diff],
+    coverage: &CoverageDelta,
+    breaking: &[BreakingFinding],
+    rust_api_delta: Option<&super::api_delta::ApiArtifactView>,
     repo_root: Option<&Path>,
 ) -> Vec<FileRiskScore> {
     // Dedup by path: with multiple bases the same file appears once per diff,
@@ -161,7 +175,23 @@ pub fn compute_file_risk_scores_with_root(
         .iter()
         .map(|p| p.src_path.as_str())
         .collect();
-    let breaking_paths: HashSet<&str> = breaking.iter().map(|b| b.file.as_str()).collect();
+    let mut breaking_paths: HashSet<&str> = breaking.iter().map(|b| b.file.as_str()).collect();
+    if let Some(view) = rust_api_delta {
+        for finding in &view.findings {
+            if matches!(finding.kind, super::api_delta::ApiDeltaKind::Added) {
+                continue;
+            }
+            if let Some(before) = &finding.before {
+                breaking_paths.insert(before.source_path.as_str());
+            }
+            if let Some(after) = &finding.after {
+                breaking_paths.insert(after.source_path.as_str());
+            }
+            if let Some(source) = &finding.unknown_source {
+                breaking_paths.insert(source.source_path.as_str());
+            }
+        }
+    }
 
     let security_keywords = [
         "auth",

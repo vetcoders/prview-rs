@@ -621,6 +621,7 @@ pub struct NormalizedDecision {
     pub merge_recommendation: String,
     pub allow_merge: bool,
     pub verdict: String,
+    pub enforcement_disposition: crate::policy::engine::EnforcementDisposition,
     pub blocking_issues: Vec<String>,
     pub caveats: Vec<String>,
     pub base_used: Vec<String>,
@@ -660,6 +661,8 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // read-back surface and is accepted silently.
     let schema_caveat = crate::gate::check_merge_gate_schema_field(value.get("schema_version"))
         .map_err(|e| ToolError::new(error_class::STORAGE_CORRUPT, e.to_string()))?;
+    let enforcement_required =
+        crate::gate::schema_requires_enforcement_disposition(value.get("schema_version"));
 
     // A pack with no `schema_version` predates the field and its ROOT is the
     // decision — the same legacy tolerance the CLI reader and the contract keep.
@@ -740,6 +743,21 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     )
     .and_then(|v| v.as_array())
     .map(|issues| issues.len());
+    let mut enforcement_caveats = Vec::new();
+    let stated_enforcement_disposition = crate::gate::read_enforcement_disposition(
+        decision.get("enforcement_disposition"),
+        enforcement_required,
+        &mut enforcement_caveats,
+    );
+    let mut check_caveats = Vec::new();
+    let warning_tally = crate::gate::read_pack_warning_tally(
+        value.get("checks"),
+        value.get("inline_findings"),
+        value.get("policy"),
+        decision.get("quality_failure_details"),
+        enforcement_required,
+        &mut check_caveats,
+    );
 
     // Whether any signal was present and could not be TYPED. Captured before
     // the vocabulary caveats below join the same list, because the two are
@@ -816,10 +834,16 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // This is the CLI's rule, mirrored, because a pack this adapter approved
     // while the CLI held it is the same split the reader parity work closed.
     // (Read above, with the other typed signals.)
-    let quality_rank = match raw_quality_pass {
-        Some(false) => Some(2),
-        _ => None,
-    };
+    let quality_rank = (raw_quality_pass == Some(false)
+        || warning_tally.has_new_quality_failure_signal)
+        .then_some(2);
+    if warning_tally.has_new_quality_failure_signal && raw_quality_pass != Some(false) {
+        unknown_signal_caveats.push(
+            "quality_failure_inconsistency: typed introduced/mixed/unclassified failure details \
+             contradict quality_pass; normalized to false"
+                .to_string(),
+        );
+    }
     // Same rule on the confidence axis: only `degraded`/`incomplete` rule `PASS`
     // out and therefore rank. `complete` is a precondition of `PASS`, not a
     // grant of it, so it stays silent like `quality_pass: true`.
@@ -832,8 +856,10 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     // `policy_allow_merge = blocking_issues.is_empty()`. Neither says anything
     // permissive: "policy did not hard-block" is explicitly NOT `allow_merge`.
     let blocker_rank = (raw_policy_allow_merge == Some(false)
-        || raw_blocking_issues.is_some_and(|len| len > 0))
-    .then_some(3);
+        || raw_blocking_issues.is_some_and(|len| len > 0)
+        || warning_tally.has_blocking_signal)
+        .then_some(3);
+    let check_review_rank = warning_tally.has_review_signal.then_some(2);
 
     // A verdict this reader had to SUBSTITUTE — absent, outside the vocabulary,
     // or present with the wrong JSON type — governs everything derived beside
@@ -850,6 +876,7 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
         allow_rank,
         quality_rank,
         analysis_rank,
+        check_review_rank,
         blocker_rank,
     ]
     .into_iter()
@@ -862,6 +889,62 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     };
 
     let allow_merge = final_rank == 1;
+    let mut enforcement_disposition = stated_enforcement_disposition.unwrap_or(match final_rank {
+        1 => crate::policy::engine::EnforcementDisposition::Clean,
+        2 => crate::policy::engine::EnforcementDisposition::ReviewRequired,
+        _ => crate::policy::engine::EnforcementDisposition::Block,
+    });
+    if final_rank == 3 {
+        enforcement_disposition.raise_to(crate::policy::engine::EnforcementDisposition::Block);
+    } else if raw_quality_pass == Some(false)
+        || analysis_rank.is_some()
+        || check_review_rank.is_some()
+        || blocker_rank.is_some()
+        || (final_rank == 2
+            && enforcement_disposition == crate::policy::engine::EnforcementDisposition::Clean)
+    {
+        if check_review_rank.is_some()
+            && enforcement_disposition
+                < crate::policy::engine::EnforcementDisposition::ReviewRequired
+        {
+            unknown_signal_caveats.push(
+                "check_enforcement_inconsistency: a typed check requires review but the stored \
+                 enforcement_disposition was more permissive; normalized to review_required"
+                    .to_string(),
+            );
+        }
+        enforcement_disposition
+            .raise_to(crate::policy::engine::EnforcementDisposition::ReviewRequired);
+    }
+    if warning_tally.has_unreadable_signal {
+        enforcement_disposition
+            .raise_to(crate::policy::engine::EnforcementDisposition::ReviewRequired);
+    } else if enforcement_required
+        && enforcement_disposition == crate::policy::engine::EnforcementDisposition::WarningsOnly
+        && !warning_tally.has_explicit_warnings
+    {
+        unknown_signal_caveats.push(
+            "unproven_warnings_only: MERGE_GATE.json schema 2.3+ states warnings_only without a \
+             typed warning fact; normalized to review_required"
+                .to_string(),
+        );
+        enforcement_disposition
+            .raise_to(crate::policy::engine::EnforcementDisposition::ReviewRequired);
+    } else if warning_tally.has_explicit_warnings
+        && enforcement_disposition == crate::policy::engine::EnforcementDisposition::Clean
+    {
+        if stated_enforcement_disposition
+            == Some(crate::policy::engine::EnforcementDisposition::Clean)
+        {
+            unknown_signal_caveats.push(
+                "enforcement_inconsistency: MERGE_GATE.json has typed warning facts beside a clean \
+                 enforcement_disposition; warnings-clean enforcement uses the canonical tally"
+                    .to_string(),
+            );
+        }
+        enforcement_disposition
+            .raise_to(crate::policy::engine::EnforcementDisposition::WarningsOnly);
+    }
 
     // Only the PACK's own axes can be inconsistent with each other; a verdict
     // this reader substituted is already named by its own caveat, and calling
@@ -885,9 +968,13 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
     let normalized = signals_disagree
         || allow_contradicts
         || !unknown_signal_caveats.is_empty()
+        || !enforcement_caveats.is_empty()
+        || !check_caveats.is_empty()
         || schema_caveat.is_some();
 
     let mut caveats = schema_caveat.into_iter().collect::<Vec<_>>();
+    caveats.append(&mut enforcement_caveats);
+    caveats.append(&mut check_caveats);
     caveats.append(&mut unknown_signal_caveats);
     if signals_disagree || allow_contradicts {
         caveats.push(format!(
@@ -916,6 +1003,7 @@ pub fn read_decision(run_dir: &Path) -> Result<NormalizedDecision, ToolError> {
         merge_recommendation: merge_rec_from_rank(final_rank).to_string(),
         allow_merge,
         verdict: verdict_from_rank(final_rank).to_string(),
+        enforcement_disposition,
         blocking_issues: string_array(decision.get("blocking_issues")),
         caveats,
         base_used: string_array(value.get("bases")),

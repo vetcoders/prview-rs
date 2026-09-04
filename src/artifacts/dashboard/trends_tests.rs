@@ -94,6 +94,7 @@ fn mock_ctx() -> DashboardContext {
         blocking_issues: vec![],
         check_gates: vec![],
         breaking: vec![],
+        rust_api_delta: None,
         coverage: super::super::CoverageDelta {
             pct: Some(100),
             total_source: 1,

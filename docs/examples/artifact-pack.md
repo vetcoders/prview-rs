@@ -29,7 +29,10 @@ A typical artifact pack looks like this:
 │   ├── *.result.json         # Per-check machine-readable outputs
 │   ├── *.log                 # Per-check raw logs
 │   ├── coverage-delta.txt    # Source↔test mapping with change status
-│   └── BREAKING_CHANGES.md   # Removed pub symbols, changed signatures
+│   ├── PUBLIC_API_DIFF.json  # Compatibility rows + lossless repo-backed Rust API delta
+│   ├── PUBLIC_API_DIFF.md    # Human API summary
+│   ├── BREAKING_CHANGES.json # Same lossless Rust delta used by the merge gate
+│   └── BREAKING_CHANGES.md   # Human Rust API truth + bounded JS/TS/env signals
 ├── 30_context/
 │   ├── INLINE_FINDINGS.sarif # Optional SARIF output for findings
 │   ├── cargo-tree.txt        # Dependency tree
@@ -45,3 +48,13 @@ A typical artifact pack looks like this:
 2. **`00_summary/MERGE_GATE.json`**: The canonical source of truth for CI/CD automation. It determines if the PR is safe to merge based on the active `.prview-policy.yml`.
 3. **`dashboard.html`**: A zero-dependency, self-contained HTML dashboard that visualizes the PR metrics, test hotspots, and quality gates.
 4. **`report.json`**: The complete state of the analysis, useful for building custom integrations or training AI models.
+
+For Rust, `PUBLIC_API_DIFF.json`, `BREAKING_CHANGES.json`, `report.json`, and
+`00_summary/MERGE_GATE.json` serialize the same revision-backed API-delta IDs,
+counts, confidence, evidence, unknown reasons, and base/target provenance. The
+legacy compatibility rows in `PUBLIC_API_DIFF.json` and the JS/TS and
+environment sections in `BREAKING_CHANGES.md` are separate bounded signals;
+they are not a second Rust API analyzer. The generic `CONSISTENCY_CHECK` keeps
+its existing file/finding/verdict checks and intentionally does not reconstruct
+Rust API facts into a scalar count; equality is enforced by the lossless
+artifact contract tests instead.

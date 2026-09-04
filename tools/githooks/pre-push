@@ -53,13 +53,13 @@ set -e
 
 case "$STATUS" in
   0)
-    echo "prview gate: PASS or accepted CONDITIONAL (exit 0)."
+    echo "prview gate: PASS, advisory CONDITIONAL, or accepted warnings-only (exit 0)."
     ;;
   1)
     echo "prview gate: BLOCK (exit 1)." >&2
     ;;
   2)
-    echo "prview gate: CONDITIONAL rejected by strict mode (exit 2)." >&2
+    echo "prview gate: typed review-required decision rejected by strict mode (exit 2)." >&2
     ;;
   3)
     echo "prview gate: internal/tooling error (exit 3)." >&2

@@ -7,6 +7,7 @@ pub use manifest::*;
 
 use crate::cli::{Cli, ExecutionMode, PolicyModeArg, Profile};
 use crate::git::{git_cmd, short_sha};
+use crate::policy::engine::EnforcementMode;
 use crate::policy::{PolicyConfig, PolicyMode, load_policy, resolve_policy_path};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,10 @@ pub struct Config {
 
     // Modes
     pub execution_mode: ExecutionMode,
+    /// Process-exit policy selected by the invocation. Kept separate from the
+    /// execution preset because `--update` may change the preset label without
+    /// cancelling an explicitly requested CI enforcement lane.
+    pub enforcement_mode: EnforcementMode,
     pub update_mode: bool,
     pub remote_mode: bool,
     pub current_only: bool,
@@ -615,6 +620,7 @@ impl Config {
             bases: vec![],
             profile,
             execution_mode: ExecutionMode::Standard,
+            enforcement_mode: EnforcementMode::Advisory,
             update_mode: false,
             remote_mode: false,
             current_only: false,
@@ -775,6 +781,7 @@ impl Config {
         config.bases = bases;
         config.security_full = cli.security_full;
         config.execution_mode = cli.execution_mode();
+        config.enforcement_mode = EnforcementMode::from_ci_flags(cli.ci, cli.fail_on_warnings);
         config.update_mode = cli.update;
         config.remote_mode = remote_mode;
         config.current_only = cli.current_only;
@@ -798,8 +805,9 @@ impl Config {
     /// The `gate` subcommand owns its check budget: global step opt-ins such as
     /// `--with-tests`, `--with-lint`, or `--security-full` must not accidentally
     /// turn the pre-push gate into a deep review.
-    pub fn apply_gate_profile(&mut self) {
+    pub fn apply_gate_profile(&mut self, enforcement_mode: EnforcementMode) {
         self.execution_mode = ExecutionMode::Quick;
+        self.enforcement_mode = enforcement_mode;
         self.update_mode = false;
         self.tui_mode = false;
 

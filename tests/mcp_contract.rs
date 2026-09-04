@@ -435,6 +435,7 @@ fn run_review_quick_completes_and_verdict_reads_it() {
     assert_eq!(body["schema_version"], "prview.mcp.v1");
     let run_id = body["run_id"].as_str().expect("run_id").to_string();
     assert!(body["verdict"].as_str().is_some());
+    assert!(body["enforcement_disposition"].as_str().is_some());
     assert!(body["stats"]["files_changed"].is_number());
     let pack = body["artifact_paths"]["pack"].as_str().expect("pack path");
     assert!(
@@ -453,6 +454,10 @@ fn run_review_quick_completes_and_verdict_reads_it() {
     let vbody = tool_body(&v);
     assert_eq!(vbody["status"], "completed");
     assert_eq!(vbody["run_id"], run_id);
+    assert_eq!(
+        vbody["enforcement_disposition"], body["enforcement_disposition"],
+        "quick completion and verdict readback must expose one stored disposition"
+    );
 }
 
 #[test]
@@ -840,6 +845,13 @@ fn verdict_on_completed_run_reports_decision() {
     );
     assert!(body["merge_recommendation"].as_str().is_some());
     assert!(body["allow_merge"].is_boolean());
+    assert!(
+        matches!(
+            body["enforcement_disposition"].as_str(),
+            Some("clean" | "warnings_only" | "review_required" | "block")
+        ),
+        "MCP must expose the typed MERGE_GATE 2.3 disposition: {body}"
+    );
     assert!(body["base_used"].is_array());
     let gates = body["gates"].as_array().expect("gates array");
     assert!(!gates.is_empty());

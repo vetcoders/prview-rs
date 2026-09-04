@@ -1,0 +1,24 @@
+{
+  "schema": "prview.api_surface_expected.v1",
+  "cell": "function_added",
+  "family": "removal",
+  "legacy_expectation": "accepted_zero",
+  "legacy_positive_sibling": "function_removed",
+  "legacy_delta_rationale": "the legacy breaking detector deliberately ignored additive public functions",
+  "repo_backed_records": [
+    {
+      "kind": "added",
+      "symbol": "added",
+      "namespace": "crate",
+      "before": null,
+      "after": "pub fn added()",
+      "provenance": {
+        "base_revision": "fixture://function_added/base",
+        "target_revision": "fixture://function_added/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    }
+  ]
+}

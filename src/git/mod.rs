@@ -77,6 +77,38 @@ pub enum FileStatus {
     Copied,
 }
 
+/// File mode carried by an entry in an exact Git tree.
+///
+/// This is intentionally separate from [`FileStatus`]: it describes what an
+/// object *is*, not how it changed between two revisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitTreeEntryKind {
+    RegularFile,
+    Symlink,
+    Tree,
+    Gitlink,
+    Unsupported,
+}
+
+/// One entry from an exact commit tree, including non-regular entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitTreeEntry {
+    pub path: String,
+    pub object_id: String,
+    pub mode: u32,
+    pub kind: GitTreeEntryKind,
+}
+
+/// A tracked working-tree change relative to one exact target commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitWorktreeChange {
+    pub old_path: Option<String>,
+    pub new_path: Option<String>,
+    pub status: git2::Delta,
+    pub new_mode_raw: u32,
+    pub new_mode: GitTreeEntryKind,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiffStats {
@@ -701,6 +733,129 @@ impl Repository {
         &self.path
     }
 
+    /// Working directory resolved by libgit2 for this repository.
+    ///
+    /// Unlike [`Self::path`], this remains the checkout root when the repository
+    /// was opened through its `.git` directory. Bare repositories return None.
+    pub(crate) fn workdir(&self) -> Option<&Path> {
+        self.inner.workdir()
+    }
+
+    /// Enumerate every entry in one exact commit tree.
+    ///
+    /// The input must be a full object id. Branch names, abbreviated ids and
+    /// implicit `HEAD` are deliberately rejected so callers cannot label bytes
+    /// with a revision other than the one that was actually opened.
+    pub(crate) fn tree_entries_at_oid(&self, commit_oid: &str) -> Result<Vec<GitTreeEntry>> {
+        let tree = self.exact_commit_tree(commit_oid)?;
+        let mut entries = Vec::new();
+        let mut path_error = None;
+        let walked = tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            let Some(name) = entry.name() else {
+                path_error = Some(anyhow::anyhow!(
+                    "Git tree entry contains a non-UTF-8 path component"
+                ));
+                return git2::TreeWalkResult::Abort;
+            };
+            let path = format!("{dir}{name}");
+            entries.push(GitTreeEntry {
+                path,
+                object_id: entry.id().to_string(),
+                mode: entry.filemode_raw() as u32,
+                kind: git_tree_entry_kind(entry.filemode()),
+            });
+            git2::TreeWalkResult::Ok
+        });
+        if let Some(error) = path_error {
+            return Err(error);
+        }
+        walked?;
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(entries)
+    }
+
+    /// Return exact bytes for a regular blob in one exact commit tree.
+    ///
+    /// `Ok(None)` means the path is absent. Non-regular entries are rejected;
+    /// callers that need their mode should use [`Self::tree_entries_at_oid`].
+    pub(crate) fn regular_blob_bytes_at_oid(
+        &self,
+        commit_oid: &str,
+        file_path: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let safe_path = crate::paths::validate_repo_relative_str(file_path)?;
+        let tree = self.exact_commit_tree(commit_oid)?;
+        let entry = match tree.get_path(safe_path) {
+            Ok(entry) => entry,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if git_tree_entry_kind(entry.filemode()) != GitTreeEntryKind::RegularFile {
+            anyhow::bail!("Git tree path is not a regular file: {file_path}");
+        }
+        let blob = self.inner.find_blob(entry.id())?;
+        Ok(Some(blob.content().to_vec()))
+    }
+
+    /// Tracked changes between an exact target commit and the current index /
+    /// working directory, with rename detection enabled.
+    ///
+    /// Untracked files are excluded at diff construction time. The caller
+    /// supplies provenance separately; this helper never computes or relabels
+    /// a worktree digest.
+    pub(crate) fn worktree_changes_from_oid(
+        &self,
+        target_oid: &str,
+    ) -> Result<Vec<GitWorktreeChange>> {
+        let tree = self.exact_commit_tree(target_oid)?;
+        let mut options = DiffOptions::new();
+        options
+            .include_untracked(false)
+            .include_typechange(true)
+            .include_unreadable(true);
+        let mut diff = self
+            .inner
+            .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))?;
+        let mut find = git2::DiffFindOptions::new();
+        find.renames(true)
+            .renames_from_rewrites(true)
+            .rename_threshold(RENAME_SIMILARITY_THRESHOLD);
+        diff.find_similar(Some(&mut find))?;
+
+        let mut changes = Vec::new();
+        for delta in diff.deltas() {
+            let old_path = diff_path_to_string(delta.old_file().path())?;
+            let new_path = diff_path_to_string(delta.new_file().path())?;
+            changes.push(GitWorktreeChange {
+                old_path,
+                new_path,
+                status: delta.status(),
+                new_mode_raw: i32::from(delta.new_file().mode()) as u32,
+                new_mode: git_tree_entry_kind(i32::from(delta.new_file().mode())),
+            });
+        }
+        changes.sort_by(|left, right| {
+            left.old_path
+                .as_deref()
+                .or(left.new_path.as_deref())
+                .cmp(&right.old_path.as_deref().or(right.new_path.as_deref()))
+        });
+        Ok(changes)
+    }
+
+    fn exact_commit_tree(&self, commit_oid: &str) -> Result<git2::Tree<'_>> {
+        if commit_oid.len() != 40 {
+            anyhow::bail!("Expected a full 40-character commit OID: {commit_oid}");
+        }
+        let oid = git2::Oid::from_str(commit_oid)
+            .with_context(|| format!("Invalid commit OID: {commit_oid}"))?;
+        let commit = self
+            .inner
+            .find_commit(oid)
+            .with_context(|| format!("Commit object is unavailable: {commit_oid}"))?;
+        Ok(commit.tree()?)
+    }
+
     /// Whether `file_path` is a REGULAR FILE in the tree of `commit_ref`.
     ///
     /// Answers "does the REVIEWED commit contain this file" without materialising
@@ -1015,6 +1170,30 @@ impl Repository {
             .ok()
             .and_then(|h| h.shorthand().map(String::from))
     }
+}
+
+fn git_tree_entry_kind(mode: i32) -> GitTreeEntryKind {
+    match mode {
+        mode if mode == i32::from(git2::FileMode::Blob)
+            || mode == i32::from(git2::FileMode::BlobExecutable)
+            || mode == i32::from(git2::FileMode::BlobGroupWritable) =>
+        {
+            GitTreeEntryKind::RegularFile
+        }
+        mode if mode == i32::from(git2::FileMode::Link) => GitTreeEntryKind::Symlink,
+        mode if mode == i32::from(git2::FileMode::Tree) => GitTreeEntryKind::Tree,
+        mode if mode == i32::from(git2::FileMode::Commit) => GitTreeEntryKind::Gitlink,
+        _ => GitTreeEntryKind::Unsupported,
+    }
+}
+
+fn diff_path_to_string(path: Option<&Path>) -> Result<Option<String>> {
+    path.map(|path| {
+        path.to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("Git diff contains a non-UTF-8 path"))
+    })
+    .transpose()
 }
 
 fn truncate_commit_list(commits: &mut Vec<CommitInfo>) {

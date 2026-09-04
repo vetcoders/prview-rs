@@ -3,7 +3,9 @@
 use super::*;
 
 pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
-    use crate::policy::engine::{AnalysisStatus, MergeRecommendation, PolicyEngine};
+    use crate::policy::engine::{
+        AnalysisStatus, EnforcementDisposition, MergeRecommendation, PolicyEngine,
+    };
     use serde_json::json;
     use std::collections::BTreeSet;
     let MergeGateInput {
@@ -13,6 +15,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         heuristics,
         inline,
         breaking,
+        rust_api_delta,
         coverage,
         diffs,
         skipped_checks,
@@ -41,6 +44,8 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     let mut worst_merge = outcome.worst_merge;
     let mut blocking_issues = outcome.blocking_issues;
     let mut review_caveats = outcome.advisory_caveats;
+    let mut enforcement_disposition =
+        EnforcementDisposition::from_evaluations(&outcome.effective_evals);
     let mut gate_checks = Vec::new();
 
     let inline_findings_path =
@@ -102,9 +107,12 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         .iter()
         .any(|c| check_id_from_name(&c.name) == "heuristics_loctree");
     if !has_heuristics {
-        let (heuristics_check, heuristics_issue) = build_heuristics_gate_check(config, heuristics);
+        let (heuristics_check, heuristics_issue, heuristics_disposition) =
+            build_heuristics_gate_check(config, heuristics);
+        enforcement_disposition.raise_to(heuristics_disposition);
         if let Some(issue) = heuristics_issue {
             record_blocking_issue(&mut blocking_issues, &mut worst_merge, issue);
+            enforcement_disposition.raise_to(EnforcementDisposition::Block);
         }
         gate_checks.push(heuristics_check);
     }
@@ -120,6 +128,23 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     );
     let inline_severity = inline_gate.severity;
     let inline_blocking = inline_gate.blocking;
+    let inline_enforcement_disposition = if inline_gate.blocking {
+        EnforcementDisposition::Block
+    } else {
+        match inline_gate.class {
+            crate::policy::GateClass::Fail => EnforcementDisposition::ReviewRequired,
+            crate::policy::GateClass::Info => EnforcementDisposition::WarningsOnly,
+            crate::policy::GateClass::Pass | crate::policy::GateClass::Skip
+                if inline.status.eq_ignore_ascii_case("warnings") =>
+            {
+                EnforcementDisposition::WarningsOnly
+            }
+            crate::policy::GateClass::Pass | crate::policy::GateClass::Skip => {
+                EnforcementDisposition::Clean
+            }
+        }
+    };
+    enforcement_disposition.raise_to(inline_enforcement_disposition);
 
     let policy_allow_merge = blocking_issues.is_empty();
 
@@ -131,12 +156,16 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     if !quality_pass && worst_confidence == AnalysisStatus::Complete {
         worst_confidence = AnalysisStatus::Degraded;
     }
+    if !quality_pass {
+        enforcement_disposition.raise_to(EnforcementDisposition::ReviewRequired);
+    }
 
     if !diffs.is_empty() {
-        let risk_scores = signal::compute_file_risk_scores_with_root(
+        let risk_scores = signal::compute_file_risk_scores_with_api(
             diffs,
             coverage,
             breaking,
+            rust_api_delta,
             Some(&config.repo_root),
         );
         let risk_heatmap = signal::compute_risk_heatmap(diffs, &risk_scores);
@@ -160,6 +189,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             if worst_confidence == AnalysisStatus::Complete {
                 worst_confidence = AnalysisStatus::Degraded;
             }
+            enforcement_disposition.raise_to(EnforcementDisposition::ReviewRequired);
         }
 
         let semantic_findings = signal::detect_orphaned_resource_delete(diffs);
@@ -176,6 +206,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             if worst_merge == MergeRecommendation::Approve {
                 worst_merge = MergeRecommendation::ReviewRequired;
             }
+            enforcement_disposition.raise_to(EnforcementDisposition::ReviewRequired);
         }
     }
     // Breaking-change escalation (critic-1): a genuine breaking API change must
@@ -186,7 +217,27 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     if let Some(reason) =
         apply_breaking_escalation(config.breaking_escalation, breaking, &mut worst_merge)
     {
+        enforcement_disposition.raise_to(EnforcementDisposition::ReviewRequired);
         review_caveats.push(reason);
+    }
+    enforcement_disposition.raise_to(apply_rust_api_delta_outcome(
+        config.breaking_escalation,
+        rust_api_delta,
+        &mut worst_confidence,
+        &mut worst_merge,
+    ));
+
+    // Fail-honest backstop for any typed ratchet added above without an
+    // explicit disposition update. The warnings-only exception remains
+    // representable only when that exact typed disposition was already set.
+    if worst_merge == MergeRecommendation::Block {
+        enforcement_disposition.raise_to(EnforcementDisposition::Block);
+    } else if worst_confidence != AnalysisStatus::Complete
+        || !quality_pass
+        || (worst_merge == MergeRecommendation::ReviewRequired
+            && enforcement_disposition == EnforcementDisposition::Clean)
+    {
+        enforcement_disposition.raise_to(EnforcementDisposition::ReviewRequired);
     }
 
     // Derive the scalar decision fields from the FINAL axes (after every
@@ -198,6 +249,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     let legacy_recommended_merge = decision_fields.recommended_merge;
 
     let mut all_review_caveats = build_review_caveats(breaking, coverage, inline.findings_count);
+    all_review_caveats.extend(rust_api_delta_review_caveats(rust_api_delta));
     all_review_caveats.extend(review_caveats);
     all_review_caveats.extend(rust_quality_review_caveats(config, checks));
     all_review_caveats.extend(cargo_audit_review_caveats(checks));
@@ -268,11 +320,15 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             "status": inline.status,
             "severity": policy_severity_to_str(inline_severity),
             "blocking": inline_blocking,
+            "effective_class": gate_class_to_str(inline_gate.class),
+            "enforcement_disposition": inline_enforcement_disposition,
             "findings_count": inline.findings_count,
             "introduced_count": introduced_inline,
             "preexisting_count": preexisting_inline
         },
+        "rust_api_delta": rust_api_delta,
         "decision": {
+            "enforcement_disposition": enforcement_disposition,
             "analysis_status": worst_confidence,
             "merge_recommendation": worst_merge,
             "verdict": decision_fields.verdict,
@@ -317,8 +373,9 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         config.policy.mode_str(),
     ));
     md.push_str(&format!(
-        "- Verdict: `{}`\n- Recommended label: `{}`\n- Reason: {}\n\n",
+        "- Verdict: `{}`\n- Enforcement disposition: `{}`\n- Recommended label: `{}`\n- Reason: {}\n\n",
         decision_fields.verdict,
+        enforcement_disposition.as_str(),
         decision.state.gate_label(),
         decision.reason,
     ));
@@ -528,6 +585,54 @@ mod tests {
         )
     }
 
+    #[test]
+    fn merge_gate_serializes_the_exact_shared_rust_api_view() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config();
+        let inline = InlineFindingsSummary {
+            status: "passed".to_owned(),
+            findings_count: 0,
+            dashboard_findings: Vec::new(),
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+        let view = api_delta::ApiArtifactView {
+            view: api_delta::ApiArtifactViewKind::BreakingChanges,
+            analysis_source: api_delta::REPO_BACKED_RUST_API_SOURCE,
+            base_revision: "git_tree:base".to_owned(),
+            target_revision: "git_tree:target".to_owned(),
+            counts: api_delta::ApiDeltaCounts {
+                added: 0,
+                removed: 0,
+                changed: 0,
+                relocated: 0,
+                visibility_changed: 0,
+                unknown: 0,
+            },
+            findings: Vec::new(),
+        };
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            checks: &[],
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            rust_api_delta: Some(&view),
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+        })
+        .expect("merge gate");
+        let gate: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("MERGE_GATE.json")).unwrap())
+                .unwrap();
+        assert_eq!(gate["rust_api_delta"], serde_json::to_value(view).unwrap());
+    }
+
     fn run_gate_with_semgrep_finding(in_diff: bool, security_full: bool) -> serde_json::Value {
         run_gate_with_semgrep_finding_scan(in_diff, security_full, true)
     }
@@ -562,6 +667,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -605,6 +711,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -655,6 +762,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -698,6 +806,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &skipped_checks,
@@ -752,6 +861,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -770,6 +880,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: Vec::new(),
+            rust_api_delta: None,
             coverage,
             diff_dir: tmp.path(),
             skipped_checks: Vec::new(),
@@ -813,6 +924,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &breaking,
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -831,6 +943,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: breaking.clone(),
+            rust_api_delta: None,
             coverage,
             diff_dir: tmp.path(),
             skipped_checks: Vec::new(),
@@ -1033,10 +1146,19 @@ mod tests {
             false,
         );
 
-        assert_ne!(gate["decision"]["verdict"].as_str(), Some("PASS"));
+        assert_eq!(gate["decision"]["verdict"].as_str(), Some("CONDITIONAL"));
+        assert_eq!(gate["decision"]["allow_merge"].as_bool(), Some(false));
         assert_eq!(
             gate["decision"]["analysis_status"].as_str(),
             Some("degraded")
+        );
+        assert_eq!(
+            gate["decision"]["merge_recommendation"].as_str(),
+            Some("approve")
+        );
+        assert_eq!(
+            gate["decision"]["enforcement_disposition"].as_str(),
+            Some("review_required")
         );
         // The finding impact is still downgraded: it lands in the pre-existing
         // bucket, not as a new failure that blocks.
@@ -1134,7 +1256,12 @@ mod tests {
 
     fn run_gate_with_rustfmt_warning(in_diff: bool) -> serde_json::Value {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let config = test_config();
+        let mut config = test_config();
+        config.policy.default_severity = crate::policy::PolicySeverity::Ignore;
+        config
+            .policy
+            .checks
+            .insert("rustfmt".to_string(), crate::policy::PolicySeverity::Warn);
         let checks = vec![rustfmt_warnings_check()];
         let inline = InlineFindingsSummary {
             status: "warnings".to_string(),
@@ -1157,6 +1284,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &[],
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -1180,6 +1308,10 @@ mod tests {
         let gate = run_gate_with_rustfmt_warning(false);
 
         assert_eq!(gate["decision"]["verdict"].as_str(), Some("PASS"));
+        assert_eq!(
+            gate["decision"]["enforcement_disposition"].as_str(),
+            Some("warnings_only")
+        );
         assert_eq!(gate["decision"]["quality_pass"].as_bool(), Some(true));
         assert_eq!(
             gate["decision"]["preexisting_quality_failures"][0].as_str(),
@@ -1209,10 +1341,12 @@ mod tests {
     }
 
     #[test]
-    fn introduced_warning_keeps_strict_gate_exit_two() {
-        // The other half of the contract: an in-diff warning stays CONDITIONAL,
-        // so `--strict` still exits 2. Warnings became honest, not toothless.
-        use crate::gate::{GateVerdict, gate_exit_code};
+    fn introduced_warning_uses_typed_operator_policy_exit_lane() {
+        // The canonical verdict remains CONDITIONAL, while the orthogonal 2.3
+        // disposition lets default strict accept a warning and preserves the
+        // explicit warnings-clean exit 2.
+        use crate::gate::{GateVerdict, gate_exit_code_for_disposition};
+        use crate::policy::engine::{EnforcementDisposition, EnforcementMode};
 
         let gate = run_gate_with_rustfmt_warning(true);
         let verdict = GateVerdict::try_from(
@@ -1221,9 +1355,19 @@ mod tests {
                 .expect("verdict is a string"),
         )
         .expect("verdict is contract vocabulary");
+        let disposition: EnforcementDisposition =
+            serde_json::from_value(gate["decision"]["enforcement_disposition"].clone()).unwrap();
 
         assert_eq!(verdict, GateVerdict::Conditional);
-        assert_eq!(gate_exit_code(verdict, true), 2);
+        assert_eq!(disposition, EnforcementDisposition::WarningsOnly);
+        assert_eq!(
+            gate_exit_code_for_disposition(disposition, EnforcementMode::GateStrict),
+            0
+        );
+        assert_eq!(
+            gate_exit_code_for_disposition(disposition, EnforcementMode::GateFailOnWarnings),
+            2
+        );
     }
 
     #[test]
@@ -1272,6 +1416,7 @@ mod tests {
             heuristics: None,
             inline: &inline,
             breaking: &breaking,
+            rust_api_delta: None,
             coverage: &coverage,
             diffs: &[],
             skipped_checks: &[],
@@ -1284,6 +1429,70 @@ mod tests {
         let raw =
             std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
         serde_json::from_str(&raw).expect("parse gate json")
+    }
+
+    fn run_gate_with_warning_and_breaking(escalation: bool) -> serde_json::Value {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config();
+        config.breaking_escalation = escalation;
+        config.policy.default_severity = crate::policy::PolicySeverity::Ignore;
+        config
+            .policy
+            .checks
+            .insert("rustfmt".to_string(), crate::policy::PolicySeverity::Warn);
+        let checks = vec![rustfmt_warnings_check()];
+        let inline = InlineFindingsSummary {
+            status: "passed".to_string(),
+            findings_count: 0,
+            dashboard_findings: vec![],
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+        let breaking = vec![breaking_removed_symbol()];
+
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            checks: &checks,
+            heuristics: None,
+            inline: &inline,
+            breaking: &breaking,
+            rust_api_delta: None,
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+        })
+        .expect("merge gate");
+
+        serde_json::from_slice(&std::fs::read(tmp.path().join("MERGE_GATE.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn operator_policy_mixed_warning_and_potential_breaking_stays_enforced() {
+        use crate::gate::gate_exit_code_for_disposition;
+        use crate::policy::engine::{EnforcementDisposition, EnforcementMode};
+
+        let enabled = run_gate_with_warning_and_breaking(true);
+        let disposition: EnforcementDisposition =
+            serde_json::from_value(enabled["decision"]["enforcement_disposition"].clone()).unwrap();
+        assert_eq!(disposition, EnforcementDisposition::ReviewRequired);
+        assert_eq!(
+            gate_exit_code_for_disposition(disposition, EnforcementMode::GateStrict),
+            2
+        );
+
+        let disabled = run_gate_with_warning_and_breaking(false);
+        let disposition: EnforcementDisposition =
+            serde_json::from_value(disabled["decision"]["enforcement_disposition"].clone())
+                .unwrap();
+        assert_eq!(disposition, EnforcementDisposition::WarningsOnly);
+        assert_eq!(
+            gate_exit_code_for_disposition(disposition, EnforcementMode::GateStrict),
+            0
+        );
     }
 
     #[test]
