@@ -1194,14 +1194,26 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
                     "run publication failed with an unconfirmed index rollback; durable recovery journal retained",
                 ));
             }
-            if let Err(rollback_error) = rollback_latest_publication(&latest_transaction) {
+            let cancellation_active =
+                governor.is_cancelled() || crate::governor::is_cancellation(&e);
+            let rollback = rollback_latest_publication(&latest_transaction);
+            if cancellation_active {
+                let cancellation = if crate::governor::is_cancellation(&e) {
+                    e
+                } else {
+                    anyhow::Error::new(crate::governor::Cancelled).context(format!(
+                        "run publication failed while cancellation was active: {e:#}"
+                    ))
+                };
+                return Err(preserve_primary_error_after_latest_rollback(
+                    cancellation,
+                    rollback,
+                ));
+            }
+            if let Err(rollback_error) = rollback {
                 return Err(anyhow::anyhow!(
                     "run publication failed ({e:#}) and its durable alias/index reconciliation also failed ({rollback_error:#})"
                 ));
-            }
-            if governor.is_cancelled() {
-                ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)?;
-                unreachable!("a cancelled governor fails the index seam");
             }
             return Err(e.context(
                 "run publication failed; generated files were not committed to discoverable history",

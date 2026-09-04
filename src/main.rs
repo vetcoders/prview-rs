@@ -3,7 +3,10 @@ use clap::Parser;
 use colored::Colorize;
 use prview::cli::{GateArgs, McpArgs};
 use prview::git::git_cmd;
-use prview::governor::{CtrlC, is_cancellation, supervise_startup_stage, with_cancellation};
+use prview::governor::{
+    CtrlC, is_cancellation, supervise_startup_stage, with_cancellation,
+    with_cancellation_after_commit,
+};
 use prview::{App, Cli, CliCommand, Config, OpenArgs, RunsArgs, ScopeArgs, StateArgs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -148,7 +151,7 @@ async fn run() -> Result<()> {
     }
 
     // Normal run
-    let report = with_cancellation(app.run(), &governor, CtrlC).await?;
+    let report = with_cancellation_after_commit(app.run(), &governor, CtrlC).await?;
 
     // The verdict comes from the pack's MERGE_GATE.json and nowhere else. If it
     // cannot be read, prview cannot report a verdict — that is an execution
@@ -283,7 +286,7 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     config.apply_gate_profile(enforcement_mode);
     let app = App::from_config(config)?;
     let governor = app.governor();
-    let report = with_cancellation(app.run(), &governor, CtrlC)
+    let report = with_cancellation_after_commit(app.run(), &governor, CtrlC)
         .await
         .context("gate review run failed")?;
     let cli_summary = prview::output::build_cli_json_summary(&app.config, &report)?;

@@ -1261,9 +1261,11 @@ Cancellation has a synchronous truth boundary and a blocking cleanup half.
 the child registry before the work future can finish. The owned termination
 batch then runs outside the async signal owner, which keeps polling a second
 interrupt while a platform tree killer is blocked. Headless completion uses the
-same biased `InterruptSupervisor::stop().await` handoff as TUI startup: an
-already-ready signal is drained, cancellation is re-checked, and no successful
-work value can cross the verdict boundary after Ctrl-C.
+same biased `InterruptSupervisor::stop().await` handoff as TUI startup. Before
+durable publication, an already-ready signal is drained and cancellation wins
+the result handoff. A successful `App::run` return proves that publication has
+already committed, so the dedicated post-commit handoff preserves that result
+instead of simultaneously exposing a verdict and claiming cancellation.
 
 `blocking_stage` makes the surrounding runtime responsive; it does not preempt
 the in-process libgit2 closure itself. After the TUI's first quit request cancels
@@ -1273,9 +1275,9 @@ typed cancellation through `run_tui`, so terminal cleanup runs before the
 established exit-130 path. The in-process closure itself continues until it
 returns naturally or the process exits. Before the durable publication commit,
 cancellation prevents a completion/verdict publication. After that commit the
-pack, `latest`, and index row remain valid by design; a hard second interrupt can
-therefore win the narrow return window and exit 130 even though that already
-committed pack remains discoverable.
+pack, `latest`, and index row remain valid by design. The first late interrupt
+cannot retroactively relabel that success; a hard second interrupt still exits
+immediately if it arrives while the supervisor is finishing its handoff.
 
 The first raw-mode Ctrl-C deliberately shares the TUI's existing cooperative
 quit result with q/Escape: after the join and terminal cleanup it returns
@@ -1323,8 +1325,11 @@ clears the journal. Invalid journal state is quarantined without mutating the
 advertised alias, so stale or tampered recovery evidence cannot deny all future
 publications. The shared review worktree is explicitly removed before either
 advertisement; cancellation during that governed cleanup therefore produces an
-incomplete, unpublished pack rather than exit 130 after a published verdict.
-A valid journal is preserved when `index.jsonl` cannot be opened or parsed.
+  incomplete, unpublished pack rather than exit 130 after a published verdict.
+A valid journal is preserved when `index.jsonl` cannot be opened or parsed. The
+journal itself is opened without following a final symlink, must be a regular
+file, and is read through a 64 KiB limit; a FIFO, device, or oversized record
+cannot block or exhaust a publisher while it holds the global lock.
 Publication and recovery use a strict loader that rejects every malformed row;
 they never turn partial input into a rewritten partial ledger. Failure to commit
 the finished pack into that ledger is a fatal generation error, because a pack

@@ -7,6 +7,9 @@ use anyhow::Context;
 #[cfg(unix)]
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+const MAX_PUBLICATION_JOURNAL_BYTES: u64 = 64 * 1024;
+
 /// Durable intent for the only cross-file part of run publication.
 ///
 /// `index.jsonl` and the per-branch `latest` symlink cannot be replaced in one
@@ -290,7 +293,7 @@ pub(crate) fn recover_latest_publication(
     _publication: &crate::storage::RunPublicationLock,
 ) -> Result<()> {
     let path = latest_publication_record_path();
-    let bytes = match fs::read(&path) {
+    let bytes = match read_bounded_publication_journal(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
@@ -317,6 +320,37 @@ pub(crate) fn recover_latest_publication(
             Ok(())
         }
     }
+}
+
+/// Read a crash journal without following a final link or blocking on a FIFO,
+/// device, or attacker-sized file while the global publication lock is held.
+#[cfg(unix)]
+fn read_bounded_publication_journal(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_PUBLICATION_JOURNAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "publication transaction is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_PUBLICATION_JOURNAL_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PUBLICATION_JOURNAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "publication transaction exceeds the bounded read limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(unix)]
@@ -1230,6 +1264,36 @@ mod latest_tests {
         let written: LatestPublicationRecord =
             serde_json::from_slice(&fs::read(destination).unwrap()).unwrap();
         assert_eq!(written.schema, 1);
+    }
+
+    #[test]
+    fn publication_journal_read_refuses_links_fifos_and_oversized_files() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let linked = root.path().join("linked-journal");
+        symlink("/dev/zero", &linked).unwrap();
+        assert!(read_bounded_publication_journal(&linked).is_err());
+
+        let fifo = root.path().join("fifo-journal");
+        let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_path is a NUL-terminated path inside this test's TempDir.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(read_bounded_publication_journal(&fifo).is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "FIFO rejection must not block while holding the publication lock"
+        );
+
+        let oversized = root.path().join("oversized-journal");
+        fs::write(
+            &oversized,
+            vec![b'x'; MAX_PUBLICATION_JOURNAL_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(read_bounded_publication_journal(&oversized).is_err());
     }
 
     #[test]

@@ -71,6 +71,31 @@ pub async fn with_cancellation<T>(
     governor: &Arc<ResourceGovernor>,
     interrupts: impl Interrupts,
 ) -> Result<T> {
+    with_cancellation_policy(work, governor, interrupts, false).await
+}
+
+/// Supervise work whose successful return proves that its durable commit
+/// boundary has already completed.
+///
+/// A signal observed before that return still cancels the run through its own
+/// error path. Once the work returns `Ok`, however, replacing the committed
+/// result with `Cancelled` would publish a verdict and simultaneously claim
+/// that no verdict exists. Callers may use this only when `Ok` is impossible
+/// before durable publication.
+pub async fn with_cancellation_after_commit<T>(
+    work: impl Future<Output = Result<T>>,
+    governor: &Arc<ResourceGovernor>,
+    interrupts: impl Interrupts,
+) -> Result<T> {
+    with_cancellation_policy(work, governor, interrupts, true).await
+}
+
+async fn with_cancellation_policy<T>(
+    work: impl Future<Output = Result<T>>,
+    governor: &Arc<ResourceGovernor>,
+    interrupts: impl Interrupts,
+    preserve_committed_success: bool,
+) -> Result<T> {
     // A normal value/error finishes through the explicit biased handoff below:
     // an interrupt already ready when `work` completes must cancel the run, not
     // lose to Drop aborting the watcher and escape as a publishable result.
@@ -78,8 +103,9 @@ pub async fn with_cancellation<T>(
     // watcher cleanup.
     let supervisor = InterruptSupervisor::start(Arc::clone(governor), interrupts);
     let result = work.await;
+    let committed_success = preserve_committed_success && result.is_ok();
     supervisor.stop().await;
-    if governor.is_cancelled() {
+    if governor.is_cancelled() && !committed_success {
         Err(super::Cancelled.into())
     } else {
         result
@@ -266,6 +292,25 @@ mod tests {
 
         assert!(is_cancellation(&error), "{error:#}");
         assert!(governor.is_cancelled());
+        assert!(!abandoned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_ready_after_durable_commit_keeps_the_result() {
+        let governor = Arc::new(ResourceGovernor::with_budget(2, 1));
+        let (tx, interrupts, abandoned) = scripted();
+        tx.send(())
+            .expect("prefill the interrupt before committed work returns");
+
+        let value = with_cancellation_after_commit(async { Ok(7) }, &governor, interrupts)
+            .await
+            .expect("a durable committed success cannot be relabelled cancelled");
+
+        assert_eq!(value, 7);
+        assert!(
+            governor.is_cancelled(),
+            "the late signal remains observable"
+        );
         assert!(!abandoned.load(Ordering::SeqCst));
     }
 

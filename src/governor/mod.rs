@@ -619,6 +619,21 @@ pub async fn with_cancellation<T>(
     .await
 }
 
+/// Supervise a run whose successful return occurs only after durable
+/// publication, so a signal already observed at the return handoff cannot
+/// relabel that committed success as cancellation.
+pub async fn with_cancellation_after_commit<T>(
+    work: impl std::future::Future<Output = anyhow::Result<T>>,
+    governor: &Arc<ResourceGovernor>,
+    interrupts: impl Interrupts,
+) -> anyhow::Result<T> {
+    with_run_scope(
+        Arc::clone(governor),
+        supervisor::with_cancellation_after_commit(work, governor, interrupts),
+    )
+    .await
+}
+
 /// Supervise synchronous startup work before an [`App`](crate::App) exists.
 ///
 /// PR metadata lookup and config discovery can spawn governed children, but the
