@@ -237,7 +237,7 @@ pub struct Cli {
     #[arg(
         long = "tests-pattern",
         value_name = "PATTERN",
-        long_help = "Filter supported test checks using each runner's native semantics. Vitest accepts a regular expression through --grep. Cargo/libtest accepts only a literal substring; regex metacharacters, option-shaped values, and filtered runs with no executed tests fail closed. Mixed JS/Rust reviews therefore accept only the shared literal subset. Pytest is currently not filtered by this flag."
+        long_help = "Filter supported test checks using each runner's native semantics. Vitest accepts a regular expression through --testNamePattern. Cargo/libtest accepts only a literal substring; regex metacharacters, option-shaped values, and filtered runs with no executed tests fail closed. Mixed JS/Rust reviews therefore accept only the shared literal subset. Pytest is currently not filtered by this flag."
     )]
     pub tests_pattern: Option<String>,
 

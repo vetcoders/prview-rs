@@ -291,7 +291,7 @@ review envelope as a product-wide cap for that separate command.
 
 | Runner | Selection contract |
 |--------|--------------------|
-| Vitest | Regular expression passed to `--grep` |
+| Vitest | Regular expression passed to `--testNamePattern` |
 | Cargo/libtest | Literal substring only; regex metacharacters and values beginning with `-` are rejected before Cargo starts |
 | Pytest | Not currently filtered by this flag |
 

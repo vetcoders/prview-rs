@@ -1291,10 +1291,13 @@ drop the run future, but returning through the ordinary error path is what lets
 the destructors on the way out remove the temporary worktrees a killed process
 would leave on disk. Worktree creation arms a path-exact libgit2 rollback before
 `git worktree add` starts, covering the interval in which Git has registered the
-path but its governed child has not returned. The same in-process fallback
-deregisters an already-created snapshot when a cancelled run refuses to spawn
-`git worktree remove`; it never runs a global prune or touches a sibling
-worktree. `TempDir` remains the filesystem owner. A **second** interrupt is the
+path but its governed child has not returned. The same in-process fallback is
+the only operation performed by `WorktreeSnapshot::Drop`, so an early async
+unwind never starts or waits for a `git worktree remove` child. The normal
+success path explicitly performs that governed removal from a blocking stage.
+Both paths skip unreadable stale sibling registrations, match only the exact
+snapshot path, and never run a global prune. `TempDir` remains the filesystem
+owner. A **second** interrupt is the
 operator declining to wait for the ordinary unwind and exits immediately.
 
 **Cancel ⇒ never a verdict.** Only the checks stage watches

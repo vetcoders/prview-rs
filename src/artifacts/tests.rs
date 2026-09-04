@@ -443,6 +443,23 @@ fn cancellation_after_latest_symlink_restores_predecessor() {
     assert_cancelled_pack_is_not_published(&second, ArtifactGenerationSeam::LatestAdvertisement);
 }
 
+#[test]
+fn rollback_failure_keeps_cancellation_identity_and_detail() {
+    let error = preserve_primary_error_after_latest_rollback(
+        crate::governor::Cancelled.into(),
+        Err(anyhow::anyhow!("rollback storage fault")),
+    );
+
+    assert!(
+        crate::governor::is_cancellation(&error),
+        "rollback context must not replace the typed cancellation: {error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("rollback storage fault"),
+        "rollback detail must remain observable: {error:#}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn cancellation_during_shared_snapshot_cleanup_never_publishes_the_pack() {

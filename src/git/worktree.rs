@@ -17,7 +17,9 @@ fn prune_registered_worktree(repo_root: &Path, worktree_path: &Path) -> Result<b
     let repo = git2::Repository::open(repo_root)?;
     let expected = comparable_worktree_path(worktree_path);
     for name in repo.worktrees()?.iter().flatten() {
-        let worktree = repo.find_worktree(name)?;
+        let Ok(worktree) = repo.find_worktree(name) else {
+            continue;
+        };
         if comparable_worktree_path(worktree.path()) != expected {
             continue;
         }
@@ -80,11 +82,18 @@ pub struct WorktreeSnapshot {
 
 impl Drop for WorktreeSnapshot {
     fn drop(&mut self) {
-        // `cleanup` prefers the governed Git child. If cancellation refuses that
-        // spawn, its path-exact libgit2 fallback removes only this registration
-        // in-process; a destructor must never resurrect a cancelled run with an
-        // unbounded raw child or leave common-dir metadata behind.
-        let _ = self.cleanup();
+        // Drop can run while unwinding an async stage. Never start or wait for a
+        // child here: the explicit success path owns governed `git worktree
+        // remove`, while this backstop only prunes this exact registration in
+        // process. TempDir removes the checkout files after this method returns.
+        if self.registered
+            && matches!(
+                prune_registered_worktree(&self.repo_root, &self.worktree_path),
+                Ok(true)
+            )
+        {
+            self.registered = false;
+        }
     }
 }
 
@@ -269,6 +278,88 @@ mod tests {
                 .any(|path| comparable_worktree_path(path)
                     == comparable_worktree_path(&control_path)),
             "rollback must not prune a sibling worktree"
+        );
+    }
+
+    #[test]
+    fn registration_rollback_skips_an_unreadable_sibling_before_the_exact_target() {
+        let (repo_tmp, repo) = repo_with_commit();
+        let worktrees_tmp = tempfile::tempdir().expect("worktree tempdir");
+        let stale_path = worktrees_tmp.path().join("stale");
+        let healthy_path = worktrees_tmp.path().join("healthy");
+        let target_path = worktrees_tmp.path().join("target");
+        let _stale = repo
+            .worktree("a-stale", &stale_path, None)
+            .expect("stale sibling registration");
+        let _healthy = repo
+            .worktree("m-healthy", &healthy_path, None)
+            .expect("healthy sibling registration");
+        let target = repo
+            .worktree("z-target", &target_path, None)
+            .expect("target registration");
+        target
+            .lock(Some("exact rollback target"))
+            .expect("lock target");
+
+        std::fs::remove_file(repo.path().join("worktrees/a-stale/gitdir"))
+            .expect("make the sibling registration unreadable");
+        assert!(repo.find_worktree("a-stale").is_err());
+        assert!(
+            prune_registered_worktree(repo_tmp.path(), &target_path)
+                .expect("a stale sibling must not abort the exact lookup")
+        );
+
+        let names = repo.worktrees().expect("remaining worktree names");
+        assert!(names.iter().flatten().any(|name| name == "m-healthy"));
+        assert!(!names.iter().flatten().any(|name| name == "z-target"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_drop_deregisters_in_process_without_spawning_git() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo_tmp, _repo) = repo_with_commit();
+        let head = git2::Repository::open(repo_tmp.path())
+            .expect("open repo")
+            .head()
+            .expect("head")
+            .target()
+            .expect("head oid")
+            .to_string();
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head).expect("snapshot");
+        let snapshot_path = snapshot.worktree_path.clone();
+        let marker = repo_tmp.path().join("drop-spawned-git");
+        let shim = repo_tmp.path().join("git-shim");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf called > '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .expect("write git shim");
+        let mut permissions = std::fs::metadata(&shim)
+            .expect("shim metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&shim, permissions).expect("make shim executable");
+
+        let _override = crate::git::override_test_git_program(shim);
+        drop(snapshot);
+
+        assert!(!marker.exists(), "Drop must not start a git child");
+        let repo = git2::Repository::open(repo_tmp.path()).expect("reopen repo");
+        assert!(
+            registered_paths(&repo)
+                .iter()
+                .all(|path| comparable_worktree_path(path)
+                    != comparable_worktree_path(&snapshot_path)),
+            "Drop must prune the exact registration"
+        );
+        assert!(
+            !snapshot_path.exists(),
+            "TempDir still owns checkout cleanup"
         );
     }
 

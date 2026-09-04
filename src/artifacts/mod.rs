@@ -456,6 +456,18 @@ fn ensure_generation_active(
     Err(crate::governor::Cancelled.into())
 }
 
+fn preserve_primary_error_after_latest_rollback(
+    primary: anyhow::Error,
+    rollback: Result<()>,
+) -> anyhow::Error {
+    match rollback {
+        Ok(()) => primary,
+        Err(rollback_error) => primary.context(format!(
+            "latest publication rollback also failed: {rollback_error:#}"
+        )),
+    }
+}
+
 /// Generate all artifacts
 pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let GenerateInput {
@@ -1152,15 +1164,19 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
             &out_dir,
             ArtifactGenerationSeam::LatestAdvertisement,
         ) {
-            rollback_latest_publication(&latest_transaction)?;
-            return Err(error);
+            return Err(preserve_primary_error_after_latest_rollback(
+                error,
+                rollback_latest_publication(&latest_transaction),
+            ));
         }
 
         if let Err(error) =
             ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)
         {
-            rollback_latest_publication(&latest_transaction)?;
-            return Err(error);
+            return Err(preserve_primary_error_after_latest_rollback(
+                error,
+                rollback_latest_publication(&latest_transaction),
+            ));
         }
 
         if let Err(e) = storage::register_and_prune_locked(

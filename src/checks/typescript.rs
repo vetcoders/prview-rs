@@ -73,7 +73,7 @@ fn vitest_args(config: &Config) -> Vec<String> {
         "1".to_string(),
     ];
     if let Some(pattern) = &config.tests_pattern {
-        args.extend(["--grep".to_string(), pattern.clone()]);
+        args.extend(["--testNamePattern".to_string(), pattern.clone()]);
     }
     args
 }
@@ -779,7 +779,13 @@ mod tests {
 
         assert_eq!(
             vitest_args(&config),
-            vec!["run", "--maxWorkers", "1", "--grep", "critical path"]
+            vec![
+                "run",
+                "--maxWorkers",
+                "1",
+                "--testNamePattern",
+                "critical path"
+            ]
         );
     }
 

@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cancellation remains typed as exit 130 even when rollback of the temporary
+  `latest` publication also fails; the rollback error is retained as context.
+- Vitest filtering now uses its supported `--testNamePattern` option. Snapshot
+  Drop no longer starts a potentially blocking `git worktree remove` child on a
+  Tokio worker, and exact rollback skips unreadable stale sibling registrations.
 - The CLI now rejects `--watch` together with `--tui` instead of silently
   entering TUI mode and ignoring the requested watcher.
 - Context artifact planning is reconciled with the command outcome and actual
