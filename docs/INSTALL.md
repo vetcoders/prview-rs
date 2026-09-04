@@ -106,7 +106,11 @@ already adds to `PATH`.
 | `aarch64-apple-darwin`        | yes       | yes            |
 | `x86_64-unknown-linux-gnu`    | yes       | yes            |
 
-Other platforms build from source via `cargo install prview --locked --force`.
+Other platforms may build the CLI from source via
+`cargo install prview --locked --force`; this is a build path, not a promise
+that every platform-specific runtime surface is supported. In particular, MCP
+`run_review` requires a PID-reuse-safe native process-birth identity and is
+supported on Linux, macOS, and Windows. On other targets, use the CLI directly.
 
 ## Verifying a release
 

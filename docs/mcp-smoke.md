@@ -35,6 +35,10 @@ For automation use `prview mcp --probe --json`.
 
 Register the server with your MCP client (for example in an `mcp.json`):
 
+The `run_review` smoke below is supported on Linux, macOS, and Windows. Other
+source-buildable targets should smoke the CLI directly because they do not have
+the native PID-reuse-safe identity required by MCP's durable running marker.
+
 ```json
 {
   "mcpServers": {

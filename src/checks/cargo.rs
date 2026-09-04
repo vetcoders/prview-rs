@@ -1,8 +1,9 @@
 //! Rust/Cargo checks
 
 use super::{
-    Check, CheckResult, CheckStatus, ProvenanceBuilder, TEST_TIMEOUT_SECS, has_tool_crash,
-    off_head_target_commit, plan_check_run, run_command_with_env, run_command_with_timeout_and_env,
+    Check, CheckResult, CheckStatus, ProvenanceBuilder, TEST_TIMEOUT_SECS,
+    bounded_descendant_limit, has_tool_crash, off_head_target_commit, plan_check_run,
+    run_command_with_env, run_command_with_timeout_and_env,
 };
 use crate::Config;
 use crate::cache;
@@ -10,6 +11,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Local;
 use std::path::{Path, PathBuf};
+
+const MAX_CARGO_CONFIG_BYTES: u64 = 1024 * 1024;
 
 pub struct CargoCheck;
 pub struct ClippyCheck;
@@ -32,7 +35,8 @@ struct CargoRun {
     /// Directory to run `cargo` in — the reviewed snapshot's cargo root in
     /// `--pr`/`--remote` mode, the local cargo root otherwise.
     cwd: PathBuf,
-    /// Extra child environment (`CARGO_TARGET_DIR`), empty for a local run.
+    /// Extra child environment. Every Cargo invocation receives the canonical
+    /// `CARGO_BUILD_JOBS` cap; snapshot runs also redirect `CARGO_TARGET_DIR`.
     env: Vec<(String, String)>,
     /// Ephemeral snapshot, kept alive until the check finishes.
     _snapshot: Option<crate::git::WorktreeSnapshot>,
@@ -67,9 +71,10 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
     let plan = plan_check_run(config)?;
 
     if plan.scan_dir == config.repo_root {
+        let cwd = manifest_stays_in_root(local_root)?;
         return Ok(CargoRun {
-            cwd: manifest_stays_in_root(local_root)?,
-            env: Vec::new(),
+            env: vec![cargo_jobs_env(config, &cwd)],
+            cwd,
             _snapshot: plan._snapshot,
         });
     }
@@ -105,29 +110,428 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
     dependency_paths_stay_in_snapshot(&cwd, &plan.scan_dir)?;
 
     Ok(CargoRun {
+        env: vec![
+            cargo_jobs_env(config, &cwd),
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                target_dir.display().to_string(),
+            ),
+        ],
         cwd,
-        env: vec![(
-            "CARGO_TARGET_DIR".to_string(),
-            target_dir.display().to_string(),
-        )],
         _snapshot: plan._snapshot,
     })
+}
+
+fn cargo_jobs_env(config: &Config, cwd: &Path) -> (String, String) {
+    cargo_jobs_env_with_inherited(config, cwd, |key| std::env::var_os(key))
+}
+
+/// Resolve Cargo's effective worker ceiling for a command launched from
+/// `cwd`, including inherited environment and repository/home configuration.
+///
+/// Python runners reuse this for Rust-backed build frontends spawned by uv or
+/// Python plugins. Exporting `CARGO_BUILD_JOBS` there has the same precedence as
+/// a direct Cargo gate, so both paths must preserve the same stricter contract.
+pub(super) fn cargo_jobs_env_with_inherited(
+    config: &Config,
+    cwd: &Path,
+    mut inherited: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> (String, String) {
+    let cargo_home = cargo_home_path(cwd, inherited("CARGO_HOME"), cargo_operator_home());
+    cargo_jobs_env_with(
+        config.resource_plan.worker_limit,
+        config.resource_plan.logical_cores,
+        cwd,
+        cargo_home.as_deref(),
+        inherited,
+    )
+}
+
+fn cargo_home_path(
+    cwd: &Path,
+    configured: Option<std::ffi::OsString>,
+    operator_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let path = configured
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| operator_home.map(|path| path.join(".cargo")))?;
+    Some(if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    })
+}
+
+fn cargo_operator_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)
+    }
+    #[cfg(not(windows))]
+    {
+        // Match Cargo's `home` crate: on Unix this honors HOME (including an
+        // empty value) before falling back to the account database.
+        #[allow(deprecated)]
+        std::env::home_dir()
+    }
+}
+
+fn cargo_jobs_env_with(
+    worker_limit: u32,
+    logical_cores: u32,
+    cwd: &Path,
+    cargo_home: Option<&Path>,
+    mut inherited: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> (String, String) {
+    let configured_limit = reviewed_cargo_jobs_limit(cwd, cargo_home, logical_cores).unwrap_or(1);
+    let inherited_limit = match inherited("CARGO_BUILD_JOBS") {
+        None => u32::MAX,
+        Some(value) => match cargo_jobs_directive_from_os(&value, logical_cores) {
+            CargoJobsDirective::Default | CargoJobsDirective::Absent => u32::MAX,
+            CargoJobsDirective::Limit(limit) => limit,
+            CargoJobsDirective::Uncertain => 1,
+        },
+    };
+    (
+        "CARGO_BUILD_JOBS".to_string(),
+        worker_limit
+            .max(1)
+            .min(inherited_limit)
+            .min(configured_limit)
+            .to_string(),
+    )
+}
+
+fn cargo_jobs_directive_from_os(value: &std::ffi::OsStr, logical_cores: u32) -> CargoJobsDirective {
+    value
+        .to_str()
+        .map(|value| cargo_jobs_directive_from_text(value, logical_cores))
+        .unwrap_or(CargoJobsDirective::Uncertain)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CargoJobsDirective {
+    Absent,
+    Default,
+    Limit(u32),
+    Uncertain,
+}
+
+/// Resolve only Cargo's scalar `build.jobs` contract for the command's exact
+/// cwd. A direct environment override is applied separately by
+/// [`cargo_jobs_env_with`]. Any config shape we cannot prove falls back to one
+/// worker rather than raising a repository-owned ceiling.
+fn reviewed_cargo_jobs_limit(
+    cwd: &Path,
+    cargo_home: Option<&Path>,
+    logical_cores: u32,
+) -> Option<u32> {
+    let mut directories: Vec<PathBuf> = cwd
+        .ancestors()
+        .map(|ancestor| ancestor.join(".cargo"))
+        .collect();
+    if let Some(cargo_home) = cargo_home {
+        directories.push(cargo_home.to_path_buf());
+    } else {
+        return None;
+    }
+
+    let mut visited = std::collections::BTreeSet::new();
+    for directory in directories {
+        if !visited.insert(directory.clone()) {
+            continue;
+        }
+        match cargo_jobs_directive_in(&directory, logical_cores) {
+            CargoJobsDirective::Absent => continue,
+            CargoJobsDirective::Default => return Some(u32::MAX),
+            CargoJobsDirective::Limit(limit) => return Some(limit),
+            CargoJobsDirective::Uncertain => return None,
+        }
+    }
+    Some(u32::MAX)
+}
+
+fn cargo_jobs_directive_in(directory: &Path, logical_cores: u32) -> CargoJobsDirective {
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return CargoJobsDirective::Uncertain,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CargoJobsDirective::Absent;
+        }
+        Err(_) => return CargoJobsDirective::Uncertain,
+    }
+    let legacy = directory.join("config");
+    let modern = directory.join("config.toml");
+    let present = |path: &Path| match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    };
+    let path = match present(&legacy) {
+        Ok(true) => legacy,
+        Ok(false) => match present(&modern) {
+            Ok(true) => modern,
+            Ok(false) => return CargoJobsDirective::Absent,
+            Err(_) => return CargoJobsDirective::Uncertain,
+        },
+        Err(_) => return CargoJobsDirective::Uncertain,
+    };
+    let Ok(contents) = read_bounded_regular_cargo_config(&path) else {
+        return CargoJobsDirective::Uncertain;
+    };
+    let Ok(document) = toml::from_str::<toml::Value>(&contents) else {
+        return CargoJobsDirective::Uncertain;
+    };
+    // Cargo's recursive include/merge contract is deliberately not
+    // reimplemented here. Unknown influence means the only safe upper bound is
+    // one worker; Cargo itself will still diagnose an invalid include.
+    if document.get("include").is_some() {
+        return CargoJobsDirective::Uncertain;
+    }
+    let Some(jobs) = document.get("build").and_then(|build| build.get("jobs")) else {
+        return CargoJobsDirective::Absent;
+    };
+    jobs.as_str()
+        .map(|value| {
+            if value == "default" {
+                CargoJobsDirective::Default
+            } else {
+                CargoJobsDirective::Uncertain
+            }
+        })
+        .or_else(|| {
+            jobs.as_integer()
+                .map(|value| cargo_jobs_directive_from_integer(value, logical_cores))
+        })
+        .unwrap_or(CargoJobsDirective::Uncertain)
+}
+
+/// Read only a finite regular Cargo config without following a final symlink.
+///
+/// This runs before any governed Cargo child exists, so it must not block on a
+/// tracked FIFO/device or consume an unbounded file reached through a snapshot
+/// symlink. Unsupported input is intentionally `Uncertain`; the resource plan
+/// then lowers Cargo to one worker while Cargo itself reports its config error.
+fn read_bounded_regular_cargo_config(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Cargo config is not a direct regular file",
+            ));
+        }
+    }
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_CARGO_CONFIG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo config is not a bounded regular file",
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CARGO_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CARGO_CONFIG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cargo config exceeds the bounded read limit",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn cargo_jobs_directive_from_text(value: &str, logical_cores: u32) -> CargoJobsDirective {
+    let value = value.trim();
+    if value == "default" {
+        return CargoJobsDirective::Default;
+    }
+    value
+        .parse::<i64>()
+        .ok()
+        .map(|value| cargo_jobs_directive_from_integer(value, logical_cores))
+        .unwrap_or(CargoJobsDirective::Uncertain)
+}
+
+fn cargo_jobs_directive_from_integer(jobs: i64, logical_cores: u32) -> CargoJobsDirective {
+    let Ok(jobs) = i32::try_from(jobs) else {
+        return CargoJobsDirective::Uncertain;
+    };
+    if jobs > 0 {
+        return CargoJobsDirective::Limit(u32::try_from(jobs).unwrap_or(u32::MAX));
+    }
+    if jobs < 0 {
+        let effective = i64::from(logical_cores.max(1)) + i64::from(jobs);
+        return u32::try_from(effective)
+            .ok()
+            .filter(|value| *value > 0)
+            .map(CargoJobsDirective::Limit)
+            .unwrap_or(CargoJobsDirective::Uncertain);
+    }
+    CargoJobsDirective::Uncertain
+}
+
+fn cargo_test_thread_env(config: &Config) -> (String, String) {
+    cargo_test_thread_env_with(config.resource_plan.worker_limit, |key| {
+        std::env::var(key).ok()
+    })
+}
+
+fn cargo_test_thread_env_with(
+    worker_limit: u32,
+    mut inherited: impl FnMut(&str) -> Option<String>,
+) -> (String, String) {
+    (
+        "RUST_TEST_THREADS".to_string(),
+        bounded_descendant_limit(worker_limit, inherited("RUST_TEST_THREADS").as_deref())
+            .to_string(),
+    )
+}
+
+/// Exact `cargo test` command surface for the run-wide resource envelope.
+///
+/// Cargo's build-job cap does not constrain libtest's own worker pool. Cap
+/// libtest through `RUST_TEST_THREADS` rather than forwarding `--test-threads`
+/// after `--`, because `[ARGS]...` are passed to every test binary — including
+/// `harness = false` custom targets that reject libtest flags. A stricter
+/// positive `RUST_TEST_THREADS` supplied by the operator remains the ceiling.
+fn cargo_literal_test_filter(pattern: &str) -> Result<&str> {
+    if pattern.trim().is_empty() {
+        anyhow::bail!(
+            "Cargo test cannot honor an empty --tests-pattern; no Cargo command was started"
+        );
+    }
+    if pattern.starts_with('-') {
+        anyhow::bail!(
+            "Cargo test filter {pattern:?} is invalid: values beginning with '-' could be interpreted as Cargo or libtest options; no Cargo command was started"
+        );
+    }
+    if pattern.chars().any(char::is_control) {
+        anyhow::bail!(
+            "Cargo test filter {pattern:?} is invalid: control characters are not accepted; no Cargo command was started"
+        );
+    }
+    if pattern.chars().any(|character| {
+        matches!(
+            character,
+            '\\' | '^' | '$' | '.' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    }) {
+        anyhow::bail!(
+            "Cargo test cannot honor --tests-pattern {pattern:?}: Cargo/libtest accepts a literal substring, not a regular expression; use a literal-only substring, omit --tests-pattern, or run a regex-capable test profile separately; no Cargo command was started"
+        );
+    }
+    Ok(pattern)
+}
+
+fn cargo_test_args(config: &Config) -> Result<Vec<String>> {
+    let mut args = vec![
+        "test".to_string(),
+        "--all-targets".to_string(),
+        "--no-fail-fast".to_string(),
+    ];
+    if let Some(pattern) = &config.tests_pattern {
+        match cargo_literal_test_filter(pattern) {
+            Ok(pattern) => args.push(pattern.to_string()),
+            Err(error)
+                if config.profile.kind == crate::config::ProfileKind::Mixed
+                    && config.profile.has_package_json =>
+            {
+                anyhow::bail!(
+                    "Mixed JS/Rust reviews share one --tests-pattern across Vitest and Cargo. The common portable subset is a literal substring; use a literal-only value or omit the shared selector. Cargo detail: {error:#}"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(args)
+}
+
+fn cargo_test_executed_count(output: &str) -> Option<u64> {
+    let mut summaries = 0_u64;
+    let mut executed = 0_u64;
+    for line in output.lines() {
+        let Some(summary) = line.trim().strip_prefix("test result: ") else {
+            continue;
+        };
+        let Some((_, counts)) = summary.split_once(". ") else {
+            continue;
+        };
+        let Some(passed) = counts
+            .split(';')
+            .find_map(|field| field.trim().strip_suffix(" passed"))
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        summaries += 1;
+        executed = executed.saturating_add(passed);
+    }
+    (summaries > 0).then_some(executed)
+}
+
+fn classify_cargo_test_status(
+    exit_success: bool,
+    filter: Option<&str>,
+    output: &str,
+) -> (CheckStatus, Option<String>) {
+    if !exit_success {
+        return (CheckStatus::Failed, None);
+    }
+    let Some(filter) = filter else {
+        return (CheckStatus::Passed, None);
+    };
+    match cargo_test_executed_count(output) {
+        Some(executed) if executed > 0 => (CheckStatus::Passed, None),
+        Some(_) => (
+            CheckStatus::Error,
+            Some(format!(
+                "Cargo test filter {filter:?} matched no runnable tests. The check is ERROR, not PASS, because prview cannot prove that any selected Cargo test executed."
+            )),
+        ),
+        None => (
+            CheckStatus::Error,
+            Some(format!(
+                "Cargo test filter {filter:?} produced no verifiable libtest summary. The check is ERROR, not PASS, because prview cannot prove that a selected Cargo test executed."
+            )),
+        ),
+    }
 }
 
 /// The directory a cargo check would have run in, given a scan dir that already
 /// exists.
 ///
 /// Shares its resolution with [`plan_cargo_run`] rather than repeating it, and
-/// materialises nothing: the caller is the error path in the dispatcher, which
-/// has the run-wide snapshot (or the local root) in hand and only needs to know
-/// where within it the command was headed. Collapsing every cargo run to the
-/// snapshot root there would report a directory the command did not run in —
-/// wrong in exactly the workspace-member case the cache key already learned to
+/// materialises nothing: its callers already have the run-wide snapshot (or the
+/// local root) in hand and only need to know where within it a cargo command
+/// belongs — the error path in the dispatcher, which reports the directory the
+/// check was headed for, and the context artifacts, which must run `cargo tree`
+/// in the same place the gates did. Collapsing every cargo run to the snapshot
+/// root there would name a directory the command did not run in — wrong in
+/// exactly the workspace-member case the cache key already learned to
 /// distinguish.
 ///
 /// Best effort by construction: a root the reviewed tree cannot offer falls back
 /// to the scan dir, which is the closest true statement available.
-pub(super) fn planned_cargo_cwd(config: &Config, scan_dir: &Path) -> PathBuf {
+pub(crate) fn planned_cargo_cwd(config: &Config, scan_dir: &Path) -> PathBuf {
     if scan_dir == config.repo_root {
         return cargo_cache_root(config).to_path_buf();
     }
@@ -1001,6 +1405,12 @@ impl Check for CargoCheck {
         "Cargo check"
     }
 
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
+    }
+
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
         if !config.profile.has_cargo {
             return super::CheckEligibility::Skip(format!(
@@ -1071,6 +1481,12 @@ impl Check for CargoCheck {
 impl Check for ClippyCheck {
     fn name(&self) -> &str {
         "Clippy"
+    }
+
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
@@ -1189,6 +1605,12 @@ impl Check for CargoTestCheck {
         "Cargo test"
     }
 
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
+    }
+
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
         if !config.profile.has_cargo {
             return super::CheckEligibility::Skip(format!(
@@ -1220,24 +1642,32 @@ impl Check for CargoTestCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
+        // Validate before planning/materialising a remote snapshot. Invalid or
+        // semantically unsupported selectors must not start any Cargo work.
+        let owned_args = cargo_test_args(config)?;
         let run = plan_cargo_run(config)?;
         let cwd = run.cwd.as_path();
 
-        let args = &["test", "--all-targets", "--no-fail-fast"];
+        let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+        let mut env = run.env.clone();
+        env.push(cargo_test_thread_env(config));
         let output =
-            run_command_with_timeout_and_env("cargo", args, cwd, TEST_TIMEOUT_SECS, &run.env)
-                .await?;
+            run_command_with_timeout_and_env("cargo", &args, cwd, TEST_TIMEOUT_SECS, &env).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{}\n{}", stdout, stderr);
-
-        let status = if output.status.success() {
-            CheckStatus::Passed
-        } else {
-            CheckStatus::Failed
-        };
+        let mut combined = format!("{}\n{}", stdout, stderr);
+        let (status, diagnostic) = classify_cargo_test_status(
+            output.status.success(),
+            config.tests_pattern.as_deref(),
+            &combined,
+        );
+        if let Some(diagnostic) = diagnostic {
+            combined.push_str("\nprview: ");
+            combined.push_str(&diagnostic);
+            combined.push('\n');
+        }
 
         Ok(CheckResult {
             name: self.name().to_string(),
@@ -1249,7 +1679,7 @@ impl Check for CargoTestCheck {
                 ProvenanceBuilder {
                     check: self.name(),
                     cmd: "cargo",
-                    args,
+                    args: &args,
                     cwd,
                     repo_root: &config.repo_root,
                     exit_code: output.status.code(),
@@ -1268,6 +1698,10 @@ impl Check for CargoTestCheck {
 impl Check for RustfmtCheck {
     fn name(&self) -> &str {
         "Rustfmt"
+    }
+
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Light
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
@@ -1379,6 +1813,12 @@ fn rustfmt_tool_unavailable(output: &str) -> bool {
 impl Check for CargoAuditCheck {
     fn name(&self) -> &str {
         "Cargo audit"
+    }
+
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
@@ -1552,6 +1992,12 @@ fn count_cargo_audit_warning_items(value: &serde_json::Value) -> usize {
 impl Check for CargoGeigerCheck {
     fn name(&self) -> &str {
         "Cargo geiger"
+    }
+
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
     }
 
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
@@ -1876,6 +2322,8 @@ mod tests {
     use super::*;
     use crate::cli::ExecutionMode;
     use crate::config::{test_config_builder, test_rust_profile};
+    #[cfg(unix)]
+    use std::time::Duration;
 
     fn create_test_config(has_cargo: bool, run_lint: bool, run_tests: bool) -> Config {
         test_config_builder()
@@ -1919,6 +2367,361 @@ mod tests {
             check.check_eligibility(&config),
             super::super::CheckEligibility::Skip(_)
         ));
+    }
+
+    #[test]
+    fn cargo_jobs_never_raises_a_stricter_operator_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("repo");
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let value = |worker_limit, inherited: Option<&str>| {
+            cargo_jobs_env_with(worker_limit, 8, &cwd, Some(&cargo_home), |_| {
+                inherited.map(std::ffi::OsString::from)
+            })
+            .1
+        };
+
+        assert_eq!(value(4, Some("1")), "1");
+        assert_eq!(value(4, Some("8")), "4");
+        assert_eq!(value(4, Some("-7")), "1");
+        assert_eq!(value(4, Some("default")), "4");
+        assert_eq!(value(4, None), "4");
+        assert_eq!(value(4, Some("0")), "1");
+        assert_eq!(value(4, Some("2147483648")), "1");
+        assert_eq!(value(4, Some("not-a-limit")), "1");
+        assert_eq!(value(0, None), "1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_cargo_jobs_limit_is_uncertain_not_unset() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = std::ffi::OsString::from_vec(vec![0xff]);
+        assert_eq!(
+            cargo_jobs_directive_from_os(&value, 8),
+            CargoJobsDirective::Uncertain
+        );
+    }
+
+    #[test]
+    fn cargo_home_resolution_matches_cargo_empty_and_relative_rules() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("reviewed");
+        let operator_home = tmp.path().join("operator");
+
+        assert_eq!(
+            cargo_home_path(
+                &cwd,
+                Some(std::ffi::OsString::new()),
+                Some(operator_home.clone())
+            ),
+            Some(operator_home.join(".cargo"))
+        );
+        assert_eq!(
+            cargo_home_path(
+                &cwd,
+                Some(std::ffi::OsString::from("relative-cargo-home")),
+                Some(operator_home)
+            ),
+            Some(cwd.join("relative-cargo-home"))
+        );
+        assert_eq!(
+            cargo_home_path(&cwd, None, Some(PathBuf::new())),
+            Some(cwd.join(".cargo"))
+        );
+    }
+
+    fn write_cargo_config(root: &Path, name: &str, contents: &str) {
+        let directory = root.join(".cargo");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(name), contents).unwrap();
+    }
+
+    fn resolved_jobs(
+        worker_limit: u32,
+        logical_cores: u32,
+        cwd: &Path,
+        cargo_home: &Path,
+        inherited: Option<&str>,
+    ) -> String {
+        cargo_jobs_env_with(worker_limit, logical_cores, cwd, Some(cargo_home), |_| {
+            inherited.map(std::ffi::OsString::from)
+        })
+        .1
+    }
+
+    #[test]
+    fn cargo_jobs_preserves_reviewed_config_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        write_cargo_config(&repo, "config.toml", "[build]\njobs = 1\n");
+        assert_eq!(resolved_jobs(4, 8, &repo, &cargo_home, None), "1");
+
+        write_cargo_config(&repo, "config.toml", "[build]\njobs = 8\n");
+        assert_eq!(resolved_jobs(4, 8, &repo, &cargo_home, None), "4");
+        assert_eq!(resolved_jobs(4, 8, &repo, &cargo_home, Some("1")), "1");
+    }
+
+    #[test]
+    fn cargo_jobs_matches_cargo_scalar_precedence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let member = repo.join("member");
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(&member).unwrap();
+
+        write_cargo_config(&repo, "config", "[build]\njobs = 1\n");
+        write_cargo_config(&repo, "config.toml", "[build]\njobs = 4\n");
+        assert_eq!(resolved_jobs(4, 8, &repo, &cargo_home, None), "1");
+
+        write_cargo_config(&member, "config.toml", "[build]\njobs = 2\n");
+        assert_eq!(resolved_jobs(4, 8, &member, &cargo_home, None), "2");
+
+        write_cargo_config(&member, "config.toml", "[build]\njobs = \"default\"\n");
+        assert_eq!(resolved_jobs(4, 8, &member, &cargo_home, None), "4");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_jobs_refuses_a_symlinked_config_before_reading_it() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let cargo_home = tmp.path().join("cargo-home");
+        let external = tmp.path().join("external-config.toml");
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        std::fs::write(&external, "[build]\njobs = 7\n").unwrap();
+        symlink(&external, repo.join(".cargo/config")).unwrap();
+        std::fs::write(repo.join(".cargo/config.toml"), "[build]\njobs = 2\n").unwrap();
+
+        assert_eq!(
+            resolved_jobs(8, 8, &repo, &cargo_home, None),
+            "1",
+            "the higher-precedence symlink is uncertain and must not be followed or skipped",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn off_head_snapshot_refuses_a_tracked_config_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(root.join("external-config.toml"), "[build]\njobs = 7\n").unwrap();
+        symlink("../external-config.toml", root.join(".cargo/config")).unwrap();
+        init_repo_with_commit(root);
+        let target = head_sha(root);
+        std::fs::write(root.join("later.txt"), "make target off HEAD\n").unwrap();
+        commit_all(root, "later");
+
+        let snapshot = crate::git::create_worktree_snapshot(root, &target)
+            .expect("materialize the reviewed commit");
+        assert_eq!(
+            cargo_jobs_directive_in(&snapshot.worktree_path.join(".cargo"), 8),
+            CargoJobsDirective::Uncertain,
+            "a revision-backed symlink must not escape the snapshot read boundary",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_jobs_refuses_a_symlinked_cargo_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let external = tmp.path().join("external-cargo");
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("config.toml"), "[build]\njobs = 7\n").unwrap();
+        symlink(&external, repo.join(".cargo")).unwrap();
+
+        assert_eq!(resolved_jobs(8, 8, &repo, &cargo_home, None), "1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_jobs_dangerous_config_helper() {
+        let Ok(directory) = std::env::var("PRVIEW_TEST_CARGO_CONFIG_DIR") else {
+            return;
+        };
+        assert_eq!(
+            cargo_jobs_directive_in(Path::new(&directory), 8),
+            CargoJobsDirective::Uncertain,
+        );
+        std::fs::write(
+            std::env::var("PRVIEW_TEST_CARGO_CONFIG_DONE").expect("result path"),
+            "done\n",
+        )
+        .expect("publish bounded result");
+    }
+
+    #[cfg(unix)]
+    fn assert_dangerous_cargo_config_returns_promptly(prepare: impl FnOnce(&Path), label: &str) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cargo_dir = tmp.path().join(".cargo");
+        let done = tmp.path().join("done");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        prepare(&cargo_dir.join("config"));
+
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "checks::cargo::tests::cargo_jobs_dangerous_config_helper",
+                "--nocapture",
+            ])
+            .env("PRVIEW_TEST_CARGO_CONFIG_DIR", &cargo_dir)
+            .env("PRVIEW_TEST_CARGO_CONFIG_DONE", &done)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn bounded config probe");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait().expect("poll config probe") {
+                Some(status) => {
+                    assert!(
+                        status.success(),
+                        "{label} must fail closed without blocking"
+                    );
+                    assert!(
+                        done.is_file(),
+                        "{label} probe did not execute its assertion"
+                    );
+                    break;
+                }
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{label} blocked the synchronous resource planner");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_jobs_never_reads_a_dev_zero_symlink() {
+        use std::os::unix::fs::symlink;
+
+        assert_dangerous_cargo_config_returns_promptly(
+            |path| symlink("/dev/zero", path).expect("symlink /dev/zero"),
+            "a /dev/zero config symlink",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_jobs_never_blocks_on_a_fifo() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        assert_dangerous_cargo_config_returns_promptly(
+            |path| {
+                let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path");
+                // SAFETY: the path is a NUL-terminated temporary pathname and
+                // mkfifo creates only that fixture with owner read/write mode.
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            },
+            "a FIFO Cargo config",
+        );
+    }
+
+    #[test]
+    fn cargo_jobs_refuses_an_oversized_config_before_parsing_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        std::fs::write(
+            repo.join(".cargo/config.toml"),
+            vec![b' '; MAX_CARGO_CONFIG_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        assert_eq!(resolved_jobs(8, 8, &repo, &cargo_home, None), "1");
+    }
+
+    #[test]
+    fn cargo_jobs_reads_canonical_home_config_after_project_ancestors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::write(cargo_home.join("config.toml"), "[build]\njobs = 1\n").unwrap();
+
+        assert_eq!(resolved_jobs(4, 8, &repo, &cargo_home, None), "1");
+
+        write_cargo_config(&repo, "config.toml", "[build]\njobs = 2\n");
+        assert_eq!(resolved_jobs(4, 8, &repo, &cargo_home, None), "2");
+    }
+
+    #[test]
+    fn cargo_jobs_handles_negative_and_uncertain_config_fail_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        write_cargo_config(&repo, "config.toml", "[build]\njobs = -7\n");
+        assert_eq!(resolved_jobs(4, 8, &repo, &cargo_home, None), "1");
+
+        for contents in [
+            "[build]\njobs = 0\n",
+            "[build]\njobs = true\n",
+            "[build]\njobs = \"8\"\n",
+            "[build]\njobs = 2147483648\n",
+            "[build]\njobs = -2147483649\n",
+            "[build\njobs = 2\n",
+            "include = [\"shared.toml\"]\n[build]\njobs = 4\n",
+        ] {
+            write_cargo_config(&repo, "config.toml", contents);
+            assert_eq!(
+                resolved_jobs(4, 8, &repo, &cargo_home, None),
+                "1",
+                "uncertain config must fail closed: {contents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_jobs_reads_only_config_visible_from_exact_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let member = repo.join("member");
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(&member).unwrap();
+        write_cargo_config(&member, "config.toml", "[build]\njobs = 1\n");
+
+        assert_eq!(resolved_jobs(4, 8, &repo, &cargo_home, None), "4");
+        assert_eq!(resolved_jobs(4, 8, &member, &cargo_home, None), "1");
+    }
+
+    #[test]
+    fn cargo_test_threads_never_raises_a_stricter_operator_limit() {
+        let value = |worker_limit, inherited: Option<&str>| {
+            cargo_test_thread_env_with(worker_limit, |_| inherited.map(str::to_owned)).1
+        };
+
+        assert_eq!(value(4, Some("1")), "1");
+        assert_eq!(value(4, Some("8")), "4");
+        assert_eq!(value(4, None), "4");
+        assert_eq!(value(4, Some("0")), "4");
+        assert_eq!(value(4, Some("not-a-limit")), "4");
+        assert_eq!(value(0, None), "1");
     }
 
     #[test]
@@ -1992,6 +2795,106 @@ mod tests {
             check.check_eligibility(&config),
             super::super::CheckEligibility::Skip(_)
         ));
+    }
+
+    #[test]
+    fn cargo_test_args_do_not_forward_libtest_flags() {
+        let mut config = create_test_config(true, false, true);
+        config.resource_plan.worker_limit = 1;
+
+        assert_eq!(
+            cargo_test_args(&config).unwrap(),
+            vec!["test", "--all-targets", "--no-fail-fast"]
+        );
+        assert_eq!(
+            cargo_test_thread_env_with(config.resource_plan.worker_limit, |_| None),
+            ("RUST_TEST_THREADS".to_string(), "1".to_string())
+        );
+    }
+
+    #[test]
+    fn cargo_test_args_preserve_filter_without_harness_args() {
+        let mut config = create_test_config(true, false, true);
+        config.resource_plan.worker_limit = 3;
+        config.tests_pattern = Some("critical path".to_string());
+
+        assert_eq!(
+            cargo_test_args(&config).unwrap(),
+            vec!["test", "--all-targets", "--no-fail-fast", "critical path"]
+        );
+        assert_eq!(
+            cargo_test_thread_env_with(config.resource_plan.worker_limit, |_| None),
+            ("RUST_TEST_THREADS".to_string(), "3".to_string())
+        );
+    }
+
+    #[test]
+    fn cargo_test_filter_rejects_regex_and_option_shapes_before_spawn() {
+        for pattern in [
+            "",
+            "critical.*path",
+            "^critical",
+            "(critical|path)",
+            "[ab]",
+            r"foo\.bar",
+            "--no-run",
+            "-q",
+            "line\nbreak",
+        ] {
+            let mut config = create_test_config(true, false, true);
+            config.tests_pattern = Some(pattern.to_string());
+            assert!(
+                cargo_test_args(&config).is_err(),
+                "unsupported Cargo selector must fail before spawn: {pattern:?}"
+            );
+        }
+
+        for pattern in ["critical_path", "module::critical_path", "critical path"] {
+            let mut config = create_test_config(true, false, true);
+            config.tests_pattern = Some(pattern.to_string());
+            let args = cargo_test_args(&config).unwrap();
+            assert_eq!(args.last().map(String::as_str), Some(pattern));
+        }
+    }
+
+    #[test]
+    fn mixed_js_rust_test_filter_names_literal_intersection() {
+        let mut config = create_test_config(true, false, true);
+        config.profile.kind = crate::config::ProfileKind::Mixed;
+        config.profile.has_package_json = true;
+        config.tests_pattern = Some("critical.*path".to_string());
+
+        let error = cargo_test_args(&config).expect_err("mixed regex must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("Mixed JS/Rust"), "got: {message}");
+        assert!(message.contains("common portable subset"), "got: {message}");
+    }
+
+    #[test]
+    fn filtered_cargo_test_requires_positive_execution_evidence() {
+        let zero = "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out";
+        let one = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out";
+
+        assert_eq!(
+            classify_cargo_test_status(true, Some("critical"), zero).0,
+            CheckStatus::Error
+        );
+        assert_eq!(
+            classify_cargo_test_status(true, Some("critical"), &format!("{zero}\n{one}")).0,
+            CheckStatus::Passed
+        );
+        assert_eq!(
+            classify_cargo_test_status(true, Some("critical"), "custom harness output").0,
+            CheckStatus::Error
+        );
+        assert_eq!(
+            classify_cargo_test_status(false, Some("critical"), one).0,
+            CheckStatus::Failed
+        );
+        assert_eq!(
+            classify_cargo_test_status(true, None, zero).0,
+            CheckStatus::Passed
+        );
     }
 
     #[test]
@@ -2697,10 +3600,16 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         assert_eq!(run.cwd, scan_dir.path());
         assert_eq!(
             run.env,
-            vec![(
-                "CARGO_TARGET_DIR".to_string(),
-                config.cargo_build_cache_dir().display().to_string()
-            )],
+            vec![
+                (
+                    "CARGO_BUILD_JOBS".to_string(),
+                    config.resource_plan.worker_limit.to_string()
+                ),
+                (
+                    "CARGO_TARGET_DIR".to_string(),
+                    config.cargo_build_cache_dir().display().to_string()
+                )
+            ],
             "cargo must build into the shared per-repo cache, not the snapshot",
         );
         let target_dir = config.cargo_build_cache_dir();
@@ -2715,8 +3624,8 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
     }
 
     /// A local review (target == HEAD) is unchanged: the local cargo root, and
-    /// no `CARGO_TARGET_DIR` redirect, so the operator's warm `target/` is used
-    /// exactly as before.
+    /// no `CARGO_TARGET_DIR` redirect, so the operator's warm `target/` is used.
+    /// The descendant job cap still applies.
     #[tokio::test]
     async fn test_cargo_run_local_target_is_unchanged() {
         let repo_root = tempfile::tempdir().expect("repo_root tempdir");
@@ -2730,9 +3639,9 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         let run = plan_cargo_run(&config).expect("plan");
 
         assert_eq!(run.cwd, repo_root.path());
-        assert!(
-            run.env.is_empty(),
-            "a local run must not redirect the build directory",
+        assert_eq!(
+            run.env,
+            vec![("CARGO_BUILD_JOBS".to_string(), "1".to_string())]
         );
     }
 
@@ -3048,16 +3957,14 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
     /// (no `..` in the path), and following it runs cargo on the operator's
     /// unrelated tree while the verdict is cached under the reviewed commit —
     /// the external-root hole, reopened by a target-controlled symlink.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_symlinked_cargo_root_never_escapes_the_snapshot() {
         let outside = tempfile::tempdir().expect("outside tempdir");
         write_crate(outside.path(), true);
         let scan_dir = tempfile::tempdir().expect("scan_dir tempdir");
         write_crate(scan_dir.path(), true);
-        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), scan_dir.path().join("backend")).unwrap();
-        #[cfg(not(unix))]
-        return;
 
         let repo_root = tempfile::tempdir().expect("repo_root tempdir");
         write_crate(&repo_root.path().join("backend"), true);

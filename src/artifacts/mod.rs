@@ -10,7 +10,7 @@ pub use signal::{api_delta, api_surface, revision_source};
 
 mod context_artifacts;
 mod findings;
-mod git_artifacts;
+pub(crate) mod git_artifacts;
 mod merge_gate;
 mod sanity;
 
@@ -51,11 +51,12 @@ use crate::config::Config;
 use crate::git::git_cmd;
 use crate::git::{Diff, Repository, ResolvedRef};
 use crate::heuristics::HeuristicsResult;
+use crate::ledger::TaskLedger;
 use crate::paths::{read_dir_within, read_to_string_within, read_within};
 use crate::policy::{GateClass, PolicySeverity};
 use crate::regression;
 use crate::regression::tests::is_test_file;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use signal::{
     BreakingFinding, BreakingKind, CoverageDelta, ReviewFileCategory, classify_review_file,
 };
@@ -72,6 +73,14 @@ const CONTEXT_GEN_TIMEOUT_SECS: u64 = 30;
 
 /// Maximum commits for per-commit diffs (avoid huge PRs)
 const MAX_COMMITS_FOR_PER_COMMIT_DIFFS: usize = 50;
+
+/// Private one-shot hand-off used by the MCP launcher. The public CLI still
+/// requires `--output-dir` to name a path that does not exist; MCP alone must
+/// reserve the eventual pack directory first so it can expose liveness and
+/// capture subprocess logs before the child starts generating artifacts.
+pub(crate) const MCP_OUTPUT_RESERVATION_ENV: &str = "PRVIEW_INTERNAL_MCP_OUTPUT_RESERVATION";
+const MCP_OUTPUT_RESERVATION_FILE: &str = ".prview-mcp-output-reservation";
+const MCP_CONTROL_FILES: [&str; 3] = ["RUNNING.json", "run.log", "run.stderr.log"];
 
 /// Maximum size for tsc-trace.log before truncation
 const MAX_TSC_TRACE_BYTES: usize = 500_000;
@@ -116,11 +125,23 @@ struct ContextCommandTiming {
     label: String,
     artifact: Option<String>,
     status: &'static str,
+    /// Runtime truth used by the ledger. Kept internal so the established
+    /// `context_commands[]` wire contract does not grow a second lifecycle.
+    started: bool,
     duration_secs: f32,
+    /// Exact pre-spawn/wait failure when no artifact can carry stderr.
+    reason: Option<String>,
 }
 
 pub struct GenerateInput<'a> {
     pub config: &'a Config,
+    /// The run's task ledger — here for the ONE fact the artifact stage cannot
+    /// derive on its own: which tree the run actually reviewed. `config` never
+    /// learns it, because the shared target snapshot is installed on a clone of
+    /// the config inside `checks::run_all`; without the ledger the context
+    /// generators fall back to the local checkout and a `--pr` pack ends up
+    /// mixing two revisions (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`).
+    pub ledger: &'a TaskLedger,
     pub diffs: &'a [Diff],
     pub checks: &'a [CheckResult],
     pub heuristics: Option<&'a HeuristicsResult>,
@@ -138,6 +159,13 @@ pub struct GenerateInput<'a> {
     /// `worktree_clean`. Recorded in `00_summary/PROVENANCE.json`; `None` when
     /// the repository could not be inspected.
     pub worktree_status_digest: Option<String>,
+    /// The run's machine-wide budget, shared with the checks stage.
+    ///
+    /// The context stage shells out to the same class of tools the gates do — a
+    /// project-wide `tsc`, a project-wide `eslint`, a bundler — so it must draw
+    /// on the same budget rather than pick its own fan-out. It is also what a
+    /// Ctrl-C reaches those children through.
+    pub governor: &'a crate::governor::ResourceGovernor,
 }
 
 struct RunJsonInput<'a> {
@@ -154,12 +182,19 @@ struct RunJsonInput<'a> {
     stage_timings: &'a [StageTiming],
     context_artifacts: &'a [ContextArtifactDecision],
     context_command_timings: &'a [ContextCommandTiming],
+    /// The run's task ledger, serialized as the additive `ledger` view.
+    ledger: &'a TaskLedger,
     regression: Option<&'a regression::RegressionReport>,
 }
 
 struct MergeGateInput<'a> {
     dir: &'a Path,
     config: &'a Config,
+    /// The run's task ledger, read for ONE fact no `CheckResult` carries: how
+    /// old the stored result behind a replayed check was. Any gate row built on
+    /// a days-old replay earns the advisory `stale_cache_caveats` entry because
+    /// both stale failures and stale passes can support the decision.
+    ledger: &'a TaskLedger,
     checks: &'a [CheckResult],
     heuristics: Option<&'a HeuristicsResult>,
     inline: &'a InlineFindingsSummary,
@@ -235,8 +270,9 @@ fn heuristics_provenance(
     };
 
     Some(crate::checks::CheckProvenance {
-        // Loctree runs in-process as a library, so there is no argv to record.
-        command: "loctree (in-process)".to_string(),
+        // Cache creation crosses a private governed worker boundary; the
+        // remaining snapshot analysis stays in the parent process.
+        command: "prview loctree worker (internal)".to_string(),
         tool_version: None,
         cwd,
         target_sha: substrate.target_sha,
@@ -319,10 +355,124 @@ pub(super) fn build_heuristics_check(
     }
 }
 
+macro_rules! artifact_generation_seams {
+    ($( $variant:ident => $label:literal ),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ArtifactGenerationSeam {
+            $( $variant ),+
+        }
+
+        impl ArtifactGenerationSeam {
+            #[cfg(test)]
+            const ALL: [Self; artifact_generation_seams!(@count $( $variant )+)] = [
+                $( Self::$variant ),+
+            ];
+
+            const fn label(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $label ),+
+                }
+            }
+        }
+    };
+    (@count $( $variant:ident )+) => {
+        <[()]>::len(&[$(artifact_generation_seams!(@unit $variant)),+])
+    };
+    (@unit $variant:ident) => { () };
+}
+
+// This is the single ordered registry for the artifact pipeline's cancellation
+// boundaries. The enum, stable marker labels, and test matrix are all expanded
+// from these entries, so a production callsite cannot drift to an ad-hoc string.
+artifact_generation_seams! {
+    ArtifactDirectorySetup => "artifact directory setup",
+    DiffGeneration => "diff generation",
+    StructuralSignalGeneration => "structural signal generation",
+    SummaryMetadata => "summary metadata",
+    PerCommitDiffs => "per-commit diffs",
+    QualityArtifacts => "quality artifacts",
+    PerFileDiffs => "per-file diffs",
+    StaticContextArtifacts => "static context artifacts",
+    ContextTools => "context tools",
+    MergeGate => "merge gate",
+    PrReview => "PR review",
+    ReportAndDashboard => "report and dashboard",
+    ReviewHandoffSurfaces => "review handoff surfaces",
+    Provenance => "provenance",
+    RunJson => "RUN.json",
+    ManifestJson => "MANIFEST.json",
+    SanityChecks => "SANITY checks",
+    SharedSnapshotCleanup => "shared snapshot cleanup",
+    PackPublication => "pack publication",
+    RunIndexPublication => "run index publication",
+    LatestAdvertisement => "latest advertisement",
+    IndexCommit => "run index commit",
+}
+
+const CANCELLED_GENERATION_SUCCESS_SURFACES: [&str; 12] = [
+    "00_summary/MERGE_GATE.json",
+    "00_summary/MERGE_GATE.md",
+    "00_summary/RUN.json",
+    "00_summary/MANIFEST.json",
+    "00_summary/SANITY.json",
+    "report.json",
+    "dashboard.html",
+    "review.html",
+    "PR_REVIEW.md",
+    "REVIEW_SUMMARY.md",
+    "AI_INDEX.md",
+    "artifacts.zip",
+];
+
+/// Cancellation turns the directory into typed incomplete evidence and removes
+/// every success-shaped surface that may have been written before the seam.
+fn ensure_generation_active(
+    governor: &crate::governor::ResourceGovernor,
+    out_dir: &Path,
+    seam: ArtifactGenerationSeam,
+) -> Result<()> {
+    #[cfg(test)]
+    generation_seam_test_hook::observe_and_maybe_cancel(seam, governor);
+
+    if !governor.is_cancelled() {
+        return Ok(());
+    }
+
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        let _ = fs::remove_file(out_dir.join(relative));
+    }
+
+    let summary_dir = out_dir.join("00_summary");
+    fs::create_dir_all(&summary_dir)?;
+    fs::write(
+        summary_dir.join("INCOMPLETE.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": "1.0",
+            "status": "incomplete",
+            "reason": "cancelled",
+            "stage": seam.label(),
+        }))?,
+    )?;
+    Err(crate::governor::Cancelled.into())
+}
+
+fn preserve_primary_error_after_latest_rollback(
+    primary: anyhow::Error,
+    rollback: Result<()>,
+) -> anyhow::Error {
+    match rollback {
+        Ok(()) => primary,
+        Err(rollback_error) => primary.context(format!(
+            "latest publication rollback also failed: {rollback_error:#}"
+        )),
+    }
+}
+
 /// Generate all artifacts
 pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let GenerateInput {
         config,
+        ledger,
         diffs,
         checks,
         heuristics,
@@ -332,6 +482,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         skipped_checks,
         worktree_clean,
         worktree_status_digest,
+        governor,
     } = input;
     let t_total = Instant::now();
     let mut stage_timings = Vec::new();
@@ -344,11 +495,33 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let heuristics_check = build_heuristics_check(heuristics, config);
     let mut all_checks: Vec<CheckResult> = checks.to_vec();
     all_checks.push(heuristics_check);
-    let context_artifacts = plan_context_artifacts(config, diffs, &all_checks);
+    // The reviewed tree, not the local one: in a `--pr` run the checks judged a
+    // snapshot of the PR's commit, and the 30_context artifacts must be planned
+    // and produced from the same bytes or the pack describes two revisions at
+    // once (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). `share_target_snapshot` therefore
+    // materialises one whenever the target is off-`HEAD`, whether or not a gate
+    // needed it, so the fallback below is reached only for a local review (target
+    // == `HEAD`, where the repo root IS the reviewed tree) or for a run whose
+    // snapshot could not be created at all — the same degraded path the checks
+    // themselves take.
+    let context_scan_root = ledger
+        .scan_dir()
+        .unwrap_or_else(|| config.repo_root.clone());
+    let mut context_artifacts =
+        plan_context_artifacts(config, &context_scan_root, diffs, &all_checks, ledger);
 
     let emit_human_stdout = !config.json && !config.quiet;
     let out_dir = config.allocate_artifacts_dir_for_commit(&resolved_target.commit_id)?;
-    fs::create_dir_all(&out_dir)?;
+    if config.output_dir.is_some() {
+        if let Some(parent) = out_dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        claim_explicit_output_dir(&out_dir)?;
+    } else {
+        // The default allocator already claimed a unique directory; this is
+        // idempotent only for that internally owned path.
+        fs::create_dir_all(&out_dir)?;
+    }
 
     // Open repository once for all generators
     let repo = Repository::open(&config.repo_root)?;
@@ -365,6 +538,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     fs::create_dir_all(&quality_dir)?;
     fs::create_dir_all(&context_dir)?;
     fs::create_dir_all(&per_commit_dir)?;
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::ArtifactDirectorySetup,
+    )?;
 
     // Artifact Pack version marker
     fs::write(summary_dir.join("ARTIFACT_VERSION.txt"), "1.0\n")?;
@@ -378,20 +556,42 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let t = Instant::now();
     let patch_texts = generate_full_patch(&diff_dir, &repo, diffs)?;
     stage_timings.push(finish_timing(emit_human_stdout, "full.patch", t));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::DiffGeneration)?;
 
-    // Rust API truth is computed once from the exact revision trees named by
-    // each Diff. The same delta feeds both artifact views and every verdict
-    // projection. JS/TS remains on its legacy diff parser behind a structural
-    // language boundary.
+    // Rust API truth is either an explicit fast-preset unknown or the output of
+    // one bounded private child covering all exact revision pairs. The parent
+    // never enters the repo-backed snapshot engine. The same delta feeds both
+    // artifact views and every verdict projection.
     let has_rust_scope = config.profile.has_cargo
         || diffs
             .iter()
             .flat_map(|diff| diff.files.iter())
             .any(|file| file.path.ends_with(".rs"));
-    let rust_api_delta = has_rust_scope
-        .then(|| api_delta::compare_rust_api_revisions(&repo, diffs))
-        .transpose()?
-        .flatten();
+    let rust_api_delta = if has_rust_scope {
+        let fast_preset = config.is_fast_remote_only_standard();
+        let phase = if fast_preset {
+            "rust-api.fast-preset-unknown"
+        } else {
+            "rust-api.isolated-worker"
+        };
+        if emit_human_stdout {
+            if fast_preset {
+                println!("  · {phase}");
+            } else {
+                println!("  · {phase} (active; 30s total)");
+            }
+        }
+        let started = Instant::now();
+        let delta =
+            api_delta::compare_rust_api_revisions_isolated(fast_preset, repo.path(), diffs)?;
+        stage_timings.push(StageTiming {
+            label: phase.to_owned(),
+            duration_secs: started.elapsed().as_secs_f32(),
+        });
+        delta
+    } else {
+        None
+    };
     let rust_breaking_view = rust_api_delta
         .as_ref()
         .map(api_delta::breaking_changes_view);
@@ -410,6 +610,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     if let Some(ghr) = signal::generate_ghost_refs(&context_dir, diffs, &repo)? {
         all_checks.push(ghr);
     }
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::StructuralSignalGeneration,
+    )?;
 
     // 00_summary/
     let t = Instant::now();
@@ -419,10 +624,12 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     generate_system_meta(&summary_dir)?;
     generate_git_meta(&summary_dir, config, resolved_target, resolved_bases)?;
     stage_timings.push(finish_timing(emit_human_stdout, "00_summary", t));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::SummaryMetadata)?;
 
     let t = Instant::now();
     generate_per_commit_diffs(&repo, &per_commit_dir, diffs, emit_human_stdout)?;
     stage_timings.push(finish_timing(emit_human_stdout, "per-commit-diffs", t));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PerCommitDiffs)?;
 
     // 20_quality/ — per-gate result.json + .log, then aggregate logs
     let t = Instant::now();
@@ -445,11 +652,13 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let coverage_delta = signal::CoverageDelta::from_signal(&coverage_signal);
     signal::generate_coverage_delta(&quality_dir, &coverage_signal)?;
     stage_timings.push(finish_timing(emit_human_stdout, "20_quality", t));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::QualityArtifacts)?;
 
     // 10_diff/ — per-file diffs for hotspots
     let t = Instant::now();
     signal::generate_per_file_diffs(&diff_dir, &repo, diffs)?;
     stage_timings.push(finish_timing(emit_human_stdout, "per-file-diffs", t));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PerFileDiffs)?;
 
     // Log signal generator status for human output
     if emit_human_stdout {
@@ -493,22 +702,47 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     )?;
     signal::generate_pattern_scan(&context_dir, diffs, &repo)?;
 
-    let tauri_dir = if let Some(cargo_root) = &config.profile.cargo_root {
-        if cargo_root.ends_with("src-tauri") {
-            cargo_root.clone()
+    let tauri_dir = tauri_dir_in_context_tree(config, &context_scan_root);
+    if is_tauri_project(&context_scan_root) && tauri_dir.exists() {
+        // Diff paths are repository-relative. When `tauri_dir` belongs to the
+        // shared off-HEAD worktree, the Repository path must name that same
+        // tree or `strip_prefix(tauri_dir)` inside the signal generator cannot
+        // map changed files back onto the scanned command set. The worktree's
+        // repository shares the object database, so base revisions remain
+        // available without consulting working-tree bytes from the checkout.
+        let result = if context_scan_root == config.repo_root {
+            signal::generate_tauri_commands(&context_dir, diffs, &repo, &tauri_dir)
         } else {
-            config.repo_root.join("src-tauri")
+            Repository::open(&context_scan_root).and_then(|context_repo| {
+                signal::generate_tauri_commands(&context_dir, diffs, &context_repo, &tauri_dir)
+            })
+        };
+        if let Err(e) = result {
+            eprintln!("Warning: failed scanning tauri commands: {}", e);
         }
-    } else {
-        config.repo_root.join("src-tauri")
-    };
-    if is_tauri_project(&config.repo_root)
-        && tauri_dir.exists()
-        && let Err(e) = signal::generate_tauri_commands(&context_dir, diffs, &repo, &tauri_dir)
-    {
-        eprintln!("Warning: failed scanning tauri commands: {}", e);
     }
     stage_timings.push(finish_timing(emit_human_stdout, "30_context", t));
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::StaticContextArtifacts,
+    )?;
+
+    // External context tools finish before any verdict/report surface. A
+    // cancellation here therefore cannot leave a final-shaped pack behind.
+    let t = Instant::now();
+    let context_command_timings = generate_context_artifacts(
+        config,
+        &context_scan_root,
+        ledger,
+        &context_dir,
+        emit_human_stdout,
+        &context_artifacts,
+        governor,
+    )?;
+    reconcile_context_artifacts(&mut context_artifacts, &context_command_timings, &out_dir);
+    stage_timings.push(finish_timing(emit_human_stdout, "context-tools", t));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::ContextTools)?;
 
     // 00_summary/ — merge gate + failures summary
     let t = Instant::now();
@@ -526,6 +760,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     generate_merge_gate(MergeGateInput {
         dir: &summary_dir,
         config,
+        ledger,
         checks: &all_checks,
         heuristics,
         inline: &inline_summary,
@@ -544,6 +779,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         "MERGE_GATE + FAILURES_SUMMARY",
         t,
     ));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::MergeGate)?;
 
     // Root-level content generators
     let t = Instant::now();
@@ -558,6 +794,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         heuristics,
     )?;
     stage_timings.push(finish_timing(emit_human_stdout, "PR_REVIEW", t));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PrReview)?;
 
     // Load base coverage from previous run (if available)
     let prev_coverage = load_previous_coverage(&out_dir);
@@ -711,17 +948,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     } else {
         stage_timings.push(finish_timing(emit_human_stdout, "report.json", t));
     }
-
-    // 30_context/ — profile-specific artifacts (with timeouts, skip duplicates)
-    let t = Instant::now();
-    let context_command_timings = generate_context_artifacts(
-        config,
-        &all_checks,
-        &context_dir,
-        emit_human_stdout,
-        &context_artifacts,
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::ReportAndDashboard,
     )?;
-    stage_timings.push(finish_timing(emit_human_stdout, "context-tools", t));
 
     // REVIEW_SUMMARY.md + review.html + AI_INDEX.md — consolidated human
     // review, the always-present browser handoff, and the reading-order map
@@ -736,6 +967,11 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         "REVIEW_SUMMARY + review.html + AI_INDEX",
         t,
     ));
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::ReviewHandoffSurfaces,
+    )?;
 
     // 00_summary/PROVENANCE.json — pack-level substrate record. Written before
     // RUN.json/MANIFEST so the manifest hashes it like any other pack file.
@@ -752,6 +988,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         worktree_status_digest: worktree_status_digest.as_deref(),
     })?;
     stage_timings.push(finish_timing(emit_human_stdout, "PROVENANCE.json", t));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::Provenance)?;
 
     // 00_summary/RUN.json — after all generators complete for accurate timing
     let t = Instant::now();
@@ -769,19 +1006,23 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         stage_timings: &stage_timings,
         context_artifacts: &context_artifacts,
         context_command_timings: &context_command_timings,
+        ledger,
         regression: Some(&regression_report),
     })?;
     stage_timings.push(finish_timing(emit_human_stdout, "RUN.json", t));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::RunJson)?;
 
     // 00_summary/MANIFEST.json — runs LAST (hashes all files)
     let t = Instant::now();
     generate_manifest(&out_dir)?;
     stage_timings.push(finish_timing(emit_human_stdout, "MANIFEST.json", t));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::ManifestJson)?;
 
     // Sanity checks — verify pack integrity after manifest
     let t = Instant::now();
     let sanity = run_sanity_checks(&out_dir)?;
     stage_timings.push(finish_timing(emit_human_stdout, "SANITY checks", t));
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::SanityChecks)?;
     if emit_human_stdout {
         use colored::Colorize;
         if sanity.valid {
@@ -803,6 +1044,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
             }
         }
     }
+    ensure_sanity_valid(&sanity)?;
 
     // Create ZIP LAST, after RUN.json + MANIFEST + SANITY have all been written
     // to disk. The shipped pack is a portable copy of the run, so it must carry
@@ -816,8 +1058,41 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         stage_timings.push(finish_timing(emit_human_stdout, "artifacts.zip", t));
     }
 
-    // Create `latest` symlink in parent directory
-    create_latest_symlink(&out_dir)?;
+    // The shared snapshot is required through the last context/pack read, but it
+    // must be gone before this run becomes discoverable as completed. Cleanup
+    // owns a cancellable `git worktree remove` child plus its path-exact
+    // in-process rollback; publishing first would let Ctrl-C return 130 after
+    // `latest` and the index already exposed a verdict. Drop is only the
+    // early-return backstop.
+    if let Err(error) = ledger.cleanup_shared_snapshot() {
+        if governor.is_cancelled() {
+            ensure_generation_active(
+                governor,
+                &out_dir,
+                ArtifactGenerationSeam::SharedSnapshotCleanup,
+            )?;
+            unreachable!("a cancelled governor fails the snapshot cleanup seam");
+        }
+        return Err(error.context("failed to clean the shared review snapshot before publication"));
+    }
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::SharedSnapshotCleanup,
+    )?;
+    ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::PackPublication)?;
+
+    // Latest + run-index are one publication transaction. Check cancellation
+    // before assembling its index row, then hold the shared publication lock
+    // across the durable latest journal, alias swap, index append, and prune.
+    // This gives concurrent successful runs one total order and gives the next
+    // publisher enough durable intent to reconcile a hard crash between the two
+    // filesystem advertisements.
+    ensure_generation_active(
+        governor,
+        &out_dir,
+        ArtifactGenerationSeam::RunIndexPublication,
+    )?;
 
     // Register run in index and prune old runs
     {
@@ -870,12 +1145,74 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
                 .sum(),
             has_dashboard: out_dir.join("dashboard.html").exists(),
         };
-        if let Err(e) = storage::register_and_prune(&out_dir, entry, emit_human_stdout)
-            && emit_human_stdout
-        {
-            use colored::Colorize;
-            eprintln!("  {} Index: {}", "\u{26a0}".yellow(), e);
+
+        let publication = match storage::acquire_publication_lock(|| governor.is_cancelled()) {
+            Ok(publication) => publication,
+            Err(error) if crate::governor::is_cancellation(&error) => {
+                ensure_generation_active(
+                    governor,
+                    &out_dir,
+                    ArtifactGenerationSeam::RunIndexPublication,
+                )?;
+                unreachable!("a cancelled governor fails the publication seam");
+            }
+            Err(error) => return Err(error),
+        };
+        let latest_transaction = begin_latest_publication(&publication, &out_dir)?;
+        if let Err(error) = ensure_generation_active(
+            governor,
+            &out_dir,
+            ArtifactGenerationSeam::LatestAdvertisement,
+        ) {
+            return Err(preserve_primary_error_after_latest_rollback(
+                error,
+                rollback_latest_publication(&latest_transaction),
+            ));
         }
+
+        if let Err(error) =
+            ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)
+        {
+            return Err(preserve_primary_error_after_latest_rollback(
+                error,
+                rollback_latest_publication(&latest_transaction),
+            ));
+        }
+
+        if let Err(e) = storage::register_and_prune_locked(
+            &publication,
+            &out_dir,
+            entry,
+            emit_human_stdout,
+            || governor.is_cancelled(),
+        ) {
+            if storage::is_unconfirmed_publication_rollback(&e) {
+                // The durable index may contain either side of the attempted
+                // rollback. Keep the publication journal intact so the next
+                // lock owner can reconcile `latest` from the persisted index.
+                return Err(e.context(
+                    "run publication failed with an unconfirmed index rollback; durable recovery journal retained",
+                ));
+            }
+            if let Err(rollback_error) = rollback_latest_publication(&latest_transaction) {
+                return Err(anyhow::anyhow!(
+                    "run publication failed ({e:#}) and its durable alias/index reconciliation also failed ({rollback_error:#})"
+                ));
+            }
+            if governor.is_cancelled() {
+                ensure_generation_active(governor, &out_dir, ArtifactGenerationSeam::IndexCommit)?;
+                unreachable!("a cancelled governor fails the index seam");
+            }
+            return Err(e.context(
+                "run publication failed; generated files were not committed to discoverable history",
+            ));
+        } else if let Err(error) = finish_latest_publication(&latest_transaction) {
+            // Index and alias are already consistent. Keep the journal for the
+            // next publisher, which will reconcile it idempotently.
+            eprintln!("prview: publication committed; durable journal cleanup deferred: {error:#}");
+        }
+        #[cfg(test)]
+        publication_commit_test_hook::observe_and_maybe_cancel(governor);
     }
 
     if emit_human_stdout {
@@ -888,6 +1225,147 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     }
 
     Ok(out_dir)
+}
+
+/// Locate the Tauri crate in the same tree as the context stage.
+///
+/// The detected profile describes the operator's checkout. Preserve that exact
+/// path for a local review, but project an in-repository `.../src-tauri` cargo
+/// root onto the run-wide target worktree for an off-HEAD review. An external
+/// cargo root cannot exist in a snapshot of this repository, so the reviewed
+/// tree's canonical `src-tauri` location is the only truthful fallback.
+fn tauri_dir_in_context_tree(config: &Config, context_scan_root: &Path) -> PathBuf {
+    let local_tauri_dir = config
+        .profile
+        .cargo_root
+        .as_ref()
+        .filter(|cargo_root| cargo_root.ends_with("src-tauri"))
+        .cloned()
+        .unwrap_or_else(|| config.repo_root.join("src-tauri"));
+    if context_scan_root == config.repo_root {
+        return local_tauri_dir;
+    }
+
+    let Some(cargo_root) = config
+        .profile
+        .cargo_root
+        .as_deref()
+        .filter(|cargo_root| cargo_root.ends_with("src-tauri"))
+    else {
+        return context_scan_root.join("src-tauri");
+    };
+    let relative = if cargo_root.is_relative() {
+        cargo_root
+    } else if let Ok(relative) = cargo_root.strip_prefix(&config.repo_root) {
+        relative
+    } else {
+        return context_scan_root.join("src-tauri");
+    };
+    if !relative.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return context_scan_root.join("src-tauri");
+    }
+    relative
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .fold(context_scan_root.to_path_buf(), |path, component| {
+            path.join(component)
+        })
+}
+
+/// Plant a one-shot reservation in the fresh directory exclusively allocated
+/// by the MCP layer. A failed spawn leaves the directory reserved and visible
+/// as a failed run; it is never silently recycled as another historical pack.
+pub(crate) fn reserve_mcp_output_dir(out_dir: &Path, nonce: &str) -> Result<()> {
+    use std::io::Write;
+
+    let reservation = out_dir.join(MCP_OUTPUT_RESERVATION_FILE);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&reservation)
+        .with_context(|| {
+            format!(
+                "failed to reserve MCP output directory {}",
+                out_dir.display()
+            )
+        })?;
+    file.write_all(nonce.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Claim one explicit pack path. Existing directories are rejected unless the
+/// current process holds the exact, unconsumed MCP reservation and the
+/// directory contains only the launcher's known control files. Removing the
+/// create-new sentinel is the single-use claim: a second consumer cannot adopt
+/// the same directory even if it inherited the nonce.
+fn claim_explicit_output_dir(out_dir: &Path) -> Result<()> {
+    let reservation = std::env::var(MCP_OUTPUT_RESERVATION_ENV).ok();
+    claim_explicit_output_dir_with_reservation(out_dir, reservation.as_deref())
+}
+
+fn claim_explicit_output_dir_with_reservation(
+    out_dir: &Path,
+    expected_nonce: Option<&str>,
+) -> Result<()> {
+    match fs::create_dir(out_dir) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to create immutable --output-dir {}",
+                    out_dir.display()
+                )
+            });
+        }
+    }
+
+    let fail = || {
+        anyhow::anyhow!(
+            "--output-dir must name a new directory for one immutable pack: {}",
+            out_dir.display()
+        )
+    };
+    let expected_nonce = expected_nonce.ok_or_else(fail)?;
+    let reservation = out_dir.join(MCP_OUTPUT_RESERVATION_FILE);
+    let metadata = fs::symlink_metadata(&reservation).map_err(|_| fail())?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(fail());
+    }
+    let actual_nonce = fs::read_to_string(&reservation).map_err(|_| fail())?;
+    if actual_nonce != expected_nonce {
+        return Err(fail());
+    }
+
+    for entry in fs::read_dir(out_dir).map_err(|_| fail())? {
+        let entry = entry.map_err(|_| fail())?;
+        let name = entry.file_name();
+        let allowed = name == std::ffi::OsStr::new(MCP_OUTPUT_RESERVATION_FILE)
+            || MCP_CONTROL_FILES
+                .iter()
+                .any(|candidate| name == std::ffi::OsStr::new(candidate));
+        if !allowed {
+            return Err(fail());
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| fail())?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(fail());
+        }
+    }
+
+    fs::remove_file(&reservation).with_context(|| {
+        format!(
+            "failed to consume MCP output reservation for {}",
+            out_dir.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn generate_consistency_check(summary_dir: &Path, out_dir: &Path, diffs: &[Diff]) -> Result<()> {
@@ -964,6 +1442,18 @@ fn finish_timing(emit: bool, label: &str, start: Instant) -> StageTiming {
         label: label.to_string(),
         duration_secs: elapsed,
     }
+}
+
+fn ensure_sanity_valid(sanity: &SanityResult) -> Result<()> {
+    if sanity.valid {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "artifact pack sanity is invalid ({}/{} checks passed): {}",
+        sanity.checks_passed,
+        sanity.checks_run,
+        sanity.failures.join("; ")
+    )
 }
 
 fn generate_metadata(
@@ -1363,6 +1853,87 @@ fn generate_provenance_json(input: ProvenanceJsonInput<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Version of the `ledger` object in `RUN.json`, independent of the pack's
+/// `schema_version`.
+///
+/// The ledger is an ADDITIVE view over work the pack already reports elsewhere
+/// (`checks[].cached`, `context_artifacts[]`, `context_commands[]`), which stay
+/// exactly as they were — a consumer that never looks at `ledger` cannot tell
+/// this cut happened, which is precisely why `schema_version` does not move (the
+/// precedent `CheckProvenance` set in `checks/mod.rs`). Its own counter is what
+/// lets the view's shape evolve, and be recognised, without renegotiating the
+/// pack contract.
+const LEDGER_SCHEMA: u32 = 2;
+
+/// The run's task ledger, as it appears in `RUN.json`.
+///
+/// One object per entry, stating WHAT tool the run considered, WHICH surface
+/// asked (`check` / `context_artifact`), how it resolved, and on which tree.
+/// `substrate` is serialized with the same `tree_state` strings as
+/// `checks[].tree_state` — one vocabulary for "which tree", not two.
+///
+/// Each lifecycle carries only the evidence it actually has: a `run` its
+/// duration, a `cached` the age of the entry it replayed and the substrate of
+/// the ORIGINAL execution, a `reused` the substrate of the same-run gate, a
+/// `skipped` / `not_applicable` its reason. Queue wait is emitted only when
+/// both timestamps exist. Nothing is filled in with a plausible-looking value
+/// where the run holds none.
+fn ledger_view(ledger: &TaskLedger) -> serde_json::Value {
+    use crate::ledger::TaskState;
+    use serde_json::json;
+
+    let substrate = |substrate: &crate::ledger::SubstrateKey| {
+        json!({
+            "target_sha": substrate.target_sha,
+            "tree_state": substrate.tree_state.map(|state| state.as_str()),
+        })
+    };
+
+    let entries: Vec<serde_json::Value> = ledger
+        .entries()
+        .iter()
+        .map(|entry| {
+            let mut row = json!({
+                "tool": entry.key.tool,
+                "kind": entry.kind.as_str(),
+                "lifecycle": entry.state.lifecycle(),
+                "substrate": substrate(&entry.key.substrate),
+            });
+            if let (Some(queued_at), Some(started_at)) = (entry.queued_at, entry.started_at) {
+                row["queue_wait_secs"] = json!(
+                    started_at
+                        .saturating_duration_since(queued_at)
+                        .as_secs_f32()
+                );
+            }
+            match &entry.state {
+                TaskState::Run { duration } => {
+                    row["duration_secs"] = json!(duration.as_secs_f32());
+                }
+                TaskState::Cached {
+                    cache_age_secs,
+                    origin,
+                } => {
+                    row["cache_age_secs"] = json!(cache_age_secs);
+                    row["origin"] = substrate(origin);
+                }
+                TaskState::Reused { origin } => {
+                    row["origin"] = substrate(origin);
+                }
+                TaskState::Skipped { reason } | TaskState::NotApplicable { reason } => {
+                    row["reason"] = json!(reason);
+                }
+            }
+            row
+        })
+        .collect();
+
+    json!({
+        "schema": LEDGER_SCHEMA,
+        "entries": entries,
+    })
+}
+
 /// RUN.json — single source of truth (Artifact Pack v1)
 fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
     use serde_json::json;
@@ -1380,6 +1951,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
         stage_timings,
         context_artifacts,
         context_command_timings,
+        ledger,
         regression,
     } = input;
 
@@ -1461,6 +2033,17 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             "dashboard": config.create_dashboard,
             "cached": config.use_cache,
         },
+        "resources": {
+            "requested_budget": config.resource_plan.requested.as_str(),
+            "effective_budget": config.resource_plan.effective.as_str(),
+            "logical_cores": config.resource_plan.logical_cores,
+            "parent_permits": config.resource_plan.total_budget,
+            "heavy_cost": config.resource_plan.heavy_cost,
+            "child_worker_limit": config.resource_plan.worker_limit,
+            "load_per_core": config.resource_plan.load_per_core,
+            "backpressured": config.resource_plan.backpressured,
+            "schedule": "cheap orientation/checks -> capped pools -> serialized uncapped tools -> artifacts",
+        },
         "runner": {
             "tool": env!("CARGO_PKG_NAME"),
             "version": env!("CARGO_PKG_VERSION"),
@@ -1514,7 +2097,9 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             "artifact": command.artifact,
             "status": command.status,
             "duration_secs": command.duration_secs,
+            "reason": command.reason,
         })).collect::<Vec<_>>(),
+        "ledger": ledger_view(ledger),
     });
 
     fs::write(dir.join("RUN.json"), serde_json::to_string_pretty(&run)?)?;
@@ -1531,41 +2116,49 @@ fn generate_system_meta(dir: &Path) -> Result<()> {
         std::env::consts::ARCH
     ));
 
-    if let Ok(hostname) = std::env::var("HOSTNAME")
+    let mut hostname = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
-        .or_else(|_| {
-            Command::new("hostname")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        })
-    {
+        .ok();
+    if hostname.is_none() {
+        hostname = governed_optional_output(Command::new("hostname"), "system metadata hostname")?
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    }
+    if let Some(hostname) = hostname {
         content.push_str(&format!("hostname: {}\n", hostname));
     }
 
     content.push_str(&format!("prview_version: {}\n", env!("CARGO_PKG_VERSION")));
 
-    if let Ok(output) = Command::new("rustc").arg("--version").output() {
+    let mut command = Command::new("rustc");
+    command.arg("--version");
+    if let Some(output) = governed_optional_output(command, "system metadata rustc version")? {
         content.push_str(&format!(
             "rustc: {}\n",
             String::from_utf8_lossy(&output.stdout).trim()
         ));
     }
 
-    if let Ok(output) = Command::new("cargo").arg("--version").output() {
+    let mut command = Command::new("cargo");
+    command.arg("--version");
+    if let Some(output) = governed_optional_output(command, "system metadata cargo version")? {
         content.push_str(&format!(
             "cargo: {}\n",
             String::from_utf8_lossy(&output.stdout).trim()
         ));
     }
 
-    if let Ok(output) = Command::new("node").arg("--version").output() {
+    let mut command = Command::new("node");
+    command.arg("--version");
+    if let Some(output) = governed_optional_output(command, "system metadata node version")? {
         content.push_str(&format!(
             "node: {}\n",
             String::from_utf8_lossy(&output.stdout).trim()
         ));
     }
 
-    if let Ok(output) = Command::new("pnpm").arg("--version").output() {
+    let mut command = Command::new("pnpm");
+    command.arg("--version");
+    if let Some(output) = governed_optional_output(command, "system metadata pnpm version")? {
         content.push_str(&format!(
             "pnpm: {}\n",
             String::from_utf8_lossy(&output.stdout).trim()
@@ -1591,11 +2184,11 @@ fn generate_git_meta(
     let mut content = String::new();
 
     // Remote URL
-    if let Ok(output) = git_cmd()
+    let mut command = git_cmd();
+    command
         .args(["config", "--get", "remote.origin.url"])
-        .current_dir(&config.repo_root)
-        .output()
-    {
+        .current_dir(&config.repo_root);
+    if let Some(output) = governed_optional_output(command, "git metadata remote origin")? {
         content.push_str(&format!(
             "remote_url: {}\n",
             String::from_utf8_lossy(&output.stdout).trim()
@@ -1629,6 +2222,18 @@ fn generate_git_meta(
 
     fs::write(dir.join("git_meta.txt"), content)?;
     Ok(())
+}
+
+fn governed_optional_output(command: Command, label: &str) -> Result<Option<std::process::Output>> {
+    match crate::proc::output_governed_with_timeout(
+        command,
+        label,
+        std::time::Duration::from_secs(10),
+    ) {
+        Ok(output) => Ok(Some(output)),
+        Err(error) if crate::governor::is_cancellation(&error) => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 fn collect_quick_wins(config: &Config, checks: &[CheckResult], exact_twins: usize) -> Vec<String> {
@@ -1824,6 +2429,22 @@ fn is_packaging_junk(path: &Path) -> bool {
     )
 }
 
+/// MCP liveness and launcher logs live beside the pack for operational
+/// readback, but they are not immutable artifact payload. In particular,
+/// stdout/stderr can still be appended after MANIFEST generation, so hashing or
+/// zipping them would make an otherwise valid pack self-inconsistent.
+fn is_mcp_control_file(relative: &Path) -> bool {
+    relative
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty())
+        && relative.file_name().is_some_and(|name| {
+            name == std::ffi::OsStr::new(MCP_OUTPUT_RESERVATION_FILE)
+                || MCP_CONTROL_FILES
+                    .iter()
+                    .any(|candidate| name == std::ffi::OsStr::new(candidate))
+        })
+}
+
 fn generate_manifest(out_dir: &Path) -> Result<()> {
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -1841,12 +2462,14 @@ fn generate_manifest(out_dir: &Path) -> Result<()> {
         let rel_str = rel.to_string_lossy().to_string();
 
         // Skip the manifest itself and the ZIP envelope (path-separator
-        // agnostic), plus OS packaging junk. The manifest hashes every shipped
-        // pack file except itself and the archive that wraps them; SANITY.json
-        // is written after this step, so it is not covered here.
+        // agnostic), plus OS packaging junk and mutable MCP control files. The
+        // manifest hashes every immutable shipped pack file except itself and
+        // the archive that wraps them; SANITY.json is written after this step,
+        // so it is not covered here.
         if rel.file_name() == Some(std::ffi::OsStr::new("MANIFEST.json"))
             || rel_str.ends_with(".zip")
             || is_packaging_junk(path)
+            || is_mcp_control_file(rel)
         {
             continue;
         }
@@ -1914,7 +2537,7 @@ fn create_zip(dir: &Path, emit_human_stdout: bool) -> Result<()> {
         if path.is_file() {
             let name = path.strip_prefix(dir).unwrap_or(path);
             // Don't ship OS packaging junk to reviewers.
-            if is_packaging_junk(name) {
+            if is_packaging_junk(name) || is_mcp_control_file(name) {
                 continue;
             }
             zip.start_file(name.to_string_lossy(), options)?;
@@ -2024,4 +2647,104 @@ fn generate_checks_status_json(
         serde_json::to_string_pretty(&serde_json::Value::Object(status_map))?,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod generation_seam_test_hook {
+    use super::ArtifactGenerationSeam;
+    use crate::governor::ResourceGovernor;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct ProbeState {
+        cancel_at: Option<ArtifactGenerationSeam>,
+        observed: Vec<ArtifactGenerationSeam>,
+    }
+
+    thread_local! {
+        static PROBE: RefCell<Option<ProbeState>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct ProbeGuard;
+
+    impl ProbeGuard {
+        pub(super) fn install(cancel_at: Option<ArtifactGenerationSeam>) -> Self {
+            PROBE.with(|probe| {
+                let previous = probe.borrow_mut().replace(ProbeState {
+                    cancel_at,
+                    observed: Vec::new(),
+                });
+                assert!(previous.is_none(), "nested artifact seam probe");
+            });
+            Self
+        }
+
+        pub(super) fn observed(&self) -> Vec<ArtifactGenerationSeam> {
+            PROBE.with(|probe| {
+                probe
+                    .borrow()
+                    .as_ref()
+                    .expect("artifact seam probe is installed")
+                    .observed
+                    .clone()
+            })
+        }
+    }
+
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            PROBE.with(|probe| {
+                probe.borrow_mut().take();
+            });
+        }
+    }
+
+    pub(super) fn observe_and_maybe_cancel(
+        seam: ArtifactGenerationSeam,
+        governor: &ResourceGovernor,
+    ) {
+        PROBE.with(|probe| {
+            if let Some(state) = probe.borrow_mut().as_mut() {
+                state.observed.push(seam);
+                if state.cancel_at == Some(seam) {
+                    governor.cancel();
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod publication_commit_test_hook {
+    use crate::governor::ResourceGovernor;
+    use std::cell::Cell;
+
+    thread_local! {
+        static CANCEL_AFTER_COMMIT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) struct CommitGuard;
+
+    impl CommitGuard {
+        pub(super) fn install() -> Self {
+            CANCEL_AFTER_COMMIT.with(|enabled| {
+                assert!(!enabled.replace(true), "nested publication commit probe");
+            });
+            Self
+        }
+    }
+
+    impl Drop for CommitGuard {
+        fn drop(&mut self) {
+            CANCEL_AFTER_COMMIT.with(|enabled| enabled.set(false));
+        }
+    }
+
+    pub(super) fn observe_and_maybe_cancel(governor: &ResourceGovernor) {
+        CANCEL_AFTER_COMMIT.with(|enabled| {
+            if enabled.get() {
+                governor.cancel();
+            }
+        });
+    }
 }

@@ -378,39 +378,46 @@ pub(crate) fn get_base_cargo_audit_findings(
     repo: Option<&crate::git::Repository>,
     diffs: &[crate::git::Diff],
     cargo_root: Option<&std::path::Path>,
-) -> Option<std::collections::HashSet<(String, String, String)>> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+) -> anyhow::Result<Option<std::collections::HashSet<(String, String, String)>>> {
+    use std::process::Command;
 
-    let repo = repo?;
-    let context = cargo_audit_comparison_context(repo, diffs, cargo_root)?;
+    let Some(repo) = repo else {
+        return Ok(None);
+    };
+    let Some(context) = cargo_audit_comparison_context(repo, diffs, cargo_root) else {
+        return Ok(None);
+    };
     if !context.lock_changed {
-        return None;
+        return Ok(None);
     }
-    let cargo_lock_path = context.base_lock_path?;
-    let base_content = repo
-        .file_at_commit(&context.base_commit_id, &cargo_lock_path)
-        .ok()?;
+    let Some(cargo_lock_path) = context.base_lock_path else {
+        return Ok(None);
+    };
+    let Ok(base_content) = repo.file_at_commit(&context.base_commit_id, &cargo_lock_path) else {
+        return Ok(None);
+    };
 
     // cargo-audit explicitly documents `-` as the stdin sentinel for --file.
     // Keeping the historical lock out of the target worktree avoids making the
     // baseline comparison mutate or materialise a second checkout.
-    let mut child = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .args(["audit", "--json", "-n", "-q", "-f", "-"])
-        .current_dir(context.cargo_cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(base_content.as_bytes()).ok()?;
-    }
-
-    let output = child.wait_with_output().ok()?;
-    let out_str = String::from_utf8(output.stdout).ok()?;
-    cargo_audit_report_advisory_keys(&out_str)
+        .current_dir(context.cargo_cwd);
+    let output = match crate::proc::output_governed_with_input_timeout(
+        command,
+        "cargo audit baseline",
+        base_content.as_bytes(),
+        std::time::Duration::from_secs(120),
+    ) {
+        Ok(output) => output,
+        Err(error) if crate::governor::is_cancellation(&error) => return Err(error),
+        Err(_) => return Ok(None),
+    };
+    let Ok(out_str) = String::from_utf8(output.stdout) else {
+        return Ok(None);
+    };
+    Ok(cargo_audit_report_advisory_keys(&out_str))
 }
 
 pub(crate) fn parse_cargo_audit_findings(output: &str) -> Vec<CargoAuditFinding> {

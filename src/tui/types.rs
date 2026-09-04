@@ -357,6 +357,8 @@ pub struct TuiState {
     pub running: bool,
     pub start_time: Option<Instant>,
     pub report: Option<Report>,
+    /// `prview state --tui` is a viewer: `r` must not spawn analysis.
+    pub can_run_analysis: bool,
 
     // Quit flag
     pub should_quit: bool,
@@ -382,6 +384,7 @@ impl TuiState {
             running: false,
             start_time: None,
             report: None,
+            can_run_analysis: true,
             should_quit: false,
         }
     }
@@ -409,6 +412,7 @@ impl TuiState {
             running: false,
             start_time: None,
             report: None,
+            can_run_analysis: false,
             should_quit: false,
         }
     }
@@ -686,6 +690,9 @@ pub enum TuiEvent {
     Tick,
     /// Keyboard input
     Key(crossterm::event::KeyEvent),
+    /// Check entered the execution set but has not been admitted by the
+    /// resource governor yet — queued, not running.
+    CheckQueued { name: String },
     /// Check started
     CheckStarted { name: String },
     /// Check completed

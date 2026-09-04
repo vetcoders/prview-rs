@@ -6,6 +6,34 @@
   "legacy_positive_sibling": null,
   "repo_backed_records": [
     {
+      "kind": "removed",
+      "symbol": "a",
+      "namespace": "crate",
+      "before": "a",
+      "after": null,
+      "provenance": {
+        "base_revision": "fixture://module_scope_changed/base",
+        "target_revision": "fixture://module_scope_changed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    },
+    {
+      "kind": "added",
+      "symbol": "b",
+      "namespace": "crate",
+      "before": null,
+      "after": "b",
+      "provenance": {
+        "base_revision": "fixture://module_scope_changed/base",
+        "target_revision": "fixture://module_scope_changed/head",
+        "source_kind": "repo_revision_pair"
+      },
+      "confidence": "confirmed",
+      "unknown_reason": null
+    },
+    {
       "kind": "relocated",
       "symbol": "value",
       "namespace": "crate",

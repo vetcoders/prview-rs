@@ -3231,6 +3231,8 @@ dependencies = [
  "loctree",
  "notify",
  "predicates",
+ "proc-macro2",
+ "process-wrap",
  "quote",
  "ratatui",
  "regex",
@@ -3241,6 +3243,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "shlex",
  "syn 2.0.117",
  "tempfile",
  "tokio",
@@ -3250,6 +3253,7 @@ dependencies = [
  "unicode-width",
  "walkdir",
  "which",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

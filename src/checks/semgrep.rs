@@ -17,6 +17,12 @@ impl Check for SemgrepCheck {
         "Semgrep scan"
     }
 
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
+    }
+
     fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
         if which::which("semgrep").is_ok() {
             CheckEligibility::Run
@@ -64,9 +70,14 @@ impl Check for SemgrepCheck {
             "auto"
         };
 
-        let args = build_semgrep_args(config_arg, plan.baseline_commit.as_deref());
+        let args = build_semgrep_args(
+            config_arg,
+            plan.baseline_commit.as_deref(),
+            config.resource_plan.worker_limit,
+        );
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
 
-        let output = run_command("semgrep", &args, cwd).await?;
+        let output = run_command("semgrep", &args_ref, cwd).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -96,7 +107,7 @@ impl Check for SemgrepCheck {
                 ProvenanceBuilder {
                     check: self.name(),
                     cmd: "semgrep",
-                    args: &args,
+                    args: &args_ref,
                     cwd,
                     repo_root: &config.repo_root,
                     exit_code: output.status.code(),
@@ -325,26 +336,37 @@ fn format_tool_error_reason(exit_code: Option<i32>, stdout: &str, stderr: &str) 
 /// prototype-pollution, `public_dist` missing-integrity, …). Extracted as a
 /// pure helper so the exclude set is hermetically testable without invoking the
 /// semgrep binary.
-fn build_semgrep_args<'a>(config_arg: &'a str, baseline_commit: Option<&'a str>) -> Vec<&'a str> {
+fn build_semgrep_args(
+    config_arg: &str,
+    baseline_commit: Option<&str>,
+    worker_limit: u32,
+) -> Vec<String> {
     let mut args = vec![
-        "scan", "--config", config_arg, "--json", "--error", "--quiet",
+        "scan".to_string(),
+        "--config".to_string(),
+        config_arg.to_string(),
+        "--jobs".to_string(),
+        worker_limit.max(1).to_string(),
+        "--json".to_string(),
+        "--error".to_string(),
+        "--quiet".to_string(),
     ];
 
     if let Some(commit) = baseline_commit {
-        args.push("--baseline-commit");
-        args.push(commit);
+        args.push("--baseline-commit".to_string());
+        args.push(commit.to_string());
     }
 
     args.extend([
-        ".",
-        "--exclude",
-        "target",
-        "--exclude",
-        "node_modules",
-        "--exclude",
-        "*.min.js",
-        "--exclude",
-        "public_dist",
+        ".".to_string(),
+        "--exclude".to_string(),
+        "target".to_string(),
+        "--exclude".to_string(),
+        "node_modules".to_string(),
+        "--exclude".to_string(),
+        "*.min.js".to_string(),
+        "--exclude".to_string(),
+        "public_dist".to_string(),
     ]);
 
     args
@@ -537,19 +559,29 @@ mod tests {
 
     #[test]
     fn build_semgrep_args_excludes_vendored_and_generated_and_emits_json() {
-        let args = build_semgrep_args("auto", None);
+        let args = build_semgrep_args("auto", None, 2);
         let has_exclude = |val: &str| args.windows(2).any(|w| w[0] == "--exclude" && w[1] == val);
-        assert!(args.contains(&"--json"), "structured parser expects JSON");
+        assert!(
+            args.iter().any(|arg| arg == "--json"),
+            "structured parser expects JSON"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "--jobs" && w[1] == "2"),
+            "semgrep worker pool must be capped"
+        );
         assert!(has_exclude("*.min.js"), "must exclude minified bundles");
         assert!(has_exclude("public_dist"), "must exclude generated site");
         assert!(has_exclude("node_modules"));
         assert!(has_exclude("target"));
-        assert!(args.contains(&"auto"), "config arg threaded through");
+        assert!(
+            args.iter().any(|arg| arg == "auto"),
+            "config arg threaded through"
+        );
     }
 
     #[test]
     fn build_semgrep_args_adds_baseline_commit_when_available() {
-        let args = build_semgrep_args("auto", Some("abc123"));
+        let args = build_semgrep_args("auto", Some("abc123"), 1);
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--baseline-commit" && w[1] == "abc123"),
@@ -559,9 +591,9 @@ mod tests {
 
     #[test]
     fn build_semgrep_args_omits_baseline_without_merge_base() {
-        let args = build_semgrep_args("auto", None);
+        let args = build_semgrep_args("auto", None, 1);
         assert!(
-            !args.contains(&"--baseline-commit"),
+            !args.iter().any(|arg| arg == "--baseline-commit"),
             "full-tree fallback must not pass a bogus baseline"
         );
     }

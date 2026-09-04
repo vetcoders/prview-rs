@@ -6,6 +6,7 @@ use crate::Config;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Legacy sidecar holding the check's captured output, next to its status entry.
@@ -59,6 +60,12 @@ impl Cache {
         Self { dir, enabled }
     }
 
+    /// The on-disk path of one entry (test-only), so a test can age it.
+    #[cfg(test)]
+    pub(crate) fn entry_path(&self, check_name: &str, key: &str) -> PathBuf {
+        self.dir.join(check_name).join(key)
+    }
+
     /// Check if cached result exists
     pub fn get(&self, check_name: &str, key: &str) -> Option<CachedResult> {
         if !self.enabled {
@@ -66,7 +73,14 @@ impl Cache {
         }
 
         let cache_dir = self.dir.join(check_name);
-        let raw = fs::read_to_string(cache_dir.join(key)).ok()?;
+        let entry_path = cache_dir.join(key);
+        // One open handle for bytes and mtime: a rename between `read_to_string`
+        // and a later `stat` of the same path would otherwise pair one entry's
+        // contents with another entry's age.
+        let mut file = fs::File::open(&entry_path).ok()?;
+        let mut raw = String::new();
+        file.read_to_string(&mut raw).ok()?;
+        let age_secs = file.metadata().ok().and_then(|meta| age_from_mtime(&meta));
 
         // An entry written by this prview is one self-contained JSON document.
         if let Ok(entry) = serde_json::from_str::<CacheEntry>(&raw) {
@@ -74,6 +88,7 @@ impl Cache {
                 status: entry.status.trim().to_string(),
                 output: entry.output,
                 provenance: entry.provenance,
+                age_secs,
             });
         }
 
@@ -85,6 +100,7 @@ impl Cache {
             status: raw.trim().to_string(),
             output: fs::read_to_string(sidecar(&cache_dir, key, LOG_SUFFIX)).ok(),
             provenance: fs::read_to_string(sidecar(&cache_dir, key, PROVENANCE_SUFFIX)).ok(),
+            age_secs,
         })
     }
 
@@ -194,14 +210,69 @@ pub struct CachedResult {
     /// the caller stored it. `None` for entries written before the sidecar
     /// existed, or for a check that produced no provenance.
     pub provenance: Option<String>,
+    /// How long ago this entry was published, in whole seconds — see
+    /// [`age_from_mtime`]. `None` when the age cannot be established.
+    pub age_secs: Option<u64>,
 }
 
-/// Generate a content-based cache key for TypeScript checks.
+/// Move an entry's mtime `by` into the past (test-only), so the age a replay
+/// reports can be asserted without waiting for wall-clock time to pass.
+///
+/// Only the timestamp moves — the entry's bytes are exactly what `set` wrote,
+/// which is what makes this a test of the real published-at reading rather than
+/// of a fixture format.
+#[cfg(test)]
+pub(crate) fn backdate(path: &Path, by: std::time::Duration) {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("cache entry must exist to be aged");
+    let modified = file
+        .metadata()
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    file.set_modified(modified - by).expect("set mtime");
+}
+
+/// How old the entry file at `path` is, in whole seconds.
+///
+/// Read from the file's mtime rather than from anything inside it: an entry is
+/// published by a single `rename`, so its mtime IS the moment the result became
+/// readable, and taking the age this way costs one `stat` and keeps the on-disk
+/// format untouched — every entry a previous prview wrote already carries it.
+///
+/// `None` rather than a guess when the age is unknowable: no metadata to read,
+/// a filesystem that does not report mtime, or a timestamp in the future (a
+/// clock that moved backwards, a copied tree). A replay of unknown age is a fact
+/// a reviewer can act on; a fabricated zero is not.
+#[cfg(test)]
+fn entry_age_secs(path: &Path) -> Option<u64> {
+    age_from_mtime(&fs::metadata(path).ok()?)
+}
+
+fn age_from_mtime(meta: &fs::Metadata) -> Option<u64> {
+    let modified = meta.modified().ok()?;
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(modified)
+            .ok()?
+            .as_secs(),
+    )
+}
+
+/// Legacy TypeScript content fingerprint.
+///
+/// This deliberately omits tool, dependency, and configuration state and is
+/// therefore not safe as a persistent replay key for TypeScript-family checks.
 pub fn ts_hash(repo_root: &Path) -> String {
     hash_files(repo_root, &["*.ts", "*.tsx", "**/*.ts", "**/*.tsx"])
 }
 
-/// Generate a content-based cache key for Stylelint checks.
+/// Legacy Stylelint content fingerprint.
+///
+/// This is retained for compatibility, but is incomplete and must not be used
+/// as a persistent replay key.
 pub fn stylelint_hash(repo_root: &Path) -> String {
     let style_hash = hash_files(
         repo_root,
@@ -237,7 +308,10 @@ pub fn cargo_lock_hash(repo_root: &Path) -> String {
     hash_files(repo_root, &["Cargo.lock", "Cargo.toml"])
 }
 
-/// Generate a content-based cache key for Python checks.
+/// Legacy Python content fingerprint.
+///
+/// This deliberately omits interpreter, tool, and dependency state and is
+/// therefore not safe as a persistent replay key for Python checks.
 pub fn python_hash(repo_root: &Path) -> String {
     let config_hash = hash_files(repo_root, &["pyproject.toml", "requirements*.txt"]);
     let src_hash = hash_files(repo_root, &["*.py", "**/*.py"]);
@@ -288,6 +362,7 @@ fn hash_files(repo_root: &Path, patterns: &[&str]) -> String {
 mod tests {
     use super::*;
     use crate::git::git_cmd;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
@@ -296,6 +371,7 @@ mod tests {
             status: "passed".to_string(),
             output: Some("test output".to_string()),
             provenance: None,
+            age_secs: None,
         };
         assert_eq!(result.status, "passed");
         assert_eq!(result.output, Some("test output".to_string()));
@@ -307,6 +383,7 @@ mod tests {
             status: "failed".to_string(),
             output: None,
             provenance: None,
+            age_secs: None,
         };
         assert_eq!(result.status, "failed");
         assert!(result.output.is_none());
@@ -354,6 +431,81 @@ mod tests {
         assert_eq!(result.status, "passed");
         assert_eq!(result.output.as_deref(), Some("out"));
         assert!(result.provenance.is_none());
+    }
+
+    /// A replay is only as good as the answer it replays, and until now the
+    /// pack could not say how old that answer was. The age comes from the entry
+    /// file's mtime — the moment the single `rename` published it — so no entry
+    /// on disk had to change format to carry it.
+    #[test]
+    fn a_cache_hit_reports_how_old_the_entry_is() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Cache {
+            dir: temp_dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        cache
+            .set("check", "key", "passed", Some("out"), None)
+            .unwrap();
+        let fresh_age = cache
+            .get("check", "key")
+            .unwrap()
+            .age_secs
+            .expect("a fresh entry has an age");
+        assert!(
+            fresh_age <= 2,
+            "mtime and observation may straddle a second boundary, got {fresh_age}s"
+        );
+
+        backdate(&cache.entry_path("check", "key"), Duration::from_secs(7200));
+
+        let aged = cache.get("check", "key").unwrap();
+        let age = aged.age_secs.expect("an entry on disk has an age");
+        assert!(
+            (7199..7261).contains(&age),
+            "an entry backdated two hours replays as two hours old, got {age}s",
+        );
+        assert_eq!(
+            aged.status, "passed",
+            "reading the age must not disturb the entry itself",
+        );
+        assert_eq!(aged.output.as_deref(), Some("out"));
+    }
+
+    #[test]
+    fn a_future_dated_cache_entry_has_unknown_age() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("future-entry");
+        fs::write(&path, "entry").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+
+        assert_eq!(entry_age_secs(&path), None);
+    }
+
+    /// The legacy layout keeps its status file as the entry, so the same mtime
+    /// answers for it — a warm cache from an older prview is not ageless.
+    #[test]
+    fn a_legacy_cache_hit_also_reports_an_age() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Cache {
+            dir: temp_dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        let legacy_dir = temp_dir.path().join("check");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(legacy_dir.join("legacy-key"), "passed").unwrap();
+        backdate(&legacy_dir.join("legacy-key"), Duration::from_secs(60));
+
+        let age = cache
+            .get("check", "legacy-key")
+            .unwrap()
+            .age_secs
+            .expect("a legacy entry has an mtime like any other file");
+        assert!((60..120).contains(&age), "got {age}s");
     }
 
     #[test]

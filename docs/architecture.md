@@ -34,6 +34,10 @@ prview-rs/
 │   │   ├── typescript.rs
 │   │   ├── cargo.rs
 │   │   └── python.rs
+│   ├── ledger/
+│   │   └── mod.rs       # Task ledger: one record per unit of work in a run
+│   ├── governor/
+│   │   └── mod.rs       # Bounded execution: weighted budget + child registry
 │   ├── heuristics/
 │   │   ├── mod.rs       # HeuristicsResult, runner
 │   │   └── loctree.rs   # Loctree heuristic (universal)
@@ -94,15 +98,22 @@ main.rs
 Cli::parse()              ─── clap parses arguments
     │
     ▼
-App::new(&cli)            ─── builds Config + opens Repository
+supervise_startup_stage(…) ─── temporary startup governor owns Config probes
     │
     ▼
-app.run()
+Config::from_cli(&cli)    ─── resolves PR metadata and builds Config
+    │
+    ▼
+App::from_config(config)  ─── opens Repository + creates the run governor
+    │
+    ▼
+with_cancellation(app.run(), run governor)
     │
     ├─► resolve_target()       ─── resolves the target branch
     ├─► resolve_bases()        ─── resolves bases (repo default plus tool fallbacks)
     ├─► generate_diffs()       ─── git2 diff with per-file stats (Patch API)
-    ├─► checks::run_all()      ─── parallel checks (tsc, cargo, ruff...)
+    ├─► checks::run_all()      ─── parallel checks (tsc, cargo, ruff...), bounded
+    │                              by the run's ResourceGovernor
     ├─► heuristics::run()      ─── loctree (universal structural signals)
     └─► artifacts::generate()  ─── numbered layout + signal generators
 ```
@@ -150,6 +161,10 @@ pub struct DetectedProfile {
 Profile detection inspects the **actual source files**, not just the presence of
 manifests:
 - `has_js_source` = `.ts/.tsx/.js/.jsx` files under `src/`
+- root or nested `tsconfig*.json` declares a JS/TS product component, except
+  under fixture, `node_modules`, `target`, or `vendor`; generic directory names
+  such as `build` and `dist` remain valid package names when they contain a
+  project config
 - `Cargo.toml` → Rust (also checks `src-tauri/`, `*_rs/`)
 - `pyproject.toml` → Python
 - combinations → Mixed
@@ -256,6 +271,70 @@ The Python and JS checks (`Ruff`, `Mypy`, `Pytest`, `TypeScript`, `ESLint`,
 its own — see `uses_shared_scan_dir()`. `SemgrepCheck` is the single deliberate
 opt-out: it manages its own worktree because it also needs a baseline commit.
 
+`share_target_snapshot()` decides whether that snapshot is materialised at all,
+and the condition is **not** "some gate needs it". It is:
+
+> a runnable check is in `uses_shared_scan_dir()`, **or** the reviewed target is
+> off-`HEAD` (`off_head_target_commit()`).
+
+The second arm exists because the gates are not the only stage that reads the
+tree: the context stage plans and produces the whole of `30_context` from
+`ledger.scan_dir()`. An off-`HEAD` run can have nothing snapshot-backed to run —
+for example, the fast remote-only preset, where those gates skip and only
+semgrep remains, or a profile whose complete runnable set has sound cache hits.
+TypeScript, ESLint, Stylelint, Ruff and Mypy do not currently take that path:
+they opt out of persistent replay and remain runnable. Tying materialisation to
+the runnable set left an empty-run case with no scan dir, so
+`cargo tree`, the SBOMs, `tauri info` and the entry-point probes read the
+operator's local checkout while the diffs and `MERGE_GATE.json` described the PR's
+commit, and `RUN.json` looked identical either way
+(`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). A warm all-cacheable `--pr` run therefore
+pays for one `git worktree` its gates do not need: a correct pack outranks a
+saved checkout.
+
+When the target **is** the checked-out `HEAD` and no runnable check wants a
+snapshot, nothing is materialised — there the repo root genuinely is the reviewed
+tree, and the artifact stage's fallback to `config.repo_root` is the right answer.
+The call therefore sits *outside* the dispatcher's "anything to run" guard, since
+a run with an empty runnable set is exactly the case it exists to cover.
+
+Once either arm requires a snapshot, materialisation failure aborts the run.
+Letting each check create an independent temporary tree would not give the
+later context and artifact stages a verified root; their fallback to
+`config.repo_root` could then combine the target commit's gate results with the
+operator checkout's context in one pack. A missing snapshot is therefore a
+provenance failure, not an optimization failure.
+
+Materialising also resolves the run-wide substrate
+(`ledger.set_substrate_keyed`), which adopts the first pass's skips and cache
+replays off the unknown substrate they were necessarily recorded under. That is
+the quiet half of the same bug: a warm `--pr` run used to report its own
+decisions as being about no particular tree. The run-wide substrate is resolved
+with an **empty** consumable-scaffolding list, so it reports `snapshot` and never
+`snapshot-borrowed-deps` — with no command to name, nothing at that point can
+consume the linked `node_modules`; a command that does resolve through the link
+reports that for itself.
+
+The adopted ENTRIES are keyed differently, and must be: they each name a tool,
+and the substrate a later stage computes for that tool is that tool's own reading
+of the tree. `adopted_substrate` re-keys each one through
+`consumable_scaffolding(entry.key.tool)`, caching one `git status` per distinct
+consumable set (there are two, and the run-wide resolution seeds the first).
+Filing them all under the run-wide key instead put a JS repo's ESLint skip under
+`snapshot` while the context stage went on to resolve `snapshot-borrowed-deps`
+for the same directory: the exact-key lookup missed, `lookup_tool`'s
+unknown-substrate fallback had just been spent by this very adoption, and the
+context stage read `Uncovered` and re-ran the gate's work in full — on both
+scenarios the shared snapshot exists for. `consumable_scaffolding` therefore
+normalises its argument through `check_id_from_name`, since a ledger entry
+carries only the id (`tsc`, `tests`) and never the display name.
+
+The same table covers context commands that can consume the link. `tauri_info`
+and `esbuild_meta` prefer binaries from `node_modules/.bin`, while `npm_sbom`
+walks the linked dependency tree; their ledger rows therefore report
+`snapshot-borrowed-deps` whenever that link exists, rather than certifying the
+context artifact as an exact target-only snapshot.
+
 The Python checks add one step on top of that symlink. `uv run` synchronises the
 project environment before executing, so a reviewed commit whose dependencies
 differ from the local branch would install into — and remove packages from — the
@@ -265,6 +344,60 @@ therefore sets `UV_PROJECT_ENVIRONMENT` to `Config::uv_env_dir_for()`
 dependency set is still installed and judged, in a prview-owned environment kept
 warm across runs. A local review sets no override and uses the checkout's own
 environment exactly as before.
+
+The cold `uv sync` pre-step is resolved only after the run-wide target snapshot
+exists, through that same `plan_python_run()`. Its cwd and
+`UV_PROJECT_ENVIRONMENT` are therefore identical to the later gates; it never
+syncs an off-HEAD dependency set into the operator checkout. uv download/build/
+install pools and Cargo-backed PEP 517 builds inherit the run's child limit.
+`CARGO_BUILD_JOBS` is then resolved through the direct Cargo gate's exact-cwd
+configuration path, so a reviewed repository `[build].jobs` value remains a
+ceiling for both uv and directly launched Python tools.
+Before exporting higher-precedence `UV_CONCURRENT_*` values, the plan reads the
+project-scoped authority selected by uv's explicit/discovery precedence: an
+in-tree `UV_CONFIG_FILE`; otherwise, when boolish `UV_NO_CONFIG` is enabled, no
+discovered uv configuration; otherwise `uv.toml`, then `[tool.uv]` from
+`pyproject.toml`. An explicit config remains authoritative together with
+`UV_NO_CONFIG`, matching uv. Each pool takes the
+minimum of that project ceiling, inherited environment, and the run plan;
+malformed, unreadable, non-UTF-8, wrong-type, or non-positive authority fails
+closed. Because this inspection precedes the governed uv child, the selected
+project-scoped authority is opened non-blocking on Unix, must resolve to a
+regular file, and is read through a 1 MiB cap. FIFOs, devices, and oversized
+`uv.toml`/`pyproject.toml` inputs fail closed without hanging or exhausting the
+planner; an in-tree metadata symlink is bounded at its resolved regular target.
+User- and system-level uv config remains outside this deliberately
+project-scoped resolver. The cap remains on every later `uv run`, so an
+unsuccessful pre-sync cannot retry outside the envelope. A direct Ruff, Mypy,
+or Pytest fallback selected because uv is unavailable skips uv-only files and
+environment selectors altogether; it still contains the generic Python
+metadata it reads and retains the Cargo descendant cap. Before collection, a
+plugin-disabled, null-config `--version` probe uses the same pytest launcher,
+reviewed cwd, and bounded environment as the real check. Its actual major and
+minor select the pytest 6.0-7.1, 7.2-8.0, 8.1-8.x, or 9.x discovery contract;
+unsupported versions fail closed instead of guessing.
+Pytest is then explicitly bound to the one highest-precedence config inside the
+reviewed root (including pytest 9 TOML and hidden variants), or to an empty
+config when the root has none, so it never walks into an ambient parent project.
+Pytest 7.2-8.x recognizes `.pytest.ini` as a candidate but does not select an
+empty hidden file unconditionally; that behavior begins with pytest 9. The
+versioned discovery model preserves this distinction instead of treating every
+recognized basename as an automatic winner.
+Existing but unreadable, non-UTF-8, malformed, or conflicting recognized config
+is an execution error, not absence. Pytest-xdist gets the same upper bound
+through its auto-worker environment and a final CLI override only when the
+effective shell-tokenized config/environment request exceeds that bound or is
+dynamic; an explicit smaller count or zero remains unchanged. A standalone
+`--` in config or inherited addopts fails closed because it would turn the
+later isolation and worker-cap arguments into positional values. Xdist's custom
+and proxy gateway options (`--tx` and `--px`) also fail closed: those paths can
+create execution environments independently of `-n`, so a numeric override
+cannot prove the run-wide child bound. Unknown build
+backends remain one serialized Exclusive parent; the governor does not claim to
+discover every third-party backend's private thread knob. Pytest itself also
+remains Exclusive: arbitrary project `conftest.py` code and third-party plugins
+can create private processes or mutate xdist hooks, which a portable parent
+cannot infer or truthfully claim to cap.
 
 That environment is per reviewed **commit**, not per repository. `uv run` syncs
 before executing and releases the environment lock while the child command runs,
@@ -305,14 +438,23 @@ Nothing is pre-created — uv rejects an existing directory that is not a valid
 environment, so the directory tree only ever comes from uv itself.
 
 The tools read the project **files**, not the directory, so `plan_python_run()`
-also refuses a `pyproject.toml` or `uv.lock` that resolves outside the tree being
-judged — the Python counterpart of the Cargo manifest guards. A reviewed commit
+also refuses a `pyproject.toml`, discovered `uv.toml`, or `uv.lock` that resolves
+outside the tree being judged — the Python counterpart of the Cargo manifest
+guards. A reviewed commit
 that tracks either as a link to an external file would have ruff, mypy and pytest
 configure themselves, and uv resolve dependencies, from another project, while
 provenance recorded an exact `snapshot` scan and the cache filed the verdict
 under the reviewed commit (`uv run` is given neither `--no-project` nor
 `--locked`, so nothing downstream re-asks). Metadata linked to a real file inside
 the tree resolves back inside and passes: escape is the target, not symlinks.
+An enabled `UV_NO_CONFIG` removes only discovered `uv.toml` from that boundary;
+`pyproject.toml` and `uv.lock` remain independently consumed metadata. Invalid
+or non-UTF-8 boolish values fail loud, as uv would. Ambient `UV_CONFIG_FILE`,
+`UV_PROJECT`, `UV_WORKING_DIR`, and legacy
+`UV_WORKING_DIRECTORY` are checked at the same boundary. A config file may stay
+inside the tree, but a project or working-directory redirect must resolve to the
+exact reviewed root; prview reports a planning error instead of silently
+neutralizing an operator setting and certifying a different execution.
 
 The cargo checks (`Cargo check`, `Clippy`, `Rustfmt`, `Cargo test`,
 `Cargo audit`, `Cargo geiger`) run in the snapshot as well, but with one extra
@@ -562,6 +704,12 @@ record describes the run that *populated* the entry — its `cwd`, `started_at`,
 it as a replay rather than a fresh execution. Without this the fastest runs
 (all-cache-hit) were the only ones with no audit trail at all.
 
+A check returns no cache key when its complete effective input set cannot be
+proved. TypeScript, ESLint, Stylelint, Ruff and Mypy currently opt out: their
+answers depend on config, ignore rules, plugins and installed tool/dependency
+state beyond the former source-only hashes. They still participate in same-run
+`Run` to `Reused` context dedup; only persistent cross-run replay is disabled.
+
 The entry is written to a `<key>.tmp-<pid>-<nanos>` staging file and published
 with a single `fs::rename`, so a concurrent reader sees either the old entry or
 the new one — never a result paired with another run's provenance. Staging files
@@ -650,9 +798,10 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   (`check_id_from_name`): a skipped gate is `tsc`, `cargo` or `tests`, never the
   slug of its display name, so a consumer can pair the skip with the gate it
   belongs to. `REPORT.json.checks_skipped[]` carries the same id. The
-  synthetic `heuristics_loctree` row is included: Loctree runs in-process rather
-  than as a subprocess (`command` is `loctree (in-process)`), but it still reads
-  a tree — the `git archive` extraction of the target commit in snapshot mode,
+  synthetic `heuristics_loctree` row is included: Loctree cache creation runs in
+  a private governed worker (`command` is `prview loctree worker (internal)`),
+  while snapshot interpretation stays in-process. It reads a tree — the `git
+  archive` extraction of the target commit in snapshot mode,
   or `repo_root` when no snapshot could be made — and a gating signal whose
   substrate is unstated is unauditable.
 
@@ -700,9 +849,10 @@ facts and parsing, but not an accidentally conflated enforcement mode.
 The worktree state is frozen **per run**, and a `--watch` iteration is a run:
 each iteration re-reads the working tree before its checks, so the pack it emits
 describes the tree that iteration analysed rather than the tree as it looked
-when the watcher started. (With an in-repo `--output-dir` this means later
-iterations legitimately report *dirty* — they can see the previous iteration's
-artifacts. The default output root is `~/.prview/runs`, outside the repo.)
+when the watcher started. Watch mode uses the default unique allocator for each
+immutable iteration pack; combining `--watch` with one explicit `--output-dir`
+is rejected instead of reusing or overwriting that path. The default output
+root is `~/.prview/runs`, outside the repo.
 
 The file is purely additive: no other pack file changed shape for it. It is
 hashed by `MANIFEST.json` like any other artifact and listed in the sanity
@@ -719,6 +869,647 @@ from returning no provenance at all. Making the substrate a *parameter* — a
 to look elsewhere — is the 0.8 cut. Until then the guarantee is "every check
 reports where it ran", not "no check can run anywhere else".
 
+### ledger/mod.rs
+
+A run-wide record of every unit of work it considered: one `TaskEntry` per task,
+stating what was resolved (`Run` / `Cached` / `Skipped` / `NotApplicable`) and
+under which `TaskKey`.
+
+The key is deliberately *semantic*: `TaskKey { tool, substrate }`, where `tool`
+is normalised through `check_id::check_id_from_name` and `substrate` is the pair
+(`target_sha`, `TreeState`) the task read. That makes "the same tool on the same
+tree" one key regardless of which surface asked for it — the TypeScript gate and
+a `tsc` context artifact are one task, not two — without a second alias table
+free to drift from `check_id`'s. Both substrate fields are optional, mirroring
+`checks::ScanSubstrate`: an unresolved substrate stays visibly unknown rather
+than being certified as anything.
+
+`TaskLedger` is shared across a run's concurrent tasks by reference; each field
+sits behind its own `Mutex` and no lock is held across an `await`.
+
+The ledger also **owns** the run's shared target snapshot
+(`set_shared_snapshot` / `scan_dir`). Materialising it stays the check
+dispatcher's job, but the handle lives here because the ledger outlives every
+stage: a snapshot parked in it is still on disk when artifact generation asks
+where the reviewed tree is, instead of having been dropped with the frame that
+created it. Because the artifact stage reads it too, an off-`HEAD` target is on
+its own enough to materialise one, whether or not any gate had to run — see
+*Where checks run*.
+
+The ledger observes; it never runs, skips or caches anything itself.
+
+`App::run` builds one ledger per run and hands it to `checks::run_all` /
+`run_all_with_events`, which record every check as it resolves: a cache hit as
+`Cached`, an eligibility skip as `Skipped`, an execution as `Run` with the
+duration the result reports. A check that ran is keyed on the substrate its OWN
+provenance names — the tree it actually read — so no second resolution can
+contradict it; a check with no provenance falls back to the run's resolved
+substrate, and to unknown when that is unset too.
+
+A cache replay is keyed on the substrate of the run REPLAYING it (the cache key
+is content-derived, so a hit is an answer about the tree this run is reviewing)
+while its `origin` names the tree the ORIGINAL execution read, taken from the
+provenance stored beside the entry. The two are deliberately separate: the key is
+what a later stage asks about, the origin is what makes the replay auditable. It
+also carries `cache_age_secs`, the age of the entry it replayed (see
+`cache/mod.rs`), so a gate reported as passing off a stored answer states how
+stale that answer is.
+
+Skips and replays are decided in the checks stage's *first pass*, which
+necessarily precedes `share_target_snapshot` — the runnable set is what decides
+whether a snapshot is materialised at all — so they are recorded under an unknown
+substrate. `TaskLedger::set_substrate_keyed` therefore **adopts** them: every
+entry still keyed on an unknown substrate is re-keyed, because they were this
+run's decisions about the tree this run went on to read. The new key is asked for
+per entry, by tool id — one tree does not have one identity, and a snapshot that
+carries a `node_modules` link is `snapshot` to a cargo gate and
+`snapshot-borrowed-deps` to a JS one. The knowledge of which is which stays in
+`checks` (`consumable_scaffolding`) and is handed in as a closure; the ledger
+holds no table of tools. Only the key moves; a replay's `origin` is never
+overwritten with the current run's substrate. An unknown key survives only where
+the run genuinely resolved no substrate (nothing needed a shared snapshot), which
+is what `TaskLedger::lookup_tool`'s fallback still covers.
+
+Admission is not itself proof that a target command executed. If a non-security
+check is admitted but its launcher returns a missing/unlaunchable-tool error,
+its no-command provenance is recorded as `Skipped` with both queue timestamps.
+A tool that did start, inspect the substrate, and later returns a runtime
+`Skipped` result remains `Run`; status text alone cannot erase live coverage.
+
+Context commands that actually execute are recorded too, by
+`artifacts::context_artifacts::record_context_runs`, once the runtime knows their
+duration: `Run` for anything that started (including a failure or a timeout — the
+tool read the tree either way), `Skipped` for a command that never spawned. A
+command is recorded under the GATE it stands in for when one exists (`eslint
+json` → `ESLint`, `tsc trace` → `TypeScript`), so one tool cannot land under two
+ids depending on which surface resolved it; a command with no gate counterpart
+(`cargo tree`, `tauri info`, `npm sbom`) is recorded under its own label, slugged
+by `check_id_from_name`. The plan site hands that identity over in
+`ContextCmd::gate` rather than leaving the label to be reverse-engineered, so
+there is no per-command alias table.
+
+#### The `ledger` view in RUN.json
+
+`RUN.json` carries the entries as an additive `ledger` object: `schema` (its own
+counter, currently `2`) and `entries[]`, one row per task with `tool`, `kind`
+(`check` / `context_artifact`), `lifecycle` (`run` / `cached` / `reused` /
+`skipped` / `not_applicable`) and `substrate` (`target_sha` + the same
+`tree_state` strings `checks[].tree_state` uses). Each lifecycle adds only the
+evidence it has: `duration_secs` for a run, `cache_age_secs` + `origin` for a
+replay, `origin` for a same-run reuse, `reason` for a ruled-out task.
+`queue_wait_secs` is emitted when both `queued_at` and `started_at` exist — the
+gap between entering the budget queue and admission — so a slow tool is not
+confused with a long resource wait.
+
+Everything the pack already reported — `checks[].cached`, `context_artifacts[]`,
+`context_commands[]`, the top-level `schema_version` — is untouched, so a
+consumer that ignores `ledger` cannot tell the section exists. That is why the
+pack's `schema_version` does not move (the precedent `CheckProvenance` set) and
+why the view versions itself instead.
+After context commands finish, `context_artifacts[].generated` is reconciled
+against the command outcome and the expected file in the pack. Planning intent
+cannot survive a timeout, spawn failure, missing runnable command, or missing
+output as a false claim that an artifact was generated.
+
+The context runtime also retains an internal admission fact. Two commands may
+both display `timed_out` in the stable `context_commands[]` contract, but only
+the one that actually spawned becomes ledger lifecycle `run`; a command whose
+shared stage deadline expired while it was still queued becomes `skipped` with
+the explicit pre-spawn reason.
+
+#### One tool, one execution per run
+
+The artifact stage reads the entries back through `TaskLedger::lookup_tool`,
+which answers "did a gate already do this work on this tree?" before a context
+generator repeats it.
+
+The context stage used to derive that answer from the *results* list
+(`checks_ran_eslint` and friends), which can only report what reached a result.
+A gate ruled out by a preset leaves no result, so absence read as a gap: a fast
+remote-only run excluded the lint gate on purpose and the context stage then
+spent 23 s linting the whole tree by itself (`PRV-CONTEXT-WORK-DEDUP`).
+The ledger holds the missing half — what was
+deliberately ruled out and why — so the decision moved there:
+
+- a gate that **ran** covers the artifact, recorded as `Reused` naming the
+  substrate that live execution read. A gate that **replayed a cache** covers it
+  as `Cached`, with the stored entry's age and the substrate of the ORIGINAL
+  execution. A gate that ran and *failed* still covers it as `Reused`: the tool
+  read the tree and reported, and a second run buys the same answer at the same
+  price;
+- a gate that was **ruled out** leaves the artifact unproduced, recorded with the
+  gate's own reason — `Skipped` when the reviewed tree could run the tool anyway
+  (this run chose not to), `NotApplicable` when it could not (no switch would
+  change that);
+- a tool **no gate decided on** is still generated by the context stage, which is
+  the one case where compensating was ever right.
+
+The `tsc` trace answers to the same rule: a deep run used to compile the
+reviewed tree twice, once as the TypeScript gate and once as
+`tsc --noEmit --traceResolution`, so the trace is now deduped against a gate
+that already compiled the same tree. One exception stands — a gate that failed
+with module-resolution errors still forces the trace, because there the second
+compile answers a question the gate's own output cannot: which candidate paths
+the compiler tried. `tauri info` has no gate to dedup against and keeps its
+behaviour; what changed is that a deferred one records its reason in the ledger
+too, so the run has one account of what it did not do rather than two.
+
+Both sides resolve the substrate through `checks::resolve_scan_substrate` with
+the same `consumable_scaffolding` set, so a gate and its artifact describe one
+tree identically instead of differing on `tree_state` alone. A lookup falls back
+to an unknown-substrate entry for the same tool, which is what a run that never
+resolved a substrate of its own leaves behind; it never crosses two *known*
+substrates, which would be evidence of different work.
+
+#### One reviewed tree per run
+
+`share_target_snapshot` (in `checks/mod.rs`) resolves the run's scan directory
+once, points the checks' config clone at it via `scan_dir_override`, records the
+resolved substrate on the ledger, and hands the ledger the snapshot handle.
+`artifacts::generate` takes the ledger in its `GenerateInput` and resolves the
+context generators' root as `ledger.scan_dir()`, falling back to
+`config.repo_root`.
+
+That fallback is valid only when the reviewed target is the checked-out
+`HEAD`, where both paths name the same tree. If an off-`HEAD` snapshot is
+required but cannot be created, the checks dispatcher returns an error before
+pre-sync or gate execution; it never publishes a mixed-revision pack.
+
+This is what keeps a pack describing ONE revision. `scan_dir_override` is set on
+a *clone* of the config inside `run_all`, so `App::run`'s own config never learns
+about the snapshot; before the ledger owned the handle, the worktree was also
+deleted when `run_all` returned. A `--pr` run therefore had its gates judge the
+reviewed snapshot while `30_context/*` was produced from whatever the operator
+had checked out locally (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). Every context
+command's cwd and every filesystem probe that decides which commands to plan now
+read the reviewed tree. Static Tauri discovery, its source walk, and the
+repo-relative mapping used to compare head commands with the base commit use
+that same tree and repository view. A local review resolves to the repo root,
+which *is* the reviewed tree, so its behaviour is unchanged. Cargo context
+commands resolve their directory through `checks::planned_cargo_cwd`, the same
+resolution the cargo gates use, so a workspace member is not collapsed to the
+snapshot root.
+
+### governor/mod.rs
+
+Concurrency used to be decided per stage: the checks stage picked its own
+fan-out, the context stage picked another, and nothing held the machine-wide
+number. Two stages each behaving reasonably still oversubscribe a laptop, and the
+tools are not equal — `cargo clippy` and `cargo test` each want the whole box
+while reading a manifest costs nothing.
+
+`ResourceGovernor` is that missing number, plus the registry that makes a run
+killable. One governor per run, owned by `App` (and by `tui::run_tui`, which is
+its own entry point) so BOTH stages that put load on the machine draw on the same
+budget:
+
+```rust
+pub enum Weight { Light, Heavy, Exclusive } // semantic declaration
+
+impl ResourceGovernor {
+    pub fn new() -> Self;                                  // safe default
+    pub fn for_resource_budget(ResourceBudget) -> Self;    // safe | balanced
+    pub fn with_budget(total: u32, heavy_cost: u32) -> Self;
+    pub fn plan(&self) -> ResourcePlan;                     // parent + child envelope
+    pub fn cost(&self, weight: Weight) -> u32;
+    pub async fn acquire(&self, weight: Weight) -> Result<GovernorPermit, Cancelled>;
+    pub fn try_acquire(&self, weight: Weight) -> Option<GovernorPermit>;
+    pub fn register_child(&self, key: impl Into<String>, pid: u32) -> bool;
+    pub fn unregister_child(&self, key: &str);
+    pub fn cancel(&self);
+    pub fn cancelled_signal(&self) -> tokio::sync::watch::Receiver<bool>;
+    pub async fn cancelled(&self);
+    pub fn is_cancelled(&self) -> bool;
+}
+
+// Attribute a task's spawned children to a governor without threading it
+// through `Check::run`.
+pub async fn with_child_scope<F: Future>(g: Arc<ResourceGovernor>, label: &str, f: F) -> F::Output;
+pub fn register_active_child(pid: u32) -> Option<ChildRegistration>;
+```
+
+- **Weights cost what the governor says.** `Light` is cheap metadata work;
+  `Heavy` is a whole-project tool with an explicit descendant-worker cap;
+  `Exclusive` consumes the entire budget for unsupported or unbounded child
+  pools. The safe default therefore serializes every whole-machine tool.
+- **The default is intentionally conservative.** `--resource-budget safe` uses
+  one parent permit and one child worker. The opt-in `balanced` plan admits at
+  most two capped heavy parents, never creates more parent permits than detected
+  logical cores, caps each supported child pool at four, and caps the logical
+  permit envelope at eight even on a large host. A one-core host therefore stays
+  single-parent and single-worker. A one-minute load at or above `0.75/core` (or
+  an unavailable load reading) backpressures a requested balanced run to the safe
+  plan. This is a CPU/memory envelope, not a claim that future peak memory can be
+  predicted exactly.
+- **Cargo configuration cannot escape the planner's read bound.** Effective
+  `build.jobs` discovery honors Cargo's cwd hierarchy and filename precedence,
+  but opens only direct regular `.cargo/config*` files under a direct `.cargo`
+  directory. Final or directory symlinks, devices, FIFOs, invalid text, and
+  inputs beyond the byte cap are `Uncertain` and lower the child limit to one;
+  the synchronous planner never follows or reads them without a bound.
+- **Python descendants use the same plan.** The pre-sync and Python gates share
+  one reviewed snapshot and per-commit uv environment. uv pools, Cargo-backed
+  package builds, and pytest-xdist are clamped to the child-worker limit. A
+  third-party PEP 517 backend with its own undocumented pool is still serialized
+  at the parent level but is not falsely advertised as internally capped.
+- **A permit is held, never released by hand.** `GovernorPermit` returns the
+  permits on drop, so an error path cannot leak budget.
+- **Cancellation closes the semaphore.** That refuses a newcomer and a task
+  ALREADY waiting alike — a task parked on the budget is work that has not
+  started. `cancelled_signal()` is a `watch::Receiver` a dispatcher loop can
+  `select!` on, and it starts at the current state so a late subscriber is not
+  left waiting for a change that already happened.
+- **`cancel()` force-terminates each registered process tree.** Unix freezes
+  the child's group, reaches a fixed point of live PPID descendants that moved
+  into new groups, verifies their native birth identities, and then uses
+  leaf-first `SIGKILL`. Windows children are
+  attached to Job Objects before execution; synchronous wrappers terminate the
+  live Job Object and use native `taskkill /T /F` only as a fallback. After a
+  successful tree kill, prview reaps the direct root through the raw child
+  handle with a finite budget; it does not block on the Job Object completion
+  port. If both mechanisms fail, cancellation returns without an unbounded
+  `wait()` rather than turning a kill failure into a hung CLI. Windows-runner
+  tests cover child+grandchild, root-exits-first, and cancellation paths.
+  It is idempotent in the strong sense: the registry is DRAINED, so a
+  second cancel signals nothing — a pid whose process died in between may by then
+  belong to another program. Registration checks cancellation while holding that
+  same registry lock: a process spawned after the drain is refused (`false`) and
+  its process group is killed immediately instead of being inserted too late.
+  Callers must `unregister_child` on exit for the same pid-reuse reason.
+- **A spawned tree remains owned after its root exits.** Unix retains the
+  process-group identity; Windows check and context runners attach the child to
+  a Job Object before it starts. A success-shaped wrapper therefore cannot
+  orphan background work by making its root PID unavailable to `taskkill`.
+- **The command deadline includes output drain.** Async children are reaped,
+  residual Unix process-group or Windows Job Object members are terminated, and
+  the registry guard is dropped before buffered stdout/stderr are drained. Reader tasks share the
+  command's original deadline and are aborted *and awaited* on every terminal
+  error, so a background descendant holding a pipe cannot turn a bounded check
+  into an unbounded join.
+
+The budget remains `tokio::sync::Semaphore::acquire_many_owned` and the signal
+remains `tokio::sync::watch`. Durable Windows ownership promotes `process-wrap`,
+already present transitively through Loctree, to an explicit dependency so its
+Job Object contract cannot disappear with an unrelated dependency change.
+
+#### Who acquires, and in what order
+
+- **Checks** (`checks::run_all`, `run_all_with_events`) take a permit per check
+  before the process starts. The weight comes from `Check::resource_weight`,
+  which defaults to `Exclusive`. Rustfmt opts into `Light`; Cargo/rustc, Vitest
+  and Semgrep opt into `Heavy` because they receive `CARGO_BUILD_JOBS`,
+  `--maxWorkers`, and `--jobs` respectively. Cargo test binaries additionally
+  receive `RUST_TEST_THREADS`. TSC, ESLint, Stylelint, Python gates and other
+  uncapped pools stay `Exclusive`. Cargo's build and libtest child caps are the
+  minimum of the active resource plan, any valid inherited
+  `CARGO_BUILD_JOBS`, and the effective Cargo `[build].jobs` visible from the
+  exact reviewed cwd (including a remote snapshot). The resolver follows
+  Cargo's nearest scalar and legacy-`config` precedence; unreadable, invalid,
+  zero-valued, or include-dependent config fails closed to one worker.
+  Inherited `CARGO_BUILD_JOBS` uses the same signed logical-core-relative
+  interpretation; invalid and zero values also fail closed. Empty `CARGO_HOME`
+  follows Cargo's operator-home fallback rather than resolving to the reviewed
+  cwd.
+  `RUST_TEST_THREADS` is bounded independently by the plan and inherited
+  ceiling, so an operator's stricter limit is never raised. Vitest stays at one
+  CLI worker in every plan: its CLI option
+  overrides project configuration, so passing the wider balanced limit could
+  raise a repository's intentional `maxWorkers: 1` ceiling.
+  Test selection is runner-specific: Vitest receives a regex, while Cargo gets
+  only a literal substring validated before snapshot planning. A filtered Cargo
+  exit 0 becomes `Error` unless libtest summaries prove positive execution. In
+  a Mixed JS/Rust profile the one shared selector is therefore restricted to
+  the literal intersection; per-runner selectors remain a future contract.
+- **Context commands** (`artifacts::context_artifacts`) take a permit before each
+  spawn, via the synchronous `try_acquire` — `artifacts::generate` is a blocking
+  pipeline with a poll loop and has nothing to `.await` on. The weight comes from
+  `context_cmd_weight`: `tsc trace`, `eslint json`, `stylelint json` and
+  `esbuild meta` are `Exclusive`; the metadata readers (`cargo tree`, `cargo sbom`,
+  `npm sbom`, `tauri info`) are `Light`. The context-stage timeout is one
+  deadline for the whole batch, not a fresh clock per admitted command.
+- **The cargo `target/` lock stays.** It is a correctness lock — one writer per
+  `target/` — and the budget is not that. A check that takes both takes them in
+  ONE order: **cargo lock first, then budget**. Waiting for that lock races the
+  cancellation signal, so a cancelled waiter exits immediately rather than
+  waiting for an unrelated Cargo timeout. Same order everywhere is what
+  makes two locks deadlock-free, and this direction also avoids parking half the
+  budget on a cargo check that is still queueing for `target/`. Nothing acquires
+  the cargo lock once it holds budget, so there is no cycle the other way.
+
+#### Queued vs running
+
+Admission is what makes the distinction real, so the run reports it:
+
+- the progress line separates the two — `Running: X (12s) · Queued: Y, Z`;
+- the ledger's `started_at` is the moment of admission, not the first poll of the
+  check's future, so `started_at − queued_at` is time spent waiting for the
+  machine;
+- the PV-18 slow notice measures from admission. A check parked on the budget for
+  ten minutes has not been slow, it has not started, and naming it would blame
+  the tool for the queue;
+- TUI mode gets the same split: `CheckEvent::Started` means "the run considered
+  this check" (mapped to the `Pending` lifecycle) and the added
+  `CheckEvent::Running` means a process began.
+
+#### Cancellation path (Ctrl-C)
+
+```
+governor::with_cancellation(work, governor, CtrlC)
+      │
+      ├─ tokio::spawn(supervise)
+      │        └── a SEPARATE task, drained by an explicit stop handoff
+      │        │  first interrupt
+      │        ▼
+      │   governor.begin_cancel()
+      │        ├─► semaphore.close()  ── refuses newcomers AND tasks already waiting
+      │        ├─► watch::send(true)  ── wakes the dispatcher's select! arm
+      │        └─► drain children into an owned termination batch
+      │                 └─► blocking tree kill runs off the async interrupt owner
+      │                      (SIGKILL -pgid / Job Object + taskkill fallback)
+      │        │  second interrupt
+      │        ▼
+      │   Interrupts::abandon_run()   ── exit(130) without waiting for the unwind
+      │
+      └─ work.await
+             │
+             ▼
+        checks::run_all returns Err(Cancelled)   ── or the context stage stops admitting
+             │                                      ── or App::ensure_not_cancelled fires
+             ▼
+        App::run unwinds through `?`  ── Drop runs: ledger's shared WorktreeSnapshot,
+             │                           heuristics AnalysisSnapshots
+             ▼
+        main exits `CANCELLED_EXIT_CODE` (130 = 128 + SIGINT)
+```
+
+**The supervisor is its own task.** It used to be an arm of the same `select!`
+as the run, which works only while the run keeps yielding. `artifacts::generate`
+is synchronous and polls its children with `std::thread::sleep`, so for the whole
+of the longest stage of a review the task was never polled and NEITHER interrupt
+arm could fire — and `tokio::signal::ctrl_c` had by then replaced SIGINT's
+default disposition, so the terminal could not end the process either. Watching
+from a separate task removes the coupling. `governor::blocking_stage` wraps the
+`artifacts::generate` call in both headless `App::run` and TUI `run_analysis`
+for the remaining edge, a runtime with a single worker thread: it tells tokio
+the stage is about to block so the interrupt supervisor (headless) and the
+event loop (TUI q/Escape) keep a thread to be polled on. The interrupt source
+is the `Interrupts` trait rather than a direct `ctrl_c()` call, so the state
+machine is testable without raising a real signal at the test harness.
+
+Cancellation has a synchronous truth boundary and a blocking cleanup half.
+`begin_cancel()` publishes the cancelled state, closes admission, and drains
+the child registry before the work future can finish. The owned termination
+batch then runs outside the async signal owner, which keeps polling a second
+interrupt while a platform tree killer is blocked. Headless completion uses the
+same biased `InterruptSupervisor::stop().await` handoff as TUI startup: an
+already-ready signal is drained, cancellation is re-checked, and no successful
+work value can cross the verdict boundary after Ctrl-C.
+
+`blocking_stage` makes the surrounding runtime responsive; it does not preempt
+the in-process libgit2 closure itself. After the TUI's first quit request cancels
+the governor, the cancel join therefore keeps polling raw input while it waits
+for that closure to unwind. A second Ctrl-C aborts the task wait and returns
+typed cancellation through `run_tui`, so terminal cleanup runs before the
+established exit-130 path. The in-process closure itself continues until it
+returns naturally or the process exits. Before the durable publication commit,
+cancellation prevents a completion/verdict publication. After that commit the
+pack, `latest`, and index row remain valid by design; a hard second interrupt can
+therefore win the narrow return window and exit 130 even though that already
+committed pack remains discoverable.
+
+The first raw-mode Ctrl-C deliberately shares the TUI's existing cooperative
+quit result with q/Escape: after the join and terminal cleanup it returns
+success. A second Ctrl-C key event selects the typed forced-cancellation path.
+When a terminal reports event kinds, reported repeat/release events from the
+first press do not count. Without keyboard-enhancement negotiation, however,
+some Unix terminals encode autorepeated ETX bytes as ordinary press events;
+this bounded escape hatch cannot distinguish those bytes from a physically new
+press.
+
+Cancelling rather than aborting is the whole point: the supervisor could simply
+drop the run future, but returning through the ordinary error path is what lets
+the destructors on the way out remove the temporary worktrees a killed process
+would leave on disk. Worktree creation arms a path-exact libgit2 rollback before
+`git worktree add` starts, covering the interval in which Git has registered the
+path but its governed child has not returned. The same in-process fallback is
+the only operation performed by `WorktreeSnapshot::Drop`, so an early async
+unwind never starts or waits for a `git worktree remove` child. The normal
+success path explicitly performs that governed removal from a blocking stage.
+Both paths skip unreadable stale sibling registrations, match only the exact
+snapshot path, and never run a global prune. `TempDir` remains the filesystem
+owner. A **second** interrupt is the
+operator declining to wait for the ordinary unwind and exits immediately.
+
+**Cancel ⇒ never a verdict.** Only the checks stage watches
+`governor.cancelled()` itself, and it is one stage of several: a cancel arriving
+in the heuristics, in the artifact stage, or in a run whose gates all replayed
+from the cache (an empty runnable set never builds that `select!` loop at all)
+was previously ignored outright. `App::run` would go on to write a pack whose
+context commands were every one of them recorded `cancelled`, return a report,
+and let `main` compute an ACCEPT or a BLOCK from it. `App::ensure_not_cancelled`
+now guards every substantial orchestration/artifact seam. External context tools
+finish before merge/report generation. If cancellation reaches artifact
+generation, success-shaped verdict/report/RUN/MANIFEST/SANITY surfaces are
+removed and `00_summary/INCOMPLETE.json` records `status=incomplete`, the reason,
+and the interrupted stage. An unexpected invalid SANITY result is also fatal
+before ZIP and publication; its directory and `SANITY.json` are retained for
+diagnosis, while `latest`, the run index, and successful completion output
+remain untouched.
+The `latest` symlink and the run-index row are one publication transaction under
+a global lock, not two best-effort writes. Before retargeting `latest`, prview
+fsyncs a durable recovery journal containing the
+predecessor; the next publisher reconciles a crash from the committed index and
+clears the journal. Invalid journal state is quarantined without mutating the
+advertised alias, so stale or tampered recovery evidence cannot deny all future
+publications. The shared review worktree is explicitly removed before either
+advertisement; cancellation during that governed cleanup therefore produces an
+incomplete, unpublished pack rather than exit 130 after a published verdict.
+A valid journal is preserved when `index.jsonl` cannot be opened or parsed.
+Publication and recovery use a strict loader that rejects every malformed row;
+they never turn partial input into a rewritten partial ledger. Failure to commit
+the finished pack into that ledger is a fatal generation error, because a pack
+that `state` and MCP cannot discover is not a completed publication.
+A cancellation that wins after the alias swap performs a
+short, uninterruptible consistency rollback while it still owns that lock. The
+index append itself is abortable: the file is saved only while the run is still
+active, rolled back if cancel arrives before commit, and retention candidates
+are first moved
+atomically into `$PRVIEW_HOME/prune-trash`. A cancelled transaction restores
+those moves and the previous index. Committed tombstones are physically deleted
+at the start of the next registration, before that run mutates its index, using
+a cooperatively cancellable directory walk. This removes recursive deletion
+from the current publication's irreversible window. The run ends in `Cancelled`
+and exit `130`. If a custom output path cannot be renamed into prune-trash
+atomically (for example across filesystems), registration keeps the new and old
+index rows, emits a retention warning, and performs no destructive fallback.
+The durable index/retention marker completion is the explicit commit boundary:
+after it succeeds, caller layers return the completed report even if a signal
+arrives before they render it. Treating that late signal as cancellation would
+claim "no verdict" while `latest` and the index already expose one.
+
+The publication lock uses a persistent v2 kernel lock plus the legacy
+create-new pathname understood by pre-0.8 binaries. Together they exclude old
+and new publishers from the **index critical section**, but not from the whole
+publication: pre-0.8 binaries retarget `latest` before attempting the legacy
+lock. A 0.8 rollout must therefore use a quiescent cutover that drains and
+excludes every pre-0.8 publisher sharing `PRVIEW_HOME`; only 0.8-to-0.8
+publication has the end-to-end transaction described above. A live legacy
+owner blocks normally; a stale legacy sentinel fails
+closed and is never rewritten automatically because an old process could have
+observed it before pausing. An operator may remove that exact sentinel only
+after ruling out old publishers. MCP branch activation preserves this rule:
+stale `.active.lock` evidence becomes non-retryable `storage_locked` with
+`recovery_required` and its exact path, rather than the false claim that a live
+review will clear on retry. Unsafe or unreadable activation paths become
+`storage_corrupt`; they are not folded into lock contention. Lock opens reject
+symlinks/reparse points and, on Unix, shared hardlink inodes; journal/index/prune
+manifests are published via owned unique temp files and atomic rename.
+When the legacy claim fails, the contender explicitly releases its v2 kernel
+lock before returning the recovery error; operator recovery can therefore retry
+immediately instead of waiting for platform-specific close timing.
+The prune manifest is not path authority by itself: before recovery moves or
+deletes a payload, the payload root, its `00_summary` directory, and its
+`RUN.json` must each be owned non-link components, and RUN must identify the
+same artifacts root. Windows rejects every reparse point (including junctions
+and mount points); authority files on Unix reject shared hardlink inodes.
+Recursive
+cleanup unlinks a nested reparse entry itself and never traverses its target. A
+missing, invalid, or mismatched manifest/payload pair is
+preserved fail-closed without denying the next publisher; an I/O failure after
+recovery mutation begins still aborts publication. Rollback attempts the
+predecessor moves and previous index independently. If the previous-index write
+cannot be confirmed, the outer publication journal remains durable and the run
+fails for restart reconciliation. Relative custom output paths are made
+absolute before pack creation, so a later cwd cannot retarget recovery. The
+final custom path is claimed with one create-directory operation and must not
+already exist; one immutable path therefore maps to one pack and one index row.
+MCP reserves that path before spawn through a create-new nonce sentinel; only
+the child holding the nonce may consume the control-only directory once. These
+metadata checks cover accidental and state-at-rest link traversal, not a
+same-user adversary racing directory replacement between check and use.
+Directory fsync makes the rename/manifest/index ordering a power-loss contract
+on Unix (including macOS). The non-Unix implementation does not claim equivalent
+directory-entry power-loss durability.
+
+`--update` needs a gate of its own (`App::reuse_unchanged_run`), because it is
+the one path that returns a report without reaching any of the others: an
+interrupt during `prepare_refs` followed by a HEAD with no new commits used to
+hand back the *previous* run's pack, and `main` computed an ACCEPT or a BLOCK
+from that. Reusing a pack is still reporting a verdict. Ref preparation is now
+inside the run scope and its Git child is registered, so cancellation can stop
+the fetch rather than merely rejecting the eventual reuse.
+
+Every child that can be reached this way must be registered. Unix children lead
+their own process group (`proc::harden` for async checks and `proc::harden_std`
+for synchronous context commands); Windows check and context children belong to
+a Job Object. One owned-tree operation therefore reaches `cargo → rustc → cc`
+and `sh → pnpm → tool`, even when the wrapper exits first. Checks register through the
+`with_child_scope` task-local rather than an argument: the governor is known at
+the dispatcher, the pid at the single spawn point five frames below it behind
+`Check::run(&self, config)`, and a trait method cannot grow a parameter without
+every check and every `run_command_*` call site growing one it never reads. The
+returned guard unregisters on drop, so the success, timeout and error paths all
+leave the registry clean — a pid the governor still believes in is a pid it may
+signal, and pids are reused.
+
+On Unix, cancellation and timeout do not assume that inherited PGID membership
+is permanent. The owner first stops the hardened root group, repeatedly takes a
+bounded process-table snapshot, follows the live transitive PPID closure, and
+stops every newly discovered `setsid`/`setpgid` group until the census reaches a
+fixed point. Stability requires every visible member of every owned group to be
+stopped or zombie in two consecutive censuses, including the case where no
+detached group was found. Each detached group is paired with its native
+process-birth identity and killed leaf-first before the root PGID. An unreadable
+or unstable census is unconfirmed containment, never success. This portable
+guarantee ends when a descendant has already double-forked and been reparented
+before cleanup; unlike a Windows Job Object, Unix process groups plus a PPID
+census are not an OS-owned container for an adversarial daemon.
+
+An MCP `quick` review adds one cross-process ownership boundary around that
+in-process registry. The adapter cannot treat the review root's Unix process
+group as a recursive tree: checks intentionally lead distinct groups. It sends
+Ctrl-C first so the review governor performs its normal drain, while a private
+sidecar ledger mirrors group registration and completion to the MCP parent. A
+nonce-bound header rejects an incomplete or stale capability. The forked child
+first writes a provisional PGID in `pre_exec`, before it can run the tool;
+governor registration then upgrades that evidence with the native process-birth
+identity. The mode-0600 ledger descriptor remains CLOEXEC in the multi-threaded
+MCP parent, becomes inheritable only inside the already-forked review root, and
+is restored to CLOEXEC before repository discovery or startup helpers. It stays exclusively
+locked by the review root and any fork still in pre-exec. Hard fallback stops
+the root and accepts a finite local process-table census only when that same
+snapshot reports the root in stopped state. Only process groups led by proven
+direct children and committed native identities may be signalled; a provisional
+PID never authorizes a signal by itself. After killing and reaping the root, the
+MCP parent must acquire the lock before its final drain, so a child cannot
+disappear into the spawn-before-registration gap. The descriptor closes at
+tool exec. Ordinary descendants remain in that tool group; a live descendant
+that creates its own group is recovered by the stopped fixed-point census. The
+review root also handles the macOS gap where a very short-lived group leader is
+already waitable but no longer exposes its native birth identity: because the
+owned leader remains unreaped, registration can safely terminate that exact
+PGID and any surviving members before PID reuse becomes possible. The parent
+accepts a rejected signal only when a bounded local census proves that the PGID
+has no live members (a zombie leader alone is already closed); live members or
+an unreadable census remain fail-closed. It then settles the provisional row
+without treating it as signal authority. The
+sidecar is a control file beside the run directory, never an input to its
+immutable manifest or ZIP. If the bounded unwind stalls, the parent terminates
+every still-owned group before killing and reaping the direct review root;
+tracker Drop repeats that cleanup. Confirmed cleanup unlinks the sidecar;
+unconfirmed containment retains it and is surfaced in the MCP error contract.
+Windows keeps native recursive `taskkill /T` and needs no mirror.
+
+**`--watch` ends on the first interrupt.** One `App`, and therefore one governor,
+is shared by every iteration, and `Semaphore::close` is one-way — so a cancelled
+watcher can never grant work again. The iteration used to report any failure of
+its quick run as an ordinary error and carry on, which turned that into a silent
+degradation: every later edit produced a pack with an empty `30_context` under a
+cheerful "Regenerated artifacts", until the operator interrupted a second time
+and took the cleanup with them. A cancellation is now propagated out of the
+iteration, and both watch loops (the filesystem watcher and the polling fallback)
+carry a biased `governor.cancelled()` arm so a cancel arriving while the watcher
+is idle ends it too. Each iteration captures provenance under the same
+supervised synchronous stage, and its `rev-parse`/`status`/`diff` probes use
+owned governed subprocesses rather than raw `Command::output` waits.
+
+**Everything long the run spawns must be in a child scope.** The `uv sync`
+pre-step was not, and outside a scope `register_active_child` is a no-op, so
+`cancel()` had no pid to signal: a Ctrl-C during a cold venv build printed
+"stopping running tools" and then waited out the full timeout with `uv` still
+running. It is scoped now, takes an `Exclusive` permit, passes the run's worker
+limit to uv's download/build/install pools, and refuses to start on an
+already-cancelled run. The
+Loctree cache creation is the exception: the synchronous third-party scan runs
+in a private current-executable worker under its own child scope. Cancelling the
+review therefore kills the scan process itself; it never relies on aborting an
+already-started `spawn_blocking` closure. Snapshot interpretation remains
+in-process and cooperatively checks cancellation.
+
+`--tui` analysis is deliberately NOT wrapped by the headless signal supervisor:
+once the terminal is in raw mode, Ctrl-C
+arrives as a Control-C key event and the TUI routes it through the same
+cancel-and-join path as q/Escape before wizard or panel handling. Its dispatcher is
+nevertheless held to the same contract as the headless one — same
+`presync_python_venv`, same biased `governor.cancelled()` arm — because it was a
+copy that had drifted back into both of the bugs above while still claiming to
+mirror `run_all`. Artifact generation on the TUI path uses the same
+`blocking_stage` wrapper as headless, so a single-worker runtime can still
+poll q/Escape while the pack is being written. After that first quit stops the
+ordinary event loop, the cancel join remains a terminal-input owner: it waits
+cooperatively for the analysis task but treats a second Ctrl-C as typed forced
+cancellation. The initial repository/ref preflight is the exception: it runs
+before raw mode under a temporary Ctrl-C signal supervisor, so a slow fetch
+cannot enter a window where signals are disabled but the terminal event reader
+does not yet exist. The supervisor stays alive until raw mode is enabled, then
+completes an explicit biased handoff that consumes any already-pending signal
+before key events take ownership. Both the post-stage and post-handoff checks
+convert a late interrupt into typed cancellation.
+
+**Operator surface.** `--resource-budget safe|balanced` selects the plan; preflight
+prints requested/effective budget, parent permits, child-worker cap, current-load
+decision, expensive tools, and cheap-first schedule before checks execute.
+
 ### mcp/
 
 The MCP server (`prview mcp`) is a thin contract adapter over the prview core.
@@ -726,6 +1517,43 @@ It adds no review logic: tools spawn `prview` as a subprocess to produce a pack
 and read truth back from storage. Every tool takes an explicit `repo` path,
 every response carries `schema_version`, and every failure is fail-loud. See
 `docs/mcp.md` for the tool reference.
+
+Synchronous quick reviews retain their hardened child through the bounded wait.
+A timeout or child-wait error first requests the root's ordinary cancellation
+unwind, then uses the parent-owned child-group sidecar described above before
+hard-killing and reaping the direct root. Failed quick runs retain
+`RUNNING.json` as diagnostic `Stale` state, which lifecycle readers do not treat
+as an active run.
+
+Deep reviews are asynchronous at the RPC boundary, not unowned processes. A
+dedicated waiter thread retains each `Child` and reaps its direct root, including
+an immediate failure. The review root inherits the same parent-owned child-group
+sidecar used by synchronous quick reviews, so after root exit the waiter also
+drains separately hardened Cargo, Semgrep, and other nested groups. It removes
+`RUNNING.json` only when publication is complete and full containment has been
+confirmed; otherwise the marker remains explicit diagnostic state. Residual
+Unix root-group members are terminated as part of that proof, while Windows
+retains the complete Job Object until wait.
+The caller also captures the exact publication-index path before starting the
+waiter, so background completion never re-resolves a different storage home.
+Active-run discovery rejects markerless history and the completed-run `latest`
+alias before lifecycle probing. A run without `SANITY.json` never reads the
+global publication index; index lookup is reserved for proving that a finalized
+pack committed durable publication.
+`RUNNING.json` protocol v2 pairs the PID with the native
+process creation identity. A successfully read mismatch proves PID reuse and
+becomes stale, while a live PID whose token is absent or whose native identity
+cannot be read fails closed as running. Legacy and unknown marker versions use
+the same conservative live-PID boundary, then become stale after that PID exits.
+The server returns `status: running` for a new review only after identity
+capture, marker publication, and reaper installation all succeed.
+Failure at any setup seam terminates the child tree, reaps the direct root, and
+fails the RPC instead of publishing an untracked run.
+Linux, macOS, and Windows are the supported MCP `run_review` targets because
+they provide the native PID-reuse-safe identity required by this protocol. A
+different source-buildable target is refused before activation locking or child
+spawn; the ordinary CLI does not require a durable MCP liveness marker and
+remains the direct execution surface there.
 
 ### artifacts/mod.rs
 
@@ -737,7 +1565,44 @@ The core artifact generator. Builds the numbered directory layout
 - `10_diff/`: `full.patch`, `per-commit-diffs/` (batching + thematic labels), `per-file-diffs/` (hotspots)
 - `20_quality/`: per-check `*.result.json` + `*.log`, `full-checks.log`, `checks-errors.log`, `coverage-delta.txt`, `PUBLIC_API_DIFF.json/md`, `BREAKING_CHANGES.json/md`
 - `30_context/`: optional `INLINE_FINDINGS.sarif`, `changed-tests.txt`, profile-specific (`cargo-tree`, `tsc-trace`, `eslint`, `vitest`)
-- `latest` symlink in the parent dir
+- `latest` symlink in the parent dir (completed runs only)
+
+#### Stale-cache caveats (`MERGE_GATE.json.stale_cache_caveats`)
+
+A verdict can rest on evidence the run never produced. In the Vista dogfood run
+(`PRV-CACHE-STALENESS`) a `Cargo audit` result replayed from a cache written
+before a reboot co-authored a `BLOCK`, and the pack said only `cached: true` —
+nothing named the age of the evidence.
+
+`generate_merge_gate` therefore reads the run's ledger (the only place that
+carries `cache_age_secs`, see [ledger/mod.rs](#ledgermodrs)) and emits one entry
+for every gate row whose replay is older than
+`STALE_CACHE_CAVEAT_MAX_AGE_SECS` (7 days, a constant in
+`src/artifacts/merge_gate.rs`; a CLI knob is a follow-up). This includes stale
+passes: unchanged source keys do not bind the compiler or every tool version,
+so an old positive result can support a clean verdict the current toolchain
+would reject:
+
+```json
+"stale_cache_caveats": [
+  { "check_id": "cargo_audit", "check_name": "Cargo audit",
+    "cache_age_secs": 806400, "age_status": "stale",
+    "threshold_secs": 604800 }
+]
+```
+
+If the ledger cannot establish an age — for example after clock rollback gives
+the cache file a future mtime — the entry remains in this list with
+`"cache_age_secs": null` and `"age_status": "unknown"`. Unknown age is
+unverifiable evidence, not a fabricated fresh replay. Known old entries use
+`"age_status": "stale"`.
+
+The field is **WARN-ONLY and additive**. It sits at the top level, deliberately
+outside `decision`: that object is closed by contract and every field in it ranks
+the verdict, so a report ABOUT the pack must not live there. A stale replay
+changes no verdict, no exit code, and no other field — pinned by
+`the_stale_cache_caveat_moves_no_other_field`, which diffs the whole `decision`,
+`checks`, and `inline_findings` of a stale run against a fresh one.
 
 ### artifacts/signal/ (module directory)
 
@@ -771,17 +1636,87 @@ revision bytes like other live entries; there is no checkout or HEAD fallback.
 Evidence paths, source states, private origins, and provenance remain traceable
 but are separate from external semantic identity.
 
-Library discovery matches the exact `Cargo.toml` basename. It validates every
-consumed Cargo field (`package.name`, `[lib]`, `lib.name`, `lib.path`,
-`lib.proc-macro`, and `package.autolib`) instead of inventing defaults for an
-invalid schema. Package and explicit library names must also be non-empty valid
-Cargo/crate identifiers; a TOML string alone is not semantic validation. A
-valid virtual workspace is non-crate; an implicit library is
-admitted only when `autolib != false` and its live default `src/lib.rs` can be
-read and parsed. Repository-relative paths are normalized fallibly: absolute,
-prefixed, non-UTF-8, and escaping paths become manifest/source unknowns rather
-than being remapped. Missing, renamed-away, deleted, non-regular, non-UTF-8,
-unreadable, or parse-failed manifests and roots remain typed unknowns.
+Cargo target discovery matches the exact `Cargo.toml` basename. Library
+discovery validates every consumed field (`package.name`, `[lib]`, `lib.name`,
+`lib.path`, `lib.proc-macro`, `lib.crate-type`, `package.autolib`, and effective
+edition) instead of inventing defaults for an invalid schema. Edition is
+resolved from a library-target override, direct package value, exact
+workspace-package inheritance, or Cargo's 2015 default. The crate contract
+includes the normalized `crate-type` set (default `["lib"]`, or
+`["proc-macro"]` for a proc-macro target) and `proc-macro`; the library root path
+and edition stay in evidence/provenance rather than globally changing every
+crate fact. Optional normal/build/target
+dependencies without an explicit `[features]` entry become implicit Cargo
+features unless suppressed through `dep:` references. Package and explicit
+library names must also be non-empty Cargo-valid identities. Keywords addressable
+as raw identifiers and Cargo-valid special values `crate`, `self`, `Self`, and
+`super` remain string identities in the census; prview does not synthesize an
+invalid Rust path from them. A TOML string alone is not semantic validation. A
+valid virtual workspace is non-crate; an implicit library exists whenever its
+live default `src/lib.rs` exists unless `package.autolib = false`, independently
+of edition and unrelated explicit targets. Its absence is not a missing-root
+error, while an explicit `[lib]` whose effective root is unavailable remains
+typed `MissingLibRoot`. A tracked symlink at an implicit library root is not
+followed: its compiler-visible source and module base are revision-ambiguous,
+so each compared side retains non-neutralizable `MissingLibRoot` uncertainty.
+Repository-relative
+paths are normalized fallibly: absolute, prefixed, non-UTF-8, and escaping
+paths become manifest/source unknowns rather than being remapped. Missing,
+renamed-away, deleted, non-regular, non-UTF-8, unreadable, or parse-failed
+manifests and roots remain typed unknowns.
+
+Real binary-target discovery is separate from the library early-exit. It
+recognizes Cargo's implicit `src/main.rs`, `src/bin/*.rs`, and
+`src/bin/*/main.rs` roots plus explicit `[[bin]]` entries; applies the edition
+2015 auto-discovery default per binary target category (only explicit `[[bin]]`
+metadata disables implicit bins by default) and `package.autobins`; and validates
+target name, explicit or inferred path, target edition, and `required-features`. Explicit
+targets claim their roots so the same source is not also invented as an
+auto-discovered target. Malformed, unavailable, duplicate, or ambiguous target
+metadata remains typed manifest uncertainty. An exact binary root that is
+itself a tracked symlink is retained as non-neutralizable typed uncertainty.
+Discovery does not separately model a symlinked parent directory such as
+`src/` or `src/bin/`; that bounded filesystem-shape residual remains outside
+this contract. A binary target name is validated as Cargo target metadata, not
+as a Rust dependency-crate identifier: a leading digit is valid, while Cargo's
+reserved build-directory names remain invalid. Each binary
+uses a stable target-scoped analysis identity (`<package>#bin:<target>`) that
+preserves the exact manifest target name, so `foo-bar` and `foo_bar` remain
+distinct while preventing
+the common same-named library and default binary from sharing projection,
+edition, cfg-authority, module-cache, or native-evidence state. These synthetic
+identities are evidence keys, not Rust dependency crates and not additions to
+the public crate census.
+
+Target projection follows Cargo/Rust linkage semantics. `lib`, `rlib`, and
+`dylib` outputs expose the ordinary downstream Rust item graph; proc-macro
+targets expose only supported procedural macro entry points. A target whose
+effective types are only `cdylib`, `staticlib`, or `bin` is not projected as a
+Rust dependency surface. Its public and private native exports are still
+scanned, including exported associated functions in inherent and trait impls.
+Direct and associated native function evidence contains the normalized
+signature and export attributes but not the implementation block; static
+initializers remain observable because they can determine exported data.
+For ordinary Cargo binaries this scan starts from every discovered binary root;
+internal `pub` items remain absent from the dependency API surface, while native
+export signatures retain typed uncertainty bound to their local type semantics.
+In a native-producing target, including `dylib` and mixed `rlib + cdylib`, an
+associated binary export carrying a transforming attribute binds the full
+macro-visible member input, a separate normalized owner/ABI contract, and the
+revision-backed transformer implementation. A custom associated attribute may
+synthesize the `no_mangle`/`export_name` attribute during expansion; for
+`dylib`, `cdylib`, `staticlib`, or `bin` output that possibility remains typed
+macro-generated native-export evidence even when no export marker exists in the
+pre-expansion AST.
+Item-position invocations backed by `macro_rules!`, plus `include!`,
+`global_asm!`, and other opaque macro invocations, are native-export boundaries
+when the crate produces one of those native artifacts, even when the target is
+not Rust-linkable; their invocation, included source, or implementation proof
+therefore cannot neutralize after the generated native surface changes. The
+fallback is not applied to private owners in `rlib`-only crates, whose associated
+transform evidence still materializes only after external Rust reachability is
+proven. The native target remains typed uncertainty, so a transition to or from
+a Rust-linkable target cannot be reported as falsely clean.
 
 Reachability starts at each library root. Ordinary inline modules and
 `mod foo;` files (`foo.rs` or `foo/mod.rs`) are walked as whole syntax trees.
@@ -860,40 +1795,241 @@ unsupported cfg syntax inherits all already-proved outer guards, emits
 and lint-only `cfg_attr` branches are semantic no-ops; conditional cfg, shape,
 ABI, path, and transforming branches retain their distinct meaning. Globs, true
 cycles, external/prelude paths, `include!`, and unexpanded macro-generated items
-remain typed unknowns. A reachable `pub extern crate` is likewise retained as
-guarded `UnsupportedExternResolution` until external/prelude resolution exists;
-private or unreachable declarations do not create external semantic surface.
+remain typed unknowns. An `include!` / `include_str!` / `include_bytes!` unknown
+carries a digest of the included file when that path is readable. Its proof
+walks the caller-observable contract — signatures, generics, field and alias
+types, enum discriminants, trait members, public constants and inherent
+associated items, plus observable trait-impl associated types/constants — but
+not ordinary function bodies. It materializes only when
+the owning declaration is externally reachable, directly or through a public
+reexport. An unresolved or changed included source keeps the unknown active
+instead of treating an identical invocation as unchanged. Unchanged terminal
+`include_str!` and `include_bytes!` proofs may neutralize because the digest
+binds their complete output. Plain `include!` remains review-required even when
+its direct file is unchanged: that file may contain path-sensitive `file!()` or
+nested relative includes whose transitive sources are not yet Merkle-proven.
+A reachable
+`pub extern crate` is likewise
+retained as guarded `UnsupportedExternResolution` until external/prelude
+resolution exists; private or unreachable declarations do not create external
+semantic surface. A private `extern crate self as alias` is nevertheless a
+same-crate module binding for dependency resolution: `alias::Hidden` is followed
+back to the root `Hidden` declaration so its layout/auto-trait uncertainty stays
+attached to the public owner that exposes it.
+
+Custom cfg leaves are not assumed to be Cargo's built-in feature/target/runtime
+predicates. An externally relevant custom predicate on an item, field, variant,
+trait or impl member, or foreign item emits `CfgPredicate` evidence bound to a
+revision-backed authority digest whenever an active build script or repository
+Cargo config can supply `--cfg`. A declared build script must resolve to a live
+regular revision entry; Cargo's `build = true` explicitly selects the default
+`build.rs`, while `build = false` disables it. For each package, the effective
+repository-backed Cargo config is merged from the repository root through the
+manifest directory, modeling a direct invocation from that package rather than
+assuming every consumer launches Cargo only at the workspace root. Deeper
+values follow Cargo precedence; when both names exist in one directory Cargo's
+legacy `.cargo/config` precedence over `.cargo/config.toml` is preserved.
+Authority is
+recognized only at legal schema paths (`build.rustflags`, target-specific
+`rustflags`, or a concrete-target link override's `rustc-cfg` when its key
+matches the package's `links`). Declaring `package.links` without a live build
+script is an invalid manifest, not a way to acquire config authority. Configs
+outside the package's ancestor chain and lookalike keys in unrelated sections
+such as `[net]` do not upgrade a proof. Config includes remain unresolved until
+their authority graph is source-backed. The current conservative digest covers the complete live
+revision inventory, so it may over-report after an unrelated tracked edit; it
+never executes `build.rs`. With no complete revision-backed authority, the proof
+is explicitly unresolved and cannot neutralize against the same text on the
+other side. A definitely private untransformed free helper does not create a
+standalone cfg unknown; any effect on an exposed opaque return remains covered
+by that public proof's implementation digest.
+Private non-function declarations with custom cfg currently remain
+conservative `CfgPredicate` uncertainty before a complete reachability proof.
+That is a known precision residual: it can add review noise, but it cannot
+certify a conditionally exposed contract as clean.
 Semantic proof comparison includes the public unknown's kind, crate/module
-location, exact evidence, and guards, while continuing to exclude source paths,
-provenance, and private reexport target/origin spelling.
+location, exact evidence, and guards, while continuing to exclude private
+reexport target/origin spelling. Terminal `include_str!` / `include_bytes!`
+proof matching also excludes the private donor source path because its public
+path, normalized contract, invocation, and digest already bind the complete
+caller-visible output. Plain `include!` remains source-path-sensitive.
+A public reexport's
+resolved origin is part of the compared contract, so retargeting
+`pub use a::A as Public` to `pub use b::B as Public` when both donors remain
+public is a `Changed` fact.
 
 Item identity is `crate + external module path + Rust namespace + NFC external
-name`. Value, type, and macro namespaces are separate. Tuple and unit struct
-constructors also occupy Value; named-field structs remain Type-only.
+name`. Value, type, and macro namespaces are separate. The snapshot also emits
+explicit Module, Crate, and CargoFeature identities: public empty modules,
+library-crate declaration changes, and removed or redefined Cargo features
+therefore cannot disappear merely because no ordinary item changed. These
+container namespaces do not participate in Rust `use`-leaf resolution. Tuple
+and unit struct constructors occupy Value; named-field structs remain Type-only.
 `macro_export` is projected to the crate-root Macro namespace, with docs,
-rustfmt, and lint attributes normalized away. Proc-macro crate exports use their
+rustfmt, and lint attributes normalized away. Its item-local contract includes
+the effective edition of the defining library target because macro fragment
+semantics are edition-dependent; editions do not otherwise manufacture a
+crate-wide API change. Proc-macro crate exports use their
 external macro/derive names only for public functions declared at crate root;
 private or nested declarations become precise unknowns. Unresolved transforming
-attributes are checked on modules, impls and associated items, foreign
-blocks/items, macro declarations, and ordinary public projections. They
-suppress every dependent positive claim and emit exact `MacroGeneratedItems`
-evidence. Foreign functions/statics inherit the parent ABI, safety, and relevant
-attributes.
+attributes, including recursively nested `cfg_attr`, are checked on modules,
+impls and associated items, foreign blocks/items, macro declarations, and
+ordinary items before visibility filtering. A private annotated input can expand
+into public output, so it is not
+discarded merely because the source item is private. Replacement-style
+attribute boundaries suppress only claims for their annotated owner; an
+unrelated confirmed change in the same module remains visible. Derives are
+additive: the annotated input item remains a confirmed contract while custom generated
+output emits `MacroGeneratedItems` evidence bound to the complete input and to
+revision-backed transformer provenance. Custom derive/helper attributes are
+excluded from the confirmed input contract, and an unqualified builtin-looking
+derive is treated as custom whenever an import, glob, or `macro_use` can shadow
+that name. Builtin `Default` variant markers are retained only when the enum has
+a proven builtin derive, including matching nested conditional predicate
+lineage. Singleton `all`/`any` wrappers are normalized; any remaining
+unprovable helper/derive relationship emits typed `CfgPredicate` uncertainty
+instead of disappearing. Custom helper attributes stay outside the confirmed
+contract. Associated-item
+transform evidence is materialized only after its inherent or trait owner
+reaches the external API, directly or by reexport. Public type-alias chains are
+resolved transitively and conservatively emit owner uncertainty because source
+analysis does not prove generic specialization. Function-like associated macros
+on externally reachable Rust owners, native-artifact item-position boundaries
+(including private owners), top-level macro invocations, and nested
+trait/trait-impl attributes bind both their invocation/input and the appropriate
+revision-backed implementation substrate.
+Conditional and nested `cfg_attr(..., macro_export)` declarations remain
+crate-root macro API only for Rust-linkable targets. A lock-backed external
+candidate binds all reachable product/path manifests, effective Cargo config
+bytes, and lockfiles.
+When a reachable local proc-macro exists, the current safety floor additionally hashes
+the complete live tracked-entry inventory by Git object identity (excluding
+redundant directory-tree objects), including nonstandard `lib.path`, `#[path]`,
+gitlinks, and build assets outside a package directory. A lock-backed external
+candidate must also appear by actual package name, external registry/git source,
+and a version satisfying the declared requirement in the effective lock.
+Registry entries additionally require a valid checksum and Git entries a
+precise commit; a present but stale/empty lock or a same-name local workspace package does not
+qualify. Cargo config discovery covers each reachable manifest directory and
+its ancestors as well as the lock authority; running Cargo from a workspace
+member therefore cannot hide a member-local source replacement. Tracked
+symlinks, including working-tree regular-to-symlink type changes, remain
+`unresolved` because their Git blob pins only the target path, not the bytes of
+an outside-repository target. Exact attribute-to-crate resolution remains a
+future precision improvement; the local
+aggregate can therefore over-report after any tracked-file change. Missing
+effective product/workspace lock data, no transformer dependency candidate, or
+unresolved Cargo manifest/config source replacement (`patch`, `replace`,
+`source`, or `paths`) produces an explicit unresolved digest that never
+neutralizes. A lockfile owned only by an unrelated fixture cannot qualify the
+proof. An unchanged transformer therefore cannot neutralize a changed item or
+changed implementation substrate. Foreign functions/statics inherit the parent
+ABI, safety, and relevant attributes.
 
-Contracts are emitted from normalized `syn` ASTs. Function/default bodies and
-private member types are excluded, while ABI, qualifiers,
+Contracts are emitted from normalized `syn` ASTs. Ordinary function bodies are
+excluded from confirmed item contracts, although private implementation inputs
+can contribute to the conservative opaque-return digest described below.
+Public trait method and associated-const defaults remain directional structural
+contract facts. Adding a default is compatible; removing one can make
+downstream impls incomplete, while changing a const default value/type/cfg
+remains a confirmed contract change. Member slots retain order, attributes, and
+canonical cfg identity, so a default cannot move between same-named disjoint
+cfg branches. Trait-default opaque proofs carry the same member cfg key and do
+not cross-cancel.
+Bodies of caller-observable `async fn` and return-position `impl Trait` items
+also carry item-local `OpaqueReturnAutoTraits` evidence because their hidden
+types can change `Send`, `Sync`, and other auto traits without a signature edit.
+The proof binds a canonical body/signature to the effective product/workspace
+lock, canonicalized repo-backed Rust files, and cheap Git object identities for
+every other live tracked input. This covers nonstandard `include!`/`#[path]`
+files and build-script assets without rereading every blob; redundant directory
+tree objects are excluded so they do not defeat Rust canonicalization. Tracked
+symlinks keep the proof unresolved until their target provenance can be proven;
+pinned gitlinks remain object-bound. Free identifiers from the whole body are
+reserved before synthetic binders are allocated, and macro namespaces are not
+rewritten as type-generic uses. Public opaque bodies are alpha-normalized inside
+that substrate so generic binder
+spelling plus parameter/local irrefutable-destructuring/closure/loop/shadow
+binding names remain neutral; refutable match/`if let`/`while let` pattern names
+stay spelling-sensitive unless name resolution can prove they are bindings.
+Private helper changes remain observable. This conservative implementation
+closure can over-report after an unrelated tracked
+input changes. Missing lock-backed provenance or unresolved Cargo source
+replacement never neutralizes.
+Changed digests stay typed uncertainty rather than becoming a confirmed API
+change, and follow public reexports/inherent origins without suppressing an
+independent signature change. One-sided proofs for a wholly new or removed item
+are suppressed because the Added/Removed fact already carries the compatibility
+decision. Adding a trait-method default is compatible; removing one remains a
+confirmed contract change. Ordinary named private member names/order are
+excluded. Inherited and restricted field visibility are normalized to the same
+external-private form. Their anonymized type multiset remains observable because
+a private type can change public auto traits such as `Send`/`Sync`. Only
+`repr(C)` fixes named struct-field declaration order. `repr(transparent)` and
+standalone `repr(packed)`/`repr(align)` retain their semantic attributes and
+private field types but canonicalize named private-field order. `repr(Rust)`
+follows the same order-insensitive contract. Tuple-field position and privacy
+remain structural because any private tuple element changes constructor
+callability and arity. ABI, qualifiers,
 generics/bounds/where clauses, return types, public fields with structural tuple
 indices, enum variants/discriminants, trait headers and associated items, type
-aliases, public constants/statics, and relevant attributes remain. Inherent
-impls are collected independently of module reachability, resolve owners through
+aliases, public constants/statics, and relevant attributes remain. Rust 2024
+unsafe attribute wrappers are parsed structurally. Private functions or statics
+exported through direct or conditional `no_mangle`/`export_name` remain typed,
+guard-aware binary-symbol uncertainty rather than being omitted. Inherent impls
+are collected independently of module reachability, resolve owners through
 same-crate `self`/`super`/`crate` paths, and retain self type, specialization,
 impl generics/bounds/where clauses, and impl/item attributes before projection
 through every reachable type alias. Unprovable owners are typed unknowns.
+Private trait-impl dependency evidence is keyed by the joint effective cfg of
+each resolved trait/owner pair. Alternative trait targets are never flattened
+into one owner-independent set, so exchanging cfg-selected traits changes the
+public dependency proof even when the owner aliases stay fixed.
 Documentation, rustfmt, and lint-control attributes are recursively discarded;
 shape/ABI attributes remain. Raw identifiers and NFC-equivalent identifiers
 share semantic names. Nested `cfg`/`cfg_attr` use the same recursive sorted and
 deduplicated `all(...)`/`any(...)` canonicalization as top-level guards, without
 evaluating host configuration.
+
+Union members are canonicalized as an order-independent set even under
+`repr(C)`: every member starts at offset zero, while names and types still
+determine source compatibility, size, alignment, and auto traits. Named
+enum-variant fields are order-sensitive for `repr(C)` and primitive integer
+representations. They are order-neutral under `repr(Rust)`, `repr(transparent)`,
+and standalone `repr(align)`; tuple-variant order is always
+preserved.
+
+Confirmed function contracts canonicalize parameter patterns to `_`. Generic,
+const, and lifetime binders are alpha-normalized by declaration order across
+free, trait,
+inherent, foreign, and higher-ranked function signatures as well as public
+structs, unions, enums, type aliases, and associated trait const/type members.
+The mapping is reused at every bound, type, and default occurrence, so renaming
+a binder is neutral while generic order, types, ABI, and lifetime relationships
+remain part of the contract. Opaque macro invocation token bodies are not Rust
+AST to `syn`; binder references that exist only inside those tokens remain a
+source-parser limitation and are not presented as compiler-backed truth.
+Source-only analysis does not pretend to resolve trait selection or coherence:
+an impl whose trait and
+owner are both externally reachable is retained as `TraitImplResolution`
+uncertainty with its normalized source contract until compiler-backed resolution
+exists, including impls written in a private helper module. Private/private
+impls do not degrade the public surface. Declaring-module reachability does not
+gate collection: Rust makes a public-trait-on-public-type impl globally usable
+regardless of the helper module's visibility. An unqualified unresolved trait
+path is retained conservatively because it may have entered scope through an
+external `use`; the backend does not guess externality from a trait-name
+allowlist.
+Trait and owner aliases are reduced to canonical guarded nominal pairs before
+evidence is compared. Top-level alias spelling and reference/pointer/slice/
+array owner wrappers are canonicalized, and ordinary fn/const/type impl members
+form an order-independent set. The declaring module and source remain part of
+the proof because relative associated types and generic arguments resolve in
+that scope. Moving an otherwise identical impl can therefore remain a
+conservative unknown, and aliases nested only inside generic arguments are not
+claimed equivalent until compiler-backed resolution exists. Finite alias
+resolution exhaustion is a structural non-neutralizable proof state rather
+than a diagnostic-text heuristic.
 
 #### signal/api_delta.rs — revision-backed Rust API production truth (0.8)
 
@@ -908,28 +2044,109 @@ addition/removal. Parsed ordinary declarations include private counterparts
 only as evidence for a proven public/non-public transition; externally
 reachable `items` remain the API surface.
 
+Named-struct field projection is policy-aware. A public field added to an
+existing exhaustive struct is a `Changed` parent contract because downstream
+struct literals and exhaustive patterns stop compiling. It remains a parent
+`Changed` on an existing `#[non_exhaustive]` struct: callers cannot construct
+or exhaustively match that type, but the field type can still remove
+compiler-derived auto traits from the parent. A wholly new public struct remains
+an added item. Public fields are selected by external visibility, not by the
+legal identifier prefix used in the internal private-field projection, so a
+user field named `__prview_private_field_*` cannot disappear from the field map.
+
+Enum projection applies the corresponding exhaustiveness policy independently:
+adding variants to an exhaustive public enum changes the parent contract, while
+an otherwise unchanged public `#[non_exhaustive]` enum exposes an appended
+fieldless variant as informational `Added`. A fieldless variant inserted before
+an existing variant stays `Changed` because it shifts implicit numeric
+discriminants; payload-bearing variants stay `Changed` because their field types
+can change auto traits. ABI-sensitive
+`#[repr(...)]` enums, including primitive integer reprs from `u8` through
+`isize`, remain on the parent `Changed` path even when they are non-exhaustive,
+because payload growth can change size or alignment. Adding a field to an
+existing variant-level `#[non_exhaustive]` variant also stays on the parent
+`Changed` path: `..` protects matching syntax, not auto-trait compatibility.
+Exhaustive variants, field removals/type changes, and enum header/policy changes
+remain conservative as well.
+
 Exact identity is grouped on both sides before any fact is consumed: only a
 `1 ↔ 1` component may become a confirmed change, while wider components are
 consumed as deterministic typed ambiguity, including one-sided duplicate
 components before the final add/remove pass. Cfg-region changes are paired only
 when the guards may overlap. The comparison reuses the snapshot resolver's
-single conservative disjointness proof (currently Unix versus Windows), so
-different feature guards remain potentially co-active. One shared pair-certainty
+conservative disjointness proofs for Unix versus Windows and for a direct cfg
+atom versus its direct `not(atom)` negation. Other different feature guards
+remain potentially co-active. One shared pair-certainty
 check tests both identities and both source paths against the unknown regions
 from both revisions before any exact, cfg, relocation, or visibility fact can
 be confirmed. A glob, include, source-parse, or other relevant unknown therefore
 blocks a contradictory confirmed fact at either the source or destination.
 Standalone unknown findings retain their source side, source path, and revision
-provenance. Finding IDs preserve Rust identifier case and serialize the complete
-semantic identity, including both sides' cfg regions, contracts, and typed
-unknown provenance; legal ambiguous input is data, never an assertion failure.
+provenance. Before those findings are emitted, identical one-to-one unknown
+proofs on base and target cancel out: kind, crate/module, cfg guard, evidence,
+and provenance class must match, and each proof must belong to its own snapshot.
+An unresolved custom-cfg authority proof is structurally non-neutralizable even
+when its diagnostic text matches on both sides. A complete unchanged authority
+digest may neutralize; a changed digest remains review-required uncertainty.
+Source path must also match for every unknown kind except terminal
+`include_str!` / `include_bytes!`, whose private donor file may move without
+changing the bound public proof. Changed,
+one-sided, duplicate, detached, or Git-tree-versus-overlay proofs remain typed
+unknowns. Finding IDs preserve Rust identifier case and
+serialize the complete semantic identity, including both sides' cfg regions,
+contracts, and typed unknown provenance; legal ambiguous input is data, never
+an assertion failure.
+
+A legal non-UTF-8 Git tree component is represented by a deterministic internal
+identity whose surrogate component starts with a NUL sentinel — a byte Git
+forbids anywhere in real pathnames. At the artifact boundary every internal
+sentinel is removed, including for a nested path, producing a printable
+`dir/<git-path-bytes:...>` surrogate without embedding NUL in JSON or rendered
+output. A legal UTF-8 file literally named like that surrogate therefore remains
+a separate readable entry. The raw path emits a side-specific `PathNonUtf8`
+unknown. The tree walk skips only descendants whose prefix cannot be represented
+and continues through valid siblings. Unlike an unchanged parser/resolver
+unknown, path uncertainty is deliberately not neutralized across revisions and
+does not contaminate confirmed facts from independently parsed valid paths.
 
 `compare_rust_api_revisions` constructs snapshots only from the exact
 `Diff.base_commit_id` and `Diff.target_commit_id` Git trees. It never reads a
-checkout, working-tree overlay, or patch fallback. Duplicate exact base/target
+checkout, working-tree overlay, or patch fallback. Crate discovery follows
+Cargo workspace `members`/`exclude` when a workspace exists, and otherwise only
+the repository-root package — nested fixture and tool manifests are not product
+API. A revision source intentionally rooted below the repository may expose one
+package or one workspace authority. Multiple rootless packages/workspaces are
+not silently unioned, and an unreadable, malformed, or non-UTF-8 rootless
+manifest is itself an unresolved authority. A parseable manifest with neither a
+top-level `[package]` nor `[workspace]` is invalid in the same way, rather than
+being discarded as though it did not exist; a manifest that combines
+`[workspace]` with `package.workspace` is also rejected. These cases emit
+side-specific `WorkspaceDiscovery` and/or `ManifestParse` uncertainty and no
+false confirmed product authority.
+Private-field types stay in the parent contract (auto-trait effects such as
+replacing `u8` with `Rc<()>`), and implementations of external/prelude traits on
+a public type are typed `TraitImplResolution` unknowns. A transitive non-public
+local type, private import/module alias, or local impl reached from public API
+emits guard-aware `PrivateTypeDependency` uncertainty because its auto-trait,
+layout, or inference consequence requires compiler resolution. A root package
+that declares `package.workspace` is enumerated through that workspace's full
+member authority; missing, invalid, incomplete, or non-reciprocal membership
+emits `WorkspaceDiscovery` rather than certifying an isolated root package.
+Duplicate exact base/target
 OID pairs are coalesced in stable first-seen order before either snapshot is
 built; distinct multi-base comparisons each retain their own revision evidence
 and comparison-qualified finding ID.
+
+Private dependency analysis remains part of the exact-tree snapshot engine, but
+production artifact generation never enters that engine in the parent process.
+The fast remote-only standard preset emits a typed, exact-revision unknown and
+does not launch the engine. Local standard, deep, and CI runs launch one private
+same-binary worker for all unique base/target pairs under one 30-second total
+deadline. The governed process group inherits Ctrl-C and cleanup semantics.
+Timeout, nonzero exit, or malformed JSON yields one typed unknown per exact
+comparison instead of an empty scan. Artifact generation records the honest
+`rust-api.fast-preset-unknown` or `rust-api.isolated-worker` stage in
+`RUN.json.timings`.
 `breaking_changes_view` and `public_api_diff_view` are pure deterministic
 projections over the same delta. Their shared counts, IDs, confidence, evidence,
 unknown reasons, and provenance therefore cannot drift through independent
@@ -1610,7 +2827,10 @@ cleanup (file/storage/S3 artifact deletion).
 #### signal/tauri_commands.rs — Tauri command surface
 
 `generate_tauri_commands(...)` analyzes the Tauri command surface exposed by the
-changed files, for Tauri (mixed JS + Rust) projects.
+changed files, for Tauri (mixed JS + Rust) projects. Its head-side directory,
+filesystem walk, and changed-file mapping come from the run-wide reviewed tree;
+the base side is read from the exact Git objects. An off-HEAD review therefore
+cannot leak commands or layout from the operator's current checkout.
 
 #### signal/test_helpers.rs — shared test fixtures (`#[cfg(test)]`)
 
@@ -1677,6 +2897,17 @@ pub fn rust_hash(root: &Path) -> String {
     // Cargo.toml/Cargo.lock hash + Rust source hash, 16-byte digest segments
 }
 ```
+
+A hit also reports `age_secs`: how long ago the entry was published, read from
+the entry file's mtime — an entry is published by a single `rename`, so its mtime
+IS the moment the result became readable. Nothing changed on disk to carry it, so
+a cache warmed by an older prview reports its age too (the legacy layout keeps
+its status file as the entry, and the same mtime answers). `None` when the age is
+unknowable — no metadata, or a timestamp in the future after a clock moved
+backwards — never a fabricated zero. The age travels with the replay into the
+ledger's `Cached` state and out through `RUN.json`'s `ledger` view as
+`cache_age_secs`; it deliberately does NOT enter `CheckResult`, since it is a
+property of the entry, not of the check's verdict.
 
 ## Dependencies
 

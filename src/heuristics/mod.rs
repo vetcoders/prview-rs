@@ -6,7 +6,10 @@
 
 mod loctree;
 
-pub use loctree::{CycleInfo, DeadExport, DeadParrot, LoctreeAnalysis, TwinsAnalysis, run_loctree};
+pub use loctree::{
+    CycleInfo, DeadExport, DeadParrot, LOCTREE_WORKER_ROOT_ENV, LoctreeAnalysis, TwinsAnalysis,
+    run_loctree, run_loctree_worker,
+};
 
 use crate::Config;
 use anyhow::Result;
@@ -143,6 +146,7 @@ pub async fn run_all(config: &Config, analysis_root: Option<&Path>) -> Result<He
 
             result.loctree = Some(analysis);
         }
+        Err(e) if crate::governor::is_cancellation(&e) => return Err(e),
         Err(e) => {
             // Honest degraded status: loctree produced no signal this run, so
             // say so instead of leaving `result.loctree = None` behind a green

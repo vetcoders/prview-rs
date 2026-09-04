@@ -4,12 +4,16 @@
 
 use crate::cache::Cache;
 use crate::config::{Config, ProfileKind};
-use anyhow::Result;
+use crate::governor::{Cancelled, ResourceGovernor, Weight};
+use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -25,6 +29,7 @@ mod python;
 mod semgrep;
 mod typescript;
 
+pub(crate) use cargo::planned_cargo_cwd;
 pub(crate) use cargo::validated_cargo_audit_vulnerability_list;
 pub use cargo::{
     CargoAuditCheck, CargoCheck, CargoGeigerCheck, CargoTestCheck, ClippyCheck, RustfmtCheck,
@@ -40,7 +45,9 @@ pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 /// Provenance without this is not auditable: `cwd` alone cannot tell a reviewer
 /// whether the bytes a gate scanned were the reviewed commit or whatever the
 /// operator happened to have uncommitted on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `Hash` is derived so `TreeState` can be half of a task-ledger substrate key
+// (`crate::ledger::SubstrateKey`) — one enum for "which tree", not two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TreeState {
     /// A tree materialised from THIS repository's objects at the reviewed
@@ -196,9 +203,24 @@ const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
 /// reviewed dependency set, never the link. Without uv the commands come off
 /// `PATH` and use the ambient interpreter, which is not the link either. Should
 /// that redirect ever be removed, `.venv` belongs back in this list.
-fn consumable_scaffolding(check: &str) -> &'static [&'static str] {
-    match check {
-        "TypeScript" | "ESLint" | "Vitest" | "Stylelint" => &["node_modules"],
+///
+/// The context stage resolves its own substrate through this same table, so a
+/// `tsc` trace and the TypeScript gate describe one tree identically instead of
+/// differing on `tree_state` alone — a difference that would silently partition
+/// the two into separate ledger tasks and defeat the dedup.
+///
+/// The lookup goes through [`crate::check_id::check_id_from_name`], so a display
+/// name (`"TypeScript"`) and the id a ledger entry carries (`"tsc"`) get the same
+/// answer. That is a requirement, not a convenience: the ledger keys tasks by id,
+/// so re-keying an entry has nothing but the id to ask with, and a table that
+/// only knew display names would answer "consumes nothing" for every one of them.
+pub(crate) fn consumable_scaffolding(check: &str) -> &'static [&'static str] {
+    match crate::check_id::check_id_from_name(check).as_str() {
+        // JS checks and context generators — as their canonical ids. The
+        // latter prefer local binaries or traverse the dependency tree too.
+        "tsc" | "eslint" | "tests" | "stylelint" | "tauri_info" | "esbuild_meta" | "npm_sbom" => {
+            &["node_modules"]
+        }
         _ => &[],
     }
 }
@@ -385,17 +407,252 @@ pub trait Check: Send + Sync {
     fn cache_key(&self, _config: &Config) -> Option<String> {
         None
     }
+
+    /// How much of the machine this check wants, for the run's resource
+    /// governor (`crate::governor`).
+    ///
+    /// `Exclusive` is the safe default: a tool is allowed to overlap only after
+    /// its descendant pool has a supported, tested cap. Known cheap checks opt
+    /// into `Light`; capped whole-project tools opt into `Heavy`.
+    ///
+    /// - Rust: `CargoCheck`, `ClippyCheck`, `CargoTestCheck`, `CargoAuditCheck`,
+    ///   `CargoGeigerCheck` (the last two compile the crate graph to reach it).
+    /// - JS/TS: `TypeScriptCheck`, `VitestCheck`, `ESLintCheck`.
+    /// - Security: `SemgrepCheck`, which parses every file in the tree.
+    ///
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Exclusive
+    }
+}
+
+/// Cheap orientation precedes bounded whole-workspace work. Stable sorting
+/// preserves profile order inside each cost class.
+fn schedule_rank(check: &dyn Check) -> u8 {
+    match check.resource_weight() {
+        crate::governor::Weight::Light => 0,
+        crate::governor::Weight::Heavy => 1,
+        crate::governor::Weight::Exclusive => 2,
+    }
+}
+
+/// The substrate a ledger entry is keyed on.
+///
+/// A check that ran resolved its own substrate and reported it in its
+/// provenance — that is the tree it actually read, and no second resolution can
+/// be more authoritative. A check with no provenance (an eligibility skip; a
+/// cache entry written before provenance was stored) falls back to the
+/// substrate the run resolved, and to "unknown" when even that is unset.
+fn ledger_substrate(provenance: Option<&CheckProvenance>, ledger: &TaskLedger) -> SubstrateKey {
+    match provenance {
+        Some(prov) => provenance_substrate(prov),
+        None => ledger.resolved_substrate().unwrap_or_default(),
+    }
+}
+
+/// The tree a stored provenance says was read.
+fn provenance_substrate(provenance: &CheckProvenance) -> SubstrateKey {
+    SubstrateKey {
+        target_sha: provenance.target_sha.clone(),
+        tree_state: provenance.tree_state,
+    }
+}
+
+/// The substrate a cache replay is keyed on, and the one it reports as `origin`.
+///
+/// These are deliberately two different trees. The KEY is this run's substrate:
+/// the cache key is content-derived, so a hit is an answer about the tree THIS
+/// run is reviewing, and that is what a later stage asks the ledger about. The
+/// `origin` is the substrate the ORIGINAL execution recorded in the provenance
+/// stored beside the entry — the audit half, which no re-resolution can supply
+/// and which the current run's substrate must never overwrite.
+fn replay_substrates(
+    provenance: Option<&CheckProvenance>,
+    ledger: &TaskLedger,
+) -> (SubstrateKey, SubstrateKey) {
+    (
+        ledger.resolved_substrate().unwrap_or_default(),
+        provenance.map(provenance_substrate).unwrap_or_default(),
+    )
+}
+
+/// Which runnable checks are holding budget and which are still waiting for it.
+///
+/// Before the governor these were the same set: everything runnable started at
+/// once, so one "Running:" list told the whole truth. Now a check can sit on the
+/// budget for minutes, and calling that "running" is the specific lie this board
+/// exists to prevent — both on the progress line and in the slow-notice
+/// threshold, which must measure work, not queueing.
+///
+/// Order follows the order checks were dispatched in, so the line reads the same
+/// way twice in a row.
+#[derive(Default)]
+struct RunBoard {
+    entries: Vec<BoardEntry>,
+}
+
+struct BoardEntry {
+    name: String,
+    /// When the check was admitted by the governor; `None` while it waits.
+    started_at: Option<std::time::Instant>,
+}
+
+impl RunBoard {
+    fn new<'a>(names: impl Iterator<Item = &'a str>) -> Self {
+        Self {
+            entries: names
+                .map(|name| BoardEntry {
+                    name: name.to_string(),
+                    started_at: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// The check was granted its share of the budget and its process is next.
+    fn mark_running(&mut self, name: &str, at: std::time::Instant) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.name == name) {
+            entry.started_at = Some(at);
+        }
+    }
+
+    fn finish(&mut self, name: &str) {
+        self.entries.retain(|e| e.name != name);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn names_where(&self, running: bool) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|e| e.started_at.is_some() == running)
+            .map(|e| e.name.as_str())
+            .collect()
+    }
+
+    /// How long the longest-running check has actually been RUNNING, or `None`
+    /// when everything outstanding is still queued.
+    ///
+    /// This, not the stage's wall clock, is what a "still running after Ns"
+    /// notice is about: a check that has been parked on the budget for ten
+    /// minutes has not been slow, it has not started.
+    fn longest_running_secs(&self, now: std::time::Instant) -> Option<u64> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.started_at)
+            .map(|start| now.duration_since(start).as_secs())
+            .max()
+    }
+
+    /// The progress line's payload — `None` when nothing is outstanding.
+    ///
+    /// `elapsed_secs` is the stage's wall clock, unchanged from before the
+    /// governor: it answers "how long have I been waiting for this stage", which
+    /// is the question the operator staring at the line is asking.
+    fn progress_line(&self, elapsed_secs: u64) -> Option<String> {
+        let running = self.names_where(true);
+        let queued = self.names_where(false);
+        let mut parts = Vec::new();
+        if !running.is_empty() {
+            parts.push(format!(
+                "Running: {} ({}s)",
+                running.join(", "),
+                elapsed_secs
+            ));
+        }
+        if !queued.is_empty() {
+            parts.push(format!("Queued: {}", queued.join(", ")));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
+/// The board, recovering from a poisoned lock rather than propagating it: a
+/// panicking check must not also take down the progress line of the ones still
+/// running.
+fn lock_board(board: &std::sync::Mutex<RunBoard>) -> std::sync::MutexGuard<'_, RunBoard> {
+    board
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Everything a check must keep hold of for as long as its process runs: its
+/// slice of the machine, and — for the cargo family — the `target/` write lock.
+type Admission = (
+    Option<tokio::sync::OwnedSemaphorePermit>,
+    crate::governor::GovernorPermit,
+);
+
+/// Wait for everything a check needs before its process may start, and report
+/// the instant it actually got it.
+///
+/// THE ORDER IS PART OF THE CONTRACT: the `target/` lock first, the governor's
+/// budget second, for every check that takes both. Same order everywhere is what
+/// makes a two-lock system deadlock-free; this direction is also the one that
+/// does not waste the machine. A cargo check holding Heavy permits while it
+/// queues behind another cargo check for `target/` would park half the budget on
+/// work that has not begun, starving the light checks. Taking the cargo lock
+/// first — it costs nothing but waiting — means budget is only ever held by a
+/// check that can actually proceed. There is no cycle to close in the other
+/// direction: nothing acquires the cargo lock once it holds budget.
+///
+/// The returned instant is the honest `started_at`: the ledger's queued/started
+/// split is only meaningful if "started" means the process was allowed to begin,
+/// not that its future was polled.
+async fn admit_check(
+    check: &dyn Check,
+    cargo_lock: &Arc<Semaphore>,
+    governor: &ResourceGovernor,
+    board: &std::sync::Mutex<RunBoard>,
+) -> Result<(std::time::Instant, Admission), Cancelled> {
+    let cargo_permit = if is_cargo_target_check(check.name()) {
+        Some(tokio::select! {
+            biased;
+            _ = governor.cancelled() => return Err(Cancelled),
+            permit = Arc::clone(cargo_lock).acquire_owned() => {
+                permit.map_err(|_| Cancelled)?
+            }
+        })
+    } else {
+        None
+    };
+    let budget = governor.acquire(check.resource_weight()).await?;
+    let started_at = std::time::Instant::now();
+    lock_board(board).mark_running(check.name(), started_at);
+    Ok((started_at, (cargo_permit, budget)))
 }
 
 /// Run all applicable checks with caching (parallel execution, streaming output).
-pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)> {
+pub async fn run_all(
+    config: &Config,
+    ledger: &TaskLedger,
+    governor: &Arc<ResourceGovernor>,
+) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)> {
+    run_all_checks(
+        get_checks_for_profile(config),
+        Cache::new(config),
+        config,
+        ledger,
+        governor,
+    )
+    .await
+}
+
+/// [`run_all`] with the check set and cache handed in, so a test can drive the
+/// runner without a profile detection and a `PRVIEW_HOME`-rooted cache.
+async fn run_all_checks(
+    checks: Vec<Box<dyn Check>>,
+    cache: Cache,
+    config: &Config,
+    ledger: &TaskLedger,
+    governor: &Arc<ResourceGovernor>,
+) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)> {
     use colored::Colorize;
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::io::Write;
-    use std::sync::Arc;
 
-    let checks: Vec<Box<dyn Check>> = get_checks_for_profile(config);
-    let cache = Arc::new(Cache::new(config));
+    let cache = Arc::new(cache);
     let emit = !config.json && !config.quiet;
 
     if emit {
@@ -411,13 +668,35 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
     for check in checks {
         match check.check_eligibility(config) {
             CheckEligibility::Skip(reason) => {
+                ledger.record(TaskEntry {
+                    key: TaskKey::new(check.name(), ledger_substrate(None, ledger)),
+                    kind: TaskKind::Check,
+                    state: TaskState::Skipped {
+                        reason: reason.clone(),
+                    },
+                    queued_at: None,
+                    started_at: None,
+                });
                 skipped.push(build_skipped_check(check.as_ref(), reason));
                 continue;
             }
             CheckEligibility::Run => {}
         }
 
-        if let Some(result) = load_cached_result(check.as_ref(), config, cache.as_ref()) {
+        if let Some((result, cache_age_secs)) =
+            load_cached_result(check.as_ref(), config, cache.as_ref())
+        {
+            let (key_substrate, origin) = replay_substrates(result.provenance.as_ref(), ledger);
+            ledger.record(TaskEntry {
+                key: TaskKey::new(check.name(), key_substrate),
+                kind: TaskKind::Check,
+                state: TaskState::Cached {
+                    cache_age_secs,
+                    origin,
+                },
+                queued_at: None,
+                started_at: None,
+            });
             let status_str = format_status(result.status);
             if emit {
                 println!("  {} {} (cached)", status_str, check.name());
@@ -429,71 +708,56 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
         runnable_checks.push(check);
     }
 
+    runnable_checks.sort_by_key(|check| schedule_rank(check.as_ref()));
+
+    // Materialise ONE shared target snapshot for the whole run so every
+    // snapshot-backed check reuses it instead of creating (and cleaning up) its
+    // own worktree (thread 1). Snapshot failure is terminal: allowing checks to
+    // resolve their own temporary trees while later artifact stages fall back
+    // to repo_root would mix revisions in one pack. The ledger owns the
+    // snapshot, so the reviewed tree survives this frame and the artifact stage
+    // can still read it.
+    //
+    // OUTSIDE the "anything to run" guard on purpose: a run whose every gate hit
+    // the cache or was ruled out still goes on to read the reviewed tree in the
+    // context stage, and it is `share_target_snapshot` that decides whether a
+    // snapshot is needed at all.
+    //
+    // This must happen BEFORE Python pre-sync. The sync reads the same tree and
+    // uses the same per-commit environment as the gates; doing it against
+    // repo_root in an off-HEAD review mutates the operator's environment and
+    // does not prepare the environment the checks consume.
+    let mut config = config.clone();
+    share_target_snapshot(&mut config, &runnable_checks, ledger)?;
+
     // Pre-sync Python venv if any Python checks will run and uv is available.
     // This separates venv build time from the per-check timeout budget.
     let has_python_checks = runnable_checks
         .iter()
         .any(|c| matches!(c.name(), "Ruff" | "Mypy" | "Pytest"));
     if has_python_checks && config.profile.runs_python_checks() && which::which("uv").is_ok() {
-        if emit {
-            print!("  {} Syncing Python venv...", "●".blue());
-            let _ = std::io::stdout().flush();
-        }
-        match run_command_with_timeout(
-            "uv",
-            &["sync", "--quiet"],
-            &config.repo_root,
-            CHECK_TIMEOUT_SECS,
-        )
-        .await
-        {
-            Ok(output) => {
-                if emit {
-                    if output.status.success() {
-                        print!("\r\x1b[2K  {} Python venv ready\n", "✓".green());
-                    } else {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        print!(
-                            "\r\x1b[2K  {} uv sync failed: {}\n",
-                            "⚠".yellow(),
-                            stderr.lines().next().unwrap_or("unknown error")
-                        );
-                    }
-                    let _ = std::io::stdout().flush();
-                }
-            }
-            Err(e) => {
-                if emit {
-                    print!("\r\x1b[2K  {} uv sync: {}\n", "⚠".yellow(), e);
-                    let _ = std::io::stdout().flush();
-                }
-            }
-        }
+        presync_python_venv(&config, governor, emit).await?;
     }
 
     if !runnable_checks.is_empty() {
-        let mut remaining: Vec<String> = runnable_checks
-            .iter()
-            .map(|c| c.name().to_string())
-            .collect();
+        let board = Arc::new(std::sync::Mutex::new(RunBoard::new(
+            runnable_checks.iter().map(|c| c.name()),
+        )));
 
         if emit {
-            print!("  {} Running: {}", "●".blue(), remaining.join(", "));
+            // Nothing has been admitted yet, so everything is honestly queued.
+            print!(
+                "  {} {}",
+                "●".blue(),
+                lock_board(&board).progress_line(0).unwrap_or_default()
+            );
             let _ = std::io::stdout().flush();
         }
-
-        // Materialise ONE shared target snapshot for the whole run so every
-        // snapshot-backed check reuses it instead of creating (and cleaning up)
-        // its own worktree (thread 1). On failure, leave the override unset so
-        // each check falls back to resolving its own plan — the original
-        // per-check behaviour. `_shared_snapshot` stays alive until every check
-        // has finished.
-        let mut config = config.clone();
-        let _shared_snapshot = share_target_snapshot(&mut config, &runnable_checks);
 
         // Launch all checks in parallel, stream results as they complete.
         // Cargo checks share one target/ build lock, so they serialize on a
         // single-permit semaphore while non-cargo checks stay parallel (PV-17).
+        // The governor bounds how many of them the machine runs at once.
         let config = Arc::new(config);
         let cargo_lock = Arc::new(Semaphore::new(1));
         let mut futs: FuturesUnordered<_> = runnable_checks
@@ -502,23 +766,26 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
                 let config = Arc::clone(&config);
                 let cache = Arc::clone(&cache);
                 let cargo_lock = Arc::clone(&cargo_lock);
+                let governor = Arc::clone(governor);
+                let board = Arc::clone(&board);
+                let queued_at = std::time::Instant::now();
+                let queued_name = check.name().to_string();
                 async move {
-                    let _permit = if is_cargo_target_check(check.name()) {
-                        Some(
-                            cargo_lock
-                                .acquire()
-                                .await
-                                .expect("cargo-target semaphore never closed"),
-                        )
-                    } else {
-                        None
-                    };
-                    execute_live_check(check, config.as_ref(), cache.as_ref()).await
+                    let (started_at, _admission) =
+                        admit_check(check.as_ref(), &cargo_lock, &governor, &board).await?;
+                    let result = crate::governor::with_child_scope(
+                        governor,
+                        &queued_name,
+                        execute_live_check(check, config.as_ref(), cache.as_ref()),
+                    )
+                    .await;
+                    record_completed_check(&result, ledger, queued_at, started_at);
+                    Ok::<_, Cancelled>((queued_name, result))
                 }
             })
             .collect();
 
-        // Elapsed timer — ticks every second on the "Running" line
+        // Elapsed timer — ticks every second on the progress line
         let start = std::time::Instant::now();
         let mut timer = tokio::time::interval(tokio::time::Duration::from_secs(1));
         timer.tick().await; // consume immediate first tick
@@ -534,12 +801,21 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
             tokio::select! {
                 biased;
 
-                Some(result) = futs.next() => {
-                    // Remove completed check from remaining list
-                    remaining.retain(|n| n != &result.name);
+                outcome = futs.next() => {
+                    let Some(outcome) = outcome else {
+                        if !lock_board(&board).is_empty() {
+                            anyhow::bail!(
+                                "check dispatcher exhausted with pending board rows: {:?}",
+                                lock_board(&board).names_where(false)
+                            );
+                        }
+                        break;
+                    };
+                    let (queued_name, result) = outcome?;
+                    lock_board(&board).finish(&queued_name);
 
                     if emit {
-                        // Clear the "Running" line and print the result
+                        // Clear the progress line and print the result
                         print!("\r\x1b[2K");
                         let status_str = format_status(result.status);
                         println!(
@@ -549,33 +825,58 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
                             result.duration.as_secs_f32(),
                         );
 
-                        // Show updated "Running" line if checks remain
-                        if !remaining.is_empty() {
-                            let elapsed = start.elapsed().as_secs();
-                            print!(
-                                "  {} Running: {} ({}s)",
-                                "●".blue(),
-                                remaining.join(", "),
-                                elapsed
-                            );
+                        // Show the updated progress line if checks remain
+                        if let Some(line) =
+                            lock_board(&board).progress_line(start.elapsed().as_secs())
+                        {
+                            print!("  {} {}", "●".blue(), line);
                             let _ = std::io::stdout().flush();
                         }
                     }
 
+                    let done = lock_board(&board).is_empty();
                     results.push(result);
 
-                    if remaining.is_empty() {
+                    if done {
                         break;
                     }
                 }
 
-                _ = timer.tick(), if emit && !remaining.is_empty() => {
+                // Cancellation, as its own arm rather than as a thing noticed
+                // the next time a check happens to finish: the checks still
+                // running have just had their process groups SIGKILLed, but a
+                // gate with a long timeout and no child yet would otherwise
+                // hold the stage open. Returning here unwinds `App::run`
+                // through its ordinary `?`, which is what lets the ledger's
+                // shared worktree snapshot and the analysis snapshots be
+                // dropped — an aborted process leaves both on disk.
+                _ = governor.cancelled() => {
+                    if emit {
+                        let board = lock_board(&board);
+                        print!("\r\x1b[2K");
+                        println!(
+                            "  {} Cancelled — {} check(s) stopped, {} never started.",
+                            "✗".red(),
+                            board.names_where(true).len(),
+                            board.names_where(false).len(),
+                        );
+                    }
+                    return Err(Cancelled.into());
+                }
+
+                _ = timer.tick(), if emit && !lock_board(&board).is_empty() => {
+                    let now = std::time::Instant::now();
                     let elapsed = start.elapsed().as_secs();
-                    // PV-18: when a run crosses a soft threshold, print a
-                    // one-time note naming what's still running and how to bail.
-                    // We inform, we do not abort — the checks own their timeouts.
+                    let board = lock_board(&board);
+                    // PV-18: when a check has been RUNNING past a soft threshold,
+                    // print a one-time note naming it and how to bail. Measured
+                    // from admission, not from enqueue: a check still waiting for
+                    // the budget is not slow, and saying so would blame the tool
+                    // for the queue. We inform, we do not abort — the checks own
+                    // their timeouts.
+                    let running_secs = board.longest_running_secs(now).unwrap_or(0);
                     if next_slow_notice < SLOW_NOTICE_THRESHOLDS_SECS.len()
-                        && elapsed >= SLOW_NOTICE_THRESHOLDS_SECS[next_slow_notice]
+                        && running_secs >= SLOW_NOTICE_THRESHOLDS_SECS[next_slow_notice]
                     {
                         next_slow_notice += 1;
                         println!(
@@ -583,18 +884,15 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
                              the whole workspace and can take several minutes (each has its \
                              own timeout). Press Ctrl-C to abort.",
                             "ℹ".cyan(),
-                            elapsed,
-                            remaining.join(", "),
+                            running_secs,
+                            board.names_where(true).join(", "),
                         );
                     }
-                    // Update elapsed time on the "Running" line
-                    print!(
-                        "\r\x1b[2K  {} Running: {} ({}s)",
-                        "●".blue(),
-                        remaining.join(", "),
-                        elapsed
-                    );
-                    let _ = std::io::stdout().flush();
+                    // Update elapsed time on the progress line
+                    if let Some(line) = board.progress_line(elapsed) {
+                        print!("\r\x1b[2K  {} {}", "●".blue(), line);
+                        let _ = std::io::stdout().flush();
+                    }
                 }
             }
         }
@@ -607,27 +905,227 @@ pub async fn run_all(config: &Config) -> Result<(Vec<CheckResult>, Vec<SkippedCh
     Ok((results, skipped))
 }
 
+/// Build the Python venv once, before the gates that need it start their own
+/// timeout clocks.
+///
+/// Runs INSIDE a child scope, which is what makes it cancellable. `uv sync` on a
+/// cold venv is one of the longest single commands a run issues, and outside a
+/// scope [`crate::governor::register_active_child`] is a no-op: `cancel` had no
+/// pid to signal, so a Ctrl-C during it printed "stopping running tools" and
+/// then waited out the full five-minute timeout with the build still running.
+///
+/// Refuses to start at all on an already-cancelled run — the checks that would
+/// consume the venv are never going to run.
+async fn presync_python_venv(
+    config: &Config,
+    governor: &Arc<ResourceGovernor>,
+    emit: bool,
+) -> Result<(), Cancelled> {
+    use colored::Colorize;
+    use std::io::Write;
+
+    if governor.is_cancelled() {
+        return Err(Cancelled);
+    }
+
+    // A cold environment may compile several source distributions. Admit it as
+    // Exclusive before spawning, and pass the same descendant cap the run
+    // advertises to uv's download/build/install pools.
+    let _budget = governor.acquire(Weight::Exclusive).await?;
+    let plan = match plan_python_presync(config) {
+        Ok(plan) => plan,
+        Err(error) => {
+            if emit {
+                print!("\r\x1b[2K  {} Python venv: {error}\n", "⚠".yellow());
+                let _ = std::io::stdout().flush();
+            }
+            return Ok(());
+        }
+    };
+    if emit {
+        print!("  {} Syncing Python venv...", "●".blue());
+        let _ = std::io::stdout().flush();
+    }
+
+    let outcome = crate::governor::with_child_scope(
+        Arc::clone(governor),
+        "uv sync",
+        run_command_with_timeout_and_env(
+            "uv",
+            &["sync", "--quiet"],
+            &plan.cwd,
+            CHECK_TIMEOUT_SECS,
+            &plan.env,
+        ),
+    )
+    .await;
+
+    match outcome {
+        Ok(output) => {
+            if emit {
+                if output.status.success() {
+                    print!("\r\x1b[2K  {} Python venv ready\n", "✓".green());
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    print!(
+                        "\r\x1b[2K  {} uv sync failed: {}\n",
+                        "⚠".yellow(),
+                        stderr.lines().next().unwrap_or("unknown error")
+                    );
+                }
+                let _ = std::io::stdout().flush();
+            }
+        }
+        Err(e) => {
+            if emit {
+                print!("\r\x1b[2K  {} uv sync: {}\n", "⚠".yellow(), e);
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+
+    // A cancel that landed mid-sync SIGKILLed the build; the run is over, and
+    // going on to start the gates it was preparing for would be worse than
+    // saying so.
+    if governor.is_cancelled() {
+        return Err(Cancelled);
+    }
+    Ok(())
+}
+
+/// Resolve the exact tree and environment the Python checks will consume, then
+/// add uv's bounded descendant pools. Keeping this as one tested plan prevents
+/// the pre-sync and the actual gates from drifting onto different substrates.
+fn plan_python_presync(config: &Config) -> Result<python::PythonRun> {
+    python::plan_python_run(config)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct UvConcurrencyLimits {
+    pub(super) downloads: Option<u32>,
+    pub(super) builds: Option<u32>,
+    pub(super) installs: Option<u32>,
+}
+
+pub(super) fn uv_concurrency_env_with(
+    worker_limit: u32,
+    configured: UvConcurrencyLimits,
+    mut inherited: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> Result<Vec<(String, String)>> {
+    let run_limit = worker_limit.max(1);
+    let mut env = Vec::with_capacity(4);
+    for (key, configured_limit) in [
+        ("UV_CONCURRENT_DOWNLOADS", configured.downloads),
+        ("UV_CONCURRENT_BUILDS", configured.builds),
+        ("UV_CONCURRENT_INSTALLS", configured.installs),
+    ] {
+        let inherited_limit = match inherited(key) {
+            None => u32::MAX,
+            Some(value) => {
+                let Some(value) = value.to_str() else {
+                    anyhow::bail!("{key} is not valid UTF-8, so its worker limit is unknown");
+                };
+                value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|limit| *limit > 0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{key} must be a positive integer, got {value:?}")
+                    })?
+            }
+        };
+        let limit = run_limit
+            .min(inherited_limit)
+            .min(configured_limit.unwrap_or(u32::MAX));
+        env.push((key.to_owned(), limit.to_string()));
+    }
+
+    // uv caps simultaneous source builds, not the pool inside one Rust-backed
+    // PEP 517 backend. Keep Cargo's inherited knob on its existing, independent
+    // seam: a repository's uv configuration must never become Cargo policy.
+    let inherited_cargo_jobs =
+        inherited("CARGO_BUILD_JOBS").and_then(|value| value.into_string().ok());
+    env.push((
+        "CARGO_BUILD_JOBS".to_owned(),
+        bounded_descendant_limit(worker_limit, inherited_cargo_jobs.as_deref()).to_string(),
+    ));
+    Ok(env)
+}
+
+/// Resolve a child-process worker cap without ever raising a stricter limit
+/// supplied by the operator. Invalid and zero values are not useful process
+/// limits, so they fall back to the run plan's non-zero minimum.
+pub(super) fn bounded_descendant_limit(worker_limit: u32, inherited: Option<&str>) -> u32 {
+    let run_limit = worker_limit.max(1);
+    inherited
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .map_or(run_limit, |operator_limit| operator_limit.min(run_limit))
+}
+
 /// Callback type for check events (used by TUI)
 pub type CheckEventCallback = Box<dyn Fn(CheckEvent) + Send + Sync>;
 
 /// Events emitted during check execution
 #[derive(Debug, Clone)]
 pub enum CheckEvent {
-    Started { name: String },
-    Completed { result: Box<CheckResult> },
-    Skipped { name: String },
+    /// The check entered the execution set. It is not necessarily running: the
+    /// resource governor may hold it in the queue for as long as the machine is
+    /// busy. `Running` is what says the process was allowed to start.
+    Started {
+        name: String,
+    },
+    /// The governor admitted the check and its process is beginning.
+    ///
+    /// Added rather than folded into `Started` so a consumer that only wants
+    /// "the run considered this check" keeps the event it already had.
+    Running {
+        name: String,
+    },
+    Completed {
+        result: Box<CheckResult>,
+    },
+    Skipped {
+        name: String,
+    },
 }
 
 /// Run all applicable checks with event callbacks (for TUI mode)
 pub async fn run_all_with_events<F>(
     config: &Config,
+    ledger: &TaskLedger,
+    governor: &Arc<ResourceGovernor>,
     on_event: F,
 ) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)>
 where
     F: Fn(CheckEvent) + Send + Sync,
 {
-    let checks: Vec<Box<dyn Check>> = get_checks_for_profile(config);
-    let cache = Cache::new(config);
+    run_all_checks_with_events(
+        get_checks_for_profile(config),
+        Cache::new(config),
+        config,
+        ledger,
+        governor,
+        on_event,
+    )
+    .await
+}
+
+/// [`run_all_with_events`] with the check set and cache handed in — the same
+/// seam [`run_all_checks`] gives the headless dispatcher, and for the same
+/// reason: a test drives the loop with staged mocks instead of a profile
+/// detection and a `PRVIEW_HOME`-rooted cache.
+async fn run_all_checks_with_events<F>(
+    checks: Vec<Box<dyn Check>>,
+    cache: Cache,
+    config: &Config,
+    ledger: &TaskLedger,
+    governor: &Arc<ResourceGovernor>,
+    on_event: F,
+) -> Result<(Vec<CheckResult>, Vec<SkippedCheck>)>
+where
+    F: Fn(CheckEvent) + Send + Sync,
+{
     let mut results = Vec::new();
     let mut skipped = Vec::new();
     let mut runnable_checks: Vec<Box<dyn Check>> = Vec::new();
@@ -636,6 +1134,15 @@ where
     for check in checks {
         match check.check_eligibility(config) {
             CheckEligibility::Skip(reason) => {
+                ledger.record(TaskEntry {
+                    key: TaskKey::new(check.name(), ledger_substrate(None, ledger)),
+                    kind: TaskKind::Check,
+                    state: TaskState::Skipped {
+                        reason: reason.clone(),
+                    },
+                    queued_at: None,
+                    started_at: None,
+                });
                 let skipped_check = build_skipped_check(check.as_ref(), reason);
                 let name = skipped_check.name.clone();
                 skipped.push(skipped_check);
@@ -645,7 +1152,18 @@ where
             CheckEligibility::Run => {}
         }
 
-        if let Some(result) = load_cached_result(check.as_ref(), config, &cache) {
+        if let Some((result, cache_age_secs)) = load_cached_result(check.as_ref(), config, &cache) {
+            let (key_substrate, origin) = replay_substrates(result.provenance.as_ref(), ledger);
+            ledger.record(TaskEntry {
+                key: TaskKey::new(check.name(), key_substrate),
+                kind: TaskKind::Check,
+                state: TaskState::Cached {
+                    cache_age_secs,
+                    origin,
+                },
+                queued_at: None,
+                started_at: None,
+            });
             on_event(CheckEvent::Completed {
                 result: Box::new(result.clone()),
             });
@@ -656,25 +1174,30 @@ where
         runnable_checks.push(check);
     }
 
-    // Pre-sync Python venv before running checks, mirroring run_all behaviour.
-    // This keeps venv build time outside the per-check timeout budget.
+    runnable_checks.sort_by_key(|check| schedule_rank(check.as_ref()));
+
+    // Materialise the reviewed substrate before pre-sync, exactly as headless
+    // does. The TUI must not sync an off-HEAD dependency set into repo_root.
+    let mut config = config.clone();
+    share_target_snapshot(&mut config, &runnable_checks, ledger)?;
+
+    // Pre-sync Python venv before running checks, through the SAME helper the
+    // headless dispatcher uses. It was a bare `run_command_with_timeout` under a
+    // comment claiming to mirror `run_all` — a copy that had stopped mirroring
+    // anything: no child scope, so `cancel` held no pid for the longest command
+    // a run issues, and no gates, so an already-cancelled run still paid for a
+    // cold venv build it would never consume.
     let has_python_checks = runnable_checks
         .iter()
         .any(|c| matches!(c.name(), "Ruff" | "Mypy" | "Pytest"));
     if has_python_checks && config.profile.runs_python_checks() && which::which("uv").is_ok() {
-        let _ = run_command_with_timeout(
-            "uv",
-            &["sync", "--quiet"],
-            &config.repo_root,
-            CHECK_TIMEOUT_SECS,
-        )
-        .await;
+        // `emit: false` — the TUI owns the screen; progress reaches it as events.
+        presync_python_venv(&config, governor, false).await?;
     }
 
     // Second pass: run checks in parallel, fire events as they complete.
     {
         use futures::stream::{FuturesUnordered, StreamExt};
-        use std::sync::Arc;
 
         for check in &runnable_checks {
             on_event(CheckEvent::Started {
@@ -682,42 +1205,78 @@ where
             });
         }
 
-        // One shared target snapshot for the whole run (thread 1); see run_all.
-        let mut config = config.clone();
-        let _shared_snapshot = share_target_snapshot(&mut config, &runnable_checks);
-
         let config = Arc::new(config);
         let cache = Arc::new(cache);
         // Cargo checks share one target/ build lock, so they serialize on a
         // single-permit semaphore while non-cargo checks stay parallel (PV-17).
+        // The governor bounds how many of them the machine runs at once; see
+        // `admit_check` for why the two are taken in that order.
         let cargo_lock = Arc::new(Semaphore::new(1));
+        let board = Arc::new(std::sync::Mutex::new(RunBoard::new(
+            runnable_checks.iter().map(|c| c.name()),
+        )));
+        let on_event = &on_event;
         let mut futs: FuturesUnordered<_> = runnable_checks
             .into_iter()
             .map(|check| {
                 let config = Arc::clone(&config);
                 let cache = Arc::clone(&cache);
                 let cargo_lock = Arc::clone(&cargo_lock);
+                let governor = Arc::clone(governor);
+                let board = Arc::clone(&board);
+                let queued_at = std::time::Instant::now();
+                let queued_name = check.name().to_string();
                 async move {
-                    let _permit = if is_cargo_target_check(check.name()) {
-                        Some(
-                            cargo_lock
-                                .acquire()
-                                .await
-                                .expect("cargo-target semaphore never closed"),
-                        )
-                    } else {
-                        None
-                    };
-                    execute_live_check(check, config.as_ref(), cache.as_ref()).await
+                    let (started_at, _admission) =
+                        admit_check(check.as_ref(), &cargo_lock, &governor, &board).await?;
+                    on_event(CheckEvent::Running {
+                        name: queued_name.clone(),
+                    });
+                    let result = crate::governor::with_child_scope(
+                        governor,
+                        &queued_name,
+                        execute_live_check(check, config.as_ref(), cache.as_ref()),
+                    )
+                    .await;
+                    record_completed_check(&result, ledger, queued_at, started_at);
+                    Ok::<_, Cancelled>((queued_name, result))
                 }
             })
             .collect();
 
-        while let Some(result) = futs.next().await {
-            on_event(CheckEvent::Completed {
-                result: Box::new(result.clone()),
-            });
-            results.push(result);
+        // Same shape as the headless dispatcher's loop, and for the same reason:
+        // cancellation is its own arm, not a thing noticed the next time a check
+        // happens to finish. A gate with a long timeout that has not spawned a
+        // child yet would otherwise hold the stage open after `cancel` has
+        // already SIGKILLed everything that had. The board condition covers the
+        // empty runnable set — with no futures left, its arm is disabled and a
+        // `select!` would have nothing to wait on but the cancel.
+        while !lock_board(&board).is_empty() {
+            tokio::select! {
+                biased;
+
+                outcome = futs.next() => {
+                    let Some(outcome) = outcome else {
+                        if !lock_board(&board).is_empty() {
+                            anyhow::bail!(
+                                "check dispatcher exhausted with pending board rows: {:?}",
+                                lock_board(&board).names_where(false)
+                            );
+                        }
+                        break;
+                    };
+                    let (queued_name, result) = outcome?;
+                    lock_board(&board).finish(&queued_name);
+                    on_event(CheckEvent::Completed {
+                        result: Box::new(result.clone()),
+                    });
+                    results.push(result);
+                }
+
+                _ = governor.cancelled() => {
+                    return Err(Cancelled.into());
+                }
+            }
         }
     }
 
@@ -741,7 +1300,18 @@ fn build_skipped_check(check: &dyn Check, reason: String) -> SkippedCheck {
     SkippedCheck { id, name, reason }
 }
 
-fn load_cached_result(check: &dyn Check, config: &Config, cache: &Cache) -> Option<CheckResult> {
+/// Replay a stored result, with the age of the entry it came from.
+///
+/// The age rides alongside rather than inside [`CheckResult`]: it is a property
+/// of the cache entry, not of the check's verdict, and the artifacts derived
+/// from a result must not start reporting it as one. The ledger is where it
+/// belongs — "this gate did not run, and the answer it replayed is N seconds
+/// old" is one fact about how the run resolved a task.
+fn load_cached_result(
+    check: &dyn Check,
+    config: &Config,
+    cache: &Cache,
+) -> Option<(CheckResult, Option<u64>)> {
     let cache_key = check.cache_key(config)?;
     let cached = cache.get(check.name(), &cache_key)?;
     let output = cached.output.unwrap_or_default();
@@ -751,14 +1321,17 @@ fn load_cached_result(check: &dyn Check, config: &Config, cache: &Cache) -> Opti
         status = CheckStatus::Error;
     }
 
-    Some(CheckResult {
-        name: check.name().to_string(),
-        status,
-        duration: Duration::from_secs(0),
-        output,
-        cached: true,
-        provenance: replayed_provenance(cached.provenance.as_deref()),
-    })
+    Some((
+        CheckResult {
+            name: check.name().to_string(),
+            status,
+            duration: Duration::from_secs(0),
+            output,
+            cached: true,
+            provenance: replayed_provenance(cached.provenance.as_deref()),
+        },
+        cached.age_secs,
+    ))
 }
 
 /// Rebuild the provenance a cache hit is replaying.
@@ -837,6 +1410,48 @@ fn errored_check_provenance(
         }
         .with_scan_substrate(name, &scan_dir, &config.repo_root),
     )
+}
+
+/// Record a check after admission, keyed on the tree its own provenance says it
+/// was going to read.
+///
+/// `queued_at` is when the check entered the execution set and `started_at` when
+/// the resource governor admitted it — the gap between them is time the check
+/// spent waiting for the machine, which is exactly the fact a reader comparing
+/// two runs of the same gate needs and cannot reconstruct from the duration.
+fn record_completed_check(
+    result: &CheckResult,
+    ledger: &TaskLedger,
+    queued_at: std::time::Instant,
+    started_at: std::time::Instant,
+) {
+    let state = if result.status == CheckStatus::Skipped
+        && result
+            .provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.command == NO_COMMAND_RECORDED)
+    {
+        TaskState::Skipped {
+            reason: result.output.clone(),
+        }
+    } else {
+        // Some tools execute and inspect the substrate before deciding that
+        // their own result is Skipped. Those remain honest live coverage; only
+        // the explicit no-command provenance above proves pre-spawn failure.
+        TaskState::Run {
+            duration: result.duration,
+        }
+    };
+    ledger.record(TaskEntry {
+        key: TaskKey::new(
+            &result.name,
+            ledger_substrate(result.provenance.as_ref(), ledger),
+        ),
+        kind: TaskKind::Check,
+        state,
+        queued_at: Some(queued_at),
+        started_at: Some(started_at),
+    });
 }
 
 async fn execute_live_check(check: Box<dyn Check>, config: &Config, cache: &Cache) -> CheckResult {
@@ -1060,30 +1675,123 @@ pub fn off_head_target_commit(config: &Config) -> Option<String> {
     (target.commit_id != head).then_some(target.commit_id)
 }
 
-/// Materialise ONE target snapshot for the whole run and point `config` at it, so
-/// every snapshot-backed check reuses a single worktree instead of creating its
-/// own (thread 1). Returns the snapshot handle for the caller to keep alive until
-/// all checks finish; `None` (leaving `scan_dir_override` unset) when no runnable
-/// check needs a snapshot, or when snapshot creation fails — in which case each
-/// check falls back to resolving its own plan, the original per-check behaviour.
+/// Materialise ONE target snapshot for the whole run, point `config` at it and
+/// hand its ownership to the ledger (thread 1).
+///
+/// The snapshot used to be returned to a local binding in the dispatcher, which
+/// meant it — and the reviewed tree it holds on disk — died when `run_all`'s
+/// frame ended. Everything downstream of the checks (the context artifacts most
+/// of all) therefore had no reviewed tree left to read and silently fell back to
+/// the local checkout, which in a `--pr` run is a different revision entirely
+/// (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). The ledger outlives the whole run, so
+/// giving it the handle makes ONE snapshot the substrate of every stage instead
+/// of just the gates.
+///
+/// A snapshot is materialised when EITHER a runnable check needs one
+/// ([`uses_shared_scan_dir`]) OR the reviewed target is off-`HEAD`. The second
+/// arm is not redundant: the gates are not the only stage that reads the tree.
+/// The context stage plans and produces the whole of `30_context` from
+/// `ledger.scan_dir()`, so tying materialisation to the runnable set alone gave
+/// back `PRV-CONTEXT-SNAPSHOT-PROVENANCE` through a quieter door — a run whose
+/// complete applicable gate set has sound cache hits, or the fast remote-only
+/// preset, where the snapshot-backed gates all skip and only semgrep (which
+/// owns its worktree) remains. Both left the ledger with no scan
+/// dir, and the context commands then read the operator's local checkout while
+/// the diffs and the gate described the PR's commit. An all-cacheable `--pr`
+/// run therefore pays for one `git worktree` it does not strictly need for its
+/// gates: a correct pack is worth more than a saved checkout.
+///
+/// Nothing is installed (`scan_dir_override` stays unset, the ledger keeps no
+/// snapshot) when the target IS the checked-out `HEAD` and no runnable check
+/// wants one — there the repo root genuinely is the reviewed tree. Once a
+/// snapshot is required, creation failure is terminal: per-check snapshots do
+/// not give later artifact stages a verified tree and would permit one pack to
+/// mix the reviewed target with the operator's checkout.
 fn share_target_snapshot(
     config: &mut Config,
     runnable_checks: &[Box<dyn Check>],
-) -> Option<crate::git::WorktreeSnapshot> {
-    if !runnable_checks
+    ledger: &TaskLedger,
+) -> Result<()> {
+    share_target_snapshot_with(config, runnable_checks, ledger, plan_check_run)
+}
+
+fn share_target_snapshot_with(
+    config: &mut Config,
+    runnable_checks: &[Box<dyn Check>],
+    ledger: &TaskLedger,
+    planner: impl FnOnce(&Config) -> Result<CheckPlan>,
+) -> Result<()> {
+    let wanted_by_a_gate = runnable_checks
         .iter()
-        .any(|c| uses_shared_scan_dir(c.name()))
-    {
-        return None;
+        .any(|c| uses_shared_scan_dir(c.name()));
+    if !wanted_by_a_gate && off_head_target_commit(config).is_none() {
+        return Ok(());
     }
-    match plan_check_run(config) {
-        Ok(plan) => {
-            config.scan_dir_override = Some(plan.scan_dir.clone());
-            plan._snapshot
+    let plan = planner(config).context("failed to materialize shared review snapshot")?;
+    config.scan_dir_override = Some(plan.scan_dir.clone());
+    // The run-wide substrate is the tree identity of the shared scan dir, with
+    // no per-command scaffolding judgement: a check that ran reports its own,
+    // finer provenance and overrides this in `ledger_substrate`.
+    //
+    // The empty `consumable` list is the honest reading of a run-wide claim, and
+    // it is what keeps a gate-less run truthful: `create_worktree_snapshot` links
+    // `node_modules` into every snapshot regardless of who will run there, but
+    // "this tree carries a link" is not "this run consumed one". With no command
+    // to name, nothing here can consume anything, so the run-wide substrate is
+    // `snapshot` — never `snapshot-borrowed-deps`. A command that DOES resolve
+    // through the link (a JS gate, the context stage's `tsc` trace) reports that
+    // for itself via `consumable_scaffolding`.
+    //
+    // Installing it also adopts the first pass's skips and cache replays, which
+    // were necessarily decided before this point — the first pass is what
+    // produces the runnable set — and so were recorded under an unknown
+    // substrate. Those entries DO name a tool, so each is re-keyed on that tool's
+    // own reading of this tree rather than on the run-wide claim: the ESLint skip
+    // of a JS repo has to land on the key the context stage will later compute
+    // for ESLint, or the dedup misses it and lints the whole tree again.
+    let run_wide: SubstrateKey =
+        resolve_scan_substrate(&plan.scan_dir, &config.repo_root, &[]).into();
+    let per_tool = adopted_substrate(
+        plan.scan_dir.clone(),
+        config.repo_root.clone(),
+        run_wide.clone(),
+    );
+    ledger.set_substrate_keyed(run_wide, &per_tool);
+    ledger.set_shared_snapshot(plan._snapshot);
+    Ok(())
+}
+
+/// How each tool reads `scan_dir`, for re-keying the entries decided before the
+/// run knew which tree it was reading.
+///
+/// One `git status` per distinct consumable set, not per entry: there are only
+/// two sets in the table ([`consumable_scaffolding`] answers either nothing or
+/// `node_modules`), and the run-wide resolution seeds the first of them, so a
+/// whole adoption costs at most one status read more than it used to.
+fn adopted_substrate(
+    scan_dir: PathBuf,
+    repo_root: PathBuf,
+    run_wide: SubstrateKey,
+) -> impl Fn(&str) -> SubstrateKey {
+    let cache: std::cell::RefCell<HashMap<&'static [&'static str], SubstrateKey>> =
+        std::cell::RefCell::new(HashMap::from([(NOTHING_CONSUMABLE, run_wide)]));
+
+    move |tool| {
+        let consumable = consumable_scaffolding(tool);
+        if let Some(known) = cache.borrow().get(consumable) {
+            return known.clone();
         }
-        Err(_) => None,
+        let resolved: SubstrateKey =
+            resolve_scan_substrate(&scan_dir, &repo_root, consumable).into();
+        cache.borrow_mut().insert(consumable, resolved.clone());
+        resolved
     }
 }
+
+/// The answer [`consumable_scaffolding`] gives a tool that reads none of
+/// prview's dependency links — and the key the run-wide substrate is cached
+/// under, since that is resolved the same way.
+const NOTHING_CONSUMABLE: &[&str] = &[];
 
 /// Security checks stay loud: a spawn failure here is NOT downgraded to Skipped
 /// (PV-01), so a broken or half-installed security tool can't silently vanish
@@ -1467,10 +2175,15 @@ mod tests {
     /// Minimal git fixture: an initialised repo with one commit, returning the
     /// temp dir and the commit id.
     fn repo_with_one_commit() -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sha = init_repo_with_one_commit(tmp.path());
+        (tmp, sha)
+    }
+
+    fn init_repo_with_one_commit(root: &Path) -> String {
         use crate::git::cmd::git_cmd;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
+        std::fs::create_dir_all(root).expect("repo dir");
         let run_git = |args: &[&str]| {
             let out = git_cmd()
                 .args(args)
@@ -1494,8 +2207,220 @@ mod tests {
             .output()
             .expect("rev-parse");
         assert!(out.status.success());
-        let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
-        (tmp, sha)
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// A repo whose checked-out `HEAD` is NOT the reviewed target: `main` holds
+    /// revision "one", `feature` holds revision "two", and `main` is checked
+    /// out. Returns the temp dir and the target (`feature`) commit id.
+    fn repo_with_off_head_target() -> (tempfile::TempDir, String) {
+        use crate::git::cmd::git_cmd;
+
+        let (tmp, _head) = repo_with_one_commit();
+        let root = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(out.status.success(), "git {:?} failed", args);
+        };
+
+        run_git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(root.join("tracked.txt"), "two\n").expect("write fixture");
+        run_git(&["add", "tracked.txt"]);
+        run_git(&["commit", "-q", "-m", "two"]);
+        let out = git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .expect("rev-parse");
+        assert!(out.status.success());
+        let target = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        run_git(&["checkout", "-q", "main"]);
+
+        (tmp, target)
+    }
+
+    /// PRV-CONTEXT-SNAPSHOT-PROVENANCE, half one: the shared snapshot used to be
+    /// held in a local binding inside the dispatcher, so the reviewed tree was
+    /// deleted the moment `run_all` returned — every later stage then had
+    /// nothing but the local checkout to read. Ownership now sits in the ledger,
+    /// which outlives the whole run.
+    #[test]
+    fn the_shared_target_snapshot_outlives_the_dispatcher() {
+        let (repo, target) = repo_with_off_head_target();
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some("feature".to_string());
+
+        let ledger = TaskLedger::new();
+        let snapshot_backed: Vec<Box<dyn Check>> = vec![Box::new(cargo::CargoCheck)];
+        share_target_snapshot(&mut config, &snapshot_backed, &ledger)
+            .expect("shared target snapshot");
+
+        let scan_dir = ledger
+            .scan_dir()
+            .expect("the run's shared snapshot must belong to the ledger");
+        assert_eq!(
+            config.scan_dir_override.as_ref(),
+            Some(&scan_dir),
+            "the checks and the ledger must name ONE scan dir",
+        );
+        assert_ne!(
+            scan_dir, config.repo_root,
+            "an off-HEAD review must not scan the local checkout",
+        );
+        // The decisive assertion: the worktree is still on disk AFTER the call
+        // that created it returned, and it carries the REVIEWED revision.
+        assert_eq!(
+            std::fs::read_to_string(scan_dir.join("tracked.txt")).expect("snapshot still on disk"),
+            "two\n",
+        );
+        assert_eq!(
+            std::fs::read_to_string(config.repo_root.join("tracked.txt")).expect("local checkout"),
+            "one\n",
+            "the fixture is only meaningful while the two trees disagree",
+        );
+        assert_eq!(
+            ledger.resolved_substrate(),
+            Some(crate::ledger::SubstrateKey {
+                target_sha: Some(target),
+                tree_state: Some(TreeState::Snapshot),
+            }),
+            "the run-wide substrate must name the reviewed commit, not HEAD",
+        );
+    }
+
+    /// A skip is decided in the first pass, before the run can know which tree
+    /// it will read — the runnable set is what decides whether a snapshot is
+    /// materialised at all. It must not stay filed under an unknown substrate
+    /// once the run does know: `RUN.json` would then report the run's own
+    /// decisions as being about no particular tree.
+    #[test]
+    fn a_skip_recorded_before_the_snapshot_lands_on_the_reviewed_substrate() {
+        let (repo, target) = repo_with_off_head_target();
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some("feature".to_string());
+
+        let ledger = TaskLedger::new();
+        // Recorded exactly the way run_all's first pass records it.
+        ledger.record(TaskEntry {
+            key: TaskKey::new("ESLint", ledger_substrate(None, &ledger)),
+            kind: TaskKind::Check,
+            state: TaskState::Skipped {
+                reason: "lint disabled".to_string(),
+            },
+            queued_at: None,
+            started_at: None,
+        });
+        assert_eq!(
+            ledger.entries()[0].key.substrate,
+            crate::ledger::SubstrateKey::default(),
+            "the fixture is only meaningful while the skip starts out unkeyed",
+        );
+
+        let snapshot_backed: Vec<Box<dyn Check>> = vec![Box::new(cargo::CargoCheck)];
+        share_target_snapshot(&mut config, &snapshot_backed, &ledger)
+            .expect("shared target snapshot");
+
+        assert_eq!(
+            ledger.entries()[0].key.substrate,
+            crate::ledger::SubstrateKey {
+                target_sha: Some(target),
+                tree_state: Some(TreeState::Snapshot),
+            },
+            "the skip names the reviewed tree it was a decision about",
+        );
+    }
+
+    /// PRV-CONTEXT-WORK-DEDUP, through the door adoption opened. One tree does
+    /// not have one identity: a snapshot of a JS repo carries prview's own
+    /// `node_modules` link whoever runs there, so the same directory is
+    /// `snapshot` to a cargo gate and `snapshot-borrowed-deps` to ESLint — and
+    /// `snapshot-borrowed-deps` is exactly what the context stage resolves for
+    /// ESLint before asking whether the gate already covered it.
+    ///
+    /// Adopting every unkeyed entry onto ONE run-wide key filed the ESLint skip
+    /// under the cargo reading, the context stage's exact-key lookup missed, and
+    /// the unknown-substrate fallback that would have caught it had just been
+    /// spent by this very adoption. `Uncovered` meant a full `eslint .` over a
+    /// tree the run had already decided about — on both of the scenarios the
+    /// shared snapshot exists for: a warm second `--pr N`, and the fast
+    /// remote-only preset.
+    #[test]
+    fn an_adopted_skip_is_keyed_the_way_its_own_tool_reads_the_tree() {
+        let (repo, target) = repo_with_off_head_target();
+        let root = repo.path();
+        // What makes the snapshot carry a link at all: the operator's own
+        // dependency tree, which `create_worktree_snapshot` symlinks in.
+        std::fs::create_dir(root.join("node_modules")).expect("node_modules");
+        std::fs::write(root.join("node_modules/marker"), "dep\n").expect("dep file");
+
+        let mut config = rust_config(true, true, true);
+        config.repo_root = root.to_path_buf();
+        config.target = Some("feature".to_string());
+
+        let ledger = TaskLedger::new();
+        // Recorded exactly the way run_all's first pass records a preset skip or
+        // a cache replay: before the run knows which tree it will read.
+        ledger.record(TaskEntry {
+            key: TaskKey::new("ESLint", ledger_substrate(None, &ledger)),
+            kind: TaskKind::Check,
+            state: TaskState::Skipped {
+                reason: "fast remote-only preset".to_string(),
+            },
+            queued_at: None,
+            started_at: None,
+        });
+
+        let snapshot_backed: Vec<Box<dyn Check>> = vec![Box::new(cargo::CargoCheck)];
+        share_target_snapshot(&mut config, &snapshot_backed, &ledger)
+            .expect("shared target snapshot");
+
+        let scan_dir = ledger
+            .scan_dir()
+            .expect("an off-HEAD run snapshots the target");
+        if !scan_dir.join("node_modules").exists() {
+            // Symlinking is unix-only; nothing to assert elsewhere.
+            return;
+        }
+
+        // The key the CONTEXT stage will compute for ESLint on this tree — the
+        // same call `context_substrate` makes, with the same consumable set.
+        let as_eslint_reads_it: crate::ledger::SubstrateKey =
+            resolve_scan_substrate(&scan_dir, root, consumable_scaffolding("ESLint")).into();
+        assert_eq!(
+            as_eslint_reads_it,
+            crate::ledger::SubstrateKey {
+                target_sha: Some(target.clone()),
+                tree_state: Some(TreeState::SnapshotBorrowedDeps),
+            },
+            "the fixture is only meaningful while the linked tree is what ESLint would read",
+        );
+
+        assert_eq!(
+            ledger.entries()[0].key.substrate,
+            as_eslint_reads_it,
+            "an adopted ESLint skip must land on the key ESLint's own reading produces",
+        );
+        assert!(
+            ledger
+                .lookup(&TaskKey::new("ESLint", as_eslint_reads_it))
+                .is_some(),
+            "the context stage's EXACT lookup must answer — the unknown-substrate \
+             fallback is gone, spent by this adoption",
+        );
+        assert_eq!(
+            ledger.resolved_substrate(),
+            Some(crate::ledger::SubstrateKey {
+                target_sha: Some(target),
+                tree_state: Some(TreeState::Snapshot),
+            }),
+            "the RUN-WIDE claim names no command, so it still consumes nothing",
+        );
     }
 
     #[test]
@@ -1704,11 +2629,43 @@ mod tests {
                 "{check} does not read prview's dependency links",
             );
         }
-        for check in ["TypeScript", "ESLint", "Vitest", "Stylelint"] {
+        for check in [
+            "TypeScript",
+            "ESLint",
+            "Vitest",
+            "Stylelint",
+            "tauri_info",
+            "esbuild_meta",
+            "npm_sbom",
+        ] {
             assert_eq!(
                 consumable_scaffolding(check),
                 &["node_modules"],
                 "{check} resolves its toolchain through node_modules",
+            );
+        }
+    }
+
+    /// The table has to answer for a check ID as well as a display name: a
+    /// ledger entry carries only the id, so re-keying one has nothing else to
+    /// ask with. A display-name-only table answered "consumes nothing" for every
+    /// tool in the ledger — including `tsc` and `tests`, whose ids do not even
+    /// resemble the names.
+    #[test]
+    fn the_scaffolding_table_answers_for_a_check_id_too() {
+        for check in ["TypeScript", "ESLint", "Vitest", "Stylelint"] {
+            let id = crate::check_id::check_id_from_name(check);
+            assert_eq!(
+                consumable_scaffolding(&id),
+                consumable_scaffolding(check),
+                "{check} and its id {id} must read the same tree the same way",
+            );
+        }
+        for check in ["Cargo check", "Semgrep", "Ruff", "cargo tree"] {
+            let id = crate::check_id::check_id_from_name(check);
+            assert!(
+                consumable_scaffolding(&id).is_empty(),
+                "{id} reads nothing through prview's dependency links",
             );
         }
     }
@@ -1744,10 +2701,8 @@ mod tests {
         let (repo, _head) = repo_with_one_commit();
         let root = repo.path();
 
-        let (nested_src, nested_head) = repo_with_one_commit();
         let nested = root.join("vendor/other");
-        std::fs::create_dir_all(nested.parent().expect("parent")).expect("vendor dir");
-        copy_tree(nested_src.path(), &nested);
+        let nested_head = init_repo_with_one_commit(&nested);
 
         let substrate = resolve_scan_substrate(&nested, root, &[]);
         assert_eq!(
@@ -1761,19 +2716,6 @@ mod tests {
             "another repository's tree says nothing about the reviewed commit, \
              wherever it happens to sit",
         );
-    }
-
-    fn copy_tree(from: &Path, to: &Path) {
-        std::fs::create_dir_all(to).expect("create dir");
-        for entry in std::fs::read_dir(from).expect("read dir") {
-            let entry = entry.expect("entry");
-            let target = to.join(entry.file_name());
-            if entry.file_type().expect("file type").is_dir() {
-                copy_tree(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), target).expect("copy file");
-            }
-        }
     }
 
     #[test]
@@ -1867,6 +2809,171 @@ mod tests {
         );
     }
 
+    /// `uv sync` on a cold venv is one of the longest single commands a run
+    /// issues. Starting one for a run that has already been cancelled means the
+    /// operator waits out a build whose gates are never going to run.
+    #[tokio::test]
+    async fn a_cancelled_run_does_not_start_a_cold_venv_build() {
+        let config = rust_config(true, true, true);
+        let governor = Arc::new(ResourceGovernor::with_budget(2, 1));
+        governor.cancel();
+
+        assert_eq!(
+            presync_python_venv(&config, &governor, false).await,
+            Err(Cancelled),
+            "a cancelled run must not begin building a venv it will never use",
+        );
+    }
+
+    #[test]
+    fn python_presync_uses_the_reviewed_snapshot_and_per_commit_environment() {
+        let home = tempfile::tempdir().expect("prview home");
+        let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+        let repo = tempfile::tempdir().expect("operator checkout");
+        let snapshot = tempfile::tempdir().expect("reviewed snapshot");
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+        config.scan_dir_override = Some(snapshot.path().to_path_buf());
+
+        let plan = plan_python_presync(&config).expect("presync plan");
+        let later = python::plan_python_run(&config).expect("later gate plan");
+
+        assert_eq!(plan.cwd, snapshot.path());
+        assert_eq!(plan.cwd, later.cwd);
+        assert_eq!(
+            plan.env, later.env,
+            "pre-sync and every later uv run must consume one exact environment plan",
+        );
+        assert!(plan.env.iter().any(|(key, value)| {
+            key == "UV_PROJECT_ENVIRONMENT" && !std::path::Path::new(value).starts_with(repo.path())
+        }));
+        for key in [
+            "UV_CONCURRENT_DOWNLOADS",
+            "UV_CONCURRENT_BUILDS",
+            "UV_CONCURRENT_INSTALLS",
+            "CARGO_BUILD_JOBS",
+        ] {
+            assert!(
+                plan.env
+                    .iter()
+                    .any(|(actual, value)| actual == key && value == "1"),
+                "{key} must be capped in the exact presync environment"
+            );
+        }
+    }
+
+    #[test]
+    fn uv_sync_preserves_the_stricter_descendant_cap() {
+        assert_eq!(
+            uv_concurrency_env_with(2, UvConcurrencyLimits::default(), |_| None)
+                .expect("unconfigured limits"),
+            vec![
+                ("UV_CONCURRENT_DOWNLOADS".to_string(), "2".to_string()),
+                ("UV_CONCURRENT_BUILDS".to_string(), "2".to_string()),
+                ("UV_CONCURRENT_INSTALLS".to_string(), "2".to_string()),
+                ("CARGO_BUILD_JOBS".to_string(), "2".to_string()),
+            ]
+        );
+        assert!(
+            uv_concurrency_env_with(0, UvConcurrencyLimits::default(), |_| None)
+                .expect("zero plan is clamped")
+                .iter()
+                .all(|(_, value)| value == "1"),
+            "invalid zero plans still produce uv's required non-zero cap"
+        );
+        assert_eq!(
+            uv_concurrency_env_with(
+                4,
+                UvConcurrencyLimits {
+                    downloads: Some(3),
+                    builds: Some(2),
+                    installs: Some(8),
+                },
+                |key| match key {
+                    "UV_CONCURRENT_BUILDS" => Some("1".into()),
+                    "UV_CONCURRENT_INSTALLS" => Some("8".into()),
+                    "CARGO_BUILD_JOBS" => Some("1".into()),
+                    _ => None,
+                },
+            )
+            .expect("valid inherited and project limits"),
+            vec![
+                ("UV_CONCURRENT_DOWNLOADS".to_string(), "3".to_string()),
+                ("UV_CONCURRENT_BUILDS".to_string(), "1".to_string()),
+                ("UV_CONCURRENT_INSTALLS".to_string(), "4".to_string()),
+                ("CARGO_BUILD_JOBS".to_string(), "1".to_string()),
+            ],
+            "project, inherited, and run limits are independent ceilings",
+        );
+    }
+
+    #[test]
+    fn uv_project_limits_never_become_cargo_build_policy() {
+        let env = uv_concurrency_env_with(
+            4,
+            UvConcurrencyLimits {
+                downloads: Some(1),
+                builds: Some(1),
+                installs: Some(1),
+            },
+            |_| None,
+        )
+        .expect("valid project limits");
+
+        assert_eq!(
+            env.iter()
+                .find_map(|(key, value)| (key == "CARGO_BUILD_JOBS").then_some(value.as_str())),
+            Some("4"),
+            "uv config owns uv pools only; Cargo keeps its separate inherited seam",
+        );
+    }
+
+    #[test]
+    fn invalid_inherited_uv_limit_fails_closed() {
+        for value in ["", "0", "-1", "many"] {
+            let error = uv_concurrency_env_with(4, UvConcurrencyLimits::default(), |key| {
+                (key == "UV_CONCURRENT_BUILDS").then(|| value.into())
+            })
+            .expect_err("an invalid inherited uv limit must stay visible");
+            assert!(
+                error.to_string().contains("UV_CONCURRENT_BUILDS"),
+                "the error must name the invalid authority: {error}",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_inherited_uv_limit_fails_closed() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+        let error = uv_concurrency_env_with(4, UvConcurrencyLimits::default(), |key| {
+            (key == "UV_CONCURRENT_INSTALLS").then(|| invalid.clone())
+        })
+        .expect_err("non-UTF-8 uv policy cannot be treated as absent");
+        assert!(error.to_string().contains("UV_CONCURRENT_INSTALLS"));
+    }
+
+    #[tokio::test]
+    async fn cold_venv_build_does_not_spawn_while_exclusive_budget_is_held() {
+        let config = rust_config(true, true, true);
+        let governor = Arc::new(ResourceGovernor::with_budget(1, 1));
+        let _held = governor
+            .acquire(Weight::Exclusive)
+            .await
+            .expect("hold the only permit");
+        let waiting = presync_python_venv(&config, &governor, false);
+        tokio::pin!(waiting);
+
+        tokio::select! {
+            result = &mut waiting => panic!("uv presync bypassed admission: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        governor.cancel();
+        assert_eq!(waiting.await, Err(Cancelled));
+    }
+
     #[test]
     fn share_target_snapshot_is_a_noop_without_snapshot_backed_checks() {
         // Semgrep owns its own worktree, so a semgrep-only run creates no shared
@@ -1874,9 +2981,41 @@ mod tests {
         let mut config = rust_config(true, true, true);
         let semgrep_only: Vec<Box<dyn Check>> =
             vec![Box::new(crate::checks::semgrep::SemgrepCheck)];
-        let snapshot = share_target_snapshot(&mut config, &semgrep_only);
-        assert!(snapshot.is_none());
+        let ledger = TaskLedger::new();
+        share_target_snapshot(&mut config, &semgrep_only, &ledger)
+            .expect("same-HEAD semgrep-only run needs no snapshot");
         assert!(config.scan_dir_override.is_none());
+        assert!(
+            ledger.scan_dir().is_none(),
+            "no shared worktree means the ledger has none to hand to later stages"
+        );
+        assert!(ledger.resolved_substrate().is_none());
+    }
+
+    #[test]
+    fn required_shared_snapshot_failure_aborts_without_mixing_revisions() {
+        let (repo, _target) = repo_with_off_head_target();
+        let mut config = rust_config(true, true, true);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some("feature".to_string());
+        let semgrep_only: Vec<Box<dyn Check>> =
+            vec![Box::new(crate::checks::semgrep::SemgrepCheck)];
+        let ledger = TaskLedger::new();
+
+        let error = share_target_snapshot_with(&mut config, &semgrep_only, &ledger, |_| {
+            anyhow::bail!("fixture snapshot failure")
+        })
+        .expect_err("an off-HEAD run must not fall back to the local checkout");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to materialize shared review snapshot"),
+            "unexpected error: {error:#}",
+        );
+        assert!(config.scan_dir_override.is_none());
+        assert!(ledger.scan_dir().is_none());
+        assert!(ledger.resolved_substrate().is_none());
     }
 
     #[test]
@@ -2490,6 +3629,68 @@ test result: ok. 2 passed; 0 failed
         assert!(!result.is_failure(), "Skipped must not count as a failure");
     }
 
+    #[test]
+    fn ledger_distinguishes_pre_spawn_skip_from_executed_skip() {
+        use crate::ledger::{SubstrateKey, TaskKey, TaskState};
+
+        let ledger = TaskLedger::new();
+        let now = std::time::Instant::now();
+        let launcher_error = "Failed to run mypy: No such file or directory (os error 2)";
+        let pre_spawn = CheckResult {
+            name: "Mypy".to_string(),
+            status: CheckStatus::Skipped,
+            duration: Duration::from_millis(2),
+            output: launcher_error.to_string(),
+            cached: false,
+            provenance: errored_check_provenance(
+                "Mypy",
+                &rust_config(false, true, true),
+                None,
+                launcher_error,
+                chrono::Local::now().to_rfc3339(),
+            ),
+        };
+        let pre_spawn_key = TaskKey::new(
+            "Mypy",
+            ledger_substrate(pre_spawn.provenance.as_ref(), &ledger),
+        );
+        record_completed_check(&pre_spawn, &ledger, now, now);
+
+        let entry = ledger
+            .lookup(&pre_spawn_key)
+            .expect("pre-spawn skip ledger row");
+        assert_eq!(
+            entry.state,
+            TaskState::Skipped {
+                reason: launcher_error.to_string()
+            }
+        );
+        assert!(
+            entry.queued_at.is_some() && entry.started_at.is_some(),
+            "the task was admitted even though its target command did not spawn"
+        );
+
+        let executed_skip = CheckResult {
+            name: "Runtime skip".to_string(),
+            status: CheckStatus::Skipped,
+            duration: Duration::from_millis(7),
+            output: "tool inspected the tree, then ruled itself out".to_string(),
+            cached: false,
+            provenance: None,
+        };
+        record_completed_check(&executed_skip, &ledger, now, now);
+        assert_eq!(
+            ledger
+                .lookup(&TaskKey::new("Runtime skip", SubstrateKey::default()))
+                .expect("executed skip ledger row")
+                .state,
+            TaskState::Run {
+                duration: Duration::from_millis(7)
+            },
+            "status Skipped alone is not proof that no command ran"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn run_js_command_prefers_local_node_modules_bin() {
@@ -2548,6 +3749,859 @@ test result: ok. 2 passed; 0 failed
         assert!(
             stdout.contains("LOCAL_BIN_RAN"),
             "run_js_command must exec the local bin directly, got: {stdout}"
+        );
+    }
+
+    /// Every check a run considers must leave exactly one ledger entry, stating
+    /// how it resolved. A gate that is missing from the ledger is a gate a later
+    /// consumer would re-run instead of recognising as already done.
+    #[tokio::test]
+    async fn run_all_records_one_ledger_entry_per_check() {
+        use crate::ledger::{SubstrateKey, TaskKey, TaskKind, TaskLedger, TaskState};
+        use async_trait::async_trait;
+
+        struct MockCheck {
+            name: &'static str,
+            eligibility: CheckEligibility,
+            cache_key: Option<&'static str>,
+        }
+
+        #[async_trait]
+        impl Check for MockCheck {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                self.eligibility.clone()
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                Ok(CheckResult {
+                    name: self.name.to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_millis(7),
+                    output: "ok".to_string(),
+                    cached: false,
+                    provenance: None,
+                })
+            }
+            fn cache_key(&self, _config: &Config) -> Option<String> {
+                self.cache_key.map(str::to_string)
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+
+        // A pre-populated entry so the cache-hit path is exercised for real,
+        // aged an hour so the replay has a non-trivial age to report.
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), true);
+        cache
+            .set("Mock cached", "cached-key", "passed", Some("replay"), None)
+            .expect("seed cache");
+        crate::cache::backdate(
+            &cache.entry_path("Mock cached", "cached-key"),
+            Duration::from_secs(3600),
+        );
+
+        let checks: Vec<Box<dyn Check>> = vec![
+            Box::new(MockCheck {
+                name: "Mock ran",
+                eligibility: CheckEligibility::Run,
+                cache_key: None,
+            }),
+            Box::new(MockCheck {
+                name: "Mock cached",
+                eligibility: CheckEligibility::Run,
+                cache_key: Some("cached-key"),
+            }),
+            Box::new(MockCheck {
+                name: "Mock skipped",
+                eligibility: CheckEligibility::Skip("lint disabled".to_string()),
+                cache_key: None,
+            }),
+        ];
+
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::new());
+        let (results, skipped) = run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect("run_all_checks");
+
+        // Behaviour is unchanged: the ledger is written alongside, not instead.
+        assert_eq!(results.len(), 2, "one live result plus one cache replay");
+        assert_eq!(skipped.len(), 1);
+
+        let entries = ledger.entries();
+        assert_eq!(entries.len(), 3, "exactly one ledger entry per check");
+        assert!(
+            entries.iter().all(|e| e.kind == TaskKind::Check),
+            "every entry recorded here is a check"
+        );
+
+        // Nothing resolved a run-wide substrate in this cut, and no mock reports
+        // provenance, so every key carries the honestly-unknown substrate.
+        let key = |name: &str| TaskKey::new(name, SubstrateKey::default());
+
+        let ran = ledger.lookup(&key("Mock ran")).expect("executed check");
+        assert_eq!(
+            ran.state,
+            TaskState::Run {
+                duration: Duration::from_millis(7)
+            },
+            "an executed check records the duration its result reports"
+        );
+        assert!(
+            ran.queued_at.is_some() && ran.started_at.is_some(),
+            "an executed check is queued and started"
+        );
+
+        let cached = ledger.lookup(&key("Mock cached")).expect("cached check");
+        match cached.state {
+            TaskState::Cached {
+                cache_age_secs,
+                origin,
+            } => {
+                assert_eq!(origin, SubstrateKey::default());
+                // The age of the ENTRY that was replayed, not of this run: a
+                // gate reported as passing off a stored answer states how stale
+                // that answer is.
+                let age = cache_age_secs.expect("a replay reports the age of its entry");
+                assert!(
+                    (3600..3660).contains(&age),
+                    "an entry backdated an hour replays as an hour old, got {age}s",
+                );
+            }
+            other => panic!("expected a cache replay, got {other:?}"),
+        }
+
+        let skipped_entry = ledger.lookup(&key("Mock skipped")).expect("skipped check");
+        assert_eq!(
+            skipped_entry.state,
+            TaskState::Skipped {
+                reason: "lint disabled".to_string()
+            },
+            "the skip reason is preserved verbatim"
+        );
+        assert!(
+            skipped_entry.queued_at.is_none() && skipped_entry.started_at.is_none(),
+            "a check that never entered the queue has no queue timestamps"
+        );
+    }
+
+    /// A gate that resolves exactly the way a test stages it, with no toolchain
+    /// behind it — so a dispatcher-level scenario (everything replayed,
+    /// everything skipped) can be staged hermetically.
+    struct StagedCheck {
+        name: &'static str,
+        eligibility: CheckEligibility,
+        cache_key: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Check for StagedCheck {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+            self.eligibility.clone()
+        }
+        async fn run(&self, _config: &Config) -> Result<CheckResult> {
+            Ok(CheckResult {
+                name: self.name.to_string(),
+                status: CheckStatus::Passed,
+                duration: Duration::from_millis(1),
+                output: "ok".to_string(),
+                cached: false,
+                provenance: None,
+            })
+        }
+        fn cache_key(&self, _config: &Config) -> Option<String> {
+            self.cache_key.map(str::to_string)
+        }
+    }
+
+    /// The substrate an off-HEAD run of the `repo_with_off_head_target` fixture
+    /// must resolve: the reviewed commit, read out of a snapshot.
+    fn reviewed_substrate(target: &str) -> crate::ledger::SubstrateKey {
+        crate::ledger::SubstrateKey {
+            target_sha: Some(target.to_string()),
+            tree_state: Some(TreeState::Snapshot),
+        }
+    }
+
+    /// Assert that `scan_dir` is the reviewed tree of the fixture and not the
+    /// local checkout — the whole point of the shared snapshot.
+    fn assert_scans_the_reviewed_tree(scan_dir: &std::path::Path, repo_root: &std::path::Path) {
+        assert_ne!(
+            scan_dir, repo_root,
+            "an off-HEAD review must not scan the local checkout",
+        );
+        assert_eq!(
+            std::fs::read_to_string(scan_dir.join("tracked.txt")).expect("snapshot on disk"),
+            "two\n",
+            "the shared scan dir must hold the REVIEWED revision",
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_root.join("tracked.txt")).expect("local checkout"),
+            "one\n",
+            "the fixture is only meaningful while the two trees disagree",
+        );
+    }
+
+    /// PRV-CONTEXT-SNAPSHOT-PROVENANCE, the quiet half: a run whose complete
+    /// applicable gate set has sound cache hits leaves NOTHING runnable. The
+    /// reviewed tree still has to be materialised for context; otherwise that
+    /// stage reads the operator's checkout while the diff and gate describe the
+    /// PR commit. A synthetic cacheable check keeps this invariant independent
+    /// of language checks that deliberately opt out of persistent replay.
+    #[tokio::test]
+    async fn a_fully_cached_off_head_run_still_materialises_the_reviewed_tree() {
+        let (repo, target) = repo_with_off_head_target();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some("feature".to_string());
+        config.quiet = true;
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), true);
+        cache
+            .set(
+                "CacheableCheck",
+                "cacheable-target",
+                "passed",
+                Some("replay"),
+                None,
+            )
+            .expect("seed cache");
+
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(StagedCheck {
+            name: "CacheableCheck",
+            eligibility: CheckEligibility::Run,
+            cache_key: Some("cacheable-target"),
+        })];
+
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::new());
+        let (results, skipped) = run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect("run_all_checks");
+
+        assert_eq!((results.len(), skipped.len()), (1, 0));
+        assert!(
+            results[0].cached,
+            "the fixture is only meaningful while its sole synthetic gate replays",
+        );
+
+        let scan_dir = ledger
+            .scan_dir()
+            .expect("a warm --pr run still owes the context stage the reviewed tree");
+        assert_scans_the_reviewed_tree(&scan_dir, &config.repo_root);
+
+        // The other half of the silence: with no snapshot there was no substrate
+        // either, so RUN.json reported the replay as being about no particular
+        // tree. Resolving one adopts the first pass's entries onto it.
+        assert_eq!(
+            ledger.resolved_substrate(),
+            Some(reviewed_substrate(&target))
+        );
+        assert_eq!(
+            ledger.entries()[0].key.substrate,
+            reviewed_substrate(&target),
+            "the replay is keyed to the tree this run went on to read",
+        );
+    }
+
+    /// The other way to end up with nothing snapshot-backed to run: the fast
+    /// remote-only preset, where the snapshot-backed gates are ruled out at
+    /// eligibility and the one runnable check is semgrep — which owns its own
+    /// worktree and is deliberately outside `uses_shared_scan_dir`. A non-empty
+    /// runnable set is therefore not evidence that a shared snapshot was made.
+    #[tokio::test]
+    async fn an_off_head_run_with_only_semgrep_runnable_still_materialises_the_tree() {
+        let (repo, target) = repo_with_off_head_target();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some("feature".to_string());
+        config.quiet = true;
+
+        let checks: Vec<Box<dyn Check>> = vec![
+            Box::new(StagedCheck {
+                name: "TypeScript",
+                eligibility: CheckEligibility::Skip("fast remote-only preset".to_string()),
+                cache_key: None,
+            }),
+            Box::new(StagedCheck {
+                name: "Semgrep scan",
+                eligibility: CheckEligibility::Run,
+                cache_key: None,
+            }),
+        ];
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::new());
+        let (results, skipped) = run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect("run_all_checks");
+
+        assert_eq!((results.len(), skipped.len()), (1, 1));
+        let scan_dir = ledger
+            .scan_dir()
+            .expect("semgrep owning its own worktree does not excuse the context stage");
+        assert_scans_the_reviewed_tree(&scan_dir, &config.repo_root);
+        assert_eq!(
+            ledger.resolved_substrate(),
+            Some(reviewed_substrate(&target))
+        );
+    }
+
+    /// The counterpart guard: with the target checked out, the repo root really
+    /// IS the reviewed tree, so a fully cached local run must still cost no
+    /// worktree. Materialising one "to be safe" would charge every local run for
+    /// a checkout that answers a question it does not have.
+    #[tokio::test]
+    async fn a_fully_cached_local_run_makes_no_snapshot() {
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), true);
+        cache
+            .set("TypeScript", "tsc-local", "passed", Some("replay"), None)
+            .expect("seed cache");
+
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(StagedCheck {
+            name: "TypeScript",
+            eligibility: CheckEligibility::Run,
+            cache_key: Some("tsc-local"),
+        })];
+
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::new());
+        let (results, _skipped) = run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect("run_all_checks");
+
+        assert!(results[0].cached);
+        assert!(
+            ledger.scan_dir().is_none(),
+            "target == HEAD: the artifact stage's fallback to repo_root is the right answer",
+        );
+        assert!(ledger.resolved_substrate().is_none());
+    }
+
+    /// The point of the governor: however many heavy gates a profile enables,
+    /// the number of them ON THE MACHINE at once never exceeds the budget. Uses
+    /// sleeping mocks rather than real toolchains — what is under test is the
+    /// dispatcher's admission, not any tool.
+    #[tokio::test]
+    async fn heavy_checks_never_exceed_the_budget() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct HeavyMock {
+            name: &'static str,
+            live: Arc<AtomicU32>,
+            peak: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl Check for HeavyMock {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> crate::governor::Weight {
+                crate::governor::Weight::Heavy
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(live, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                Ok(CheckResult {
+                    name: self.name.to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_millis(30),
+                    output: String::new(),
+                    cached: false,
+                    provenance: None,
+                })
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+
+        let live = Arc::new(AtomicU32::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        // Budget 6, heavy 3 — two heavy checks fit, a third must wait. Names are
+        // deliberately not cargo names, so the target/ lock is not what bounds
+        // them and the governor is the only thing under test.
+        let names = ["Mock A", "Mock B", "Mock C", "Mock D", "Mock E"];
+        let checks: Vec<Box<dyn Check>> = names
+            .into_iter()
+            .map(|name| {
+                Box::new(HeavyMock {
+                    name,
+                    live: Arc::clone(&live),
+                    peak: Arc::clone(&peak),
+                }) as Box<dyn Check>
+            })
+            .collect();
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::with_budget(6, 3));
+        let (results, _skipped) = run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect("run_all_checks");
+
+        assert_eq!(results.len(), names.len(), "every mock check reports");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "a budget of 6 with heavy=3 admits exactly two heavy checks at a time",
+        );
+        assert_eq!(live.load(Ordering::SeqCst), 0, "nothing is left running");
+    }
+
+    #[test]
+    fn check_schedule_is_cheap_then_capped_then_exclusive() {
+        use async_trait::async_trait;
+
+        struct Weighted(&'static str, crate::governor::Weight);
+        #[async_trait]
+        impl Check for Weighted {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> crate::governor::Weight {
+                self.1
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                unreachable!("schedule test never executes checks")
+            }
+        }
+
+        let mut checks: Vec<Box<dyn Check>> = vec![
+            Box::new(Weighted("tsc", crate::governor::Weight::Exclusive)),
+            Box::new(Weighted("cargo", crate::governor::Weight::Heavy)),
+            Box::new(Weighted("rustfmt", crate::governor::Weight::Light)),
+            Box::new(Weighted("semgrep", crate::governor::Weight::Heavy)),
+        ];
+        checks.sort_by_key(|check| schedule_rank(check.as_ref()));
+        assert_eq!(
+            checks.iter().map(|check| check.name()).collect::<Vec<_>>(),
+            vec!["rustfmt", "cargo", "semgrep", "tsc"]
+        );
+    }
+
+    /// A parent permit and a child cap are one contract: with two admitted heavy
+    /// parents and two workers each, the simulated descendant census peaks at
+    /// four, never at the host's core count per parent.
+    #[tokio::test]
+    async fn capped_heavy_parents_bound_the_descendant_census() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct PoolMock {
+            name: &'static str,
+            parents: Arc<AtomicU32>,
+            parent_peak: Arc<AtomicU32>,
+            descendants: Arc<AtomicU32>,
+            descendant_peak: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl Check for PoolMock {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> crate::governor::Weight {
+                crate::governor::Weight::Heavy
+            }
+            async fn run(&self, config: &Config) -> Result<CheckResult> {
+                let parents = self.parents.fetch_add(1, Ordering::SeqCst) + 1;
+                self.parent_peak.fetch_max(parents, Ordering::SeqCst);
+                let mut workers = Vec::new();
+                for _ in 0..config.resource_plan.worker_limit {
+                    let descendants = Arc::clone(&self.descendants);
+                    let peak = Arc::clone(&self.descendant_peak);
+                    workers.push(tokio::spawn(async move {
+                        let live = descendants.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(live, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        descendants.fetch_sub(1, Ordering::SeqCst);
+                    }));
+                }
+                for worker in workers {
+                    worker.await.expect("fake descendant must not panic");
+                }
+                self.parents.fetch_sub(1, Ordering::SeqCst);
+                Ok(CheckResult {
+                    name: self.name.to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_millis(30),
+                    output: String::new(),
+                    cached: false,
+                    provenance: None,
+                })
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+        config.resource_plan.worker_limit = 2;
+        let parents = Arc::new(AtomicU32::new(0));
+        let parent_peak = Arc::new(AtomicU32::new(0));
+        let descendants = Arc::new(AtomicU32::new(0));
+        let descendant_peak = Arc::new(AtomicU32::new(0));
+        let checks: Vec<Box<dyn Check>> = ["Pool A", "Pool B", "Pool C", "Pool D"]
+            .into_iter()
+            .map(|name| {
+                Box::new(PoolMock {
+                    name,
+                    parents: Arc::clone(&parents),
+                    parent_peak: Arc::clone(&parent_peak),
+                    descendants: Arc::clone(&descendants),
+                    descendant_peak: Arc::clone(&descendant_peak),
+                }) as Box<dyn Check>
+            })
+            .collect();
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::with_budget(4, 2));
+
+        run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect("bounded fake pools");
+        assert_eq!(parent_peak.load(Ordering::SeqCst), 2);
+        assert_eq!(descendant_peak.load(Ordering::SeqCst), 4);
+        assert_eq!(descendants.load(Ordering::SeqCst), 0);
+    }
+
+    /// Cancelling must take the dispatcher down through its ordinary error
+    /// path, not leave it waiting for checks whose children have just been
+    /// killed. Driven by calling `cancel()` directly: sending a real SIGINT from
+    /// a test is a known flake class, and the signal is not what is under test —
+    /// what the loop does about it is.
+    #[tokio::test]
+    async fn a_cancelled_run_stops_the_check_loop() {
+        use async_trait::async_trait;
+
+        struct SlowMock;
+
+        #[async_trait]
+        impl Check for SlowMock {
+            fn name(&self) -> &str {
+                "Slow"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                unreachable!("the run is cancelled long before this")
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::with_budget(4, 2));
+
+        let canceller = {
+            let governor = Arc::clone(&governor);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                governor.cancel();
+            })
+        };
+
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(SlowMock)];
+        let err = run_all_checks(checks, cache, &config, &ledger, &governor)
+            .await
+            .expect_err("a cancelled run does not produce results");
+        canceller.await.expect("canceller must not panic");
+
+        assert!(
+            err.downcast_ref::<Cancelled>().is_some(),
+            "the caller has to be able to tell a cancellation from a failure: {err}",
+        );
+    }
+
+    /// The TUI dispatcher is the same loop behind a different front end, and it
+    /// has to end the same way. It was a copy that had drifted: a plain
+    /// `while let` over the futures with no arm for the cancel at all, so a gate
+    /// holding a long timeout kept the stage open after `cancel` had already
+    /// SIGKILLed every child that had spawned.
+    #[tokio::test]
+    async fn a_cancelled_run_stops_the_event_check_loop() {
+        use async_trait::async_trait;
+
+        struct SlowMock;
+
+        #[async_trait]
+        impl Check for SlowMock {
+            fn name(&self) -> &str {
+                "Slow"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                unreachable!("the run is cancelled long before this")
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::with_budget(4, 2));
+
+        let canceller = {
+            let governor = Arc::clone(&governor);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                governor.cancel();
+            })
+        };
+
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(SlowMock)];
+        let err = run_all_checks_with_events(checks, cache, &config, &ledger, &governor, |_| {})
+            .await
+            .expect_err("a cancelled TUI run does not produce results either");
+        canceller.await.expect("canceller must not panic");
+
+        assert!(
+            err.downcast_ref::<Cancelled>().is_some(),
+            "the caller has to be able to tell a cancellation from a failure: {err}",
+        );
+    }
+
+    /// A check that has not been admitted is QUEUED, and the progress line has
+    /// to say so. Reporting it as running is the lie the split exists to stop:
+    /// the operator reads "Running: Clippy" and concludes clippy is slow, when
+    /// clippy has not started.
+    #[tokio::test]
+    async fn a_check_waiting_for_the_budget_is_queued_not_running() {
+        use async_trait::async_trait;
+
+        struct HeavyMock;
+
+        #[async_trait]
+        impl Check for HeavyMock {
+            fn name(&self) -> &str {
+                "Waiting"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> crate::governor::Weight {
+                crate::governor::Weight::Heavy
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                unreachable!("never admitted")
+            }
+        }
+
+        let governor = Arc::new(ResourceGovernor::with_budget(2, 2));
+        let cargo_lock = Arc::new(Semaphore::new(1));
+        let board = Arc::new(std::sync::Mutex::new(RunBoard::new(
+            ["Admitted", "Waiting"].into_iter(),
+        )));
+
+        // Somebody else already holds the whole budget.
+        let hog = governor
+            .acquire(crate::governor::Weight::Heavy)
+            .await
+            .expect("budget");
+        lock_board(&board).mark_running("Admitted", std::time::Instant::now());
+
+        let waiter = {
+            let governor = Arc::clone(&governor);
+            let cargo_lock = Arc::clone(&cargo_lock);
+            let board = Arc::clone(&board);
+            tokio::spawn(
+                async move { admit_check(&HeavyMock, &cargo_lock, &governor, &board).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        {
+            let board = lock_board(&board);
+            assert_eq!(board.names_where(true), vec!["Admitted"]);
+            assert_eq!(board.names_where(false), vec!["Waiting"]);
+            let line = board
+                .progress_line(12)
+                .expect("two outstanding checks produce a line");
+            assert_eq!(line, "Running: Admitted (12s) · Queued: Waiting");
+        }
+
+        drop(hog);
+        waiter
+            .await
+            .expect("waiter must not panic")
+            .expect("a released permit admits the queued check");
+        assert_eq!(
+            lock_board(&board).names_where(false),
+            Vec::<&str>::new(),
+            "an admitted check leaves the queue",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cargo_lock_waiter_races_cancellation() {
+        use async_trait::async_trait;
+
+        struct CargoWaiter;
+        #[async_trait]
+        impl Check for CargoWaiter {
+            fn name(&self) -> &str {
+                "Cargo test"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> crate::governor::Weight {
+                crate::governor::Weight::Heavy
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                unreachable!("the waiter must be cancelled before admission")
+            }
+        }
+
+        let governor = Arc::new(ResourceGovernor::with_budget(2, 2));
+        let cargo_lock = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&cargo_lock)
+            .acquire_owned()
+            .await
+            .expect("hold cargo lock");
+        let board = Arc::new(std::sync::Mutex::new(RunBoard::new(
+            ["Cargo test"].into_iter(),
+        )));
+        let waiter = {
+            let governor = Arc::clone(&governor);
+            let cargo_lock = Arc::clone(&cargo_lock);
+            let board = Arc::clone(&board);
+            tokio::spawn(
+                async move { admit_check(&CargoWaiter, &cargo_lock, &governor, &board).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        governor.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancellation must wake the cargo-lock waiter")
+            .expect("waiter must not panic");
+        assert!(matches!(result, Err(Cancelled)));
+        assert_eq!(lock_board(&board).names_where(false), vec!["Cargo test"]);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_finishes_board_rows_by_queued_name() {
+        use async_trait::async_trait;
+
+        struct Mismatch;
+
+        #[async_trait]
+        impl Check for Mismatch {
+            fn name(&self) -> &str {
+                "Queued"
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                Ok(CheckResult {
+                    name: "Different".to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_millis(1),
+                    output: "ok".to_string(),
+                    cached: false,
+                    provenance: None,
+                })
+            }
+        }
+
+        let (repo, _head) = repo_with_one_commit();
+        let mut config = rust_config(false, false, false);
+        config.repo_root = repo.path().to_path_buf();
+        config.quiet = true;
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), true);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::new());
+        let (results, skipped) = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_all_checks(vec![Box::new(Mismatch)], cache, &config, &ledger, &governor),
+        )
+        .await
+        .expect("mismatched result names must not hang the dispatcher")
+        .expect("run_all_checks");
+
+        assert!(skipped.is_empty());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Different");
+    }
+
+    /// The slow notice is about work, not about waiting. A check parked on the
+    /// budget for an hour has not been slow — it has not begun — and naming it
+    /// in "still running after Ns" would blame the tool for the queue.
+    #[test]
+    fn the_slow_notice_clock_ignores_queued_checks() {
+        let now = std::time::Instant::now();
+        let mut board = RunBoard::new(["Queued only"].into_iter());
+        assert_eq!(
+            board.longest_running_secs(now),
+            None,
+            "nothing admitted, so nothing has been running for any time at all",
+        );
+        assert_eq!(
+            board.progress_line(90).as_deref(),
+            Some("Queued: Queued only"),
+            "a line with nothing admitted claims nothing is running",
+        );
+
+        board.mark_running("Queued only", now - Duration::from_secs(61));
+        assert_eq!(
+            board.longest_running_secs(now),
+            Some(61),
+            "the clock starts at admission",
         );
     }
 
@@ -2838,9 +4892,13 @@ test result: ok. 2 passed; 0 failed
         let live_prov = live.provenance.expect("live run must carry provenance");
 
         // Pass 2 — served from cache.
-        let hit = load_cached_result(&MockCheck, &config, &cache)
+        let (hit, age_secs) = load_cached_result(&MockCheck, &config, &cache)
             .expect("second pass must hit the cache");
         assert!(hit.cached, "a replay must announce itself as cached");
+        assert!(
+            age_secs.is_some(),
+            "a replay must report how old the entry it replayed is",
+        );
         let hit_prov = hit
             .provenance
             .expect("a cache hit must carry the provenance of the run that filled it");

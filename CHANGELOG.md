@@ -13,6 +13,635 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI and the prview gate run on every pull request, not only those targeting
+  `main`.
+
+### Fixed
+
+- Cancellation remains typed as exit 130 even when rollback of the temporary
+  `latest` publication also fails; the rollback error is retained as context.
+- Vitest filtering now uses its supported `--testNamePattern` option. Snapshot
+  Drop no longer starts a potentially blocking `git worktree remove` child on a
+  Tokio worker, and exact rollback skips unreadable stale sibling registrations.
+- The CLI now rejects `--watch` together with `--tui` instead of silently
+  entering TUI mode and ignoring the requested watcher.
+- Context artifact planning is reconciled with the command outcome and actual
+  output file, so a timeout or unavailable command cannot remain recorded as
+  generated. Invalid SANITY results now abort before ZIP and publication while
+  retaining the incomplete directory for diagnosis.
+- Fast remote-only runs no longer enter repo-backed Rust API snapshot analysis;
+  they emit exact-revision typed unknowns that degrade the gate and require
+  review. Heavier modes isolate all base/target comparisons in one governed
+  same-binary worker with one 30-second total deadline. Worker timeout, failure,
+  or malformed output remains typed uncertainty. Headless Ctrl-C remains exit
+  130; the TUI keeps its documented cooperative first-interrupt behavior.
+- Cargo resource planning now opens only bounded regular configuration files
+  and refuses final symlinks, devices, FIFOs, and oversized inputs before any
+  synchronous read. A malicious off-HEAD `.cargo/config*` can therefore lower
+  the plan fail-closed, but cannot hang or exhaust the review before a governed
+  child exists. Context provenance now also marks `tauri info`, esbuild
+  metadata, and npm SBOM collection as `snapshot-borrowed-deps` when those
+  commands consume prview's linked local `node_modules`.
+- Python resource planning now applies the same finite-read boundary to the
+  selected project-scoped uv authority. A FIFO, device, non-regular file, or
+  `uv.toml`/`pyproject.toml` above 1 MiB fails closed before a governed uv child
+  exists; contained metadata symlinks still resolve to their in-tree regular
+  target.
+- Unix cancellation and timeout cleanup now freezes a hardened tool group,
+  discovers the fixed point of its live PPID descendants, binds each detached
+  group leader to its native birth identity, and kills leaf groups before the
+  original PGID. A child using `setsid` or `setpgid` can no longer escape the
+  resource governor merely by leaving its parent's group. Already-reparented
+  double-fork daemons remain outside the portable Unix guarantee and are
+  documented as such rather than covered by a false whole-tree claim.
+- Rust API analysis now treats `dylib` as both Rust-linkable and
+  native-producing, so private macro boundaries that may synthesize exported
+  symbols cannot disappear from an otherwise ordinary Rust dependency
+  surface. Custom-cfg authority also follows repository-backed Cargo config
+  from each package directory through its ancestors, with Cargo's merge and
+  same-directory filename precedence, instead of recognizing only the
+  repository-root config.
+- MCP lifecycle readers no longer classify a possibly-active v2 review as
+  stale merely because its process-birth identity is missing or the native
+  identity probe is indeterminate. A live PID now retains the one-active-run
+  invariant unless a successfully read identity proves PID reuse; confirmed
+  dead or recycled publishers still become stale.
+- Off-HEAD reviews now abort when their required shared target snapshot cannot
+  be materialized. Checks, Python pre-sync, and later context artifacts can no
+  longer continue against independent or local trees and combine multiple
+  revisions in one apparently coherent pack.
+- Python runners now resolve `CARGO_BUILD_JOBS` through the same effective
+  Cargo configuration path as direct Cargo gates. A Rust-backed `uv sync`,
+  `uv run`, or direct Python plugin can no longer raise a stricter reviewed
+  repository `[build].jobs` ceiling.
+- `MERGE_GATE.json.stale_cache_caveats` now dates old cached passing rows as
+  well as failures/blockers. A stale PASS can support a clean verdict after a
+  compiler or toolchain change just as a stale failure can hold a merge; the
+  caveat remains additive and never changes the decision by itself. A replay
+  whose age cannot be established is now surfaced as `age_status: "unknown"`
+  with a null age instead of being silently treated as fresh.
+- MCP quick reviews no longer cancel when a short-lived hardened helper exits
+  between spawn and governor registration. A non-reaping wait-status probe
+  distinguishes that completed child from an ambiguous identity failure while
+  preserving its PID/PGID until registration. If another member still occupies
+  that exited leader's group, registration terminates the group while the
+  leader remains unreaped. A rejected group signal is no longer mistaken for a
+  surviving tree when a bounded process census proves that only the zombie
+  leader remains; a live member or unreadable census still cancels fail-closed.
+  A provisional-only PGID is never left for the MCP parent to guess about after
+  PID reuse becomes possible.
+- MCP `run_review` now rejects source-buildable targets without a native
+  PID-reuse-safe process-birth identity before taking the activation lock or
+  spawning a review. Linux, macOS, and Windows remain the explicitly supported
+  MCP review targets; other targets retain the direct CLI path.
+- MCP branch activation no longer maps every lock failure to a retryable
+  "another review is running" response. Live contention carries
+  `retryable: true`; a stale legacy-compatible `.active.lock` preserves the
+  fail-closed mixed-version invariant but exposes `recovery_required`, its exact
+  path, and no retry timer. Permission, linked-path, and unsafe lock-file I/O
+  failures surface as non-retryable `storage_corrupt`; an unparseable legacy
+  token remains unattributable stale evidence and uses explicit recovery. A
+  failed legacy claim explicitly releases its v2 kernel lock before returning,
+  so documented manual recovery can retry immediately across platforms.
+- Python checks honor uv's `UV_NO_CONFIG` boolish contract before inspecting
+  repository configuration: enabled values skip discovered `uv.toml` and
+  `[tool.uv]` limits, false values preserve discovery, and an explicit contained
+  `UV_CONFIG_FILE` remains authoritative. Invalid and non-UTF-8 values fail loud
+  instead of manufacturing a resource ceiling. When uv is unavailable and
+  prview invokes Ruff, Mypy, or Pytest directly, uv-only files and environment
+  selectors no longer participate in planning or break an otherwise runnable
+  direct gate.
+- Direct Cargo gates preserve the effective repository `[build].jobs` ceiling
+  visible from the exact reviewed cwd, including remote snapshots, instead of
+  overriding a stricter project limit with prview's resource-plan width.
+  Signed inherited job limits retain Cargo's logical-core-relative semantics;
+  unknown, invalid, or zero Cargo config influence fails closed to one worker.
+- `--tests-pattern` no longer allows a Cargo regex to match zero tests or an
+  option-shaped value such as `--no-run` to produce a false green. Cargo accepts
+  literal substrings only and filtered runs require positive libtest execution
+  evidence; Vitest retains regex semantics, Mixed JS/Rust reviews require their
+  shared literal subset, and Pytest is explicitly unfiltered.
+- Repo-backed Rust API analysis now discovers Cargo's real binary targets from
+  `src/main.rs`, `src/bin/*.rs`, `src/bin/*/main.rs`, and `[[bin]]` entries,
+  respecting the per-target-category edition-2015 `autobins` default, explicit
+  paths, and `required-features`. Implicit libraries remain independent of
+  explicit binary/example/test/bench targets unless `autolib = false`.
+  Cargo-valid special library identities (`self`, `crate`, `super`, and `Self`)
+  remain analyzable as manifest identities even though they cannot be written
+  as raw Rust identifiers. Binary targets keep a target-scoped analysis identity,
+  preserving digit-prefixed and hyphen/underscore-distinct manifest target names, so
+  `foo-bar` and `foo_bar` cannot collide and native-export evidence cannot
+  inherit a same-named library's Rust dependency projection. Direct native
+  function evidence excludes implementation bodies, matching associated
+  exports, while static initializers remain observable.
+- While the TUI waits for an in-process synchronous analysis stage to unwind,
+  it continues reading raw terminal input. A second Ctrl-C now returns typed
+  cancellation immediately, allowing terminal cleanup and the established exit
+  130 path instead of trapping the operator in the cancel join. Headless and
+  TUI cancellation both split the synchronous cancel transition from blocking
+  process-tree termination, so the second interrupt stays live even while a
+  Windows `taskkill` is still running. A ready interrupt is drained before a
+  completed work future can publish a verdict.
+- The opt-in balanced resource plan no longer creates two parent permits on a
+  one-core host; parent permits now stay within the detected logical-core count,
+  preserving the advertised single-heavy-tool envelope on constrained runners.
+- The `gh --version` startup probe preserves typed cancellation at its own
+  error boundary instead of relying on the outer startup supervisor to recover
+  it. Direct or internal config construction under a run scope no longer
+  mislabels cancellation as a missing GitHub CLI.
+- MCP quick reviews route Tokio child-wait errors through the same bounded
+  containment and direct-root reap used for timeouts. On Unix the adapter first
+  requests cooperative Ctrl-C, then uses a parent-owned, incarnation-bound
+  sidecar ledger to reach every separately-grouped tool if the review root
+  cannot unwind. A pre-exec provisional row, stopped-root descendant census,
+  and inherited ledger-lock barrier close the spawn-before-registration gap;
+  a provisional PID is never trusted as signal authority by itself. The ledger
+  FD stays CLOEXEC in the MCP parent and is handed off only inside the forked
+  review root. Killing the root process group alone cannot contain nested Cargo
+  or Semgrep groups. The mode-0600 sidecar lives outside the immutable pack;
+  confirmed cleanup removes it, while an unconfirmed cleanup retains it and
+  returns `containment_confirmed: false`. Running markers remain non-blocking
+  diagnostic stale state instead of substituting stale-marker expiry for
+  explicit cleanup.
+- MCP active-run discovery filters markerless history and the completed-run
+  `latest` alias before lifecycle probing. Runs without `SANITY.json` no longer
+  reload the global publication index while they are polled, while completed
+  publication still wins over a lingering live marker.
+- MCP deep reviews retain and reap every detached direct child, including an
+  immediately failing process, and inherit the parent-owned child-group ledger
+  used by quick reviews. After the root exits, the reaper drains separately
+  hardened Cargo, Semgrep, and other tool groups before it may remove the
+  running marker; unconfirmed containment remains explicit diagnostic state.
+  A zombie or surviving nested group therefore cannot be mistaken for a
+  completed detached review or keep a later review blocked.
+  Versioned running markers bind the PID to its native process-birth identity
+  across Linux, macOS, and Windows; recycled v2 PIDs become stale, while a live
+  legacy PID blocks conservatively until it exits. Marker or reaper setup
+  failures terminate and reap the child tree before the RPC returns
+  `run_failed`. The reaper receives the caller's exact publication-index path,
+  so its background completion check cannot drift into another storage home.
+- Off-HEAD Python pre-sync now runs on the shared reviewed snapshot with the
+  same per-commit `UV_PROJECT_ENVIRONMENT` as Ruff, Mypy, and Pytest; it no
+  longer mutates the operator checkout's environment or warms a venv the gates
+  do not use. `uv.toml` is contained like `pyproject.toml` and `uv.lock`, while
+  ambient uv config/project/working-directory redirects fail closed when they
+  would leave the exact reviewed root. Repository `uv.toml` or `[tool.uv]`
+  concurrency limits are ceilings alongside inherited environment values and
+  the resource plan. Every later `uv run` inherits the same resolved
+  `UV_CONCURRENT_*` and `CARGO_BUILD_JOBS` caps, so a failed pre-sync cannot
+  retry an unbounded build or override a stricter project limit.
+  Pytest is pinned to the single config selected inside the reviewed root (or
+  an explicit empty config), preventing ambient parent options from changing
+  the run. An isolated probe of the actual project pytest selects the supported
+  major/minor discovery contract; unknown versions, malformed or unreadable
+  configs, unparseable addopts, a standalone option terminator, and xdist custom
+  gateway options (`--tx`/`--px`) fail closed. Shell-quoted inherited/config
+  addopts follow pytest token boundaries, while explicit lower
+  or disabled xdist counts stay unchanged and larger/auto pools are capped.
+- Run publication fails closed when the durable index cannot be read or when a
+  completed pack cannot be committed to discoverable history. Transactional
+  readers reject corrupt JSONL instead of saving a fabricated partial ledger,
+  and latest-journal recovery preserves a valid journal until the index is
+  readable again. MCP Quick and Deep require both finalized pack bytes and the
+  exact durable run-id/path index row; SANITY alone is never `completed`.
+- Ordinary-machine bounded-runtime receipts bind their release binary to the
+  exact clean source commit through an embedded build SHA and record the
+  binary's SHA-256 digest; an old binary beside a new checkout cannot produce
+  exact-SHA evidence.
+- Private Rust API dependency resolution follows `extern crate self as alias`
+  back to the crate root, so a private layout or auto-trait change behind
+  `alias::Type` cannot disappear as stable unresolved evidence.
+- Rust transforming-attribute uncertainty, including recursively nested
+  `cfg_attr`, is collected before visibility filtering and binds its annotated
+  input to lock-backed external dependency
+  identity or, for reachable local proc-macros, the complete live tracked-entry
+  substrate. Nonstandard crate roots, private annotated items, source
+  replacements, stale/unrelated lockfiles, and unproven symlink targets can no
+  longer hide generated public API uncertainty.
+- Derive macros are modeled as additive: the annotated item remains a confirmed
+  input contract while custom generated output stays typed uncertainty. Custom
+  derive/helper tokens cannot manufacture a confirmed break, and an imported
+  derive whose name shadows `Debug`, `Clone`, or another builtin remains
+  conservative instead of being misclassified as compiler-provided. Builtin
+  `Default` variant markers remain confirmed through nested, matching
+  `cfg_attr` predicates; unresolved conditional relationships stay typed
+  uncertainty, while a custom derive helper named `default` remains transform
+  input only. Associated transformers are materialized only when their
+  inherent or trait owner is externally reachable; public type-alias chains
+  remain typed owner uncertainty rather than invented confirmed methods.
+- External transformer proofs require an effective lock entry with an external
+  source, registry checksum or precise Git commit, and a version satisfying the
+  declared requirement; a stale lock containing only a same-name workspace
+  package cannot qualify. Reachable path manifests and effective
+  `.cargo/config` bytes from every reachable member invocation context
+  participate in the proof, and working-tree regular-to-symlink type changes
+  fail closed.
+- Public `async fn` and return-position `impl Trait` bodies retain item-local
+  opaque-return auto-trait uncertainty through public reexports and inherent
+  projections, bound to canonicalized repo-backed Rust plus all other live
+  tracked input identities and effective lock data so private helpers,
+  nonstandard includes, and build assets cannot disappear; tracked symlinks stay
+  unresolved. New/removed opaque items and newly added async trait defaults do
+  not gain redundant Unknown findings, including through public trait aliases.
+  Ordinary bodies remain outside confirmed contracts; adding a public
+  trait-method default is compatible, while removing one is a confirmed
+  contract change. Parameter, local irrefutable destructuring, closure, loop,
+  and lexical-shadow binder spellings are alpha-normalized in opaque bodies;
+  refutable pattern names stay conservative without name-resolution proof.
+- Rust 2024 `unsafe(no_mangle)`, `unsafe(export_name)`, and
+  `unsafe(link_section)` remain ordinary confirmed attributes on public items.
+  A private `no_mangle`/`export_name` function or static emits typed
+  binary-export uncertainty instead of disappearing from the API analysis,
+  including through nested `cfg_attr`. In native-only targets, associated binary
+  exports with a transforming attribute bind their complete macro-visible member
+  input, a separate normalized owner/ABI contract, and the revision-backed
+  transformer implementation. Native-producing
+  `dylib`/`cdylib`/`staticlib`/`bin` targets, including mixed `rlib + cdylib`
+  targets, also retain typed potential export evidence when a custom associated
+  attribute can synthesize the export itself. The speculative associated-macro
+  fallback is limited to those native artifacts, so an internal macro on a
+  private owner in an `rlib`-only crate does not manufacture API uncertainty.
+  Conditional `macro_export`
+  declarations remain root API, while item-position macro invocations in both
+  Rust-linkable and native-only targets bind their input to a revision-backed
+  implementation substrate; native-only `include!` also retains its included
+  source proof instead of disappearing behind the target-level uncertainty.
+- Rust named private-field order is preserved only when `repr(C)` defines it.
+  Pure reorders under `repr(transparent)` or standalone `repr(packed)` /
+  `repr(align)` are neutral, while private field types and semantic repr
+  attributes remain observable; `repr(C)` and primitive enum representations
+  stay order-sensitive.
+- TUI startup keeps its signal supervisor through the raw-mode transition and
+  gives an already-pending interrupt priority during the explicit handoff to
+  key events. `--tui` now rejects one fixed immutable
+  `--output-dir`, just like `--watch`, because every rerun needs a fresh pack.
+- Unix-only Git/tar test overrides are compiled only on Unix, allowing the
+  Windows process-tree cancellation job to compile under `-D warnings`.
+- Publication rollback tests run the synchronous restore on a blocking worker
+  under a real bounded completion deadline instead of a scheduler-sensitive
+  sub-100ms assertion.
+- Fast remote-only preflight no longer lists TSC or ESLint as expensive work
+  when that preset will skip those gates.
+- MCP Quick and Deep reserve their output path through a private one-shot nonce
+  before launching the child, then adopt only that fresh control-only directory.
+  Public `--output-dir` remains immutable and cannot reuse an existing pack;
+  `--watch` rejects a fixed explicit output path because every iteration needs a
+  distinct pack. Mutable MCP liveness/log files remain readable beside the pack
+  but are excluded from its manifest and ZIP.
+- Retention authority rejects every Windows reparse point, including junctions
+  and mount points that are not reported as symlinks. Pre-rename validation,
+  transaction recovery, every intermediate identity component, and recursive
+  cleanup all use the same owned-file/directory predicate and never traverse an
+  external target. Identity and manifest files on Unix must also own their inode
+  rather than be hard links.
+- Windows check and context-command trees are owned by Job Objects, so a
+  successful wrapper cannot orphan descendants by exiting before prview reaps
+  it. Synchronous Git/pipeline/context cleanup uses the live Job Object first
+  and `taskkill` only as a fallback; a dual termination failure returns from
+  cancellation instead of entering an unbounded wait. The `windows-latest` job
+  proves cancel and root-exits-first paths. Its process-tree fixture now uses
+  the native process-liveness probe instead of spawning `tasklist` for every
+  poll, accepts only newline-terminated stable PID publications before taking
+  descendant ownership, binds each captured PID to its native process-birth
+  identity before probing or cleanup, and reports captured PowerShell output
+  on a bounded 30-second readiness failure. This prevents stale ownership from
+  certifying a recycled runner PID and narrows failure cleanup to the recorded
+  process incarnation before invoking the PID-based tree-kill fallback.
+- Primitive integer enum representations (`repr(u8)` through `repr(isize)`) are
+  ABI-sensitive in Rust API deltas, including non-exhaustive variant additions.
+- Unparseable and non-UTF-8 rootless Cargo manifests fail crate discovery closed
+  as `WorkspaceDiscovery` uncertainty instead of letting a parseable fixture
+  become the product authority.
+- Parseable Cargo manifests that define neither `[package]` nor `[workspace]`
+  are invalid authorities rather than invisible files. A root manifest emits
+  typed manifest uncertainty, a rootless candidate prevents sibling selection,
+  and a manifest cannot combine `[workspace]` with `package.workspace`.
+- Inherited, `pub(crate)`, and `pub(super)` fields share one external-private
+  Rust API visibility while their types and tuple positions remain observable.
+- `uv sync` preserves an operator's stricter inherited `UV_CONCURRENT_*` caps,
+  direct Cargo gates preserve stricter inherited and repository-configured
+  `CARGO_BUILD_JOBS`, and
+  Cargo test binaries preserve a stricter inherited `RUST_TEST_THREADS`,
+  instead of raising any of them to the prview worker limit.
+- Snapshot extraction preserves the `git archive` stdout pipe after applying
+  hardened subprocess defaults, so `tar` receives the archive instead of an
+  empty stdin and the producer no longer exits through SIGPIPE.
+- Rust API crate discovery anchors workspace authority at the repository-root
+  `Cargo.toml`; a nested fixture workspace can no longer displace a root product
+  package from the census.
+- Nested `tsconfig*.json` files under fixtures, dependency/build-cache trees, or
+  vendor directories no longer turn a Rust repository into a Mixed profile;
+  real monorepo configs remain product signals even when a legitimate package
+  is named `build` or `dist`.
+- `prview state --tui` no longer starts a review from `r`.
+- Moving a library crate root (`src/lib.rs` → `lib.rs`) is not a public API
+  change; the compared crate contract keeps `proc-macro` and `crate-type` only.
+  A package without an explicit `[lib]` and without a live implicit
+  `src/lib.rs` is now correctly treated as having no library target instead of
+  emitting `MissingLibRoot`; an explicit missing library root remains typed
+  uncertainty. A tracked symlink in the implicit root position is never
+  silently treated as an absent crate or followed outside revision provenance;
+  both compared sides retain non-neutralizable typed uncertainty instead.
+- Cargo-valid keyword package and library names that Rust can address as raw
+  identifiers remain in the API census, and `package.build = true` resolves to
+  Cargo's default `build.rs` rather than being rejected as an invalid manifest
+  value.
+- Cache hits take content and mtime from one open file handle, so a concurrent
+  replacement cannot pair one entry's bytes with another's age.
+- A finished context-command child is unregistered before its output is read.
+- A check-dispatcher board row is finished by the queued check name, and an
+  exhausted future stream with leftover rows is an error instead of a hang.
+- Timeout waits keep durable tree ownership until after process-tree
+  termination, including after a Windows root PID has already exited.
+- Optional Cargo dependencies without an explicit `[features]` table are
+  implicit features in the repo-backed API contract, so removing or renaming
+  them is a compared delta.
+- Library `[lib] crate-type` is part of the crate contract. Ordinary Rust API
+  projection is limited to Rust-linkable `lib`/`rlib`/`dylib` outputs,
+  procedural macros declared by either `proc-macro = true` or an effective
+  `crate-type = ["proc-macro"]` retain their separate export surface, and native-only
+  `cdylib`/`staticlib`/`bin` targets retain binary-export evidence, including
+  exported associated functions in inherent and trait impls, plus typed target
+  uncertainty without inventing a Rust dependency API.
+- Exported declarative macro contracts bind the effective defining-crate
+  edition, including package, workspace-inherited, and library-target
+  authority. An edition change without an exported macro does not manufacture
+  a crate-level break.
+- Public custom `cfg` predicates, including nested fields, variants, trait or
+  impl members, and foreign items, bind revision-backed build-script and Cargo
+  config authority. Only a live declared/implicit build script or effective
+  repository-backed config in the package's manifest-directory ancestor chain
+  that can actually supply `--cfg` qualifies; sibling and descendant configs
+  do not. Equal complete digests may neutralize; missing,
+  invalid, included, or otherwise unresolved authority never does. Compiler-set
+  `target_abi` remains a built-in predicate rather than custom cfg.
+- Trait-default comparison is structural and cfg-qualified. Adding a method or
+  associated-const default is compatible, while removing a default, changing a
+  const value/type/cfg, or swapping defaults between disjoint cfg branches
+  remains a parent `Changed` fact. Opaque-return proofs use the same member cfg
+  identity and cannot cross-cancel between same-named methods.
+- Adding a field to a `#[repr(C)]` (or packed/transparent) struct is a parent
+  `Changed` ABI break even when the struct is `#[non_exhaustive]`.
+- `include!` / `include_str!` / `include_bytes!` unknowns carry a digest of the
+  included file in both item and public const/static expression position, so an
+  unchanged invocation no longer hides a breaking edit of the included source.
+- Transforming-attribute uncertainty is bound to the complete annotated input;
+  an unchanged derive/attribute can no longer neutralize a changed public item.
+- Adding a variant to an ABI-sensitive `#[repr(...)] #[non_exhaustive]` enum —
+  including primitive integer reprs — is a parent `Changed` fact rather than an
+  informational addition.
+- TUI artifact generation uses `governor::blocking_stage`, matching headless
+  `App::run`, so a single-worker Tokio runtime can still poll q/Escape and
+  cancel while the synchronous pack is being written.
+- A cancelled artifact run no longer publishes `latest` or a run-index row.
+  Those advertisements ran after the `PackPublication` seam and before the
+  final cancellation check, so Ctrl-C in that window could delete the pack's
+  success surfaces while still pointing `latest` and the index at the
+  incomplete directory. If cancel is observed after `latest` is written, the
+  previous completed alias is restored before the incomplete marker is left.
+  `register_and_prune` atomically stages retention candidates in private
+  prune-trash before the index commit: a cancel mid-transaction restores every
+  directory and the prior index. Physical deletion is deferred to the next
+  registration, before that run mutates its own index, and is cooperatively
+  cancellable.
+  If a custom output filesystem cannot be staged atomically, retention is
+  skipped with a warning while the new row and all predecessor rows are kept.
+  `latest` and `index.jsonl` are one globally serialized, restart-recoverable
+  publication: a durable journal reconciles crashes at either boundary.
+  During migration, the **index critical section** remains mutually exclusive
+  with pre-0.8 create-new sentinels. This cannot serialize the whole legacy
+  publication: a pre-0.8 binary retargets `latest` before it attempts that
+  sentinel. Operators must therefore drain and exclude every pre-0.8 publisher
+  before the 0.8 cutover; only 0.8-to-0.8 publication is end-to-end
+  transactional. A stale legacy sentinel fails closed and requires explicit
+  operator removal after old publishers are ruled out. Lock and journal paths
+  refuse links that could redirect truncation, and journal writes use owned
+  unique temp files.
+- Repo-backed crate discovery follows workspace `members`/`exclude` (or the
+  single root package). Fixture and tool `Cargo.toml` files are not product API.
+- Multiple independent workspaces without a root `Cargo.toml` now fail closed
+  as side-specific `WorkspaceDiscovery` uncertainty instead of being silently
+  unioned into one public surface.
+- `impl std::fmt::Display` (and other external/prelude traits) on a public type
+  is a `TraitImplResolution` unknown, not a silent no-delta.
+- Unqualified imported trait impls on public types are retained as
+  `TraitImplResolution` unknowns without relying on a hard-coded trait-name
+  allowlist.
+- Private-field type changes on a public struct (for example `u8` → `Rc<()>`,
+  which drops `Send`/`Sync`) change the parent contract, while a pure private
+  field reorder under the default/`repr(Rust)` layout does not. An informational
+  field addition to a non-exhaustive struct cannot mask a simultaneous repr,
+  generic, attribute, or private-field change; public fields are identified by
+  visibility rather than collision-prone synthetic names.
+- Public signatures that depend on transitive non-public local types or their
+  local trait impls now emit guard-aware `PrivateTypeDependency` uncertainty
+  instead of overclaiming a compiler-derived breaking fact. Private imports,
+  module aliases, and unreachable-module reexports participate in that closure.
+- A root package that declares `package.workspace` is resolved through that
+  workspace's complete member authority instead of being treated as an
+  isolated package; missing, invalid, or incomplete workspace membership fails
+  closed as `WorkspaceDiscovery` uncertainty.
+- TUI/headless `git fetch` and `git archive | tar` register with the run
+  governor, so q/Escape/Ctrl-C can stop the sync phase. Headless provenance,
+  target/base snapshot creation, watch-mode Git state probes, and TUI preflight
+  also run only after an interrupt supervisor is active; TUI preflight happens
+  before raw terminal mode.
+- Raw-mode TUI Control-C is handled before wizard/panel routing, and async
+  command deadlines now include bounded stdout/stderr drain with reader-task
+  cleanup after the child is reaped.
+- Loctree cache creation runs in a private governed worker, so cancelling TUI or
+  headless analysis terminates the synchronous scan instead of merely dropping
+  the awaiting `spawn_blocking` handle.
+- Cold `uv sync` takes the run's Exclusive budget and inherits the configured
+  download/build/install concurrency cap.
+- Context commands share one stage timeout instead of minting a fresh deadline
+  per Exclusive spawn.
+- A context command that reaches that deadline while still queued remains
+  `skipped` in the ledger instead of being claimed as a zero-duration run.
+- Same-run context dedup is `reused`, not `cached` with a null age. A live
+  gate that already produced the signal is reuse; only a stored replay stays
+  `cached` with the original entry's age. `RUN.json` `ledger.schema` is `2`.
+- Persistent replay is disabled for TypeScript, ESLint, Stylelint, Ruff and
+  Mypy until their keys can bind the complete effective config, ignore,
+  plugin, dependency and toolchain inputs. Same-run context reuse remains.
+- `RUN.json` ledger rows emit `queue_wait_secs` when a check waited on the
+  resource budget before admission, so a slow tool is not confused with queue
+  pressure.
+- Public trait-impl evidence alpha-normalizes impl-level generic binders, so
+  renaming `impl<T> Trait for Wrapper<T>` to `impl<U> Trait for Wrapper<U>`
+  is not a review-required unknown delta.
+- Public trait associated const/type members reuse the same alpha-normalized
+  binder scopes. Rust API additions remain informational only when they cannot
+  add an auto-trait input or shift an existing implicit discriminant: an
+  appended fieldless variant on an otherwise unchanged `#[non_exhaustive]` enum
+  qualifies; inserted or payload variants and fields added to existing structs
+  or variants retain a parent `Changed` finding.
+- A check admitted by the resource governor but unable to launch its target
+  command is recorded as ledger `skipped`, not as live `run` coverage. Checks
+  that actually execute before returning a runtime skip remain `run`.
+- `include!`, `include_str!` and `include_bytes!` dependencies in every public
+  contract position carry their source digest, including declarations exposed
+  through private-module reexports, without degrading unreachable declarations
+  or scanning ordinary function bodies. Proofs bind the resolved public alias,
+  never cross disjoint cfg declarations, and terminal `include_str!` /
+  `include_bytes!` proofs remain stable when an unchanged private donor file
+  moves behind that alias. Plain `include!` stays review-required until its
+  path-sensitive and transitive expansion can be proven.
+- `repr(C)` union members are canonicalized as an order-independent set while
+  retaining names and types; named `repr(Rust)` enum-variant fields are likewise
+  order-neutral, while `repr(C)` enum payload order remains ABI-significant.
+- Public trait impls declared in private helper modules are retained as
+  `TraitImplResolution` unknowns instead of disappearing from the delta.
+- Retargeting a public reexport between two still-public types is a compared
+  contract change; private donor renames stay semantically equal.
+- TUI backend errors after analysis has started cancel and join the analysis
+  task instead of detaching Cargo/Node process trees.
+- The TUI `r` hotkey no longer starts a run from the branch wizard or the
+  help overlay, so `r` can still be typed into the branch filter.
+- `cargo test` caps libtest through `RUST_TEST_THREADS` rather than forwarding
+  `--test-threads` after `--`, so `harness = false` custom targets are not
+  passed libtest-only flags and a stricter operator-provided thread limit is
+  never raised.
+- Repo-backed Rust API analysis now preserves callable tuple-constructor shape,
+  exhaustive versus `#[non_exhaustive]` enum policy, explicit-repr private
+  layout, public data-type binder semantics, and valid siblings beside legal
+  non-UTF-8 Git paths. Trait impls that need compiler resolution remain typed
+  unknowns instead of silently disappearing.
+- Raw non-UTF-8 Git path identities cannot collide with a legal UTF-8 file whose
+  name literally matches the printable `<git-path-bytes:...>` surrogate, while
+  nested artifact-facing surrogates remove the internal NUL sentinel before
+  JSON or rendered output.
+- Public modules, library-crate declarations, and Cargo feature contracts now
+  participate in the shared Rust `ApiDelta`, so their removal is projected
+  consistently through human artifacts, JSON, MERGE_GATE, report, CLI, and MCP
+  readers without changing schema 2.3 or existing field names.
+- Ctrl-C is observed in every phase of a run, including the artifact stage. The
+  interrupt was watched from the same `select!` as the run itself, which only
+  works while the run keeps yielding — `artifacts::generate` is synchronous and
+  polls its children with `std::thread::sleep`, so for the whole of the longest
+  stage of a review neither the first nor the second interrupt could fire, and
+  since `tokio::signal` had replaced SIGINT's default disposition the terminal
+  could not end the process either. The supervisor now watches from its own task.
+- A cancelled run never reports a verdict. Only the checks stage watched for
+  cancellation, so a Ctrl-C arriving during the heuristics or the artifact stage
+  — or during a run whose gates all replayed from the cache, where that stage's
+  wait loop is never built — was ignored: the run finished, wrote a pack whose
+  context commands were all recorded `cancelled`, and exited `0` or `1` on the
+  verdict computed from it. Cancellation is now checked between the stages, so
+  the run ends in exit `130` as the contract says. A partial pack may remain on
+  disk; nothing claims a verdict from it.
+- `--watch` ends on the first Ctrl-C. The iteration reported a cancelled run as
+  an ordinary error and carried on watching, but the governor it shares with
+  every later iteration was by then permanently closed — so each subsequent edit
+  emitted a pack with an empty `30_context` and announced "Regenerated
+  artifacts", until a second interrupt killed the process and left the temporary
+  worktrees behind. A cancel arriving while the watcher is idle ends it too.
+- Ctrl-C during the `uv sync` pre-step stops it. The Python venv build ran
+  outside any child scope, so the governor held no pid for it and `cancel()`
+  signalled nothing: the run announced that it was stopping its tools and then
+  waited out the full five-minute timeout with `uv` still building. It is now
+  registered like every other child, and is not started at all for a run that
+  has already been cancelled.
+- `prview --update` no longer reports a verdict for a cancelled run. Every
+  cancellation gate sat after the checks stage, and `--update` returns before
+  reaching it: a Ctrl-C during the initial `git fetch` — which the governor holds
+  no pid for, so it cannot be cut short — on a HEAD with no new commits printed
+  "stopping running tools" and then handed back the *previous* run's pack, which
+  the exit code was computed from. The run is now asked on entry and again before
+  reusing that pack, so it exits `130` like any other cancelled run.
+- The TUI's check dispatcher stops on Ctrl-C the way the headless one does. It
+  was a copy that had drifted back into two already-fixed bugs while its comment
+  still claimed to mirror them: the `uv sync` pre-step ran outside any child
+  scope and with no cancellation gates, and the loop over the running gates had
+  no arm for a cancel at all, so a gate with a long timeout could hold the stage
+  open after every child had been killed. Both paths now go through the shared
+  helper and the shared loop shape.
+- The context stage no longer repeats a gate's work on a JS repository. When the
+  gates share an analysis snapshot, the ledger entries that predate it are
+  adopted onto that snapshot's revision signature — but the signature was
+  computed once for the whole run, ignoring which dependencies each tool borrows
+  from the working tree. An ESLint entry was therefore filed under `snapshot`
+  while the context stage went on to ask for `snapshot-borrowed-deps` for the
+  same directory, the lookup missed, and the context stage re-ran a full
+  `eslint . -f json` (and, off the fast path, a full `tsc` trace) that the gate
+  had already done — on exactly the two scenarios the shared snapshot exists
+  for. Each entry is now adopted under the signature its own tool will later
+  compute, so the gate's result is found — and a missing tool is no longer
+  reported as "no ESLint gate in this run" when the run did have one.
+
+### Added
+
+- Ctrl-C cancels a run instead of killing it. The first interrupt stops the
+  governor granting work, SIGKILLs the process group of every tool the run
+  spawned (reaching `cargo → rustc → cc` and `sh → pnpm → tool`, not just the
+  direct child), and unwinds the run through its ordinary error path so the
+  temporary worktrees and analysis snapshots are removed on the way out — an
+  aborted process left all of them on disk. A cancelled run exits `130`
+  (128 + SIGINT), deliberately outside prview's verdict codes because it
+  produced no verdict; a second interrupt exits immediately. Context commands
+  that never started are recorded as `cancelled` rather than omitted. `--tui`
+  keeps its own quit path. A Loctree worker reaped on the narrow
+  cancel-versus-wait seam remains a typed cancellation rather than leaking a
+  platform-specific wait error.
+- Temporary review worktrees arm a path-exact in-process registration rollback
+  before `git worktree add`. Cancellation or timeout after Git has written
+  common-dir metadata, and cleanup of an already-created snapshot under a
+  cancelled run, remove only that snapshot's administrative entry without
+  spawning an ungoverned child or waiting for a future global prune.
+
+### Changed
+
+- The ordinary-machine `--deep` acceptance fixture now runs and requires real
+  Cargo, Vitest, Semgrep, TSC, ESLint, and Stylelint processes. A green receipt
+  can no longer be produced by the narrower Rust-plus-Vitest subset or by a
+  check that merely started and then failed, skipped, or reused cached evidence:
+  every required `RUN.json` row must be a live `passed` result. Its census
+  separates Semgrep RPC coordinators from scan workers, and exact-SHA receipts
+  require a clean source tree at the claimed commit. The harness deliberately
+  omits `--resource-budget`, so it proves the bare `--deep` CLI default itself
+  resolves to the safe one-parent/one-child plan.
+- Rust trait-impl unknown evidence resolves top-level trait/owner aliases
+  (including reference, pointer, slice, and array owners) to guarded nominal
+  pairs, preserves each trait/owner pair's joint cfg region, and compares
+  ordinary associated items independently of source order.
+  Declaring scope remains fail-closed for relative names; aliases used only in
+  generic arguments remain typed uncertainty until compiler-backed resolution.
+- Alias-resolution exhaustion is structural, never paired away as an equal
+  partial proof, and cannot be spoofed by matching diagnostic text.
+- Retention recovery validates a staged payload's RUN identity before any move
+  or deletion. Missing, invalid, or mismatched transaction metadata preserves
+  evidence without blocking later publication, while I/O failures after
+  mutation still abort. An unconfirmed previous-index rollback keeps the outer
+  durable journal for the next lock owner. Relative custom output paths become
+  absolute before publication, and a custom path must be newly claimed for one
+  immutable pack rather than reused by multiple history rows. Unix/macOS parent-directory fsync defines the
+  power-loss ordering; other platforms do not claim that durability tier.
+- Quality checks and context commands now run under one machine-wide budget
+  (`ResourceGovernor`) instead of each stage picking its own fan-out. Checks
+  declare `Light` or `Heavy` via `Check::resource_weight`; unspecified checks
+  stay `Exclusive`. Rustfmt is `Light`. The Cargo family, Vitest, and Semgrep
+  are `Heavy` and cost half the budget each, so a mixed Rust+JS profile no
+  longer starts four toolchains that each size their worker pool to the whole
+  machine. TypeScript, ESLint, Stylelint, and Python gates stay `Exclusive`
+  until their descendant pools have a tested cap. The cargo `target/` write
+  lock is unchanged and is always taken before the budget. Context commands
+  (`tsc --traceResolution`, `eslint`, `stylelint`, `esbuild`) draw on the same
+  budget and now lead their own process groups like the checks always have.
+  `--resource-budget safe|balanced` selects the plan: `safe` is the default
+  (one expensive tool and one child worker); `balanced` is the capped opt-in.
+  Vitest remains at one CLI worker in both plans because its CLI override must
+  not raise a repository's stricter project-level worker ceiling.
+
+- Progress output tells queued work from running work. The stage line reads
+  `Running: X (12s) · Queued: Y, Z` instead of naming every runnable check as
+  running from the first instant; the task ledger's `started_at` is the moment a
+  check was admitted rather than first polled, so the gap from `queued_at` is
+  time spent waiting for the machine; and the "still running after Ns" notice
+  measures from admission, so a check parked on the budget is no longer reported
+  as a slow tool. TUI mode gains `CheckEvent::Running` beside the existing
+  `Started`, which now maps to the `Pending` lifecycle.
+
+
 - `prview gate --strict` now consumes a schema 2.3 typed enforcement
   disposition instead of collapsing every `CONDITIONAL` cause into one exit.
   Clean and proven warnings-only packs exit `0`; confirmed/potential breaking,
@@ -67,6 +696,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JSON `errors[]` payload.
 
 ### Fixed
+
+- A `--pr` / `--remote` run with nothing snapshot-backed to run now still reads
+  the reviewed tree. The shared target snapshot was materialised only when a
+  runnable check needed one, which silently excluded two ordinary shapes: a
+  run whose complete applicable gate set has sound cache hits, and the fast
+  remote-only preset, where the
+  snapshot-backed gates all skip and only semgrep (which owns its worktree)
+  remains. Both left the task ledger with no scan dir, so every `30_context`
+  command fell back to the operator's local checkout while the diffs and
+  `MERGE_GATE.json` described the PR's commit — the same
+  `PRV-CONTEXT-SNAPSHOT-PROVENANCE` split pack, reached through a quieter door,
+  with nothing in `RUN.json` to distinguish it. An off-`HEAD` target is now
+  enough to materialise the snapshot on its own, which also resolves the
+  run-wide substrate so `RUN.json` stops reporting an all-cacheable `--pr`
+  run's replays and skips as being about no particular tree. Such a run pays
+  for one `git worktree` its gates do not need. Local reviews (target == `HEAD`) still
+  materialise nothing.
+
+- `30_context/*` artifacts are now produced from the same reviewed tree the
+  quality gates judged. In `--pr` / `--remote` runs the gates scanned a snapshot
+  of the reviewed commit while the context generators (`cargo tree`, `tsc
+  --traceResolution`, `eslint`, `npm`/`pnpm` SBOM, `stylelint`, `esbuild`,
+  `tauri info`) ran against the operator's local checkout, so one pack could
+  describe two different revisions. The run's shared target snapshot is now
+  owned by the task ledger and stays alive through artifact generation, and
+  every context command's working directory — plus the filesystem probes that
+  decide which commands to plan at all, static Tauri command discovery, and its
+  diff mapping — follows it. Local reviews are
+  unaffected: there the repo root is the reviewed tree.
 
 - The human-readable `PRVIEW CONFIG` panel now caps itself to the active
   terminal width and wraps long refs and preset notes before drawing its right

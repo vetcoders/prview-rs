@@ -10,8 +10,16 @@ use super::types::{ConfigField, Panel, TuiEvent, TuiState, WizardMode};
 pub async fn handle_key(
     state: &mut TuiState,
     key: KeyEvent,
-    tx: &mpsc::UnboundedSender<TuiEvent>,
+    _tx: &mpsc::UnboundedSender<TuiEvent>,
 ) -> Result<()> {
+    // Raw terminal mode delivers Ctrl-C as a key event rather than a SIGINT.
+    // It must outrank wizard/help/panel routing: otherwise a running analysis
+    // keeps Cargo/Node alive and the `c` may even be typed into a branch filter.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        state.should_quit = true;
+        return Ok(());
+    }
+
     // Wizard mode takes priority
     if state.wizard_mode != WizardMode::None {
         handle_wizard_keys(state, key);
@@ -98,41 +106,6 @@ pub async fn handle_key(
             return Ok(());
         }
         _ => {}
-    }
-
-    // Run analysis
-    if key.code == KeyCode::Char('r') && !state.running {
-        state.running = true;
-        state.start_time = Some(std::time::Instant::now());
-        state.message = "Starting analysis...".to_string();
-
-        // Spawn analysis task.
-        // run_analysis does all git2 (non-Send) work synchronously before
-        // the first .await, so the future is Send-safe for tokio::spawn.
-        let config = state.config.clone();
-        let tx_err = tx.clone();
-        let handle = tokio::spawn(super::run_analysis(config, tx.clone()));
-
-        // Supervise the task so a panic (or cancellation) surfaces as an Error
-        // event. Without this, a panicked analysis leaves checks stuck rendering
-        // as "running" and the header stuck at "Running analysis... Ns" forever.
-        tokio::spawn(async move {
-            match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    let _ = tx_err.send(TuiEvent::Error {
-                        message: e.to_string(),
-                    });
-                }
-                Err(join_err) => {
-                    let _ = tx_err.send(TuiEvent::Error {
-                        message: format!("analysis task aborted: {join_err}"),
-                    });
-                }
-            }
-        });
-
-        return Ok(());
     }
 
     // Panel-specific key handling
@@ -752,6 +725,20 @@ mod tests {
             .await
             .unwrap();
         assert!(state.should_quit);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_quits_before_wizard_or_panel_routing() {
+        let config = create_test_config();
+        let mut state = TuiState::new(config);
+        state.start_target_wizard();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        handle_key(&mut state, ctrl_c, &tx).await.unwrap();
+
+        assert!(state.should_quit);
+        assert!(state.branch_selector.filter.is_empty());
     }
 
     #[tokio::test]

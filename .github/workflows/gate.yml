@@ -4,7 +4,6 @@ on:
   push:
     branches: [main, feat/gate-core, feat/gate-packaging]
   pull_request:
-    branches: [main, feat/gate-core]
   workflow_dispatch:
 
 env:

@@ -3,6 +3,7 @@ use clap::Parser;
 use colored::Colorize;
 use prview::cli::{GateArgs, McpArgs};
 use prview::git::git_cmd;
+use prview::governor::{CtrlC, is_cancellation, supervise_startup_stage, with_cancellation};
 use prview::{App, Cli, CliCommand, Config, OpenArgs, RunsArgs, ScopeArgs, StateArgs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,6 +11,13 @@ use std::process::Command;
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
+        // A cancelled run produced no verdict. Reporting one of prview's own
+        // codes would claim it did, so it exits on the shell's interrupt
+        // convention instead.
+        if is_cancellation(&err) {
+            eprintln!("{} run cancelled", "^C".yellow().bold());
+            std::process::exit(prview::governor::CANCELLED_EXIT_CODE);
+        }
         display_error(&err);
         std::process::exit(1);
     }
@@ -51,7 +59,29 @@ fn display_error(err: &anyhow::Error) {
 }
 
 async fn run() -> Result<()> {
+    // Private same-binary worker protocol. It must be selected before public
+    // CLI parsing so no user-facing flag or subcommand can activate it.
+    if std::env::var_os("PRVIEW_INTERNAL_RUST_API_WORKER").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        return run_private_rust_api_worker();
+    }
+
+    // Loctree's library scan is synchronous and cannot be cooperatively
+    // cancelled once entered. The parent review launches this private mode as
+    // a governed child process so Ctrl-C can terminate the scan itself.
+    if let Some(root) = std::env::var_os(prview::heuristics::LOCTREE_WORKER_ROOT_ENV) {
+        return prview::heuristics::run_loctree_worker(Path::new(&root));
+    }
+
     let cli = Cli::parse();
+
+    if cli.build_source_sha {
+        // Build-script provenance is intentionally a private binary probe, not
+        // a new public library API surface.
+        println!("{}", env!("PRVIEW_BUILD_SOURCE_SHA"));
+        return Ok(());
+    }
 
     // Force-disable ANSI color for --no-color / --ci before anything prints.
     // set_override wins over colored's auto-detection; the NO_COLOR env
@@ -69,15 +99,22 @@ async fn run() -> Result<()> {
         return match command {
             CliCommand::Gate(args) => match run_gate_command(&cli, args).await {
                 Ok(exit_code) => std::process::exit(exit_code),
+                // A cancelled gate run did not fail to execute — it was stopped.
+                // `main` owns that distinction and the exit code for it.
+                Err(err) if is_cancellation(&err) => Err(err),
                 Err(err) => {
                     display_error(&err);
                     std::process::exit(prview::gate::GATE_EXECUTION_ERROR_EXIT_CODE);
                 }
             },
             CliCommand::State(args) => {
-                run_state_command(Config::from_cli(&cli).ok().as_ref(), args).await
+                let config = optional_supervised_config(&cli).await?;
+                run_state_command(config.as_ref(), args).await
             }
-            CliCommand::Doctor => run_doctor_command(Config::from_cli(&cli)).await,
+            CliCommand::Doctor => {
+                let config = supervised_config_result(&cli).await?;
+                run_doctor_command(config).await
+            }
             CliCommand::Runs(args) => run_runs_command(args),
             CliCommand::Open(args) => run_open_command(args),
             CliCommand::Fix => run_fix_command().await,
@@ -91,24 +128,27 @@ async fn run() -> Result<()> {
         };
     }
 
-    let config = Config::from_cli(&cli)?;
+    let config = supervised_config(&cli).await?;
 
-    // TUI mode
+    // TUI mode owns Ctrl-C in two phases: its preflight installs a signal
+    // supervisor before raw mode, then the event loop receives Ctrl-C as a key
+    // and owns analysis cancellation/terminal cleanup.
     if cli.tui {
         prview::tui::run_tui(config).await?;
         return Ok(());
     }
 
     let app = App::from_config(config)?;
+    let governor = app.governor();
 
     // Watch mode
     if cli.watch {
-        app.run_watch().await?;
+        with_cancellation(app.run_watch(), &governor, CtrlC).await?;
         return Ok(());
     }
 
     // Normal run
-    let report = app.run().await?;
+    let report = with_cancellation(app.run(), &governor, CtrlC).await?;
 
     // The verdict comes from the pack's MERGE_GATE.json and nowhere else. If it
     // cannot be read, prview cannot report a verdict — that is an execution
@@ -159,6 +199,64 @@ async fn run() -> Result<()> {
     std::process::exit(exit_code);
 }
 
+#[derive(serde::Deserialize)]
+struct RustApiWorkerPair {
+    base_revision: String,
+    target_revision: String,
+}
+
+fn run_private_rust_api_worker() -> Result<()> {
+    let repo_root = std::env::var_os("PRVIEW_INTERNAL_RUST_API_REPO")
+        .map(PathBuf::from)
+        .context("missing private Rust API worker repository")?;
+    let pairs_json = std::env::var("PRVIEW_INTERNAL_RUST_API_PAIRS")
+        .context("missing private Rust API worker revision pairs")?;
+    let pairs: Vec<RustApiWorkerPair> =
+        serde_json::from_str(&pairs_json).context("parse private Rust API worker request")?;
+    anyhow::ensure!(
+        !pairs.is_empty(),
+        "private Rust API worker request is empty"
+    );
+
+    let repo = prview::git::Repository::open(&repo_root)?;
+    let diffs = pairs
+        .into_iter()
+        .map(|pair| prview::git::Diff {
+            base: pair.base_revision.clone(),
+            target: pair.target_revision.clone(),
+            base_commit_id: pair.base_revision,
+            target_commit_id: pair.target_revision,
+            files: Vec::new(),
+            stats: Default::default(),
+            commits: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let delta = prview::artifacts::api_delta::compare_rust_api_revisions(&repo, &diffs)?
+        .context("private Rust API worker received no comparisons")?;
+    serde_json::to_writer(std::io::stdout().lock(), &delta)
+        .context("write private Rust API worker result")?;
+    Ok(())
+}
+
+async fn supervised_config(cli: &Cli) -> Result<Config> {
+    supervise_startup_stage(|| Config::from_cli(cli), CtrlC).await
+}
+
+async fn optional_supervised_config(cli: &Cli) -> Result<Option<Config>> {
+    match supervise_startup_stage(|| Config::from_cli(cli), CtrlC).await {
+        Ok(config) => Ok(Some(config)),
+        Err(error) if is_cancellation(&error) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn supervised_config_result(cli: &Cli) -> Result<Result<Config>> {
+    match supervise_startup_stage(|| Config::from_cli(cli), CtrlC).await {
+        Err(error) if is_cancellation(&error) => Err(error),
+        result => Ok(result),
+    }
+}
+
 async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     let mut run_cli = cli.clone();
     run_cli.command = None;
@@ -177,14 +275,17 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     // the `--ci`-scoped warnings escape hatch must not leak into it.
     run_cli.fail_on_warnings = false;
 
-    let mut config = Config::from_cli(&run_cli)?;
+    let mut config = supervised_config(&run_cli).await?;
     let enforcement_mode = prview::policy::engine::EnforcementMode::from_gate_flags(
         args.strict,
         args.fail_on_warnings,
     );
     config.apply_gate_profile(enforcement_mode);
     let app = App::from_config(config)?;
-    let report = app.run().await.context("gate review run failed")?;
+    let governor = app.governor();
+    let report = with_cancellation(app.run(), &governor, CtrlC)
+        .await
+        .context("gate review run failed")?;
     let cli_summary = prview::output::build_cli_json_summary(&app.config, &report)?;
     let merge_gate_path = report
         .artifacts_dir
@@ -307,7 +408,7 @@ async fn run_init_command(cli: &prview::Cli) -> Result<()> {
     );
 
     let repo_root = std::env::current_dir()?;
-    let config = Config::from_cli(cli)?;
+    let config = supervised_config(cli).await?;
     let profile_kind = config.profile.kind;
     println!(
         "  {} Detected project profile: {:?}",

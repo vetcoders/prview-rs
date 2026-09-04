@@ -5,7 +5,6 @@ use super::{
     js_tool_available, plan_check_run, run_js_command, run_js_command_with_timeout,
 };
 use crate::Config;
-use crate::cache;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Local;
@@ -57,6 +56,24 @@ fn stylelint_args(config: &Config) -> Vec<String> {
     for pattern in &config.lint_ignore_patterns {
         args.push("--ignore-pattern".to_string());
         args.push(pattern.clone());
+    }
+    args
+}
+
+fn vitest_args(config: &Config) -> Vec<String> {
+    // Vitest's CLI flag overrides the project's configured maxWorkers. Using
+    // the wider balanced-plan limit here could therefore *raise* a project's
+    // intentional single-worker ceiling. Keep the owned Vitest pool at one
+    // worker in every plan until Vitest exposes a portable "min(config, cap)"
+    // mechanism; the run-wide limit remains an upper bound, never a request to
+    // increase project concurrency.
+    let mut args = vec![
+        "run".to_string(),
+        "--maxWorkers".to_string(),
+        "1".to_string(),
+    ];
+    if let Some(pattern) = &config.tests_pattern {
+        args.extend(["--testNamePattern".to_string(), pattern.clone()]);
     }
     args
 }
@@ -209,6 +226,11 @@ impl Check for TypeScriptCheck {
         "TypeScript"
     }
 
+    /// `tsc` exposes no stable worker-pool cap, so it must serialize.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Exclusive
+    }
+
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
         if !config.profile.has_tsconfig {
             return super::CheckEligibility::Skip(format!(
@@ -227,15 +249,11 @@ impl Check for TypeScriptCheck {
         super::CheckEligibility::Run
     }
 
-    fn cache_key(&self, config: &Config) -> Option<String> {
-        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
-        let target = repo.resolve_target(config).ok()?;
-        let head = repo.head_commit_id().ok()?;
-        if head == target.commit_id {
-            Some(format!("tsc-{}", cache::ts_hash(&config.repo_root)))
-        } else {
-            Some(format!("tsc-{}", target.commit_id))
-        }
+    fn cache_key(&self, _config: &Config) -> Option<String> {
+        // A sound tsc key must bind every effective source/config input plus
+        // the compiler and dependency environment. The old *.ts/*.tsx hash
+        // could replay a PASS after tsconfig, JS/JSX or toolchain changes.
+        None
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -294,6 +312,12 @@ impl Check for ESLintCheck {
         "ESLint"
     }
 
+    /// ESLint worker controls vary by installed major version; serialize instead
+    /// of passing an option an older project may reject.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Exclusive
+    }
+
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
         if !config.profile.has_package_json {
             return super::CheckEligibility::Skip(format!(
@@ -315,15 +339,10 @@ impl Check for ESLintCheck {
         super::CheckEligibility::Run
     }
 
-    fn cache_key(&self, config: &Config) -> Option<String> {
-        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
-        let target = repo.resolve_target(config).ok()?;
-        let head = repo.head_commit_id().ok()?;
-        if head == target.commit_id {
-            Some(format!("eslint-{}", cache::ts_hash(&config.repo_root)))
-        } else {
-            Some(format!("eslint-{}", target.commit_id))
-        }
+    fn cache_key(&self, _config: &Config) -> Option<String> {
+        // ESLint consumes more than TS sources (JS/JSX, config, ignore rules,
+        // plugins and CLI policy), so source-only replay is not truth-preserving.
+        None
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -433,6 +452,12 @@ impl Check for VitestCheck {
         "Vitest"
     }
 
+    /// Heavy: see [`Check::resource_weight`] for the one list of tools that
+    /// want the whole machine.
+    fn resource_weight(&self) -> crate::governor::Weight {
+        crate::governor::Weight::Heavy
+    }
+
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
         if !config.profile.has_package_json {
             return super::CheckEligibility::Skip(format!(
@@ -466,19 +491,14 @@ impl Check for VitestCheck {
         let plan = plan_check_run(config)?;
         let run_dir = &plan.scan_dir;
 
-        // Build args
-        let mut args = vec!["run"];
-
-        // Add pattern filter if specified
-        let pattern_args: Vec<String>;
-        if let Some(pattern) = &config.tests_pattern {
-            pattern_args = vec!["--grep".to_string(), pattern.clone()];
-            args.extend(pattern_args.iter().map(|s| s.as_str()));
-        }
+        // Vitest's supported worker cap bounds its descendant pool. Keep owned
+        // strings because the limit is selected at runtime.
+        let args = vitest_args(config);
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
 
         // Use longer timeout for tests
         let output =
-            run_js_command_with_timeout("vitest", &args, run_dir, TEST_TIMEOUT_SECS).await?;
+            run_js_command_with_timeout("vitest", &args_ref, run_dir, TEST_TIMEOUT_SECS).await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -549,18 +569,10 @@ impl Check for StylelintCheck {
         super::CheckEligibility::Run
     }
 
-    fn cache_key(&self, config: &Config) -> Option<String> {
-        let repo = crate::git::Repository::open(&config.repo_root).ok()?;
-        let target = repo.resolve_target(config).ok()?;
-        let head = repo.head_commit_id().ok()?;
-        if head == target.commit_id {
-            Some(format!(
-                "stylelint-{}",
-                cache::stylelint_hash(&config.repo_root)
-            ))
-        } else {
-            Some(format!("stylelint-{}", target.commit_id))
-        }
+    fn cache_key(&self, _config: &Config) -> Option<String> {
+        // Stylelint's result also depends on ignore files, plugins, CLI policy
+        // and the installed toolchain; the former content hash omitted them.
+        None
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -654,31 +666,24 @@ mod tests {
     }
 
     #[test]
-    fn test_typescript_check_cache_key() {
+    fn test_typescript_check_disables_unsafe_persistent_cache() {
         let config = create_test_config(true);
         let check = TypeScriptCheck;
-        let key = check.cache_key(&config);
-        assert!(key.is_some());
-        // Verify it has prefix
-        assert!(key.unwrap().starts_with("tsc-"));
+        assert!(check.cache_key(&config).is_none());
     }
 
     #[test]
-    fn test_eslint_cache_key_has_prefix() {
+    fn test_eslint_disables_unsafe_persistent_cache() {
         let config = create_test_config(true);
         let check = ESLintCheck;
-        let key = check.cache_key(&config);
-        assert!(key.is_some());
-        assert!(key.unwrap().starts_with("eslint-"));
+        assert!(check.cache_key(&config).is_none());
     }
 
     #[test]
-    fn test_stylelint_cache_key_has_prefix() {
+    fn test_stylelint_disables_unsafe_persistent_cache() {
         let config = create_test_config(true);
         let check = StylelintCheck;
-        let key = check.cache_key(&config);
-        assert!(key.is_some());
-        assert!(key.unwrap().starts_with("stylelint-"));
+        assert!(check.cache_key(&config).is_none());
     }
 
     #[test]
@@ -763,6 +768,24 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--ignore-pattern", "**/tmp/**"])
+        );
+    }
+
+    #[test]
+    fn vitest_args_preserve_project_ceiling_and_pattern() {
+        let mut config = create_test_config(true);
+        config.resource_plan.worker_limit = 3;
+        config.tests_pattern = Some("critical path".to_string());
+
+        assert_eq!(
+            vitest_args(&config),
+            vec![
+                "run",
+                "--maxWorkers",
+                "1",
+                "--testNamePattern",
+                "critical path"
+            ]
         );
     }
 

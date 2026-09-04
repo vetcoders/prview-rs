@@ -1,0 +1,6 @@
+rules:
+  - id: acceptance-no-eval
+    languages: [javascript, typescript]
+    message: Dynamic evaluation is not allowed in the acceptance fixture.
+    severity: ERROR
+    pattern: eval(...)

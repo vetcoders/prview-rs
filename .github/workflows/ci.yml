@@ -4,7 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,9 +15,6 @@ env:
   # limits on Rust 1.93+; that no longer reproduces — the full release build
   # and test suite compile clean on 1.94.x.
   RUST_TOOLCHAIN: "1.94"
-
-permissions:
-  contents: read
 
 jobs:
   check:
@@ -69,6 +68,97 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
+
+  windows-process-tree:
+    name: Windows process-tree cancellation
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile Windows process-tree tests
+        run: cargo test --lib --no-run
+      - name: Prove cancellation owns first and late process trees
+        timeout-minutes: 2
+        run: cargo test --lib governor::tests::windows_cancellation_reaps_first_cancel_and_late_registration_trees -- --exact
+      - name: Prove Tokio root-exit ownership
+        timeout-minutes: 2
+        run: cargo test --lib proc::tests::windows_successful_root_exit_reaps_job_descendants -- --exact
+      - name: Prove synchronous root-exit ownership
+        timeout-minutes: 2
+        run: cargo test --lib proc::tests::windows_sync_root_exit_reaps_job_descendants -- --exact
+      - name: Prove pipeline root-exit ownership repeatedly
+        timeout-minutes: 2
+        run: |
+          1..10 | ForEach-Object {
+            cargo test --lib proc::tests::windows_governed_pipeline_reaps_root_exits_first_descendants -- --exact
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Prove context root-exit ownership
+        timeout-minutes: 2
+        run: cargo test --lib artifacts::context_artifacts::tests::windows_successful_context_root_exit_reaps_job_descendant -- --exact
+
+  ordinary-machine-resource-acceptance:
+    name: Ordinary-machine bounded deep review
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PRVIEW_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PRVIEW_SOURCE_SHA }}
+      - name: Initialize failure-shaped receipt
+        env:
+          PRVIEW_ACCEPTANCE_DIR: ${{ runner.temp }}/prview-resource-acceptance
+        run: |
+          python3 tools/bounded_runtime_acceptance.py \
+            --initialize-only \
+            --receipt-dir "$PRVIEW_ACCEPTANCE_DIR" \
+            --source-sha "$PRVIEW_SOURCE_SHA"
+      - name: Test bounded-runtime gate evidence classifier
+        run: python3 -m unittest discover -s tools/tests -p 'test_bounded_runtime_acceptance.py'
+      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: tools/fixtures/bounded-runtime/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the real Semgrep scanner
+        run: python -m pip install --disable-pip-version-check semgrep==1.175.0
+      - name: Build the candidate release binary
+        run: timeout 900 cargo build --release --locked
+      - name: Exercise the full mixed-tool deep review
+        env:
+          PRVIEW_ACCEPTANCE_DIR: ${{ runner.temp }}/prview-resource-acceptance
+        run: |
+          python3 tools/bounded_runtime_acceptance.py \
+            --binary "$GITHUB_WORKSPACE/target/release/prview" \
+            --fixture "$GITHUB_WORKSPACE/tools/fixtures/bounded-runtime" \
+            --receipt-dir "$PRVIEW_ACCEPTANCE_DIR" \
+            --source-sha "$PRVIEW_SOURCE_SHA" \
+            --timeout-seconds 1200
+      - name: Upload bounded-runtime receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ordinary-machine-resource-acceptance-${{ env.PRVIEW_SOURCE_SHA }}
+          path: ${{ runner.temp }}/prview-resource-acceptance
+          if-no-files-found: error
+          retention-days: 14
 
   build:
     name: Build Release

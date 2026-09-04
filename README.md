@@ -95,6 +95,9 @@ prview
 # Full analysis with stricter presets
 prview --deep feature/x main
 
+# Opt into higher throughput with capped child pools (safe is the default)
+prview --deep --resource-budget balanced feature/x main
+
 # Incremental update after new commits
 prview --update feature/x main
 
@@ -113,6 +116,21 @@ prview --tui
 
 The full flag reference is always one command away: `prview --help`. A written guide lives in [`docs/usage.md`](docs/usage.md).
 
+Deep reviews use a conservative whole-machine resource contract by default:
+one expensive tool and one supported child worker at a time. The preflight names
+the effective budget, expensive checks, and schedule; `balanced` remains capped
+and falls back to `safe` under load.
+
+On Unix, cancellation and timeout cleanup also follows live PPID ancestry when
+a tool descendant leaves its inherited process group with `setsid` or
+`setpgid`; Windows uses Job Object ownership. An already-reparented Unix
+double-fork is outside the portable containment guarantee.
+
+In TUI raw mode, `q`, Escape, or the first Ctrl-C follows the TUI's cooperative
+quit path and returns normally after cleanup. If an in-process Git analysis
+stage is still unwinding, a second Ctrl-C event is the immediate escape hatch:
+the terminal is restored before prview exits 130.
+
 ## Quality gate
 
 `prview gate` runs the standard fast gate profile, reads the verdict from the
@@ -124,6 +142,7 @@ generated merge-gate artifact, and exits with the automation contract:
 | `1` | `BLOCK` |
 | `2` | Review-required under `--strict`, or warnings-only with `--strict --fail-on-warnings` |
 | `3` | Gate execution failed before a trustworthy verdict was available |
+| `130` | A headless/preflight Ctrl-C or second raw-mode TUI Ctrl-C event forced cancellation; the CLI reports no new verdict, while any pack already durably committed remains discoverable |
 
 Use `prview gate --json` for schema-friendly stdout with the verdict, caveats,
 blocking issues, typed `enforcement_disposition`, and artifact paths. A strict
@@ -151,12 +170,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: vetcoders/prview-rs@v0.8.0 # fail-on-warnings requires 0.8+
+      - uses: vetcoders/prview-rs@v0.7.0 # current published Action
         id: prview
         with:
           strict: "true"
-          fail-on-warnings: "false"
-          version: "latest"
+          version: "0.7.0"
       - uses: github/codeql-action/upload-sarif@v3
         if: ${{ steps.prview.outputs['sarif-path'] != '' }}
         with:
@@ -166,11 +184,13 @@ jobs:
 The Action maps pass/fail only from the `prview gate` exit-code contract. JSON
 stdout is used for step-summary details and artifact paths, not for deciding
 whether the check passed. `cargo-binstall` is used when available, with
-`cargo install prview` as the fallback. The base gate exists from `0.6.0`, but
-the typed warnings-only contract and the Action's `fail-on-warnings` input
-require Action/runtime `0.8.0` or newer. `latest` resolves that lane after 0.8
-is published; older pins must omit the input and retain their historical gate
-semantics.
+`cargo install prview` as the fallback. This copy-pasteable example deliberately
+uses the currently published `v0.7.0` Action/runtime and its historical
+verdict-only strict semantics. The typed warnings-only contract and the
+Action's `fail-on-warnings` input are staged for `0.8.0`; release preparation
+owns switching both pins and adding that input only after the tag and crate are
+published. Until then, exercise the 0.8 contract from source rather than using
+an unissued release pin.
 
 GitHub code scanning accepts SARIF uploads through
 `github/codeql-action/upload-sarif`. Keep SARIF under GitHub's ingestion limits:
@@ -197,6 +217,11 @@ The merge decision is a single enum — `PASS`, `CONDITIONAL`, or `BLOCK` — so
 ## MCP server
 
 Agents don't have to drive the CLI and parse files. prview ships a native MCP (Model Context Protocol) server so an agent can run a review and consume the verdict and artifacts through tools. The server speaks JSON-RPC over stdio:
+
+MCP `run_review` is supported on Linux, macOS, and Windows, where prview can bind
+its durable running marker to a native PID-reuse-safe process identity. Other
+source-buildable targets can use the CLI directly; see
+[`docs/mcp.md`](docs/mcp.md#run_review) for the lifecycle boundary.
 
 ```bash
 prview mcp

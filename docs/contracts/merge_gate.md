@@ -20,8 +20,10 @@ document disagree, the code is the contract and this document is the bug.
 | `policy` | object | `{ version, mode, default_severity, source }` |
 | `checks` | object[] | Per-check evaluation records (see below) |
 | `inline_findings` | object | Inline SARIF summary (see below) |
+| `stale_cache_caveats` | object[] | Advisory, additive: gate rows replayed from an old or age-unverifiable cache (see below) |
 | `decision` | object | The merge decision (see below) |
 | `files` | object | Artifact-root-relative paths (see below) |
+| `rust_api_delta` | object \| null | Additive lossless Rust API delta; `null` on non-Rust runs (see below) |
 
 ### `policy`
 
@@ -169,6 +171,90 @@ changed, relocated, and visibility-changed facts raise the merge axis to review
 when `breaking_escalation` is enabled. Unknown facts degrade analysis confidence
 and require review; they never masquerade as confirmed removals. Review caveats
 carry the same IDs, so consumers can join directly to this structure.
+
+`PrivateTypeDependency` findings retain the canonical guarded declaration,
+alias, and impl evidence that produced them. If finite alias resolution is
+exhausted, the finding remains `Unknown` with explicit finite-graph-bound
+evidence; it is never serialized as Added, omitted as an empty scan, or allowed
+to coexist with a clean PASS. Runtime-only phase timings are intentionally
+outside this semantic view and live in `RUN.json.timings` under
+`rust-api.fast-preset-unknown` or `rust-api.isolated-worker`. The former does
+not launch full analysis. The latter covers one isolated worker and one
+30-second total deadline across all comparisons; timeout, nonzero exit, or
+malformed JSON remains review-required uncertainty.
+
+Unknown classifier names are an additive, open vocabulary rather than a closed
+client enum. `OpaqueReturnAutoTraits` identifies a caller-observable `async fn`
+or return-position `impl Trait` whose unchanged signature does not prove that
+its hidden return type kept the same auto traits. Its evidence may include
+`opaque-implementation-digest:sha256:<digest>`. One-sided opaque proofs are not
+emitted for wholly added/removed items because the corresponding Added/Removed
+finding is already canonical. `MacroGeneratedItems` evidence may include
+`macro-implementation-digest:sha256:<digest>` and
+`declarative-implementation-digest:sha256:<digest>`. Associated and top-level
+function-like macro boundaries neutralize only when the digest required for
+their boundary kind is revision-backed. For both proof classes an `unresolved:*`
+digest is deliberately non-neutralizable. Only the effective
+product/workspace `Cargo.lock` may qualify these proofs; unrelated nested locks
+do not, and a proc-macro dependency candidate must appear under its actual
+package name with an external source and a locked version satisfying the
+declared requirement, including registry checksum or precise Git commit.
+Reachable path manifests and effective Cargo config bytes from every reachable
+manifest invocation context participate in the digest. Unresolved
+manifest/config Cargo source replacement, a stale same-name local lock entry,
+or a tracked symlink (including an overlay
+typechange to symlink) keeps the digest non-neutralizable. Additive derive
+unknowns do not suppress confirmed changes to their annotated input item; they
+cover only generated output.
+
+`CfgPredicate` evidence for a custom cfg leaf may include
+`cfg-authority-digest:sha256:<digest>` when an active revision-backed build
+script or Cargo config can define it. The digest is deliberately conservative
+and can over-report after unrelated tracked changes. With no revision-backed
+authority it is `cfg-authority-digest:unresolved:*`; unresolved cfg authority is
+non-neutralizable even when both sides carry identical evidence. Nested fields,
+variants, trait/impl members, and foreign items follow the same rule. For each
+package, Cargo config authority is merged from revision-backed files visible
+from its manifest directory through in-repository ancestors. This is the
+package's possible direct-invocation context; workspace-root-only invocation is
+narrower. Deeper values follow Cargo precedence, and legacy `.cargo/config`
+takes precedence over `.cargo/config.toml` when both exist in one directory.
+Only legal build/target rustflags and a
+concrete-target link-override rustc-cfg whose key matches the package's `links`
+can define custom cfg, and `package.links` still requires a live build script.
+Child-process environment settings, configs outside that package's ancestor
+chain, lookalike keys in unrelated tables, and include-backed authority do not
+become a complete proof.
+
+## `stale_cache_caveats`
+
+An additive, advisory list naming every gate row whose result was REPLAYED from
+a stored entry older than the staleness threshold or whose age cannot be
+established. Empty on a run where no such row exists.
+
+| Field | Type | Notes |
+|---|---|---|
+| `check_id` | string | Policy check id, the same value as `checks[].id` |
+| `check_name` | string | Human-readable check name |
+| `cache_age_secs` | integer \| null | Age of the replayed entry, or null when the ledger cannot establish it |
+| `age_status` | `stale` \| `unknown` | Whether the age exceeded the threshold or could not be verified |
+| `threshold_secs` | integer | Current staleness threshold (7 days); exceeded when `age_status` is `stale` |
+
+A stale failure can hold a merge, while a stale passing row can support a clean
+verdict after a compiler or tool version changed without changing the current
+source key. Both are evidence the current run did not produce, so both are
+dated. The ledger lookup binds the caveat to an actual cached replay rather than
+to the row's status text.
+An unknown age (including a future mtime after clock rollback) is not silently
+treated as fresh: it produces an `unknown` caveat with a null age.
+
+The list is WARN-ONLY and changes nothing else. It is deliberately NOT part of
+`decision`: that object is closed and every field in it ranks the verdict, so a
+report about the pack's evidence must not sit where a reader reconciles axes. The
+verdict, `allow_merge`, `enforcement_disposition`, the exit codes and every other
+field are byte-identical to the same run with a fresh cache. Readers that ignore
+the field lose nothing but the date on the evidence, and `tools/validate_merge_gate.py`
+neither requires nor rejects it.
 
 ## `decision`
 

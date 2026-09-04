@@ -140,12 +140,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: vetcoders/prview-rs@v0.8.0 # fail-on-warnings requires 0.8+
+      - uses: vetcoders/prview-rs@v0.7.0 # current published Action
         id: prview
         with:
           strict: "true"
-          fail-on-warnings: "false"
-          version: "latest"
+          version: "0.7.0"
       - uses: github/codeql-action/upload-sarif@v3
         if: ${{ steps.prview.outputs['sarif-path'] != '' }}
         with:
@@ -154,15 +153,20 @@ jobs:
 
 Use `strict: "false"` for advisory rollout: `CONDITIONAL` remains exit `0`,
 while `BLOCK` still exits `1`. Extra CLI flags can be passed as whitespace-
-separated `args`. With `strict: "true"`, typed warnings-only remains successful;
-set `fail-on-warnings: "true"` to require a warning-clean pack as well.
+separated `args`. On the published 0.7 lane, `strict: "true"` rejects every
+`CONDITIONAL`. In the staged 0.8 source contract, typed warnings-only remains
+successful under strict mode; after 0.8 is published and the pins move, set
+`fail-on-warnings: "true"` to require a warning-clean pack as well.
 
 The Action prefers `cargo-binstall` when that binary is already available on the
 runner and falls back to `cargo install prview --locked --force`. The base gate
 exists from `0.6.0`; typed warnings-only enforcement and the
-`fail-on-warnings` Action input require Action/runtime `0.8.0` or newer.
-`latest` resolves that lane after 0.8 is published. Older pins must omit that
-input and retain their historical gate semantics.
+`fail-on-warnings` Action input are staged for `0.8.0`; release preparation
+owns switching both pins and adding that input only after the tag and crate are
+published. This copy-pasteable example deliberately uses the currently
+published `v0.7.0` Action/runtime and its historical verdict-only strict
+semantics. Until 0.8 is published, exercise its contract from source rather
+than using an unissued release pin.
 
 SARIF upload requires `permissions: security-events: write`. prview writes
 `30_context/INLINE_FINDINGS.sarif` only when there are inline findings or
@@ -187,6 +191,121 @@ prview feature/x main
 | `--ci` | Like deep, tuned for automation: no colors; non-zero on Block/quality failure |
 | `--update` | Incremental rerun after new commits, skipping heavy checks unless forced |
 | `--ai-only` | Minimal artifact pack for AI/review flows |
+
+### Resource budget
+
+`prview` defaults to `--resource-budget safe`: at most one whole-machine tool
+runs at a time and supported descendant pools receive one worker. This is the
+recommended setting for ordinary developer machines.
+
+`--resource-budget balanced` is an explicit throughput opt-in. It still admits
+at most two capped heavy parents and never creates more parent permits than the
+detected logical-core count; a one-core host therefore remains single-parent
+and single-worker. Cargo/rustc receive `CARGO_BUILD_JOBS`, Cargo test binaries
+receive `RUST_TEST_THREADS`, and Semgrep receives `--jobs`.
+Vitest remains capped at one CLI worker because a higher CLI value would
+override and raise a repository's stricter `maxWorkers` setting. Tools without
+a stable portable cap (including tsc
+and ESLint across supported project versions) remain serialized. High current
+load, or an unavailable load reading, backpressures the effective plan to
+`safe`. Inherited `CARGO_BUILD_JOBS`, repository Cargo `[build].jobs`, and
+positive inherited `RUST_TEST_THREADS` values remain operator ceilings: prview
+may lower an effective limit to the active plan, but never raises it. Cargo config is
+resolved from the exact reviewed cwd, including a materialized remote snapshot,
+using Cargo's nearest-scalar and legacy-`config` precedence. An unreadable,
+invalid, zero-valued, or include-dependent `build.jobs` contract fails closed
+to one worker instead of guessing a wider limit. Configuration planning opens
+only bounded direct regular files; a symlink, device, FIFO, or oversized config
+also lowers the plan fail-closed and is never followed or read without a bound.
+Signed inherited
+`CARGO_BUILD_JOBS` values use Cargo's logical-core-relative semantics; invalid
+or zero inherited values fail closed in the same way. An empty `CARGO_HOME`
+falls back to the operator home rather than being mistaken for the reviewed cwd.
+
+Cold Python environment setup and every later `uv run` apply the same cap to
+`UV_CONCURRENT_DOWNLOADS`, `UV_CONCURRENT_BUILDS`,
+`UV_CONCURRENT_INSTALLS`, and `CARGO_BUILD_JOBS` for Rust-backed Python
+packages. Each uv pool is the minimum of the run plan, a positive inherited
+environment value, and the matching project value from `uv.toml` or
+`[tool.uv]`; `uv.toml` wins when both project files exist. Invalid or
+unreadable concurrency authority fails closed instead of widening the run.
+The selected project-scoped uv authority is opened only as a regular file and
+read up to 1 MiB before parsing; a FIFO, device, or oversized `uv.toml` or
+`pyproject.toml` therefore cannot block or exhaust the synchronous planner.
+An in-tree metadata symlink remains supported and is bounded at its resolved
+regular target.
+Python pre-sync and check runners resolve Cargo's effective `[build].jobs`
+from their exact reviewed cwd as well, using the same precedence and
+fail-closed rules as direct Cargo gates.
+`pyproject.toml`, `uv.lock`, and any discovered `uv.toml` must resolve inside the
+reviewed tree. An explicit in-tree `UV_CONFIG_FILE` replaces discovery, matching
+uv's precedence. An enabled boolish `UV_NO_CONFIG` skips discovered `uv.toml`
+and `[tool.uv]` concurrency values, while an explicit `UV_CONFIG_FILE` remains
+authoritative even when both variables are set. The project manifest and other
+metadata still require containment because uv and the selected Python tools
+consume them independently of uv configuration discovery. `UV_PROJECT`,
+`UV_WORKING_DIR`, and the legacy `UV_WORKING_DIRECTORY` are refused when they
+redirect execution away from the exact reviewed root; an in-tree explicit
+config remains the concurrency authority uv will actually use. User- and
+system-level uv configuration is not currently reproduced by this project-level
+resolver. When uv is unavailable, direct Ruff, Mypy, and Pytest invocations do
+not parse `uv.toml`, `uv.lock`, `[tool.uv]`, or uv-only environment selectors;
+those inputs cannot affect a process that will not consume them. Generic Python
+metadata and the run's `CARGO_BUILD_JOBS` descendant cap remain in force.
+Pytest also receives `PYTEST_XDIST_AUTO_NUM_WORKERS`; when project or inherited addopts request
+xdist (`-n auto`, `logical`, or explicit `-n N`), prview caps only a dynamic or
+too-large pool. An explicit smaller count and `-n 0` remain unchanged. A short,
+isolated probe of the actual project pytest selects the matching supported
+major/minor config-discovery rules; unsupported versions fail closed. Prview then
+passes `-c` for the single highest-precedence config inside the reviewed root,
+or an explicit empty config when none exists, and fixes `--rootdir` to that
+root. Malformed, unreadable, non-UTF-8, or conflicting recognized config and
+addopts are reported instead of silently skipped. A standalone `--` in config
+or inherited addopts is rejected because it would disable the later isolation
+and worker-cap arguments. Xdist `--tx` and `--px` gateway options are rejected
+because their process fan-out is independent of `-n` and cannot be bounded by
+the numeric worker override. Parent-directory pytest
+options therefore cannot change test selection or worker count. If the operator
+already set a lower positive uv/Cargo value, prview preserves that stricter
+limit. Arbitrary third-party PEP 517 backends can
+still own private worker controls that no portable parent setting can infer;
+they remain serialized as one Exclusive parent rather than being claimed as a
+universally capped child pool. The same boundary applies to executable project
+`conftest.py` code and third-party pytest plugins: Pytest remains Exclusive, but
+prview does not claim to infer arbitrary plugin-created processes or xdist hook
+mutations.
+
+Before checks start, the human preflight prints the requested/effective budget,
+parent and child caps, expensive tools, and the cheap-first execution schedule.
+The envelope is conservative; it does not pretend to predict exact future peak
+memory.
+
+This envelope covers review generation and its check/context subprocesses. The
+explicit mutating `prview fix` command still invokes formatter/fixer toolchains
+synchronously and is not yet governed by `--resource-budget`; do not treat the
+review envelope as a product-wide cap for that separate command.
+
+### Test selection
+
+`--tests-pattern PATTERN` is runner-aware rather than one portable regex:
+
+| Runner | Selection contract |
+|--------|--------------------|
+| Vitest | Regular expression passed to `--testNamePattern` |
+| Cargo/libtest | Literal substring only; regex metacharacters and values beginning with `-` are rejected before Cargo starts |
+| Pytest | Not currently filtered by this flag |
+
+A Mixed JS/Rust review runs both Vitest and Cargo with the same value, so the
+portable contract is their literal intersection. A regex-specific value makes
+the Cargo check `ERROR`; use a literal substring common to both runners, omit
+the shared selector, or run runner-specific test commands separately.
+
+A filtered Cargo run is `ERROR`, not `PASS`, unless standard libtest summaries
+prove that at least one selected test executed. This prevents both zero-match
+false greens and option-shaped values such as `--no-run` from turning a test
+gate into compile-only success. Custom Cargo harnesses without a verifiable
+libtest summary therefore require an unfiltered run or a separate runner-aware
+profile.
 
 ## Quick cheat sheet
 
@@ -257,6 +376,8 @@ prview --help
 | `--with-security` | Raise the heavy security posture (does not add cargo-geiger or full-tree Semgrep) |
 | `--skip-security` | Skip heavy security checks |
 | `--security-full` | Full security tier: runs full-tree Semgrep and adds cargo-geiger's unsafe scan (slow; off even under `--deep`) |
+| `--resource-budget safe\|balanced` | Select the whole-machine envelope (`safe` is the default; `balanced` is capped and load-aware) |
+| `--tests-pattern PATTERN` | Filter Vitest by regex or Cargo/libtest by literal substring; Mixed uses the literal intersection and Pytest remains unfiltered |
 
 By default, Semgrep is scoped to the change when prview can resolve a clean git
 baseline: it passes Semgrep `--baseline-commit <merge-base>` so existing
@@ -425,9 +546,70 @@ or, when `PRVIEW_HOME` is unset, to
 `$HOME/.prview/runs/<repo>/<branch>/<run_id>/` in an ordered numbered layout.
 New run ids use a timestamp plus short HEAD suffix, for example
 `20260704-120500-a1b2c3d`; treat the full value as opaque.
-A `latest` symlink points at the most recent run in
+On Unix, a `latest` symlink points at the most recent **completed** run in
 `$PRVIEW_HOME/runs/<repo>/<branch>/latest` or
 `$HOME/.prview/runs/<repo>/<branch>/latest` when `PRVIEW_HOME` is unset.
+An unexpected invalid `00_summary/SANITY.json` is a fatal generation result:
+the diagnostic directory and SANITY evidence remain on disk, but no ZIP,
+`latest` update, index row, or successful completion message is produced.
+A cancellation observed before the durable publication commit writes
+`00_summary/INCOMPLETE.json` and does not update `latest` or the run index. If
+cancellation is observed after `latest` has
+already been retargeted, the previous completed run is restored. A cancel
+during index registration rolls the index file back and does not prune older
+runs. Once both advertisements cross the durable commit point, the run is
+completed; a signal arriving after that point does not retroactively relabel the
+published verdict as cancelled. Unix publishers serialize `latest` and
+`index.jsonl` as one transaction, and a durable publication journal reconciles either side after a
+process crash **when all publishers are 0.8 or newer**. A journal whose pack is
+missing, malformed, or has a mismatched `RUN.json` identity is never trusted to
+retarget `latest`: prview preserves it as a uniquely named
+`publication-transaction.invalid.*` quarantine file and permits the next clean
+publication instead of permanently denying every later run. A valid journal is
+not discarded when the durable index is unreadable: transactional readers
+reject any invalid JSONL row, preserve the journal, and fail the run rather than
+reconstructing or saving a partial ledger. Likewise, failure to commit the
+finished pack into the index is fatal; a pack is not reported as completed when
+`state`/`verdict` could not discover it. The compatibility lock
+serializes the index critical section with pre-0.8 binaries, but it cannot
+serialize their earlier `latest` update. Before installing or starting 0.8,
+drain and exclude every pre-0.8 publisher that shares `PRVIEW_HOME`; concurrent
+mixed-version publication is unsupported. If prview reports a **stale legacy
+index lock**, first establish that no pre-0.8 publisher is still running, then
+remove exactly the reported legacy sentinel; prview deliberately does not take
+it over automatically. Retention
+candidates are staged atomically in
+`$PRVIEW_HOME/prune-trash`; physical cleanup occurs before the next index
+registration and may therefore lag one completed run. If a custom output path
+cannot be staged atomically, prview keeps every index row and skips that prune
+with a warning. Recovery validates a staged payload's owned regular
+`00_summary/RUN.json` identity against the manifest before moving or deleting
+it; missing, invalid, or mismatched transaction metadata leaves a payload
+preserved in prune-trash without blocking a clean publication. An I/O failure
+after recovery begins still aborts publication. If restoration of the previous
+index cannot be confirmed, prview leaves the outer publication journal intact
+and fails the run so the next lock owner can reconcile durable state. Relative
+`--output-dir` values are converted to absolute paths before pack creation, so
+restart recovery is independent of a later process's working directory. An
+explicit output path must not already exist: it is atomically claimed for one
+immutable pack and cannot be reused for a later run. This prevents stale files
+and multiple history rows from pretending that one mutable directory contains
+several historical packs. `--watch` and `--tui` are mutually exclusive because
+they are separate run controllers; neither can be combined with an explicit
+`--output-dir`. Each watch iteration and each interactive TUI rerun emits a
+separate immutable pack through the default unique allocator. MCP
+keeps the same invariant
+through a private, one-shot reservation that only its child process can claim;
+ordinary CLI callers cannot adopt an existing directory.
+On Windows, every reparse-point directory or file (including junctions and
+mount points, not only symlinks) is treated as linked storage. Retention refuses
+such an index path and never recursively traverses it during cleanup. These
+path checks prevent accidental or state-at-rest link traversal; the retention
+store is not a security boundary against a same-user attacker concurrently
+swapping directory entries between validation and rename/read.
+Parent-directory fsync supplies the stated rename ordering on Unix/macOS. Other
+platforms retain atomic/process-crash recovery but do not claim the same
+power-loss durability for directory entries.
 
 ```
 $HOME/.prview/runs/my-repo/feature-x/20260225-185357/
@@ -500,8 +682,160 @@ decoded Git header identity; incoherent, truncated, or markerless hunk sections
 are discarded fail-closed, while coherent mode-only add/delete metadata remains
 valid. Confirmed removed, changed, relocated, and
 visibility-changed Rust facts are breaking; added-only facts are informational.
+
+The ordinary remote `prview --pr <number>` fast preset does not enter the full
+repo-backed Rust engine. It emits an exact-revision typed unknown instead, so
+the run is degraded and requires review rather than reporting a clean scan.
+Local standard, deep, and CI modes run all exact base/target comparisons in one
+private same-binary worker with a single 30-second total deadline. Artifact
+generation announces and records `rust-api.fast-preset-unknown` or
+`rust-api.isolated-worker` in `00_summary/RUN.json.timings`. Worker timeout,
+failure, or malformed output becomes an exact-comparison typed unknown.
+Headless Ctrl-C terminates the governed child and remains cancellation with
+exit 130; the TUI retains the first/second-interrupt semantics documented in
+the architecture guide.
 Typed unknowns degrade confidence and require review without claiming a
-confirmed removal.
+confirmed removal. Rust identities include ordinary type/value/macro items plus
+public modules, library crates, and Cargo features. An implicit library target
+is present whenever a live `src/lib.rs` exists unless `package.autolib = false`;
+explicit targets and the package edition do not turn it off. Absence is not a
+`MissingLibRoot`, while an explicit unavailable `[lib]` root remains unknown. A
+tracked symlink in the implicit root position is not followed and remains non-neutralizable typed
+uncertainty on both sides. Cargo-valid keyword package and library names that
+can be addressed as raw identifiers remain part of the census, as do Cargo-valid
+special identities `self`, `crate`, `super`, and `Self`; these remain manifest
+identity strings rather than synthetic Rust paths. Ordinary Rust
+items are projected only for Rust-linkable `lib`/`rlib`/`dylib` outputs. Real
+Cargo binary roots are discovered from `src/main.rs`, both supported `src/bin`
+layouts, and explicit `[[bin]]` tables with Cargo's `autobins`, edition, path,
+and `required-features` rules. For edition 2015, only explicit `[[bin]]` metadata
+disables implicit binary discovery by default; unrelated explicit
+examples, tests, benches, or libraries do not. An exact tracked binary-root symlink fails
+closed; symlinked parent directories such as `src/` or `src/bin/` are not
+separately classified by this discovery layer. Each binary has a target-scoped
+analysis identity separate from a same-named library. The identity preserves
+the manifest target name: digit-prefixed targets are accepted, Cargo's reserved
+build-directory names remain invalid, and names such as `foo-bar` and `foo_bar`
+remain distinct in prview despite normalizing to the same Rust crate name.
+This is an evidence identity only; it does not publish binary internals as Rust
+dependency API. Proc-macro exports remain separate, and
+native-only `cdylib`/`staticlib`/`bin` targets retain binary-export and target
+uncertainty, including exported associated functions in inherent and trait
+impls, without pretending that their internal `pub` items are dependency API.
+Native export signatures are bound to local type semantics so an alias-only ABI
+change cannot neutralize as unchanged evidence. Direct and associated function
+bodies are excluded from native ABI evidence; static initializers remain part
+of the observable native contract. Native-producing targets (including `dylib`
+and a mixed `rlib + cdylib`) also retain typed potential-export evidence when a
+custom associated attribute or item-position macro can generate the
+native symbol; an
+internal associated macro in an `rlib`-only private owner remains outside the
+external contract. Exported declarative macro contracts
+bind the effective direct, workspace-inherited, or library-target edition; an
+edition change without such a macro does not create a synthetic break.
+Tuple-constructor privacy,
+`repr(C)` named-field order, private field types under every repr, primitive
+integer enum reprs, and exhaustive-enum variant additions are observable
+changes. `repr(Rust)`, `repr(transparent)`, and standalone
+`repr(packed)`/`repr(align)` private named-field order is not; their attributes
+and private field types remain observable through layout and auto traits.
+Inherited and restricted field visibility are equivalent to an external caller.
+Appending a fieldless
+variant to an otherwise unchanged `#[non_exhaustive]` enum is informational
+unless an ABI-sensitive repr makes layout observable. A new payload-bearing
+variant, a fieldless variant inserted before an existing implicit discriminant,
+a field added to an existing variant, or a field added to an existing public
+struct remains a parent `Changed`: non-exhaustive syntax prevents exhaustive
+construction and matching, but does not prove stable auto traits or numeric
+discriminants.
+Direct private-field types remain in that confirmed parent contract. When a
+public item instead reaches a transitive non-public local type, private alias,
+or local trait implementation whose compiler-derived effect cannot be proven
+from source, prview emits guard-aware `PrivateTypeDependency` uncertainty. It
+does not promote that evidence to a confirmed breaking change.
+Expression-position include macros retain included-byte digests.
+Transforming-attribute unknowns, including recursively nested `cfg_attr`, are
+collected before visibility filtering and bound both to their annotated input
+and to revision-backed transformer provenance. Derives are additive: confirmed
+input-item changes remain visible,
+while custom generated output stays Unknown; custom/helper tokens are not
+duplicated as confirmed breaking semantics, builtin-looking names shadowed by
+imports remain conservative, and associated transforms require an externally
+reachable inherent owner. Builtin `Default` helpers follow matching nested
+  conditional predicate lineage; relationships that cannot be proven remain
+  typed uncertainty. Lock-backed external candidates use reachable manifest,
+  effective Cargo config from every reachable member context, and lock identity;
+  their external source, registry checksum or precise Git commit, and locked
+version must satisfy the declared package requirement. When a local proc-macro
+is reachable, the conservative safety floor hashes every live
+tracked entry by Git object identity (excluding redundant directory-tree
+objects) so nonstandard crate roots, pinned gitlinks, and build assets do not
+disappear. Only the effective product/workspace lock qualifies; a fixture lock,
+stale lock missing a dependency candidate, or tracked symlink whose target bytes
+are not revision-proven does not. Missing lock/candidate provenance and
+unresolved manifest/config Cargo source replacement never neutralize, while the
+local aggregate may over-report after an unrelated tracked-file edit. Custom
+cfg predicates bind revision-backed build-script or Cargo-config authority when
+present, including nested public contract positions. A declared build script
+must be a live revision file; `build = true` selects the default `build.rs` and
+`build = false` disables discovery. For each package, prview merges the
+repository-backed Cargo config visible from that manifest directory through
+its in-repository ancestors. This models the package's direct Cargo invocation
+context; a Cargo command launched only from the workspace root sees a narrower
+set, but prview cannot assume that is the only supported invocation. Legal
+build/target rustflags or a concrete-target link-override rustc-cfg matching the
+package's `links` can define custom cfg.
+Deeper values follow Cargo precedence, and an extensionless `.cargo/config`
+wins over `.cargo/config.toml` in the same directory. The package must still
+own a live build script when it declares `package.links`. Child-process
+environment settings and lookalike keys in unrelated tables do not qualify.
+The conservative digest may likewise over-report, but a missing,
+invalid, included, or otherwise unresolved authority proof never cancels merely
+because both sides have the same diagnostic text. Public trait method and
+associated-const defaults are directional and structural: adding a default is
+compatible, while removal, const value/type/cfg changes, or moving a default
+between disjoint cfg-qualified members remains a confirmed contract change.
+Body or private-helper changes affecting a
+caller-observable `async fn` or return-position `impl Trait` produce item-local
+`OpaqueReturnAutoTraits` uncertainty bound to canonicalized repo-backed Rust,
+all other live tracked input identities, and effective lock data. This covers
+nonstandard include/path/build inputs without reading every tracked blob. A
+tracked symlink keeps this proof unresolved; a wholly new or removed opaque item
+relies on its Added/Removed fact instead of a redundant Unknown, and adding an
+async trait default is treated the same way. This conservative source closure
+may over-report after an unrelated tracked input
+changes, but it does not promote uncertainty to a confirmed break. Legal
+non-include macro invocation token bodies remain opaque to source-level binder
+normalization. Their invocations bind to a revision-backed implementation
+substrate, and conditional `macro_export` declarations remain crate-root API.
+Rust-AST opaque bodies alpha-normalize generic, parameter, irrefutable local
+destructuring, closure, loop, and lexical-shadow binder spellings. Refutable
+match/`if let`/`while let` pattern names remain spelling-sensitive without name
+resolution; macro token bodies are not compiler-backed semantic proof. Private
+binary symbols exported by direct or conditional `no_mangle`/`export_name`
+produce guard-aware typed uncertainty. Legal non-UTF-8 Git paths emit
+side-specific typed path uncertainty while valid sibling
+files continue to be analyzed; their collision-free internal identity cannot be
+forged by a literal UTF-8 surrogate filename. Multiple independent workspace
+authorities in a rootless revision source emit `WorkspaceDiscovery` uncertainty
+instead of unioning product and fixture crates. An unreadable, malformed, or
+non-UTF-8 rootless manifest is also an unresolved authority and cannot be
+discarded in favour of a parseable sibling. The same fail-closed rule applies to
+a parseable `Cargo.toml` that defines neither `[package]` nor `[workspace]`;
+`[workspace]` and `package.workspace` cannot coexist in one manifest.
+When a root package points at another workspace with `package.workspace`, that
+workspace's full member authority is used; unreadable, invalid, incomplete, or
+non-reciprocal membership remains `WorkspaceDiscovery` uncertainty.
+Unqualified imported trait impls on public owners remain typed uncertainty
+until compiler-backed name resolution exists. Trait/owner alias spelling is
+canonicalized at the resolved nominal pair, including reference, pointer,
+slice, and array owners. Each resolved trait remains correlated with only the
+owner cfg regions where that impl can exist; cfg-selected trait swaps therefore
+cannot collapse into one global evidence set. Ordinary impl members are compared
+as an unordered set. Declaring scope intentionally remains part of the proof because relative
+paths inside an impl can change meaning when it moves modules. Aliases used only
+inside generic arguments can therefore still produce a conservative warning;
+they are not neutralized without compiler-backed name resolution.
 
 #### How to read an artifact pack
 

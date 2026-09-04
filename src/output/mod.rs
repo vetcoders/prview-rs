@@ -1251,8 +1251,36 @@ pub fn print_config(config: &Config, target: &ResolvedRef, bases: &[ResolvedRef]
         plain: format!(" Checks: {}", checks),
         style: ConfigLineStyle::Label("Checks"),
     });
+    let plan = config.resource_plan;
+    let load = plan
+        .load_per_core
+        .map_or_else(|| "unknown".to_string(), |value| format!("{value:.2}/core"));
+    rows.push(ConfigRow::Line {
+        plain: format!(
+            " Resources: {}{} · parents={} · child-workers={} · load={}",
+            plan.effective.as_str(),
+            if plan.requested != plan.effective {
+                " (balanced requested; backpressured)"
+            } else {
+                ""
+            },
+            plan.total_budget,
+            plan.worker_limit,
+            load,
+        ),
+        style: ConfigLineStyle::Label("Resources"),
+    });
+    rows.push(ConfigRow::Line {
+        plain: format!(" Expensive: {}", describe_expensive_steps(config)),
+        style: ConfigLineStyle::Label("Expensive"),
+    });
+    rows.push(ConfigRow::Line {
+        plain: " Schedule: cheap orientation/checks → capped pools → serialized uncapped tools → artifacts"
+            .to_string(),
+        style: ConfigLineStyle::Label("Schedule"),
+    });
     if config.is_fast_remote_only_standard() {
-        let note = "fast remote-only preset skips tests and heuristics; use --with-tests, --with-lint, or --deep for a heavier pass";
+        let note = "fast remote-only preset skips tests, heuristics, and full repo-backed Rust API analysis; use --deep or a local/CI run for the bounded full analysis";
         rows.push(ConfigRow::Line {
             plain: format!("    note: {}", note),
             style: ConfigLineStyle::Note,
@@ -1325,6 +1353,34 @@ fn describe_enabled_steps(config: &Config) -> String {
     }
 
     steps.join(", ")
+}
+
+fn describe_expensive_steps(config: &Config) -> String {
+    let mut steps = Vec::new();
+    let fast_lint_skipped = config.is_fast_remote_only_standard() && !config.lint_forced;
+    if which::which("semgrep").is_ok() {
+        steps.push("semgrep(capped)");
+    }
+    if config.profile.has_cargo {
+        steps.push("cargo/rustc(capped)");
+    }
+    if config.profile.has_tsconfig && !fast_lint_skipped {
+        steps.push("tsc(serial)");
+    }
+    if config.profile.has_package_json && config.run_lint && !fast_lint_skipped {
+        steps.push("eslint(serial)");
+    }
+    if config.profile.has_package_json && config.run_tests {
+        steps.push("vitest(capped)");
+    }
+    if config.profile.runs_python_checks() {
+        steps.push("python gates(serial)");
+    }
+    if steps.is_empty() {
+        "none selected".to_string()
+    } else {
+        steps.join(", ")
+    }
 }
 
 /// Print artifact directory tree based on what actually exists on disk
@@ -1606,7 +1662,7 @@ mod tests {
     use super::*;
     use crate::checks::{CheckResult, CheckStatus};
     use crate::cli::ExecutionMode;
-    use crate::config::{test_config, test_rust_profile};
+    use crate::config::{test_config, test_js_profile, test_rust_profile};
 
     /// Minimal artifact pack carrying one `MERGE_GATE.json` decision. The gate
     /// artifact is now the ONLY source of the verdict, so every summary test
@@ -2522,7 +2578,7 @@ mod tests {
             },
             ConfigRow::Rule,
             ConfigRow::Line {
-                plain: "    note: fast remote-only preset skips tests and heuristics; use --with-tests, --with-lint, or --deep for a heavier pass"
+                plain: "    note: fast remote-only preset skips tests, heuristics, and full repo-backed Rust API analysis; use --deep or a local/CI run for the bounded full analysis"
                     .to_string(),
                 style: ConfigLineStyle::Note,
             },
@@ -4966,5 +5022,20 @@ api-router/app/core/cache.py
         assert!(steps.contains("cargo-check"));
         assert!(steps.contains("lint"));
         assert!(steps.contains("cargo-audit"));
+    }
+
+    #[test]
+    fn fast_remote_preflight_does_not_advertise_skipped_js_lints_as_expensive() {
+        let mut config = test_config();
+        config.profile = test_js_profile(true);
+        config.execution_mode = ExecutionMode::Standard;
+        config.remote_only = true;
+        config.run_lint = true;
+
+        let expensive = describe_expensive_steps(&config);
+
+        assert!(!expensive.contains("tsc"), "got: {expensive}");
+        assert!(!expensive.contains("eslint"), "got: {expensive}");
+        assert!(expensive.contains("semgrep") || expensive == "none selected");
     }
 }

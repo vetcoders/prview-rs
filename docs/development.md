@@ -50,6 +50,42 @@ cargo test --lib
 cargo test --test json_contract
 ```
 
+Process-tree cancellation has platform-specific proof. Unix coverage runs in the
+normal Linux/macOS suites. `.github/workflows/ci.yml` also runs the Windows-only
+PowerShell child+grandchild census on `windows-latest`; cross-compilation alone
+is not accepted as Windows cancellation evidence.
+
+The same workflow has an `ubuntu-latest` ordinary-machine acceptance job. It
+builds the release binary and runs bare `prview --deep` (with fixture/output
+arguments, but deliberately without `--resource-budget`)
+against `tools/fixtures/bounded-runtime`, a real mixed Rust, TypeScript,
+JavaScript, and CSS repo. The fixture installs TSC, ESLint, Stylelint, and
+Vitest; the workflow also installs a pinned real Semgrep scanner. The
+stdlib-only `tools/bounded_runtime_acceptance.py` sampler requires all six tool
+families (Cargo, Vitest, Semgrep, TSC, ESLint, and Stylelint) to appear in the
+owned process census and to have an exact, live, non-cached `passed` row in
+`RUN.json`; a skipped or failed process launch is not acceptance evidence. It
+fails when more than one
+whole-machine tool is active, when a Cargo/rustc, Vitest, or Semgrep pool
+exceeds the selected cap, or when the final pack and its resource metadata do
+not agree. This proves the CLI default itself resolves to the one-parent,
+one-child `safe` envelope; an explicit selector cannot hide default-wiring
+drift. Semgrep RPC coordinators are reported separately from its actual scan
+workers. The receipt also requires a clean source tree whose `HEAD` is the exact
+candidate SHA. The release build embeds that exact `PRVIEW_SOURCE_SHA`; the
+harness probes it from the binary, requires it to match the requested commit,
+and records the binary's SHA-256 digest. A dirty or stale local build therefore
+cannot masquerade as exact-SHA evidence. The
+job keeps its failure-shaped receipt under the runner's temporary directory so
+initializing that evidence cannot dirty the checkout it is about to validate.
+It has an internal 20-minute deadline inside a 45-minute Actions timeout, then
+always uploads a compact JSON receipt plus the captured CLI log.
+Only the published job on the exact candidate SHA is platform evidence; a local
+run validates the harness, not the `ubuntu-latest` envelope.
+The mixed fixture intentionally has no Python project, so this receipt does not
+prove uv/PEP 517/pytest-xdist limits; those are covered by the Rust contract
+tests and their real behavior remains part of repository-specific dogfood.
+
 For Rust review flow, a standard `prview` run executes tests by default.
 You disable them only with a lighter preset (`--quick`, `--update`, `--ai-only`)
 or an explicit `--skip-tests`. Exception: standard `--remote-only` is now a
@@ -337,6 +373,22 @@ cargo build --release --target x86_64-unknown-linux-gnu
 # Windows (from Mac)
 cargo build --release --target x86_64-pc-windows-gnu
 ```
+
+The Windows build above is only a compile check. Claimed Windows cancellation
+support depends on the real `windows-latest` process-tree job. It exercises
+`taskkill /T /F` for governor cancellation and Job Object ownership for async
+checks and synchronous context wrappers whose root exits before a descendant;
+all captured descendant PIDs must disappear.
+
+Cancellation is deliberately immediate: Unix first freezes the owned process
+group, inventories and freezes live PPID descendants that moved into their own
+`setsid`/`setpgid` groups, and requires every visible member to remain stopped
+or zombie across two censuses before sending `SIGKILL` leaf-first; Windows
+force-terminates the Job Object tree. Unix cannot portably recover an
+adversarial double-fork that was already reparented before cleanup. A killed
+Cargo/rustc tree can leave a shared target directory dirty. The next Cargo
+invocation should validate/rebuild it; remove that target directory only if
+Cargo reports persistent corruption.
 
 ## Status note
 

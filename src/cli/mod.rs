@@ -7,6 +7,8 @@ use clap_complete::{Shell, generate};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::governor::ResourceBudget;
+
 /// PR Review & Artifact Generator by Vetcoders - cross-language PR analysis tool
 ///
 /// Generates Artifact Pack v1: structured, verifiable PR review artifacts
@@ -160,7 +162,7 @@ pub struct Cli {
     pub update: bool,
 
     /// Watch mode: monitor file changes and regenerate artifacts automatically [experimental]
-    #[arg(long)]
+    #[arg(long, conflicts_with = "output_dir")]
     pub watch: bool,
 
     // === Fetch control ===
@@ -180,6 +182,10 @@ pub struct Cli {
     /// Disable result caching; re-run all checks from scratch
     #[arg(long = "no-cache")]
     pub no_cache: bool,
+
+    /// Machine resource envelope: safe serial execution or capped balanced throughput
+    #[arg(long = "resource-budget", value_enum, default_value = "safe")]
+    pub resource_budget: ResourceBudget,
 
     // === Output ===
     /// Suppress progress output; only print errors and final summary
@@ -227,8 +233,12 @@ pub struct Cli {
     )]
     pub fail_on_warnings: bool,
 
-    /// Regex pattern to filter which tests to run (passed to the test runner, e.g. vitest --grep)
-    #[arg(long = "tests-pattern", value_name = "REGEX")]
+    /// Runner-aware pattern used to filter supported test checks
+    #[arg(
+        long = "tests-pattern",
+        value_name = "PATTERN",
+        long_help = "Filter supported test checks using each runner's native semantics. Vitest accepts a regular expression through --testNamePattern. Cargo/libtest accepts only a literal substring; regex metacharacters, option-shaped values, and filtered runs with no executed tests fail closed. Mixed JS/Rust reviews therefore accept only the shared literal subset. Pytest is currently not filtered by this flag."
+    )]
     pub tests_pattern: Option<String>,
 
     /// PR URL to embed in artifact metadata (e.g. for traceability in RUN.json)
@@ -248,16 +258,24 @@ pub struct Cli {
     pub bridge_stage: u8,
 
     /// Run in interactive TUI mode instead of streaming text output
-    #[arg(long)]
+    #[arg(long, conflicts_with = "watch")]
     pub tui: bool,
 
     /// Override the artifacts output directory (default: ~/.prview/runs/<repo>/<branch>/<run_id>/)
-    #[arg(long = "output-dir", value_name = "PATH")]
+    #[arg(
+        long = "output-dir",
+        value_name = "PATH",
+        conflicts_with_all = ["watch", "tui"]
+    )]
     pub output_dir: Option<PathBuf>,
 
     /// Print shell alias setup instructions and exit
     #[arg(long = "shell-setup")]
     pub shell_setup: bool,
+
+    /// Internal: print the exact source SHA embedded by the build and exit
+    #[arg(long = "build-source-sha", hide = true)]
+    pub build_source_sha: bool,
 
     /// Explain why the merge gate is blocking (human-readable)
     #[arg(long = "why-blocked")]
@@ -615,6 +633,7 @@ mod tests {
             local_only: false,
             remote_only: false,
             no_cache: false,
+            resource_budget: ResourceBudget::Safe,
             quiet: false,
             json: false,
             no_color: false,
@@ -632,6 +651,7 @@ mod tests {
             tui: false,
             output_dir: None,
             shell_setup: false,
+            build_source_sha: false,
             why_blocked: false,
         }
     }
@@ -640,6 +660,78 @@ mod tests {
     fn test_should_run_tests_default() {
         let cli = default_cli();
         assert!(cli.should_run_tests());
+    }
+
+    #[test]
+    fn resource_budget_defaults_safe_and_parses_balanced_opt_in() {
+        let default = Cli::try_parse_from(["prview"]).expect("default CLI");
+        assert_eq!(default.resource_budget, ResourceBudget::Safe);
+
+        let balanced =
+            Cli::try_parse_from(["prview", "--resource-budget", "balanced"]).expect("balanced CLI");
+        assert_eq!(balanced.resource_budget, ResourceBudget::Balanced);
+    }
+
+    #[test]
+    fn tests_pattern_help_names_runner_specific_contract() {
+        let cli = Cli::try_parse_from(["prview", "--tests-pattern", "critical_path"])
+            .expect("tests pattern");
+        assert_eq!(cli.tests_pattern.as_deref(), Some("critical_path"));
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--tests-pattern <PATTERN>"), "got: {help}");
+        assert!(
+            help.contains("Vitest accepts a regular expression"),
+            "got: {help}"
+        );
+        assert!(
+            help.contains("Cargo/libtest accepts only a literal substring"),
+            "got: {help}"
+        );
+        assert!(help.contains("Mixed JS/Rust reviews"), "got: {help}");
+        assert!(
+            help.contains("Pytest is currently not filtered"),
+            "got: {help}"
+        );
+    }
+
+    #[test]
+    fn hidden_build_source_probe_parses_without_a_repository_target() {
+        let cli = Cli::try_parse_from(["prview", "--build-source-sha"])
+            .expect("private provenance probe");
+        assert!(cli.build_source_sha);
+    }
+
+    #[test]
+    fn watch_rejects_one_fixed_immutable_output_path() {
+        let error = Cli::try_parse_from(["prview", "--watch", "--output-dir", "review-pack"])
+            .expect_err("watch needs a fresh default run path for every iteration");
+        let rendered = error.to_string();
+        assert!(rendered.contains("--watch"), "got: {rendered}");
+        assert!(rendered.contains("--output-dir"), "got: {rendered}");
+    }
+
+    #[test]
+    fn tui_rejects_one_fixed_immutable_output_path() {
+        let error = Cli::try_parse_from(["prview", "--tui", "--output-dir", "review-pack"])
+            .expect_err("TUI reruns need a fresh default run path for every analysis");
+        let rendered = error.to_string();
+        assert!(rendered.contains("--tui"), "got: {rendered}");
+        assert!(rendered.contains("--output-dir"), "got: {rendered}");
+    }
+
+    #[test]
+    fn tui_and_watch_are_mutually_exclusive() {
+        for args in [
+            ["prview", "--tui", "--watch"],
+            ["prview", "--watch", "--tui"],
+        ] {
+            let error = Cli::try_parse_from(args)
+                .expect_err("interactive TUI and headless watch cannot own one run together");
+            let rendered = error.to_string();
+            assert!(rendered.contains("--tui"), "got: {rendered}");
+            assert!(rendered.contains("--watch"), "got: {rendered}");
+        }
     }
 
     #[test]

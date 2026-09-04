@@ -1,5 +1,682 @@
 use super::*;
 
+fn generate_fixture_pack(
+    repo_root: &Path,
+    output_dir: &Path,
+    target_sha: &str,
+    base_sha: &str,
+    governor: &crate::governor::ResourceGovernor,
+) -> Result<PathBuf> {
+    let ledger = crate::ledger::TaskLedger::new();
+    generate_fixture_pack_with_ledger(
+        repo_root, output_dir, target_sha, base_sha, governor, &ledger,
+    )
+}
+
+fn generate_fixture_pack_with_ledger(
+    repo_root: &Path,
+    output_dir: &Path,
+    target_sha: &str,
+    base_sha: &str,
+    governor: &crate::governor::ResourceGovernor,
+    ledger: &crate::ledger::TaskLedger,
+) -> Result<PathBuf> {
+    generate_fixture_pack_with_ledger_and_diffs(
+        repo_root,
+        output_dir,
+        target_sha,
+        base_sha,
+        governor,
+        ledger,
+        &[],
+    )
+}
+
+fn generate_fixture_pack_with_ledger_and_diffs(
+    repo_root: &Path,
+    output_dir: &Path,
+    target_sha: &str,
+    base_sha: &str,
+    governor: &crate::governor::ResourceGovernor,
+    ledger: &crate::ledger::TaskLedger,
+    diffs: &[Diff],
+) -> Result<PathBuf> {
+    let mut config = test_config_builder()
+        .repo_root(repo_root)
+        .target(Some("feature"))
+        .bases(&["main"])
+        .profile(test_generic_profile())
+        .execution_mode(ExecutionMode::Standard)
+        .run_tests(false)
+        .run_lint(false)
+        .do_fetch(false)
+        .use_cache(false)
+        .create_zip(true)
+        .build();
+    config.run_bundle = false;
+    config.run_security = false;
+    config.run_heuristics = false;
+    config.create_dashboard = true;
+    config.quiet = true;
+    config.output_dir = Some(output_dir.to_path_buf());
+
+    let resolved_target = ResolvedRef {
+        name: "feature".to_string(),
+        commit_id: target_sha.to_string(),
+        is_remote: false,
+    };
+    let resolved_bases = [ResolvedRef {
+        name: "main".to_string(),
+        commit_id: base_sha.to_string(),
+        is_remote: false,
+    }];
+
+    generate(GenerateInput {
+        config: &config,
+        ledger,
+        diffs,
+        checks: &[],
+        heuristics: None,
+        resolved_target: &resolved_target,
+        resolved_bases: &resolved_bases,
+        run_start: Instant::now(),
+        skipped_checks: Vec::new(),
+        worktree_clean: Some(true),
+        worktree_status_digest: None,
+        governor,
+    })
+}
+
+fn assert_no_success_surfaces(output_dir: &Path, seam: ArtifactGenerationSeam) {
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        let path = output_dir.join(relative);
+        assert!(
+            !path.exists(),
+            "{} survived cancellation at {}",
+            path.display(),
+            seam.label()
+        );
+    }
+}
+
+/// A cancelled pack must not be advertised as the latest completed review
+/// (parent `latest` symlink) or as a row in the run index. Publication is
+/// irreversible; the seam check has to run before those side effects.
+fn assert_cancelled_pack_is_not_published(output_dir: &Path, seam: ArtifactGenerationSeam) {
+    if let Some(parent) = output_dir.parent() {
+        let latest = parent.join("latest");
+        if latest.exists() {
+            let target = fs::read_link(&latest).unwrap_or_default();
+            assert_ne!(
+                target.as_os_str(),
+                output_dir.file_name().unwrap_or_default(),
+                "cancelled pack at {} was published as latest ({})",
+                seam.label(),
+                latest.display()
+            );
+        }
+    }
+
+    let index = crate::config::prview_home().join("index.jsonl");
+    if index.exists() {
+        let hay = fs::read_to_string(&index).unwrap_or_default();
+        let path = output_dir.display().to_string();
+        assert!(
+            !hay.contains(&path),
+            "cancelled pack at {} was registered in the run index: {path}",
+            seam.label()
+        );
+    }
+}
+
+#[test]
+fn cancellation_injection_stops_every_artifact_generation_seam() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    assert_eq!(ArtifactGenerationSeam::ALL.len(), 22);
+    let unique_labels: std::collections::HashSet<_> = ArtifactGenerationSeam::ALL
+        .iter()
+        .map(|seam| seam.label())
+        .collect();
+    assert_eq!(unique_labels.len(), ArtifactGenerationSeam::ALL.len());
+
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    for (index, seam) in ArtifactGenerationSeam::ALL.iter().copied().enumerate() {
+        let output = tempfile::tempdir().expect("output tempdir");
+        let output_dir = output.path().join("pack");
+        let governor = crate::governor::ResourceGovernor::new();
+        let probe = generation_seam_test_hook::ProbeGuard::install(Some(seam));
+
+        let error =
+            generate_fixture_pack(repo.path(), &output_dir, &target_sha, &base_sha, &governor)
+                .expect_err("injected cancellation must stop artifact generation");
+        let observed = probe.observed();
+        drop(probe);
+
+        assert!(
+            crate::governor::is_cancellation(&error),
+            "{} returned {error:#}",
+            seam.label()
+        );
+        assert_eq!(
+            observed,
+            ArtifactGenerationSeam::ALL[..=index],
+            "generation did not stop exactly at {}",
+            seam.label()
+        );
+        if let Some(next) = ArtifactGenerationSeam::ALL.get(index + 1) {
+            assert!(
+                !observed.contains(next),
+                "stage after {} was observed: {}",
+                seam.label(),
+                next.label()
+            );
+        }
+
+        assert_no_success_surfaces(&output_dir, seam);
+        assert_cancelled_pack_is_not_published(&output_dir, seam);
+        let incomplete: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(output_dir.join("00_summary/INCOMPLETE.json"))
+                .expect("incomplete marker"),
+        )
+        .expect("valid incomplete JSON");
+        assert_eq!(incomplete["status"], "incomplete");
+        assert_eq!(incomplete["reason"], "cancelled");
+        assert_eq!(incomplete["stage"], seam.label());
+    }
+}
+
+#[test]
+fn cancellation_at_publication_preserves_existing_latest() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let first = output.path().join("first");
+    let governor = crate::governor::ResourceGovernor::new();
+    generate_fixture_pack(repo.path(), &first, &target_sha, &base_sha, &governor)
+        .expect("completed predecessor pack");
+
+    #[cfg(unix)]
+    {
+        let latest = output.path().join("latest");
+        assert_eq!(
+            fs::read_link(&latest).expect("predecessor latest"),
+            first.file_name().expect("first basename")
+        );
+    }
+
+    let second = output.path().join("second");
+    let cancel_governor = crate::governor::ResourceGovernor::new();
+    let probe = generation_seam_test_hook::ProbeGuard::install(Some(
+        ArtifactGenerationSeam::RunIndexPublication,
+    ));
+    generate_fixture_pack(
+        repo.path(),
+        &second,
+        &target_sha,
+        &base_sha,
+        &cancel_governor,
+    )
+    .expect_err("publication seam must stop before advertising the new pack");
+    drop(probe);
+
+    #[cfg(unix)]
+    {
+        let latest = output.path().join("latest");
+        assert_eq!(
+            fs::read_link(&latest).expect("preserved latest"),
+            first.file_name().expect("first basename"),
+            "cancel must not retarget latest at the incomplete pack"
+        );
+    }
+    assert_cancelled_pack_is_not_published(&second, ArtifactGenerationSeam::RunIndexPublication);
+}
+
+#[test]
+fn explicit_output_dir_is_one_immutable_pack_path() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let pack = output.path().join("pack");
+    let governor = crate::governor::ResourceGovernor::new();
+
+    generate_fixture_pack(repo.path(), &pack, &target_sha, &base_sha, &governor)
+        .expect("first explicit pack claims the path");
+    let first_identity = fs::read_to_string(pack.join("00_summary/RUN.json")).unwrap();
+    let error = generate_fixture_pack(repo.path(), &pack, &target_sha, &base_sha, &governor)
+        .expect_err("a second run cannot overwrite one historical pack path");
+
+    assert!(
+        error.to_string().contains("must name a new directory"),
+        "got {error:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(pack.join("00_summary/RUN.json")).unwrap(),
+        first_identity,
+        "the rejected rerun must not mix stale and new artifact files"
+    );
+    assert_eq!(
+        crate::storage::RunIndex::load().entries().len(),
+        1,
+        "one immutable output path owns one history row"
+    );
+}
+
+#[test]
+fn index_commit_failure_is_fatal_and_does_not_publish_a_completed_run() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let pack = output.path().join("pack");
+    let governor = crate::governor::ResourceGovernor::new();
+    crate::storage::arm_test_index_save_failure();
+
+    let error = generate_fixture_pack(repo.path(), &pack, &target_sha, &base_sha, &governor)
+        .expect_err("an unindexed pack must not be reported as completed");
+
+    assert!(
+        error.to_string().contains("run publication failed"),
+        "got {error:#}"
+    );
+    assert!(
+        crate::storage::RunIndex::load().entries().is_empty(),
+        "failed publication must not manufacture an index row"
+    );
+    #[cfg(unix)]
+    assert!(
+        !output.path().join("latest").exists(),
+        "failed publication must roll back its latest advertisement"
+    );
+}
+
+#[test]
+fn mcp_output_reservation_is_strict_and_single_use() {
+    let tmp = tempfile::tempdir().expect("output root");
+    let pack = tmp.path().join("pack");
+    fs::create_dir(&pack).expect("exclusive MCP allocation");
+    reserve_mcp_output_dir(&pack, "correct-nonce").expect("reservation");
+    fs::write(pack.join("run.log"), "launcher output").expect("allowed log");
+    fs::write(pack.join("run.stderr.log"), "").expect("allowed stderr");
+
+    claim_explicit_output_dir_with_reservation(&pack, Some("correct-nonce"))
+        .expect("matching reservation claims the fresh directory");
+    assert!(
+        !pack.join(MCP_OUTPUT_RESERVATION_FILE).exists(),
+        "the one-shot reservation is consumed"
+    );
+    claim_explicit_output_dir_with_reservation(&pack, Some("correct-nonce"))
+        .expect_err("the same reserved path cannot be claimed twice");
+
+    let wrong_nonce = tmp.path().join("wrong-nonce");
+    fs::create_dir(&wrong_nonce).unwrap();
+    reserve_mcp_output_dir(&wrong_nonce, "real").unwrap();
+    claim_explicit_output_dir_with_reservation(&wrong_nonce, Some("forged"))
+        .expect_err("a wrong nonce cannot adopt the directory");
+    assert!(
+        wrong_nonce.join(MCP_OUTPUT_RESERVATION_FILE).exists(),
+        "a failed claim does not consume the real reservation"
+    );
+
+    let contaminated = tmp.path().join("contaminated");
+    fs::create_dir(&contaminated).unwrap();
+    reserve_mcp_output_dir(&contaminated, "nonce").unwrap();
+    fs::write(contaminated.join("stale-artifact.json"), "{}").unwrap();
+    claim_explicit_output_dir_with_reservation(&contaminated, Some("nonce"))
+        .expect_err("unexpected content prevents stale-pack adoption");
+
+    let missing = tmp.path().join("missing");
+    fs::create_dir(&missing).unwrap();
+    claim_explicit_output_dir_with_reservation(&missing, Some("nonce"))
+        .expect_err("a nonce without its create-new sentinel proves nothing");
+}
+
+#[test]
+fn cancellation_while_waiting_for_publication_lock_finalizes_the_pack_as_incomplete() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let first = output.path().join("first");
+    let first_governor = crate::governor::ResourceGovernor::new();
+    generate_fixture_pack(repo.path(), &first, &target_sha, &base_sha, &first_governor)
+        .expect("completed predecessor pack");
+
+    let held_publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+    let governor = Arc::new(crate::governor::ResourceGovernor::new());
+    let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+    let _waiting = crate::storage::PublicationLockWaitGuard::install(waiting_tx);
+    let canceller = {
+        let governor = Arc::clone(&governor);
+        std::thread::spawn(move || {
+            waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("run never reached the busy publication lock");
+            governor.cancel();
+        })
+    };
+    let second = output.path().join("second");
+    let error = generate_fixture_pack(
+        repo.path(),
+        &second,
+        &target_sha,
+        &base_sha,
+        governor.as_ref(),
+    )
+    .expect_err("a run waiting for the publication lock must observe cancellation");
+    canceller.join().unwrap();
+    drop(held_publication);
+
+    assert!(crate::governor::is_cancellation(&error), "{error:#}");
+    assert_no_success_surfaces(&second, ArtifactGenerationSeam::RunIndexPublication);
+    assert_cancelled_pack_is_not_published(&second, ArtifactGenerationSeam::RunIndexPublication);
+    let incomplete: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(second.join("00_summary/INCOMPLETE.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        incomplete["stage"],
+        ArtifactGenerationSeam::RunIndexPublication.label()
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read_link(output.path().join("latest")).unwrap(),
+        PathBuf::from("first")
+    );
+}
+
+#[test]
+fn cancellation_after_latest_symlink_restores_predecessor() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let first = output.path().join("first");
+    let governor = crate::governor::ResourceGovernor::new();
+    generate_fixture_pack(repo.path(), &first, &target_sha, &base_sha, &governor)
+        .expect("completed predecessor pack");
+
+    #[cfg(unix)]
+    {
+        let latest = output.path().join("latest");
+        assert_eq!(
+            fs::read_link(&latest).expect("predecessor latest"),
+            first.file_name().expect("first basename")
+        );
+    }
+
+    let second = output.path().join("second");
+    let cancel_governor = crate::governor::ResourceGovernor::new();
+    let probe = generation_seam_test_hook::ProbeGuard::install(Some(
+        ArtifactGenerationSeam::LatestAdvertisement,
+    ));
+    generate_fixture_pack(
+        repo.path(),
+        &second,
+        &target_sha,
+        &base_sha,
+        &cancel_governor,
+    )
+    .expect_err("latest advertisement seam must restore the predecessor alias");
+    drop(probe);
+
+    #[cfg(unix)]
+    {
+        let latest = output.path().join("latest");
+        assert_eq!(
+            fs::read_link(&latest).expect("restored latest"),
+            first.file_name().expect("first basename"),
+            "cancel after writing latest must restore the predecessor, not leave the incomplete pack advertised"
+        );
+    }
+    assert_cancelled_pack_is_not_published(&second, ArtifactGenerationSeam::LatestAdvertisement);
+}
+
+#[test]
+fn rollback_failure_keeps_cancellation_identity_and_detail() {
+    let error = preserve_primary_error_after_latest_rollback(
+        crate::governor::Cancelled.into(),
+        Err(anyhow::anyhow!("rollback storage fault")),
+    );
+
+    assert!(
+        crate::governor::is_cancellation(&error),
+        "rollback context must not replace the typed cancellation: {error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("rollback storage fault"),
+        "rollback detail must remain observable: {error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_during_shared_snapshot_cleanup_never_publishes_the_pack() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let first = output.path().join("first");
+    let first_governor = crate::governor::ResourceGovernor::new();
+    generate_fixture_pack(repo.path(), &first, &target_sha, &base_sha, &first_governor)
+        .expect("completed predecessor pack");
+
+    let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target_sha)
+        .expect("shared target snapshot");
+    let ledger = crate::ledger::TaskLedger::new();
+    ledger.set_shared_snapshot(Some(snapshot));
+
+    let pids = output.path().join("cleanup.pids");
+    let shim = output.path().join("blocking-git");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = remove ]; then\n  sleep 30 &\n  printf '%s %s\\n' \"$$\" \"$!\" > '{}'\n  wait\nfi\nexec git \"$@\"\n",
+            pids.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+
+    let governor = Arc::new(crate::governor::ResourceGovernor::new());
+    let canceller = {
+        let governor = Arc::clone(&governor);
+        let pids = pids.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while crate::proc::read_published_unix_pids(&pids, 2).is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "snapshot cleanup never spawned its governed git child"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            governor.cancel();
+        })
+    };
+    let _git = crate::git::override_test_git_program(shim);
+    let second = output.path().join("second");
+    let result = crate::governor::with_run_scope(Arc::clone(&governor), async {
+        crate::governor::blocking_stage(|| {
+            generate_fixture_pack_with_ledger(
+                repo.path(),
+                &second,
+                &target_sha,
+                &base_sha,
+                governor.as_ref(),
+                &ledger,
+            )
+        })
+    })
+    .await;
+    canceller.join().unwrap();
+
+    let error = result.expect_err("cancelled cleanup must abort before publication");
+    assert!(crate::governor::is_cancellation(&error), "{error:#}");
+    assert_eq!(
+        fs::read_link(output.path().join("latest")).unwrap(),
+        PathBuf::from("first")
+    );
+    assert_cancelled_pack_is_not_published(&second, ArtifactGenerationSeam::SharedSnapshotCleanup);
+    let incomplete: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(second.join("00_summary/INCOMPLETE.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        incomplete["stage"],
+        ArtifactGenerationSeam::SharedSnapshotCleanup.label()
+    );
+
+    let recorded = fs::read_to_string(&pids).unwrap();
+    for (position, pid) in recorded
+        .split_whitespace()
+        .map(|pid| pid.parse::<i32>().unwrap())
+        .enumerate()
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 only probes PIDs created and recorded by this test.
+            if unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let state = std::process::Command::new("ps")
+                    .args([
+                        "-o",
+                        "pid=,ppid=,pgid=,stat=,command=",
+                        "-p",
+                        &pid.to_string(),
+                    ])
+                    .output()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                    .unwrap_or_else(|error| format!("ps failed: {error}"));
+                panic!(
+                    "snapshot cleanup process {position} (pid {pid}) survived cancellation; test pid {}; state: {state}",
+                    std::process::id()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+fn artifact_generation_registry_is_exact_and_success_path_reaches_every_seam() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let expected = ArtifactGenerationSeam::ALL;
+    let last = expected.len() - 1;
+    let mut duplicate = expected;
+    duplicate[last] = duplicate[last - 1];
+    let mut reordered = expected;
+    reordered.swap(8, 9);
+    assert_ne!(
+        &expected[..last],
+        expected.as_slice(),
+        "missing seam accepted"
+    );
+    assert_ne!(duplicate, expected, "duplicate seam accepted");
+    assert_ne!(reordered, expected, "reordered seams accepted");
+
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let output_dir = output.path().join("pack");
+    let governor = crate::governor::ResourceGovernor::new();
+    let probe = generation_seam_test_hook::ProbeGuard::install(None);
+    let generated =
+        generate_fixture_pack(repo.path(), &output_dir, &target_sha, &base_sha, &governor)
+            .expect("positive-control artifact generation");
+    let observed = probe.observed();
+    drop(probe);
+
+    assert_eq!(generated, output_dir);
+    assert_eq!(
+        observed, expected,
+        "production callsites drifted from registry"
+    );
+    assert!(!output_dir.join("00_summary/INCOMPLETE.json").exists());
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        assert!(
+            output_dir.join(relative).exists(),
+            "positive control did not publish {relative}"
+        );
+    }
+    #[cfg(unix)]
+    if let Some(parent) = output_dir.parent() {
+        let latest = parent.join("latest");
+        assert!(
+            latest.exists(),
+            "positive control did not publish the latest symlink"
+        );
+        assert_eq!(
+            fs::read_link(&latest).expect("latest symlink"),
+            output_dir.file_name().expect("pack basename")
+        );
+    }
+}
+
+#[test]
+fn cancellation_after_durable_publication_commit_does_not_relabel_the_run() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let output_dir = output.path().join("pack");
+    let governor = crate::governor::ResourceGovernor::new();
+    let _commit = publication_commit_test_hook::CommitGuard::install();
+
+    let generated =
+        generate_fixture_pack(repo.path(), &output_dir, &target_sha, &base_sha, &governor)
+            .expect("a signal after the durable commit cannot cancel the completed run");
+
+    assert_eq!(generated, output_dir);
+    assert!(
+        governor.is_cancelled(),
+        "the probe must deliver the late cancel"
+    );
+    assert!(!output_dir.join("00_summary/INCOMPLETE.json").exists());
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        assert!(
+            output_dir.join(relative).exists(),
+            "completed publication lost {relative} after its commit point"
+        );
+    }
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read_link(output.path().join("latest")).unwrap(),
+        PathBuf::from("pack")
+    );
+    assert!(
+        crate::storage::RunIndex::load()
+            .entries()
+            .iter()
+            .any(|entry| entry.path == output_dir),
+        "durably committed pack must remain indexed"
+    );
+}
+
 #[test]
 fn junk_files_excluded_from_zip_and_manifest() {
     use std::fs::File;
@@ -16,6 +693,11 @@ fn junk_files_excluded_from_zip_and_manifest() {
     fs::write(out.join(".DS_Store"), b"junk").expect("root .DS_Store");
     fs::write(summary.join(".DS_Store"), b"junk").expect("nested .DS_Store");
     fs::write(out.join("Thumbs.db"), b"junk").expect("Thumbs.db");
+    // Mutable MCP control files are useful beside the live pack but are not
+    // immutable payload: stdout can still grow after MANIFEST generation.
+    for control in ["RUNNING.json", "run.log", "run.stderr.log"] {
+        fs::write(out.join(control), b"mutable control").expect("MCP control file");
+    }
 
     generate_manifest(out).expect("generate_manifest");
     // SANITY.json is written after the manifest in production and must ride
@@ -49,6 +731,12 @@ fn junk_files_excluded_from_zip_and_manifest() {
         !manifest_paths.iter().any(|p| is_junk(p)),
         "MANIFEST.json must not list OS junk, got {manifest_paths:?}"
     );
+    assert!(
+        !manifest_paths
+            .iter()
+            .any(|path| MCP_CONTROL_FILES.contains(path)),
+        "MANIFEST.json must not hash mutable MCP control files: {manifest_paths:?}"
+    );
 
     // The shipped ZIP must contain RUN.json and no junk.
     let mut zip = zip::ZipArchive::new(File::open(out.join("artifacts.zip")).expect("open zip"))
@@ -63,6 +751,12 @@ fn junk_files_excluded_from_zip_and_manifest() {
     assert!(
         !zip_names.iter().any(|n| is_junk(n)),
         "artifacts.zip must not ship OS junk, got {zip_names:?}"
+    );
+    assert!(
+        !zip_names
+            .iter()
+            .any(|name| MCP_CONTROL_FILES.contains(&name.as_str())),
+        "artifacts.zip must not ship mutable MCP control files: {zip_names:?}"
     );
     // The shipped pack must be self-validating: RUN.json (source of truth),
     // MANIFEST.json (integrity) and SANITY.json (verdict) all ride along.
@@ -110,7 +804,14 @@ use std::time::Duration;
 #[test]
 fn api_delta_no_diff_only_runtime() {
     let production = include_str!("mod.rs");
-    assert!(production.contains("compare_rust_api_revisions(&repo, diffs)"));
+    assert!(production.contains("compare_rust_api_revisions_isolated("));
+    assert!(!production.contains("compare_rust_api_revisions("));
+    for phase in ["rust-api.fast-preset-unknown", "rust-api.isolated-worker"] {
+        assert!(
+            production.contains(phase),
+            "the Rust API stage and RUN timing must name {phase}"
+        );
+    }
     assert!(production.contains("analyze_js_ts_public_api_diff(&patch_texts)"));
     assert!(production.contains("analyze_js_ts_breaking_changes(&patch_texts)"));
     assert!(production.contains("analyze_rust_env_requirements(&patch_texts)"));
@@ -122,6 +823,17 @@ fn api_delta_no_diff_only_runtime() {
         !production.contains("analyze_all_breaking_changes(&patch_texts)"),
         "Rust production must never return to the diff-only BREAKING backend"
     );
+}
+
+#[test]
+fn rust_api_worker_activation_precedes_public_cli_parsing() {
+    let main = include_str!("../main.rs");
+    let worker = main
+        .find("PRVIEW_INTERNAL_RUST_API_WORKER")
+        .expect("private worker activation");
+    let cli_parse = main.find("Cli::parse()").expect("public CLI parser");
+    assert!(worker < cli_parse);
+    assert!(main.contains("run_private_rust_api_worker()"));
 }
 
 #[test]
@@ -325,6 +1037,9 @@ macro_rules! generate_merge_gate_test {
         generate_merge_gate(MergeGateInput {
             dir: $dir,
             config: $config,
+            // Nothing recorded: these packs replay no stored result, so no gate
+            // row can carry a stale-cache caveat.
+            ledger: &crate::ledger::TaskLedger::new(),
             checks: $checks,
             heuristics: $heuristics,
             inline: $inline,
@@ -342,7 +1057,25 @@ macro_rules! generate_merge_gate_test {
 
 macro_rules! generate_run_json_test {
     ($dir:expr, $artifacts_root:expr, $config:expr, $checks:expr, $heuristics:expr, $resolved_target:expr, $resolved_bases:expr, ($run_started_at:expr, $total_duration_secs:expr), $stage_timings:expr, $context_artifacts:expr, $context_command_timings:expr, $regression:expr $(,)?) => {
+        generate_run_json_test!(
+            $dir,
+            $artifacts_root,
+            $config,
+            $checks,
+            $heuristics,
+            $resolved_target,
+            $resolved_bases,
+            ($run_started_at, $total_duration_secs),
+            $stage_timings,
+            $context_artifacts,
+            $context_command_timings,
+            $regression,
+            &crate::ledger::TaskLedger::new(),
+        )
+    };
+    ($dir:expr, $artifacts_root:expr, $config:expr, $checks:expr, $heuristics:expr, $resolved_target:expr, $resolved_bases:expr, ($run_started_at:expr, $total_duration_secs:expr), $stage_timings:expr, $context_artifacts:expr, $context_command_timings:expr, $regression:expr, $ledger:expr $(,)?) => {
         generate_run_json(RunJsonInput {
+            ledger: $ledger,
             dir: $dir,
             artifacts_root: $artifacts_root,
             config: $config,
@@ -1026,6 +1759,15 @@ fn run_json_records_stage_timings() {
         Some("report.json + dashboard")
     );
     assert_eq!(timings[1]["duration_secs"].as_f64(), Some(1.75));
+    assert_eq!(run["resources"]["requested_budget"], "safe");
+    assert_eq!(run["resources"]["effective_budget"], "safe");
+    assert_eq!(run["resources"]["parent_permits"], 1);
+    assert_eq!(run["resources"]["child_worker_limit"], 1);
+    assert!(
+        run["resources"]["schedule"]
+            .as_str()
+            .is_some_and(|schedule| schedule.starts_with("cheap orientation/checks"))
+    );
 }
 
 #[test]
@@ -1109,13 +1851,17 @@ fn run_json_records_context_command_timings() {
             label: "cargo tree".to_string(),
             artifact: Some("30_context/cargo-tree.txt".to_string()),
             status: "completed",
+            started: true,
             duration_secs: 3.5,
+            reason: None,
         },
         ContextCommandTiming {
             label: "tauri info".to_string(),
             artifact: Some("30_context/tauri-info.log".to_string()),
             status: "timed_out",
+            started: true,
             duration_secs: 30.0,
+            reason: Some("exceeded 30s context timeout".to_string()),
         },
     ];
 
@@ -1149,6 +1895,331 @@ fn run_json_records_context_command_timings() {
     );
     assert_eq!(context_commands[1]["status"].as_str(), Some("timed_out"));
     assert_eq!(context_commands[1]["duration_secs"].as_f64(), Some(30.0));
+}
+
+/// The `ledger` view is the run's account of the work it considered: every
+/// lifecycle serializes with the evidence it holds and nothing else, under a
+/// schema counter of its own.
+#[test]
+fn run_json_records_the_task_ledger() {
+    use crate::checks::TreeState;
+    use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
+
+    let config = create_test_config(PolicyConfig::default());
+    let resolved_target = ResolvedRef {
+        name: "feature/ledger".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let resolved_bases = vec![ResolvedRef {
+        name: "origin/main".to_string(),
+        commit_id: "def5678def5678def5678def5678def5678de".to_string(),
+        is_remote: true,
+    }];
+
+    let substrate = SubstrateKey {
+        target_sha: Some("abc1234".to_string()),
+        tree_state: Some(TreeState::Snapshot),
+    };
+    let ledger = TaskLedger::new();
+    let record = |tool: &str, kind, state| {
+        ledger.record(TaskEntry {
+            key: TaskKey::new(tool, substrate.clone()),
+            kind,
+            state,
+            queued_at: None,
+            started_at: None,
+        });
+    };
+    record(
+        "TypeScript",
+        TaskKind::Check,
+        TaskState::Run {
+            duration: Duration::from_millis(8130),
+        },
+    );
+    record(
+        "TypeScript",
+        TaskKind::ContextArtifact,
+        TaskState::Cached {
+            cache_age_secs: Some(42),
+            origin: SubstrateKey {
+                target_sha: Some("older".to_string()),
+                tree_state: Some(TreeState::LocalDirty),
+            },
+        },
+    );
+    record(
+        "ESLint",
+        TaskKind::ContextArtifact,
+        TaskState::Reused {
+            origin: substrate.clone(),
+        },
+    );
+    record(
+        "ESLint",
+        TaskKind::Check,
+        TaskState::Skipped {
+            reason: "fast remote-only preset".to_string(),
+        },
+    );
+    record(
+        "cargo tree",
+        TaskKind::ContextArtifact,
+        TaskState::NotApplicable {
+            reason: "no cargo project".to_string(),
+        },
+    );
+
+    let summary_dir = tempfile::tempdir().expect("summary tempdir");
+    generate_run_json_test!(
+        summary_dir.path(),
+        summary_dir.path(),
+        &config,
+        &[],
+        None,
+        &resolved_target,
+        &resolved_bases,
+        ("2026-03-08T12:00:00Z", 1.5),
+        &[],
+        &[],
+        &[],
+        None,
+        &ledger,
+    )
+    .expect("run json");
+
+    let raw = std::fs::read_to_string(summary_dir.path().join("RUN.json")).expect("read run json");
+    let run: serde_json::Value = serde_json::from_str(&raw).expect("parse run json");
+
+    assert_eq!(
+        run["schema_version"].as_str(),
+        Some("1.0"),
+        "an additive view must not move the pack's schema version",
+    );
+    assert_eq!(run["ledger"]["schema"].as_u64(), Some(2));
+
+    let entries = run["ledger"]["entries"].as_array().expect("ledger entries");
+    assert_eq!(entries.len(), 5);
+
+    assert_eq!(entries[0]["tool"].as_str(), Some("tsc"));
+    assert_eq!(entries[0]["kind"].as_str(), Some("check"));
+    assert_eq!(entries[0]["lifecycle"].as_str(), Some("run"));
+    let duration = entries[0]["duration_secs"].as_f64().expect("duration");
+    assert!(
+        (duration - 8.13).abs() < 1e-4,
+        "durations serialize as f32 seconds like the rest of RUN.json, got {duration}",
+    );
+    assert_eq!(
+        entries[0]["substrate"],
+        serde_json::json!({"target_sha": "abc1234", "tree_state": "snapshot"}),
+        "the substrate speaks the same tree_state vocabulary as checks[]",
+    );
+    assert!(entries[0].get("reason").is_none());
+    assert!(entries[0].get("cache_age_secs").is_none());
+
+    assert_eq!(entries[1]["kind"].as_str(), Some("context_artifact"));
+    assert_eq!(entries[1]["lifecycle"].as_str(), Some("cached"));
+    assert_eq!(entries[1]["cache_age_secs"].as_u64(), Some(42));
+    assert_eq!(
+        entries[1]["origin"],
+        serde_json::json!({"target_sha": "older", "tree_state": "local-dirty"}),
+        "a replay reports the tree the ORIGINAL execution read",
+    );
+
+    assert_eq!(entries[2]["tool"].as_str(), Some("eslint"));
+    assert_eq!(entries[2]["kind"].as_str(), Some("context_artifact"));
+    assert_eq!(entries[2]["lifecycle"].as_str(), Some("reused"));
+    assert_eq!(
+        entries[2]["origin"],
+        serde_json::json!({"target_sha": "abc1234", "tree_state": "snapshot"}),
+        "reuse names the live gate's substrate, not a stored cache entry",
+    );
+    assert!(entries[2].get("cache_age_secs").is_none());
+    assert!(entries[2].get("reason").is_none());
+
+    assert_eq!(entries[3]["tool"].as_str(), Some("eslint"));
+    assert_eq!(entries[3]["lifecycle"].as_str(), Some("skipped"));
+    assert_eq!(
+        entries[3]["reason"].as_str(),
+        Some("fast remote-only preset")
+    );
+
+    assert_eq!(
+        entries[4]["tool"].as_str(),
+        Some("cargo_tree"),
+        "a command with no gate counterpart is slugged from its own label",
+    );
+    assert_eq!(entries[4]["lifecycle"].as_str(), Some("not_applicable"));
+}
+
+/// The ledger already records queued_at vs started_at; the wire view must
+/// keep that gap so a slow tool is distinguishable from a long resource wait.
+#[test]
+fn run_json_emits_queue_wait_when_admission_lagged() {
+    use crate::checks::TreeState;
+    use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
+
+    let config = create_test_config(PolicyConfig::default());
+    let resolved_target = ResolvedRef {
+        name: "feature/queue-wait".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let resolved_bases = vec![ResolvedRef {
+        name: "origin/main".to_string(),
+        commit_id: "def5678def5678def5678def5678def5678de".to_string(),
+        is_remote: true,
+    }];
+    let substrate = SubstrateKey {
+        target_sha: Some("abc1234".to_string()),
+        tree_state: Some(TreeState::Snapshot),
+    };
+    let started = std::time::Instant::now();
+    let queued = started
+        .checked_sub(Duration::from_secs(12))
+        .expect("monotonic clock can subtract 12s");
+    let ledger = TaskLedger::new();
+    ledger.record(TaskEntry {
+        key: TaskKey::new("Clippy", substrate),
+        kind: TaskKind::Check,
+        state: TaskState::Run {
+            duration: Duration::from_secs(3),
+        },
+        queued_at: Some(queued),
+        started_at: Some(started),
+    });
+
+    let summary_dir = tempfile::tempdir().expect("summary tempdir");
+    generate_run_json_test!(
+        summary_dir.path(),
+        summary_dir.path(),
+        &config,
+        &[],
+        None,
+        &resolved_target,
+        &resolved_bases,
+        ("2026-03-08T12:00:00Z", 1.5),
+        &[],
+        &[],
+        &[],
+        None,
+        &ledger,
+    )
+    .expect("run json");
+
+    let raw = std::fs::read_to_string(summary_dir.path().join("RUN.json")).expect("read run json");
+    let run: serde_json::Value = serde_json::from_str(&raw).expect("parse run json");
+    let entries = run["ledger"]["entries"].as_array().expect("ledger entries");
+    assert_eq!(entries.len(), 1);
+    let wait = entries[0]["queue_wait_secs"]
+        .as_f64()
+        .expect("queue wait is serialized");
+    assert!(
+        (wait - 12.0).abs() < 0.05,
+        "queue wait is started_at − queued_at in seconds, got {wait}"
+    );
+    assert!(
+        entries[0].get("queued_at").is_none() && entries[0].get("started_at").is_none(),
+        "absolute Instants are not part of the wire contract"
+    );
+}
+
+/// A skip is decided before the run can know which tree it will read. By the
+/// time `RUN.json` is written the run does know, and the entry must say so —
+/// a reader of the pack cannot apply the in-memory fallback a later stage can.
+#[test]
+fn run_json_reports_the_reviewed_substrate_for_a_skip_recorded_before_it() {
+    use crate::checks::TreeState;
+    use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
+
+    let config = create_test_config(PolicyConfig::default());
+    let resolved_target = ResolvedRef {
+        name: "feature/ledger".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let summary_dir = tempfile::tempdir().expect("summary tempdir");
+
+    let ledger = TaskLedger::new();
+    // The checks stage's first pass: no substrate resolved yet.
+    ledger.record(TaskEntry {
+        key: TaskKey::new("ESLint", SubstrateKey::default()),
+        kind: TaskKind::Check,
+        state: TaskState::Skipped {
+            reason: "fast remote-only preset".to_string(),
+        },
+        queued_at: None,
+        started_at: None,
+    });
+    // …and then the run materialises its shared snapshot.
+    ledger.set_substrate(SubstrateKey {
+        target_sha: Some("abc1234".to_string()),
+        tree_state: Some(TreeState::Snapshot),
+    });
+
+    generate_run_json_test!(
+        summary_dir.path(),
+        summary_dir.path(),
+        &config,
+        &[],
+        None,
+        &resolved_target,
+        &[],
+        ("2026-03-08T12:00:00Z", 1.5),
+        &[],
+        &[],
+        &[],
+        None,
+        &ledger,
+    )
+    .expect("run json");
+
+    let raw = std::fs::read_to_string(summary_dir.path().join("RUN.json")).expect("read run json");
+    let run: serde_json::Value = serde_json::from_str(&raw).expect("parse run json");
+    assert_eq!(
+        run["ledger"]["entries"][0]["substrate"],
+        serde_json::json!({"target_sha": "abc1234", "tree_state": "snapshot"}),
+        "the pack must name the tree the skip was a decision about",
+    );
+}
+
+/// A run with no ledger entries still publishes the view, so a consumer can tell
+/// "this pack records nothing" from "this pack is too old to have the section".
+#[test]
+fn run_json_ledger_view_is_always_present() {
+    let config = create_test_config(PolicyConfig::default());
+    let resolved_target = ResolvedRef {
+        name: "feature/ledger".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let summary_dir = tempfile::tempdir().expect("summary tempdir");
+
+    generate_run_json_test!(
+        summary_dir.path(),
+        summary_dir.path(),
+        &config,
+        &[],
+        None,
+        &resolved_target,
+        &[],
+        ("2026-03-08T12:00:00Z", 1.5),
+        &[],
+        &[],
+        &[],
+        None,
+    )
+    .expect("run json");
+
+    let raw = std::fs::read_to_string(summary_dir.path().join("RUN.json")).expect("read run json");
+    let run: serde_json::Value = serde_json::from_str(&raw).expect("parse run json");
+    assert_eq!(run["ledger"]["schema"].as_u64(), Some(2));
+    assert_eq!(
+        run["ledger"]["entries"].as_array().map(Vec::len),
+        Some(0),
+        "an empty ledger is an empty list, not a missing section",
+    );
 }
 
 #[test]
@@ -3775,7 +4846,14 @@ fn plan_context_artifacts_marks_tauri_info_deferred_for_fast_remote_only() {
         commits: vec![],
     }];
 
-    let decisions = plan_context_artifacts(&config, &diffs, &[]);
+    // No shared snapshot in this fixture, so the reviewed tree is the repo root.
+    let decisions = plan_context_artifacts(
+        &config,
+        &config.repo_root.clone(),
+        &diffs,
+        &[],
+        &crate::ledger::TaskLedger::new(),
+    );
     let tauri_info = decisions
         .iter()
         .find(|decision| decision.key == "tauri_info")
@@ -3787,6 +4865,163 @@ fn plan_context_artifacts_marks_tauri_info_deferred_for_fast_remote_only() {
         tauri_info
             .reason
             .contains("Tauri config/build files changed")
+    );
+}
+
+#[test]
+fn tauri_context_dir_preserves_local_path_and_rebases_the_snapshot() {
+    let repo = tempfile::tempdir().expect("repo");
+    let snapshot = tempfile::tempdir().expect("snapshot");
+    let local_tauri = repo.path().join("desktop/src-tauri");
+    let mut config = create_test_config(PolicyConfig::default());
+    config.repo_root = repo.path().to_path_buf();
+    config.profile.cargo_root = Some(local_tauri.clone());
+
+    assert_eq!(
+        tauri_dir_in_context_tree(&config, repo.path()),
+        local_tauri,
+        "local reviews keep the previously selected cargo root",
+    );
+    assert_eq!(
+        tauri_dir_in_context_tree(&config, snapshot.path()),
+        snapshot.path().join("desktop/src-tauri"),
+        "off-HEAD reviews project that relative layout onto the reviewed tree",
+    );
+}
+
+#[test]
+fn static_tauri_commands_follow_the_shared_reviewed_tree() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let repo = tempfile::tempdir().expect("repo");
+    run_git_fixture(repo.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(repo.path().join("src-tauri/src")).expect("base tauri layout");
+    write_commit_fixture(
+        repo.path(),
+        "src-tauri/Cargo.toml",
+        "[package]\nname = \"desktop\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write_commit_fixture(repo.path(), "src-tauri/src/lib.rs", "mod local;\n");
+    let base_sha = write_commit_fixture(
+        repo.path(),
+        "src-tauri/src/local.rs",
+        "#[tauri::command]\npub fn base_command() {}\n",
+    );
+
+    run_git_fixture(repo.path(), &["checkout", "-q", "-b", "feature"]);
+    std::fs::remove_file(repo.path().join("src-tauri/src/local.rs")).expect("remove base command");
+    std::fs::create_dir_all(repo.path().join("src-tauri/src/commands"))
+        .expect("target command layout");
+    std::fs::write(
+        repo.path().join("src-tauri/src/lib.rs"),
+        "#[path = \"commands/target.rs\"]\nmod target;\n",
+    )
+    .expect("target crate root");
+    std::fs::write(
+        repo.path().join("src-tauri/src/commands/target.rs"),
+        "#[tauri::command]\npub fn target_command() {}\n",
+    )
+    .expect("target command");
+    run_git_fixture(repo.path(), &["add", "-A"]);
+    run_git_fixture(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=prview test",
+            "-c",
+            "user.email=prview@example.test",
+            "commit",
+            "-q",
+            "-m",
+            "target tauri layout",
+        ],
+    );
+    let target_sha = String::from_utf8(
+        git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .expect("target rev-parse")
+            .stdout,
+    )
+    .expect("UTF-8 target sha")
+    .trim()
+    .to_owned();
+
+    run_git_fixture(repo.path(), &["checkout", "-q", "main"]);
+    std::fs::remove_dir_all(repo.path().join("src-tauri")).expect("remove local tauri layout");
+    std::fs::create_dir_all(repo.path().join("local-shell/src")).expect("different local layout");
+    std::fs::write(
+        repo.path().join("local-shell/src/local.rs"),
+        "#[tauri::command]\npub fn local_only_command() {}\n",
+    )
+    .expect("local-only command");
+
+    let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target_sha)
+        .expect("shared reviewed snapshot");
+    let ledger = crate::ledger::TaskLedger::new();
+    ledger.set_shared_snapshot(Some(snapshot));
+    let diffs = [Diff {
+        base: "main".to_string(),
+        target: "feature".to_string(),
+        base_commit_id: base_sha.clone(),
+        target_commit_id: target_sha.clone(),
+        files: vec![
+            FileChange {
+                path: "src-tauri/src/local.rs".to_string(),
+                status: FileStatus::Deleted,
+                additions: 0,
+                deletions: 2,
+            },
+            FileChange {
+                path: "src-tauri/src/commands/target.rs".to_string(),
+                status: FileStatus::Added,
+                additions: 2,
+                deletions: 0,
+            },
+            FileChange {
+                path: "src-tauri/src/lib.rs".to_string(),
+                status: FileStatus::Modified,
+                additions: 2,
+                deletions: 1,
+            },
+        ],
+        stats: DiffStats {
+            files_changed: 3,
+            additions: 4,
+            deletions: 3,
+            copied: 0,
+        },
+        commits: vec![],
+    }];
+    let output = tempfile::tempdir().expect("output");
+    let pack = output.path().join("pack");
+
+    generate_fixture_pack_with_ledger_and_diffs(
+        repo.path(),
+        &pack,
+        &target_sha,
+        &base_sha,
+        &crate::governor::ResourceGovernor::new(),
+        &ledger,
+        &diffs,
+    )
+    .expect("reviewed-tree pack");
+
+    let commands = std::fs::read_to_string(pack.join("30_context/tauri-commands.txt"))
+        .expect("reviewed Tauri commands artifact");
+    assert!(
+        commands.contains("[ADDED] src/commands/target.rs:target_command"),
+        "target snapshot command missing: {commands}",
+    );
+    assert!(
+        commands.contains("[REMOVED] src/local.rs:base_command"),
+        "base command delta missing: {commands}",
+    );
+    assert!(
+        !commands.contains("local_only_command") && !commands.contains("local-shell"),
+        "local checkout layout leaked into reviewed Tauri truth: {commands}",
     );
 }
 
@@ -5214,6 +6449,41 @@ fn sanity_passes_when_completed_command_output_exists() {
         "existing output must pass; failures: {:?}",
         result.failures
     );
+}
+
+#[test]
+fn invalid_sanity_is_rejected_before_publication_helper() {
+    let sanity = SanityResult {
+        valid: false,
+        checks_run: 5,
+        checks_passed: 4,
+        failures: vec!["completed context artifact is missing".to_owned()],
+    };
+    let publication_started = std::cell::Cell::new(false);
+
+    let result = (|| -> Result<()> {
+        ensure_sanity_valid(&sanity)?;
+        publication_started.set(true);
+        Ok(())
+    })();
+
+    let error = result.expect_err("invalid SANITY must abort finalization");
+    assert!(error.to_string().contains("4/5 checks passed"));
+    assert!(error.to_string().contains("context artifact is missing"));
+    assert!(!publication_started.get());
+
+    let production = include_str!("mod.rs");
+    let sanity_guard = production
+        .find("ensure_sanity_valid(&sanity)?")
+        .expect("production sanity guard");
+    let zip = production
+        .find("if config.create_zip")
+        .expect("ZIP finalization");
+    let publication = production
+        .find("begin_latest_publication(&publication, &out_dir)")
+        .expect("publication helper");
+    assert!(sanity_guard < zip);
+    assert!(sanity_guard < publication);
 }
 
 #[test]
