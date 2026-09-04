@@ -125,6 +125,11 @@ fn unix_child_exited_without_reaping(_pid: u32) -> std::io::Result<bool> {
     ))
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn child_exited_without_reaping_for_test(pid: u32) -> std::io::Result<bool> {
+    unix_child_exited_without_reaping(pid)
+}
+
 #[cfg(unix)]
 static EXTERNAL_CHILD_GROUP_WRITER: std::sync::OnceLock<ExternalChildGroupWriterState> =
     std::sync::OnceLock::new();

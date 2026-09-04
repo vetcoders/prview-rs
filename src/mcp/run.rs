@@ -1214,7 +1214,13 @@ mod tests {
             .trim()
             .parse::<u32>()
             .expect("surviving member pid");
-        while crate::storage::process_birth_identity(pid).is_ok() {
+        loop {
+            let birth_identity_missing = crate::storage::process_birth_identity(pid).is_err();
+            let child_is_waitable =
+                crate::proc::child_exited_without_reaping_for_test(pid).unwrap_or(false);
+            if birth_identity_missing && child_is_waitable {
+                break;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "short-lived child did not reach the Darwin post-exit identity gap"
