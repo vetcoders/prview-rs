@@ -733,6 +733,14 @@ impl Repository {
         &self.path
     }
 
+    /// Working directory resolved by libgit2 for this repository.
+    ///
+    /// Unlike [`Self::path`], this remains the checkout root when the repository
+    /// was opened through its `.git` directory. Bare repositories return None.
+    pub(crate) fn workdir(&self) -> Option<&Path> {
+        self.inner.workdir()
+    }
+
     /// Enumerate every entry in one exact commit tree.
     ///
     /// The input must be a full object id. Branch names, abbreviated ids and
