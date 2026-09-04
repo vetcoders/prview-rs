@@ -968,17 +968,20 @@ def validate(path: Path) -> list[str]:
                 and check.get("outcome") == "findings_warning"
                 for check in typed_checks
             ) or typed_inline.get("enforcement_disposition") == "warnings_only"
-            typed_review_source = any(
+            typed_confidence_review_source = any(
                 isinstance(check, dict)
-                and (
-                    check.get("confidence_impact") in {"degraded", "incomplete"}
-                    or (
-                        check.get("outcome") != "findings_warning"
-                        and check.get("merge_impact") == "review_required"
-                    )
-                )
+                and check.get("confidence_impact") in {"degraded", "incomplete"}
+                for check in typed_checks
+            )
+            typed_merge_review_source = any(
+                isinstance(check, dict)
+                and check.get("outcome") != "findings_warning"
+                and check.get("merge_impact") == "review_required"
                 for check in typed_checks
             ) or typed_inline.get("enforcement_disposition") == "review_required"
+            typed_review_source = (
+                typed_confidence_review_source or typed_merge_review_source
+            )
             typed_blocking_source = any(
                 isinstance(check, dict)
                 and (
@@ -1041,13 +1044,18 @@ def validate(path: Path) -> list[str]:
             if typed_review_source and (
                 verdict == "PASS"
                 or decision.get("allow_merge") is not False
-                or decision.get("merge_recommendation")
-                not in {"review_required", "block"}
                 or disposition not in {"review_required", "block"}
             ):
                 issues.append(
                     "a typed degraded/incomplete or non-warning review check requires a "
                     "non-PASS decision and enforcement_disposition review_required or block"
+                )
+            if typed_merge_review_source and decision.get(
+                "merge_recommendation"
+            ) not in {"review_required", "block"}:
+                issues.append(
+                    "a typed check or inline merge review source requires "
+                    "merge_recommendation review_required or block"
                 )
             if typed_blocking_source and (
                 verdict != "BLOCK"

@@ -484,6 +484,49 @@ fn operator_policy_rank_invariants_validator_contract() {
     }]);
     validate(&preexisting_failure, true);
 
+    let mut degraded_preexisting = clean_pack.clone();
+    degraded_preexisting["checks"] = serde_json::json!([{
+        "id":"semgrep_scan", "name":"Semgrep scan", "status":"failed",
+        "execution_state":"executed", "outcome":"findings_failed", "class":"FAIL",
+        "severity":"warn", "policy_conclusion":"advisory",
+        "confidence_impact":"degraded", "merge_impact":"approve", "blocking":false,
+        "duration_secs":0.0, "evidence":"20_quality/semgrep.result.json"
+    }]);
+    degraded_preexisting["decision"]["verdict"] = serde_json::json!("CONDITIONAL");
+    degraded_preexisting["decision"]["allow_merge"] = serde_json::json!(false);
+    degraded_preexisting["decision"]["analysis_status"] = serde_json::json!("degraded");
+    degraded_preexisting["decision"]["merge_recommendation"] = serde_json::json!("approve");
+    degraded_preexisting["decision"]["policy_allow_merge"] = serde_json::json!(true);
+    degraded_preexisting["decision"]["quality_pass"] = serde_json::json!(true);
+    degraded_preexisting["decision"]["blocking_issues"] = serde_json::json!([]);
+    degraded_preexisting["decision"]["enforcement_disposition"] =
+        serde_json::json!("review_required");
+    degraded_preexisting["decision"]["quality_failure_details"] = serde_json::json!([{
+        "name":"Semgrep scan", "classification":"pre-existing", "origin":"failure"
+    }]);
+    validate(&degraded_preexisting, true);
+
+    let mut forged_pass = degraded_preexisting.clone();
+    forged_pass["decision"]["verdict"] = serde_json::json!("PASS");
+    forged_pass["decision"]["allow_merge"] = serde_json::json!(true);
+    validate(&forged_pass, false);
+
+    let mut forged_allow = degraded_preexisting.clone();
+    forged_allow["decision"]["allow_merge"] = serde_json::json!(true);
+    validate(&forged_allow, false);
+
+    let mut hidden_review = degraded_preexisting.clone();
+    hidden_review["decision"]["enforcement_disposition"] = serde_json::json!("clean");
+    validate(&hidden_review, false);
+
+    // Confidence-only degradation may retain a top-level approval, but an
+    // explicit typed merge-review source may not be hidden by that approval.
+    let mut hidden_merge_recommendation = degraded_preexisting.clone();
+    hidden_merge_recommendation["checks"][0]["confidence_impact"] = serde_json::json!("complete");
+    hidden_merge_recommendation["checks"][0]["merge_impact"] = serde_json::json!("review_required");
+    hidden_merge_recommendation["decision"]["analysis_status"] = serde_json::json!("complete");
+    validate(&hidden_merge_recommendation, false);
+
     let mut amputated_failure = preexisting_failure.clone();
     amputated_failure["decision"]["quality_failure_details"] = serde_json::json!([]);
     validate(&amputated_failure, false);
