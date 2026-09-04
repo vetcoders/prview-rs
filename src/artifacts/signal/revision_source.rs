@@ -11,6 +11,7 @@ use crate::git::{GitTreeEntryKind, GitWorktreeChange, Repository};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
+use std::path::Path;
 
 /// Identity of the substrate that produced an entry or read result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +109,7 @@ pub enum RevisionSourceError {
     ObjectUnavailable { oid: String, reason: String },
     InvalidRepoRelativePath { path: String, reason: String },
     MissingDirtyDigest,
+    MissingWorkingTree { repository: String },
     WorktreeStatusUnavailable { reason: String },
 }
 
@@ -125,6 +127,12 @@ impl fmt::Display for RevisionSourceError {
             }
             Self::MissingDirtyDigest => {
                 write!(f, "working-tree overlay requires a captured dirty digest")
+            }
+            Self::MissingWorkingTree { repository } => {
+                write!(
+                    f,
+                    "repository {repository} has no working tree for an overlay"
+                )
             }
             Self::WorktreeStatusUnavailable { reason } => {
                 write!(f, "working-tree status is unavailable: {reason}")
@@ -235,7 +243,7 @@ impl RevisionFileSource for GitTree<'_> {
 
 /// Tracked working-tree state over one exact target commit.
 pub struct WorkingTreeOverlay<'repo> {
-    target: GitTree<'repo>,
+    workdir: &'repo Path,
     provenance: RevisionProvenance,
     entries: BTreeMap<String, RevisionEntry>,
 }
@@ -250,6 +258,11 @@ impl<'repo> WorkingTreeOverlay<'repo> {
         if dirty_digest.trim().is_empty() {
             return Err(RevisionSourceError::MissingDirtyDigest);
         }
+        let workdir = repo
+            .workdir()
+            .ok_or_else(|| RevisionSourceError::MissingWorkingTree {
+                repository: repo.path().display().to_string(),
+            })?;
         let target = GitTree::new(repo, target_oid)?;
         let provenance = RevisionProvenance::WorkingTreeOverlay {
             target_oid: target_oid.to_owned(),
@@ -273,7 +286,7 @@ impl<'repo> WorkingTreeOverlay<'repo> {
             record_tracked_change(&mut entries, &provenance, change);
         }
         Ok(Self {
-            target,
+            workdir,
             provenance,
             entries,
         })
@@ -331,7 +344,7 @@ impl RevisionFileSource for WorkingTreeOverlay<'_> {
             });
         }
 
-        let disk_path = self.target.repo.path().join(path);
+        let disk_path = self.workdir.join(path);
         let metadata = match fs::symlink_metadata(&disk_path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -610,7 +623,10 @@ mod tests {
             .into_iter()
             .map(|entry| entry.path)
             .collect();
+        #[cfg(unix)]
         assert_eq!(paths, ["binary.dat", "link.rs", "src", "src/lib.rs"]);
+        #[cfg(not(unix))]
+        assert_eq!(paths, ["binary.dat", "src", "src/lib.rs"]);
 
         let text = bytes(source.read("src/lib.rs").expect("text"));
         assert_eq!(
@@ -626,12 +642,18 @@ mod tests {
         );
         assert_eq!(binary.content_kind, RevisionContentKind::BinaryOrNonUtf8);
 
+        #[cfg(unix)]
         assert!(matches!(
             source.read("link.rs").expect("link state"),
             RevisionRead::NonRegular {
                 kind: RevisionEntryKind::Symlink,
                 ..
             }
+        ));
+        #[cfg(not(unix))]
+        assert!(matches!(
+            source.read("link.rs").expect("link state"),
+            RevisionRead::Missing { .. }
         ));
         assert_ne!(first, second);
     }
@@ -916,5 +938,51 @@ mod tests {
             RevisionRead::Missing { .. }
         ));
         assert!(!overlay.entries().iter().any(|entry| entry.path == "new.rs"));
+    }
+
+    #[test]
+    fn revision_source_overlay_opened_through_dot_git_reads_worktree_bytes() {
+        let (temp, _, target) = fixture_repo();
+        fs::write(
+            temp.path().join("src/lib.rs"),
+            b"pub fn value() -> u8 { 3 }\n",
+        )
+        .expect("current worktree bytes");
+        let repo = Repository::open(&temp.path().join(".git")).expect("repo through .git");
+        let overlay =
+            WorkingTreeOverlay::new(&repo, &target, "sha256:dot-git").expect("worktree overlay");
+
+        assert_eq!(
+            bytes(overlay.read("src/lib.rs").expect("current read")).bytes,
+            b"pub fn value() -> u8 { 3 }\n"
+        );
+    }
+
+    #[test]
+    fn revision_source_overlay_rejects_bare_repository_explicitly() {
+        let (source, _, target) = fixture_repo();
+        let parent = tempfile::tempdir().expect("bare parent");
+        let bare = parent.path().join("fixture.git");
+        let output = git_cmd()
+            .args([
+                "clone",
+                "--bare",
+                ".",
+                bare.to_str().expect("UTF-8 bare path"),
+            ])
+            .current_dir(source.path())
+            .output()
+            .expect("clone bare repository");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let repo = Repository::open(&bare).expect("bare repo");
+
+        assert!(matches!(
+            WorkingTreeOverlay::new(&repo, &target, "sha256:bare"),
+            Err(RevisionSourceError::MissingWorkingTree { .. })
+        ));
     }
 }

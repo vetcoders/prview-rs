@@ -1414,10 +1414,19 @@ mod tests {
             false,
         );
 
-        assert_ne!(gate["decision"]["verdict"].as_str(), Some("PASS"));
+        assert_eq!(gate["decision"]["verdict"].as_str(), Some("CONDITIONAL"));
+        assert_eq!(gate["decision"]["allow_merge"].as_bool(), Some(false));
         assert_eq!(
             gate["decision"]["analysis_status"].as_str(),
             Some("degraded")
+        );
+        assert_eq!(
+            gate["decision"]["merge_recommendation"].as_str(),
+            Some("approve")
+        );
+        assert_eq!(
+            gate["decision"]["enforcement_disposition"].as_str(),
+            Some("review_required")
         );
         // The finding impact is still downgraded: it lands in the pre-existing
         // bucket, not as a new failure that blocks.

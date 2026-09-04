@@ -132,14 +132,15 @@ fn flush_js_ts_section(output: &mut String, section: &str, header_paths: Option<
     let mut new_file = false;
     let mut deleted_file = false;
     let mut has_hunk_or_change_content = false;
+    let mut in_hunk = false;
     for line in section.lines() {
-        if let Some(value) = line.strip_prefix("--- ") {
+        if let Some(value) = line.strip_prefix("--- ").filter(|_| !in_hunk) {
             if old_marker.is_some() {
                 marker_error = true;
             } else {
                 old_marker = Some(parse_patch_marker(value, "a/"));
             }
-        } else if let Some(value) = line.strip_prefix("+++ ") {
+        } else if let Some(value) = line.strip_prefix("+++ ").filter(|_| !in_hunk) {
             if new_marker.is_some() {
                 marker_error = true;
             } else {
@@ -149,8 +150,10 @@ fn flush_js_ts_section(output: &mut String, section: &str, header_paths: Option<
             new_file = true;
         } else if line.starts_with("deleted file mode ") {
             deleted_file = true;
-        } else if line.starts_with("@@")
-            || (line.starts_with('+') && !line.starts_with("+++"))
+        } else if line.starts_with("@@") {
+            in_hunk = true;
+            has_hunk_or_change_content = true;
+        } else if (line.starts_with('+') && !line.starts_with("+++"))
             || (line.starts_with('-') && !line.starts_with("---"))
         {
             has_hunk_or_change_content = true;
@@ -203,20 +206,22 @@ fn flush_js_ts_section(output: &mut String, section: &str, header_paths: Option<
     ));
 
     let mut last_change_kept = false;
+    let mut in_hunk = false;
     for line in section.lines() {
         if line.starts_with("@@") {
+            in_hunk = true;
             output.push_str(line);
             output.push('\n');
             last_change_kept = false;
-        } else if line.starts_with("--- ") || line.starts_with("+++ ") {
+        } else if !in_hunk && (line.starts_with("--- ") || line.starts_with("+++ ")) {
             continue;
-        } else if line.starts_with('-') && !line.starts_with("---") {
+        } else if line.starts_with('-') {
             last_change_kept = old_js;
             if old_js {
                 output.push_str(line);
                 output.push('\n');
             }
-        } else if line.starts_with('+') && !line.starts_with("+++") {
+        } else if line.starts_with('+') {
             last_change_kept = new_js;
             if new_js {
                 output.push_str(line);
@@ -675,6 +680,22 @@ mod tests {
         let deleted = "diff --git a/src/old.ts b/src/old.ts\ndeleted file mode 100644\n--- a/src/old.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-export const removed = 1;\n";
         assert!(js_ts_patch_sections(added).contains("export const added"));
         assert!(js_ts_patch_sections(deleted).contains("export const removed"));
+    }
+
+    #[test]
+    fn js_ts_patch_sections_does_not_parse_removed_content_as_old_marker() {
+        let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,2 +1 @@\n--- content collision\n-export function removed() {}\n";
+        let filtered = js_ts_patch_sections(patch);
+        assert!(filtered.contains("--- content collision"));
+        assert!(filtered.contains("removed"));
+    }
+
+    #[test]
+    fn js_ts_patch_sections_does_not_parse_added_content_as_new_marker() {
+        let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1 +1,2 @@\n export const kept = true;\n+++ content collision\n";
+        let filtered = js_ts_patch_sections(patch);
+        assert!(filtered.contains("+++ content collision"));
+        assert!(filtered.contains("src/api.ts"));
     }
 
     #[test]

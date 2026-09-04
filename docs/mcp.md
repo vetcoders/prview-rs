@@ -305,8 +305,16 @@ The decision surface is normalized so callers read one vocabulary:
   a warning-bearing pack may remain `PASS`/`allow_merge: true` while reporting
   `warnings_only`.
 - `merge_recommendation` — `approve`, `review_required`, or `block`.
-- `allow_merge` — boolean, **derived** conservatively: it is `true` only for a
-  clean `PASS`. A permissive flag on disk can never override a block/hold signal.
+- `allow_merge` — boolean, derived from the normalized verdict:
+  `allow_merge == (verdict == "PASS")`. This includes a valid `PASS` carrying
+  `warnings_only`.
+
+`enforcement_disposition` independently controls process-lane acceptance. A
+strict gate rejects `review_required` while accepting `warnings_only`; a
+warnings-clean lane additionally rejects `warnings_only` even when the verdict
+is `PASS` and `allow_merge` is true. The CLI and MCP `verdict` response expose
+these normalized fields. The GitHub Action reports the verdict and disposition,
+but maps its pass/fail result from the gate process exit code.
 
 If the stored gate emits contradictory signals (for example `allow_merge: true`
 alongside a block recommendation, or a clean approval alongside

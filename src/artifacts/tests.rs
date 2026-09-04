@@ -834,6 +834,32 @@ fn js_ts_legacy_breaking_path_never_observes_rust_patch_lines() {
 }
 
 #[test]
+fn marker_like_hunk_content_survives_both_legacy_api_adapters() {
+    let patch = "diff --git a/src/api.ts b/src/api.ts\n--- a/src/api.ts\n+++ b/src/api.ts\n@@ -1,2 +1,2 @@\n--- content collision\n-export function removed_after_collision() {}\n+++ content collision\n+export function added_after_collision() {}\n";
+
+    let public = signal::analyze_js_ts_public_api_diff(&[patch.to_owned()]);
+    assert!(
+        public
+            .removed
+            .iter()
+            .any(|finding| finding.signature.contains("removed_after_collision"))
+    );
+    assert!(
+        public
+            .added
+            .iter()
+            .any(|finding| finding.signature.contains("added_after_collision"))
+    );
+
+    let breaking = signal::analyze_js_ts_breaking_changes(&[patch.to_owned()]);
+    assert!(
+        breaking
+            .iter()
+            .any(|finding| finding.line.contains("removed_after_collision"))
+    );
+}
+
+#[test]
 fn malformed_marker_identity_never_reclassifies_rust_for_either_legacy_adapter() {
     for patch in [
         "diff --git a/src/lib.rs b/src/api.ts\n--- a/src/fake.ts\n+++ b/src/api.ts\n@@ -1 +1 @@\n-pub fn rust_secret() {}\n+export function js_added() {}\n",
