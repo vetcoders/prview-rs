@@ -1109,6 +1109,7 @@ pub(crate) fn create_owned_temp_file(parent: &Path, prefix: &str) -> Result<(Pat
 /// Create a uniquely named, owned empty temp directory without replacing an
 /// existing entry. This is the directory-shaped counterpart to
 /// [`create_owned_temp_file`].
+#[cfg(unix)]
 pub(crate) fn create_owned_temp_dir(parent: &Path, prefix: &str) -> Result<PathBuf> {
     fs::create_dir_all(parent)?;
     for _ in 0..16 {

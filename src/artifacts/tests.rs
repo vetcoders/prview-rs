@@ -463,6 +463,13 @@ fn rollback_failure_keeps_cancellation_identity_and_detail() {
 #[test]
 fn cancellation_that_arrives_during_rollback_remains_typed() {
     let governor = crate::governor::ResourceGovernor::new();
+    let output = tempfile::tempdir().unwrap();
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        let path = output.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "published success surface").unwrap();
+    }
+    let summary = output.path().join("00_summary");
     let cancellation_before_rollback = governor.is_cancelled();
     governor.cancel();
 
@@ -471,6 +478,7 @@ fn cancellation_that_arrives_during_rollback_remains_typed() {
         cancellation_before_rollback,
         Err(anyhow::anyhow!("rollback storage fault")),
         &governor,
+        output.path(),
     );
 
     assert!(
@@ -480,6 +488,61 @@ fn cancellation_that_arrives_during_rollback_remains_typed() {
     let detail = format!("{error:#}");
     assert!(detail.contains("publication storage fault"), "{detail}");
     assert!(detail.contains("rollback storage fault"), "{detail}");
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        assert!(
+            !output.path().join(relative).exists(),
+            "cancelled pack retained success surface {relative}"
+        );
+    }
+    let incomplete: serde_json::Value =
+        serde_json::from_slice(&fs::read(summary.join("INCOMPLETE.json")).unwrap()).unwrap();
+    assert_eq!(incomplete["status"], "incomplete");
+    assert_eq!(incomplete["reason"], "cancelled");
+    assert_eq!(incomplete["stage"], "run index commit");
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellation_at_publication_rollback_leaves_only_incomplete_unpublished_evidence() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let first = output.path().join("first");
+    let governor = crate::governor::ResourceGovernor::new();
+    generate_fixture_pack(repo.path(), &first, &target_sha, &base_sha, &governor)
+        .expect("completed predecessor pack");
+
+    let second = output.path().join("second");
+    let cancel_governor = crate::governor::ResourceGovernor::new();
+    crate::storage::arm_test_index_save_failure();
+    let _rollback = publication_rollback_test_hook::RollbackGuard::install();
+    let error = generate_fixture_pack(
+        repo.path(),
+        &second,
+        &target_sha,
+        &base_sha,
+        &cancel_governor,
+    )
+    .expect_err("cancel at rollback must not publish the failed pack");
+
+    assert!(crate::governor::is_cancellation(&error), "{error:#}");
+    assert!(format!("{error:#}").contains("injected index save failure"));
+    for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
+        assert!(!second.join(relative).exists(), "retained {relative}");
+    }
+    assert!(second.join("00_summary/INCOMPLETE.json").exists());
+    assert_eq!(
+        fs::read_link(output.path().join("latest")).unwrap(),
+        PathBuf::from("first")
+    );
+    assert!(
+        crate::storage::RunIndex::load()
+            .entries()
+            .iter()
+            .all(|entry| entry.path != second)
+    );
 }
 
 #[cfg(unix)]
