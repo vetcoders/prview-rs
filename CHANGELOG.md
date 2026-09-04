@@ -19,8 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A signal arriving after durable pack publication no longer relabels the
-  completed run as exit 130. TUI publication failures preserve typed
-  cancellation through rollback errors, and crash-journal recovery refuses
+  completed run as exit 130, while an unchanged `--update` remains
+  cancellation-sensitive. Crash-journal recovery refuses and quarantines
   symlinks, non-regular inputs, and records larger than 64 KiB.
 - Cancellation remains typed as exit 130 even when rollback of the temporary
   `latest` publication also fails; the rollback error is retained as context.

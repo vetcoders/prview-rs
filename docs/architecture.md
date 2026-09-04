@@ -1325,7 +1325,9 @@ clears the journal. Invalid journal state is quarantined without mutating the
 advertised alias, so stale or tampered recovery evidence cannot deny all future
 publications. The shared review worktree is explicitly removed before either
 advertisement; cancellation during that governed cleanup therefore produces an
-  incomplete, unpublished pack rather than exit 130 after a published verdict.
+incomplete, unpublished pack rather than exit 130 after a published verdict.
+An unchanged `--update` only reuses an existing pack and has no new durable
+commit boundary, so it remains cancellation-sensitive at the final handoff.
 A valid journal is preserved when `index.jsonl` cannot be opened or parsed. The
 journal itself is opened without following a final symlink, must be a regular
 file, and is read through a 64 KiB limit; a FIFO, device, or oversized record

@@ -468,6 +468,33 @@ fn preserve_primary_error_after_latest_rollback(
     }
 }
 
+fn publication_failure_after_rollback(
+    publication_error: anyhow::Error,
+    cancellation_before_rollback: bool,
+    rollback: Result<()>,
+    governor: &crate::governor::ResourceGovernor,
+) -> anyhow::Error {
+    if cancellation_before_rollback || governor.is_cancelled() {
+        let cancellation = if crate::governor::is_cancellation(&publication_error) {
+            publication_error
+        } else {
+            anyhow::Error::new(crate::governor::Cancelled).context(format!(
+                "run publication failed while cancellation was active: {publication_error:#}"
+            ))
+        };
+        return preserve_primary_error_after_latest_rollback(cancellation, rollback);
+    }
+
+    match rollback {
+        Ok(()) => publication_error.context(
+            "run publication failed; generated files were not committed to discoverable history",
+        ),
+        Err(rollback_error) => anyhow::anyhow!(
+            "run publication failed ({publication_error:#}) and its durable alias/index reconciliation also failed ({rollback_error:#})"
+        ),
+    }
+}
+
 /// Generate all artifacts
 pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let GenerateInput {
@@ -1194,29 +1221,14 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
                     "run publication failed with an unconfirmed index rollback; durable recovery journal retained",
                 ));
             }
-            let cancellation_active =
+            let cancellation_before_rollback =
                 governor.is_cancelled() || crate::governor::is_cancellation(&e);
             let rollback = rollback_latest_publication(&latest_transaction);
-            if cancellation_active {
-                let cancellation = if crate::governor::is_cancellation(&e) {
-                    e
-                } else {
-                    anyhow::Error::new(crate::governor::Cancelled).context(format!(
-                        "run publication failed while cancellation was active: {e:#}"
-                    ))
-                };
-                return Err(preserve_primary_error_after_latest_rollback(
-                    cancellation,
-                    rollback,
-                ));
-            }
-            if let Err(rollback_error) = rollback {
-                return Err(anyhow::anyhow!(
-                    "run publication failed ({e:#}) and its durable alias/index reconciliation also failed ({rollback_error:#})"
-                ));
-            }
-            return Err(e.context(
-                "run publication failed; generated files were not committed to discoverable history",
+            return Err(publication_failure_after_rollback(
+                e,
+                cancellation_before_rollback,
+                rollback,
+                governor,
             ));
         } else if let Err(error) = finish_latest_publication(&latest_transaction) {
             // Index and alias are already consistent. Keep the journal for the

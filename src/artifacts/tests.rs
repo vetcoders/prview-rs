@@ -460,6 +460,28 @@ fn rollback_failure_keeps_cancellation_identity_and_detail() {
     );
 }
 
+#[test]
+fn cancellation_that_arrives_during_rollback_remains_typed() {
+    let governor = crate::governor::ResourceGovernor::new();
+    let cancellation_before_rollback = governor.is_cancelled();
+    governor.cancel();
+
+    let error = publication_failure_after_rollback(
+        anyhow::anyhow!("publication storage fault"),
+        cancellation_before_rollback,
+        Err(anyhow::anyhow!("rollback storage fault")),
+        &governor,
+    );
+
+    assert!(
+        crate::governor::is_cancellation(&error),
+        "cancellation observed after rollback must remain typed: {error:#}"
+    );
+    let detail = format!("{error:#}");
+    assert!(detail.contains("publication storage fault"), "{detail}");
+    assert!(detail.contains("rollback storage fault"), "{detail}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn cancellation_during_shared_snapshot_cleanup_never_publishes_the_pack() {

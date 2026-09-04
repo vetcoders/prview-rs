@@ -619,17 +619,17 @@ pub async fn with_cancellation<T>(
     .await
 }
 
-/// Supervise a run whose successful return occurs only after durable
-/// publication, so a signal already observed at the return handoff cannot
-/// relabel that committed success as cancellation.
-pub async fn with_cancellation_after_commit<T>(
+/// Supervise a run and let the returned value identify whether durable
+/// publication completed before the final interrupt handoff.
+pub async fn with_cancellation_after_commit_if<T>(
     work: impl std::future::Future<Output = anyhow::Result<T>>,
     governor: &Arc<ResourceGovernor>,
     interrupts: impl Interrupts,
+    is_committed: impl FnOnce(&T) -> bool,
 ) -> anyhow::Result<T> {
     with_run_scope(
         Arc::clone(governor),
-        supervisor::with_cancellation_after_commit(work, governor, interrupts),
+        supervisor::with_cancellation_after_commit_if(work, governor, interrupts, is_committed),
     )
     .await
 }
