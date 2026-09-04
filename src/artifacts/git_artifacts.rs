@@ -296,6 +296,17 @@ pub(crate) fn recover_latest_publication(
     let bytes = match read_bounded_publication_journal(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::InvalidData
+                || error.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            let error = anyhow::Error::new(error).context(format!(
+                "Unsafe publication transaction object {}",
+                path.display()
+            ));
+            quarantine_invalid_latest_publication_record(&path, &error)?;
+            return Ok(());
+        }
         Err(error) => return Err(error.into()),
     };
     let record: LatestPublicationRecord = match serde_json::from_slice(&bytes)
@@ -1267,33 +1278,52 @@ mod latest_tests {
     }
 
     #[test]
-    fn publication_journal_read_refuses_links_fifos_and_oversized_files() {
+    fn publication_recovery_quarantines_unsafe_journals_and_allows_next_run() {
         use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
-        let linked = root.path().join("linked-journal");
-        symlink("/dev/zero", &linked).unwrap();
-        assert!(read_bounded_publication_journal(&linked).is_err());
+        for case in ["symlink", "fifo", "oversized"] {
+            let home = tempfile::tempdir().unwrap();
+            let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
+            let journal = latest_publication_record_path();
+            match case {
+                "symlink" => symlink("/dev/zero", &journal).unwrap(),
+                "fifo" => {
+                    let fifo_path = std::ffi::CString::new(journal.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: fifo_path is a NUL-terminated path inside this test's TempDir.
+                    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+                }
+                "oversized" => fs::write(
+                    &journal,
+                    vec![b'x'; MAX_PUBLICATION_JOURNAL_BYTES as usize + 1],
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
 
-        let fifo = root.path().join("fifo-journal");
-        let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: fifo_path is a NUL-terminated path inside this test's TempDir.
-        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
-        let started = std::time::Instant::now();
-        assert!(read_bounded_publication_journal(&fifo).is_err());
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "FIFO rejection must not block while holding the publication lock"
-        );
+            let publication = crate::storage::acquire_publication_lock(|| false).unwrap();
+            let started = std::time::Instant::now();
+            recover_latest_publication(&publication)
+                .expect("unsafe journal must be quarantined, not deny later publishers");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{case} recovery must remain bounded"
+            );
+            assert!(!journal.exists(), "{case} source path must be quarantined");
+            assert!(fs::read_dir(home.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("publication-transaction.invalid")
+            }));
 
-        let oversized = root.path().join("oversized-journal");
-        fs::write(
-            &oversized,
-            vec![b'x'; MAX_PUBLICATION_JOURNAL_BYTES as usize + 1],
-        )
-        .unwrap();
-        assert!(read_bounded_publication_journal(&oversized).is_err());
+            let next = home.path().join("runs/repo/main/next");
+            write_pack_identity(&next);
+            let transaction = begin_latest_publication(&publication, &next)
+                .expect("the next valid publisher must proceed after quarantine");
+            finish_latest_publication(&transaction).unwrap();
+        }
     }
 
     #[test]
