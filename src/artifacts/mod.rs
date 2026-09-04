@@ -1235,7 +1235,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
             }
             let cancellation_before_rollback =
                 governor.is_cancelled() || crate::governor::is_cancellation(&e);
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             publication_rollback_test_hook::observe_and_maybe_cancel(governor);
             let rollback = rollback_latest_publication(&latest_transaction);
             return Err(publication_failure_after_rollback(
@@ -2788,7 +2788,7 @@ mod publication_commit_test_hook {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod publication_rollback_test_hook {
     use crate::governor::ResourceGovernor;
     use std::cell::Cell;
