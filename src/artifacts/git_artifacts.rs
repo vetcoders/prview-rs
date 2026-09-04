@@ -251,8 +251,9 @@ fn clear_latest_publication_record() -> Result<()> {
 }
 
 /// Preserve an invalid crash journal as evidence without letting it permanently
-/// deny every later publication. The destination is an owned create-new file,
-/// so the rename cannot overwrite an operator file even if names collide.
+/// deny every later publication. The destination is an owned create-new entry
+/// with the same directory shape as the source, so the rename cannot overwrite
+/// an operator file even if names collide.
 #[cfg(unix)]
 fn quarantine_invalid_latest_publication_record(
     path: &Path,
@@ -261,11 +262,21 @@ fn quarantine_invalid_latest_publication_record(
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("publication transaction has no parent"))?;
-    let (quarantine, placeholder) =
-        crate::storage::create_owned_temp_file(parent, "publication-transaction.invalid")?;
-    drop(placeholder);
+    let source_is_dir = fs::symlink_metadata(path)?.file_type().is_dir();
+    let quarantine = if source_is_dir {
+        crate::storage::create_owned_temp_dir(parent, "publication-transaction.invalid")?
+    } else {
+        let (quarantine, placeholder) =
+            crate::storage::create_owned_temp_file(parent, "publication-transaction.invalid")?;
+        drop(placeholder);
+        quarantine
+    };
     if let Err(error) = fs::rename(path, &quarantine) {
-        let _ = fs::remove_file(&quarantine);
+        if source_is_dir {
+            let _ = fs::remove_dir(&quarantine);
+        } else {
+            let _ = fs::remove_file(&quarantine);
+        }
         return Err(error).with_context(|| {
             format!(
                 "Failed to quarantine invalid publication transaction {}",
@@ -1282,7 +1293,7 @@ mod latest_tests {
         use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::symlink;
 
-        for case in ["symlink", "fifo", "oversized"] {
+        for case in ["symlink", "fifo", "directory", "oversized"] {
             let home = tempfile::tempdir().unwrap();
             let _home = crate::config::override_test_prview_home(home.path().to_path_buf());
             let journal = latest_publication_record_path();
@@ -1293,6 +1304,7 @@ mod latest_tests {
                     // SAFETY: fifo_path is a NUL-terminated path inside this test's TempDir.
                     assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
                 }
+                "directory" => fs::create_dir(&journal).unwrap(),
                 "oversized" => fs::write(
                     &journal,
                     vec![b'x'; MAX_PUBLICATION_JOURNAL_BYTES as usize + 1],

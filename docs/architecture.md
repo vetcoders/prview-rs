@@ -1263,9 +1263,11 @@ batch then runs outside the async signal owner, which keeps polling a second
 interrupt while a platform tree killer is blocked. Headless completion uses the
 same biased `InterruptSupervisor::stop().await` handoff as TUI startup. Before
 durable publication, an already-ready signal is drained and cancellation wins
-the result handoff. A successful `App::run` return proves that publication has
-already committed, so the dedicated post-commit handoff preserves that result
-instead of simultaneously exposing a verdict and claiming cancellation.
+the result handoff. A successful `App::run` return with `Report.unchanged ==
+false` proves that publication has already committed, so the dedicated
+post-commit handoff preserves that result instead of simultaneously exposing a
+verdict and claiming cancellation. An unchanged update has no new commit
+boundary and remains cancellation-sensitive.
 
 `blocking_stage` makes the surrounding runtime responsive; it does not preempt
 the in-process libgit2 closure itself. After the TUI's first quit request cancels
