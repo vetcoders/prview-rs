@@ -2605,6 +2605,13 @@ at the `;` ending the item the marker annotates. Waiting for a brace that never
 comes left the context open for the rest of the hunk, and every production loop
 and query below it was recorded as test-only and dropped from the signal.
 
+Braces after an item's top-level `=` belong to its initializer, including
+struct literals and nested blocks. Closing a struct literal therefore does not
+end test context before a following method call or closure in the same
+initializer. The item ends at its own semicolon, outside both signature brackets
+and initializer braces; semicolons inside nested initializer blocks cannot end
+it. Production code following that terminator remains eligible for perf signals.
+
 Which brace opens that body is decided against the signature's bracket nesting,
 not by taking the first `{`. A brace in type or pattern position —
 `fn run() -> Buffer<{ LIMIT }>`, or the extractor idiom
