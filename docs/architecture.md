@@ -2168,7 +2168,12 @@ both Markdown files are presentations of that same data. MERGE_GATE and
 `report.json` serialize the same view directly. Confirmed Removed, Changed,
 Relocated, and VisibilityChanged facts use the existing `breaking_escalation`
 knob; Added-only is informational. Unknown facts degrade confidence and require
-review without changing policy defaults or becoming a confirmed break.
+review without changing policy defaults or becoming a confirmed break. The
+`public_api_diff` check row is aggregate context, retained as a dashboard note.
+It never creates an inline SARIF diagnostic or contributes to the inline finding
+count, including when the summary contains a path or an unknown region. Typed
+API facts and their merge-gate escalation remain independent of this presentation.
+
 
 `tests/fixtures/api_surface/phase_a_parity.json` is the deterministic,
 byte-locked v3 machine ledger for all 32 W0 positive/mutant cells. Its test

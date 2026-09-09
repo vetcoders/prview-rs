@@ -487,6 +487,19 @@ pub(super) fn generate_inline_findings(
 
         // Dispatch to structured parsers first.
         match check_id.as_str() {
+            "public_api_diff" => {
+                // This row summarizes the API artifact; it is not a source
+                // diagnostic. Typed deltas still drive breaking escalation and
+                // uncertainty in the merge gate independently of inline SARIF.
+                dashboard_findings.push(DashboardFinding {
+                    level: "note",
+                    check_name: check.name.clone(),
+                    check_id: check_id.clone(),
+                    message: check.output.trim().to_string(),
+                    in_diff: None,
+                });
+                continue;
+            }
             "eslint" => {
                 let parsed = parsers::eslint::parse_eslint_output(&check.output);
                 if !parsed.is_empty() {
@@ -904,6 +917,36 @@ pub(super) fn should_skip_inline_fallback_line(is_geiger: bool, line: &str) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_api_summary_never_invents_a_sarif_diagnostic() {
+        for output in [
+            "Public API changed: 0 new, 0 removed, 0 modified",
+            "Public API analysis incomplete: unknown region src/lib.rs:42",
+            "Public API changed: 0 new, 1 removed, 0 modified",
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let check = CheckResult {
+                name: "public_api_diff".to_owned(),
+                status: CheckStatus::Warnings,
+                duration: std::time::Duration::ZERO,
+                output: output.to_owned(),
+                cached: false,
+                provenance: None,
+            };
+            let summary =
+                generate_inline_findings(tmp.path(), std::slice::from_ref(&check), &[], None, None)
+                    .expect("findings");
+            assert_eq!(summary.findings_count, 0);
+            assert_eq!(summary.dashboard_findings.len(), 1);
+            let context = &summary.dashboard_findings[0];
+            assert_eq!(context.level, "note");
+            assert_eq!(context.message, output);
+            assert!(!is_operator_finding(context));
+            assert!(!tmp.path().join("INLINE_FINDINGS.sarif").exists());
+            assert_eq!(gate_class_for_check(check.status), GateClass::Info);
+        }
+    }
 
     fn err(in_diff: Option<bool>) -> DashboardFinding {
         DashboardFinding {
