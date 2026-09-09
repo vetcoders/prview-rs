@@ -245,6 +245,13 @@ The decision caveat always enumerates counts for `new`, `pre-existing`,
 `resolved`, and `unknown-baseline`, plus an explicit baseline status
 (`not-required`, `available`, `unavailable`, or `current-unavailable`).
 
+Semgrep's inline finding parser reads the first complete JSON value from the
+combined stdout/stderr log. Trailing stderr diagnostics do not discard valid
+`results[]` or become source findings. The parser preserves each result's rule,
+message, severity, path, and start position; truncated JSON is not accepted as
+a complete payload. The legacy pretty-output parser remains available for
+historical text logs.
+
 Semgrep's `errors[]` remains a completeness signal independently of findings.
 Path-like `path`, `location.path`, and span `file` fields are collected into a
 stable deduplicated list and emitted in decision caveats. A partial parser run

@@ -4030,6 +4030,44 @@ fn inline_findings_emits_one_sarif_result_per_cargo_audit_advisory() {
 }
 
 #[test]
+fn inline_findings_keeps_semgrep_json_results_with_stderr() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let check = CheckResult {
+        name: "Semgrep scan".to_string(),
+        status: CheckStatus::Failed,
+        duration: Duration::from_secs(1),
+        output: r#"{"results":[{"check_id":"javascript.audit.example","path":"e2e/browser.cjs","start":{"line":23,"col":11},"extra":{"message":"Inspect page.goto(url)","severity":"WARNING"}}],"errors":[{"type":"PartialParsing","path":"src/unparsed.js"}]}
+/opt/semgrep/dependencies.py:4: UserWarning: pkg_resources is deprecated
+"#.to_string(),
+        cached: false,
+        provenance: None,
+    };
+
+    let summary =
+        generate_inline_findings(tmp.path(), &[check], &[], None, None).expect("inline findings");
+    assert_eq!(summary.findings_count, 1);
+    assert_eq!(summary.dashboard_findings.len(), 1);
+    assert_eq!(
+        summary.dashboard_findings[0].message,
+        "Inspect page.goto(url)"
+    );
+
+    let sarif: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("INLINE_FINDINGS.sarif")).expect("read SARIF"),
+    )
+    .expect("parse SARIF");
+    let results = sarif["runs"][0]["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["ruleId"], "javascript.audit.example");
+    assert_eq!(results[0]["level"], "warning");
+    assert_eq!(results[0]["message"]["text"], "Inspect page.goto(url)");
+    let location = &results[0]["locations"][0]["physicalLocation"];
+    assert_eq!(location["artifactLocation"]["uri"], "e2e/browser.cjs");
+    assert_eq!(location["region"]["startLine"], 23);
+    assert_eq!(location["region"]["startColumn"], 11);
+}
+
+#[test]
 fn inline_findings_splits_semgrep_introduced_vs_preexisting() {
     // Two semgrep findings: one in a file touched by the PR (introduced),
     // one in an untouched file (preexisting). The SARIF run must carry an
