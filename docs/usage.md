@@ -229,6 +229,8 @@ packages. Each uv pool is the minimum of the run plan, a positive inherited
 environment value, and the matching project value from `uv.toml` or
 `[tool.uv]`; `uv.toml` wins when both project files exist. Invalid or
 unreadable concurrency authority fails closed instead of widening the run.
+Pytest configuration reads are also capped at 1 MiB; an oversized candidate
+fails the check before collection rather than falling back to another config.
 The selected project-scoped uv authority is opened only as a regular file and
 read up to 1 MiB before parsing; a FIFO, device, or oversized `uv.toml` or
 `pyproject.toml` therefore cannot block or exhaust the synchronous planner.

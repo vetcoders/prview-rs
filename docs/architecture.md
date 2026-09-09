@@ -383,7 +383,10 @@ Pytest 7.2-8.x recognizes `.pytest.ini` as a candidate but does not select an
 empty hidden file unconditionally; that behavior begins with pytest 9. The
 versioned discovery model preserves this distinction instead of treating every
 recognized basename as an automatic winner.
-Existing but unreadable, non-UTF-8, malformed, or conflicting recognized config
+Pytest and uv share a 1 MiB read cap checked against the opened regular file,
+with at most one extra byte read to detect growth. Pytest retains its existing
+regular-file symlink discovery; non-file candidates remain ignored. Existing
+but oversized, unreadable, non-UTF-8, malformed, or conflicting recognized config
 is an execution error, not absence. Pytest-xdist gets the same upper bound
 through its auto-worker environment and a final CLI override only when the
 effective shell-tokenized config/environment request exceeds that bound or is

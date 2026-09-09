@@ -19,9 +19,9 @@ pub struct RuffCheck;
 pub struct MypyCheck;
 pub struct PytestCheck;
 
-/// Project-scoped uv configuration is inspected synchronously before the
-/// governed child exists. Keep that planning read finite on every platform.
-const MAX_UV_CONFIG_BYTES: u64 = 1024 * 1024;
+/// Project-scoped uv and pytest configuration is inspected before the check
+/// child runs. Keep those planning reads finite on every platform.
+const MAX_PYTHON_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Skip reason when the REVIEWED commit is not a Python project.
 ///
@@ -700,14 +700,25 @@ fn read_pytest_config(path: &Path) -> Result<Option<String>> {
     if !metadata.is_file() {
         return Ok(None);
     }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("pytest config {} exists but cannot be read", path.display())
-            });
-        }
-    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Preserve pytest's existing symlink discovery semantics. Nonblocking
+        // open plus the shared post-open file check bounds replacement races.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let bytes = options
+        .open(path)
+        .map_err(anyhow::Error::from)
+        .and_then(|file| read_bounded_python_config(file, "pytest config"))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "pytest config {} exists but cannot be read: {error:#}",
+                path.display()
+            )
+        })?;
     String::from_utf8(bytes)
         .map(Some)
         .with_context(|| format!("pytest config {} is not valid UTF-8", path.display()))
@@ -1180,8 +1191,6 @@ fn uv_concurrency_limits_from_file(
 /// Read one already-contained uv authority without blocking on special files
 /// or allocating from an attacker-controlled length.
 fn read_bounded_regular_uv_config(path: &Path) -> Result<String> {
-    use std::io::Read as _;
-
     // Reject a special file before open as well as after it. O_NONBLOCK keeps
     // ordinary Unix FIFOs safe, but not every device driver is required to
     // honor that flag; the post-open fstat below closes the replacement race.
@@ -1198,18 +1207,27 @@ fn read_bounded_regular_uv_config(path: &Path) -> Result<String> {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
 
-    let file = options.open(path)?;
+    let bytes = read_bounded_python_config(options.open(path)?, "uv configuration")?;
+    String::from_utf8(bytes).context("uv configuration is not UTF-8")
+}
+
+/// Bound allocation and reads using the opened file, not only pathname metadata.
+/// The extra byte detects growth after the metadata check without an unbounded read.
+fn read_bounded_python_config(file: std::fs::File, label: &str) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_UV_CONFIG_BYTES {
-        anyhow::bail!("uv configuration is not a bounded regular file");
+    if !metadata.is_file() || metadata.len() > MAX_PYTHON_CONFIG_BYTES {
+        anyhow::bail!("{label} is not a bounded regular file (limit: 1 MiB)");
     }
 
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_UV_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_UV_CONFIG_BYTES {
-        anyhow::bail!("uv configuration exceeds the bounded read limit");
+    file.take(MAX_PYTHON_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PYTHON_CONFIG_BYTES {
+        anyhow::bail!("{label} exceeds the bounded read limit (1 MiB)");
     }
-    String::from_utf8(bytes).context("uv configuration is not UTF-8")
+    Ok(bytes)
 }
 
 fn positive_uv_concurrency_limit(
@@ -2472,7 +2490,7 @@ mod tests {
             let root = tempfile::tempdir().expect("reviewed root");
             std::fs::write(
                 root.path().join(name),
-                vec![b' '; MAX_UV_CONFIG_BYTES as usize + 1],
+                vec![b' '; MAX_PYTHON_CONFIG_BYTES as usize + 1],
             )
             .expect("oversized uv authority");
 
@@ -2491,7 +2509,7 @@ mod tests {
         let root = tempfile::tempdir().expect("reviewed root");
         std::fs::write(
             root.path().join("uv.toml"),
-            vec![b' '; MAX_UV_CONFIG_BYTES as usize],
+            vec![b' '; MAX_PYTHON_CONFIG_BYTES as usize],
         )
         .expect("exact-cap uv authority");
 
@@ -3497,6 +3515,57 @@ mod tests {
         let (path, _) = selected_pytest_config(root.path(), PytestConfigDialect::Legacy)
             .expect("pytest ignores config names that are not files");
         assert_eq!(path, empty_pytest_config());
+    }
+
+    #[test]
+    fn pytest_config_refuses_oversized_files_before_parsing() {
+        for name in PYTEST_NINE_CONFIG_FILES {
+            let root = tempfile::tempdir().expect("pytest project");
+            let path = root.path().join(name);
+            let file = std::fs::File::create(&path).expect("config file");
+            file.set_len(1024 * 1024 * 1024)
+                .expect("sparse oversized config");
+            let error = selected_pytest_config(root.path(), PytestConfigDialect::Nine)
+                .expect_err("oversized config must fail before parsing or choosing a fallback");
+            assert!(
+                error.to_string().contains("limit: 1 MiB"),
+                "{name}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn pytest_config_accepts_the_exact_read_limit() {
+        let root = tempfile::tempdir().expect("pytest project");
+        let mut contents = String::from("[pytest]\naddopts = -n 1\n#");
+        contents.extend(std::iter::repeat_n(
+            ' ',
+            MAX_PYTHON_CONFIG_BYTES as usize - contents.len(),
+        ));
+        std::fs::write(root.path().join("pytest.ini"), contents).unwrap();
+        let (_, addopts) = selected_pytest_config(root.path(), PytestConfigDialect::Nine)
+            .expect("exact-limit config remains readable");
+        assert_eq!(addopts, Some(vec!["-n".to_owned(), "1".to_owned()]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pytest_config_preserves_regular_symlinks_and_bounds_their_targets() {
+        let root = tempfile::tempdir().expect("pytest project");
+        let target = root.path().join("shared.ini");
+        std::fs::write(&target, "[pytest]\naddopts = -q\n").unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join("pytest.ini")).unwrap();
+        let (_, addopts) = selected_pytest_config(root.path(), PytestConfigDialect::Nine).unwrap();
+        assert_eq!(addopts, Some(vec!["-q".to_owned()]));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_len(MAX_PYTHON_CONFIG_BYTES + 1)
+            .unwrap();
+        let error = selected_pytest_config(root.path(), PytestConfigDialect::Nine)
+            .expect_err("symlink targets have the same size bound");
+        assert!(error.to_string().contains("limit: 1 MiB"));
     }
 
     #[cfg(unix)]
