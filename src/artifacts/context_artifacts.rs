@@ -542,6 +542,19 @@ fn tauri_info_cmd(repo_root: &Path, has_pnpm: bool) -> Option<(String, Vec<Strin
     }
 }
 
+/// List the complete installed dependency tree using the selected manager's
+/// own CLI. pnpm does not accept npm's `--all` flag.
+fn dependency_list_cmd(has_pnpm: bool) -> (&'static str, Vec<String>) {
+    if has_pnpm {
+        (
+            "pnpm",
+            vec!["list".into(), "--depth".into(), "Infinity".into()],
+        )
+    } else {
+        ("npm", vec!["ls".into(), "--all".into()])
+    }
+}
+
 /// Resolve the command for an optional `pnpm exec`-class JS-tool context
 /// artifact (tsc, eslint, esbuild, ...).
 ///
@@ -867,11 +880,7 @@ fn plan_context_cmds(
     if config.profile.has_package_json {
         // `npx list` would run the npm package "list" from the registry —
         // the dependency listing lives in npm/pnpm themselves.
-        let (sbom_cmd, sbom_args) = if has_pnpm {
-            ("pnpm", vec!["list".into(), "--all".into()])
-        } else {
-            ("npm", vec!["ls".into(), "--all".into()])
-        };
+        let (sbom_cmd, sbom_args) = dependency_list_cmd(has_pnpm);
         cmds.push(ContextCmd {
             label: "npm sbom".into(),
             gate: None,
@@ -2329,6 +2338,16 @@ mod tests {
                 "a resolved binary must never carry launcher flags (tool={tool})"
             );
         }
+    }
+
+    #[test]
+    fn dependency_list_preserves_full_depth_for_each_package_manager() {
+        let (pnpm, pnpm_args) = super::dependency_list_cmd(true);
+        assert_eq!(pnpm, "pnpm");
+        assert_eq!(pnpm_args, ["list", "--depth", "Infinity"]);
+        let (npm, npm_args) = super::dependency_list_cmd(false);
+        assert_eq!(npm, "npm");
+        assert_eq!(npm_args, ["ls", "--all"]);
     }
 
     #[test]

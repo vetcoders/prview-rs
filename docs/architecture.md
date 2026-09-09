@@ -1574,7 +1574,15 @@ The core artifact generator. Builds the numbered directory layout
 - `10_diff/`: `full.patch`, `per-commit-diffs/` (batching + thematic labels), `per-file-diffs/` (hotspots)
 - `20_quality/`: per-check `*.result.json` + `*.log`, `full-checks.log`, `checks-errors.log`, `coverage-delta.txt`, `PUBLIC_API_DIFF.json/md`, `BREAKING_CHANGES.json/md`
 - `30_context/`: optional `INLINE_FINDINGS.sarif`, `changed-tests.txt`, profile-specific (`cargo-tree`, `tsc-trace`, `eslint`, `vitest`)
+
 - `latest` symlink in the parent dir (completed runs only)
+
+For JS/TS profiles, `30_context/npm-sbom.txt` contains the installed dependency
+tree. The planner uses `pnpm list --depth Infinity` when pnpm is available,
+otherwise `npm ls --all`; both include transitive dependencies. This is the
+existing text inventory artifact.
+The pnpm depth option follows [pnpm's CLI contract](https://pnpm.io/cli/list).
+
 
 #### Stale-cache caveats (`MERGE_GATE.json.stale_cache_caveats`)
 
