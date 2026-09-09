@@ -715,7 +715,7 @@ fn read_pytest_config(path: &Path) -> Result<Option<String>> {
         .and_then(|file| read_bounded_python_config(file, "pytest config"))
         .map_err(|error| {
             anyhow::anyhow!(
-                "pytest config {} exists but cannot be read: {error:#}",
+                "{error:#}; pytest config cannot be read: {}",
                 path.display()
             )
         })?;
@@ -3521,14 +3521,21 @@ mod tests {
     fn pytest_config_refuses_oversized_files_before_parsing() {
         for name in PYTEST_NINE_CONFIG_FILES {
             let root = tempfile::tempdir().expect("pytest project");
-            let path = root.path().join(name);
+            let project = root.path().join("long-project-path-".repeat(12));
+            std::fs::create_dir(&project).unwrap();
+            let path = project.join(name);
             let file = std::fs::File::create(&path).expect("config file");
             file.set_len(1024 * 1024 * 1024)
                 .expect("sparse oversized config");
-            let error = selected_pytest_config(root.path(), PytestConfigDialect::Nine)
+            let error = selected_pytest_config(&project, PytestConfigDialect::Nine)
                 .expect_err("oversized config must fail before parsing or choosing a fallback");
             assert!(
-                error.to_string().contains("limit: 1 MiB"),
+                error
+                    .to_string()
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+                    .contains("limit: 1 MiB"),
                 "{name}: {error:#}"
             );
         }
