@@ -248,12 +248,17 @@ The decision caveat always enumerates counts for `new`, `pre-existing`,
 `resolved`, and `unknown-baseline`, plus an explicit baseline status
 (`not-required`, `available`, `unavailable`, or `current-unavailable`).
 
-Semgrep's `errors[]` remains a completeness signal independently of findings.
-Path-like `path`, `location.path`, and span `file` fields are collected into a
-stable deduplicated list and emitted in decision caveats. A partial parser run
-therefore cannot look like a complete clean scan merely because `results[]` is
-empty. The operator-facing caveat shows at most ten paths and reports the
-remaining count; this display bound does not truncate the underlying error set.
+Semgrep's `results[]` determines the code result: findings fail the check;
+zero findings with a successful scanner exit pass it. A non-zero exit without
+findings remains a skipped tool error. Independently, `errors[]` degrades
+analysis confidence and appears in `decision.review_caveats`. Thus a passed
+check with scan errors still produces a `CONDITIONAL` decision requiring review.
+Error `path`, `location.path`, and span `file` fields are deduplicated, with
+`start.line` and `start.col` included when available. Positioned spans replace
+bare mentions of the same file; unknown positions are not invented. The caveat
+shows at most ten locations plus a remaining count. The full error set remains
+in the tool log. Engine errors and partial parsing are analysis gaps, not code
+warnings or SARIF findings.
 
 In standard execution mode, tests and lint are enabled by default, unless a
 preset (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*` disables them.

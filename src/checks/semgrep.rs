@@ -137,33 +137,17 @@ impl Check for SemgrepCheck {
 /// errors, so a degraded scan was reported as a clean PASS — hiding the fact
 /// that part of the tree was never analysed.
 ///
-/// Any non-empty `errors[]` (parse errors / partial parsing) downgrades a
-/// successful scan to `Warnings`, making degraded coverage a visible review
-/// signal instead of a silent pass.
-///
-/// A non-zero exit is ambiguous on its own: `--error` makes semgrep exit 1
-/// when it found real results, but semgrep also exits non-zero (commonly 2)
-/// on a config/tool error — an invalid ruleset, a crash — where it never
-/// produced a findings payload at all. Counting the latter as a code `Failed`
-/// makes a broken scanner look like a regression in the PR's own code
-/// (TOOL-VS-CODE). So a non-zero exit is only `Failed` when stdout carries a
-/// parsable payload with at least one actual result; otherwise it is a tool
-/// error and classifies `Skipped`, mirroring the missing-tool pattern already
-/// used for ruff/mypy (`checks/python.rs`).
+/// Findings determine the code result; `errors[]` independently degrades
+/// analysis confidence in the policy engine and is shown in review caveats.
+/// A non-zero exit without findings is a tool error, not a code failure.
 fn classify_semgrep_status(command_succeeded: bool, stdout: &str, _combined: &str) -> CheckStatus {
-    if !command_succeeded {
-        return if output_has_findings_payload(stdout) {
-            CheckStatus::Failed
-        } else {
-            CheckStatus::Skipped
-        };
+    if output_has_findings_payload(stdout) {
+        CheckStatus::Failed
+    } else if command_succeeded {
+        CheckStatus::Passed
+    } else {
+        CheckStatus::Skipped
     }
-
-    if output_reports_scan_errors(stdout) {
-        return CheckStatus::Warnings;
-    }
-
-    CheckStatus::Passed
 }
 
 /// True when semgrep's output reports any scan/parse errors (including
@@ -189,27 +173,38 @@ pub(crate) fn output_reports_scan_errors(output: &str) -> bool {
         .is_some_and(|errors| !errors.is_empty())
 }
 
-/// Files Semgrep names inside its JSON `errors[]` payload. Semgrep versions use
-/// several shapes (`path`, `location.path`, or span `file` fields), so collect
-/// path-like leaves recursively and deduplicate them in stable order.
-pub(crate) fn scan_error_paths(output: &str) -> Vec<String> {
-    fn collect(value: &serde_json::Value, paths: &mut Vec<String>) {
+/// Error locations, with source positions when Semgrep supplies them. A path
+/// without a position is retained only when no positioned span names that file.
+pub(crate) fn scan_error_locations(output: &str) -> Vec<String> {
+    fn collect(value: &serde_json::Value, locations: &mut Vec<(String, Option<u64>, Option<u64>)>) {
         match value {
             serde_json::Value::Object(map) => {
-                for (key, value) in map {
-                    if matches!(key.as_str(), "path" | "file")
-                        && let Some(path) = value.as_str()
+                for key in ["path", "file"] {
+                    if let Some(path) = map.get(key).and_then(|value| value.as_str())
                         && !path.trim().is_empty()
-                        && !paths.iter().any(|existing| existing == path)
                     {
-                        paths.push(path.to_string());
+                        let start = map.get("start");
+                        let line = start
+                            .and_then(|value| value.get("line"))
+                            .and_then(|value| value.as_u64())
+                            .filter(|line| *line > 0);
+                        let col = start
+                            .and_then(|value| value.get("col"))
+                            .and_then(|value| value.as_u64())
+                            .filter(|col| *col > 0);
+                        let location = (path.to_string(), line, col.filter(|_| line.is_some()));
+                        if !locations.contains(&location) {
+                            locations.push(location);
+                        }
                     }
-                    collect(value, paths);
+                }
+                for value in map.values() {
+                    collect(value, locations);
                 }
             }
             serde_json::Value::Array(values) => {
                 for value in values {
-                    collect(value, paths);
+                    collect(value, locations);
                 }
             }
             _ => {}
@@ -231,6 +226,19 @@ pub(crate) fn scan_error_paths(output: &str) -> Vec<String> {
         collect(error, &mut paths);
     }
     paths
+        .iter()
+        .filter(|(path, line, _)| {
+            line.is_some()
+                || !paths
+                    .iter()
+                    .any(|(other, line, _)| other == path && line.is_some())
+        })
+        .map(|(path, line, col)| match (line, col) {
+            (Some(line), Some(col)) => format!("{path}:{line}:{col}"),
+            (Some(line), None) => format!("{path}:{line}"),
+            _ => path.clone(),
+        })
+        .collect()
 }
 
 /// True when `stdout` carries a parsable JSON payload with at least one entry
@@ -609,14 +617,14 @@ mod tests {
     }
 
     #[test]
-    fn partial_parsing_errors_degrade_to_warnings() {
+    fn partial_parsing_errors_do_not_become_code_warnings() {
         // Real semgrep OSS output: clean results but PartialParsing errors on
-        // modern Rust constructs. Must NOT be reported as a clean PASS.
+        // modern Rust constructs. The merge gate separately retains degraded confidence.
         let stdout = r#"{"version":"1.135.0","results":[],"errors":[{"code":3,"level":"warn","type":["PartialParsing",[]],"message":"Syntax error: `unsafe extern \"C\"` was unexpected"}]}"#;
         let combined = format!("{stdout}\n");
         assert_eq!(
             classify_semgrep_status(true, stdout, &combined),
-            CheckStatus::Warnings
+            CheckStatus::Passed
         );
     }
 
@@ -697,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_error_paths_handles_semgrep_error_shapes_and_deduplicates() {
+    fn scan_error_locations_handles_semgrep_error_shapes_and_deduplicates() {
         let output = r#"{
           "errors": [
             {"path":"src/lib.rs"},
@@ -706,8 +714,34 @@ mod tests {
           ]
         } trailing stderr"#;
         assert_eq!(
-            scan_error_paths(output),
+            scan_error_locations(output),
             vec!["src/lib.rs", "src/parser.rs", "src/ffi.rs"]
+        );
+    }
+
+    #[test]
+    fn scan_error_locations_preserve_positions_without_duplicate_bare_paths() {
+        let output = r#"{"errors":[
+            {"path":"src/test.tsx","type":["PartialParsing",[
+                {"path":"src/test.tsx","start":{"line":98,"col":69}}
+            ]],"spans":[
+                {"file":"src/test.tsx","start":{"line":98,"col":69}},
+                {"file":"src/test.tsx","start":{"line":119}}
+            ]},
+            {"type":"Internal matching error","path":"src/auth.tsx"}
+        ]} trailing stderr"#;
+        assert_eq!(
+            scan_error_locations(output),
+            vec!["src/test.tsx:98:69", "src/test.tsx:119", "src/auth.tsx"]
+        );
+    }
+
+    #[test]
+    fn findings_fail_even_when_semgrep_exits_zero_with_scan_errors() {
+        let output = r#"{"results":[{"check_id":"real-rule"}],"errors":[{"type":"Internal matching error"}]}"#;
+        assert_eq!(
+            classify_semgrep_status(true, output, output),
+            CheckStatus::Failed
         );
     }
 

@@ -421,11 +421,14 @@ baseline: it passes Semgrep `--baseline-commit <merge-base>` so existing
 findings outside the diff do not degrade the merge verdict. If the worktree is
 dirty or the merge-base is unavailable, prview falls back to a full scan and the
 artifact classifier still separates introduced from pre-existing findings.
-Semgrep parse/scan errors remain surfaced even when no rule findings are
-introduced. When Semgrep reports paths in `errors[]`, the merge decision caveats
-name the files that were only partially parsed, so the reviewer does not need to
-open the raw tool log to discover the analysis gap. Up to ten paths are shown in
-the caveat, followed by a remaining count when necessary.
+Semgrep parse/scan errors remain visible even when no rule findings are
+introduced: they degrade analysis confidence and make the merge decision
+`CONDITIONAL`, requiring review, without adding code warnings or SARIF findings.
+The check itself passes when the scanner exits successfully with no findings;
+a non-zero exit without findings remains a skipped tool error. Decision caveats
+name up to ten affected locations (`file:line:column` when supplied), followed by
+a remaining count. Missing source positions are not invented. The raw tool log
+retains all diagnostics.
 
 Cargo-audit advisories are baseline-classified as `new`, `pre-existing`,
 `resolved`, or `unknown-baseline`. If `Cargo.lock` did not change, every current
