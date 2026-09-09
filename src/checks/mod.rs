@@ -4483,6 +4483,66 @@ test result: ok. 2 passed; 0 failed
     }
 
     #[tokio::test]
+    async fn cargo_admission_preserves_budget_and_releases_lock_on_cancel() {
+        struct CargoWaiter(&'static str);
+
+        #[async_trait]
+        impl Check for CargoWaiter {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> Weight {
+                Weight::Heavy
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                unreachable!("only admission is under test")
+            }
+        }
+
+        for name in [
+            "Cargo check",
+            "Clippy",
+            "Rustfmt",
+            "Cargo test",
+            "Cargo audit",
+            "Cargo geiger",
+        ] {
+            let governor = ResourceGovernor::with_budget(2, 2);
+            let cargo_lock = Arc::new(Semaphore::new(1));
+            let held = Arc::clone(&cargo_lock).acquire_owned().await.unwrap();
+            let board = std::sync::Mutex::new(RunBoard::new([name].into_iter()));
+            let check = CargoWaiter(name);
+            let waiting = admit_check(&check, &cargo_lock, &governor, &board);
+            tokio::pin!(waiting);
+
+            assert!(futures::poll!(&mut waiting).is_pending());
+            let other_work =
+                tokio::time::timeout(Duration::from_secs(1), governor.acquire(Weight::Exclusive))
+                    .await
+                    .expect("a cargo-lock waiter must leave the entire budget available")
+                    .expect("the run is not cancelled");
+            assert_eq!(lock_board(&board).names_where(false), vec![name]);
+
+            drop(held);
+            assert!(futures::poll!(&mut waiting).is_pending());
+            assert_eq!(cargo_lock.available_permits(), 0);
+            assert_eq!(lock_board(&board).names_where(false), vec![name]);
+
+            governor.cancel();
+            let result = tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+                .await
+                .expect("cancellation must wake the budget waiter");
+            assert!(matches!(result, Err(Cancelled)));
+            assert_eq!(cargo_lock.available_permits(), 1);
+            assert_eq!(lock_board(&board).names_where(false), vec![name]);
+            drop(other_work);
+        }
+    }
+
+    #[tokio::test]
     async fn a_cargo_lock_waiter_races_cancellation() {
         use async_trait::async_trait;
 

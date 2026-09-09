@@ -1195,6 +1195,11 @@ Job Object contract cannot disappear with an unrelated dependency change.
   makes two locks deadlock-free, and this direction also avoids parking half the
   budget on a cargo check that is still queueing for `target/`. Nothing acquires
   the cargo lock once it holds budget, so there is no cycle the other way.
+  Regression coverage exercises all six cargo-family names: a waiter leaves
+  the whole budget available while the target lock is held, remains queued
+  while waiting for budget after taking that lock, and releases the target
+  lock when cancellation interrupts the budget wait. A separate regression
+  checks cancellation while the target lock itself is still held.
 
 #### Queued vs running
 
