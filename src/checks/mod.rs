@@ -25,6 +25,7 @@ pub const CHECK_TIMEOUT_SECS: u64 = 300;
 pub const TEST_TIMEOUT_SECS: u64 = 900;
 
 mod cargo;
+mod pytest_home;
 mod python;
 mod semgrep;
 mod typescript;

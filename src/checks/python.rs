@@ -886,12 +886,13 @@ fn parse_pytest_version(value: &str) -> Result<(PytestConfigDialect, String)> {
 }
 
 /// Ask the exact pytest launcher used by the check which discovery dialect it
-/// implements. The null config, explicit root and scrubbed addopts/plugin env
-/// keep ambient parents and plugins out of this version oracle.
+/// implements. The null config, explicit root, disabled conftests and scrubbed
+/// addopts/plugin env keep project code and ambient plugins out of this oracle.
 async fn probe_pytest_runtime(
     root: &Path,
     base_env: &[(String, String)],
     use_uv: bool,
+    home_plugin: Option<&str>,
 ) -> Result<(PytestConfigDialect, String)> {
     let null_config = empty_pytest_config().display().to_string();
     let root_dir = root.display().to_string();
@@ -899,11 +900,15 @@ async fn probe_pytest_runtime(
     if use_uv {
         args.extend(["run".to_owned(), "pytest".to_owned()]);
     }
+    if let Some(plugin) = home_plugin {
+        args.extend(["-p".to_owned(), plugin.to_owned()]);
+    }
     args.extend([
         "-c".to_owned(),
         null_config,
         "--rootdir".to_owned(),
         root_dir,
+        "--noconftest".to_owned(),
         "--version".to_owned(),
     ]);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1593,19 +1598,32 @@ impl Check for PytestCheck {
         let use_uv = which::which("uv").is_ok();
         let plan = plan_python_tool_run(config, use_uv)?;
         let run_dir = &plan.cwd;
+        let home = super::pytest_home::SnapshotPytestHome::for_run(
+            &config.repo_root,
+            run_dir,
+            std::env::var_os("PYTHONPATH"),
+        )?;
+        let base_env = home
+            .as_ref()
+            .map(|home| home.child_env(&plan.env))
+            .unwrap_or_else(|| plan.env.clone());
+        let home_plugin = home.as_ref().map(|home| home.module_name());
         let (pytest_dialect, pytest_version) =
-            probe_pytest_runtime(run_dir, &plan.env, use_uv).await?;
+            probe_pytest_runtime(run_dir, &base_env, use_uv, home_plugin).await?;
         let inherited_addopts = checked_pytest_addopts(std::env::var("PYTEST_ADDOPTS"))?;
         let inherited_auto_workers =
             checked_xdist_auto_workers(std::env::var("PYTEST_XDIST_AUTO_NUM_WORKERS"))?;
-        let (pytest_args, pytest_env) = bounded_pytest_invocation_with_auto_workers(
+        let (mut pytest_args, pytest_env) = bounded_pytest_invocation_with_auto_workers(
             run_dir,
-            &plan.env,
+            &base_env,
             config.resource_plan.worker_limit,
             inherited_addopts.as_deref(),
             inherited_auto_workers.as_deref(),
             pytest_dialect,
         )?;
+        if let Some(plugin) = home_plugin {
+            pytest_args.splice(0..0, ["-p".to_owned(), plugin.to_owned()]);
+        }
         let pytest_arg_refs: Vec<&str> = pytest_args.iter().map(String::as_str).collect();
 
         let output = if use_uv {
@@ -3895,6 +3913,29 @@ mod tests {
             "def test_from_scan_dir():\n    assert True\n",
         )
         .unwrap();
+        let operator_home = dirs::home_dir().expect("operator home");
+        let operator_home = serde_json::to_string(&operator_home).expect("home literal");
+        std::fs::write(
+            scan_dir.path().join("conftest.py"),
+            format!(
+                r#"import json
+import os
+from pathlib import Path
+
+home = Path.home().resolve()
+assert home != Path({operator_home}).resolve(), "snapshot read operator HOME"
+assert not (home / ".codex").exists(), "snapshot inherited an existing home store"
+for key in ("USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+            "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "APPDATA", "LOCALAPPDATA"):
+    value = Path(os.environ[key]).resolve()
+    assert value == home or home in value.parents, (key, value)
+receipt = Path(__file__).with_name("home-receipt.json")
+count = json.loads(receipt.read_text())["count"] if receipt.exists() else 0
+receipt.write_text(json.dumps({{"home": str(home), "count": count + 1}}))
+"#
+            ),
+        )
+        .unwrap();
 
         let mut config = test_config_builder()
             .profile(test_python_profile(true))
@@ -3919,9 +3960,24 @@ mod tests {
             "Pytest executed in repo_root instead of the reviewed scan dir. Output: {}",
             result.output
         );
+        assert!(result.output.contains("prview: snapshot-local HOME/XDG"));
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(scan_dir.path().join("home-receipt.json")).expect("conftest receipt"),
+        )
+        .unwrap();
+        assert_eq!(
+            receipt["count"], 1,
+            "version discovery must not execute project conftest code"
+        );
+        assert!(
+            !Path::new(receipt["home"].as_str().unwrap()).exists(),
+            "the owned home must be removed after pytest and its children exit"
+        );
 
         // Provenance must not claim a cwd the run never used.
-        let cwd = result.provenance.expect("provenance").cwd;
+        let provenance = result.provenance.expect("provenance");
+        assert!(provenance.command.contains(" -p _prview_pytest_home_"));
+        let cwd = provenance.cwd;
         assert_eq!(
             std::fs::canonicalize(&cwd).unwrap(),
             std::fs::canonicalize(scan_dir.path()).unwrap(),

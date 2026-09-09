@@ -256,7 +256,9 @@ Pytest also receives `PYTEST_XDIST_AUTO_NUM_WORKERS`; when project or inherited 
 xdist (`-n auto`, `logical`, or explicit `-n N`), prview caps only a dynamic or
 too-large pool. An explicit smaller count and `-n 0` remain unchanged. A short,
 isolated probe of the actual project pytest selects the matching supported
-major/minor config-discovery rules; unsupported versions fail closed. Prview then
+major/minor config-discovery rules; unsupported versions fail closed. The probe
+disables conftest loading, so discovering the version does not execute project
+`conftest.py` code. Prview then
 passes `-c` for the single highest-precedence config inside the reviewed root,
 or an explicit empty config when none exists, and fixes `--rootdir` to that
 root. Malformed, unreadable, non-UTF-8, or conflicting recognized config and
@@ -274,6 +276,24 @@ universally capped child pool. The same boundary applies to executable project
 `conftest.py` code and third-party pytest plugins: Pytest remains Exclusive, but
 prview does not claim to infer arbitrary plugin-created processes or xdist hook
 mutations.
+
+When Pytest runs in a reviewed snapshot, prview loads a temporary plugin before
+project plugins, conftests and test collection. It supplies fresh `HOME`,
+`USERPROFILE`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`,
+`XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, `APPDATA` and `LOCALAPPDATA` directories.
+Tests that census the default home directory therefore see snapshot-local data,
+rather than the operator's live stores. The pytest log identifies this as
+`prview: snapshot-local HOME/XDG`; the command provenance names the plugin.
+The directories and plugin are retained through the run and removed together
+when pytest finishes. Each concurrent run gets its own home.
+
+The uv/pytest launcher still uses the existing tool and dependency environment.
+Python's user package base is pinned before redirecting HOME, so user-installed
+pytest and xdist subprocess imports continue to work. Existing `PYTHONPATH`
+entries and explicit application-specific paths remain available. This is
+isolation of default home/config lookups, not an OS filesystem sandbox. A local
+checkout review keeps its original HOME/XDG behavior; only a snapshot enables
+the temporary plugin. Ruff, Mypy and uv dependency preparation are unaffected.
 
 Before checks start, the human preflight prints the requested/effective budget,
 parent and child caps, expensive tools, and the cheap-first execution schedule.

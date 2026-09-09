@@ -345,6 +345,23 @@ dependency set is still installed and judged, in a prview-owned environment kept
 warm across runs. A local review sets no override and uses the checkout's own
 environment exactly as before.
 
+Pytest adds `SnapshotPytestHome` for a snapshot run. A per-run temporary module
+loaded via `-p` redirects HOME, USERPROFILE, XDG and Windows application-data
+selectors before project plugins/conftests and collection. Redirection happens
+inside pytest: the uv launcher and Python startup still find their existing
+interpreter, dependencies and user-installed pytest. The plugin pins Python's
+original user package base for child/xdist bootstraps, preserving an explicit
+`PYTHONUSERBASE` when present. Its directory is prepended to the existing
+`PYTHONPATH`; each run uses a unique module name and private home. The owner
+retains the module, JSON environment description and directories through the
+check, then removes them together. The pytest header and command provenance
+identify the isolation. It is a default home/config view, not OS-level access
+control or a claim that all explicit host paths have been removed. Local
+checkout tests retain their environment. The version probe uses the same
+plugin in snapshot mode and always passes `--noconftest` to keep project code
+out of version discovery.
+
+
 The cold `uv sync` pre-step is resolved only after the run-wide target snapshot
 exists, through that same `plan_python_run()`. Its cwd and
 `UV_PROJECT_ENVIRONMENT` are therefore identical to the later gates; it never
