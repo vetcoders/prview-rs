@@ -23,7 +23,10 @@ impl Check for SemgrepCheck {
         crate::governor::Weight::Heavy
     }
 
-    fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+    fn check_eligibility(&self, config: &Config) -> CheckEligibility {
+        if config.skip_security {
+            return CheckEligibility::Skip("security explicitly disabled".to_string());
+        }
         if which::which("semgrep").is_ok() {
             CheckEligibility::Run
         } else {
@@ -783,10 +786,30 @@ mod tests {
     }
 
     #[test]
-    fn test_semgrep_check_can_run() {
-        let config = test_config();
-        let check = SemgrepCheck;
-        let _ = check.check_eligibility(&config);
+    fn explicit_security_opt_out_disables_semgrep_before_tool_discovery() {
+        let mut config = test_config();
+        config.skip_security = true;
+        for heavy_opt_in in [false, true] {
+            config.run_security = heavy_opt_in;
+            assert!(matches!(
+                SemgrepCheck.check_eligibility(&config),
+                CheckEligibility::Skip(reason) if reason == "security explicitly disabled"
+            ));
+        }
+    }
+
+    #[test]
+    fn semgrep_default_eligibility_does_not_require_heavy_security_opt_in() {
+        let mut config = test_config();
+        config.run_security = false;
+        assert!(!config.skip_security);
+        assert_eq!(
+            matches!(
+                SemgrepCheck.check_eligibility(&config),
+                CheckEligibility::Run
+            ),
+            which::which("semgrep").is_ok()
+        );
     }
 
     #[test]
