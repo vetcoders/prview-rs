@@ -380,7 +380,7 @@ prview --help
 | `--tests-pattern PATTERN` | Filter Vitest by regex or Cargo/libtest by literal substring; Mixed uses the literal intersection and Pytest remains unfiltered |
 
 An explicit `--skip-security` disables Semgrep before tool discovery, including
-in quick and gate runs. This is separate from the heavy-security opt-in; an
+in quick review runs. This is separate from the heavy-security opt-in; an
 ordinary run without `--with-security` still uses the default Semgrep scan.
 
 By default, Semgrep is scoped to the change when prview can resolve a clean git

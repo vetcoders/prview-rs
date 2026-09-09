@@ -224,7 +224,7 @@ Implementations:
   `--baseline-commit <merge-base>` when the git baseline is clean and available,
   while `--security-full` keeps a full-tree scan. Explicit `--skip-security`
   is carried separately from the heavy-security opt-in and disables this check
-  before tool discovery, including when the gate profile is applied.
+  before tool discovery.
 - `CargoGeigerCheck` - `cargo geiger`
 - `RuffCheck` - `ruff check`
 - `MypyCheck` - `mypy`
