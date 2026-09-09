@@ -50,6 +50,18 @@ cargo test --lib
 cargo test --test json_contract
 ```
 
+JSON and MCP binary contract tests use `tests/support/mod.rs` to own a temporary
+`PRVIEW_HOME` and prepend a local Semgrep test double to each child process's
+`PATH`. The fixture returns an empty successful scan without downloading rules
+or starting the operator's scanner. Other tools retain their normal discovery.
+The owner survives artifact inspection and repeated update runs; for MCP it
+survives until the session is dropped. Tests can explicitly override `PATH` or
+`PRVIEW_HOME` when that behavior is the subject of the contract. No parent-process
+environment mutation or manual PATH preparation is required. This harness tests
+CLI/MCP contracts, not real Semgrep detection; production discovery and scanner
+dogfood remain separate. The test double has POSIX shell and Windows command
+script implementations; runtime evidence must still name the platform exercised.
+
 Process-tree cancellation has platform-specific proof. Unix coverage runs in the
 normal Linux/macOS suites. `.github/workflows/ci.yml` also runs the Windows-only
 PowerShell child+grandchild census on `windows-latest`; cross-compilation alone

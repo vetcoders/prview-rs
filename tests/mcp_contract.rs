@@ -3,11 +3,13 @@
 //! These drive the real binary over JSON-RPC on stdin/stdout, asserting the
 //! wire contract from `2026-07-01-prview-mcp-v1-design.md`.
 
+mod support;
+
 use prview::git::git_cmd;
 use prview::storage::RunEntry;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Stdio};
 
 // --- fixture git repo helpers -------------------------------------------------
 
@@ -120,7 +122,9 @@ fn fixture_repo_with_stale_local_default() -> tempfile::TempDir {
 
 /// Run a synchronous quick review to completion, registering it under `home`.
 fn run_quick_review(repo: &Path, home: &Path) {
-    let status = Command::new(env!("CARGO_BIN_EXE_prview"))
+    let environment = support::ContractEnvironment::new();
+    let status = environment
+        .command()
         .current_dir(repo)
         .args([
             "--quick",
@@ -240,6 +244,7 @@ struct McpSession {
     child: Child,
     reader: BufReader<ChildStdout>,
     next_id: i64,
+    _environment: support::ContractEnvironment,
 }
 
 impl McpSession {
@@ -248,7 +253,8 @@ impl McpSession {
     }
 
     fn start_in(cwd: Option<&Path>, envs: &[(&str, &str)]) -> Self {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_prview"));
+        let environment = support::ContractEnvironment::new();
+        let mut cmd = environment.command();
         cmd.arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -265,6 +271,7 @@ impl McpSession {
             child,
             reader,
             next_id: 1,
+            _environment: environment,
         };
         session.initialize();
         session
