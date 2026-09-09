@@ -187,10 +187,16 @@ prview feature/x main
 |------|--------------|
 | standard (default) | Full review with tests and lint enabled by default |
 | `--quick` | Light pass: skip tests/lint/bundle/heuristics |
-| `--deep` | All heavier checks enabled (including security and heuristics) |
-| `--ci` | Like deep, tuned for automation: no colors; non-zero on Block/quality failure |
+| `--deep` | Tests, lint, security, and heuristics; bundle and full security remain opt-in |
+| `--ci` | Deep checks plus bundle; full security remains opt-in; no colors; non-zero on Block/quality failure |
 | `--update` | Incremental rerun after new commits, skipping heavy checks unless forced |
 | `--ai-only` | Minimal artifact pack for AI/review flows |
+
+`--deep` does not enable `--with-bundle` or `--security-full`. Add those
+flags explicitly when needed. `--ci` enables the bundle build by default,
+but also requires `--security-full` for full-tree Semgrep and cargo-geiger.
+Explicit skip flags still apply, and check selection depends on the detected
+profile and available tools.
 
 ### Resource budget
 
@@ -359,8 +365,8 @@ prview --help
 | Flag | Effect |
 |------|--------|
 | `--quick` | Skip tests/lint/bundle/heuristics |
-| `--deep` | Enable all checks (including security and heuristics) |
-| `--ci` | CI mode: all checks, no colors; Block/quality failure exit |
+| `--deep` | Enable tests, lint, security, and heuristics; bundle and full security remain opt-in |
+| `--ci` | Deep checks plus bundle; full security remains opt-in; no colors; Block/quality failure exit |
 | `--ai-only` | Minimal checks, AI context pack only |
 
 ### Step control

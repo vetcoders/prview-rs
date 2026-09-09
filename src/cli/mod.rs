@@ -45,7 +45,7 @@ Generates Artifact Pack v1 with structured, verifiable PR review artifacts:\n\n\
 #[command(after_help = "Examples:
   prview                              Standard review (tests + lint, current branch vs develop/main)
   prview --quick                      Quick review (skip tests/lint/heuristics)
-  prview --deep feature/x dev         Full review with all checks
+  prview --deep feature/x dev         Tests, lint, security, and heuristics
   prview --skip-tests feature/x dev   Review without tests
   prview --no-dashboard               Skip HTML dashboard generation
   prview --pr 42                      Analyze GitHub PR #42
@@ -78,11 +78,11 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["deep", "ci", "ai_only"])]
     pub quick: bool,
 
-    /// Deep mode: enable all checks including security and heuristics
+    /// Deep mode: tests, lint, security, and heuristics; bundle/full security stay opt-in
     #[arg(long, conflicts_with_all = ["quick", "ci", "ai_only"])]
     pub deep: bool,
 
-    /// CI mode: all checks; exit 1 on BLOCK or failed quality
+    /// CI mode: deep checks plus bundle; full security stays opt-in; exit 1 on BLOCK or failed quality
     #[arg(long, conflicts_with_all = ["quick", "deep", "ai_only"])]
     pub ci: bool,
 
