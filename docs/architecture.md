@@ -2740,6 +2740,11 @@ Python `from … import`, and generic string literals. Only source files are sca
   always aggregate the full deduplicated PR surface. The original diff path is
   retained as the join key even when the displayed path is normalized. Test
   files are excluded.
+  A bare `session` path token does not establish authentication or add the
+  security-path bonus: transcript, recording and editor sessions are not auth
+  evidence. Explicit markers such as `auth` or `oauth` in that file's path still
+  classify it as auth/session. The same rule governs per-file and heatmap zone
+  membership; an auth file elsewhere in the diff does not classify other files.
 
 #### signal/i18n.rs — locale key parity analysis
 

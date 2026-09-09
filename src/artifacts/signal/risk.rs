@@ -48,11 +48,13 @@ pub struct RiskHeatmap {
 const DOMAIN_ZONES: &[(&str, &[&str])] = &[
     (
         "auth/session",
+        // Session data alone is not evidence of authentication: recording,
+        // transcript and editor sessions also use that name. An auth/session
+        // path still matches the explicit auth marker.
         &[
             "auth",
             "login",
             "logout",
-            "session",
             "oauth",
             "jwt",
             "token",
@@ -203,7 +205,6 @@ pub fn compute_file_risk_scores_with_api(
         "token",
         "password",
         "credential",
-        "session",
         "oauth",
     ];
 
@@ -432,6 +433,54 @@ mod tests {
             !security_paths.contains(&"src/tokenizer.rs"),
             "'tokenizer' must not substring-match 'token'"
         );
+    }
+
+    #[test]
+    fn session_paths_require_auth_evidence_for_security_score_and_zone() {
+        let session_paths = [
+            "tb_core/session.py",
+            "src/recording/session_manager.rs",
+            "services/session_store.py",
+        ];
+        let auth_paths = ["src/auth/session.rs", "src/oauth/session.py"];
+        // Deletion keeps every row visible, so absence of the security factor
+        // cannot hide a lost row or erase unrelated risk. A real auth path in
+        // the same diff must not lend its classification to generic sessions.
+        let diff = mock_diff(
+            session_paths
+                .iter()
+                .chain(auth_paths.iter())
+                .map(|path| mock_file_change(path, FileStatus::Deleted, 0, 10))
+                .collect(),
+        );
+        let scores = compute_file_risk_scores(std::slice::from_ref(&diff), &empty_coverage(), &[]);
+        assert_eq!(scores.len(), session_paths.len() + auth_paths.len());
+        for score in &scores {
+            let is_auth = auth_paths.contains(&score.path.as_str());
+            assert_eq!(
+                score.factors.contains(&"security-path"),
+                is_auth,
+                "{}",
+                score.path
+            );
+            assert_eq!(
+                score.zones.contains(&"auth/session"),
+                is_auth,
+                "{}",
+                score.path
+            );
+            assert_eq!(score.score, if is_auth { 35 } else { 20 }, "{}", score.path);
+        }
+        let heatmap = compute_risk_heatmap(&[diff], &scores);
+        let auth = heatmap
+            .zones
+            .iter()
+            .find(|zone| zone.name == "auth/session")
+            .unwrap();
+        assert_eq!(auth.files_touched, 2);
+        assert_eq!(auth.total_churn, 20);
+        assert_eq!(auth.max_file_risk, 35);
+        assert_eq!(heatmap.total_risk_score, 130);
     }
 
     #[test]
