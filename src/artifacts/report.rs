@@ -359,7 +359,7 @@ fn finding_stats_from_output(output: &str) -> Option<FindingStats> {
 /// findings (`total_findings: 2`) even when the scan log clearly held
 /// `results: []`. The authoritative count is the length of the JSON `results`
 /// array, so parse it directly and let the report agree with the log it links
-/// to. `errors[]` (PartialParsing) are surfaced via the check status, not here.
+/// to. `errors[]` are surfaced via analysis confidence and review caveats, not here.
 fn semgrep_finding_stats_from_output(output: &str) -> Option<FindingStats> {
     let start = output.find('{')?;
     // Callers hand us stdout+stderr combined, and semgrep prints its JSON to

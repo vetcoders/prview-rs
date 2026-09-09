@@ -518,7 +518,7 @@ pub(crate) fn semgrep_partial_parse_review_caveats(checks: &[CheckResult]) -> Ve
         return Vec::new();
     };
 
-    let paths = crate::checks::semgrep_scan_error_paths(&check.output);
+    let paths = crate::checks::semgrep_scan_error_locations(&check.output);
     let detail = if paths.is_empty() {
         "affected file names were not present in Semgrep output".to_string()
     } else {
@@ -535,7 +535,7 @@ pub(crate) fn semgrep_partial_parse_review_caveats(checks: &[CheckResult]) -> Ve
         }
     };
     vec![format!(
-        "Semgrep analysis was partial; incompletely parsed files: {detail}"
+        "Semgrep analysis was partial; scan errors affected: {detail}"
     )]
 }
 

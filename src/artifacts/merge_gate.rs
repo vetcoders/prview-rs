@@ -990,6 +990,81 @@ mod tests {
         serde_json::from_str(&raw).expect("parse gate json")
     }
 
+    fn run_gate_without_semgrep_findings(output: &str) -> serde_json::Value {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config();
+        let checks = vec![CheckResult {
+            name: "Semgrep scan".to_string(),
+            status: CheckStatus::Passed,
+            duration: Duration::from_millis(25),
+            output: output.to_string(),
+            cached: false,
+            provenance: None,
+        }];
+        let inline = InlineFindingsSummary {
+            status: "passed".to_string(),
+            findings_count: 0,
+            dashboard_findings: Vec::new(),
+        };
+        let coverage = empty_coverage();
+        let (resolved_target, resolved_bases) = resolved_refs();
+
+        generate_merge_gate(MergeGateInput {
+            dir: tmp.path(),
+            config: &config,
+            ledger: &empty_ledger(),
+            checks: &checks,
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            rust_api_delta: None,
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &resolved_target,
+            resolved_bases: &resolved_bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+        })
+        .expect("merge gate");
+
+        let raw =
+            std::fs::read_to_string(tmp.path().join("MERGE_GATE.json")).expect("read gate json");
+        serde_json::from_str(&raw).expect("parse gate json")
+    }
+
+    #[test]
+    fn scanner_errors_degrade_confidence_without_quality_warnings() {
+        let gate = run_gate_without_semgrep_findings(
+            r#"{"results":[],"errors":[
+            {"type":"Internal matching error","path":"src/auth.tsx"},
+            {"type":["PartialParsing",[]],"spans":[{"file":"src/test.tsx","start":{"line":98,"col":69}}]}
+        ]}"#,
+        );
+        assert_eq!(gate["decision"]["verdict"], "CONDITIONAL");
+        assert_eq!(gate["decision"]["quality_pass"], true);
+        assert_eq!(gate["decision"]["allow_merge"], false);
+        assert_eq!(gate["decision"]["analysis_status"], "degraded");
+        assert_eq!(
+            gate["decision"]["enforcement_disposition"],
+            "review_required"
+        );
+        assert_eq!(
+            gate["decision"]["quality_failure_details"],
+            serde_json::json!([])
+        );
+        assert!(
+            gate["decision"]["review_caveats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str().is_some_and(
+                    |text| text.contains("src/auth.tsx") && text.contains("src/test.tsx:98:69")
+                ))
+        );
+        let clean = run_gate_without_semgrep_findings(r#"{"results":[],"errors":[]}"#);
+        assert_eq!(clean["decision"]["verdict"], "PASS");
+    }
+
     fn cargo_test_check() -> CheckResult {
         CheckResult {
             name: "cargo test".to_string(),
