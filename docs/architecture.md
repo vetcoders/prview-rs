@@ -346,8 +346,13 @@ warm across runs. A local review sets no override and uses the checkout's own
 environment exactly as before.
 
 Pytest adds `SnapshotPytestHome` for a snapshot run. A per-run temporary module
-loaded via `-p` redirects HOME, USERPROFILE, XDG and Windows application-data
-selectors before project plugins/conftests and collection. Redirection happens
+loaded via `-p` in a neutral outer invocation redirects HOME, USERPROFILE, XDG
+and Windows application-data selectors. The outer invocation uses a null config,
+`--noconftest`, no plugin autoload and empty pytest plugin/addopts environment.
+Its command hook restores the original pytest environment and invokes the public
+`pytest.main` API with the bounded arguments carried after `--`. This keeps
+pytest in charge of configuration precedence while ensuring even plugins in ini
+or environment addopts load after the home redirect. Redirection happens
 inside pytest: the uv launcher and Python startup still find their existing
 interpreter, dependencies and user-installed pytest. The plugin pins Python's
 original user package base for child/xdist bootstraps, preserving an explicit
@@ -358,8 +363,8 @@ check, then removes them together. The pytest header and command provenance
 identify the isolation. It is a default home/config view, not OS-level access
 control or a claim that all explicit host paths have been removed. Local
 checkout tests retain their environment. The version probe uses the same
-plugin in snapshot mode and always passes `--noconftest` to keep project code
-out of version discovery.
+plugin in snapshot mode and always passes `--noconftest` to prevent conftest
+execution during version discovery.
 
 
 The cold `uv sync` pre-step is resolved only after the run-wide target snapshot

@@ -277,13 +277,19 @@ universally capped child pool. The same boundary applies to executable project
 prview does not claim to infer arbitrary plugin-created processes or xdist hook
 mutations.
 
-When Pytest runs in a reviewed snapshot, prview loads a temporary plugin before
-project plugins, conftests and test collection. It supplies fresh `HOME`,
+When Pytest runs in a reviewed snapshot, prview first starts it with a null
+config, disabled plugin autoload, empty plugin/addopts environment and no
+conftests. A temporary bootstrap plugin supplies fresh `HOME`,
 `USERPROFILE`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`,
 `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, `APPDATA` and `LOCALAPPDATA` directories.
+The bootstrap then restores the original pytest environment and calls
+`pytest.main` with the original bounded test arguments. Project and environment
+addopts keep their native precedence, including early `-p` plugins and ini
+overrides; pytest-managed project plugins and tests load after HOME is redirected.
 Tests that census the default home directory therefore see snapshot-local data,
 rather than the operator's live stores. The pytest log identifies this as
-`prview: snapshot-local HOME/XDG`; the command provenance names the plugin.
+`prview: snapshot-local HOME/XDG`; command provenance includes both the
+bootstrap options and the original test arguments after `--`.
 The directories and plugin are retained through the run and removed together
 when pytest finishes. Each concurrent run gets its own home.
 

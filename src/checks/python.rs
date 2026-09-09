@@ -887,7 +887,7 @@ fn parse_pytest_version(value: &str) -> Result<(PytestConfigDialect, String)> {
 
 /// Ask the exact pytest launcher used by the check which discovery dialect it
 /// implements. The null config, explicit root, disabled conftests and scrubbed
-/// addopts/plugin env keep project code and ambient plugins out of this oracle.
+/// addopts/plugin env keep conftests and ambient pytest plugins out of this oracle.
 async fn probe_pytest_runtime(
     root: &Path,
     base_env: &[(String, String)],
@@ -1598,11 +1598,10 @@ impl Check for PytestCheck {
         let use_uv = which::which("uv").is_ok();
         let plan = plan_python_tool_run(config, use_uv)?;
         let run_dir = &plan.cwd;
-        let home = super::pytest_home::SnapshotPytestHome::for_run(
-            &config.repo_root,
-            run_dir,
-            std::env::var_os("PYTHONPATH"),
-        )?;
+        let home =
+            super::pytest_home::SnapshotPytestHome::for_run(&config.repo_root, run_dir, |key| {
+                std::env::var_os(key)
+            })?;
         let base_env = home
             .as_ref()
             .map(|home| home.child_env(&plan.env))
@@ -1621,8 +1620,8 @@ impl Check for PytestCheck {
             inherited_auto_workers.as_deref(),
             pytest_dialect,
         )?;
-        if let Some(plugin) = home_plugin {
-            pytest_args.splice(0..0, ["-p".to_owned(), plugin.to_owned()]);
+        if let Some(home) = &home {
+            pytest_args = home.wrap_args(run_dir, &empty_pytest_config(), pytest_args);
         }
         let pytest_arg_refs: Vec<&str> = pytest_args.iter().map(String::as_str).collect();
 
