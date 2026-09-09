@@ -20,6 +20,15 @@ use super::*;
 /// fact.
 const STALE_CACHE_CAVEAT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
+fn format_cache_age(seconds: u64) -> String {
+    format!(
+        "{}d {}h {}m ({seconds} s)",
+        seconds / 86_400,
+        (seconds % 86_400) / 3_600,
+        (seconds % 3_600) / 60,
+    )
+}
+
 /// Whether this run replayed `check_name` from a cache of known or unknown age.
 ///
 /// Only [`TaskKind::Check`] entries answer. A context artifact backed by the
@@ -484,6 +493,33 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
             check["blocking"].as_bool().unwrap_or(false),
         );
     }
+    if !stale_cache_caveats.is_empty() {
+        md.push_str("\n## Cached evidence freshness\n\n");
+        md.push_str(
+            "These cached results are older than the advisory threshold or have an unverifiable age. \
+             Advisory only; the verdict and enforcement are unchanged. \
+             Rerun with `--no-cache` to collect fresh evidence.\n\n",
+        );
+        md.push_str("| Check | Cache age | Advisory threshold |\n");
+        md.push_str("|---|---|---|\n");
+        for caveat in &stale_cache_caveats {
+            let age = caveat["cache_age_secs"]
+                .as_u64()
+                .map(format_cache_age)
+                .unwrap_or_else(|| "Unknown (timestamp unavailable)".to_string());
+            let threshold = caveat["threshold_secs"]
+                .as_u64()
+                .map(format_cache_age)
+                .unwrap_or_else(|| "Unknown".to_string());
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} |",
+                caveat["check_name"].as_str().unwrap_or("unknown"),
+                age,
+                threshold,
+            );
+        }
+    }
     fs::write(dir.join("MERGE_GATE.md"), md)?;
     Ok(())
 }
@@ -739,6 +775,13 @@ mod tests {
         cache_age_secs: Option<u64>,
         status: CheckStatus,
     ) -> serde_json::Value {
+        run_gate_with_cached_semgrep_artifacts(cache_age_secs, status).0
+    }
+
+    fn run_gate_with_cached_semgrep_artifacts(
+        cache_age_secs: Option<u64>,
+        status: CheckStatus,
+    ) -> (serde_json::Value, String) {
         use crate::ledger::{SubstrateKey, TaskEntry, TaskKey, TaskKind, TaskLedger, TaskState};
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -789,7 +832,11 @@ mod tests {
         })
         .expect("merge gate");
 
-        serde_json::from_slice(&std::fs::read(tmp.path().join("MERGE_GATE.json")).unwrap()).unwrap()
+        let gate =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("MERGE_GATE.json")).unwrap())
+                .unwrap();
+        let markdown = std::fs::read_to_string(tmp.path().join("MERGE_GATE.md")).unwrap();
+        (gate, markdown)
     }
 
     fn run_gate_with_cached_semgrep_status(
@@ -801,6 +848,37 @@ mod tests {
 
     fn run_gate_with_cached_semgrep(cache_age_secs: u64) -> serde_json::Value {
         run_gate_with_cached_semgrep_status(cache_age_secs, CheckStatus::Failed)
+    }
+
+    #[test]
+    fn stale_and_unknown_cached_evidence_is_visible_in_markdown() {
+        for status in [CheckStatus::Passed, CheckStatus::Failed] {
+            let (gate, markdown) = run_gate_with_cached_semgrep_artifacts(
+                Some(STALE_CACHE_CAVEAT_MAX_AGE_SECS + 60),
+                status,
+            );
+            assert_eq!(gate["stale_cache_caveats"][0]["age_status"], "stale");
+            assert!(markdown.contains("## Cached evidence freshness"));
+            assert!(markdown.contains("| Semgrep scan | 7d 0h 1m (604860 s) |"));
+            assert!(markdown.contains("7d 0h 0m (604800 s)"));
+            assert!(markdown.contains("Advisory only; the verdict and enforcement are unchanged."));
+            assert!(markdown.contains("--no-cache"));
+
+            let (unknown, markdown) = run_gate_with_cached_semgrep_artifacts(None, status);
+            assert!(unknown["stale_cache_caveats"][0]["cache_age_secs"].is_null());
+            assert!(markdown.contains("| Semgrep scan | Unknown (timestamp unavailable) |"));
+            assert!(!markdown.contains("0d 0h 0m (0 s)"));
+        }
+    }
+
+    #[test]
+    fn fresh_cached_evidence_does_not_add_a_markdown_notice() {
+        for age in [0, 60, STALE_CACHE_CAVEAT_MAX_AGE_SECS] {
+            let (gate, markdown) =
+                run_gate_with_cached_semgrep_artifacts(Some(age), CheckStatus::Passed);
+            assert!(gate["stale_cache_caveats"].as_array().unwrap().is_empty());
+            assert!(!markdown.contains("## Cached evidence freshness"));
+        }
     }
 
     /// The Vista dogfood shape: the row holding the merge came out of a cache

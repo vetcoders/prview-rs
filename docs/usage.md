@@ -462,6 +462,12 @@ summary states both numbers:
 `checks_summary.warned` is what the CLI ran, `checks_summary.warned_in_pack` is
 the complete count the flag keys off, and it is always the larger of the two.
 
+Old or age-unverifiable cached results are listed separately under **Cached
+evidence freshness** in `00_summary/MERGE_GATE.md` and its `review.html` export.
+The notice shows the age and advisory threshold from `stale_cache_caveats` in
+`MERGE_GATE.json`; it does not add a warning to the gate or change the exit code.
+Use `--no-cache` to collect fresh evidence instead of replaying those results.
+
 Strictness follows the `--ci` you typed, not the preset label the run reports.
 `--update` outranks `--ci` when the execution preset is resolved, so
 `prview --ci --fail-on-warnings --update` publishes `mode.execution_mode:

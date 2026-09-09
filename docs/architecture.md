@@ -1613,6 +1613,13 @@ changes no verdict, no exit code, and no other field — pinned by
 `the_stale_cache_caveat_moves_no_other_field`, which diffs the whole `decision`,
 `checks`, and `inline_findings` of a stale run against a fresh one.
 
+The same caveat entries feed the **Cached evidence freshness** table in
+`MERGE_GATE.md`; no separate freshness calculation runs in the renderer.
+Known ages and thresholds include a readable duration plus exact seconds;
+unknown ages remain explicit. Empty lists produce no section. The portable
+`review.html` export incorporates that section through its existing Markdown
+reader, so a human sees the same age advisory as a JSON consumer.
+
 ### artifacts/signal/ (module directory)
 
 Domain-specific signal generators, each producing an artifact **only when** it

@@ -248,6 +248,13 @@ to the row's status text.
 An unknown age (including a future mtime after clock rollback) is not silently
 treated as fresh: it produces an `unknown` caveat with a null age.
 
+`MERGE_GATE.md` projects this same list into a **Cached evidence freshness**
+table, including the check name, age and advisory threshold. Known ages show
+days, hours and minutes alongside exact seconds; an unverifiable age is shown
+as unknown. The table is absent when the list is empty. The portable
+`review.html` export includes this Markdown section. The notice points to
+`--no-cache` for a fresh execution and does not introduce an expiry rule.
+
 The list is WARN-ONLY and changes nothing else. It is deliberately NOT part of
 `decision`: that object is closed and every field in it ranks the verdict, so a
 report about the pack's evidence must not sit where a reader reconciles axes. The
