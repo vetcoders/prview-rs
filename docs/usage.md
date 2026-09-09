@@ -100,7 +100,7 @@ Effective profile:
 | Surface | Gate behavior |
 |---------|---------------|
 | Rust / Cargo | `Cargo check` runs; `Clippy`, `Rustfmt`, `Cargo test`, and `Cargo audit` stay visible as skipped checks |
-| Security | Semgrep runs when the `semgrep` binary is available |
+| Security | Semgrep runs when the `semgrep` binary is available, unless `--skip-security` is explicit |
 | Geiger | `Cargo geiger` is out of the gate profile |
 | Tests, lint, bundle, heuristics | Disabled for the pre-push gate budget |
 | JS/TS | Existing JS checks only run when repo-local `node_modules` tools exist; they are not part of the measured budget below |
@@ -374,10 +374,14 @@ prview --help
 | `--with-bundle` | Enable the bundle build |
 | `--skip-bundle` | Skip the bundle build |
 | `--with-security` | Raise the heavy security posture (does not add cargo-geiger or full-tree Semgrep) |
-| `--skip-security` | Skip heavy security checks |
+| `--skip-security` | Skip Semgrep and heavy security checks; lightweight cargo-audit remains enabled |
 | `--security-full` | Full security tier: runs full-tree Semgrep and adds cargo-geiger's unsafe scan (slow; off even under `--deep`) |
 | `--resource-budget safe\|balanced` | Select the whole-machine envelope (`safe` is the default; `balanced` is capped and load-aware) |
 | `--tests-pattern PATTERN` | Filter Vitest by regex or Cargo/libtest by literal substring; Mixed uses the literal intersection and Pytest remains unfiltered |
+
+An explicit `--skip-security` disables Semgrep before tool discovery, including
+in quick review runs. This is separate from the heavy-security opt-in; an
+ordinary run without `--with-security` still uses the default Semgrep scan.
 
 By default, Semgrep is scoped to the change when prview can resolve a clean git
 baseline: it passes Semgrep `--baseline-commit <merge-base>` so existing

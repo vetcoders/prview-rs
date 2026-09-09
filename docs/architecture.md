@@ -222,7 +222,9 @@ Implementations:
 - `CargoAuditCheck` - `cargo audit`
 - `SemgrepCheck` - Semgrep JSON scan; default is diff-scoped with
   `--baseline-commit <merge-base>` when the git baseline is clean and available,
-  while `--security-full` keeps a full-tree scan
+  while `--security-full` keeps a full-tree scan. Explicit `--skip-security`
+  is carried separately from the heavy-security opt-in and disables this check
+  before tool discovery.
 - `CargoGeigerCheck` - `cargo geiger`
 - `RuffCheck` - `ruff check`
 - `MypyCheck` - `mypy`
