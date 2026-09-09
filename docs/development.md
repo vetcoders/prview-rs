@@ -59,7 +59,10 @@ survives until the session is dropped. Tests can explicitly override `PATH` or
 `PRVIEW_HOME` when that behavior is the subject of the contract. No parent-process
 environment mutation or manual PATH preparation is required. This harness tests
 CLI/MCP contracts, not real Semgrep detection; production discovery and scanner
-dogfood remain separate. The test double has POSIX shell and Windows command
+dogfood remain separate. Library pipeline/watch fixtures explicitly set
+`skip_security = true`: `run_security = false` only disables the heavy security
+tier and does not disable Semgrep. The shared `test_config()` does not opt out of
+Semgrep, so eligibility tests can still exercise default discovery. The test double has POSIX shell and Windows command
 script implementations; runtime evidence must still name the platform exercised.
 
 Process-tree cancellation has platform-specific proof. Unix coverage runs in the

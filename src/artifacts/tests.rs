@@ -1271,6 +1271,7 @@ async fn artifact_pipeline_diffs_from_merge_base_when_base_advanced() {
         .build();
     config.run_bundle = false;
     config.run_security = false;
+    config.skip_security = true;
     config.run_heuristics = false;
     config.create_dashboard = false;
     config.quiet = true;

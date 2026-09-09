@@ -1123,6 +1123,7 @@ mod tests {
         config.bases = vec!["main".to_string()];
         config.output_dir = Some(out.path().join("pack"));
         config.run_heuristics = false;
+        config.skip_security = true;
         config.quiet = true;
         config.create_zip = false;
 
@@ -1178,6 +1179,7 @@ mod tests {
         config.bases = vec!["main".to_string()];
         config.output_dir = Some(out.join("pack"));
         config.run_heuristics = false;
+        config.skip_security = true;
         config.do_fetch = false;
         config.quiet = true;
         config.create_zip = false;
@@ -1363,11 +1365,10 @@ mod tests {
     /// asked the run to stop was handed an ACCEPT or a BLOCK computed from a
     /// pack the run had kept on building.
     ///
-    /// Which stage catches it here depends on the machine (semgrep is runnable
-    /// wherever the binary is on `PATH`, whatever the flags say), so this pins
-    /// the outcome rather than the seam. The seam the checks stage cannot cover
-    /// is pinned by `a_cancelled_watch_iteration_produces_no_pack` below, which
-    /// runs no checks at all.
+    /// The fixture explicitly opts out of external security scans. This pins
+    /// the cancellation outcome without depending on host-installed scanners;
+    /// `a_cancelled_watch_iteration_produces_no_pack` also checks that a cancelled
+    /// watcher cannot enter another iteration.
     #[tokio::test]
     async fn a_cancelled_run_never_reports_a_verdict() {
         let tmp = tempfile::tempdir().unwrap();
