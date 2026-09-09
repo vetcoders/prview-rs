@@ -11,7 +11,14 @@ use super::LintFinding;
 
 /// Parse Semgrep JSON output into per-location findings.
 pub fn parse_semgrep_json_output(output: &str) -> Vec<LintFinding> {
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(output.trim()) else {
+    // CheckResult stores stdout followed by stderr. Semgrep's JSON ends before
+    // diagnostic text such as Python deprecation warnings; parsing the entire
+    // string would discard valid findings because of those trailing bytes.
+    // Require a complete first JSON value, then leave stderr out of findings.
+    let Some(Ok(json)) = serde_json::Deserializer::from_str(output.trim())
+        .into_iter::<serde_json::Value>()
+        .next()
+    else {
         return Vec::new();
     };
 
@@ -208,6 +215,38 @@ mod tests {
         assert_eq!(
             findings[0].rule_id.as_deref(),
             Some("rust.lang.security.test")
+        );
+    }
+
+    #[test]
+    fn semgrep_json_findings_survive_trailing_stderr() {
+        let payload = r#"{"results":[{"check_id":"audit.example","path":"src/app.js","start":{"line":23,"col":11},"extra":{"message":"Inspect this call","severity":"WARNING"}}],"errors":[{"type":"PartialParsing","path":"src/partial.js"}]}"#;
+        let expected = parse_semgrep_json_output(payload);
+        assert_eq!(expected.len(), 1);
+        for stderr in [
+            "/opt/semgrep/dependencies.py:4: UserWarning: pkg_resources is deprecated",
+            r#"diagnostic context: {"results":[{"path":"not-a-finding.js"}]}"#,
+        ] {
+            let combined = format!("{payload}\n{stderr}\n");
+            assert_eq!(parse_semgrep_json_output(&combined), expected);
+        }
+    }
+
+    #[test]
+    fn semgrep_stderr_and_incomplete_json_do_not_create_findings() {
+        assert!(
+            parse_semgrep_json_output(
+                r#"{"results":[],"errors":[{"path":"src/broken.js","start":{"line":3},"message":"Parse error"}]}
+diagnostic context: {"results":[{"path":"stderr.js","start":{"line":9}}]}"#,
+            )
+            .is_empty()
+        );
+        assert!(
+            parse_semgrep_json_output(
+                r#"{"results":[{"path":"src/incomplete.js","start":{"line":1}}]
+UserWarning: output was truncated"#,
+            )
+            .is_empty()
         );
     }
 

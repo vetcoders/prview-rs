@@ -443,6 +443,10 @@ baseline: it passes Semgrep `--baseline-commit <merge-base>` so existing
 findings outside the diff do not degrade the merge verdict. If the worktree is
 dirty or the merge-base is unavailable, prview falls back to a full scan and the
 artifact classifier still separates introduced from pre-existing findings.
+Semgrep findings retain their rule, message, severity, path, and start position
+in `30_context/INLINE_FINDINGS.sarif` even when the scanner appends stderr
+diagnostics after its JSON output. Those diagnostics are not inline findings.
+
 Semgrep parse/scan errors remain visible even when no rule findings are
 introduced: they degrade analysis confidence and make the merge decision
 `CONDITIONAL`, requiring review, without adding code warnings or SARIF findings.
