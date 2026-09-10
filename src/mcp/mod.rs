@@ -658,12 +658,19 @@ struct ProbeSession {
     next_id: i64,
 }
 
+// A bare "mcp" is a libtest filter. The explicit server-mode option is
+// accepted by prview but rejected by libtest before any child tests run.
+fn mcp_probe_command(executable: &std::path::Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(executable);
+    command.args(["mcp", "--stdio"]);
+    command
+}
+
 impl ProbeSession {
     async fn start() -> Result<Self, ProbeFailure> {
         let exe = std::env::current_exe().map_err(|e| ProbeFailure::new("spawn", e.to_string()))?;
-        let mut cmd = tokio::process::Command::new(exe);
-        cmd.arg("mcp")
-            .stdin(std::process::Stdio::piped())
+        let mut cmd = mcp_probe_command(&exe);
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
@@ -885,6 +892,32 @@ pub async fn probe(json_output: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mcp_probe_rejects_libtest_instead_of_running_filtered_tests() {
+        use clap::Parser;
+        // The same invocation is valid for the real application.
+        let cli = crate::Cli::try_parse_from(["prview", "mcp", "--stdio"])
+            .expect("application accepts the probe command");
+        assert!(matches!(cli.command, Some(crate::CliCommand::Mcp { .. })));
+
+        let mut command = mcp_probe_command(&std::env::current_exe().unwrap());
+        // Even if the guard regresses, --list prevents this regression test
+        // from executing any child tests. A successful listing then fails below.
+        command.arg("--list");
+        command.kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(3), command.output())
+            .await
+            .expect("harness rejects application arguments promptly")
+            .expect("bounded probe child");
+        assert!(
+            !output.status.success(),
+            "libtest must reject the app-only flag"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("stdio"), "{stderr}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("running "));
+    }
 
     fn write_running_marker(run_dir: &std::path::Path, run_id_commit: &str, started_at: &str) {
         std::fs::write(

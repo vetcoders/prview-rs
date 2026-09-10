@@ -732,7 +732,11 @@ The ordinary remote `prview --pr <number>` fast preset does not enter the full
 repo-backed Rust engine. It emits an exact-revision typed unknown instead, so
 the run is degraded and requires review rather than reporting a clean scan.
 Local standard, deep, and CI modes run all exact base/target comparisons in one
-private same-binary worker with a single 30-second total deadline. Artifact
+private same-binary worker with a single 30-second total deadline. Private workers
+require a matching internal argument and environment request and reject nested
+launches. If called from a test harness, those arguments are rejected before any
+child tests run. No public worker command or environment-only activation is
+supported. Artifact
 generation announces and records `rust-api.fast-preset-unknown` or
 `rust-api.isolated-worker` in `00_summary/RUN.json.timings`. Worker timeout,
 failure, or malformed output becomes an exact-comparison typed unknown.

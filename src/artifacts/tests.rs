@@ -960,7 +960,7 @@ fn api_delta_no_diff_only_runtime() {
 fn rust_api_worker_activation_precedes_public_cli_parsing() {
     let main = include_str!("../main.rs");
     let worker = main
-        .find("PRVIEW_INTERNAL_RUST_API_WORKER")
+        .find("match private_worker_mode(")
         .expect("private worker activation");
     let cli_parse = main.find("Cli::parse()").expect("public CLI parser");
     assert!(worker < cli_parse);

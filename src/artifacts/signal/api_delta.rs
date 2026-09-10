@@ -338,7 +338,10 @@ pub fn compare_rust_api_revisions(repo: &Repository, diffs: &[Diff]) -> Result<O
     Ok(Some(merge_comparisons(comparisons)))
 }
 
-const RUST_API_WORKER_ENV: &str = "PRVIEW_INTERNAL_RUST_API_WORKER";
+#[doc(hidden)]
+pub const RUST_API_WORKER_ENV: &str = "PRVIEW_INTERNAL_RUST_API_WORKER";
+#[doc(hidden)]
+pub const RUST_API_WORKER_ARG: &str = "--prview-internal-rust-api-worker";
 const RUST_API_WORKER_REPO_ENV: &str = "PRVIEW_INTERNAL_RUST_API_REPO";
 const RUST_API_WORKER_PAIRS_ENV: &str = "PRVIEW_INTERNAL_RUST_API_PAIRS";
 const RUST_API_WORKER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -373,24 +376,66 @@ pub(crate) fn compare_rust_api_revisions_isolated(
         RUST_API_WORKER_TIMEOUT,
         |repo_root, pairs_json, timeout| {
             let executable = std::env::current_exe().context("locate current prview executable")?;
-            let mut command = Command::new(executable);
-            command
-                .env(RUST_API_WORKER_ENV, "1")
-                .env(RUST_API_WORKER_REPO_ENV, repo_root)
-                .env(RUST_API_WORKER_PAIRS_ENV, pairs_json);
-            let output = crate::proc::output_governed_with_timeout(
-                command,
-                "isolated Rust API analysis",
-                timeout,
+            let command = rust_api_worker_command(
+                &executable,
+                repo_root,
+                pairs_json,
+                std::env::var_os(RUST_API_WORKER_ENV).is_some()
+                    || std::env::var_os(crate::heuristics::LOCTREE_WORKER_ROOT_ENV).is_some(),
             )?;
-            Ok(RustApiWorkerOutput {
-                success: output.status.success(),
-                status: output.status.to_string(),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
+            #[cfg(not(test))]
+            {
+                let output = crate::proc::output_governed_with_timeout(
+                    command,
+                    "isolated Rust API analysis",
+                    timeout,
+                )?;
+                Ok(RustApiWorkerOutput {
+                    success: output.status.success(),
+                    status: output.status.to_string(),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            }
+            #[cfg(test)]
+            {
+                // libtest does not run application main. Keep functional
+                // repository fixtures in-process, as the Loctree tests do;
+                // separate worker tests exercise command/protocol boundaries.
+                let _ = (command, timeout);
+                let repo = Repository::open(repo_root)?;
+                let delta = compare_rust_api_revisions(&repo, diffs)?
+                    .context("test Rust API worker received no comparisons")?;
+                Ok(RustApiWorkerOutput {
+                    success: true,
+                    status: "in-process test worker".into(),
+                    stdout: serde_json::to_vec(&delta)?,
+                    stderr: Vec::new(),
+                })
+            }
         },
     )
+}
+
+fn rust_api_worker_command(
+    executable: &Path,
+    repo_root: &Path,
+    pairs_json: &str,
+    parent_is_worker: bool,
+) -> Result<Command> {
+    anyhow::ensure!(
+        !parent_is_worker,
+        "refusing recursive private Rust API worker spawn"
+    );
+    let mut command = Command::new(executable);
+    // libtest rejects this application-only option instead of interpreting a
+    // bare executable launch as a request to run every test.
+    command
+        .arg(RUST_API_WORKER_ARG)
+        .env(RUST_API_WORKER_ENV, "1")
+        .env(RUST_API_WORKER_REPO_ENV, repo_root)
+        .env(RUST_API_WORKER_PAIRS_ENV, pairs_json);
+    Ok(command)
 }
 
 fn compare_rust_api_revisions_with_worker(
@@ -2152,6 +2197,65 @@ mod tests {
         compare_rust_api_revisions(&repo, &[make_diff_with_ids(base, target, Vec::new())])
             .expect("repository-backed comparison")
             .expect("Rust revisions")
+    }
+
+    #[test]
+    fn private_worker_command_is_explicit_and_rejects_recursion() {
+        let command = rust_api_worker_command(Path::new("prview"), Path::new("repo"), "[]", false)
+            .expect("worker command");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [RUST_API_WORKER_ARG]
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == RUST_API_WORKER_ENV && value == Some(std::ffi::OsStr::new("1"))
+        }));
+        let error = rust_api_worker_command(Path::new("prview"), Path::new("repo"), "[]", true)
+            .expect_err("nested workers must never launch");
+        assert!(error.to_string().contains("recursive"));
+    }
+
+    #[test]
+    fn private_worker_libtest_rejects_application_marker_without_running_tests() {
+        let executable = std::env::current_exe().expect("test executable");
+        let mut command = rust_api_worker_command(&executable, Path::new("unused"), "[]", false)
+            .expect("guarded command");
+        // Even a future regression removing the marker can only list tests,
+        // never execute this harness recursively.
+        command.arg("--list");
+        let output = crate::proc::output_governed_with_timeout(
+            command,
+            "private worker argument rejection test",
+            Duration::from_secs(2),
+        )
+        .expect("bounded rejection probe");
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .to_lowercase()
+                .contains("unrecognized option")
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("running "));
+    }
+
+    #[test]
+    fn private_worker_functional_test_entry_compares_in_process() {
+        let (_tmp, repo, base, target) = make_test_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+                "[package]\nname='fixture'\nversion='0.0.0'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "pub fn old() {}\n", "pub fn new() {}\n"),
+        ]);
+        let diff = make_diff_with_ids(base.clone(), target.clone(), Vec::new());
+        let delta = compare_rust_api_revisions_isolated(false, repo.path(), &[diff])
+            .expect("test entry result")
+            .expect("revision delta");
+        assert_eq!(delta.base_revision, format!("git_tree:{base}"));
+        assert_eq!(delta.target_revision, format!("git_tree:{target}"));
+        assert!(!delta.added.is_empty());
+        assert!(!delta.removed.is_empty());
     }
 
     #[test]

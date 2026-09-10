@@ -331,6 +331,10 @@ pub struct GateArgs {
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct McpArgs {
+    /// Explicit stdio server mode for bounded internal probes
+    #[arg(long, hide = true, conflicts_with = "probe")]
+    pub stdio: bool,
+
     /// Run a bounded self-smoke of the MCP stdio server and exit
     #[arg(long)]
     pub probe: bool,

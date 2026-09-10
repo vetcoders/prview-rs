@@ -49,6 +49,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks. A later checkout can invalidate stability but cannot grant a new
   downgrade; unknown captured HEAD no longer takes a permissive local fallback.
 
+- MCP contract tests bound response waits and pagination, and clean the owned
+  server tree before reaping it on timeout or drop, including detached reviews.
+
+- MCP child registration briefly resamples an `ESRCH` identity lookup when
+  the owned child has not yet become waitable, preserving fail-closed behavior
+  for ambiguous ownership and exposing wait-status errors in diagnostics.
+
+- Private Rust API and Loctree workers require application-only arguments paired
+  with their environment requests and refuse nested launches. A library test
+  runner can no longer re-enter the full test suite through `current_exe()`.
+  MCP probes also reject test runners rather than treating `mcp` as a test filter.
+
 - A signal arriving after durable pack publication no longer relabels the
   completed run as exit 130, while an unchanged `--update` remains
   cancellation-sensitive. Crash-journal recovery refuses and quarantines

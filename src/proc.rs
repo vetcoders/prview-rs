@@ -77,15 +77,32 @@ enum ExternalChildBirthIdentity {
 
 #[cfg(unix)]
 fn classify_external_child_birth_identity(
-    birth_identity: std::io::Result<String>,
-    child_exited: impl FnOnce() -> std::io::Result<bool>,
+    mut birth_identity: impl FnMut() -> std::io::Result<String>,
+    mut child_exited: impl FnMut() -> std::io::Result<bool>,
+    mut retry_within_budget: impl FnMut() -> bool,
 ) -> std::io::Result<ExternalChildBirthIdentity> {
-    match birth_identity {
-        Ok(identity) => Ok(ExternalChildBirthIdentity::Captured(identity)),
-        Err(error) => match child_exited() {
-            Ok(true) => Ok(ExternalChildBirthIdentity::ChildExited),
-            Ok(false) | Err(_) => Err(error),
-        },
+    loop {
+        match birth_identity() {
+            Ok(identity) => return Ok(ExternalChildBirthIdentity::Captured(identity)),
+            Err(error) => match child_exited() {
+                Ok(true) => return Ok(ExternalChildBirthIdentity::ChildExited),
+                // Darwin can stop exposing native process identity before
+                // the owned child becomes waitable. Retry only this narrow
+                // transition; absence alone is never evidence of completion.
+                Ok(false) if error.raw_os_error() == Some(libc::ESRCH) && retry_within_budget() => {
+                    continue;
+                }
+                Ok(false) => return Err(error),
+                Err(exit_error) => {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "native child birth lookup failed: {error}; non-reaping child-exit check failed: {exit_error}"
+                        ),
+                    ));
+                }
+            },
+        }
     }
 }
 
@@ -387,9 +404,18 @@ pub(crate) fn report_external_child_group_started(
         let Some(writer) = external_child_group_writer()? else {
             return Ok(ExternalChildGroupStart::NotMirrored);
         };
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
         let birth_identity = match classify_external_child_birth_identity(
-            crate::storage::process_birth_identity(pid),
+            || crate::storage::process_birth_identity(pid),
             || unix_child_exited_without_reaping(pid),
+            || {
+                let delay = Duration::from_millis(1);
+                if deadline.saturating_duration_since(std::time::Instant::now()) <= delay {
+                    return false;
+                }
+                std::thread::sleep(delay);
+                std::time::Instant::now() < deadline
+            },
         )? {
             ExternalChildBirthIdentity::Captured(identity) => identity,
             ExternalChildBirthIdentity::ChildExited => {
@@ -2896,27 +2922,131 @@ mod tests {
     #[test]
     fn waitable_exit_after_birth_identity_failure_is_completed() {
         let completed = classify_external_child_birth_identity(
-            Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            || Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
             || Ok(true),
+            || panic!("a confirmed child exit must not retry"),
         )
         .expect("an unreaped direct-child exit is definitive completion");
         assert!(matches!(completed, ExternalChildBirthIdentity::ChildExited));
 
         let ambiguous = classify_external_child_birth_identity(
-            Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            || Err(std::io::Error::from_raw_os_error(libc::EPERM)),
             || Ok(false),
+            || panic!("a permission failure must not retry"),
         )
         .expect_err("a child not observed exited must fail closed");
         assert_eq!(ambiguous.raw_os_error(), Some(libc::EPERM));
 
-        let captured = classify_external_child_birth_identity(Ok("birth".to_string()), || {
-            panic!("a successful native identity must not probe child status")
-        })
+        let captured = classify_external_child_birth_identity(
+            || Ok("birth".to_string()),
+            || panic!("a successful native identity must not probe child status"),
+            || panic!("a successful native identity must not retry"),
+        )
         .expect("captured identity");
         assert!(matches!(
             captured,
             ExternalChildBirthIdentity::Captured(identity) if identity == "birth"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_birth_identity_retries_until_child_exit_is_observed() {
+        let mut observations = [false, true].into_iter();
+        let mut retries = 0;
+        let result = classify_external_child_birth_identity(
+            || Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            || Ok(observations.next().expect("only two exit observations")),
+            || {
+                retries += 1;
+                assert_eq!(retries, 1, "confirmed exit must stop retries");
+                true
+            },
+        )
+        .expect("the next observation proves unreaped direct-child exit");
+        assert!(matches!(result, ExternalChildBirthIdentity::ChildExited));
+        assert_eq!(retries, 1);
+        assert_eq!(observations.next(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_birth_identity_retries_until_native_identity_is_captured() {
+        let mut identities = [
+            Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            Ok("birth".to_string()),
+        ]
+        .into_iter();
+        let mut exit_checks = 0;
+        let mut retries = 0;
+        let result = classify_external_child_birth_identity(
+            || identities.next().expect("only two identity observations"),
+            || {
+                exit_checks += 1;
+                assert_eq!(exit_checks, 1, "captured identity must skip exit checks");
+                Ok(false)
+            },
+            || {
+                retries += 1;
+                assert_eq!(retries, 1, "captured identity must stop retries");
+                true
+            },
+        )
+        .expect("a later native identity restores exact ownership");
+        assert!(matches!(
+            result,
+            ExternalChildBirthIdentity::Captured(identity) if identity == "birth"
+        ));
+        assert_eq!(exit_checks, 1);
+        assert_eq!(retries, 1);
+        assert!(identities.next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_birth_identity_wait_errors_fail_closed_without_retry() {
+        for errno in [libc::ECHILD, libc::EPERM, libc::EINVAL] {
+            let birth_error = std::io::Error::from_raw_os_error(libc::ESRCH);
+            let exit_error = std::io::Error::from_raw_os_error(errno);
+            let result = classify_external_child_birth_identity(
+                || Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+                || Err(std::io::Error::from_raw_os_error(errno)),
+                || panic!("a failed wait observation must not retry"),
+            )
+            .expect_err("wait errors provide no exit or ownership evidence");
+            let message = result.to_string();
+            assert!(message.contains(&birth_error.to_string()));
+            assert!(message.contains(&exit_error.to_string()));
+            assert!(message.contains("non-reaping child-exit check failed"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_birth_identity_unconfirmed_exit_exhausts_retry_budget() {
+        let mut identities = 0;
+        let mut exit_checks = 0;
+        let mut retry_budget = [true, true, false].into_iter();
+        let result = classify_external_child_birth_identity(
+            || {
+                identities += 1;
+                Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+            },
+            || {
+                exit_checks += 1;
+                Ok(false)
+            },
+            || {
+                retry_budget
+                    .next()
+                    .expect("must stop when the budget expires")
+            },
+        )
+        .expect_err("repeated absence cannot prove child completion");
+        assert_eq!(result.raw_os_error(), Some(libc::ESRCH));
+        assert_eq!(identities, 3);
+        assert_eq!(exit_checks, 3);
+        assert_eq!(retry_budget.next(), None);
     }
 
     #[cfg(unix)]

@@ -7,9 +7,11 @@ mod support;
 
 use prview::git::git_cmd;
 use prview::storage::RunEntry;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdout, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 // --- fixture git repo helpers -------------------------------------------------
 
@@ -242,9 +244,10 @@ fn repo_basename(repo: &Path) -> String {
 /// A live `prview mcp` process with an initialized MCP session.
 struct McpSession {
     child: Child,
-    reader: BufReader<ChildStdout>,
+    responses: mpsc::Receiver<std::io::Result<String>>,
     next_id: i64,
-    _environment: support::ContractEnvironment,
+    cleanup_result: Option<Result<(), String>>,
+    _environment: Option<support::ContractEnvironment>,
 }
 
 impl McpSession {
@@ -255,26 +258,59 @@ impl McpSession {
     fn start_in(cwd: Option<&Path>, envs: &[(&str, &str)]) -> Self {
         let environment = support::ContractEnvironment::new();
         let mut cmd = environment.command();
-        cmd.arg("mcp")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+        cmd.arg("mcp");
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        let mut child = cmd.spawn().expect("spawn prview mcp");
-        let reader = BufReader::new(child.stdout.take().unwrap());
-        let mut session = Self {
-            child,
-            reader,
-            next_id: 1,
-            _environment: environment,
-        };
+        let mut session = Self::spawn(cmd);
+        session._environment = Some(environment);
         session.initialize();
         session
+    }
+
+    fn spawn(mut cmd: Command) -> Self {
+        // Keep the live MCP root as the ownership anchor until its separately
+        // grouped deep review and tool descendants have been terminated.
+        prview::proc::harden_std(&mut cmd);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().expect("spawn MCP fixture");
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let (sender, responses) = mpsc::sync_channel(16);
+        std::thread::spawn(move || {
+            loop {
+                let mut line = String::new();
+                // Bound both one frame and the queue if a broken server emits
+                // notifications continuously without answering our request.
+                let result = match reader.by_ref().take(1_048_577).read_line(&mut line) {
+                    Ok(0) => Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "server closed stdout before responding",
+                    )),
+                    Ok(n) if n > 1_048_576 => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "MCP fixture response exceeds 1 MiB",
+                    )),
+                    Ok(_) => Ok(line),
+                    Err(error) => Err(error),
+                };
+                let finished = result.is_err();
+                if sender.send(result).is_err() || finished {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            responses,
+            next_id: 1,
+            cleanup_result: None,
+            _environment: None,
+        }
     }
 
     fn send(&mut self, req: &serde_json::Value) {
@@ -285,13 +321,40 @@ impl McpSession {
 
     /// Send a request with the given id and read until its response arrives.
     fn request(&mut self, id: i64, method: &str, params: serde_json::Value) -> serde_json::Value {
+        self.request_with_timeout(id, method, params, Duration::from_secs(130))
+            .unwrap_or_else(|error| panic!("MCP request failed: {error}"))
+    }
+
+    fn request_with_timeout(
+        &mut self,
+        id: i64,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
+        let deadline = Instant::now() + timeout;
         self.send(&serde_json::json!({
             "jsonrpc": "2.0", "id": id, "method": method, "params": params
         }));
         loop {
-            let mut line = String::new();
-            let n = self.reader.read_line(&mut line).expect("read line");
-            assert!(n > 0, "server closed stdout before responding");
+            if Instant::now() >= deadline {
+                let cleanup = self.cleanup();
+                return Err(format!(
+                    "{method} response deadline exceeded ({timeout:?}); cleanup: {cleanup:?}"
+                ));
+            }
+            let received = self
+                .responses
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            let line = match received {
+                Ok(Ok(line)) => line,
+                error => {
+                    let cleanup = self.cleanup();
+                    return Err(format!(
+                        "{method} response failed within {timeout:?}: {error:?}; cleanup: {cleanup:?}"
+                    ));
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -300,7 +363,46 @@ impl McpSession {
                 Err(_) => continue,
             };
             if value.get("id").and_then(|v| v.as_i64()) == Some(id) {
-                return value;
+                return Ok(value);
+            }
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if let Some(result) = &self.cleanup_result {
+            return result.clone();
+        }
+        let result = self.cleanup_owned_root();
+        self.cleanup_result = Some(result.clone());
+        result
+    }
+
+    fn cleanup_owned_root(&mut self) -> Result<(), String> {
+        match self.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "MCP root exited before descendant cleanup ({status}); live ancestry unavailable"
+                ));
+            }
+            Err(error) => return Err(format!("cannot inspect owned MCP root: {error}")),
+        }
+        // This PID comes from our still-owned live Child. Terminate before
+        // reaping: killing only MCP first would orphan the detached deep run.
+        let contained = prview::proc::terminate_hardened_process_tree(self.child.id());
+        if !contained {
+            let _ = self.child.kill();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) if contained => return Ok(()),
+                Ok(Some(_)) => return Err("MCP descendant containment was not confirmed".into()),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) => return Err("owned MCP root did not reap within 2s".into()),
+                Err(error) => return Err(format!("cannot reap owned MCP root: {error}")),
             }
         }
     }
@@ -342,9 +444,204 @@ impl McpSession {
 
 impl Drop for McpSession {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Err(error) = self.cleanup() {
+            if std::thread::panicking() {
+                eprintln!("MCP fixture cleanup failed during unwind: {error}");
+            } else {
+                panic!("MCP fixture cleanup failed: {error}");
+            }
+        }
     }
+}
+
+/// Inert in the ordinary suite; the parent runs only this exact test. Every
+/// process also has a natural 10s lifetime if the harness containment regresses.
+#[cfg(unix)]
+#[test]
+fn mcp_harness_stalled_tree_fixture() {
+    let Some(pidfile) = std::env::var_os("PRVIEW_MCP_HARNESS_PIDFILE") else {
+        return;
+    };
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            "sleep 10 & printf '%s %s\\n' \"$$\" \"$!\" > \"$1\"; wait",
+            "mcp-harness-descendant",
+        ])
+        .arg(pidfile);
+    prview::proc::harden_std(&mut command);
+    let mut child = process_wrap::std::CommandWrap::from(command)
+        .spawn()
+        .expect("spawn finite separate-group fixture");
+    // The request deliberately receives no JSON-RPC response. The descendant
+    // stays a direct child, like the deep review's detached waiter contract.
+    let deadline = Instant::now() + Duration::from_secs(11);
+    while Instant::now() < deadline {
+        if child
+            .inner_mut()
+            .try_wait()
+            .expect("probe finite fixture")
+            .is_some()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let cleanup = prview::proc::terminate_and_reap_owned_std_child(child.as_mut());
+    panic!("finite descendant exceeded its natural lifetime; cleanup confirmed: {cleanup}");
+}
+
+#[cfg(unix)]
+fn stalled_tree_session() -> (McpSession, tempfile::TempDir, Vec<i32>) {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("descendants.pids");
+    let mut command = Command::new(std::env::current_exe().expect("current test binary"));
+    command
+        .args(["--exact", "mcp_harness_stalled_tree_fixture", "--nocapture"])
+        .env("PRVIEW_MCP_HARNESS_PIDFILE", &pidfile);
+    let session = McpSession::spawn(command);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let descendants = loop {
+        if let Ok(contents) = std::fs::read_to_string(&pidfile)
+            && contents.ends_with('\n')
+            && let Ok(pids) = contents
+                .split_whitespace()
+                .map(str::parse::<i32>)
+                .collect::<Result<Vec<_>, _>>()
+            && pids.len() == 2
+            && pids.iter().all(|pid| *pid > 0)
+        {
+            break pids;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not publish its tree"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let root = session.child.id() as i32;
+    // SAFETY: these read-only queries concern only the fixture-owned PIDs.
+    assert_eq!(unsafe { libc::getpgid(root) }, root);
+    assert_eq!(unsafe { libc::getpgid(descendants[0]) }, descendants[0]);
+    assert_eq!(unsafe { libc::getpgid(descendants[1]) }, descendants[0]);
+    assert_ne!(descendants[0], root);
+    let mut pids = vec![root];
+    pids.extend(descendants);
+    (session, dir, pids)
+}
+
+#[cfg(unix)]
+fn assert_harness_tree_terminated(pids: &[i32]) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if pids.iter().enumerate().all(|(index, pid)| {
+            // SAFETY: signal 0 only probes the finite fixture-owned PID.
+            let absent = (unsafe { libc::kill(*pid, 0) }) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if absent {
+                return true;
+            }
+            // The direct root must have been reaped by our Child handle.
+            if index == 0 {
+                return false;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // Linux may retain an orphan zombie until its adopter reaps
+                // it. That proves termination, not reaping by this harness.
+                match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                    Ok(stat) => {
+                        stat.rsplit_once(") ")
+                            .and_then(|(_, fields)| fields.split_whitespace().next())
+                            == Some("Z")
+                    }
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        }) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "fixture tree survived: {pids:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_harness_response_deadline_cleans_detached_tree() {
+    let (mut session, _dir, pids) = stalled_tree_session();
+    let started = Instant::now();
+    let error = session
+        .request_with_timeout(
+            42,
+            "stalled",
+            serde_json::json!({}),
+            Duration::from_millis(150),
+        )
+        .expect_err("a stalled response must reach the request deadline");
+    assert!(error.contains("150ms"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(session.cleanup_result, Some(Ok(())));
+    assert_harness_tree_terminated(&pids);
+    drop(session);
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_harness_drop_cleans_detached_tree() {
+    let (session, _dir, pids) = stalled_tree_session();
+    drop(session);
+    assert_harness_tree_terminated(&pids);
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_harness_exited_root_does_not_claim_containment() {
+    let mut session = McpSession::spawn(Command::new("true"));
+    session
+        .responses
+        .recv_timeout(Duration::from_secs(2))
+        .expect("finite root closes stdout")
+        .expect_err("EOF is reported by the reader");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while session
+        .child
+        .try_wait()
+        .expect("probe exiting root")
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "true fixture did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let error = session
+        .cleanup()
+        .expect_err("lost ancestry is not containment");
+    assert!(error.contains("live ancestry unavailable"), "{error}");
+    // A normal test must fail on this cleanup error; Drop must not hide it.
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(session))).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_harness_expired_deadline_rejects_queued_response() {
+    let mut command = Command::new("sleep");
+    command.arg("10");
+    let mut session = McpSession::spawn(command);
+    let (sender, responses) = mpsc::sync_channel(1);
+    sender
+        .send(Ok("{\"id\":42,\"result\":{}}\n".to_string()))
+        .unwrap();
+    session.responses = responses;
+    let error = session
+        .request_with_timeout(42, "queued", serde_json::json!({}), Duration::ZERO)
+        .expect_err("an already queued response cannot extend the deadline");
+    assert!(error.contains("deadline exceeded"), "{error}");
+    assert_eq!(session.cleanup_result, Some(Ok(())));
 }
 
 /// Parse the JSON body a tool wrote into its first text content block.
@@ -1037,7 +1334,7 @@ fn findings_pagination_closes_the_set_without_duplicates() {
     let mut seen: Vec<String> = Vec::new();
     let mut cursor: Option<String> = None;
     let mut total_seen = 0;
-    loop {
+    for page_number in 0..3 {
         let mut args =
             serde_json::json!({"repo": repo_arg, "run_id": "20260101-130000", "limit": 1});
         if let Some(c) = &cursor {
@@ -1051,7 +1348,14 @@ fn findings_pagination_closes_the_set_without_duplicates() {
             total_seen += 1;
         }
         match page["next_cursor"].as_str() {
-            Some(c) => cursor = Some(c.to_string()),
+            Some(c) => {
+                assert!(
+                    page_number < 2,
+                    "three fixture rows must finish in three pages"
+                );
+                assert_ne!(cursor.as_deref(), Some(c), "cursor must advance");
+                cursor = Some(c.to_string());
+            }
             None => break,
         }
     }

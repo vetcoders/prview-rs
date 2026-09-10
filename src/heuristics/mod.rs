@@ -7,8 +7,8 @@
 mod loctree;
 
 pub use loctree::{
-    CycleInfo, DeadExport, DeadParrot, LOCTREE_WORKER_ROOT_ENV, LoctreeAnalysis, TwinsAnalysis,
-    run_loctree, run_loctree_worker,
+    CycleInfo, DeadExport, DeadParrot, LOCTREE_WORKER_ARG, LOCTREE_WORKER_ROOT_ENV,
+    LoctreeAnalysis, TwinsAnalysis, run_loctree, run_loctree_worker,
 };
 
 use crate::Config;

@@ -65,6 +65,19 @@ tier and does not disable Semgrep. The shared `test_config()` does not opt out o
 Semgrep, so eligibility tests can still exercise default discovery. The test double has POSIX shell and Windows command
 script implementations; runtime evidence must still name the platform exercised.
 
+For resource-constrained validation, run stages sequentially with explicit caps:
+
+```bash
+CARGO_BUILD_JOBS=2 RAYON_NUM_THREADS=2 RUST_TEST_THREADS=1 cargo test --locked -- --test-threads=1
+```
+
+Caps supplement test correctness. Subprocess tests must use small owned fixtures,
+bounded waits, and cleanup on assertion failure or timeout. The MCP contract
+harness bounds each RPC response and cleans its owned process tree before reaping
+the server, so a timed-out deep-review test cannot discard the live ancestry
+needed to find its detached review. A cleanup failure is a failed test, not a
+successful timeout. Pagination over a finite fixture also has a finite page bound.
+
 Process-tree cancellation has platform-specific proof. Unix coverage runs in the
 normal Linux/macOS suites. `.github/workflows/ci.yml` also runs the Windows-only
 PowerShell child+grandchild census on `windows-latest`; cross-compilation alone

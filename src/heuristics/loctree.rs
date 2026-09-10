@@ -18,6 +18,8 @@ use loctree::args::ParsedArgs;
 use loctree::snapshot::{Snapshot, project_cache_dir};
 
 pub const LOCTREE_WORKER_ROOT_ENV: &str = "PRVIEW_INTERNAL_LOCTREE_WORKER_ROOT";
+#[doc(hidden)]
+pub const LOCTREE_WORKER_ARG: &str = "--prview-internal-loctree-worker";
 #[cfg(any(not(test), unix))]
 const LOCTREE_WORKER_TIMEOUT_SECS: u64 = 300;
 
@@ -337,8 +339,12 @@ async fn create_snapshot(
     governor: Option<Arc<crate::governor::ResourceGovernor>>,
 ) -> Result<()> {
     let executable = std::env::current_exe().context("resolve prview loctree worker executable")?;
-    let mut command = tokio::process::Command::new(executable);
-    command.env(LOCTREE_WORKER_ROOT_ENV, root);
+    let command = loctree_worker_command(
+        &executable,
+        root,
+        std::env::var_os(LOCTREE_WORKER_ROOT_ENV).is_some()
+            || std::env::var_os(crate::artifacts::api_delta::RUST_API_WORKER_ENV).is_some(),
+    )?;
     let output = run_worker_command(command, governor).await?;
     if !output.status.success() {
         anyhow::bail!(
@@ -347,6 +353,22 @@ async fn create_snapshot(
         );
     }
     Ok(())
+}
+
+fn loctree_worker_command(
+    executable: &Path,
+    root: &Path,
+    parent_is_worker: bool,
+) -> Result<tokio::process::Command> {
+    anyhow::ensure!(
+        !parent_is_worker,
+        "refusing recursive private Loctree worker spawn"
+    );
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg(LOCTREE_WORKER_ARG)
+        .env(LOCTREE_WORKER_ROOT_ENV, root);
+    Ok(command)
 }
 
 #[cfg(test)]
@@ -392,6 +414,46 @@ async fn run_worker_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_worker_command_is_explicit_and_rejects_recursion() {
+        let command = loctree_worker_command(Path::new("prview"), Path::new("repo"), false)
+            .expect("worker command");
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            [LOCTREE_WORKER_ARG]
+        );
+        assert!(command.as_std().get_envs().any(|(key, value)| {
+            key == LOCTREE_WORKER_ROOT_ENV && value == Some(std::ffi::OsStr::new("repo"))
+        }));
+        let error = loctree_worker_command(Path::new("prview"), Path::new("repo"), true)
+            .expect_err("nested workers must never launch");
+        assert!(error.to_string().contains("recursive"));
+    }
+
+    #[tokio::test]
+    async fn private_worker_libtest_rejects_application_marker_without_running_tests() {
+        let executable = std::env::current_exe().expect("test executable");
+        let mut command = loctree_worker_command(&executable, Path::new("unused"), false)
+            .expect("guarded command");
+        // If the marker is ever removed, this remains a list-only child.
+        command.arg("--list");
+        let output = crate::proc::run_capture_with_timeout(
+            command,
+            std::time::Duration::from_secs(2),
+            "Loctree worker argument rejection test",
+            || anyhow::anyhow!("worker rejection probe timed out"),
+        )
+        .await
+        .expect("bounded rejection probe");
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .to_lowercase()
+                .contains("unrecognized option")
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("running "));
+    }
 
     #[tokio::test]
     async fn load_or_create_snapshot_rescans_when_head_moves() {

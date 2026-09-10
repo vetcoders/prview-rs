@@ -62,19 +62,19 @@ fn display_error(err: &anyhow::Error) {
 }
 
 async fn run() -> Result<()> {
-    // Private same-binary worker protocol. It must be selected before public
-    // CLI parsing so no user-facing flag or subcommand can activate it.
-    if std::env::var_os("PRVIEW_INTERNAL_RUST_API_WORKER").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        return run_private_rust_api_worker();
-    }
-
-    // Loctree's library scan is synchronous and cannot be cooperatively
-    // cancelled once entered. The parent review launches this private mode as
-    // a governed child process so Ctrl-C can terminate the scan itself.
-    if let Some(root) = std::env::var_os(prview::heuristics::LOCTREE_WORKER_ROOT_ENV) {
-        return prview::heuristics::run_loctree_worker(Path::new(&root));
+    // Dispatch before the public CLI, but only with the explicit application
+    // argument and its matching environment. Environment-only activation must
+    // never turn an ordinary invocation into a worker or a recursive review.
+    match private_worker_mode(
+        &std::env::args_os().skip(1).collect::<Vec<_>>(),
+        std::env::var_os(prview::artifacts::api_delta::RUST_API_WORKER_ENV).as_deref(),
+        std::env::var_os(prview::heuristics::LOCTREE_WORKER_ROOT_ENV).as_deref(),
+    )? {
+        Some(PrivateWorker::RustApi) => return run_private_rust_api_worker(),
+        Some(PrivateWorker::Loctree(root)) => {
+            return prview::heuristics::run_loctree_worker(&root);
+        }
+        None => {}
     }
 
     let cli = Cli::parse();
@@ -202,6 +202,44 @@ async fn run() -> Result<()> {
     }
 
     std::process::exit(exit_code);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PrivateWorker {
+    RustApi,
+    Loctree(PathBuf),
+}
+
+fn private_worker_mode(
+    args: &[std::ffi::OsString],
+    rust_api_env: Option<&std::ffi::OsStr>,
+    loctree_root: Option<&std::ffi::OsStr>,
+) -> Result<Option<PrivateWorker>> {
+    use std::ffi::OsStr;
+
+    if let [arg] = args {
+        if arg == OsStr::new(prview::artifacts::api_delta::RUST_API_WORKER_ARG)
+            && rust_api_env == Some(OsStr::new("1"))
+            && loctree_root.is_none()
+        {
+            return Ok(Some(PrivateWorker::RustApi));
+        }
+        if arg == OsStr::new(prview::heuristics::LOCTREE_WORKER_ARG)
+            && rust_api_env.is_none()
+            && let Some(root) = loctree_root.filter(|root| !root.is_empty())
+        {
+            return Ok(Some(PrivateWorker::Loctree(PathBuf::from(root))));
+        }
+    }
+    anyhow::ensure!(
+        rust_api_env.is_none()
+            && loctree_root.is_none()
+            && !args
+                .iter()
+                .any(|arg| arg.to_string_lossy().starts_with("--prview-internal-")),
+        "invalid private worker invocation: exactly one matching argument and worker environment are required"
+    );
+    Ok(None)
 }
 
 #[derive(serde::Deserialize)]
@@ -773,5 +811,60 @@ async fn run_mcp_command(args: &McpArgs) -> Result<()> {
         prview::mcp::probe(args.json).await
     } else {
         prview::mcp::serve().await
+    }
+}
+
+#[cfg(test)]
+mod private_worker_tests {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn private_worker_dispatch_requires_matching_argument_and_environment() {
+        let rust_arg = OsString::from(prview::artifacts::api_delta::RUST_API_WORKER_ARG);
+        let loctree_arg = OsString::from(prview::heuristics::LOCTREE_WORKER_ARG);
+        assert_eq!(
+            private_worker_mode(&[rust_arg], Some(OsStr::new("1")), None).unwrap(),
+            Some(PrivateWorker::RustApi)
+        );
+        assert_eq!(
+            private_worker_mode(&[loctree_arg], None, Some(OsStr::new("repo"))).unwrap(),
+            Some(PrivateWorker::Loctree(PathBuf::from("repo")))
+        );
+        assert_eq!(
+            private_worker_mode(&["--help".into()], None, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn private_worker_dispatch_rejects_partial_mixed_and_extra_activation() {
+        let rust_arg = OsString::from(prview::artifacts::api_delta::RUST_API_WORKER_ARG);
+        let loctree_arg = OsString::from(prview::heuristics::LOCTREE_WORKER_ARG);
+        let cases = [
+            (vec![], Some(OsStr::new("1")), None),
+            (vec![], None, Some(OsStr::new("repo"))),
+            (vec![rust_arg.clone()], None, None),
+            (vec![loctree_arg.clone()], None, None),
+            (vec![rust_arg.clone()], Some(OsStr::new("0")), None),
+            (vec![loctree_arg.clone()], None, Some(OsStr::new(""))),
+            (
+                vec![rust_arg.clone()],
+                Some(OsStr::new("1")),
+                Some(OsStr::new("repo")),
+            ),
+            (
+                vec![loctree_arg],
+                Some(OsStr::new("1")),
+                Some(OsStr::new("repo")),
+            ),
+            (vec![rust_arg, "--help".into()], Some(OsStr::new("1")), None),
+        ];
+        for (args, rust_env, loctree_env) in cases {
+            assert!(
+                private_worker_mode(&args, rust_env, loctree_env).is_err(),
+                "{args:?}"
+            );
+        }
     }
 }

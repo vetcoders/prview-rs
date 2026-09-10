@@ -1573,6 +1573,11 @@ immutable manifest or ZIP. If the bounded unwind stalls, the parent terminates
 every still-owned group before killing and reaping the direct review root;
 tracker Drop repeats that cleanup. Confirmed cleanup unlinks the sidecar;
 unconfirmed containment retains it and is surfaced in the MCP error contract.
+When the native identity lookup returns `ESRCH` before the direct child is
+waitable, registration resamples for at most 100 ms. Each retry still requires
+a captured native identity or a positive non-reaping exit observation. Other
+identity errors, wait-status errors (including `ECHILD`), and an unresolved
+deadline abort fail-closed; a missing PID alone never proves safe completion.
 Windows keeps native recursive `taskkill /T` and needs no mirror.
 
 **`--watch` ends on the first interrupt.** One `App`, and therefore one governor,
@@ -2258,6 +2263,18 @@ The fast remote-only standard preset emits a typed, exact-revision unknown and
 does not launch the engine. Local standard, deep, and CI runs launch one private
 same-binary worker for all unique base/target pairs under one 30-second total
 deadline. The governed process group inherits Ctrl-C and cleanup semantics.
+Private API and Loctree workers require an application-only argument together
+with their matching environment request. Environment variables alone never
+select worker execution. Parent launchers always pass the argument and refuse
+nested worker launches. This matters when the library runs inside a test harness
+or another executable: `current_exe()` identifies that host, not necessarily
+PrView. Libtest rejects the private option before running any tests, rather than
+re-entering the complete suite. Functional unit fixtures use the in-process
+comparison/scan path; separate process-boundary tests append `--list` as an
+independent safeguard and verify immediate argument rejection. The MCP probe
+likewise uses the explicit `mcp --stdio` server invocation,
+so `mcp` cannot become a libtest filter. Review subprocesses already require
+application-only output-directory arguments.
 Timeout, nonzero exit, or malformed JSON yields one typed unknown per exact
 comparison instead of an empty scan. Artifact generation records the honest
 `rust-api.fast-preset-unknown` or `rust-api.isolated-worker` stage in
