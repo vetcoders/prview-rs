@@ -55,6 +55,9 @@ fn gh_cmd() -> Command {
 pub struct Config {
     pub repo_root: PathBuf,
     pub target: Option<String>,
+    /// Target captured for this run's diff. Internal runtime state, never a CLI
+    /// or manifest override; cloned check configurations retain this identity.
+    pub pinned_target: Option<crate::git::ResolvedRef>,
     pub bases: Vec<String>,
     pub profile: DetectedProfile,
 
@@ -694,6 +697,7 @@ impl Config {
         Self {
             repo_root,
             target: None,
+            pinned_target: None,
             bases: vec![],
             profile,
             execution_mode: ExecutionMode::Standard,

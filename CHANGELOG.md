@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Check configurations pin the target resolved for the diff in headless, update
+  and TUI runs. Moved or deleted branch/PR refs cannot redirect shared checks to
+  the operator checkout; unavailable pinned commits fail planning explicitly.
+
 - Final snapshot observations use the same immutable creation SHA as check
   boundaries. A snapshot/diff target mismatch aborts publication before output
   allocation, preventing a pack from combining two reviewed commits.

@@ -586,7 +586,8 @@ pub async fn run_analysis(
             None
         };
 
-        let config = app.config.clone();
+        let mut config = app.config.clone();
+        config.pinned_target = Some(target.clone());
         // app (with git2::Repository) is dropped here
         Ok((
             config,

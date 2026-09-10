@@ -234,6 +234,15 @@ impl Repository {
 
     /// Resolve target branch/ref
     pub fn resolve_target(&self, config: &Config) -> Result<ResolvedRef> {
+        if let Some(target) = &config.pinned_target {
+            let commit_id = self
+                .resolve_ref(&target.commit_id)
+                .context("the pinned review target is unavailable")?;
+            return Ok(ResolvedRef {
+                commit_id,
+                ..target.clone()
+            });
+        }
         let name = config.target.clone().unwrap_or_else(|| {
             self.inner
                 .head()

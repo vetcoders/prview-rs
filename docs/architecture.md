@@ -749,6 +749,16 @@ parses replays with no provenance instead of failing the run.
 
 #### Shared snapshot integrity at check boundaries
 
+Headless and TUI pipelines copy the resolved diff target into the run's
+`Config.pinned_target` before dispatching checks; update-mode clones preserve it.
+It is runtime-only state, not a CLI/manifest setting. `Repository::resolve_target`
+then resolves that commit object, preserving its original display name and remote
+classification, instead of re-reading a moving branch or PR ref. A deleted ref
+does not invalidate an available commit. An unavailable pinned commit or
+repository is a planning error, including runs with no snapshot-backed gates;
+it cannot fall back to the operator checkout. Local targets that still match HEAD
+keep the operator checkout. Each new watch iteration resolves its target anew.
+
 `checks::snapshot_integrity::SnapshotObservation` compares the ledger-owned
 worktree with the immutable commit resolved before worktree creation. The shared
 `execute_live_check` path (headless and TUI) observes before and after every live

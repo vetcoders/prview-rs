@@ -910,10 +910,13 @@ the writer when checks overlap. Results overlapping an observed change are not
 written to cache. These observations are not atomic and do not cover later
 context commands; a change restored between observations can remain undetected.
 
-If a moving target ref causes the snapshot to be created from a different commit
-than the diff, prview reports `shared snapshot target mismatch` and aborts pack
-publication. Rerun the review against a stable target. Changes made inside an
-already created snapshot still follow the integrity rule above.
+Checks use the commit resolved for the diff, even if its branch or PR ref moves
+or is deleted before snapshot creation. If that commit is unavailable, planning
+fails instead of scanning the operator checkout. A new watch iteration resolves
+the target again. As a final consistency check, `shared snapshot target mismatch`
+aborts publication if the snapshot creation SHA differs from the diff target.
+Changes made inside an already created snapshot still follow the integrity rule
+above.
 
 #### How to read an artifact pack
 

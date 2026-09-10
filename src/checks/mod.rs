@@ -1744,7 +1744,10 @@ fn share_target_snapshot_with(
     let wanted_by_a_gate = runnable_checks
         .iter()
         .any(|c| uses_shared_scan_dir(c.name()));
-    if !wanted_by_a_gate && off_head_target_commit(config).is_none() {
+    if !wanted_by_a_gate
+        && config.pinned_target.is_none()
+        && off_head_target_commit(config).is_none()
+    {
         return Ok(());
     }
     let plan = planner(config).context("failed to materialize shared review snapshot")?;
@@ -2077,7 +2080,10 @@ pub fn plan_check_run(config: &Config) -> Result<CheckPlan> {
     let repo_root = config.repo_root.clone();
     let repo = match crate::git::Repository::open(&repo_root) {
         Ok(repo) => repo,
-        Err(_) => {
+        Err(error) => {
+            if config.pinned_target.is_some() {
+                return Err(error.context("cannot open repository for pinned review target"));
+            }
             return Ok(CheckPlan {
                 scan_dir: repo_root,
                 _snapshot: None,
@@ -2085,11 +2091,20 @@ pub fn plan_check_run(config: &Config) -> Result<CheckPlan> {
         }
     };
 
-    let (Ok(target), Ok(head)) = (repo.resolve_target(config), repo.head_commit_id()) else {
-        return Ok(CheckPlan {
-            scan_dir: repo_root,
-            _snapshot: None,
-        });
+    let resolution = repo
+        .resolve_target(config)
+        .and_then(|target| repo.head_commit_id().map(|head| (target, head)));
+    let (target, head) = match resolution {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            if config.pinned_target.is_some() {
+                return Err(error.context("cannot plan checks for pinned review target"));
+            }
+            return Ok(CheckPlan {
+                scan_dir: repo_root,
+                _snapshot: None,
+            });
+        }
     };
 
     if head == target.commit_id {
@@ -2261,6 +2276,115 @@ mod tests {
         run_git(&["checkout", "-q", "main"]);
 
         (tmp, target)
+    }
+
+    #[test]
+    fn pinned_target_survives_a_ref_moved_to_operator_head() {
+        assert_pinned_target_survives_ref_change(false);
+    }
+
+    #[test]
+    fn pinned_target_survives_a_deleted_ref() {
+        assert_pinned_target_survives_ref_change(true);
+    }
+
+    fn assert_pinned_target_survives_ref_change(delete: bool) {
+        for mode in ["local", "remote", "pr"] {
+            let (repo, target) = repo_with_off_head_target();
+            let mut config = test_config();
+            config.repo_root = repo.path().to_path_buf();
+            config.target = Some("feature".to_owned());
+            config.remote_mode = mode == "remote";
+            config.pr_number = (mode == "pr").then_some(42);
+            let owner = git2::Repository::open(repo.path()).unwrap();
+            let reference = match mode {
+                "remote" => "refs/remotes/origin/feature",
+                "pr" => "refs/remotes/origin/pr/42",
+                _ => "refs/heads/feature",
+            };
+            owner
+                .reference(
+                    reference,
+                    git2::Oid::from_str(&target).unwrap(),
+                    true,
+                    "fixture",
+                )
+                .unwrap();
+            config.pinned_target = Some(
+                crate::git::Repository::open(repo.path())
+                    .unwrap()
+                    .resolve_target(&config)
+                    .unwrap(),
+            );
+            let mut branch = owner.find_reference(reference).unwrap();
+            if delete {
+                branch.delete().unwrap();
+                // PR fallback must not rescue the deleted PR ref via feature.
+                if mode == "pr" {
+                    owner
+                        .find_reference("refs/heads/feature")
+                        .unwrap()
+                        .delete()
+                        .unwrap();
+                }
+            } else {
+                branch
+                    .set_target(owner.head().unwrap().target().unwrap(), "fixture move")
+                    .unwrap();
+            }
+            let ledger = TaskLedger::new();
+            share_target_snapshot(&mut config, &[], &ledger).unwrap();
+            let scan = ledger
+                .scan_dir()
+                .expect("captured off-HEAD target still needs a snapshot");
+            assert_ne!(scan, config.repo_root, "{mode}, delete={delete}");
+            assert_eq!(
+                std::fs::read_to_string(scan.join("tracked.txt")).unwrap(),
+                "two\n"
+            );
+            assert_eq!(
+                ledger
+                    .current_snapshot_observation()
+                    .unwrap()
+                    .expected_target_sha,
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_target_unavailable_never_falls_back_to_operator_checkout() {
+        let (repo, _) = repo_with_off_head_target();
+        let mut config = test_config();
+        config.repo_root = repo.path().to_path_buf();
+        config.pinned_target = Some(crate::git::ResolvedRef {
+            name: "missing".to_owned(),
+            commit_id: "f".repeat(40),
+            is_remote: true,
+        });
+        assert!(plan_check_run(&config).is_err());
+        let ledger = TaskLedger::new();
+        assert!(share_target_snapshot(&mut config, &[], &ledger).is_err());
+        assert!(config.scan_dir_override.is_none());
+        assert!(ledger.scan_dir().is_none());
+    }
+
+    #[test]
+    fn pinned_local_target_keeps_operator_checkout() {
+        let (repo, _) = repo_with_off_head_target();
+        let mut config = test_config();
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some("main".to_owned());
+        config.pinned_target = Some(
+            crate::git::Repository::open(repo.path())
+                .unwrap()
+                .resolve_target(&config)
+                .unwrap(),
+        );
+        let ledger = TaskLedger::new();
+        share_target_snapshot(&mut config, &[], &ledger).unwrap();
+        assert!(ledger.scan_dir().is_none());
+        assert_eq!(config.scan_dir_override.as_ref(), Some(&config.repo_root));
     }
 
     /// PRV-CONTEXT-SNAPSHOT-PROVENANCE, half one: the shared snapshot used to be

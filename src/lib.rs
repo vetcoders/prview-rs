@@ -203,10 +203,12 @@ impl App {
         // resolved. It also OWNS the run's shared target snapshot, so it must
         // outlive artifact generation (step 7), which reads that snapshot.
         let ledger = ledger::TaskLedger::new();
+        let mut check_config = self.config.clone();
+        check_config.pinned_target = Some(target.clone());
         let (check_results, skipped_checks) = if self.config.update_mode {
             // In update mode, skip heavy checks UNLESS user explicitly forced them
             // via --with-tests or --with-security (respect user intent over preset)
-            let mut update_config = self.config.clone();
+            let mut update_config = check_config.clone();
             let any_skipped = !self.config.run_tests || !self.config.run_security;
             if !self.config.run_tests {
                 // Only disable if not already force-enabled by --with-tests
@@ -221,7 +223,7 @@ impl App {
             }
             checks::run_all(&update_config, &ledger, &self.governor).await?
         } else {
-            checks::run_all(&self.config, &ledger, &self.governor).await?
+            checks::run_all(&check_config, &ledger, &self.governor).await?
         };
         // A cancel that arrived while nothing was running — a run whose gates all
         // replayed from the cache never builds the dispatcher's `select!` loop at

@@ -799,7 +799,10 @@ an observed change. Boundary check names do not identify the writer. Changes
 restored between observations are not guaranteed to be detected. Results that
 overlap non-clean observations are not written to cache; raw results are preserved.
 
-Every observation uses the snapshot's immutable creation SHA. If that SHA differs
+Checks pin the commit resolved for the diff before dispatch; moving or deleting
+the configured ref cannot redirect snapshot planning to the operator checkout.
+An unavailable pinned commit is a planning error, not permission to publish a
+local-tree pack. Every observation uses the snapshot's immutable creation SHA. If that SHA differs
 from the resolved target used for the diff, artifact generation fails before
 allocating the output directory. No gate or successful pack is published for
 mixed review identities; rerun against a stable target. A later commit made
