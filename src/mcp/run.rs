@@ -1106,15 +1106,20 @@ mod tests {
         let signal = PathBuf::from(signal);
         #[cfg(unix)]
         if let Some(pidfile) = std::env::var_os(REAPER_GRANDCHILD_PID_ENV) {
+            // File existence is the parent's readiness barrier. Publish only
+            // after the shell has closed the complete PID record.
+            let pending_pidfile = PathBuf::from(&pidfile).with_extension("pending");
             let status = std::process::Command::new("sh")
                 .args([
                     "-c",
                     "sleep 30 & echo $! > \"$PRVIEW_MCP_REAPER_TEST_GRANDCHILD_PID\"",
                 ])
-                .env(REAPER_GRANDCHILD_PID_ENV, &pidfile)
+                .env(REAPER_GRANDCHILD_PID_ENV, &pending_pidfile)
                 .status()
                 .expect("spawn background-grandchild fixture");
             assert!(status.success());
+            std::fs::rename(&pending_pidfile, &pidfile)
+                .expect("publish complete grandchild PID record");
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !signal.exists() && std::time::Instant::now() < deadline {

@@ -28,6 +28,11 @@ make precommit
 make check
 ```
 
+Process fixtures that use PID-file existence as a readiness barrier must write
+the complete record to a sibling temporary file, close it, and rename it into
+place. Creating the final path before writing its contents lets the parent
+observe an empty record. The detached MCP reaper fixture follows this protocol.
+
 ## Making changes
 
 This repo is trunk-based on `main`.
