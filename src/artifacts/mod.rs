@@ -553,16 +553,23 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         .scan_dir()
         .unwrap_or_else(|| config.repo_root.clone());
     // Freeze this run-wide observation before context commands can write more files.
-    let snapshot_integrity = ledger.scan_dir().map(|snapshot| {
-        signal::SnapshotIntegrity::from_observations(
-            crate::checks::snapshot_integrity::SnapshotObservation::observe(
-                &snapshot,
-                &config.repo_root,
-                &resolved_target.commit_id,
-            ),
-            ledger.snapshot_observations(),
-        )
-    });
+    let snapshot_integrity = ledger
+        .current_snapshot_observation()
+        .map(|observation| {
+            // Re-resolving a moving ref before snapshot creation must not combine
+            // checks of one commit with a diff and metadata for another commit.
+            anyhow::ensure!(
+                observation.expected_target_sha == resolved_target.commit_id,
+                "shared snapshot target mismatch: reviewed target {}, snapshot created from {}; rerun the review against a stable target",
+                resolved_target.commit_id,
+                observation.expected_target_sha,
+            );
+            Ok(signal::SnapshotIntegrity::from_observations(
+                observation,
+                ledger.snapshot_observations(),
+            ))
+        })
+        .transpose()?;
     let mut context_artifacts =
         plan_context_artifacts(config, &context_scan_root, diffs, &all_checks, ledger);
 

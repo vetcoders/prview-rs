@@ -101,6 +101,52 @@ fn assert_no_success_surfaces(output_dir: &Path, seam: ArtifactGenerationSeam) {
 }
 
 #[test]
+fn snapshot_final_observation_keeps_creation_target_after_branch_moves() {
+    let (repo, base, target) = init_advanced_base_fixture();
+    let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target).unwrap();
+    let ledger = TaskLedger::new();
+    ledger.set_shared_snapshot(Some(snapshot));
+    run_git_fixture(repo.path(), &["update-ref", "refs/heads/feature", &base]);
+    ledger.observe_snapshot("after-check", Some("fixture"));
+    let final_observation = ledger.current_snapshot_observation().unwrap();
+    assert_eq!(final_observation.expected_target_sha, target);
+    assert_eq!(
+        final_observation.observed_head_sha.as_deref(),
+        Some(target.as_str())
+    );
+    assert!(!final_observation.requires_review());
+    assert!(ledger.snapshot_observations().is_empty());
+}
+
+#[test]
+fn snapshot_target_mismatch_aborts_before_pack_publication() {
+    let publication_home = tempfile::tempdir().unwrap();
+    let _home = crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base, target) = init_advanced_base_fixture();
+    let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target).unwrap();
+    let ledger = TaskLedger::new();
+    ledger.set_shared_snapshot(Some(snapshot));
+    let output = publication_home.path().join("mismatched-pack");
+    let governor = crate::governor::ResourceGovernor::new();
+    let error =
+        generate_fixture_pack_with_ledger(repo.path(), &output, &base, &base, &governor, &ledger)
+            .expect_err("a snapshot of another target must not be published");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("shared snapshot target mismatch"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&base) && message.contains(&target),
+        "{message}"
+    );
+    assert!(
+        !output.exists(),
+        "mismatched identities must fail before output allocation"
+    );
+}
+
+#[test]
 fn snapshot_tracked_changes_are_preserved_as_review_evidence() {
     let publication_home = tempfile::tempdir().unwrap();
     let _home = crate::config::override_test_prview_home(publication_home.path().to_path_buf());

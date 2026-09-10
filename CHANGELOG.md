@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Final snapshot observations use the same immutable creation SHA as check
+  boundaries. A snapshot/diff target mismatch aborts publication before output
+  allocation, preventing a pack from combining two reviewed commits.
+
+- An explicit Semgrep security opt-out is a declared mode skip, requiring review
+  when policy requires the scanner instead of being classified as unknown.
+
 - Shared review snapshots now preserve tracked/index changes against the original
   target as SNAPSHOT_INTEGRITY evidence and require review without rewriting
   passing or failed Cargo results. Committed changes and unknown observations

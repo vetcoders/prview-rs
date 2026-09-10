@@ -224,7 +224,8 @@ Implementations:
   `--baseline-commit <merge-base>` when the git baseline is clean and available,
   while `--security-full` keeps a full-tree scan. Explicit `--skip-security`
   is carried separately from the heavy-security opt-in and disables this check
-  before tool discovery.
+  before tool discovery. The shared `security disabled` mode-skip reason keeps
+  policy evaluation `skipped` and review-required when the scanner is required.
 - `CargoGeigerCheck` - `cargo geiger`
 - `RuffCheck` - `ruff check`
 - `MypyCheck` - `mypy`
@@ -753,7 +754,9 @@ worktree with the immutable commit resolved before worktree creation. The shared
 `execute_live_check` path (headless and TUI) observes before and after every live
 check, including errors. The ledger retains non-clean observations even when a
 later check restores the checkout. Artifact generation adds a final observation
-before context commands run. Comparisons union target-tree→index and
+before context commands run, using the same ledger-owned creation SHA. If that SHA
+differs from the resolved diff target, publication fails before output allocation
+instead of combining two review identities. Comparisons union target-tree→index and
 index→worktree paths: staged changes and test-created commits remain visible.
 Newly untracked files are excluded; tracked lockfile changes, deletions and type
 changes remain. A changed HEAD or unreadable/foreign/raced observation cannot

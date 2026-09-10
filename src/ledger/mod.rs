@@ -323,8 +323,10 @@ impl TaskLedger {
             .unwrap_or_else(|e| e.into_inner()) = snapshot;
     }
 
-    /// Observe outside the ledger locks; retain only non-clean boundaries.
-    pub(crate) fn observe_snapshot(&self, phase: &'static str, check_name: Option<&str>) {
+    /// Observe against the snapshot's immutable creation target, outside locks.
+    pub(crate) fn current_snapshot_observation(
+        &self,
+    ) -> Option<crate::checks::snapshot_integrity::SnapshotObservation> {
         let source = self
             .shared_snapshot
             .lock()
@@ -337,10 +339,14 @@ impl TaskLedger {
                     snapshot.original_target_sha.clone(),
                 )
             });
-        if let Some((path, root, target)) = source {
-            let mut observation = crate::checks::snapshot_integrity::SnapshotObservation::observe(
-                &path, &root, &target,
-            );
+        source.map(|(path, root, target)| {
+            crate::checks::snapshot_integrity::SnapshotObservation::observe(&path, &root, &target)
+        })
+    }
+
+    /// Observe outside the ledger locks; retain only non-clean boundaries.
+    pub(crate) fn observe_snapshot(&self, phase: &'static str, check_name: Option<&str>) {
+        if let Some(mut observation) = self.current_snapshot_observation() {
             observation.phase = phase;
             observation.check_name = check_name.map(str::to_owned);
             if observation.requires_review() {

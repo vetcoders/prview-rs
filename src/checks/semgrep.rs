@@ -25,7 +25,8 @@ impl Check for SemgrepCheck {
 
     fn check_eligibility(&self, config: &Config) -> CheckEligibility {
         if config.skip_security {
-            return CheckEligibility::Skip("security explicitly disabled".to_string());
+            // Use the shared declared-mode reason recognized by the policy engine.
+            return CheckEligibility::Skip("security disabled".to_string());
         }
         if which::which("semgrep").is_ok() {
             CheckEligibility::Run
@@ -793,9 +794,46 @@ mod tests {
             config.run_security = heavy_opt_in;
             assert!(matches!(
                 SemgrepCheck.check_eligibility(&config),
-                CheckEligibility::Skip(reason) if reason == "security explicitly disabled"
+                CheckEligibility::Skip(reason) if reason == "security disabled"
             ));
         }
+    }
+
+    #[test]
+    fn explicit_security_opt_out_is_a_declared_skip_for_block_policy() {
+        use crate::policy::engine::{
+            AnalysisStatus, CheckExecutionState, MergeRecommendation, PolicyConclusion,
+            PolicyEngine, ToolOutcome,
+        };
+
+        let mut config = test_config();
+        config.skip_security = true;
+        config.policy.checks.insert(
+            "semgrep_scan".to_string(),
+            crate::policy::PolicySeverity::Block,
+        );
+        let CheckEligibility::Skip(reason) = SemgrepCheck.check_eligibility(&config) else {
+            panic!("the explicit opt-out must skip the scanner");
+        };
+        let skipped = super::super::SkippedCheck {
+            id: "semgrep_scan".to_string(),
+            name: SemgrepCheck.name().to_string(),
+            reason,
+        };
+        let engine = PolicyEngine::new(&config);
+        let evaluation = engine.evaluate_skip(&skipped);
+        assert_eq!(evaluation.execution_state, CheckExecutionState::Skipped);
+        assert_eq!(evaluation.outcome, ToolOutcome::Skipped);
+        assert_eq!(evaluation.conclusion, PolicyConclusion::Advisory);
+        assert_eq!(evaluation.confidence_impact, AnalysisStatus::Incomplete);
+        assert_eq!(evaluation.merge_impact, MergeRecommendation::ReviewRequired);
+
+        let unavailable = engine.evaluate_skip(&super::super::SkippedCheck {
+            reason: "semgrep not available".to_string(),
+            ..skipped
+        });
+        assert_eq!(unavailable.conclusion, PolicyConclusion::Blocked);
+        assert_eq!(unavailable.merge_impact, MergeRecommendation::Block);
     }
 
     #[test]

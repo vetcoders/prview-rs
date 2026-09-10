@@ -83,6 +83,12 @@ Every element of `checks` is one policy evaluation record:
 | `evidence` | string | `20_quality/<artifact_id>.result.json` for an executed check; otherwise the reason text or `"skipped — no artifact generated"` |
 | `log` | string \| null | `20_quality/<artifact_id>.log` for an executed check, else `null` |
 
+Semgrep disabled by `--skip-security` uses the shared `security disabled` mode
+reason, with `execution_state: skipped` and `outcome: skipped`. At `block`
+severity its policy conclusion is `advisory`, confidence is `incomplete`, and
+merge impact is `review_required`; `blocking` is false. An unavailable required
+scanner without an explicit opt-out retains its blocking policy outcome.
+
 Skipped or unavailable checks carry no executed `CheckResult`, so `duration_secs`
 is `0.0`, `cached` is `null`, `log` is `null`, and `evidence` degrades to a
 non-empty placeholder. These are contract-valid placeholders, never `null`
@@ -787,8 +793,14 @@ uses the existing decision fields; no gate schema migration is introduced.
 Clean shared snapshots and local runs add no signal. Newly untracked files
 (including a generated Cargo.lock) are excluded; modifications to tracked files
 (including a tracked Cargo.lock) and changes committed inside the snapshot are
-not. The evidence retains non-clean observations before/after live checks plus
+included. The evidence retains non-clean observations before/after live checks plus
 the final observation before context tools, so a later restoration does not erase
 an observed change. Boundary check names do not identify the writer. Changes
 restored between observations are not guaranteed to be detected. Results that
 overlap non-clean observations are not written to cache; raw results are preserved.
+
+Every observation uses the snapshot's immutable creation SHA. If that SHA differs
+from the resolved target used for the diff, artifact generation fails before
+allocating the output directory. No gate or successful pack is published for
+mixed review identities; rerun against a stable target. A later commit made
+inside the snapshot remains an integrity signal, not a creation-target mismatch.
