@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Fast Semgrep scans use a 60-second command budget; standard local, deep, CI,
+  and explicit full-security scans retain 300 seconds. Repository rule discovery
+  honors local YAML files and rule directories before selecting `auto`.
+
 - `report.json` schema 3.0 makes `quality.breaking_changes.md_path` nullable.
   Missing Markdown reports no longer advertise a dead link; existing Rust API
   reports remain linked even when they contain no breaking findings.
@@ -37,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `main`.
 
 ### Fixed
+
+- Semgrep engine diagnostics degrade analysis confidence without becoming code
+  warnings. Inline findings survive trailing stderr while preserving rule,
+  severity, message, and source position. Gate Shadow retains JSON, stderr,
+  source identity and exit-code evidence as downloadable CI artifacts.
 
 - Snapshot caveats retain observed HEAD changes after restoration, including
   empty commits with no tracked-path changes. Security option help names the

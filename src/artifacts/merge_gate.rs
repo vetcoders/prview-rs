@@ -1194,6 +1194,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
         .expect("merge gate");
 
