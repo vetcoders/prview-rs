@@ -130,7 +130,7 @@ pub struct CoveragePair {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CoverageSignal {
     /// Associations, including tentative Low matches retained for manual review.
-    /// Only High/Medium associations contribute to covered_count.
+    /// Only distinct sources with High/Medium associations contribute to covered_count.
     pub covered_files: Vec<(String, String, CoverageMatchTier)>, // (source_path, test_path, tier)
     pub uncovered_files: Vec<String>,
     pub total_source_files: usize,
@@ -194,19 +194,25 @@ pub fn compute_coverage_signal(
     let mut covered: Vec<(&FileChange, &FileChange, CoverageMatchTier)> = Vec::new();
     let mut uncovered: Vec<&FileChange> = Vec::new();
 
-    // Filename heuristic, path-mirrored names, and filename keyword overlap.
+    // Retain every strong filename association. If none is available, keep
+    // the existing best weak candidate solely as a manual-review hint.
     for src in &source_files {
-        if let Some((test, tier)) = find_matching_test(src, &test_files) {
-            covered.push((*src, test, tier));
-            if tier == CoverageMatchTier::Low {
-                uncovered.push(*src);
+        let strong: Vec<_> = test_files
+            .iter()
+            .filter_map(|test| find_matching_test(src, &[*test]))
+            .filter(|(_, tier)| *tier == CoverageMatchTier::High)
+            .collect();
+        if strong.is_empty() {
+            if let Some((test, tier)) = find_matching_test(src, &test_files) {
+                covered.push((*src, test, tier));
             }
-        } else {
             uncovered.push(*src);
+        } else {
+            covered.extend(strong.into_iter().map(|(test, tier)| (*src, test, tier)));
         }
     }
 
-    // Strategy 5 (import recovery): import-based matching for still-uncovered files
+    // Import evidence can add another test even after a filename match.
     let mut used_import_recovery = false;
     if repo_root.is_some() || repo.is_some() {
         let target_commit = diffs.first().map(|d| d.target_commit_id.as_str());
@@ -225,22 +231,31 @@ pub fn compute_coverage_signal(
         }
 
         let mut import_recovered: Vec<(&FileChange, &FileChange, CoverageMatchTier)> = Vec::new();
-        for src in &uncovered {
-            if let Some((test, tier)) = find_test_by_import(src, &test_files, &test_contents) {
-                import_recovered.push((*src, test, tier));
+        for src in &source_files {
+            for test in &test_files {
+                if let Some((test, tier)) = find_test_by_import(src, &[*test], &test_contents) {
+                    import_recovered.push((*src, test, tier));
+                }
             }
         }
         if !import_recovered.is_empty() {
-            used_import_recovery = true;
-            for (src, test, tier) in &import_recovered {
-                // Replace the tentative association; never count one source twice.
-                covered.retain(|(candidate, _, _)| candidate.path != src.path);
-                covered.push((*src, *test, *tier));
-            }
             let recovered_paths: HashSet<&str> = import_recovered
                 .iter()
                 .map(|(s, _, _)| s.path.as_str())
                 .collect();
+            covered.retain(|(src, _, tier)| {
+                *tier != CoverageMatchTier::Low || !recovered_paths.contains(src.path.as_str())
+            });
+            let mut known_pairs: HashSet<(&str, &str)> = covered
+                .iter()
+                .map(|(src, test, _)| (src.path.as_str(), test.path.as_str()))
+                .collect();
+            for (src, test, tier) in &import_recovered {
+                if known_pairs.insert((src.path.as_str(), test.path.as_str())) {
+                    used_import_recovery = true;
+                    covered.push((*src, *test, *tier));
+                }
+            }
             uncovered.retain(|s| !recovered_paths.contains(s.path.as_str()));
         }
     }
@@ -304,7 +319,9 @@ pub fn compute_coverage_signal(
     let covered_count = covered
         .iter()
         .filter(|(_, _, tier)| *tier != CoverageMatchTier::Low)
-        .count()
+        .map(|(src, _, _)| src.path.as_str())
+        .collect::<HashSet<_>>()
+        .len()
         + inline_tested_count;
     // 0/0 is "nothing was measured", not "everything is covered". Reporting 100%
     // for an empty scan is the SKIP-AS-ZERO inversion the gate already avoids
@@ -698,7 +715,7 @@ fn coverage_module_key(path: &str) -> Vec<String> {
 
 /// Import recovery: find a test file that imports the source module.
 ///
-/// Called for source files without a strong filename-heuristic match.
+/// Called for each source/test candidate, including already-matched sources.
 /// Reads test file content from disk and greps for import patterns.
 fn find_test_by_import<'a>(
     source: &FileChange,
@@ -835,6 +852,122 @@ mod tests {
     use super::*;
     use crate::git::FileStatus;
     use tempfile::TempDir;
+
+    #[test]
+    fn associations_retain_all_import_backed_test_files_once_per_source() {
+        let files = &[
+            (
+                "tb_core/codex_jsonl.py",
+                "def parse(): return 1\n",
+                "def parse(): return 2\n",
+            ),
+            (
+                "tests/test_completed.py",
+                "",
+                "from tb_core.codex_jsonl import parse\n",
+            ),
+            (
+                "tests/test_realtime.py",
+                "",
+                "from tb_core.codex_jsonl import parse\n",
+            ),
+            (
+                "tests/test_unrelated.py",
+                "",
+                "from tb_core.other import parse\n",
+            ),
+        ];
+        let (_tmp, repo, base, target) = make_test_repo(files);
+        let diff = make_diff_with_ids(
+            base,
+            target,
+            files
+                .iter()
+                .map(|(path, _, _)| mock_file_change(path, FileStatus::Modified, 1, 0))
+                .collect(),
+        );
+        let signal = compute_coverage_signal(&[diff.clone(), diff], None, Some(&repo));
+        assert_eq!(signal.covered_count, 1);
+        assert_eq!(signal.coverage_pct, Some(100));
+        assert_eq!(
+            signal
+                .covered_files
+                .iter()
+                .map(|(_, test, tier)| (test.as_str(), *tier))
+                .collect::<Vec<_>>(),
+            vec![
+                ("tests/test_completed.py", CoverageMatchTier::Medium),
+                ("tests/test_realtime.py", CoverageMatchTier::Medium),
+            ]
+        );
+        assert!(signal.uncovered_files.is_empty());
+    }
+
+    #[test]
+    fn associations_add_imports_after_filename_match_without_duplicate_pairs() {
+        let files = &[
+            (
+                "src/parser.py",
+                "def parse(): return 1\n",
+                "def parse(): return 2\n",
+            ),
+            ("tests/test_parser.py", "", "from src.parser import parse\n"),
+            (
+                "tests/test_alternative.py",
+                "",
+                "from src.parser import parse\n",
+            ),
+        ];
+        let (_tmp, repo, base, target) = make_test_repo(files);
+        let diff = make_diff_with_ids(
+            base,
+            target,
+            files
+                .iter()
+                .map(|(path, _, _)| mock_file_change(path, FileStatus::Modified, 1, 0))
+                .collect(),
+        );
+        let signal = compute_coverage_signal(&[diff], None, Some(&repo));
+        assert_eq!(signal.covered_count, 1);
+        assert_eq!(signal.covered_files.len(), 2);
+        assert_eq!(
+            signal
+                .covered_files
+                .iter()
+                .find(|(_, t, _)| t == "tests/test_parser.py")
+                .unwrap()
+                .2,
+            CoverageMatchTier::High
+        );
+        assert_eq!(
+            signal
+                .covered_files
+                .iter()
+                .find(|(_, t, _)| t == "tests/test_alternative.py")
+                .unwrap()
+                .2,
+            CoverageMatchTier::Medium
+        );
+    }
+
+    #[test]
+    fn associations_retain_multiple_strong_filename_matches_without_inflation() {
+        let diff = mock_diff(vec![
+            mock_file_change("src/parser.ts", FileStatus::Modified, 1, 0),
+            mock_file_change("tests/parser.test.ts", FileStatus::Modified, 1, 0),
+            mock_file_change("tests/parser.spec.ts", FileStatus::Modified, 1, 0),
+        ]);
+        let signal = compute_coverage_signal(&[diff], None, None);
+        assert_eq!(signal.covered_count, 1);
+        assert_eq!(signal.coverage_pct, Some(100));
+        assert_eq!(signal.covered_files.len(), 2);
+        assert!(
+            signal
+                .covered_files
+                .iter()
+                .all(|(_, _, tier)| *tier == CoverageMatchTier::High)
+        );
+    }
 
     #[test]
     fn weak_matches_do_not_count_as_confirmed_test_changes() {

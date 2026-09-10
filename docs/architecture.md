@@ -2753,6 +2753,12 @@ and risk scoring use the same confirmed set as the headline and JSON metrics.
 Import or inline evidence replaces a tentative pair; an earlier weak filename
 candidate cannot hide a later strong match. These are existing heuristic tiers,
 not execution coverage or proof that a test passed.
+All strong filename and import-backed relationships among changed files are
+retained, including additional importing tests after a source already matched.
+A source/test pair appears once with its strongest available evidence, and
+multiple test files still contribute only one matched source. The dashboard
+groups those test links under one source row. Test files outside the diff are
+not enumerated by this signal.
 
 **Unmeasured is not 100%.** `coverage_pct` / `CoverageDelta::pct` are
 `Option<u32>` and are `None` whenever no changed source file was evaluated

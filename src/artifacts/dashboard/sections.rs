@@ -2084,23 +2084,44 @@ pub(super) fn build_coverage_section(ctx: &DashboardContext) -> String {
     }
 
     let mut covered_html = String::new();
-    if !cov.covered.is_empty() {
+    let mut tests_by_source = std::collections::BTreeMap::new();
+    for pair in &cov.covered {
+        tests_by_source
+            .entry(pair.src_path.as_str())
+            .or_insert_with(Vec::new)
+            .push(pair);
+    }
+    if !tests_by_source.is_empty() {
         covered_html.push_str(r#"<details open style="margin-top:8px"><summary style="cursor:pointer;color:var(--muted);font-size:13px">"#);
         covered_html.push_str(&i18n_template(
             "message.filesWithMatchingTests",
-            &format!("Files with matching test changes ({})", cov.covered.len()),
-            &[("count", cov.covered.len().to_string())],
+            &format!(
+                "Files with matching test changes ({})",
+                tests_by_source.len()
+            ),
+            &[("count", tests_by_source.len().to_string())],
         ));
         covered_html.push_str(":</summary>");
         covered_html.push_str(r#"<div class="coverage-file-list" style="margin-top:8px">"#);
-        for p in &cov.covered {
+        for pairs in tests_by_source.values() {
+            let source = pairs[0];
+            let tests = pairs
+                .iter()
+                .map(|pair| {
+                    format!(
+                        "{} {}",
+                        escape_html(&pair.test_status.to_string()),
+                        source_evidence_link(&pair.test_path, None)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("<br>");
             let _ = write!(
                 covered_html,
-                r#"<div class="coverage-file"><span>{} {}</span> <span style="color:var(--faint)">&#x2194;</span> <span>{} {}</span></div>"#,
-                escape_html(&p.src_status.to_string()),
-                source_evidence_link(&p.src_path, None),
-                escape_html(&p.test_status.to_string()),
-                source_evidence_link(&p.test_path, None),
+                r#"<div class="coverage-file"><span>{} {}</span> <span style="color:var(--faint)">&#x2194;</span> <span>{}</span></div>"#,
+                escape_html(&source.src_status.to_string()),
+                source_evidence_link(&source.src_path, None),
+                tests,
             );
         }
         covered_html.push_str("</div></details>");

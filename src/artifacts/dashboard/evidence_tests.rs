@@ -98,6 +98,32 @@ fn findings_use_recorded_location_and_general_notes_remain_neutral() {
 }
 
 #[test]
+fn associations_dashboard_groups_test_links_under_one_source() {
+    let mut ctx = super::tests::mock_ctx();
+    ctx.coverage.covered_count = 1;
+    ctx.coverage.total_source = 1;
+    ctx.coverage.covered = ["tests/test_first.py", "tests/test_second.py"]
+        .into_iter()
+        .map(|test| super::super::signal::CoveragePair {
+            src_status: 'M',
+            src_path: "src/parser.py".into(),
+            test_status: 'M',
+            test_path: test.into(),
+            tier: super::super::signal::CoverageMatchTier::Medium,
+        })
+        .collect();
+    let html = build_coverage_section(&ctx);
+    assert!(html.contains("Files with matching test changes (1)"));
+    assert_eq!(
+        html.matches("data-source-path=\"src/parser.py\"").count(),
+        1
+    );
+    assert!(html.contains("data-source-path=\"tests/test_first.py\""));
+    assert!(html.contains("data-source-path=\"tests/test_second.py\""));
+    assert!(html.contains(">1/1</span>"));
+}
+
+#[test]
 fn test_matching_is_a_file_ratio_not_executed_code_coverage() {
     let mut ctx = super::tests::mock_ctx();
     ctx.coverage.covered_count = 1;
