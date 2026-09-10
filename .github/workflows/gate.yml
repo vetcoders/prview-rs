@@ -32,32 +32,53 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
+      - name: Test gate evidence contract
+        run: python3 -m unittest discover -s tools/tests -p 'test_gate_shadow_receipt.py'
       - name: Build prview from source
-        run: cargo build --locked --release
+        shell: bash
+        run: PRVIEW_SOURCE_SHA="$(git rev-parse HEAD)" cargo build --locked --release
       - name: Run prview gate
         id: gate
         shell: bash
         run: |
           runner_temp="${RUNNER_TEMP:-/tmp}"
           json_path="${runner_temp}/prview-gate.json"
+          stderr_path="${runner_temp}/prview-gate.stderr.log"
+          receipt_path="${runner_temp}/prview-gate-receipt.json"
+          source_sha="$(./target/release/prview --build-source-sha)"
+          checkout_sha="$(git rev-parse HEAD)"
 
           set +e
-          ./target/release/prview gate --json > "$json_path"
+          ./target/release/prview gate --json > "$json_path" 2> "$stderr_path"
           status=$?
           set -e
+          cat "$stderr_path" >&2
 
           echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
           echo "json_path=${json_path}" >> "$GITHUB_OUTPUT"
 
           verdict=""
+          json_exit_code=""
           enforcement_disposition=""
           output_dir=""
           sarif_path=""
           if command -v jq >/dev/null 2>&1 && [ -s "$json_path" ]; then
             verdict="$(jq -r '.verdict // empty' "$json_path" 2>/dev/null || true)"
+            json_exit_code="$(jq -r '.exit_code | select(type == "number")' "$json_path" 2>/dev/null || true)"
             enforcement_disposition="$(jq -r '.enforcement_disposition // empty' "$json_path" 2>/dev/null || true)"
             output_dir="$(jq -r '.output_dir // empty' "$json_path" 2>/dev/null || true)"
           fi
+
+          jq -n --arg source_sha "$source_sha" --arg checkout_sha "$checkout_sha" \
+            --argjson process_exit_code "$status" --argjson json_exit_code "${json_exit_code:-null}" \
+            '{schema_version: "gate-shadow-receipt/v1", build_source_sha: $source_sha,
+              checkout_sha: $checkout_sha, process_exit_code: $process_exit_code,
+              json_exit_code: $json_exit_code,
+              source_matches_checkout: ($source_sha == $checkout_sha),
+              exit_matches_json: (if $json_exit_code == null then null
+                                  else $process_exit_code == $json_exit_code end)}' > "$receipt_path"
+          source_matches_checkout="$(jq -r '.source_matches_checkout' "$receipt_path")"
+          exit_matches_json="$(jq -r 'if .exit_matches_json == null then "unavailable" else .exit_matches_json end' "$receipt_path")"
 
           if [ -n "$output_dir" ] && [ -f "${output_dir}/30_context/INLINE_FINDINGS.sarif" ]; then
             sarif_path="${output_dir}/30_context/INLINE_FINDINGS.sarif"
@@ -74,17 +95,25 @@ jobs:
             1) result="BLOCK" ;;
             2) result="strict review-required or warning-clean rejection" ;;
             3) result="internal gate execution error" ;;
+            130) result="operator cancellation; no verdict" ;;
             *) result="unexpected exit code" ;;
           esac
 
           {
             echo "## prview gate shadow"
             echo
+            echo "Shadow success is not a PASS verdict. This job records the gate result without enforcing it."
+            echo
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Mode | shadow / non-strict |"
             echo "| Decision source | exit code only |"
             echo "| Exit code | \`${status}\` |"
+            echo "| JSON exit code | \`${json_exit_code:-unavailable}\` |"
+            echo "| Exit matches JSON | \`${exit_matches_json}\` |"
+            echo "| Build source SHA | \`${source_sha}\` |"
+            echo "| Checkout SHA | \`${checkout_sha}\` |"
+            echo "| Source matches checkout | \`${source_matches_checkout}\` |"
             echo "| Result | ${result} |"
             if [ -n "$verdict" ]; then
               echo "| JSON verdict | \`${verdict}\` |"
@@ -100,6 +129,17 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           exit 0
+      - name: Upload gate evidence
+        if: ${{ always() && steps.gate.outputs.json_path != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: prview-gate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/prview-gate.json
+            ${{ runner.temp }}/prview-gate.stderr.log
+            ${{ runner.temp }}/prview-gate-receipt.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Stage constrained SARIF artifact
         if: ${{ steps.gate.outputs.sarif_path != '' }}
         env:

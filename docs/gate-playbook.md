@@ -101,6 +101,36 @@ Measured baselines from the initial gate profile:
 Treat those as starting budgets. If a repo is consistently slower, tune the
 policy or Semgrep scope before moving from Shadow to Warn.
 
+### Gate Shadow evidence in this repository
+
+The `gate.yml` workflow remains advisory: a successful job does not prove a
+`PASS` verdict. Its build embeds the exact checkout SHA through
+`PRVIEW_SOURCE_SHA`. The gate step records its actual process exit code and
+reads the SHA back from that binary with `--build-source-sha`.
+
+Every completed gate invocation uploads `prview-gate-evidence-<run>-<attempt>`
+for seven days, independently of whether SARIF exists. It contains the unchanged
+`prview-gate.json` stdout, `prview-gate.stderr.log`, and
+`prview-gate-receipt.json`. The receipt records checkout/build SHAs and
+process/JSON exit codes, with separate equality checks. Missing or malformed
+JSON leaves the JSON exit code and its equality check `null`; raw output and
+the actual process exit remain available, including execution errors and
+cancellation observed by the wrapper. A runner termination before the wrapper
+can finish cannot produce a complete receipt.
+
+The job summary displays the verdict and disposition when readable, both SHAs,
+both exit codes, and their equality checks. These checks compare evidence;
+they do not re-evaluate the gate or turn Shadow into a required check.
+The workflow's contract test runs its actual Bash step against controlled
+process outputs, including nonzero exits, malformed JSON, and mismatched
+source/exit evidence:
+
+```bash
+python3 -m unittest discover -s tools/tests -p 'test_gate_shadow_receipt.py'
+```
+
+The test requires Bash, Git, jq, and Python 3, as provided by the Linux job.
+
 ## Repository-local hook
 
 This repo ships a raw pre-push hook installer:
