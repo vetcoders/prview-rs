@@ -2807,18 +2807,38 @@ Supported manifests:
 - `pyproject.toml` — PEP 621 (`[project] dependencies`, `[project.optional-dependencies]`) and
   Poetry (`[tool.poetry.dependencies]`, `[tool.poetry.group.*.dependencies]`)
 
-#### signal/unsafe_audit.rs — new unsafe blocks + SAFETY comment scan
+#### signal/unsafe_audit.rs — unsafe additions and test-only context
 
-Scans diff patches for newly introduced `unsafe` blocks and checks whether each one
-is accompanied by a `// SAFETY:` comment explaining the invariant:
+`generate_unsafe_audit(dir, diffs, repo)` scans added Rust lines for unsafe
+blocks, functions, traits, and impls. `UNSAFE_AUDIT.json` and `.md` are emitted
+only when additions are detected, including additions in test files. This is a
+line heuristic, not an exhaustive Rust safety analysis; literals/comments are
+excluded and macros or unsupported spelling may be missed. A nearby `SAFETY:`
+comment is reported separately and does not establish safety.
 
-- `UnsafeHit` struct — file path, line number, surrounding context, and `has_safety_comment` flag
-- `audit_unsafe(diffs)` — iterates added lines in all patches, identifies `unsafe {` block
-  openings, and checks the preceding lines for a `// SAFETY:` annotation.
-  Produces `UNSAFE_AUDIT.json` only when new unsafe additions are found.
+Each `UnsafeFinding` retains file, line, snippet, and `has_safety_comment`, plus
+`scope`: `test_only` or `production_or_unknown`. The top-level
+`test_only_count` and `production_or_unknown_count` partition the findings.
+Only an all-test-only audit returns a passed check (informational); any
+production or unknown finding keeps WARN. Every finding remains visible.
 
-Rationale: undocumented `unsafe` blocks are a common review gap; surfacing them with
-explicit pass/fail per-block makes reviewer attention tractable.
+Classification reads the regular file at each diff's exact target commit,
+never the operator checkout. Whole-file `syn` spans prove enclosing `cfg`
+conditions requiring `test`: `cfg(test)`, `cfg(all(test, ...))`, and equivalent
+combinations of `all`/`any`/`not`. Other predicates remain unknown, so
+`cfg(any(test, feature = "x"))` cannot remove a warning. Enclosing attributes
+are followed across all `syn` AST nodes carrying attributes, including items,
+fields, enum variants, match arms, bindings, and expressions. Every unsafe token
+on a reported line must lie inside a proven span; mixed scopes on one line
+remain `production_or_unknown`.
+
+File names, `mod tests`, `#[test]`, framework attributes, and `cfg_attr` alone
+are not proof. In particular, `#[test]` can resolve to an imported attribute
+macro that leaves a function available in production; this analyzer does not
+perform macro resolution or expansion. Parse failure, missing/non-regular
+source, files larger than 2 MiB for syntax analysis, or unsupported context
+preserve WARN. Test-only means excluded outside test builds, not evidence that
+the code executes in a test, and does not certify unsafe code as sound.
 
 #### signal/consistency.rs — cross-artifact consistency checker
 

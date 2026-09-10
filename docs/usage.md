@@ -895,3 +895,15 @@ Make sure `tsconfig.json` exists and `pnpm`/`npm` are available.
 ### Cargo check fails
 
 Check that `cargo` is on PATH and `Cargo.toml` is valid.
+
+
+### Unsafe additions in tests
+
+`UNSAFE_AUDIT.json` / `.md` retain every detected unsafe addition, including test
+files, and distinguish `test_only` from `production_or_unknown`. A proven
+`cfg(test)` scope in the reviewed target source is informational; mixed or
+unknown context keeps WARN. JSON exposes both counts. Names such as `tests/`
+or `mod tests`, and `#[test]`/framework macros without a proven `cfg` condition,
+are not sufficient proof. The detector remains a line heuristic, and a passed
+all-test-only check does not certify memory safety or test execution. See the
+[architecture contract](architecture.md#signalunsafe_auditrs--unsafe-additions-and-test-only-context).

@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Unsafe audit retains test-file additions and classifies proven test-only `cfg`
+  scopes from the reviewed target source as informational. Production and unknown
+  contexts still warn; JSON/Markdown preserve all findings and expose both counts.
+  Bare test names and attribute macros do not establish exclusion from production.
+
 - A signal arriving after durable pack publication no longer relabels the
   completed run as exit 130, while an unchanged `--update` remains
   cancellation-sensitive. Crash-journal recovery refuses and quarantines

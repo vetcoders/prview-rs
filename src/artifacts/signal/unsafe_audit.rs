@@ -14,6 +14,8 @@ use std::path::Path;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UnsafeAudit {
     pub findings: Vec<UnsafeFinding>,
+    pub test_only_count: usize,
+    pub production_or_unknown_count: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -22,6 +24,14 @@ pub struct UnsafeFinding {
     pub line: usize,
     pub content: String,
     pub has_safety_comment: bool,
+    pub scope: UnsafeScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsafeScope {
+    TestOnly,
+    ProductionOrUnknown,
 }
 
 pub fn generate_unsafe_audit(
@@ -33,12 +43,28 @@ pub fn generate_unsafe_audit(
 
     for diff in diffs {
         for file in &diff.files {
-            if matches!(classify_review_file(&file.path), ReviewFileCategory::Code)
-                && file.path.ends_with(".rs")
+            if matches!(
+                classify_review_file(&file.path),
+                ReviewFileCategory::Code | ReviewFileCategory::Test
+            ) && file.path.ends_with(".rs")
                 && let Ok(patch) =
                     repo.file_diff(&diff.base_commit_id, &diff.target_commit_id, &file.path)
             {
-                findings.extend(scan_for_unsafe(&file.path, &patch));
+                let mut added = scan_for_unsafe(&file.path, &patch);
+                if !added.is_empty()
+                    && repo
+                        .regular_file_at_commit(&diff.target_commit_id, &file.path)
+                        .unwrap_or(false)
+                    && let Ok(source) = repo.file_at_commit(&diff.target_commit_id, &file.path)
+                {
+                    let test_lines = test_only_unsafe_lines(&source);
+                    for finding in &mut added {
+                        if test_lines.contains(&finding.line) {
+                            finding.scope = UnsafeScope::TestOnly;
+                        }
+                    }
+                }
+                findings.extend(added);
             }
         }
     }
@@ -47,7 +73,16 @@ pub fn generate_unsafe_audit(
         return Ok(None);
     }
 
-    let audit = UnsafeAudit { findings };
+    let test_only_count = findings
+        .iter()
+        .filter(|f| f.scope == UnsafeScope::TestOnly)
+        .count();
+    let production_or_unknown_count = findings.len() - test_only_count;
+    let audit = UnsafeAudit {
+        findings,
+        test_only_count,
+        production_or_unknown_count,
+    };
 
     fs::create_dir_all(dir)?;
     fs::write(
@@ -59,18 +94,244 @@ pub fn generate_unsafe_audit(
     fs::write(dir.join("UNSAFE_AUDIT.md"), md)?;
 
     let msg = format!(
-        "[⚠️ line heuristic] Found {} new `unsafe` block(s)",
-        audit.findings.len()
+        "[line heuristic] {} new unsafe line(s): {} test-only (informational), {} production or unknown (review)",
+        audit.findings.len(),
+        audit.test_only_count,
+        audit.production_or_unknown_count
     );
 
     Ok(Some(CheckResult {
         name: "unsafe_audit".to_string(),
-        status: CheckStatus::Warnings,
+        status: if audit.production_or_unknown_count == 0 {
+            CheckStatus::Passed
+        } else {
+            CheckStatus::Warnings
+        },
         duration: std::time::Duration::ZERO,
         output: msg,
         cached: false,
         provenance: None,
     }))
+}
+
+/// Lines whose every `unsafe` token is enclosed by a proven test-only scope.
+/// Full target-source spans prevent hunk boundaries and same-line mixed scopes
+/// from granting test-only status to production code.
+fn test_only_unsafe_lines(source: &str) -> std::collections::BTreeSet<usize> {
+    use proc_macro2::{TokenStream, TokenTree};
+    use syn::visit::Visit;
+
+    if source.len() > 2 * 1024 * 1024 {
+        return Default::default();
+    }
+    let Ok(file) = syn::parse_file(source) else {
+        return Default::default();
+    };
+    let Ok(tokens) = source.parse::<TokenStream>() else {
+        return Default::default();
+    };
+    let mut scopes = TestScopes::default();
+    scopes.visit_file(&file);
+    let mut lines = std::collections::BTreeMap::new();
+    let mut pending = vec![tokens];
+    while let Some(tokens) = pending.pop() {
+        for token in tokens {
+            match token {
+                TokenTree::Group(group) => pending.push(group.stream()),
+                TokenTree::Ident(ident) if ident == "unsafe" => {
+                    let at = ident.span().start();
+                    let inside = scopes.0.iter().any(|span| {
+                        let start = span.start();
+                        let end = span.end();
+                        (start.line, start.column) <= (at.line, at.column)
+                            && (at.line, at.column) < (end.line, end.column)
+                    });
+                    *lines.entry(at.line).or_insert(true) &= inside;
+                }
+                _ => {}
+            }
+        }
+    }
+    lines
+        .into_iter()
+        .filter_map(|(line, only_test)| only_test.then_some(line))
+        .collect()
+}
+
+#[derive(Default)]
+struct TestScopes(Vec<proc_macro2::Span>);
+
+impl TestScopes {
+    fn record(&mut self, attrs: &[syn::Attribute], span: proc_macro2::Span) {
+        if attrs.iter().any(attribute_requires_test) {
+            self.0.push(span);
+        }
+    }
+}
+
+macro_rules! visit_test_scopes {
+    ($($method:ident: $node:ident),* $(,)?) => {
+        $(fn $method(&mut self, node: &'ast syn::$node) {
+            use syn::spanned::Spanned;
+            self.record(&node.attrs, node.span());
+            syn::visit::$method(self, node);
+        })*
+    };
+}
+
+impl<'ast> syn::visit::Visit<'ast> for TestScopes {
+    visit_test_scopes! {
+        visit_file: File,
+        visit_item_const: ItemConst,
+        visit_item_enum: ItemEnum,
+        visit_item_extern_crate: ItemExternCrate,
+        visit_item_fn: ItemFn,
+        visit_item_foreign_mod: ItemForeignMod,
+        visit_item_impl: ItemImpl,
+        visit_item_macro: ItemMacro,
+        visit_item_mod: ItemMod,
+        visit_item_static: ItemStatic,
+        visit_item_struct: ItemStruct,
+        visit_item_trait: ItemTrait,
+        visit_item_trait_alias: ItemTraitAlias,
+        visit_item_type: ItemType,
+        visit_item_union: ItemUnion,
+        visit_item_use: ItemUse,
+        visit_foreign_item_fn: ForeignItemFn,
+        visit_foreign_item_static: ForeignItemStatic,
+        visit_foreign_item_type: ForeignItemType,
+        visit_foreign_item_macro: ForeignItemMacro,
+        visit_trait_item_const: TraitItemConst,
+        visit_trait_item_fn: TraitItemFn,
+        visit_trait_item_type: TraitItemType,
+        visit_trait_item_macro: TraitItemMacro,
+        visit_impl_item_const: ImplItemConst,
+        visit_impl_item_fn: ImplItemFn,
+        visit_impl_item_type: ImplItemType,
+        visit_impl_item_macro: ImplItemMacro,
+        visit_receiver: Receiver,
+        visit_variadic: Variadic,
+        visit_expr_array: ExprArray,
+        visit_expr_assign: ExprAssign,
+        visit_expr_async: ExprAsync,
+        visit_expr_await: ExprAwait,
+        visit_expr_binary: ExprBinary,
+        visit_expr_block: ExprBlock,
+        visit_expr_break: ExprBreak,
+        visit_expr_call: ExprCall,
+        visit_expr_cast: ExprCast,
+        visit_expr_closure: ExprClosure,
+        visit_expr_const: ExprConst,
+        visit_expr_continue: ExprContinue,
+        visit_expr_field: ExprField,
+        visit_expr_for_loop: ExprForLoop,
+        visit_expr_group: ExprGroup,
+        visit_expr_if: ExprIf,
+        visit_expr_index: ExprIndex,
+        visit_expr_infer: ExprInfer,
+        visit_expr_let: ExprLet,
+        visit_expr_lit: ExprLit,
+        visit_expr_loop: ExprLoop,
+        visit_expr_macro: ExprMacro,
+        visit_expr_match: ExprMatch,
+        visit_expr_method_call: ExprMethodCall,
+        visit_expr_paren: ExprParen,
+        visit_expr_path: ExprPath,
+        visit_expr_range: ExprRange,
+        visit_expr_raw_addr: ExprRawAddr,
+        visit_expr_reference: ExprReference,
+        visit_expr_repeat: ExprRepeat,
+        visit_expr_return: ExprReturn,
+        visit_expr_struct: ExprStruct,
+        visit_expr_try: ExprTry,
+        visit_expr_try_block: ExprTryBlock,
+        visit_expr_tuple: ExprTuple,
+        visit_expr_unary: ExprUnary,
+        visit_expr_unsafe: ExprUnsafe,
+        visit_expr_while: ExprWhile,
+        visit_expr_yield: ExprYield,
+        visit_field_value: FieldValue,
+        visit_arm: Arm,
+        visit_variant: Variant,
+        visit_field: Field,
+        visit_lifetime_param: LifetimeParam,
+        visit_type_param: TypeParam,
+        visit_const_param: ConstParam,
+        visit_pat_ident: PatIdent,
+        visit_pat_or: PatOr,
+        visit_pat_paren: PatParen,
+        visit_pat_reference: PatReference,
+        visit_pat_rest: PatRest,
+        visit_pat_slice: PatSlice,
+        visit_pat_struct: PatStruct,
+        visit_pat_tuple: PatTuple,
+        visit_pat_tuple_struct: PatTupleStruct,
+        visit_pat_type: PatType,
+        visit_pat_wild: PatWild,
+        visit_field_pat: FieldPat,
+        visit_local: Local,
+        visit_stmt_macro: StmtMacro,
+    }
+}
+
+fn attribute_requires_test(attr: &syn::Attribute) -> bool {
+    if !attr.path().is_ident("cfg") {
+        return false;
+    }
+    let Ok(meta) = attr.parse_args::<syn::Meta>() else {
+        return false;
+    };
+    let (active_in_production, mentions_test) = cfg_without_test(&meta, 0);
+    mentions_test && active_in_production == Some(false)
+}
+
+/// Evaluate only the built-in `test` predicate. Other target/feature predicates
+/// are unknown; `all(test, unknown)` is excluded, `any(test, unknown)` is not.
+fn cfg_without_test(meta: &syn::Meta, depth: usize) -> (Option<bool>, bool) {
+    use syn::{Meta, Token, punctuated::Punctuated};
+    if depth > 64 {
+        return (None, false);
+    }
+    if let Meta::Path(path) = meta {
+        return if path.is_ident("test") {
+            (Some(false), true)
+        } else {
+            (None, false)
+        };
+    }
+    let Meta::List(list) = meta else {
+        return (None, false);
+    };
+    let Ok(children) = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated) else {
+        return (None, false);
+    };
+    let values: Vec<_> = children
+        .iter()
+        .map(|meta| cfg_without_test(meta, depth + 1))
+        .collect();
+    let mentions_test = values.iter().any(|(_, test)| *test);
+    let value = if list.path.is_ident("all") {
+        if values.iter().any(|(v, _)| *v == Some(false)) {
+            Some(false)
+        } else if values.iter().all(|(v, _)| *v == Some(true)) {
+            Some(true)
+        } else {
+            None
+        }
+    } else if list.path.is_ident("any") {
+        if values.iter().any(|(v, _)| *v == Some(true)) {
+            Some(true)
+        } else if values.iter().all(|(v, _)| *v == Some(false)) {
+            Some(false)
+        } else {
+            None
+        }
+    } else if list.path.is_ident("not") && values.len() == 1 {
+        values[0].0.map(|v| !v)
+    } else {
+        None
+    };
+    (value, mentions_test)
 }
 
 fn scan_for_unsafe(file_path: &str, patch: &str) -> Vec<UnsafeFinding> {
@@ -135,6 +396,7 @@ fn scan_for_unsafe(file_path: &str, patch: &str) -> Vec<UnsafeFinding> {
                 line: current_line,
                 content: trimmed.chars().take(120).collect(),
                 has_safety_comment,
+                scope: UnsafeScope::ProductionOrUnknown,
             });
         } else if !same_line_safety
             && !clears_credit
@@ -174,16 +436,18 @@ fn format_unsafe_audit(audit: &UnsafeAudit) -> String {
     let _ = writeln!(md, "# Unsafe Audit\n");
     let _ = writeln!(
         md,
-        "> ⚠️ **NEEDS VERIFICATION**: *Generated by a text heuristic (string literals, raw strings and comments are excluded). Safety macros may be missed.* \n"
+        "> **Line heuristic:** string literals, raw strings and comments are excluded. Safety macros may be missed. Test-only classification describes code excluded from non-test builds, not proof that tests execute it. \n"
     );
     let _ = writeln!(
         md,
-        "Detected {} new `unsafe` block(s) in this PR.\n",
-        audit.findings.len()
+        "Detected {} new `unsafe` line(s): {} test-only (informational), {} production or unknown (review).\n",
+        audit.findings.len(),
+        audit.test_only_count,
+        audit.production_or_unknown_count
     );
 
-    let _ = writeln!(md, "| File | Line | Snippet | Safety Comment? |");
-    let _ = writeln!(md, "|------|------|---------|-----------------|");
+    let _ = writeln!(md, "| File | Line | Snippet | Safety Comment? | Scope |");
+    let _ = writeln!(md, "|------|------|---------|-----------------|-------|");
 
     for f in &audit.findings {
         let comment_mark = if f.has_safety_comment {
@@ -193,8 +457,16 @@ fn format_unsafe_audit(audit: &UnsafeAudit) -> String {
         };
         let _ = writeln!(
             md,
-            "| `{}` | `{}` | `{}` | {} |",
-            f.file, f.line, f.content, comment_mark
+            "| `{}` | `{}` | `{}` | {} | {} |",
+            f.file,
+            f.line,
+            f.content,
+            comment_mark,
+            if f.scope == UnsafeScope::TestOnly {
+                "Test-only (info)"
+            } else {
+                "Production or unknown (review)"
+            }
         );
     }
 
@@ -208,6 +480,131 @@ mod tests {
         make_diff_with_ids, make_test_repo, mock_file_change,
     };
     use crate::git::FileStatus;
+
+    #[test]
+    fn proven_test_only_unsafe_is_preserved_without_warning() {
+        let old = "#[cfg(test)]\nmod tests {\n    const _: () = ();\n    const _: () = ();\n    const _: () = ();\n    const _: () = ();\n    const _: () = ();\n    fn example() {\n        let value = 1;\n    }\n}\n";
+        let new = old.replace(
+            "let value = 1;",
+            "let value = unsafe { 1 }; // SAFETY: literal only",
+        );
+        let (tmp, repo, base, target) = make_test_repo(&[("src/lib.rs", old, &new)]);
+        assert!(
+            !repo
+                .file_diff(&base, &target, "src/lib.rs")
+                .unwrap()
+                .contains("cfg(test)")
+        );
+        let diff = make_diff_with_ids(
+            base,
+            target,
+            vec![mock_file_change("src/lib.rs", FileStatus::Modified, 1, 1)],
+        );
+        // The operator's file deliberately contradicts the reviewed revision.
+        fs::write(
+            tmp.path().join("src/lib.rs"),
+            "fn production() { unsafe { 1 }; }\n",
+        )
+        .unwrap();
+        let out = tmp.path().join("pack");
+        let check = generate_unsafe_audit(&out, &[diff], &repo)
+            .unwrap()
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Passed);
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join("UNSAFE_AUDIT.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(json["findings"][0]["scope"], "test_only");
+        assert_eq!(json["test_only_count"], 1);
+        assert_eq!(json["production_or_unknown_count"], 0);
+    }
+
+    #[test]
+    fn unsafe_scope_requires_proof_from_complete_rust_syntax() {
+        let cases = [
+            ("#[cfg(test)] mod t { fn f() { unsafe { 1 }; } }", true),
+            ("#![cfg(test)]\nfn f() { unsafe { 1 }; }", true),
+            ("#[test] fn f() { unsafe { 1 }; }", false),
+            ("#[cfg(test)] struct Packet([u8; unsafe { 1 }]);", true),
+            (
+                "struct Packet { #[cfg(test)] bytes: [u8; unsafe { 1 }] }",
+                true,
+            ),
+            ("enum Packet { #[cfg(test)] A = unsafe { 1 }, B = 2 }", true),
+            (
+                "fn f() { match 1 { #[cfg(test)] 1 => unsafe { 1 }, _ => 0 }; }",
+                true,
+            ),
+            ("fn f() { #[cfg(test)] consume!(unsafe { 1 }); }", true),
+            ("#[cfg(all(test, unix))] fn f() { unsafe { 1 }; }", true),
+            ("#[cfg(not(not(test)))] fn f() { unsafe { 1 }; }", true),
+            ("#[cfg(test)] const V: i32 = unsafe { 1 };", true),
+            ("fn f() { #[cfg(test)] let v = unsafe { 1 }; }", true),
+            (
+                "#[cfg(test)] mod t { fn f() { unsafe { 1 }; unsafe { 2 }; } }",
+                true,
+            ),
+            ("mod tests { fn f() { unsafe { 1 }; } }", false),
+            ("#[cfg(not(test))] fn f() { unsafe { 1 }; }", false),
+            (
+                "#[cfg(any(test, feature = \"x\"))] fn f() { unsafe { 1 }; }",
+                false,
+            ),
+            ("#[cfg_attr(test, inline)] fn f() { unsafe { 1 }; }", false),
+            ("#[tokio::test] async fn f() { unsafe { 1 }; }", false),
+            (
+                "#[cfg(test)] fn t() { unsafe { 1 }; } fn p() { unsafe { 2 }; }",
+                false,
+            ),
+            ("// #[cfg(test)]\nfn f() { unsafe { 1 }; }", false),
+            ("#[cfg(test)] mod t { fn f() { unsafe {", false),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                !test_only_unsafe_lines(source).is_empty(),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shadowed_test_attribute_is_not_test_only_proof() {
+        let source =
+            "use donor::test;\n#[test]\nfn production() -> u8 { unsafe { std::ptr::read(&7) } }\n";
+        assert!(test_only_unsafe_lines(source).is_empty());
+    }
+
+    #[test]
+    fn unsafe_test_file_path_preserves_unproven_helpers_as_warnings() {
+        let source = "#[cfg(test)]\n#[test]\nfn example() { unsafe { 1 }; }\nfn helper() { unsafe { 2 }; }\n";
+        let (tmp, repo, base, target) = make_test_repo(&[("tests/example.rs", "", source)]);
+        let diff = make_diff_with_ids(
+            base,
+            target,
+            vec![mock_file_change(
+                "tests/example.rs",
+                FileStatus::Modified,
+                4,
+                0,
+            )],
+        );
+        let out = tmp.path().join("pack");
+        let check = generate_unsafe_audit(&out, &[diff], &repo)
+            .unwrap()
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warnings);
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join("UNSAFE_AUDIT.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["findings"].as_array().unwrap().len(), 2);
+        assert_eq!(json["test_only_count"], 1);
+        assert_eq!(json["production_or_unknown_count"], 1);
+        let md = fs::read_to_string(out.join("UNSAFE_AUDIT.md")).unwrap();
+        assert!(md.contains("Test-only (info)"));
+        assert!(md.contains("Production or unknown (review)"));
+    }
 
     #[test]
     fn unsafe_audit_finds_unsafe_blocks() {
