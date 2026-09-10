@@ -19,6 +19,7 @@ pub mod public_api;
 pub mod revision_source;
 mod risk;
 pub mod semantic;
+mod snapshot_integrity;
 pub mod tauri_commands;
 pub mod unsafe_audit;
 
@@ -42,6 +43,7 @@ pub use patterns::*;
 pub use public_api::*;
 pub use risk::*;
 pub use semantic::*;
+pub(crate) use snapshot_integrity::*;
 pub use tauri_commands::*;
 pub use unsafe_audit::*;
 

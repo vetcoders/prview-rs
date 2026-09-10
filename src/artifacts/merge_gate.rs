@@ -77,6 +77,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         resolved_target,
         resolved_bases,
         clean_comparison,
+        snapshot_integrity,
     } = input;
 
     let engine = PolicyEngine::new(config);
@@ -313,6 +314,13 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         &mut worst_confidence,
         &mut worst_merge,
     ));
+
+    if let Some(integrity) = snapshot_integrity {
+        review_caveats.extend(integrity.apply_review(&mut worst_confidence, &mut worst_merge));
+        if integrity.requires_review() {
+            enforcement_disposition.raise_to(EnforcementDisposition::ReviewRequired);
+        }
+    }
 
     // Fail-honest backstop for any typed ratchet added above without an
     // explicit disposition update. The warnings-only exception remains
@@ -724,6 +732,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
         .expect("merge gate");
         let gate: serde_json::Value =
@@ -786,6 +795,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
         .expect("merge gate");
 
@@ -937,6 +947,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison,
+            snapshot_integrity: None,
         })
         .expect("merge gate");
 
@@ -982,6 +993,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
         .expect("merge gate");
 
@@ -1034,6 +1046,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
         .expect("merge gate");
 
@@ -1079,6 +1092,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
         .expect("merge gate");
 
@@ -1135,6 +1149,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
         .expect("merge gate");
 
@@ -1155,6 +1170,7 @@ mod tests {
             diffs: &[],
             ownership_map: Vec::new(),
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         });
 
         assert_eq!(
@@ -1199,6 +1215,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
         .expect("merge gate");
         let raw =
@@ -1219,6 +1236,7 @@ mod tests {
             diffs: &[],
             ownership_map: Vec::new(),
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         });
 
         assert_eq!(gate["decision"]["verdict"].as_str(), Some("CONDITIONAL"));
@@ -1560,6 +1578,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
         .expect("merge gate");
 
@@ -1693,6 +1712,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
         .expect("merge gate");
 
@@ -1735,6 +1755,7 @@ mod tests {
             resolved_target: &resolved_target,
             resolved_bases: &resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
         .expect("merge gate");
 

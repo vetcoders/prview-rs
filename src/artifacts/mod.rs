@@ -209,6 +209,7 @@ struct MergeGateInput<'a> {
     /// (R2-9/R3-16). Computed once per run for verdict parity with the dashboard
     /// context.
     clean_comparison: CleanComparison,
+    snapshot_integrity: Option<&'a signal::SnapshotIntegrity>,
 }
 
 pub(crate) struct DashboardContextInput<'a> {
@@ -227,6 +228,7 @@ pub(crate) struct DashboardContextInput<'a> {
     /// Mirrors `MergeGateInput::clean_comparison` — the same value feeds both so
     /// the two verdict surfaces cannot disagree on the pre-existing downgrade.
     clean_comparison: CleanComparison,
+    snapshot_integrity: Option<&'a signal::SnapshotIntegrity>,
 }
 
 /// Provenance for the synthetic `heuristics_loctree` result.
@@ -546,6 +548,10 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let context_scan_root = ledger
         .scan_dir()
         .unwrap_or_else(|| config.repo_root.clone());
+    // Freeze this run-wide observation before context commands can write more files.
+    let snapshot_integrity = ledger.scan_dir().map(|snapshot| {
+        signal::SnapshotIntegrity::observe(&snapshot, &config.repo_root, &resolved_target.commit_id)
+    });
     let mut context_artifacts =
         plan_context_artifacts(config, &context_scan_root, diffs, &all_checks, ledger);
 
@@ -577,6 +583,9 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     fs::create_dir_all(&quality_dir)?;
     fs::create_dir_all(&context_dir)?;
     fs::create_dir_all(&per_commit_dir)?;
+    if let Some(integrity) = &snapshot_integrity {
+        integrity.write(&quality_dir)?;
+    }
     ensure_generation_active(
         governor,
         &out_dir,
@@ -811,6 +820,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         resolved_target,
         resolved_bases,
         clean_comparison: clean_comparison.clone(),
+        snapshot_integrity: snapshot_integrity.as_ref(),
     })?;
     generate_failures_summary(&summary_dir, &all_checks)?;
     stage_timings.push(finish_timing(
@@ -951,6 +961,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         diffs,
         ownership_map,
         clean_comparison,
+        snapshot_integrity: snapshot_integrity.as_ref(),
     });
 
     // Root-level report.json (generated first so dashboard can embed it)

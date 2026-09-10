@@ -128,6 +128,14 @@ pub(crate) fn generate_ai_index(
         step
     )?;
     step += 1;
+    if dir.join("20_quality/SNAPSHOT_INTEGRITY.md").is_file() {
+        writeln!(
+            md,
+            "{}. `20_quality/SNAPSHOT_INTEGRITY.md` — snapshot changes requiring review; complete tracked-path list and original target.",
+            step
+        )?;
+        step += 1;
+    }
     if dir.join("00_summary/FAILURES_SUMMARY.md").exists() {
         writeln!(
             md,

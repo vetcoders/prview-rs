@@ -100,6 +100,7 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         diffs,
         ownership_map,
         clean_comparison,
+        snapshot_integrity,
     } = input;
     use crate::policy::engine::{AnalysisStatus, MergeRecommendation, PolicyEngine};
 
@@ -348,6 +349,10 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         &mut worst_merge,
     );
     review_caveats.extend(rust_api_delta_review_caveats(rust_api_delta.as_ref()));
+
+    if let Some(integrity) = snapshot_integrity {
+        review_caveats.extend(integrity.apply_review(&mut worst_confidence, &mut worst_merge));
+    }
 
     // B2: Compute i18n parity delta
     let i18n_delta = signal::compute_i18n_delta(diffs, &config.repo_root);

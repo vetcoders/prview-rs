@@ -99,6 +99,51 @@ fn assert_no_success_surfaces(output_dir: &Path, seam: ArtifactGenerationSeam) {
     }
 }
 
+#[test]
+fn snapshot_tracked_changes_are_preserved_as_review_evidence() {
+    let publication_home = tempfile::tempdir().unwrap();
+    let _home = crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base, target) = init_advanced_base_fixture();
+    let snapshot = crate::git::create_worktree_snapshot(repo.path(), &target).unwrap();
+    fs::write(
+        snapshot.worktree_path.join("own.rs"),
+        "pub fn own() -> u8 { 9 }\n",
+    )
+    .unwrap();
+    let ledger = crate::ledger::TaskLedger::new();
+    ledger.set_shared_snapshot(Some(snapshot));
+    let output = tempfile::tempdir().unwrap();
+    let pack = output.path().join("pack");
+    let governor = crate::governor::ResourceGovernor::new();
+    generate_fixture_pack_with_ledger(repo.path(), &pack, &target, &base, &governor, &ledger)
+        .unwrap();
+
+    let evidence = pack.join("20_quality/SNAPSHOT_INTEGRITY.json");
+    assert!(
+        evidence.is_file(),
+        "tracked changes in the shared snapshot need durable evidence"
+    );
+    let evidence: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(evidence).unwrap()).unwrap();
+    assert_eq!(evidence["expected_target_sha"], target);
+    assert_eq!(evidence["status"], "modified");
+    assert_eq!(evidence["changed_paths"][0], "own.rs");
+    let gate: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pack.join("00_summary/MERGE_GATE.json")).unwrap())
+            .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pack.join("report.json")).unwrap()).unwrap();
+    for caveats in [
+        &gate["decision"]["review_caveats"],
+        &report["gate"]["review_caveats"],
+    ] {
+        assert!(caveats.as_array().unwrap().iter().any(|c| {
+            c.as_str()
+                .is_some_and(|s| s.contains("Snapshot integrity") && s.contains("own.rs"))
+        }));
+    }
+}
+
 /// A cancelled pack must not be advertised as the latest completed review
 /// (parent `latest` symlink) or as a row in the run index. Publication is
 /// irreversible; the seam check has to run before those side effects.
@@ -1136,6 +1181,7 @@ macro_rules! generate_merge_gate_test {
             resolved_target: $resolved_target,
             resolved_bases: $resolved_bases,
             clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
         })
     };
 }
