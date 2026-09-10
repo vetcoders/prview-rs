@@ -220,7 +220,12 @@ Implementations:
 - `ClippyCheck` - `cargo clippy`
 - `CargoTestCheck` - `cargo test`
 - `CargoAuditCheck` - `cargo audit`
-- `SemgrepCheck` - Semgrep JSON scan; default is diff-scoped with
+- `SemgrepCheck` - Semgrep JSON scan; its shared command runner uses a 60-second
+  timeout for quick/AI-only/update and standard remote-only reviews, or the
+  existing 300 seconds for local standard/deep/CI and explicit full security.
+  Resource admission and snapshot setup precede that command clock. Timeout
+  reporting and process-tree cleanup use the common subprocess primitive.
+  Default is diff-scoped with
   `--baseline-commit <merge-base>` when the git baseline is clean and available,
   while `--security-full` keeps a full-tree scan
 - `CargoGeigerCheck` - `cargo geiger`
