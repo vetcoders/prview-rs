@@ -5,6 +5,14 @@ measured fast gate profile, reads the generated `MERGE_GATE.json`, and returns a
 stable process exit code. Hook recipes must decide from that exit code only;
 they must not parse stdout.
 
+The gate's Semgrep command is capped at **60 seconds**. A timeout is recorded
+as a scanner error with the budget in its reason; it is not a successful or
+silently skipped security scan. This is not a total gate deadline: startup,
+resource admission, other checks, and artifact publication have their own
+costs. The gate clears global full-security opt-ins when applying its profile;
+a full review can instead use `prview --deep` or `--security-full` for the
+300-second Semgrep allowance.
+
 ## Exit-code contract
 
 | Exit code | Meaning | Default hook effect |

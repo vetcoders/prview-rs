@@ -1,6 +1,9 @@
 //! Semgrep security scan check
 
-use super::{Check, CheckEligibility, CheckResult, CheckStatus, ProvenanceBuilder, run_command};
+use super::{
+    CHECK_TIMEOUT_SECS, Check, CheckEligibility, CheckResult, CheckStatus, ProvenanceBuilder,
+    run_command_with_timeout,
+};
 use crate::Config;
 use crate::git::{Repository, ResolvedRef, WorktreeSnapshot, create_worktree_snapshot};
 use anyhow::Result;
@@ -76,7 +79,9 @@ impl Check for SemgrepCheck {
         );
         let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
 
-        let output = run_command("semgrep", &args_ref, cwd).await?;
+        let output =
+            run_command_with_timeout("semgrep", &args_ref, cwd, semgrep_timeout_secs(config))
+                .await?;
         let finished_at = Local::now().to_rfc3339();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -135,6 +140,24 @@ fn semgrep_config_arg(scan_dir: &Path) -> &'static str {
     .into_iter()
     .find(|name| scan_dir.join(name).exists())
     .unwrap_or("auto")
+}
+
+/// Bound fast scans without shortening explicitly requested full analysis.
+/// The shared command runner owns timeout reporting and process-tree cleanup.
+fn semgrep_timeout_secs(config: &Config) -> u64 {
+    use crate::cli::ExecutionMode;
+
+    if !config.security_full
+        && (config.is_fast_remote_only_standard()
+            || matches!(
+                config.execution_mode,
+                ExecutionMode::Quick | ExecutionMode::AiOnly | ExecutionMode::Update
+            ))
+    {
+        60
+    } else {
+        CHECK_TIMEOUT_SECS
+    }
 }
 
 /// Classify a semgrep scan result.
@@ -637,6 +660,72 @@ mod tests {
         assert_ne!(plan.scan_dir, dir.path());
         drop(plan);
         assert_eq!(worktree_count(dir.path()), 1);
+    }
+
+    #[test]
+    fn scan_budget_fast_presets_use_sixty_seconds() {
+        use crate::cli::ExecutionMode;
+        for mode in [
+            ExecutionMode::Quick,
+            ExecutionMode::AiOnly,
+            ExecutionMode::Update,
+        ] {
+            for remote_only in [false, true] {
+                let mut config = test_config();
+                config.execution_mode = mode;
+                config.remote_only = remote_only;
+                assert_eq!(
+                    semgrep_timeout_secs(&config),
+                    60,
+                    "{mode:?}, remote_only={remote_only}"
+                );
+            }
+        }
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Standard;
+        config.remote_only = true;
+        assert_eq!(semgrep_timeout_secs(&config), 60);
+    }
+
+    #[test]
+    fn scan_budget_full_modes_and_explicit_full_security_keep_five_minutes() {
+        use crate::cli::ExecutionMode;
+        for mode in [
+            ExecutionMode::Standard,
+            ExecutionMode::Deep,
+            ExecutionMode::Ci,
+        ] {
+            let mut config = test_config();
+            config.execution_mode = mode;
+            config.remote_only = mode != ExecutionMode::Standard;
+            assert_eq!(semgrep_timeout_secs(&config), 300, "{mode:?}");
+        }
+        for mode in [
+            ExecutionMode::Standard,
+            ExecutionMode::Quick,
+            ExecutionMode::AiOnly,
+            ExecutionMode::Update,
+        ] {
+            let mut config = test_config();
+            config.execution_mode = mode;
+            config.remote_only = true;
+            config.security_full = true;
+            assert_eq!(
+                semgrep_timeout_secs(&config),
+                300,
+                "explicit full scan under {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_budget_gate_profile_uses_fast_limit() {
+        use crate::cli::ExecutionMode;
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Deep;
+        config.security_full = true;
+        config.apply_gate_profile(crate::policy::engine::EnforcementMode::Advisory);
+        assert_eq!(semgrep_timeout_secs(&config), 60);
     }
 
     #[test]

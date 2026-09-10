@@ -143,6 +143,12 @@ by a finalized pack plus its exact durable run-id/path index row, not by the
 child's exit code (prview exits non-zero on a `BLOCK` verdict, yet the run is a
 valid completed review). Response:
 
+Within a quick review, the Semgrep command has its own 60-second timeout.
+That scanner timeout produces a recorded check error and allows the review to
+finish publishing its pack; it does not by itself mean the MCP request exceeded
+its separate 120-second budget. A deep review keeps the 300-second Semgrep
+allowance.
+
 If the synchronous child wait itself fails, the server routes it through the
 same bounded containment and direct-root reap before returning `run_failed`.
 On Unix, timeout and wait-error cleanup first sends Ctrl-C to let the review's

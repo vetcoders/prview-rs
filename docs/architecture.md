@@ -224,7 +224,13 @@ Implementations:
   resolved scan directory, preferring `semgrep.yml`, then `.semgrep.yml`,
   `.semgrep.yaml`, `semgrep.yaml`, and `.semgrep`; `auto` is used only when no
   candidate exists. The scanner reports invalid selected rules without a
-  fallback scan. The selected argument remains in check provenance. Default is diff-scoped with
+  fallback scan. The selected argument remains in check provenance.
+  Its shared command runner uses a 60-second
+  timeout for quick/AI-only/update and standard remote-only reviews, or the
+  existing 300 seconds for local standard/deep/CI and explicit full security.
+  Resource admission and snapshot setup precede that command clock. Timeout
+  reporting and process-tree cleanup use the common subprocess primitive.
+  Default is diff-scoped with
   `--baseline-commit <merge-base>` when the git baseline is clean and available,
   while `--security-full` keeps a full-tree scan. Explicit `--skip-security`
   is carried separately from the heavy-security opt-in and disables this check

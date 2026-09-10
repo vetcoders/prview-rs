@@ -100,7 +100,7 @@ Effective profile:
 | Surface | Gate behavior |
 |---------|---------------|
 | Rust / Cargo | `Cargo check` runs; `Clippy`, `Rustfmt`, `Cargo test`, and `Cargo audit` stay visible as skipped checks |
-| Security | Semgrep runs when the `semgrep` binary is available, unless `--skip-security` is explicit |
+| Security | Semgrep runs when available, unless `--skip-security` is explicit, with a 60-second command timeout |
 | Geiger | `Cargo geiger` is out of the gate profile |
 | Tests, lint, bundle, heuristics | Disabled for the pre-push gate budget |
 | JS/TS | Existing JS checks only run when repo-local `node_modules` tools exist; they are not part of the measured budget below |
@@ -426,6 +426,17 @@ without retrying with `auto`. The command in check provenance records the
 selected path. For an off-HEAD target, discovery happens inside its snapshot,
 so a configuration found only in the operator checkout does not replace the
 reviewed revision's rules.
+
+Semgrep has a **60-second command timeout** in `--quick`, `--ai-only`,
+`--update`, and the standard fast remote-only preset (including default
+`--pr`). The ordinary local standard review, `--deep`, and `--ci` retain
+300 seconds. Explicit `--security-full` also retains 300 seconds, even with a
+fast review preset; `gate` owns its quick profile and clears that opt-in.
+A timeout remains an `ERROR` with `semgrep timed out after 60s`, and the shared
+runner terminates the owned process tree. Use `--deep` or `--security-full`
+when the scan needs the full allowance. These are command budgets, not a
+whole-review deadline: resource admission, snapshot preparation, other checks,
+and artifact generation are outside the Semgrep command clock.
 
 By default, Semgrep is scoped to the change when prview can resolve a clean git
 baseline: it passes Semgrep `--baseline-commit <merge-base>` so existing
