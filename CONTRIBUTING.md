@@ -28,6 +28,12 @@ make precommit
 make check
 ```
 
+Binary contract tests must set `PRVIEW_HOME` to a test-owned temporary directory
+and keep that directory alive until all child processes finish. This prevents
+fixture packs and lock state from leaking into the caller's storage. Preserve
+each test's intended tool environment: gate exit-code fixtures deliberately
+exclude Semgrep, since its absence is part of the verdict being tested.
+
 ## Making changes
 
 This repo is trunk-based on `main`.

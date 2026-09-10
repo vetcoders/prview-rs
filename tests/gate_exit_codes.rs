@@ -15,6 +15,8 @@
 //! * The gate profile disables tests/lint/heuristics, and the fixture PATH
 //!   exposes git but not semgrep, so the `Semgrep scan` check is always skipped
 //!   regardless of runner tooling.
+//! * Each test owns its `PRVIEW_HOME` until the child exits. Parent storage and
+//!   its locks cannot affect the expected exit code or receive fixture packs.
 //! * Under the default policy that skip is advisory → CONDITIONAL (exit 0, or
 //!   exit 2 with `--strict`).
 //! * Under a `default_severity: block` policy the same skip becomes blocking →
@@ -140,21 +142,23 @@ fn path_without_semgrep(repo: &Path) -> OsString {
     OsString::from(bin_dir)
 }
 
-fn prview_gate_command(repo: &Path) -> Command {
+fn prview_gate_command(repo: &Path, home: &Path) -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("prview"));
     command
         .current_dir(repo)
-        .env("PATH", path_without_semgrep(repo));
+        .env("PATH", path_without_semgrep(repo))
+        .env("PRVIEW_HOME", home);
     command
 }
 
 #[test]
 fn gate_exits_zero_for_non_strict_conditional() {
+    let home = tempfile::tempdir().expect("prview home");
     let temp = create_gate_fixture();
 
     // Default policy: the skipped Semgrep check is advisory → CONDITIONAL,
     // which is accepted (exit 0) without --strict.
-    prview_gate_command(temp.path())
+    prview_gate_command(temp.path(), home.path())
         .arg("gate")
         .assert()
         .code(0);
@@ -162,12 +166,13 @@ fn gate_exits_zero_for_non_strict_conditional() {
 
 #[test]
 fn gate_exits_two_for_strict_conditional() {
+    let home = tempfile::tempdir().expect("prview home");
     let temp = create_gate_fixture();
 
     // Same CONDITIONAL verdict, but --strict rejects it with exit 2. This is the
     // exact code clap also uses for usage errors, which is why the action must
     // distinguish the two (see action.yml) — here we pin the contract value.
-    prview_gate_command(temp.path())
+    prview_gate_command(temp.path(), home.path())
         .args(["gate", "--strict"])
         .assert()
         .code(2);
@@ -175,6 +180,7 @@ fn gate_exits_two_for_strict_conditional() {
 
 #[test]
 fn gate_exits_two_for_strict_conditional_with_breaking_change() {
+    let home = tempfile::tempdir().expect("prview home");
     let temp = create_breaking_gate_fixture();
 
     // A diff that removes a public Rust function is a breaking API change. With
@@ -182,7 +188,7 @@ fn gate_exits_two_for_strict_conditional_with_breaking_change() {
     // verdict to CONDITIONAL, which `--strict` rejects with the contract exit 2.
     // (The skipped Semgrep check is also advisory here; either way the process
     // must exit 2 with a real breaking finding present in the pack.)
-    prview_gate_command(temp.path())
+    prview_gate_command(temp.path(), home.path())
         .args(["gate", "--strict"])
         .assert()
         .code(2);
@@ -228,6 +234,7 @@ fn operator_policy_real_gate_warning_lane() {
 
 #[test]
 fn gate_exits_one_for_block_verdict() {
+    let home = tempfile::tempdir().expect("prview home");
     let temp = create_gate_fixture();
     let repo = temp.path();
 
@@ -240,7 +247,10 @@ fn gate_exits_one_for_block_verdict() {
     run_git(repo, &["add", ".prview-policy.yml"]);
     run_git(repo, &["commit", "-m", "block policy"]);
 
-    prview_gate_command(repo).arg("gate").assert().code(1);
+    prview_gate_command(repo, home.path())
+        .arg("gate")
+        .assert()
+        .code(1);
 }
 
 /// A pack whose `MERGE_GATE.json` is gone carries no verdict. `prview --ci` used
@@ -316,6 +326,7 @@ fn walk_merge_gate_json(root: &Path) -> Vec<std::path::PathBuf> {
 
 #[test]
 fn gate_exits_three_when_it_cannot_execute() {
+    let home = tempfile::tempdir().expect("prview home");
     // Outside a git repository the review cannot run, so the gate reports an
     // execution error (exit 3) rather than a verdict.
     let temp = tempfile::tempdir().expect("tempdir");
@@ -323,6 +334,7 @@ fn gate_exits_three_when_it_cannot_execute() {
     Command::new(assert_cmd::cargo::cargo_bin!("prview"))
         .current_dir(temp.path())
         .env("GIT_CEILING_DIRECTORIES", temp.path())
+        .env("PRVIEW_HOME", home.path())
         .arg("gate")
         .assert()
         .code(3);
