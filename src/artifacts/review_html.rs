@@ -45,36 +45,42 @@ pub(crate) fn generate_review_summary(out_dir: &Path) -> Result<()> {
         writeln!(md)?;
     }
 
-    writeln!(md, "## Artifact Map\n")?;
-    writeln!(md, "## Available Artifacts\n")?;
-
+    let mut available = String::new();
     let pattern_scan = out_dir.join("30_context/PATTERN_SCAN.json");
     if pattern_scan.exists() {
-        writeln!(md, "- `30_context/PATTERN_SCAN.json` — pattern scan")?;
+        writeln!(available, "- `30_context/PATTERN_SCAN.json` — pattern scan")?;
     }
 
     let deps_delta = out_dir.join("30_context/DEPS_DELTA.json");
     if deps_delta.exists() {
-        writeln!(md, "- `30_context/DEPS_DELTA.json` — dependency changes")?;
+        writeln!(
+            available,
+            "- `30_context/DEPS_DELTA.json` — dependency changes"
+        )?;
     }
 
     if out_dir.join("30_context/cargo-sbom.txt").exists() {
         writeln!(
-            md,
+            available,
             "- `30_context/cargo-sbom.txt` — dependency/license SBOM"
         )?;
     }
     if out_dir.join("30_context/npm-sbom.txt").exists() {
-        writeln!(md, "- `30_context/npm-sbom.txt` — dependency SBOM")?;
+        writeln!(available, "- `30_context/npm-sbom.txt` — dependency SBOM")?;
     }
 
     if out_dir.join("30_context/INLINE_FINDINGS.sarif").exists() {
         writeln!(
-            md,
+            available,
             "- `30_context/INLINE_FINDINGS.sarif` — machine-readable findings"
         )?;
     }
-    writeln!(md)?;
+
+    if !available.is_empty() {
+        writeln!(md, "## Available Artifacts\n")?;
+        md.push_str(&available);
+        writeln!(md)?;
+    }
 
     fs::write(out_dir.join("REVIEW_SUMMARY.md"), md)?;
     Ok(())

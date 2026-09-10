@@ -6369,7 +6369,7 @@ fn review_summary_includes_gate_and_checks() {
     assert!(summary.contains("## Review"));
     assert!(summary.contains("Looks good overall"));
     assert!(summary.contains("## Available Artifacts"));
-    assert!(summary.contains("## Available Artifacts"));
+    assert!(!summary.contains("## Artifact Map"));
     assert!(summary.contains("PATTERN_SCAN.json"));
     assert!(summary.contains("DEPS_DELTA.json"));
 }
@@ -6384,7 +6384,7 @@ fn review_summary_handles_missing_files() {
 
     let summary = fs::read_to_string(out.join("REVIEW_SUMMARY.md")).unwrap();
     assert!(summary.contains("# PR Review Summary"));
-    assert!(summary.contains("## Available Artifacts"));
+    assert!(!summary.contains("## Available Artifacts"));
     // Should NOT have Gate/Review/Artifact Map sections
     assert!(
         !summary.contains("## Gate Decision"),
@@ -6394,7 +6394,7 @@ fn review_summary_handles_missing_files() {
         !summary.contains("## Review"),
         "No review section when PR_REVIEW.md is missing"
     );
-    assert!(summary.contains("## Artifact Map"));
+    assert!(!summary.contains("## Artifact Map"));
 }
 
 #[test]
@@ -6419,7 +6419,30 @@ fn review_summary_partial_sources_gate_only() {
         !summary.contains("## Review"),
         "No review section when PR_REVIEW.md is missing"
     );
-    assert!(summary.contains("## Artifact Map"));
+    assert!(!summary.contains("## Artifact Map"));
+}
+
+#[test]
+fn review_summary_preserves_each_available_artifact() {
+    let artifacts = [
+        "30_context/PATTERN_SCAN.json",
+        "30_context/DEPS_DELTA.json",
+        "30_context/cargo-sbom.txt",
+        "30_context/npm-sbom.txt",
+        "30_context/INLINE_FINDINGS.sarif",
+    ];
+    for present in artifacts {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(tmp.path().join("30_context")).unwrap();
+        fs::write(tmp.path().join(present), "fixture").unwrap();
+        generate_review_summary(tmp.path()).unwrap();
+        let summary = fs::read_to_string(tmp.path().join("REVIEW_SUMMARY.md")).unwrap();
+        assert!(!summary.contains("## Artifact Map"));
+        assert_eq!(summary.matches("## Available Artifacts").count(), 1);
+        for artifact in artifacts {
+            assert_eq!(summary.contains(artifact), artifact == present);
+        }
+    }
 }
 
 #[test]

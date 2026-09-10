@@ -541,6 +541,11 @@ array, which also carries any verdict the reader had to normalize.
 
 ## Output
 
+`REVIEW_SUMMARY.md` and its rendered view in `review.html` include an
+**Available Artifacts** section only when at least one listed context artifact
+exists (pattern scan, dependency delta, Cargo/npm SBOM, or inline SARIF).
+The summary does not emit an empty **Artifact Map** placeholder.
+
 Artifacts are written to `$PRVIEW_HOME/runs/<repo>/<branch>/<run_id>/`
 or, when `PRVIEW_HOME` is unset, to
 `$HOME/.prview/runs/<repo>/<branch>/<run_id>/` in an ordered numbered layout.
