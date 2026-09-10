@@ -77,6 +77,7 @@ impl CoverageDelta {
             covered: signal
                 .covered_files
                 .iter()
+                .filter(|(_, _, tier)| *tier != CoverageMatchTier::Low)
                 .map(|(src, test, tier)| CoveragePair {
                     src_status: 'M',
                     src_path: src.clone(),
@@ -128,6 +129,8 @@ pub struct CoveragePair {
 /// Canonical coverage signal — one source of truth for all consumers.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CoverageSignal {
+    /// Associations, including tentative Low matches retained for manual review.
+    /// Only High/Medium associations contribute to covered_count.
     pub covered_files: Vec<(String, String, CoverageMatchTier)>, // (source_path, test_path, tier)
     pub uncovered_files: Vec<String>,
     pub total_source_files: usize,
@@ -195,6 +198,9 @@ pub fn compute_coverage_signal(
     for src in &source_files {
         if let Some((test, tier)) = find_matching_test(src, &test_files) {
             covered.push((*src, test, tier));
+            if tier == CoverageMatchTier::Low {
+                uncovered.push(*src);
+            }
         } else {
             uncovered.push(*src);
         }
@@ -227,6 +233,8 @@ pub fn compute_coverage_signal(
         if !import_recovered.is_empty() {
             used_import_recovery = true;
             for (src, test, tier) in &import_recovered {
+                // Replace the tentative association; never count one source twice.
+                covered.retain(|(candidate, _, _)| candidate.path != src.path);
                 covered.push((*src, *test, *tier));
             }
             let recovered_paths: HashSet<&str> = import_recovered
@@ -270,6 +278,7 @@ pub fn compute_coverage_signal(
         }
         if !inline_set.is_empty() {
             uncovered.retain(|s| !inline_set.contains(s.path.as_str()));
+            covered.retain(|(s, _, _)| !inline_set.contains(s.path.as_str()));
         }
     }
     let inline_tested_count = inline_tested_paths.len();
@@ -292,7 +301,11 @@ pub fn compute_coverage_signal(
     }
 
     let total = source_files.len();
-    let covered_count = covered.len() + inline_tested_count;
+    let covered_count = covered
+        .iter()
+        .filter(|(_, _, tier)| *tier != CoverageMatchTier::Low)
+        .count()
+        + inline_tested_count;
     // 0/0 is "nothing was measured", not "everything is covered". Reporting 100%
     // for an empty scan is the SKIP-AS-ZERO inversion the gate already avoids
     // (see build_heuristics_gate_check); coverage must speak the same language.
@@ -515,6 +528,9 @@ fn find_matching_test<'a>(
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
+    // A weak candidate must not mask stronger evidence later in the diff.
+    let mut weak_candidate = None;
+
     // Strategy 1: Exact stem match (strip test prefix/suffix)
     for test in test_files {
         if !compatible_test_language(&source.path, &test.path) {
@@ -539,7 +555,10 @@ fn find_matching_test<'a>(
             } else {
                 CoverageMatchTier::Low
             };
-            return Some((test, tier));
+            if tier == CoverageMatchTier::High {
+                return Some((test, tier));
+            }
+            weak_candidate.get_or_insert((*test, tier));
         }
     }
 
@@ -559,9 +578,16 @@ fn find_matching_test<'a>(
                 } else {
                     CoverageMatchTier::Low
                 };
-                return Some((test, tier));
+                if tier == CoverageMatchTier::High {
+                    return Some((test, tier));
+                }
+                weak_candidate.get_or_insert((*test, tier));
             }
         }
+    }
+
+    if weak_candidate.is_some() {
+        return weak_candidate;
     }
 
     // Strategy 3: Keyword overlap — source path segments appear in test filename → Low
@@ -672,7 +698,7 @@ fn coverage_module_key(path: &str) -> Vec<String> {
 
 /// Import recovery: find a test file that imports the source module.
 ///
-/// Only called for source files that had no filename-heuristic match.
+/// Called for source files without a strong filename-heuristic match.
 /// Reads test file content from disk and greps for import patterns.
 fn find_test_by_import<'a>(
     source: &FileChange,
@@ -809,6 +835,115 @@ mod tests {
     use super::*;
     use crate::git::FileStatus;
     use tempfile::TempDir;
+
+    #[test]
+    fn weak_matches_do_not_count_as_confirmed_test_changes() {
+        let diff = mock_diff(vec![
+            mock_file_change("src/a/util.rs", FileStatus::Modified, 10, 5),
+            mock_file_change("tests/b/util_test.rs", FileStatus::Modified, 5, 2),
+            mock_file_change("src/parser.rs", FileStatus::Modified, 4, 2),
+            mock_file_change("tests/parser_test.rs", FileStatus::Modified, 4, 2),
+        ]);
+        let signal = compute_coverage_signal(&[diff], None, None);
+        assert_eq!(
+            signal.covered_count, 1,
+            "weak associations must not inflate the headline"
+        );
+        assert_eq!(signal.coverage_pct, Some(50));
+        assert_eq!(signal.uncovered_files, vec!["src/a/util.rs"]);
+        assert!(
+            signal
+                .covered_files
+                .iter()
+                .any(|(_, _, tier)| *tier == CoverageMatchTier::Low)
+        );
+        let delta = CoverageDelta::from_signal(&signal);
+        assert_eq!(
+            delta.covered.len(),
+            1,
+            "dashboard and risk must not treat a weak association as confirmed"
+        );
+        assert_eq!(delta.covered[0].src_path, "src/parser.rs");
+        let dir = TempDir::new().unwrap();
+        generate_coverage_delta(dir.path(), &signal).unwrap();
+        let text = fs::read_to_string(dir.path().join("coverage-delta.txt")).unwrap();
+        assert!(text.contains("WEAK_TEST_MATCH"));
+        assert!(text.contains("Summary: 1/2 changed code files have matching test changes (50%)"));
+    }
+
+    #[test]
+    fn weak_match_is_upgraded_by_import_evidence_once() {
+        let files = &[
+            (
+                "src/a/util.py",
+                "def value(): return 1\n",
+                "def value(): return 2\n",
+            ),
+            (
+                "tests/b/test_util.py",
+                "",
+                "from src.a.util import value\ndef test_value(): assert value() == 2\n",
+            ),
+        ];
+        let (_tmp, repo, base, target) = make_test_repo(files);
+        let diff = make_diff_with_ids(
+            base,
+            target,
+            vec![
+                mock_file_change("src/a/util.py", FileStatus::Modified, 1, 1),
+                mock_file_change("tests/b/test_util.py", FileStatus::Modified, 2, 0),
+            ],
+        );
+        let signal = compute_coverage_signal(&[diff], None, Some(&repo));
+        assert_eq!(signal.covered_count, 1);
+        assert_eq!(signal.coverage_pct, Some(100));
+        assert!(signal.uncovered_files.is_empty());
+        assert_eq!(signal.covered_files.len(), 1);
+        assert_eq!(signal.covered_files[0].2, CoverageMatchTier::Medium);
+    }
+
+    #[test]
+    fn weak_match_is_upgraded_by_inline_test_once() {
+        let files = &[(
+            "src/a/util.rs",
+            "pub fn value() {}\n",
+            "pub fn value() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn smoke() { super::value(); }\n}\n",
+        )];
+        let (_tmp, repo, base, target) = make_test_repo(files);
+        let diff = make_diff_with_ids(
+            base,
+            target,
+            vec![
+                mock_file_change("src/a/util.rs", FileStatus::Modified, 1, 0),
+                mock_file_change("tests/b/util_test.rs", FileStatus::Modified, 2, 0),
+            ],
+        );
+        let signal = compute_coverage_signal(&[diff], None, Some(&repo));
+        assert_eq!(signal.covered_count, 1);
+        assert_eq!(signal.inline_tested_count, 1);
+        assert_eq!(signal.covered_files.len(), 1);
+        assert_eq!(signal.covered_files[0].2, CoverageMatchTier::High);
+        assert!(signal.uncovered_files.is_empty());
+    }
+
+    #[test]
+    fn weak_candidate_cannot_hide_a_later_strong_filename_match() {
+        for paths in [
+            ["tests/b/util_test.rs", "tests/a/util_test.rs"],
+            ["tests/a/util_test.rs", "tests/b/util_test.rs"],
+        ] {
+            let diff = mock_diff(vec![
+                mock_file_change("src/a/util.rs", FileStatus::Modified, 1, 0),
+                mock_file_change(paths[0], FileStatus::Modified, 1, 0),
+                mock_file_change(paths[1], FileStatus::Modified, 1, 0),
+            ]);
+            let signal = compute_coverage_signal(&[diff], None, None);
+            assert_eq!(signal.covered_count, 1);
+            assert_eq!(signal.covered_files.len(), 1);
+            assert_eq!(signal.covered_files[0].1, "tests/a/util_test.rs");
+            assert_eq!(signal.covered_files[0].2, CoverageMatchTier::High);
+        }
+    }
 
     #[test]
     fn coverage_requires_source_evidence_not_shared_directories() {
@@ -1049,7 +1184,8 @@ mod tests {
 
         let signal = compute_coverage_signal(&[diff], None, None);
 
-        assert_eq!(signal.covered_count, 1);
+        assert_eq!(signal.covered_count, 0);
+        assert_eq!(signal.uncovered_files, vec!["src/a/util.rs"]);
         assert_eq!(
             signal.covered_files[0],
             (

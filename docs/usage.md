@@ -937,6 +937,7 @@ they are not neutralized without compiler-backed name resolution.
 - When `30_context/INLINE_FINDINGS.sarif` exists, it emits findings per location/advisory and is suitable for annotation integrations.
 - In Rust runs, `PR_REVIEW.md` and `FAILURES_SUMMARY.md` can surface dependency paths to vulnerable crates based on `30_context/cargo-tree.txt`.
 - `10_diff/per-commit-diffs/00-SUMMARY.md` carries both the batching and thematic batch labels.
+- Test matching counts filename/path matches, import-backed associations and verified Rust inline tests. Weak name-only associations stay under `WEAK_TEST_MATCH` for manual review and do not raise the percentage or remove the source from the unmatched list. These counts do not measure executed lines or test success.
 - `20_quality/coverage-delta.txt` is a heuristic; for Rust it drops DELETED files in favor of disk searches for orphaned tests (raising an `ORPHANED_TEST_DETECTED` flag). Inline `#[cfg(test)]` modules are handled silently, without false alarms.
 - In fast `remote-only` runs, heavier diagnostics such as `30_context/tsc-trace.log` or `30_context/tauri-info.log` may be intentionally skipped. Check `RUN.json` for `recommended`/`reason` notes on whether they are worth generating.
 

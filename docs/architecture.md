@@ -2743,6 +2743,17 @@ matching, not an execution-based line or branch coverage measurement:
 - `generate_coverage_delta(dir, signal)` — renders `coverage-delta.txt` from a pre-computed signal
 - `format_coverage_pct(Option<u32>)` — the one renderer for the percentage; `None` becomes `not measured`
 
+**Tentative matches do not increase the ratio.** High (filename/path) and
+Medium (import-backed) associations, including verified Rust inline tests,
+contribute once per source file to `covered_count` and `coverage_pct`. Low
+associations remain in `CoverageSignal.covered_files` for the detailed
+`WEAK_TEST_MATCH` section, while their source stays in `uncovered_files`.
+`CoverageDelta::from_signal()` excludes Low pairs, so dashboard matched rows
+and risk scoring use the same confirmed set as the headline and JSON metrics.
+Import or inline evidence replaces a tentative pair; an earlier weak filename
+candidate cannot hide a later strong match. These are existing heuristic tiers,
+not execution coverage or proof that a test passed.
+
 **Unmeasured is not 100%.** `coverage_pct` / `CoverageDelta::pct` are
 `Option<u32>` and are `None` whenever no changed source file was evaluated
 (`total_source_files == 0`). Consumers must render that as "not measured" or
