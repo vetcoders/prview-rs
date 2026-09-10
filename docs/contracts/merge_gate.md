@@ -283,6 +283,12 @@ authoritative axes — `analysis_status` (confidence) and `merge_recommendation`
 | `review_caveats` | string[] | Non-blocking caveats requiring reviewer attention |
 | `blocking_issues` | string[] | Issues that block the merge |
 
+`MERGE_GATE.md` and `AI_INDEX.md` expose this full canonical list in a
+`Review signals (N)` section. Its count is the list length; entries retain
+canonical order and text, with multiline continuation indented inside the
+same Markdown item. Empty lists omit the section. Rendering does not change
+which caveats require review, their origin, or any decision field.
+
 ## Verdict semantics
 
 `verdict` collapses the decision into one enum for AI consumers. It is produced

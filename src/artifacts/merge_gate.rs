@@ -471,6 +471,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         decision.state.gate_label(),
         decision.reason,
     ));
+    append_review_signals(&mut md, all_review_caveats.iter().map(String::as_str));
     md.push_str("## Checks\n\n");
     md.push_str("| Check | Status | Class | Blocking |\n");
     md.push_str("|---|---|---|---|\n");
@@ -486,6 +487,26 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     }
     fs::write(dir.join("MERGE_GATE.md"), md)?;
     Ok(())
+}
+
+/// Render the canonical caveats without truncating or reclassifying them.
+/// Continuation lines stay within their Markdown list item.
+pub(super) fn append_review_signals<'a>(
+    md: &mut String,
+    caveats: impl IntoIterator<Item = &'a str>,
+) {
+    let caveats: Vec<_> = caveats.into_iter().collect();
+    if caveats.is_empty() {
+        return;
+    }
+    if !md.ends_with("\n\n") {
+        md.push('\n');
+    }
+    let _ = writeln!(md, "## Review signals ({})\n", caveats.len());
+    for caveat in caveats {
+        let _ = writeln!(md, "- {}", caveat.replace('\n', "\n  "));
+    }
+    md.push('\n');
 }
 
 /// Merge-gate axes and issue lists after the pre-existing downgrade has been
@@ -681,6 +702,76 @@ mod tests {
                 is_remote: false,
             }],
         )
+    }
+
+    fn review_signal_documents(count: usize) -> (String, String, Vec<String>) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let summary = tmp.path().join("00_summary");
+        fs::create_dir(&summary).expect("summary directory");
+        let mut config = test_config();
+        config.profile.kind = crate::config::ProfileKind::Generic;
+        let skipped: Vec<_> = (0..count)
+            .map(|i| SkippedCheck {
+                id: format!("audit_{i}"),
+                name: format!("Audit {i}"),
+                reason: format!("not requested: {i}\nadditional context: {i}"),
+            })
+            .collect();
+        let inline = InlineFindingsSummary {
+            status: "passed".into(),
+            findings_count: 0,
+            dashboard_findings: vec![],
+        };
+        let coverage = empty_coverage();
+        let (target, bases) = resolved_refs();
+        generate_merge_gate(MergeGateInput {
+            dir: &summary,
+            config: &config,
+            ledger: &empty_ledger(),
+            checks: &[],
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            rust_api_delta: None,
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &skipped,
+            resolved_target: &target,
+            resolved_bases: &bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+        })
+        .expect("merge gate");
+        generate_ai_index(tmp.path(), &config, &[], &[], &coverage).expect("index");
+        let gate: serde_json::Value =
+            serde_json::from_slice(&fs::read(summary.join("MERGE_GATE.json")).unwrap()).unwrap();
+        let caveats = serde_json::from_value(gate["decision"]["review_caveats"].clone())
+            .expect("canonical string list");
+        (
+            fs::read_to_string(summary.join("MERGE_GATE.md")).unwrap(),
+            fs::read_to_string(tmp.path().join("AI_INDEX.md")).unwrap(),
+            caveats,
+        )
+    }
+
+    #[test]
+    fn review_signals_markdown_lists_all_canonical_caveats_in_both_readers() {
+        let (gate, index, caveats) = review_signal_documents(13);
+        assert_eq!(caveats.len(), 13);
+        for document in [gate, index] {
+            assert!(document.contains("## Review signals (13)\n\n"));
+            for caveat in &caveats {
+                let entry = format!("- {}\n", caveat.replace('\n', "\n  "));
+                assert!(document.contains(&entry), "missing signal: {caveat}");
+            }
+        }
+    }
+
+    #[test]
+    fn review_signals_markdown_omits_empty_sections_in_both_readers() {
+        let (gate, index, caveats) = review_signal_documents(0);
+        assert!(caveats.is_empty());
+        assert!(!gate.contains("## Review signals"));
+        assert!(!index.contains("## Review signals"));
     }
 
     #[test]

@@ -84,6 +84,14 @@ pub(crate) fn generate_ai_index(
         if let Some(allow) = allow {
             writeln!(md, "- Allow merge: `{}`", allow)?;
         }
+        append_review_signals(
+            &mut md,
+            gate["decision"]["review_caveats"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str),
+        );
     }
     writeln!(md)?;
 

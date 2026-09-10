@@ -805,6 +805,12 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   or `repo_root` when no snapshot could be made — and a gating signal whose
   substrate is unstated is unauditable.
 
+The human Markdown gate and AI index render the complete canonical
+`decision.review_caveats` list with a matching count. Both use the shared
+`append_review_signals` formatter, retaining order and multiline item text;
+they omit the section for an empty list. The index reads the finalized gate
+JSON, so presentation never recomputes policy or invents review-signal origins.
+
 The three check inventories are projections of the same policy evaluations,
 but intentionally answer different questions. `00_summary/RUN.json.checks[]`
 contains only checks that produced a `CheckResult`, so `outcome.checks_run` is
