@@ -154,7 +154,7 @@
   "message.cleanLintAcrossChecks": "Clean lint — no issues found across {count} checks",
   "message.codeHotspotsLead": "are shown first to help review the places with the most changes.",
   "message.coverageDetail": "Source files with matching test changes: {covered}/{total}",
-  "message.coverageHeuristicNote": "Matched by file name. This does not measure code executed by tests or confirm that tested behavior is correct.",
+  "message.coverageHeuristicNote": "Matched by file names, imports, or inline test structure. This does not measure code executed by tests or confirm that tested behavior is correct.",
   "message.cyclesLabel": "Circular imports",
   "message.changedCodeWithoutMatchingTests": "Some changed code has no matched test changes",
   "message.exactTwinsLabel": "Exact twins",

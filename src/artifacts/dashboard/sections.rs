@@ -2161,7 +2161,7 @@ pub(super) fn build_coverage_section(ctx: &DashboardContext) -> String {
         ),
         coverage_note = i18n_template(
             "message.coverageHeuristicNote",
-            "File-name matching heuristic — not actual code coverage",
+            "Matched by file names, imports, or inline test structure. This does not measure code executed by tests or confirm that tested behavior is correct.",
             &[],
         ),
         uncovered = uncovered_html,

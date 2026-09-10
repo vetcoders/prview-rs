@@ -131,7 +131,9 @@ fn test_matching_is_a_file_ratio_not_executed_code_coverage() {
     let html = build_coverage_section(&ctx);
     assert!(html.contains(">1/1</span>"));
     assert!(!html.contains(">100%</span>"));
-    assert!(html.contains("not actual code coverage"));
+    assert!(html.contains("file names, imports, or inline test structure"));
+    assert!(html.contains("does not measure code executed by tests"));
+    assert!(html.contains("or confirm that tested behavior is correct"));
 }
 
 #[test]

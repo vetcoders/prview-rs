@@ -154,7 +154,7 @@
   "message.cleanLintAcrossChecks": "Analiza statyczna nie wykryła problemów. Liczba kontroli: {count}",
   "message.codeHotspotsLead": "są pokazane najpierw, aby ułatwić review miejsc z największą liczbą zmian.",
   "message.coverageDetail": "Pliki źródłowe z dopasowanymi zmianami w testach: {covered}/{total}",
-  "message.coverageHeuristicNote": "Dopasowanie na podstawie nazw plików. Nie mierzy wykonania kodu przez testy ani nie potwierdza poprawności testowanego zachowania.",
+  "message.coverageHeuristicNote": "Dopasowanie na podstawie nazw plików, importów lub struktury testów w pliku źródłowym. Nie mierzy wykonania kodu przez testy ani nie potwierdza poprawności testowanego zachowania.",
   "message.cyclesLabel": "Importy cykliczne",
   "message.changedCodeWithoutMatchingTests": "Nie dopasowano zmian w testach do części zmienionego kodu",
   "message.exactTwinsLabel": "Dokładne duplikaty",
