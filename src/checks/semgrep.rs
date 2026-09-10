@@ -63,12 +63,7 @@ impl Check for SemgrepCheck {
 
         let cwd = plan.scan_dir.as_path();
 
-        let config_path = cwd.join("semgrep.yml");
-        let config_arg = if config_path.exists() {
-            "semgrep.yml"
-        } else {
-            "auto"
-        };
+        let config_arg = semgrep_config_arg(cwd);
 
         let args = build_semgrep_args(
             config_arg,
@@ -120,6 +115,22 @@ impl Check for SemgrepCheck {
             ),
         })
     }
+}
+
+/// Prefer rules supplied by the scanned revision. Keep the existing filename
+/// first so adding discovery aliases does not replace an already-used policy.
+/// Validation belongs to Semgrep: malformed local rules must not select auto.
+fn semgrep_config_arg(scan_dir: &Path) -> &'static str {
+    [
+        "semgrep.yml",
+        ".semgrep.yml",
+        ".semgrep.yaml",
+        "semgrep.yaml",
+        ".semgrep",
+    ]
+    .into_iter()
+    .find(|name| scan_dir.join(name).exists())
+    .unwrap_or("auto")
 }
 
 /// Classify a semgrep scan result.
@@ -556,6 +567,65 @@ mod tests {
     use super::*;
     use crate::config::test_config;
     use crate::git::git_cmd;
+
+    #[test]
+    fn repo_config_uses_local_rule_files_and_directory() {
+        for name in [
+            "semgrep.yml",
+            ".semgrep.yml",
+            ".semgrep.yaml",
+            "semgrep.yaml",
+            ".semgrep",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            if name == ".semgrep" {
+                std::fs::create_dir(dir.path().join(name)).unwrap();
+                std::fs::write(dir.path().join(name).join("rules.yaml"), "rules: []\n").unwrap();
+            } else {
+                std::fs::write(dir.path().join(name), "rules: []\n").unwrap();
+            }
+            assert_eq!(semgrep_config_arg(dir.path()), name);
+        }
+    }
+
+    #[test]
+    fn repo_config_keeps_existing_precedence_and_absent_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(semgrep_config_arg(dir.path()), "auto");
+        std::fs::write(dir.path().join(".semgrep.yml"), "rules: []\n").unwrap();
+        std::fs::write(dir.path().join("semgrep.yml"), "rules: []\n").unwrap();
+        assert_eq!(semgrep_config_arg(dir.path()), "semgrep.yml");
+    }
+
+    #[test]
+    fn repo_config_invalid_local_rules_are_not_replaced_with_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".semgrep.yml"), "invalid: [yaml").unwrap();
+        assert_eq!(semgrep_config_arg(dir.path()), ".semgrep.yml");
+    }
+
+    #[test]
+    fn repo_config_comes_from_reviewed_snapshot_not_operator_checkout() {
+        use crate::config::{test_config_builder, test_generic_profile};
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-q", "-b", "main"]);
+        let without_rules = write_commit(dir.path(), "a.txt", "base\n");
+        let target = write_commit(dir.path(), ".semgrep.yml", "rules: []\n");
+        run_git(dir.path(), &["checkout", "-q", &without_rules]);
+        std::fs::write(dir.path().join("semgrep.yml"), "operator-only rules\n").unwrap();
+        let config = test_config_builder()
+            .repo_root(dir.path())
+            .target(Some(&target))
+            .bases(&["main"])
+            .profile(test_generic_profile())
+            .build();
+        let plan = plan_semgrep_scan(&config).unwrap();
+        assert_eq!(semgrep_config_arg(&plan.scan_dir), ".semgrep.yml");
+        assert_eq!(semgrep_config_arg(dir.path()), "semgrep.yml");
+        assert_ne!(plan.scan_dir, dir.path());
+        drop(plan);
+        assert_eq!(worktree_count(dir.path()), 1);
+    }
 
     #[test]
     fn build_semgrep_args_excludes_vendored_and_generated_and_emits_json() {

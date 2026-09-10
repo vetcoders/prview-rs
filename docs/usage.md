@@ -379,6 +379,17 @@ prview --help
 | `--resource-budget safe\|balanced` | Select the whole-machine envelope (`safe` is the default; `balanced` is capped and load-aware) |
 | `--tests-pattern PATTERN` | Filter Vitest by regex or Cargo/libtest by literal substring; Mixed uses the literal intersection and Pytest remains unfiltered |
 
+Semgrep uses the first configuration path present at the root of the scanned
+revision, in this order: `semgrep.yml`, `.semgrep.yml`, `.semgrep.yaml`,
+`semgrep.yaml`, `.semgrep` (a directory of YAML rules). The existing
+`semgrep.yml` choice keeps precedence when multiple paths coexist. If none is
+present, prview passes `--config auto`. A selected local configuration is
+validated by Semgrep; a malformed ruleset produces a tool/configuration error,
+without retrying with `auto`. The command in check provenance records the
+selected path. For an off-HEAD target, discovery happens inside its snapshot,
+so a configuration found only in the operator checkout does not replace the
+reviewed revision's rules.
+
 By default, Semgrep is scoped to the change when prview can resolve a clean git
 baseline: it passes Semgrep `--baseline-commit <merge-base>` so existing
 findings outside the diff do not degrade the merge verdict. If the worktree is
