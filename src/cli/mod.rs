@@ -120,11 +120,11 @@ pub struct Cli {
         long = "with-security",
         long_help = "Enable the heavy security posture. This raises the security tier used by \
                      --deep and --ci. cargo-geiger is NOT part of this tier — it is opt-in via \
-                     --security-full. Lightweight checks like cargo-audit always run regardless."
+                     --security-full. cargo-audit follows the selected lint/security profile."
     )]
     pub with_security: bool,
 
-    /// Skip heavy security checks even when otherwise enabled
+    /// Skip Semgrep and heavy security checks even when otherwise enabled
     #[arg(long = "skip-security", conflicts_with = "with_security")]
     pub skip_security: bool,
 
@@ -550,8 +550,8 @@ impl Cli {
     ///
     /// Heavy security checks are slow (3+ min on large projects) so they
     /// only run with --deep, --ci, --with-security, or the explicit
-    /// --security-full opt-in. Lightweight security (cargo audit) always runs
-    /// regardless of this flag.
+    /// --security-full opt-in. Cargo audit has separate eligibility based on
+    /// both the effective lint and security settings.
     ///
     /// `--security-full` is a deliberate opt-in to the full security tier, so
     /// it implies security intent on its own (a bare `prview --security-full`

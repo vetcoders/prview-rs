@@ -402,7 +402,7 @@ prview --help
 | `--with-bundle` | Enable the bundle build |
 | `--skip-bundle` | Skip the bundle build |
 | `--with-security` | Raise the heavy security posture (does not add cargo-geiger or full-tree Semgrep) |
-| `--skip-security` | Skip Semgrep and heavy security checks; lightweight cargo-audit remains enabled |
+| `--skip-security` | Skip Semgrep and heavy security checks; cargo-audit follows the selected profile |
 | `--security-full` | Full security tier: runs full-tree Semgrep and adds cargo-geiger's unsafe scan (slow; off even under `--deep`) |
 | `--resource-budget safe\|balanced` | Select the whole-machine envelope (`safe` is the default; `balanced` is capped and load-aware) |
 | `--tests-pattern PATTERN` | Filter Vitest by regex or Cargo/libtest by literal substring; Mixed uses the literal intersection and Pytest remains unfiltered |
@@ -413,6 +413,8 @@ ordinary run without `--with-security` still uses the default Semgrep scan.
 The explicit opt-out is a declared mode skip. If policy requires Semgrep at
 `block` severity, the missing scan requires review and leaves analysis incomplete.
 A required scanner that is unavailable without an explicit opt-out still blocks.
+Cargo audit retains its separate lint/security eligibility; quick and gate
+profiles can skip it when both settings are disabled.
 
 By default, Semgrep is scoped to the change when prview can resolve a clean git
 baseline: it passes Semgrep `--baseline-commit <merge-base>` so existing
@@ -906,7 +908,9 @@ a changed **tracked** Cargo.lock does. Staged changes, deletions and changes
 committed inside the snapshot are included. Local operator worktrees are outside
 this snapshot rule. An observed change remains visible even if a later check
 restores the file. Check names label observation boundaries and do not identify
-the writer when checks overlap. Results overlapping an observed change are not
+the writer when checks overlap. An observed HEAD change also remains in the
+human caveat after HEAD is restored, including an empty commit with no changed
+paths. Results overlapping an observed change are not
 written to cache. These observations are not atomic and do not cover later
 context commands; a change restored between observations can remain undetected.
 

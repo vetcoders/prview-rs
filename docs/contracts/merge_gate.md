@@ -795,7 +795,9 @@ Clean shared snapshots and local runs add no signal. Newly untracked files
 (including a tracked Cargo.lock) and changes committed inside the snapshot are
 included. The evidence retains non-clean observations before/after live checks plus
 the final observation before context tools, so a later restoration does not erase
-an observed change. Boundary check names do not identify the writer. Changes
+an observed change. The human caveat retains an observed HEAD change even when
+HEAD is restored and the changed-path list is empty. Boundary check names do not
+identify the writer. Changes
 restored between observations are not guaranteed to be detected. Results that
 overlap non-clean observations are not written to cache; raw results are preserved.
 

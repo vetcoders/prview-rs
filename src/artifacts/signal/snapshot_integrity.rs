@@ -113,7 +113,12 @@ impl SnapshotIntegrity {
             } else {
                 String::new()
             };
-            let head = if self.observed_head_sha.as_deref() != Some(&self.expected_target_sha) {
+            let head = if self.observations.iter().any(|observation| {
+                observation
+                    .observed_head_sha
+                    .as_deref()
+                    .is_some_and(|head| head != observation.expected_target_sha)
+            }) {
                 "; snapshot HEAD changed"
             } else {
                 ""
@@ -173,6 +178,33 @@ mod tests {
             .to_string();
         let snapshot = crate::git::create_worktree_snapshot(tmp.path(), &target).unwrap();
         (tmp, snapshot, target)
+    }
+
+    #[test]
+    fn snapshot_integrity_explains_a_restored_head_without_path_changes() {
+        let (owner, snapshot, target) = fixture();
+        let repo = git2::Repository::open(&snapshot.worktree_path).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.test").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "empty commit",
+            &parent.tree().unwrap(),
+            &[&parent],
+        )
+        .unwrap();
+        let changed = SnapshotObservation::observe(&snapshot.worktree_path, owner.path(), &target);
+        assert_eq!(changed.status, SnapshotIntegrityStatus::Modified);
+        assert_eq!(changed.changed_paths, Some(Vec::new()));
+        repo.set_head_detached(git2::Oid::from_str(&target).unwrap())
+            .unwrap();
+        let restored = SnapshotObservation::observe(&snapshot.worktree_path, owner.path(), &target);
+        assert!(!restored.requires_review());
+        let evidence = SnapshotIntegrity::from_observations(restored, vec![changed]);
+        assert!(evidence.requires_review());
+        assert!(evidence.review_caveat().contains("snapshot HEAD changed"));
     }
 
     #[test]

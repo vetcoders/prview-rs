@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Snapshot caveats retain observed HEAD changes after restoration, including
+  empty commits with no tracked-path changes. Security option help names the
+  Semgrep opt-out and no longer promises unconditional cargo-audit execution.
+
 - Check configurations pin the target resolved for the diff in headless, update
   and TUI runs. Moved or deleted branch/PR refs cannot redirect shared checks to
   the operator checkout; unavailable pinned commits fail planning explicitly.

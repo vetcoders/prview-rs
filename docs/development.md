@@ -60,8 +60,8 @@ survives until the session is dropped. Tests can explicitly override `PATH` or
 environment mutation or manual PATH preparation is required. This harness tests
 CLI/MCP contracts, not real Semgrep detection; production discovery and scanner
 dogfood remain separate. Library pipeline/watch fixtures explicitly set
-`skip_security = true`: `run_security = false` only disables the heavy security
-tier and does not disable Semgrep. The shared `test_config()` does not opt out of
+`skip_security = true` to disable Semgrep. Setting `run_security = false` alone
+does not disable Semgrep. The shared `test_config()` does not opt out of
 Semgrep, so eligibility tests can still exercise default discovery. The test double has POSIX shell and Windows command
 script implementations; runtime evidence must still name the platform exercised.
 
