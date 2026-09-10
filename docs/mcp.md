@@ -143,6 +143,16 @@ by a finalized pack plus its exact durable run-id/path index row, not by the
 child's exit code (prview exits non-zero on a `BLOCK` verdict, yet the run is a
 valid completed review). Response:
 
+Quick reviews use the shared owned Tokio child wrapper, including a Windows
+Job Object established before the child runs. The server observes the direct
+root's exit separately from the Job Object completion stream, so a surviving
+child cannot hide that root exit. Every terminal outcome closes the owned root
+group or Job Object, reaps the root, and finalizes the mirrored child registry
+before reporting containment. Successful root exit therefore also closes
+ordinary root-group descendants, including those retaining an inherited ledger
+lock. Unix keeps its existing stopped-root census for separately-grouped tools;
+cleanup does not repeat that census after those groups have been terminated.
+
 If the synchronous child wait itself fails, the server routes it through the
 same bounded containment and direct-root reap before returning `run_failed`.
 On Unix, timeout and wait-error cleanup first sends Ctrl-C to let the review's

@@ -1527,7 +1527,16 @@ and read truth back from storage. Every tool takes an explicit `repo` path,
 every response carries `schema_version`, and every failure is fail-loud. See
 `docs/mcp.md` for the tool reference.
 
-Synchronous quick reviews retain their hardened child through the bounded wait.
+Synchronous quick reviews retain the shared owned Tokio wrapper through the
+bounded direct-root wait (`wait_for_direct_child_exit`). On Windows the wrapper
+retains its Job Object even after the root exits; waiting for the whole job
+before cleanup would let a surviving descendant consume the quick budget.
+Success, cooperative cancellation, and hard fallback converge on
+`finalize_supervised_tokio_child`: close/reap the owned root group or Job Object,
+then settle the mirrored registry and its spawn barrier. Unix uses the existing
+root-group kill/reap primitive after its tracker/census has handled separate
+groups, avoiding a second census of already-terminated children. This also
+closes root-group descendants holding the ledger open after root exit.
 A timeout or child-wait error first requests the root's ordinary cancellation
 unwind, then uses the parent-owned child-group sidecar described above before
 hard-killing and reaping the direct root. Failed quick runs retain

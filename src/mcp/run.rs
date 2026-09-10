@@ -427,7 +427,7 @@ fn with_containment_status(mut error: ToolError, containment_confirmed: bool) ->
 /// is reaped, lifecycle readers classify it as diagnostic `Stale` state without
 /// blocking the next review.
 async fn quick_wait_failure(
-    child: &mut tokio::process::Child,
+    child: &mut dyn process_wrap::tokio::ChildWrapper,
     child_pid: Option<u32>,
     child_groups: &mut crate::proc::ExternalChildGroupTracker,
     error: std::io::Error,
@@ -553,7 +553,7 @@ pub async fn start(
                         )
                     })?;
 
-            let mut child = cmd.spawn().map_err(|e| {
+            let mut child = crate::proc::spawn_owned_tokio_child(cmd).map_err(|e| {
                 ToolError::new(error_class::RUN_FAILED, format!("spawn prview failed: {e}"))
             })?;
             // Declared after `child` so cancellation drops the tracker first:
@@ -562,7 +562,7 @@ pub async fn start(
             let mut child_groups = child_group_setup;
             child_groups.child_spawned(child.id());
             // Capture the pid (also the pgid, since the child leads its group)
-            // before the borrow in `child.wait()`; needed to signal the group.
+            // before observing direct-root completion; needed to signal the group.
             let child_pid = child.id();
 
             // Marker setup is part of child ownership. If PID identity capture
@@ -578,7 +578,7 @@ pub async fn start(
                 Ok(marker) => marker,
                 Err(error) => {
                     let containment_confirmed = crate::proc::terminate_supervised_tokio_child(
-                        &mut child,
+                        child.as_mut(),
                         child_pid,
                         &mut child_groups,
                         Duration::from_secs(2),
@@ -590,7 +590,7 @@ pub async fn start(
             };
             if let Err(error) = write_marker(&run_dir, &marker) {
                 let containment_confirmed = crate::proc::terminate_supervised_tokio_child(
-                    &mut child,
+                    child.as_mut(),
                     child_pid,
                     &mut child_groups,
                     Duration::from_secs(2),
@@ -601,13 +601,18 @@ pub async fn start(
             }
 
             let budget = quick_budget();
-            match tokio::time::timeout(budget, child.wait()).await {
+            match tokio::time::timeout(
+                budget,
+                crate::proc::wait_for_direct_child_exit(child.as_mut()),
+            )
+            .await
+            {
                 Err(_) => {
                     // Ask prview's governor to drain its exact group registry;
                     // the parent-owned copy remains the hard fallback if the
                     // root cannot complete that cooperative unwind.
                     let reaped = crate::proc::terminate_supervised_tokio_child(
-                        &mut child,
+                        child.as_mut(),
                         child_pid,
                         &mut child_groups,
                         Duration::from_secs(2),
@@ -636,18 +641,22 @@ pub async fn start(
                     ))
                 }
                 Ok(Err(e)) => {
-                    Err(quick_wait_failure(&mut child, child_pid, &mut child_groups, e).await)
+                    Err(quick_wait_failure(child.as_mut(), child_pid, &mut child_groups, e).await)
                 }
                 Ok(Ok(status)) => {
                     child_groups.root_reaped();
-                    if !child_groups
-                        .finalize_after_root_exit(Duration::from_secs(5))
-                        .await
+                    if !crate::proc::finalize_supervised_tokio_child(
+                        child.as_mut(),
+                        child_pid,
+                        &mut child_groups,
+                        Duration::from_secs(5),
+                    )
+                    .await
                     {
                         return Err(with_containment_status(
                             ToolError::new(
                                 error_class::RUN_FAILED,
-                                "prview exited but separately-grouped tools could not be fully terminated",
+                                "prview exited but its owned process tree could not be fully terminated",
                             ),
                             false,
                         ));
@@ -1441,6 +1450,63 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_success_closes_unregistered_root_group_member() {
+        struct GroupCleanup(u32);
+        impl Drop for GroupCleanup {
+            fn drop(&mut self) {
+                crate::proc::terminate_process_tree(self.0);
+            }
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let pidfile = fixture.path().join("background.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+                "sh",
+            ])
+            .arg(&pidfile);
+        crate::proc::harden(&mut command);
+        let setup = crate::proc::ExternalChildGroupTracker::attach(&mut command, fixture.path())
+            .expect("attach tracker");
+        let mut child = crate::proc::spawn_owned_tokio_child(command).expect("spawn quick root");
+        let root_pid = child.id().unwrap();
+        let _cleanup = GroupCleanup(root_pid);
+        let mut tracker = setup;
+        tracker.child_spawned(Some(root_pid));
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("direct root deadline")
+            .expect("direct root exit");
+        assert!(status.success());
+        let background: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(crate::storage::is_process_alive(background));
+
+        tracker.root_reaped();
+        let contained = crate::proc::finalize_supervised_tokio_child(
+            child.as_mut(),
+            Some(root_pid),
+            &mut tracker,
+            Duration::from_secs(2),
+        )
+        .await;
+        let survived = crate::storage::is_process_alive(background);
+        crate::proc::terminate_process_tree(root_pid);
+        wait_until_process_is_reaped(background);
+        assert!(
+            contained && !survived,
+            "quick terminal cleanup: contained={contained}, background_survived={survived}"
+        );
+    }
+
     #[test]
     fn profile_parse_defaults_quick_and_rejects_unknown() {
         assert_eq!(Profile::parse(None).unwrap(), Profile::Quick);
@@ -1448,6 +1514,62 @@ mod tests {
         assert_eq!(Profile::parse(Some("deep")).unwrap(), Profile::Deep);
         let err = Profile::parse(Some("turbo")).unwrap_err();
         assert_eq!(err.class, error_class::RUN_FAILED);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_quick_success_closes_job_descendant() {
+        let fixture = tempfile::tempdir().unwrap();
+        let child_script = fixture.path().join("background.ps1");
+        let parent_script = fixture.path().join("parent.ps1");
+        let pidfile = fixture.path().join("background.pid");
+        std::fs::write(&child_script, "Start-Sleep -Seconds 30\n").unwrap();
+        std::fs::write(
+            &parent_script,
+            format!(
+                "$c = Start-Process -PassThru powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','\"{}\"'\nSet-Content -LiteralPath '{}' -Value $c.Id\nexit 0\n",
+                child_script.display(), pidfile.display(),
+            ),
+        )
+        .unwrap();
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&parent_script);
+        crate::proc::harden(&mut command);
+        let setup = crate::proc::ExternalChildGroupTracker::attach(&mut command, fixture.path())
+            .expect("attach tracker");
+        let mut child =
+            crate::proc::spawn_owned_tokio_child(command).expect("spawn owned quick root");
+        let pid = child.id();
+        let mut tracker = setup;
+        tracker.child_spawned(pid);
+        let status = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::proc::wait_for_direct_child_exit(child.as_mut()),
+        )
+        .await
+        .expect("direct root must exit without waiting for its background child")
+        .expect("direct root exit");
+        assert!(status.success());
+        let background: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(crate::storage::is_process_alive(background));
+        tracker.root_reaped();
+        assert!(
+            crate::proc::finalize_supervised_tokio_child(
+                child.as_mut(),
+                pid,
+                &mut tracker,
+                Duration::from_secs(5),
+            )
+            .await,
+            "quick completion must terminate the retained Job Object",
+        );
+        wait_until_process_is_reaped(background);
     }
 
     #[test]
@@ -1757,7 +1879,8 @@ mod tests {
         let child_group_setup =
             crate::proc::ExternalChildGroupTracker::attach(&mut command, fixture.path())
                 .expect("attach quick child-group tracker");
-        let mut child = command.spawn().expect("spawn hardened quick-review tree");
+        let mut child = crate::proc::spawn_owned_tokio_child(command)
+            .expect("spawn hardened quick-review tree");
         let mut child_groups = child_group_setup;
         child_groups.child_spawned(child.id());
         let child_pid = child.id();
@@ -1790,7 +1913,7 @@ mod tests {
         assert!(crate::storage::is_process_alive(grandchild));
 
         let error = quick_wait_failure(
-            &mut child,
+            child.as_mut(),
             child_pid,
             &mut child_groups,
             std::io::Error::other("injected quick wait failure"),
@@ -1839,7 +1962,8 @@ mod tests {
         let child_group_setup =
             crate::proc::ExternalChildGroupTracker::attach(&mut command, fixture.path())
                 .expect("attach quick child-group tracker");
-        let mut child = command.spawn().expect("spawn quick review fixture");
+        let mut child =
+            crate::proc::spawn_owned_tokio_child(command).expect("spawn quick review fixture");
         let mut child_groups = child_group_setup;
         child_groups.child_spawned(child.id());
         let root_pid = child.id().expect("quick fixture root pid");
@@ -1892,7 +2016,7 @@ mod tests {
 
         assert!(
             crate::proc::terminate_supervised_tokio_child(
-                &mut child,
+                child.as_mut(),
                 Some(root_pid),
                 &mut child_groups,
                 Duration::from_millis(50),
@@ -2063,7 +2187,8 @@ mod tests {
         let tracker_setup =
             crate::proc::ExternalChildGroupTracker::attach(&mut command, fixture.path())
                 .expect("attach quick child-group tracker");
-        let mut child = command.spawn().expect("spawn pre-exec-gap review root");
+        let mut child =
+            crate::proc::spawn_owned_tokio_child(command).expect("spawn pre-exec-gap review root");
         let mut child_groups = tracker_setup;
         child_groups.child_spawned(child.id());
         let root_pid = child.id().expect("pre-exec-gap root pid");
@@ -2101,7 +2226,7 @@ mod tests {
 
         assert!(
             crate::proc::terminate_supervised_tokio_child(
-                &mut child,
+                child.as_mut(),
                 Some(root_pid),
                 &mut child_groups,
                 Duration::from_millis(50),

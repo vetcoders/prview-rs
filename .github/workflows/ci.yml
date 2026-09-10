@@ -90,6 +90,9 @@ jobs:
       - name: Prove Tokio root-exit ownership
         timeout-minutes: 2
         run: cargo test --lib proc::tests::windows_successful_root_exit_reaps_job_descendants -- --exact
+      - name: Prove MCP quick root-exit ownership
+        timeout-minutes: 2
+        run: cargo test --lib mcp::run::tests::windows_quick_success_closes_job_descendant -- --exact
       - name: Prove synchronous root-exit ownership
         timeout-minutes: 2
         run: cargo test --lib proc::tests::windows_sync_root_exit_reaps_job_descendants -- --exact

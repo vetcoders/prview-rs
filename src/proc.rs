@@ -1712,6 +1712,14 @@ pub async fn terminate_and_reap_tokio_child(
     pid: Option<u32>,
     reap_timeout: Duration,
 ) -> bool {
+    terminate_and_reap_tokio_child_wrapper(child, pid, reap_timeout).await
+}
+
+async fn terminate_and_reap_tokio_child_wrapper(
+    child: &mut dyn process_wrap::tokio::ChildWrapper,
+    pid: Option<u32>,
+    reap_timeout: Duration,
+) -> bool {
     let tree_terminated = pid.is_some_and(terminate_process_tree);
     let direct_kill_started = child.start_kill().is_ok();
     let root_reaped = matches!(
@@ -1728,10 +1736,10 @@ pub async fn terminate_and_reap_tokio_child(
 /// child registry. If that bounded unwind does not finish, the MCP-side sidecar
 /// supplies committed and pre-exec provisional tool groups to the hard fallback.
 /// Its inherited lock cannot be acquired until every in-flight pre-exec child
-/// has either published its PGID or failed the spawn. Windows uses its native
-/// recursive tree termination and needs no side ledger.
+/// has either published its PGID or failed the spawn. Windows retains its owned
+/// Job Object through root exit and needs no Unix side ledger.
 pub(crate) async fn terminate_supervised_tokio_child(
-    child: &mut tokio::process::Child,
+    child: &mut dyn process_wrap::tokio::ChildWrapper,
     pid: Option<u32>,
     tracker: &mut ExternalChildGroupTracker,
     cooperative_grace: Duration,
@@ -1744,11 +1752,11 @@ pub(crate) async fn terminate_supervised_tokio_child(
     if let Some(pid) = pid {
         let _ = interrupt_process_group(pid);
         if matches!(
-            tokio::time::timeout(cooperative_grace, child.wait()).await,
+            tokio::time::timeout(cooperative_grace, child.inner_mut().wait()).await,
             Ok(Ok(_))
         ) {
             tracker.root_reaped();
-            return tracker.finalize_after_root_exit(reap_timeout).await;
+            return finalize_supervised_tokio_child(child, Some(pid), tracker, reap_timeout).await;
         }
     }
 
@@ -1790,19 +1798,34 @@ pub(crate) async fn terminate_supervised_tokio_child(
     #[cfg(not(unix))]
     let descendant_groups_terminated = true;
     let nested_before_root = tracker.terminate_active_groups(false);
-    let root_reaped = terminate_and_reap_tokio_child(child, pid, reap_timeout).await;
+    let finalized = finalize_supervised_tokio_child(child, pid, tracker, reap_timeout).await;
+    root_suspended && descendant_groups_terminated && nested_before_root && finalized
+}
+
+/// Finish an MCP quick root through the shared owned group/Job Object primitive,
+/// then close the mirrored registry. Killing the owned root group first releases
+/// ledger locks retained by unregistered descendants after the root exits.
+pub(crate) async fn finalize_supervised_tokio_child(
+    child: &mut dyn process_wrap::tokio::ChildWrapper,
+    pid: Option<u32>,
+    tracker: &mut ExternalChildGroupTracker,
+    reap_timeout: Duration,
+) -> bool {
+    // Unix's tracker/census already owns separately-grouped descendants. Do
+    // not take a second census after those groups have been terminated.
+    #[cfg(unix)]
+    let owned_closed = terminate_and_reap_tokio_child_wrapper(child, pid, reap_timeout).await;
+    #[cfg(windows)]
+    let owned_closed = matches!(
+        tokio::time::timeout(reap_timeout, terminate_owned_tokio_child(child, pid)).await,
+        Ok(true)
+    );
+    let root_reaped = matches!(child.inner_mut().try_wait(), Ok(Some(_)));
     if root_reaped {
         tracker.root_reaped();
     }
-    // Root reap closes its locked ledger writer. Acquiring that lock proves
-    // every child already forked into pre-exec has written a provisional PGID
-    // or failed its spawn.
-    let finalized_after_root = tracker.finalize_after_root_exit(reap_timeout).await;
-    root_suspended
-        && descendant_groups_terminated
-        && nested_before_root
-        && root_reaped
-        && finalized_after_root
+    let groups_closed = tracker.finalize_after_root_exit(reap_timeout).await;
+    owned_closed && root_reaped && groups_closed
 }
 
 /// Apply the standard rails to `cmd`: detached stdin, `kill_on_drop`, and (unix)
@@ -2354,7 +2377,7 @@ pub fn run_pipeline_governed(
     Ok((producer_status.unwrap(), consumer_status.unwrap()))
 }
 
-fn spawn_owned_tokio_child(
+pub(crate) fn spawn_owned_tokio_child(
     cmd: TokioCommand,
 ) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
     use process_wrap::tokio::{CommandWrap, KillOnDrop};
@@ -2366,7 +2389,7 @@ fn spawn_owned_tokio_child(
     wrapped.spawn()
 }
 
-async fn wait_for_direct_child_exit(
+pub(crate) async fn wait_for_direct_child_exit(
     child: &mut dyn process_wrap::tokio::ChildWrapper,
 ) -> std::io::Result<std::process::ExitStatus> {
     loop {
