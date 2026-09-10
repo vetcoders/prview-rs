@@ -220,7 +220,11 @@ Implementations:
 - `ClippyCheck` - `cargo clippy`
 - `CargoTestCheck` - `cargo test`
 - `CargoAuditCheck` - `cargo audit`
-- `SemgrepCheck` - Semgrep JSON scan; default is diff-scoped with
+- `SemgrepCheck` - Semgrep JSON scan. Configuration discovery runs against its
+  resolved scan directory, preferring `semgrep.yml`, then `.semgrep.yml`,
+  `.semgrep.yaml`, `semgrep.yaml`, and `.semgrep`; `auto` is used only when no
+  candidate exists. The scanner reports invalid selected rules without a
+  fallback scan. The selected argument remains in check provenance. Default is diff-scoped with
   `--baseline-commit <merge-base>` when the git baseline is clean and available,
   while `--security-full` keeps a full-tree scan. Explicit `--skip-security`
   is carried separately from the heavy-security opt-in and disables this check
