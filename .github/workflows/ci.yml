@@ -69,6 +69,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
 
+  installer:
+    name: Installer contract
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install shellcheck
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+      - name: Lint the installer and its tests
+        run: shellcheck install.sh tools/tests/test_install.sh
+      # Offline: every case serves a fixture release over file:// or 127.0.0.1.
+      # No cargo, no toolchain, no real release download.
+      - name: Prove the installer fails closed
+        run: sh tools/tests/test_install.sh
+
   windows-process-tree:
     name: Windows process-tree cancellation
     runs-on: windows-latest

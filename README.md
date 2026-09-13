@@ -45,6 +45,8 @@ Quickest — download the latest checksum-verified release binary into `~/.local
 curl -fsSL https://raw.githubusercontent.com/vetcoders/prview-rs/main/install.sh | sh
 ```
 
+The installer is fail-closed: it installs an official binary whose checksum, macOS signature and notarization, and build provenance all verify — or it installs nothing and exits non-zero. It has no source-build fallback and never runs `cargo` on your machine.
+
 From crates.io:
 
 ```bash

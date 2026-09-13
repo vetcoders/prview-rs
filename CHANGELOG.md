@@ -11,6 +11,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `install.sh` is fail-closed. It installs an official release binary or it
+  installs nothing: the `cargo install` fallback is gone, along with every code
+  path that could build, compile, or clone on the user's machine. `latest` is
+  resolved to a concrete tag before downloading, the archive is matched against
+  its exact `SHA256SUMS` entry, the archive must contain exactly one regular
+  file named `prview`, unpacking happens in a temporary directory, and the
+  binary is installed atomically with `install -m 755`. On macOS the binary must
+  pass `codesign --verify --strict`, report Team ID `MW223P3NPX`, and be accepted
+  by Gatekeeper's primary-signature assessment
+  (`spctl -a -t open --context context:primary-signature -vv`), which must
+  report `source=Notarized Developer ID`; a Developer ID signature without a
+  notarization ticket reports plain `source=Developer ID` and is rejected. There
+  is no bypass environment variable. The
+  installed binary is then executed: `--version` must match the resolved tag and
+  `--build-source-sha` must be a 40-hex commit. Consequences by design: on macOS,
+  unsigned releases up to and including v0.7.0 are rejected (exit 5), and any
+  release whose binary reports `--build-source-sha` as `unknown` is rejected
+  (exit 6). New environment variables `PRVIEW_VERSION`, `PRVIEW_BASE_URL`, and
+  `PRVIEW_MACOS_TEAM_ID` join `PRVIEW_INSTALL_DIR`; documented exit codes are
+  0 ok, 1 tooling, 2 unsupported platform, 3 missing artifact, 4
+  checksum/archive invalid, 5 macOS signature/notarization, 6 post-install
+  verification. `docs/INSTALL.md` carries the full contract.
+
+### Fixed
+
+- The curl installer no longer silently substitutes a locally compiled binary
+  for an official one. Previously a failed download, a missing artifact, or an
+  unsupported platform fell through to `cargo install prview --locked --force`,
+  so a user who asked for a checksum-verified release could receive an
+  unverified source build — or, with `cargo` absent, only learn about it at the
+  end. Unsupported platforms now fail immediately with exit 2 and a message
+  naming the two supported targets.
+
 ## [0.8.0] - 2026-09-13
 
 ### Added
