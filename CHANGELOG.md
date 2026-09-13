@@ -13,6 +13,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `install.sh` is fail-closed. It installs an official release binary or it
+  installs nothing: the `cargo install` fallback is gone, along with every code
+  path that could build, compile, or clone on the user's machine. `latest` is
+  resolved to a concrete tag before downloading, the archive is matched against
+  its exact `SHA256SUMS` entry, the archive must contain exactly one regular
+  file named `prview`, unpacking happens in a temporary directory, and the
+  binary is installed atomically with `install -m 755`. On macOS the binary must
+  pass `codesign --verify --strict`, report Team ID `MW223P3NPX`, and be accepted
+  by Gatekeeper's primary-signature assessment
+  (`spctl -a -t open --context context:primary-signature -vv`), which must
+  report `source=Notarized Developer ID`; a Developer ID signature without a
+  notarization ticket reports plain `source=Developer ID` and is rejected. There
+  is no bypass environment variable. The
+  installed binary is then executed: `--version` must match the resolved tag and
+  `--build-source-sha` must be a 40-hex commit. Consequences by design: on macOS,
+  unsigned releases up to and including v0.7.0 are rejected (exit 5), and any
+  release whose binary reports `--build-source-sha` as `unknown` is rejected
+  (exit 6). New environment variables `PRVIEW_VERSION`, `PRVIEW_BASE_URL`, and
+  `PRVIEW_MACOS_TEAM_ID` join `PRVIEW_INSTALL_DIR`; documented exit codes are
+  0 ok, 1 tooling, 2 unsupported platform, 3 missing artifact, 4
+  checksum/archive invalid, 5 macOS signature/notarization, 6 post-install
+  verification. `docs/INSTALL.md` carries the full contract.
+
+### Fixed
+
+- The curl installer no longer silently substitutes a locally compiled binary
+  for an official one. Previously a failed download, a missing artifact, or an
+  unsupported platform fell through to `cargo install prview --locked --force`,
+  so a user who asked for a checksum-verified release could receive an
+  unverified source build — or, with `cargo` absent, only learn about it at the
+  end. Unsupported platforms now fail immediately with exit 2 and a message
+  naming the two supported targets.
+
+## [0.8.0] - 2026-09-13
+
+### Added
+
+- The macOS release binary is now signed with a Developer ID Application
+  certificate (Team ID `MW223P3NPX`) and notarized by Apple. The release
+  workflow verifies the signature strictly, asserts the `TeamIdentifier`,
+  requires notarization to reach `Accepted`, requires Gatekeeper to report
+  `source=Notarized Developer ID` via
+  `spctl -a -t open --context context:primary-signature`, and proves the
+  archived binary is the notarized one by comparing code directory hashes after
+  extraction. A
+  credentials preflight job fails the whole run when a signing or notarization
+  secret is missing, so no release can be produced unsigned.
+- The release workflow accepts `workflow_dispatch` as a dry run. It executes the
+  identical preflight, validate, build, sign, notarize and checksum jobs and
+  uploads the archives plus `SHA256SUMS` as workflow artifacts; GitHub Release
+  creation and the crates.io publish remain gated on a pushed `v*` tag.
+- Release archives and `SHA256SUMS` carry a signed GitHub build provenance
+  attestation, verifiable with
+  `gh attestation verify <file> --repo vetcoders/prview-rs`.
+
+### Fixed
+
+- Release binaries no longer link Homebrew or system OpenSSL. `git2` is now
+  built without its default `https`/`ssh` features — which drops `openssl-sys`
+  and `libssh2-sys` — and with `vendored-libgit2`, so libgit2 is bundled rather
+  than picked up from the build host. prview only reads local repositories
+  through libgit2; every network operation already went through the `git` CLI.
+  The previous macOS binaries linked `/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib`
+  and aborted on launch on any Mac without that exact Homebrew install: under
+  the hardened runtime dyld refuses a non-platform dylib with a different Team
+  ID, so even `prview --version` died with SIGABRT despite a valid signature,
+  notarization and Gatekeeper acceptance.
+- The release workflow now executes the *signed* macOS binary — not just the
+  pre-signing one — and fails unless it prints the expected version and source
+  commit, and unless `otool -L` shows only libraries under `/usr/lib` or
+  `/System`. The Linux build asserts the same shape with `ldd`, rejecting any
+  `libssl`, `libcrypto`, `libssh2`, `libgit2` or `libcurl` linkage.
+- Official release binaries no longer report `unknown` from
+  `prview --build-source-sha`. The workflow builds with `PRVIEW_SOURCE_SHA` set
+  to the released commit and fails the job unless the built binary reports
+  exactly that commit and the Cargo.toml version.
+
+### Changed
+
+- `SHA256SUMS` is regenerated deterministically from the downloaded archives in
+  a byte-sorted order, verified with `sha256sum -c`, and every archive is
+  required to have an entry. The per-build `prview-*.tar.gz.sha256` files are no
+  longer uploaded; the manifest format is unchanged. The release also pins the
+  published target set to the two documented platforms, so a release that is
+  missing a target archive — or carries an undocumented one — fails instead of
+  publishing a partial set.
+
 - `report.json` schema 3.0 makes `quality.breaking_changes.md_path` nullable.
   Missing Markdown reports no longer advertise a dead link; existing Rust API
   reports remain linked even when they contain no breaking findings.
@@ -93,38 +180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `prview gate` pre-push hook is gone. Quality proof lives in required CI, where
   clippy now covers `--all-targets`, and in an explicitly invoked `make check`.
 
-- `install.sh` is fail-closed. It installs an official release binary or it
-  installs nothing: the `cargo install` fallback is gone, along with every code
-  path that could build, compile, or clone on the user's machine. `latest` is
-  resolved to a concrete tag before downloading, the archive is matched against
-  its exact `SHA256SUMS` entry, the archive must contain exactly one regular
-  file named `prview`, unpacking happens in a temporary directory, and the
-  binary is installed atomically with `install -m 755`. On macOS the binary must
-  pass `codesign --verify --strict`, report Team ID `MW223P3NPX`, and be accepted
-  by Gatekeeper's primary-signature assessment
-  (`spctl -a -t open --context context:primary-signature -vv`), which must
-  report `source=Notarized Developer ID`; a Developer ID signature without a
-  notarization ticket reports plain `source=Developer ID` and is rejected. There
-  is no bypass environment variable. The
-  installed binary is then executed: `--version` must match the resolved tag and
-  `--build-source-sha` must be a 40-hex commit. Consequences by design: on macOS,
-  unsigned releases up to and including v0.7.0 are rejected (exit 5), and any
-  release whose binary reports `--build-source-sha` as `unknown` is rejected
-  (exit 6). New environment variables `PRVIEW_VERSION`, `PRVIEW_BASE_URL`, and
-  `PRVIEW_MACOS_TEAM_ID` join `PRVIEW_INSTALL_DIR`; documented exit codes are
-  0 ok, 1 tooling, 2 unsupported platform, 3 missing artifact, 4
-  checksum/archive invalid, 5 macOS signature/notarization, 6 post-install
-  verification. `docs/INSTALL.md` carries the full contract.
-
 ### Fixed
 
-- The curl installer no longer silently substitutes a locally compiled binary
-  for an official one. Previously a failed download, a missing artifact, or an
-  unsupported platform fell through to `cargo install prview --locked --force`,
-  so a user who asked for a checksum-verified release could receive an
-  unverified source build — or, with `cargo` absent, only learn about it at the
-  end. Unsupported platforms now fail immediately with exit 2 and a message
-  naming the two supported targets.
 - A real review on Windows no longer dies with `STATUS_STACK_OVERFLOW`: the
   composed root future of the review pipeline did not fit the 1 MiB default
   Windows main-thread stack, and Tokio cannot size the thread that runs
@@ -2505,7 +2562,8 @@ v0.1.2, consolidated from 183 commits on the development branch.
 - Cargo-geiger PascalCase output format for v0.13.0
 - Watch mode change detection using full git status hash
 
-[Unreleased]: https://github.com/vetcoders/prview-rs/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/vetcoders/prview-rs/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/vetcoders/prview-rs/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/vetcoders/prview-rs/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/vetcoders/prview-rs/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/vetcoders/prview-rs/compare/v0.4.0...v0.5.0

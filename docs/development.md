@@ -422,6 +422,10 @@ hyperfine './target/release/prview --quick'
 
 ## Release
 
+The release workflow, its required signing/notarization secrets and the
+`workflow_dispatch` dry run are documented in [Releasing prview](RELEASING.md).
+This section covers only local builds.
+
 ### Build the release binary
 
 ```bash

@@ -1,6 +1,6 @@
 [package]
 name = "prview"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.93.0"
 authors = ["vetcoders <hello@vetcoders.io>"]
@@ -36,8 +36,15 @@ async-trait = "0.1"
 # `src/proc.rs`.
 process-wrap = { version = "9.1", default-features = false, features = ["std", "tokio1", "job-object", "kill-on-drop"] }
 
-# Git operations
-git2 = "0.20"
+# Git operations. prview only reads local repositories through libgit2; every
+# network operation (fetch, clone) goes through the `git` CLI in `src/git`.
+# Dropping the default `https`/`ssh` features removes openssl-sys and
+# libssh2-sys, so release binaries do not link Homebrew/system OpenSSL — under a
+# hardened runtime dyld refuses such a dylib outright (different Team ID) and
+# the signed binary aborts on launch. `vendored-libgit2` pins the bundled
+# libgit2 so a pkg-config hit on a runner-provided libgit2 cannot reintroduce
+# the same failure class.
+git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

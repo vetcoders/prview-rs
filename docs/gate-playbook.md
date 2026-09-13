@@ -286,20 +286,19 @@ prview gate --strict
 Use the currently published composite Action for the final required stage:
 
 ```yaml
-- uses: vetcoders/prview-rs@v0.7.0 # current published Action
+- uses: vetcoders/prview-rs@v0.8.0 # current published Action
   id: prview
   with:
     strict: "true"
-    version: "0.7.0"
+    version: "0.8.0"
 ```
 
-This copy-pasteable example uses the historical verdict-only strict contract:
-`strict: "true"` rejects `CONDITIONAL`, while `strict: "false"` accepts it and
-`BLOCK` remains exit `1`. Typed review-required/warnings-only policy and the
-`fail-on-warnings` input are staged for `0.8.0`; release preparation owns
-switching both pins and adding that input only after the tag and crate are
-published. Until then, exercise the 0.8 contract from source rather than using
-an unissued release pin.
+This copy-pasteable example uses the strict contract: `strict: "true"`
+rejects `CONDITIONAL`, while `strict: "false"` accepts it and `BLOCK` remains
+exit `1`. Typed review-required/warnings-only policy and the
+`fail-on-warnings` input ship from `0.8.0`; add
+`fail-on-warnings: "true"` on top of `strict: "true"` to require a
+warning-clean pack as well.
 
 ## Troubleshooting
 

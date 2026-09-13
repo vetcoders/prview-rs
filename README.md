@@ -179,11 +179,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: vetcoders/prview-rs@v0.7.0 # current published Action
+      - uses: vetcoders/prview-rs@v0.8.0 # current published Action
         id: prview
         with:
           strict: "true"
-          version: "0.7.0"
+          version: "0.8.0"
       - uses: github/codeql-action/upload-sarif@v3
         if: ${{ steps.prview.outputs['sarif-path'] != '' }}
         with:
@@ -193,13 +193,11 @@ jobs:
 The Action maps pass/fail only from the `prview gate` exit-code contract. JSON
 stdout is used for step-summary details and artifact paths, not for deciding
 whether the check passed. `cargo-binstall` is used when available, with
-`cargo install prview` as the fallback. This copy-pasteable example deliberately
-uses the currently published `v0.7.0` Action/runtime and its historical
-verdict-only strict semantics. The typed warnings-only contract and the
-Action's `fail-on-warnings` input are staged for `0.8.0`; release preparation
-owns switching both pins and adding that input only after the tag and crate are
-published. Until then, exercise the 0.8 contract from source rather than using
-an unissued release pin.
+`cargo install prview` as the fallback. This copy-pasteable example uses the
+currently published `v0.8.0` Action/runtime, which carries the typed
+warnings-only contract and the Action's `fail-on-warnings` input. Set
+`fail-on-warnings: "true"` alongside `strict: "true"` to require a
+warning-clean pack as well.
 
 GitHub code scanning accepts SARIF uploads through
 `github/codeql-action/upload-sarif`. Keep SARIF under GitHub's ingestion limits:

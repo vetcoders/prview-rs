@@ -3,17 +3,69 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Dry run: executes the identical preflight/validate/build/sign/notarize/
+  # checksum path and uploads the archives + SHA256SUMS as workflow artifacts.
+  # The `release` and `publish` jobs are event-gated, so a dispatch can never
+  # create a GitHub Release or publish to crates.io.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   # Match local dev / CI (1.94.x); the old 1.92.0 leptos-via-loctree pin no
   # longer reproduces — see ci.yml.
   RUST_TOOLCHAIN: "1.94"
+  # Apple Developer Team ID of the Developer ID Application certificate used to
+  # sign the macOS binary. Public by construction: it is embedded in every
+  # signature and printed by `codesign -dv --verbose=2`.
+  PRVIEW_MACOS_TEAM_ID: "MW223P3NPX"
+  # The exact set of targets every release publishes — the support contract in
+  # docs/INSTALL.md "Platform support". The `checksums` job refuses to build a
+  # manifest unless the downloaded archives match this list exactly, so a
+  # dropped matrix leg goes red instead of shipping a partial release. Keep it
+  # in step with the `build` matrix below.
+  PRVIEW_RELEASE_TARGETS: "aarch64-apple-darwin x86_64-unknown-linux-gnu"
 
 permissions:
   contents: read
 
 jobs:
+  preflight:
+    name: Credentials Preflight
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert signing and notarization secrets are present
+        shell: bash
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_P12_PASSWORD: ${{ secrets.MACOS_CERT_P12_PASSWORD }}
+          NOTARY_API_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_API_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+          NOTARY_API_KEY_P8_BASE64: ${{ secrets.NOTARY_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          # Every macOS release artifact is Developer ID-signed and notarized.
+          # A missing secret must fail the whole run here rather than silently
+          # skipping a signing step and shipping an unsigned binary.
+          MISSING=0
+          for NAME in MACOS_CERT_P12_BASE64 \
+                      MACOS_CERT_P12_PASSWORD \
+                      NOTARY_API_KEY_ID \
+                      NOTARY_API_ISSUER_ID \
+                      NOTARY_API_KEY_P8_BASE64; do
+            if [ -z "${!NAME}" ]; then
+              echo "::error::required secret ${NAME} is empty or not visible to this repository — cannot codesign/notarize the macOS binary"
+              MISSING=$((MISSING + 1))
+            else
+              echo "ok: ${NAME} present"
+            fi
+          done
+
+          if [ "${MISSING}" -ne 0 ]; then
+            echo "::error::${MISSING} required release secret(s) missing; releases are never unsigned"
+            exit 1
+          fi
+
   validate:
     name: Validate Release Metadata
     runs-on: ubuntu-latest
@@ -22,27 +74,35 @@ jobs:
       - name: Validate tag, Cargo.toml, and CHANGELOG
         shell: bash
         run: |
-          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
-          TAG="${GITHUB_REF_NAME}"
+          set -euo pipefail
 
-          if [ "v${VERSION}" != "${TAG}" ]; then
-            echo "Tag ${TAG} does not match Cargo.toml version v${VERSION}"
-            exit 1
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            if [ "v${VERSION}" != "${TAG}" ]; then
+              echo "::error::Tag ${TAG} does not match Cargo.toml version v${VERSION}"
+              exit 1
+            fi
+          else
+            # Dry run: there is no tag to compare against, so the Cargo.toml
+            # version is authoritative. Every other check below is identical.
+            echo "workflow_dispatch dry run: validating Cargo.toml version v${VERSION} (no tag comparison)"
           fi
 
           grep -q '^## \[Unreleased\]' CHANGELOG.md || {
-            echo "CHANGELOG.md must contain an [Unreleased] section"
+            echo "::error::CHANGELOG.md must contain an [Unreleased] section"
             exit 1
           }
 
           grep -q "^## \[${VERSION}\]" CHANGELOG.md || {
-            echo "CHANGELOG.md must contain a release section for ${VERSION}"
+            echo "::error::CHANGELOG.md must contain a release section for ${VERSION}"
             exit 1
           }
 
   build:
     name: Build (${{ matrix.target }})
-    needs: validate
+    needs: [preflight, validate]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -59,44 +119,501 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Build release binary
+        env:
+          # build.rs bakes this into PRVIEW_BUILD_SOURCE_SHA. Without it the
+          # official binaries report "unknown" provenance.
+          PRVIEW_SOURCE_SHA: ${{ github.sha }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Strip binary
+        shell: bash
         run: |
+          set -euo pipefail
           BIN="target/${{ matrix.target }}/release/prview"
           if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
             strip -x "$BIN"
           else
             strip "$BIN"
           fi
-      - name: Package archive
+
+      - name: Assert embedded provenance
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
         run: |
+          set -euo pipefail
+
+          BIN="target/${{ matrix.target }}/release/prview"
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+
+          ACTUAL_SHA="$("$BIN" --build-source-sha)"
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+            echo "::error::binary reports source SHA '${ACTUAL_SHA}', expected '${EXPECTED_SHA}'"
+            exit 1
+          fi
+
+          ACTUAL_VERSION="$("$BIN" --version)"
+          if [ "${ACTUAL_VERSION}" != "prview ${VERSION}" ]; then
+            echo "::error::binary reports version '${ACTUAL_VERSION}', expected 'prview ${VERSION}'"
+            exit 1
+          fi
+
+          echo "provenance ok: ${ACTUAL_VERSION} built from ${ACTUAL_SHA}"
+
+      - name: Assert binary is self-contained
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="target/${{ matrix.target }}/release/prview"
+
+          # prview reads local repositories through a vendored libgit2 and
+          # shells out to `git` for anything on the network, so none of these
+          # belong in the link map. A dynamic OpenSSL dependency in particular
+          # makes the binary unusable on hosts with a different libssl soname.
+          LINKED="$(ldd "$BIN")"
+          printf '%s\n' "${LINKED}"
+          OFFENDERS="$(printf '%s\n' "${LINKED}" \
+            | grep -E 'libssl|libcrypto|libssh2|libgit2|libcurl' || true)"
+          if [ -n "${OFFENDERS}" ]; then
+            echo "::error::binary links libraries it must not depend on:"
+            printf '%s\n' "${OFFENDERS}" | while IFS= read -r line; do
+              echo "::error::  ${line}"
+            done
+            exit 1
+          fi
+
+          echo "self-contained ok: no OpenSSL/libssh2/libgit2/libcurl linkage"
+
+      - name: Import Developer ID signing certificate
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_P12_PASSWORD: ${{ secrets.MACOS_CERT_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          KEYCHAIN_PATH="${RUNNER_TEMP}/prview-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "::add-mask::${KEYCHAIN_PASSWORD}"
+
+          # Recorded before the search-list/default swap so cleanup can restore
+          # the runner's original state even on failure.
+          ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user 2>/dev/null | tr -d ' "' || true)"
+          {
+            echo "SIGNING_KEYCHAIN=${KEYCHAIN_PATH}"
+            echo "ORIGINAL_DEFAULT_KEYCHAIN=${ORIGINAL_DEFAULT_KEYCHAIN}"
+          } >> "${GITHUB_ENV}"
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          # Prepend the temp keychain to the user search list, keeping the
+          # existing entries; xargs forwards them as separate arguments.
+          security list-keychains -d user | tr -d '"' \
+            | xargs security list-keychains -d user -s "${KEYCHAIN_PATH}" >/dev/null
+          # codesign resolves an identity by name from the default keychain.
+          security default-keychain -d user -s "${KEYCHAIN_PATH}"
+
+          P12_PATH="${RUNNER_TEMP}/prview-cert.p12"
+          printf '%s' "${MACOS_CERT_P12_BASE64}" | base64 --decode > "${P12_PATH}"
+          chmod 600 "${P12_PATH}"
+          # `security import` reads legacy-format PKCS#12 bundles as-is.
+          security import "${P12_PATH}" \
+            -k "${KEYCHAIN_PATH}" \
+            -P "${MACOS_CERT_P12_PASSWORD}" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security >/dev/null
+          rm -f "${P12_PATH}"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "${KEYCHAIN_PASSWORD}" \
+            "${KEYCHAIN_PATH}" >/dev/null
+
+          # Derive the signing identity from the certificate that was actually
+          # imported instead of trusting a separate secret to agree with it.
+          IDENTITIES="$(
+            security find-identity -v -p codesigning "${KEYCHAIN_PATH}" \
+              | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p'
+          )"
+          COUNT="$(printf '%s' "${IDENTITIES}" | grep -c . || true)"
+          if [ "${COUNT}" != "1" ]; then
+            echo "::error::expected exactly one 'Developer ID Application' identity in the imported certificate, found ${COUNT}"
+            security find-identity -v -p codesigning "${KEYCHAIN_PATH}" || true
+            exit 1
+          fi
+
+          case "${IDENTITIES}" in
+            *"(${PRVIEW_MACOS_TEAM_ID})")
+              ;;
+            *)
+              echo "::error::signing identity '${IDENTITIES}' does not belong to expected Team ID ${PRVIEW_MACOS_TEAM_ID}"
+              exit 1
+              ;;
+          esac
+
+          echo "SIGNING_IDENTITY=${IDENTITIES}" >> "${GITHUB_ENV}"
+          echo "signing identity: ${IDENTITIES}"
+
+      - name: Prepare notarization credentials
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        env:
+          NOTARY_API_KEY_P8_BASE64: ${{ secrets.NOTARY_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          NOTARY_KEY_PATH="${RUNNER_TEMP}/notary-api-key.p8"
+          printf '%s' "${NOTARY_API_KEY_P8_BASE64}" | base64 --decode > "${NOTARY_KEY_PATH}"
+          chmod 600 "${NOTARY_KEY_PATH}"
+          echo "NOTARY_KEY_PATH=${NOTARY_KEY_PATH}" >> "${GITHUB_ENV}"
+
+      - name: Sign binary
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="target/${{ matrix.target }}/release/prview"
+
+          codesign --force --timestamp --options runtime \
+            --sign "${SIGNING_IDENTITY}" \
+            --keychain "${SIGNING_KEYCHAIN}" \
+            "${BIN}"
+          codesign --verify --strict --verbose=2 "${BIN}"
+
+          DETAILS="$(codesign -dvv "${BIN}" 2>&1)"
+          printf '%s\n' "${DETAILS}"
+          if ! printf '%s\n' "${DETAILS}" | grep -q "^TeamIdentifier=${PRVIEW_MACOS_TEAM_ID}$"; then
+            echo "::error::signed binary does not carry TeamIdentifier=${PRVIEW_MACOS_TEAM_ID}"
+            exit 1
+          fi
+
+          # `codesign -dvv` does not print the code directory hash; verbosity 4
+          # does. Record it so the packaged archive can be proven identical to
+          # the notarized file.
+          CDHASH="$(codesign -d --verbose=4 "${BIN}" 2>&1 | sed -n 's/^CDHash=//p' | head -1)"
+          if [ -z "${CDHASH}" ]; then
+            echo "::error::could not read CDHash from the signed binary"
+            exit 1
+          fi
+          echo "NOTARIZED_CDHASH=${CDHASH}" >> "${GITHUB_ENV}"
+          echo "cdhash: ${CDHASH}"
+
+      - name: Assert signed binary runs and is self-contained
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          BIN="target/${{ matrix.target }}/release/prview"
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+
+          # `Assert embedded provenance` ran before signing. Under a hardened
+          # runtime (`--options runtime`) dyld refuses to map a non-platform
+          # dylib signed by a different Team ID, so a binary that links e.g.
+          # Homebrew OpenSSL aborts on every launch — including `--version` —
+          # while still signing, notarizing and passing Gatekeeper. Re-run the
+          # assertions on the signed file so that failure cannot ship.
+          ACTUAL_SHA="$("$BIN" --build-source-sha)"
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+            echo "::error::signed binary reports source SHA '${ACTUAL_SHA}', expected '${EXPECTED_SHA}'"
+            exit 1
+          fi
+
+          ACTUAL_VERSION="$("$BIN" --version)"
+          if [ "${ACTUAL_VERSION}" != "prview ${VERSION}" ]; then
+            echo "::error::signed binary reports version '${ACTUAL_VERSION}', expected 'prview ${VERSION}'"
+            exit 1
+          fi
+
+          echo "signed binary runs: ${ACTUAL_VERSION} built from ${ACTUAL_SHA}"
+
+          # Every dependency must come from the OS, so the binary runs on a Mac
+          # without Homebrew. The first `otool -L` line is the binary's own
+          # path, not a dependency.
+          LINKED="$(otool -L "$BIN")"
+          printf '%s\n' "${LINKED}"
+          OFFENDERS="$(printf '%s\n' "${LINKED}" | tail -n +2 \
+            | sed -e 's/^[[:space:]]*//' \
+            | grep -v -E '^(/usr/lib/|/System/)' || true)"
+          if [ -n "${OFFENDERS}" ]; then
+            echo "::error::signed binary links non-system libraries:"
+            printf '%s\n' "${OFFENDERS}" | while IFS= read -r line; do
+              echo "::error::  ${line}"
+            done
+            exit 1
+          fi
+
+          echo "self-contained ok: only /usr/lib and /System libraries linked"
+
+      - name: Notarize binary
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        env:
+          NOTARY_API_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_API_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+
+          BIN="target/${{ matrix.target }}/release/prview"
+          ZIP="${RUNNER_TEMP}/prview-notarize.zip"
+          LOG="${RUNNER_TEMP}/notarytool.json"
+
+          ditto -c -k --keepParent "${BIN}" "${ZIP}"
+
+          # `notarytool submit --wait` can exit 0 on a rejected submission, so
+          # the final status is checked explicitly rather than trusted.
+          set +e
+          xcrun notarytool submit "${ZIP}" \
+            --key "${NOTARY_KEY_PATH}" \
+            --key-id "${NOTARY_API_KEY_ID}" \
+            --issuer "${NOTARY_API_ISSUER_ID}" \
+            --wait \
+            --output-format json > "${LOG}"
+          SUBMIT_RC=$?
+          set -e
+
+          READ_FIELD='import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],""))'
+          STATUS="$(python3 -c "${READ_FIELD}" "${LOG}" status 2>/dev/null || true)"
+          SUBMISSION_ID="$(python3 -c "${READ_FIELD}" "${LOG}" id 2>/dev/null || true)"
+
+          echo "notarytool exit=${SUBMIT_RC} status=${STATUS:-<none>} id=${SUBMISSION_ID:-<none>}"
+
+          if [ "${STATUS}" != "Accepted" ]; then
+            echo "::error::notarization did not reach status Accepted (got '${STATUS:-<none>}')"
+            if [ -n "${SUBMISSION_ID}" ]; then
+              xcrun notarytool log "${SUBMISSION_ID}" \
+                --key "${NOTARY_KEY_PATH}" \
+                --key-id "${NOTARY_API_KEY_ID}" \
+                --issuer "${NOTARY_API_ISSUER_ID}" || true
+            fi
+            exit 1
+          fi
+
+      - name: Assert Gatekeeper acceptance
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="target/${{ matrix.target }}/release/prview"
+
+          # `spctl --assess --type execute` is the wrong assessment for a bare
+          # Mach-O: it rejects EVERY standalone executable with "the code is
+          # valid but does not seem to be an app" - Apple's own /bin/ls included
+          # - because that type only ever passes for bundled applications. The
+          # correct assessment for a CLI binary is the `open` type evaluated
+          # against the primary signature.
+          #
+          # A standalone executable also cannot be stapled, so Gatekeeper has to
+          # resolve the notarization ticket online; `source=Notarized Developer
+          # ID` is the proof that lookup succeeded. A plain `source=Developer ID`
+          # means signed but not notarized and must not pass. Ticket propagation
+          # can lag a few seconds after notarytool reports Accepted, hence the
+          # retries. spctl writes the source/origin lines to stderr, so the
+          # output is captured with 2>&1.
+          ATTEMPT=1
+          ASSESS=""
+          RC=0
+          while [ "${ATTEMPT}" -le 5 ]; do
+            set +e
+            ASSESS="$(spctl -a -t open --context context:primary-signature -vv "${BIN}" 2>&1)"
+            RC=$?
+            set -e
+            printf '%s\n' "${ASSESS}"
+            if [ "${RC}" -eq 0 ] && printf '%s\n' "${ASSESS}" | grep -qx 'source=Notarized Developer ID'; then
+              echo "gatekeeper: accepted as Notarized Developer ID on attempt ${ATTEMPT}"
+              exit 0
+            fi
+            if [ "${ATTEMPT}" -lt 5 ]; then
+              sleep 15
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          echo "::error::Gatekeeper did not report a notarized assessment for ${BIN} after 5 attempts; expected spctl exit 0 and a 'source=Notarized Developer ID' line, observed exit ${RC} and:"
+          printf '%s\n' "${ASSESS:-<no output>}" >&2
+          exit 1
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
           ARCHIVE="prview-${{ matrix.target }}.tar.gz"
-          tar czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" prview
-          shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          # COPYFILE_DISABLE=1 stops macOS bsdtar from adding AppleDouble
+          # (._prview) entries; the installer requires exactly one entry, prview.
+          COPYFILE_DISABLE=1 tar czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" prview
+          # install.sh rejects any archive that isn't exactly `prview`, so pin the same shape here.
+          LISTING="$(tar tzf "$ARCHIVE")"
+          if [ "$LISTING" != "prview" ]; then
+            echo "::error::release archive $ARCHIVE must contain exactly one entry 'prview'; got:" >&2
+            printf '%s\n' "$LISTING" >&2
+            exit 1
+          fi
+
+      - name: Assert packaged binary is the notarized binary
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="prview-${{ matrix.target }}.tar.gz"
+          EXTRACT_DIR="$(mktemp -d)"
+          tar xzf "${ARCHIVE}" -C "${EXTRACT_DIR}"
+
+          PACKAGED_CDHASH="$(codesign -d --verbose=4 "${EXTRACT_DIR}/prview" 2>&1 | sed -n 's/^CDHash=//p' | head -1)"
+          if [ -z "${PACKAGED_CDHASH}" ]; then
+            echo "::error::binary inside ${ARCHIVE} carries no code signature"
+            exit 1
+          fi
+          if [ "${PACKAGED_CDHASH}" != "${NOTARIZED_CDHASH}" ]; then
+            echo "::error::packaged cdhash ${PACKAGED_CDHASH} differs from notarized cdhash ${NOTARIZED_CDHASH}"
+            exit 1
+          fi
+          echo "packaged binary matches the notarized cdhash: ${PACKAGED_CDHASH}"
+
+      - name: Clean up signing material
+        if: always() && matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -uo pipefail
+          rm -f "${RUNNER_TEMP}/prview-cert.p12" "${RUNNER_TEMP}/notary-api-key.p8"
+          if [ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]; then
+            security default-keychain -d user -s "${ORIGINAL_DEFAULT_KEYCHAIN}" || true
+          fi
+          if [ -n "${SIGNING_KEYCHAIN:-}" ] && [ -f "${SIGNING_KEYCHAIN}" ]; then
+            security delete-keychain "${SIGNING_KEYCHAIN}" || true
+          fi
+
       - uses: actions/upload-artifact@v7
         with:
           name: prview-${{ matrix.target }}
-          path: |
-            prview-${{ matrix.target }}.tar.gz
-            prview-${{ matrix.target }}.tar.gz.sha256
+          path: prview-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  checksums:
+    name: Build Checksum Manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Assert the published target set
+        shell: bash
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+
+          # A release publishes exactly the documented targets — no more, no
+          # fewer. Without this, deleting a matrix leg would produce a green
+          # run that silently ships a partial (for example Linux-only) release.
+          EXPECTED="$(mktemp)"
+          ACTUAL="$(mktemp)"
+          printf '%s' "${PRVIEW_RELEASE_TARGETS}" \
+            | tr ' ' '\n' \
+            | sed '/^$/d; s|^|prview-|; s|$|.tar.gz|' \
+            | LC_ALL=C sort > "${EXPECTED}"
+          find . -maxdepth 1 -type f -name 'prview-*.tar.gz' \
+            | sed 's|^\./||' | LC_ALL=C sort > "${ACTUAL}"
+
+          FAILED=0
+          while IFS= read -r NAME; do
+            echo "::error::expected release archive ${NAME} was not produced"
+            FAILED=1
+          done < <(comm -23 "${EXPECTED}" "${ACTUAL}")
+          while IFS= read -r NAME; do
+            echo "::error::unexpected release archive ${NAME} is not in PRVIEW_RELEASE_TARGETS"
+            FAILED=1
+          done < <(comm -13 "${EXPECTED}" "${ACTUAL}")
+
+          rm -f "${EXPECTED}" "${ACTUAL}"
+          if [ "${FAILED}" -ne 0 ]; then
+            echo "::error::published target set does not match PRVIEW_RELEASE_TARGETS (${PRVIEW_RELEASE_TARGETS})"
+            exit 1
+          fi
+          echo "published target set ok: ${PRVIEW_RELEASE_TARGETS}"
+
+      - name: Generate and verify SHA256SUMS
+        shell: bash
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+
+          # Deterministic manifest: one `sha256sum` line per archive, emitted in
+          # byte order of the file names so the manifest does not depend on
+          # artifact download order.
+          FILE_LIST="$(mktemp)"
+          find . -maxdepth 1 -type f -name 'prview-*.tar.gz' \
+            | sed 's|^\./||' | LC_ALL=C sort > "${FILE_LIST}"
+          if [ ! -s "${FILE_LIST}" ]; then
+            echo "::error::no prview-*.tar.gz archives were downloaded"
+            exit 1
+          fi
+
+          : > SHA256SUMS
+          while IFS= read -r NAME; do
+            sha256sum "${NAME}" >> SHA256SUMS
+          done < "${FILE_LIST}"
+          rm -f "${FILE_LIST}"
+
+          # `sha256sum -c` is the same contract install.sh and downstream CI use
+          # (`shasum -a 256 -c` on macOS).
+          sha256sum -c SHA256SUMS
+
+          for NAME in prview-*.tar.gz; do
+            if ! grep -q "  ${NAME}\$" SHA256SUMS; then
+              echo "::error::${NAME} has no entry in SHA256SUMS"
+              exit 1
+            fi
+          done
+
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prview-checksums
+          path: artifacts/SHA256SUMS
+          if-no-files-found: error
 
   release:
     name: Create Release
-    needs: build
+    needs: checksums
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
-      - name: Generate SHA256SUMS
+      - name: Verify checksum manifest
+        shell: bash
+        working-directory: artifacts
         run: |
-          cd artifacts
-          cat ./*.sha256 | sort > SHA256SUMS
-          rm -f -- ./*.sha256
+          set -euo pipefail
+          sha256sum -c SHA256SUMS
+          for NAME in prview-*.tar.gz; do
+            if ! grep -q "  ${NAME}\$" SHA256SUMS; then
+              echo "::error::${NAME} has no entry in SHA256SUMS"
+              exit 1
+            fi
+          done
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: |
+            artifacts/prview-*.tar.gz
+            artifacts/SHA256SUMS
       - uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
@@ -109,6 +626,7 @@ jobs:
   publish:
     name: Publish to crates.io
     needs: release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: release
     permissions:
