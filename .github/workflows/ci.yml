@@ -103,6 +103,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Compile Windows process-tree tests
         run: cargo test --lib --no-run
+      - name: Compile the Windows contract scanner test
+        run: cargo test --test json_contract --no-run
       - name: Prove cancellation owns first and late process trees
         timeout-minutes: 2
         run: cargo test --lib governor::tests::windows_cancellation_reaps_first_cancel_and_late_registration_trees -- --exact
@@ -122,6 +124,7 @@ jobs:
       - name: Prove context root-exit ownership
         timeout-minutes: 2
         run: cargo test --lib artifacts::context_artifacts::tests::windows_successful_context_root_exit_reaps_job_descendant -- --exact
+      # Compiled above without a limit; the 3-minute budget covers only the test run.
       - name: Prove the Windows contract scanner invocation
         timeout-minutes: 3
         run: cargo test --test json_contract contract_scanner -- --nocapture
