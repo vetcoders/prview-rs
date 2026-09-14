@@ -109,7 +109,7 @@ schemars = "1.2.1"
 # Markdown rendering (self-contained artifact HTML); pure-Rust regex backend
 # (syntect-fancy) avoids the onig C dependency, and disabling defaults drops the
 # comrak CLI/clap/xdg surface we do not use.
-comrak = { version = "0.53", default-features = false, features = ["syntect-fancy"] }
+comrak = { version = "0.55", default-features = false, features = ["syntect-fancy"] }
 ammonia = "4"
 
 [target.'cfg(windows)'.dependencies]
