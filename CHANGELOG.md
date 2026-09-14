@@ -45,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unverified source build — or, with `cargo` absent, only learn about it at the
   end. Unsupported platforms now fail immediately with exit 2 and a message
   naming the two supported targets.
+- The Windows CI job compiles the `json_contract` integration test in an
+  untimed step before the contract-scanner proof runs under its 3-minute
+  limit. On a cold cache after a `Cargo.lock` change, compilation alone took
+  almost four minutes and the timed step failed before any test ran; the
+  limit now covers only the test run, which takes a few seconds.
 
 ## [0.8.0] - 2026-09-13
 

@@ -86,7 +86,13 @@ whose provenance must identify that exact temporary scanner path.
 Process-tree cancellation has platform-specific proof. Unix coverage runs in the
 normal Linux/macOS suites. `.github/workflows/ci.yml` also runs the Windows-only
 PowerShell child+grandchild census on `windows-latest`; cross-compilation alone
-is not accepted as Windows cancellation evidence.
+is not accepted as Windows cancellation evidence. The Windows job compiles the
+`json_contract` integration test in an untimed step
+(`cargo test --test json_contract --no-run`) before the contract-scanner proof
+runs under its 3-minute `timeout-minutes`; that budget is a hang guard for the
+test run only. A cold cache after a `Cargo.lock` change has taken about four
+minutes to compile that binary, so never put a `cargo test --test …`
+invocation that has not been precompiled under a short step timeout.
 
 The same workflow has an `ubuntu-latest` ordinary-machine acceptance job. It
 builds the release binary and runs bare `prview --deep` (with fixture/output
