@@ -461,6 +461,10 @@ fn gate_exits_three_for_unresolvable_explicit_base() {
         "the error must name the unresolvable ref: {stderr}"
     );
     assert!(
+        !stderr.contains("hint:"),
+        "no generic repository/network hint applies to an unresolvable base: {stderr}"
+    );
+    assert!(
         !stdout.contains("PASS"),
         "no verdict may be claimed for an unresolvable base: {stdout}"
     );

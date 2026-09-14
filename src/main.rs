@@ -404,9 +404,12 @@ fn ensure_explicit_gate_base_resolves(app: &App, base: &str) -> Result<()> {
         .resolve_bases(&app.config)
         .with_context(|| format!("failed to resolve gate base '{base}'"))?;
     if resolved.is_empty() {
+        // `display_error` derives hints from keywords such as "git",
+        // "repository", or "fetch"; none of them describe this failure, so the
+        // message avoids them.
         bail!(
-            "gate base '{base}' does not resolve to a commit in this repository \
-             (fetch it first, or pass an existing branch, tag, or commit SHA)"
+            "gate base '{base}' does not resolve to a commit \
+             (make sure the ref exists locally, or pass an existing branch, tag, or commit SHA)"
         );
     }
     Ok(())
