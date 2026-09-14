@@ -113,8 +113,8 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
@@ -634,8 +634,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2

@@ -27,8 +27,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
@@ -141,7 +141,7 @@ jobs:
           test "$(wc -c < "$sarif")" -le 10485760
           jq -e '.version == "2.1.0" and (.runs | type == "array")' "$sarif" >/dev/null
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ${{ runner.temp }}/prview-sarif/INLINE_FINDINGS.sarif
           category: prview-inline

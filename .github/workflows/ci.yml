@@ -22,8 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
@@ -34,8 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
@@ -46,8 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -62,8 +62,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
@@ -96,8 +96,8 @@ jobs:
       RUSTFLAGS: -Dwarnings
     steps:
       - uses: actions/checkout@v7
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
@@ -149,8 +149,8 @@ jobs:
             --source-sha "$PRVIEW_SOURCE_SHA"
       - name: Test the Python tooling gates
         run: python3 -m unittest discover -s tools/tests -p 'test_*.py'
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
@@ -197,8 +197,8 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
@@ -214,8 +214,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: llvm-tools-preview
@@ -238,8 +238,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      # Pinned master snapshot verified 2026-09-04; supports Rust branches through 1.120.
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+      # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       # audit-check@v2 installs the newest cargo-audit without --locked. That
