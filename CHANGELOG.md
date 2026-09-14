@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `prview gate --base <REF>` reviews the current checkout against an explicit
+  branch, tag, or commit SHA instead of the auto-detected
+  `develop`/`main`/`master` base. An explicit base that does not resolve exits
+  `3` with an error naming the ref, rather than silently reviewing an empty
+  change. `docs/gate-playbook.md` documents passing `github.event.before` on CI
+  `push` events.
+
 ### Changed
 
 - `install.sh` is fail-closed. It installs an official release binary or it
@@ -38,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- This repository's `Gate Shadow` workflow now reviews the change a push
+  delivered. On a push to `main` the gate auto-detected `main` as the base while
+  `main` was also the checked-out target, so it reviewed an empty change. Push
+  runs now pass the pre-push commit (`github.event.before`) as `--base`, falling
+  back to auto-detection for new-branch pushes or an unavailable pre-push commit;
+  the job summary records which base was used. Pull request and manual runs are
+  unchanged.
 - The curl installer no longer silently substitutes a locally compiled binary
   for an official one. Previously a failed download, a missing artifact, or an
   unsupported platform fell through to `cargo install prview --locked --force`,

@@ -74,6 +74,7 @@ prview gate
 prview gate --strict
 prview gate --strict --fail-on-warnings
 prview gate --json
+prview gate --base origin/main
 ```
 
 `prview gate` runs the standard fast gate profile, consumes the existing
@@ -92,8 +93,12 @@ the verdict, `enforcement_disposition`, caveats, blocking issues, and artifact
 paths. Only a schema 2.3 or 3.x pack with typed warning proof can use the warnings-only
 strict exception; older or malformed packs remain strict-rejected.
 
-Local pre-push hook recipes and the recommended Shadow -> Warn -> Block rollout
-are in [`docs/gate-playbook.md`](gate-playbook.md).
+`--base <REF>` replaces base auto-detection (`develop`/`main`/`master`) with an
+explicit branch, tag, or commit; an unresolvable explicit base exits `3`.
+
+Local pre-push hook recipes, base selection for CI `push` events, and the
+recommended Shadow -> Warn -> Block rollout are in
+[`docs/gate-playbook.md`](gate-playbook.md).
 
 #### Gate profile and measured pre-push budget
 
@@ -162,6 +167,12 @@ while `BLOCK` still exits `1`. Extra CLI flags can be passed as whitespace-
 separated `args`. Under `strict: "true"` every `CONDITIONAL` is rejected while
 typed warnings-only remains successful; set `fail-on-warnings: "true"` to
 require a warning-clean pack as well.
+
+On `push` events the checkout is the pushed tip, so a push to the default
+branch auto-detects that branch as its own base and reviews an empty change.
+Pass the pre-push commit through `args` (`--base ${{ github.event.before }}`,
+guarded to push events); the guarded example and edge cases are in
+[`docs/gate-playbook.md#choosing-the-base`](gate-playbook.md#choosing-the-base).
 
 The Action prefers `cargo-binstall` when that binary is already available on the
 runner and falls back to `cargo install prview --locked --force`. The base gate

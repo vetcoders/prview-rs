@@ -32,6 +32,48 @@ missing, unparsable, or stamped with a `schema_version` this build cannot read.
 Plain `prview --ci` uses the same code for the same conditions: it never
 re-derives a verdict when the gate artifact cannot be read.
 
+## Choosing the base
+
+`prview gate` reviews the current checkout against a base. By default the base
+is auto-detected from `develop`, `main`, and `master`. Pass `--base <REF>` to
+name it explicitly — a branch, tag, or commit SHA:
+
+```sh
+prview gate --base origin/main
+prview gate --base 3f9c2a7d0b1e4c6f8a2d5e7b9c1f3a5d7e9b2c4f --json
+```
+
+The explicit base must already resolve in the local repository. If it does not,
+the gate exits `3` with an error naming the ref instead of reviewing an empty
+change. A base that resolves to the checked-out commit itself is not an error: the
+review simply has no change to judge.
+
+**CI on `push` events must pass the pre-push commit.** A push workflow checks
+out the pushed tip. On the default branch, auto-detection then resolves `main`
+to that same commit, so the gate reviews an empty change and passes without
+having looked at what the push delivered. Pass `github.event.before` as the base
+for push events and keep auto-detection for pull requests, where the target
+branch is the right base:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0 # the pre-push commit must be present locally
+- uses: vetcoders/prview-rs@vX.Y.Z # first release after 0.8.0 (includes gate --base)
+  with:
+    strict: "true"
+    version: "X.Y.Z"
+    args: ${{ github.event_name == 'push' && format('--base {0}', github.event.before) || '' }}
+```
+
+`gate --base` ships after `0.8.0`, so pin an Action/runtime release that
+includes it. Two push shapes need care: a push that creates a branch reports an
+all-zero `before` (no pre-push commit, so the explicit base is unresolvable and the
+gate exits `3`), and a force push may name a `before` commit that is no longer
+fetched. This repository's own `Gate Shadow` workflow (`.github/workflows/gate.yml`)
+handles both by falling back to auto-detection, and records the base it used in
+the job summary.
+
 ## Breaking-change escalation
 
 A genuine breaking API change — a confirmed removed, changed, relocated, or
@@ -305,6 +347,8 @@ warning-clean pack as well.
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | Hook blocks with exit `3` | `prview` is missing, the repo is not a valid git checkout, or a required tool failed before a verdict was produced | Install `prview`, run `prview gate` manually, and inspect the printed error |
+| Gate exits `3` naming a base ref | The explicit `--base` does not resolve locally (not fetched, typo, or an all-zero `before` from a new-branch push) | Fetch the ref (`fetch-depth: 0` in CI) or fall back to auto-detection; see [Choosing the base](#choosing-the-base) |
+| Push run on the default branch passes with nothing reviewed | The gate auto-detected `main` as the base while `main` is the checked-out target | Pass the pre-push commit: `--base ${{ github.event.before }}` on push events |
 | Hook blocks with exit `1` | Merge gate verdict is `BLOCK` | Open the generated run directory and read `00_summary/MERGE_GATE.json` and `PR_REVIEW.md` |
 | Required CI blocks with exit `2` | The typed disposition is `review_required`, or warnings-only is running with `--fail-on-warnings` | Fix the typed cause, remove the warning-clean opt-in, or move the repo back to Warn until the signal is actionable |
 | Hook is too slow | Semgrep or language checks dominate the measured budget | Stay in Shadow, tune policy/check scope, then re-measure before Warn |
