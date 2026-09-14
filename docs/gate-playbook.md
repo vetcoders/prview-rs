@@ -52,9 +52,7 @@ review simply has no change to judge.
 with `--pr`, because a pull request defines its own base. Top-level options and
 positional `<target> <bases>` arguments cannot precede the `gate` subcommand:
 `prview --pr 42 gate --base main` and `prview feature main gate --base main` are
-parser usage errors (exit `2`, no JSON on stdout) and never start a gate run. The
-gate also refuses `--base` together with `--pr` itself (exit `3`), before
-contacting GitHub.
+parser usage errors (exit `2`, no JSON on stdout) and never start a gate run.
 
 **CI on `push` events must pass the pre-push commit.** A push workflow checks
 out the pushed tip. On the default branch, auto-detection then resolves `main`
