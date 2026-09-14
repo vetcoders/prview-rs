@@ -327,6 +327,11 @@ pub struct GateArgs {
     /// Emit machine-readable gate JSON to stdout
     #[arg(long)]
     pub json: bool,
+
+    /// Base ref or commit to review the current checkout against
+    /// (default: auto-detect develop/main/master). An unresolvable ref exits 3.
+    #[arg(long, value_name = "REF")]
+    pub base: Option<String>,
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -1144,9 +1149,31 @@ mod tests {
                 strict: true,
                 fail_on_warnings: false,
                 json: true,
+                base: None,
             }))
         );
         assert_eq!(cli.target, None);
+    }
+
+    #[test]
+    fn test_parse_gate_explicit_base() {
+        let cli = Cli::try_parse_from(["prview", "gate", "--base", "main", "--json"]).unwrap();
+
+        assert_eq!(
+            cli.command,
+            Some(CliCommand::Gate(GateArgs {
+                strict: false,
+                fail_on_warnings: false,
+                json: true,
+                base: Some("main".to_string()),
+            }))
+        );
+        // The gate base is scoped to the subcommand, not the top-level positional bases.
+        assert!(cli.bases.is_empty());
+        assert!(
+            Cli::try_parse_from(["prview", "gate", "--base"]).is_err(),
+            "--base requires a ref"
+        );
     }
 
     #[test]
@@ -1160,6 +1187,7 @@ mod tests {
                 strict: true,
                 fail_on_warnings: true,
                 json: true,
+                base: None,
             }))
         );
         assert!(

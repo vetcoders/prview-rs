@@ -353,6 +353,11 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     // `gate` forces `ci = false` and derives its exit from the gate contract, so
     // the `--ci`-scoped warnings escape hatch must not leak into it.
     run_cli.fail_on_warnings = false;
+    // An explicit gate base replaces base auto-detection; the target stays the
+    // current checkout.
+    if let Some(base) = &args.base {
+        run_cli.bases = vec![base.clone()];
+    }
 
     let mut config = supervised_config(&run_cli).await?;
     let enforcement_mode = prview::policy::engine::EnforcementMode::from_gate_flags(
@@ -361,6 +366,9 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     );
     config.apply_gate_profile(enforcement_mode);
     let app = App::from_config(config)?;
+    if let Some(base) = &args.base {
+        ensure_explicit_gate_base_resolves(&app, base)?;
+    }
     let governor = app.governor();
     let report =
         with_cancellation_after_commit_if(app.run(), &governor, CtrlC, |report| !report.unchanged)
@@ -384,6 +392,24 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     }
 
     Ok(summary.exit_code)
+}
+
+/// The review resolves bases leniently: an unknown ref is dropped with a
+/// warning the quiet gate suppresses, leaving an empty change that would pass.
+/// A base the caller named explicitly must exist, so the gate fails to execute
+/// (exit 3) instead of approving a review of nothing.
+fn ensure_explicit_gate_base_resolves(app: &App, base: &str) -> Result<()> {
+    let resolved = app
+        .repo
+        .resolve_bases(&app.config)
+        .with_context(|| format!("failed to resolve gate base '{base}'"))?;
+    if resolved.is_empty() {
+        bail!(
+            "gate base '{base}' does not resolve to a commit in this repository \
+             (fetch it first, or pass an existing branch, tag, or commit SHA)"
+        );
+    }
+    Ok(())
 }
 
 fn print_gate_summary(summary: &prview::gate::GateJsonOutput) {

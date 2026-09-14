@@ -23,6 +23,8 @@
 //!   BLOCK (exit 1).
 //! * Running the gate outside a git repository makes the review unable to
 //!   execute → exit 3.
+//! * An explicit `--base` that does not resolve is an execution error → exit 3,
+//!   never an empty review that passes.
 
 use assert_cmd::prelude::*;
 use prview::git::git_cmd;
@@ -338,4 +340,128 @@ fn gate_exits_three_when_it_cannot_execute() {
         .arg("gate")
         .assert()
         .code(3);
+}
+
+/// A repo that sits on `main` with two commits — the shape of a CI checkout
+/// after a push to the default branch. Base auto-detection resolves `main` to
+/// the target itself, so only an explicit base yields a change to review.
+/// Returns the fixture and the SHA of the first (pre-push) commit.
+fn create_pushed_main_fixture() -> (TempDir, String) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test User"]);
+    run_git(repo, &["config", "user.email", "test@example.com"]);
+
+    fs::write(repo.join("README.md"), "hello\n").expect("write file");
+    run_git(repo, &["add", "README.md"]);
+    run_git(repo, &["commit", "-m", "initial"]);
+    run_git(repo, &["branch", "-M", "main"]);
+
+    let before = git_cmd()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("rev-parse HEAD");
+    assert!(before.status.success(), "rev-parse HEAD failed");
+    let before = String::from_utf8(before.stdout)
+        .expect("utf8 sha")
+        .trim()
+        .to_string();
+
+    fs::write(repo.join("README.md"), "hello\nworld\n").expect("update file");
+    run_git(repo, &["add", "README.md"]);
+    run_git(repo, &["commit", "-m", "pushed change"]);
+
+    (temp, before)
+}
+
+/// Run `prview gate --json` with extra args and return the parsed gate JSON.
+/// The pack lives under `home`, which must outlive the caller's assertions.
+fn run_gate_json(repo: &Path, path: &OsString, home: &Path, extra: &[&str]) -> serde_json::Value {
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(repo)
+        .env("PATH", path)
+        .env("PRVIEW_HOME", home)
+        .arg("gate")
+        .args(extra)
+        .arg("--json")
+        .output()
+        .expect("run gate");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("gate json")
+}
+
+fn per_file_diff_count(gate_json: &serde_json::Value) -> usize {
+    let output_dir = gate_json["output_dir"]
+        .as_str()
+        .expect("gate json names its output_dir");
+    fs::read_dir(Path::new(output_dir).join("10_diff").join("per-file-diffs"))
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn gate_explicit_base_commit_reviews_the_pushed_change() {
+    let (temp, before) = create_pushed_main_fixture();
+    // Built once: the helper copies git into the fixture bin dir, which is not
+    // writable a second time.
+    let path = path_without_semgrep(temp.path());
+
+    // Control: auto-detection resolves `main` == target, so the review is empty.
+    let auto_home = tempfile::tempdir().expect("prview home");
+    let auto = run_gate_json(temp.path(), &path, auto_home.path(), &[]);
+    assert_eq!(
+        per_file_diff_count(&auto),
+        0,
+        "auto-detected base on main must review an empty change: {auto}"
+    );
+
+    // A raw 40-hex commit SHA as --base reviews the change since that commit.
+    assert_eq!(before.len(), 40, "fixture passes a full commit SHA");
+    let explicit_home = tempfile::tempdir().expect("prview home");
+    let explicit = run_gate_json(
+        temp.path(),
+        &path,
+        explicit_home.path(),
+        &["--base", &before],
+    );
+    assert!(
+        per_file_diff_count(&explicit) > 0,
+        "--base <sha> must review a non-empty change: {explicit}"
+    );
+}
+
+#[test]
+fn gate_exits_three_for_unresolvable_explicit_base() {
+    let home = tempfile::tempdir().expect("prview home");
+    let temp = create_gate_fixture();
+
+    let output = prview_gate_command(temp.path(), home.path())
+        .args(["gate", "--base", "does-not-exist", "--json"])
+        .output()
+        .expect("run gate");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("does-not-exist"),
+        "the error must name the unresolvable ref: {stderr}"
+    );
+    assert!(
+        !stdout.contains("PASS"),
+        "no verdict may be claimed for an unresolvable base: {stdout}"
+    );
 }
