@@ -469,3 +469,47 @@ fn gate_exits_three_for_unresolvable_explicit_base() {
         "no verdict may be claimed for an unresolvable base: {stdout}"
     );
 }
+
+/// `--pr` swaps the review base for the pull request's own base, so it must
+/// never silently discard an explicit `--base`. Top-level flags cannot precede
+/// the `gate` subcommand, and the gate does not accept `--pr`. Both spellings
+/// therefore fail at parse time: offline, before any GitHub call, with no
+/// verdict. The gate's own guard for the combination is unit-tested in
+/// `src/main.rs`.
+#[test]
+fn gate_base_cannot_be_combined_with_pr() {
+    let home = tempfile::tempdir().expect("prview home");
+    let temp = create_gate_fixture();
+    // No `gh` on PATH: anything past argument parsing would fail differently.
+    // Built once, because the helper cannot copy git into the fixture bin dir twice.
+    let path = path_without_semgrep(temp.path());
+
+    for args in [
+        &["--pr", "42", "gate", "--base", "main", "--json"][..],
+        &["gate", "--base", "main", "--pr", "42", "--json"][..],
+    ] {
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+            .current_dir(temp.path())
+            .env("PRVIEW_HOME", home.path())
+            .env("PATH", &path)
+            .args(args)
+            .output()
+            .expect("run prview");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} must be a usage error: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("unexpected argument"),
+            "{args:?} must be rejected by the parser: {stderr}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "{args:?} must not emit a verdict: {stdout}"
+        );
+    }
+}

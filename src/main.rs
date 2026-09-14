@@ -337,6 +337,8 @@ async fn supervised_config_result(cli: &Cli) -> Result<Result<Config>> {
 }
 
 async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
+    // Before config loading: `Config::from_cli` resolves `--pr` through GitHub.
+    ensure_gate_base_is_unambiguous(cli, args)?;
     let mut run_cli = cli.clone();
     run_cli.command = None;
     run_cli.quick = true;
@@ -392,6 +394,18 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     }
 
     Ok(summary.exit_code)
+}
+
+/// `--pr` makes `Config::from_cli` replace the bases with the pull request's
+/// base, which would silently discard an explicit `--base`. Clap already
+/// rejects top-level flags before a subcommand (`args_conflicts_with_subcommands`),
+/// so this guards the gate path itself rather than today's parser.
+fn ensure_gate_base_is_unambiguous(cli: &Cli, args: &GateArgs) -> Result<()> {
+    if args.base.is_some() && cli.pr.is_some() {
+        // Worded to avoid the keywords `display_error` turns into hints.
+        bail!("gate --base cannot be combined with --pr: the pull request defines its own base");
+    }
+    Ok(())
 }
 
 /// The review resolves bases leniently: an unknown ref is dropped with a
@@ -876,6 +890,37 @@ async fn run_mcp_command(args: &McpArgs) -> Result<()> {
         prview::mcp::probe(args.json).await
     } else {
         prview::mcp::serve().await
+    }
+}
+
+#[cfg(test)]
+mod gate_base_tests {
+    use super::*;
+
+    fn gate_args(base: Option<&str>) -> GateArgs {
+        GateArgs {
+            strict: false,
+            fail_on_warnings: false,
+            json: true,
+            base: base.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn explicit_gate_base_conflicts_with_pr() {
+        let mut cli = Cli::parse_from(["prview"]);
+        cli.pr = Some(42);
+
+        let err = ensure_gate_base_is_unambiguous(&cli, &gate_args(Some("main")))
+            .expect_err("--base with --pr must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "gate --base cannot be combined with --pr: the pull request defines its own base"
+        );
+        assert!(ensure_gate_base_is_unambiguous(&cli, &gate_args(None)).is_ok());
+
+        cli.pr = None;
+        assert!(ensure_gate_base_is_unambiguous(&cli, &gate_args(Some("main"))).is_ok());
     }
 }
 
