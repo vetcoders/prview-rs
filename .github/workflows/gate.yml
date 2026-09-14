@@ -40,14 +40,18 @@ jobs:
         run: |
           runner_temp="${RUNNER_TEMP:-/tmp}"
           json_path="${runner_temp}/prview-gate.json"
+          err_path="${runner_temp}/prview-gate.err"
 
           set +e
-          ./target/release/prview gate --json > "$json_path"
+          ./target/release/prview gate --json > "$json_path" 2> "$err_path"
           status=$?
           set -e
 
-          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
-          echo "json_path=${json_path}" >> "$GITHUB_OUTPUT"
+          {
+            echo "exit_code=${status}"
+            echo "json_path=${json_path}"
+            echo "err_path=${err_path}"
+          } >> "$GITHUB_OUTPUT"
 
           verdict=""
           enforcement_disposition=""
@@ -58,6 +62,7 @@ jobs:
             enforcement_disposition="$(jq -r '.enforcement_disposition // empty' "$json_path" 2>/dev/null || true)"
             output_dir="$(jq -r '.output_dir // empty' "$json_path" 2>/dev/null || true)"
           fi
+          echo "output_dir=${output_dir}" >> "$GITHUB_OUTPUT"
 
           if [ -n "$output_dir" ] && [ -f "${output_dir}/30_context/INLINE_FINDINGS.sarif" ]; then
             sarif_path="${output_dir}/30_context/INLINE_FINDINGS.sarif"
@@ -100,6 +105,77 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           exit 0
+      - name: Diagnostics (branch vs auto-detected base)
+        if: always()
+        shell: bash
+        env:
+          GATE_EXIT: ${{ steps.gate.outputs.exit_code }}
+          GATE_JSON: ${{ steps.gate.outputs.json_path }}
+          GATE_ERR: ${{ steps.gate.outputs.err_path }}
+          GATE_OUTPUT_DIR: ${{ steps.gate.outputs.output_dir }}
+        run: |
+          set +e
+          diag_dir="${RUNNER_TEMP}/diag-a"
+          install -d "$diag_dir"
+
+          echo "===== RUN A: GIT TOPOLOGY ====="
+          echo "A_HEAD=$(git rev-parse HEAD 2>&1)"
+          echo "A_ORIGIN_MAIN=$(git rev-parse origin/main 2>&1)"
+          echo "A_MERGE_BASE=$(git merge-base HEAD origin/main 2>&1)"
+          echo "----- git diff --stat origin/main...HEAD (tail -3) -----"
+          git diff --stat origin/main...HEAD 2>&1 | tail -3
+
+          echo "===== RUN A: GATE EXIT CODE ====="
+          echo "A_EXIT_CODE=${GATE_EXIT}"
+
+          echo "===== RUN A: GATE JSON (${GATE_JSON}) ====="
+          if [ -n "$GATE_JSON" ] && [ -f "$GATE_JSON" ]; then
+            cat "$GATE_JSON"
+            echo
+            cp -- "$GATE_JSON" "${diag_dir}/gate-a.json"
+          else
+            echo "(missing)"
+          fi
+
+          echo "===== RUN A: GATE STDERR (${GATE_ERR}) ====="
+          if [ -n "$GATE_ERR" ] && [ -s "$GATE_ERR" ]; then
+            cat "$GATE_ERR"
+            cp -- "$GATE_ERR" "${diag_dir}/gate-a.err"
+          else
+            echo "(empty)"
+            : > "${diag_dir}/gate-a.err"
+          fi
+
+          echo "===== RUN A: OUTPUT DIR ====="
+          echo "A_OUTPUT_DIR=${GATE_OUTPUT_DIR}"
+          a_sarif_present="no"
+          if [ -z "$GATE_OUTPUT_DIR" ]; then
+            echo "(output_dir empty - nothing to list)"
+          elif [ ! -d "$GATE_OUTPUT_DIR" ]; then
+            echo "(output_dir does not exist on disk)"
+          else
+            echo "----- ls -la output_dir -----"
+            ls -la "$GATE_OUTPUT_DIR"
+            echo "----- ls -la output_dir/30_context -----"
+            if [ -d "${GATE_OUTPUT_DIR}/30_context" ]; then
+              ls -la "${GATE_OUTPUT_DIR}/30_context"
+            else
+              echo "(30_context missing)"
+            fi
+            echo "----- find output_dir -maxdepth 2 -----"
+            find "$GATE_OUTPUT_DIR" -maxdepth 2 | sort | tee "${diag_dir}/gate-a-pack-listing.txt"
+            if [ -f "${GATE_OUTPUT_DIR}/30_context/INLINE_FINDINGS.sarif" ]; then
+              a_sarif_present="yes"
+              cp -- "${GATE_OUTPUT_DIR}/30_context/INLINE_FINDINGS.sarif" "${diag_dir}/INLINE_FINDINGS.sarif"
+            fi
+          fi
+
+          echo "A_SARIF_PRESENT=${a_sarif_present}"
+          if [ "$a_sarif_present" = "yes" ]; then
+            echo "A_SARIF_RUNS=$(jq '.runs | length' "${diag_dir}/INLINE_FINDINGS.sarif" 2>&1)"
+            echo "A_SARIF_RESULTS=$(jq '[.runs[].results | length] | add' "${diag_dir}/INLINE_FINDINGS.sarif" 2>&1)"
+          fi
+          exit 0
       - name: Stage constrained SARIF artifact
         if: ${{ steps.gate.outputs.sarif_path != '' }}
         env:
@@ -115,6 +191,115 @@ jobs:
           path: ${{ runner.temp }}/prview-sarif/INLINE_FINDINGS.sarif
           if-no-files-found: error
           retention-days: 1
+      # Runs after the constrained SARIF artifact is already staged and uploaded,
+      # so rewriting the origin remote cannot disturb the production path.
+      - name: Reproduce main-push condition (base == target)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          diag_dir="${RUNNER_TEMP}/diag-b"
+          install -d "$diag_dir"
+          bare="${RUNNER_TEMP}/bare.git"
+
+          head_sha="$(git rev-parse HEAD)"
+          orig_url="$(git remote get-url origin)"
+          echo "===== RUN B: SETUP ====="
+          echo "B_HEAD=${head_sha}"
+          echo "B_ORIGINAL_ORIGIN_URL=${orig_url}"
+
+          git clone --quiet --bare . "$bare"
+          git --git-dir="$bare" update-ref refs/heads/main "$head_sha"
+          git --git-dir="$bare" symbolic-ref HEAD refs/heads/main
+          echo "B_BARE_MAIN=$(git --git-dir="$bare" rev-parse refs/heads/main 2>&1)"
+
+          git remote set-url origin "$bare"
+          git fetch --quiet --force origin "+refs/heads/*:refs/remotes/origin/*"
+
+          echo "===== RUN B: GIT TOPOLOGY (base == target) ====="
+          echo "B_ORIGIN_MAIN=$(git rev-parse origin/main 2>&1)"
+          echo "B_MERGE_BASE=$(git merge-base HEAD origin/main 2>&1)"
+          echo "----- git diff --stat origin/main...HEAD (tail -3) -----"
+          git diff --stat origin/main...HEAD 2>&1 | tail -3
+          echo "(no output above means an empty diff)"
+
+          b_json="${RUNNER_TEMP}/gate-b.json"
+          b_err="${RUNNER_TEMP}/gate-b.err"
+          ./target/release/prview gate --json > "$b_json" 2> "$b_err"
+          b_status=$?
+
+          echo "===== RUN B: GATE EXIT CODE ====="
+          echo "B_EXIT_CODE=${b_status}"
+          echo "B_ORIGIN_MAIN_AFTER_PRVIEW_FETCH=$(git rev-parse origin/main 2>&1)"
+
+          echo "===== RUN B: GATE JSON (${b_json}) ====="
+          if [ -s "$b_json" ]; then
+            cat "$b_json"
+            echo
+            cp -- "$b_json" "${diag_dir}/gate-b.json"
+          else
+            echo "(empty or missing)"
+          fi
+
+          echo "===== RUN B: GATE STDERR (${b_err}) ====="
+          if [ -s "$b_err" ]; then
+            cat "$b_err"
+            cp -- "$b_err" "${diag_dir}/gate-b.err"
+          else
+            echo "(empty)"
+            : > "${diag_dir}/gate-b.err"
+          fi
+
+          b_verdict=""
+          b_output_dir=""
+          if command -v jq >/dev/null 2>&1 && [ -s "$b_json" ]; then
+            b_verdict="$(jq -r '.verdict // empty' "$b_json" 2>/dev/null)"
+            b_output_dir="$(jq -r '.output_dir // empty' "$b_json" 2>/dev/null)"
+          fi
+          echo "===== RUN B: OUTPUT DIR ====="
+          echo "B_VERDICT=${b_verdict}"
+          echo "B_OUTPUT_DIR=${b_output_dir}"
+
+          b_sarif_present="no"
+          if [ -z "$b_output_dir" ]; then
+            echo "(output_dir empty - nothing to list)"
+          elif [ ! -d "$b_output_dir" ]; then
+            echo "(output_dir does not exist on disk)"
+          else
+            echo "----- ls -la output_dir -----"
+            ls -la "$b_output_dir"
+            echo "----- ls -la output_dir/30_context -----"
+            if [ -d "${b_output_dir}/30_context" ]; then
+              ls -la "${b_output_dir}/30_context"
+            else
+              echo "(30_context missing)"
+            fi
+            echo "----- find output_dir -maxdepth 2 -----"
+            find "$b_output_dir" -maxdepth 2 | sort | tee "${diag_dir}/gate-b-pack-listing.txt"
+            if [ -f "${b_output_dir}/30_context/INLINE_FINDINGS.sarif" ]; then
+              b_sarif_present="yes"
+              cp -- "${b_output_dir}/30_context/INLINE_FINDINGS.sarif" "${diag_dir}/INLINE_FINDINGS.sarif"
+            fi
+          fi
+
+          echo "B_SARIF_PRESENT=${b_sarif_present}"
+          if [ "$b_sarif_present" = "yes" ]; then
+            echo "B_SARIF_RUNS=$(jq '.runs | length' "${diag_dir}/INLINE_FINDINGS.sarif" 2>&1)"
+          fi
+
+          git remote set-url origin "$orig_url"
+          echo "B_RESTORED_ORIGIN_URL=$(git remote get-url origin 2>&1)"
+          exit 0
+      - name: Upload diagnostics artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gate-sarif-diagnostics
+          path: |
+            ${{ runner.temp }}/diag-a
+            ${{ runner.temp }}/diag-b
+          if-no-files-found: warn
+          retention-days: 7
 
   upload-sarif:
     name: Upload trusted SARIF
@@ -145,3 +330,68 @@ jobs:
         with:
           sarif_file: ${{ runner.temp }}/prview-sarif/INLINE_FINDINGS.sarif
           category: prview-inline
+
+  # Diagnostic-only job: exercises github/codeql-action/upload-sarif@v4 end to end
+  # on a throwaway branch. Never runs on push or pull_request.
+  upload-sarif-v4-test:
+    name: Upload SARIF v4 controlled test
+    needs: gate-shadow
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Download diagnostics artifact
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: gate-sarif-diagnostics
+          path: ${{ runner.temp }}/diag
+      - name: Select SARIF source
+        id: select
+        shell: bash
+        run: |
+          set -e
+          staged="${RUNNER_TEMP}/v4-sarif"
+          install -d "$staged"
+          target="${staged}/upload.sarif"
+          candidate="${RUNNER_TEMP}/diag/diag-a/INLINE_FINDINGS.sarif"
+
+          if [ -f "$candidate" ]; then
+            cp -- "$candidate" "$target"
+            source="real-inline-findings"
+            echo "SARIF_SOURCE=real-inline-findings (${candidate})"
+          else
+            jq -n '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",version:"2.1.0",runs:[{tool:{driver:{name:"prview-inline-diag",informationUri:"https://github.com/vetcoders/prview-rs",version:"0.0.0-diag",rules:[{id:"PRVIEW-DIAG-0001",name:"DiagnosticProbe",shortDescription:{text:"Diagnostic probe rule"},fullDescription:{text:"Placeholder rule used to exercise the SARIF upload path."},defaultConfiguration:{level:"note"}}]}},results:[]}]}' > "$target"
+            source="synthetic-fixture"
+            echo "SARIF_SOURCE=synthetic-fixture (no diag-a/INLINE_FINDINGS.sarif found)"
+          fi
+
+          jq -e '.version == "2.1.0" and (.runs | type == "array")' "$target" >/dev/null
+          echo "source=${source}" >> "$GITHUB_OUTPUT"
+          echo "path=${target}" >> "$GITHUB_OUTPUT"
+          echo "SARIF_RUNS=$(jq '.runs | length' "$target")"
+          echo "SARIF_BYTES=$(wc -c < "$target")"
+          echo "----- SARIF head -----"
+          head -c 2000 "$target"
+          echo
+      - name: Upload SARIF via codeql-action v4
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ steps.select.outputs.path }}
+          category: prview-diag
+          wait-for-processing: true
+      - name: Report upload source
+        if: always()
+        shell: bash
+        env:
+          SARIF_SOURCE: ${{ steps.select.outputs.source }}
+        run: |
+          echo "UPLOAD_SARIF_V4_SOURCE=${SARIF_SOURCE}"
