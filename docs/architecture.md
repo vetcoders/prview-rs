@@ -1387,7 +1387,23 @@ Job Object contract cannot disappear with an unrelated dependency change.
 
 Admission is what makes the distinction real, so the run reports it:
 
-- the progress line separates the two — `Running: X (12s) · Queued: Y, Z`;
+- the progress line separates the two, and every number on it belongs to the
+  check it is printed next to —
+  `Running: Vitest (312s) · Queued: waiting for run resources — Y, Z`.
+  The counter is the running check's own elapsed time measured from admission,
+  NOT the stage wall clock: under `safe` a check admitted thirty seconds ago can
+  sit behind half an hour of queue, and printing the stage clock beside its name
+  made an ordinary serialized run read as a hang;
+- the line quotes no timeout beside that counter. Elapsed is measured from
+  admission while `CHECK_TIMEOUT_SECS`/`TEST_TIMEOUT_SECS` apply from command
+  spawn, and Pytest and `Cargo geiger` run bounded probes in between, so the
+  pair would not compare like with like — a Pytest at `931s` can be a 900s-capped
+  command with time left. No whole-check deadline is enforced anywhere, so there
+  is no honest denominator to substitute;
+- the queue wording is deliberately neutral about the cause. `admit_check` takes
+  the cargo `target/` lock before the governor's budget, so an unstarted cargo
+  check may be parked on that lock while permits are free; the board knows the
+  check has not started, not which resource is holding it;
 - the ledger's `started_at` is the moment of admission, not the first poll of the
   check's future, so `started_at − queued_at` is time spent waiting for the
   machine;

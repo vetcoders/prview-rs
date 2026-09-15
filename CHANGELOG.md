@@ -38,6 +38,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The check progress line reported the STAGE's wall clock as the running
+  check's elapsed time, so `Running: Vitest (2000s)` could mean a Vitest
+  admitted thirty seconds ago behind half an hour of queue. Combined with a
+  bare `Queued:` list, an ordinary `--resource-budget safe` run — one permit,
+  fair-FIFO, every check admitted one at a time by design — read as a hang, and
+  operators aborted healthy runs. Each running check now reports its own
+  elapsed time, measured from admission (`Running: Vitest (312s)`), and the
+  queue states that it is waiting on run resources
+  (`Queued: waiting for run resources — Cargo check, Clippy`) without claiming
+  which one, since a queued cargo check may be held by the shared `target/`
+  lock rather than the machine budget. No timeout is printed beside the
+  counter: elapsed runs from admission while the timeouts run from command
+  spawn, and checks that probe first (Pytest, `cargo geiger`) would otherwise
+  render impossible pairs such as `931s/900s`. The resource contract itself is
+  unchanged: same budget, same weights, same child-worker caps.
 - The curl installer no longer silently substitutes a locally compiled binary
   for an official one. Previously a failed download, a missing artifact, or an
   unsupported platform fell through to `cargo install prview --locked --force`,
