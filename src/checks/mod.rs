@@ -610,14 +610,6 @@ impl RunBoard {
         }
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
-
-    /// How many checks are still waiting for the budget.
-    fn queued_len(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| e.started_at.is_none())
-            .count()
-    }
 }
 
 /// The board, recovering from a poisoned lock rather than propagating it: a
@@ -851,13 +843,6 @@ async fn run_all_checks(
         const SLOW_NOTICE_THRESHOLDS_SECS: [u64; 3] = [60, 300, 900];
         let mut next_slow_notice = 0usize;
 
-        // The queue under `safe` is the contract working, not a fault — but on
-        // an otherwise idle machine the operator is entitled to know that the
-        // sanctioned throughput opt-in exists. Once per run, and only while a
-        // real queue is visible; the condition itself lives in the governor.
-        let resource_plan = config.resource_plan;
-        let mut budget_hint_shown = false;
-
         loop {
             tokio::select! {
                 biased;
@@ -946,19 +931,6 @@ async fn run_all_checks(
                             "ℹ".cyan(),
                             running_secs,
                             board.names_where(true).join(", "),
-                        );
-                    }
-                    // One-shot: name the sanctioned way out of a queue the
-                    // machine has the capacity to shorten. It changes nothing
-                    // about this run — `safe` stays `safe`.
-                    if !budget_hint_shown
-                        && resource_plan.suggests_balanced_opt_in(board.queued_len())
-                    {
-                        budget_hint_shown = true;
-                        println!(
-                            "\r\x1b[2K  {} machine is mostly idle; --resource-budget balanced \
-                             runs capped tools in parallel",
-                            "ℹ".cyan(),
                         );
                     }
                     // Refresh each running check's own elapsed time.

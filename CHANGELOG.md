@@ -11,16 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- On an idle machine with at least three checks parked on the budget, a `safe`
-  run prints one line naming the sanctioned throughput opt-in:
-  `machine is mostly idle; --resource-budget balanced runs capped tools in
-  parallel`. It changes nothing about the plan — `safe` stays `safe` — and it
-  is suppressed under `--quiet` and `--json`, when the load average is
-  unreadable, and when `balanced` was already requested (including a
-  `balanced` request that backpressure already lowered).
-
 ### Changed
 
 - `install.sh` is fail-closed. It installs an official release binary or it

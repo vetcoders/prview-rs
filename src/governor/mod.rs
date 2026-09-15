@@ -130,35 +130,6 @@ impl ResourcePlan {
             }
         }
     }
-
-    /// Whether this run should offer the sanctioned throughput opt-in.
-    ///
-    /// Pure, so the condition is testable without a machine to observe: it
-    /// reads the plan [`Self::from_observation`] already produced plus the
-    /// number of checks currently parked on the budget. It changes NOTHING
-    /// about the plan — `safe` stays `safe` — it only decides whether the
-    /// operator is told that `--resource-budget balanced` exists.
-    ///
-    /// Three conditions, all required:
-    /// - the effective budget is `safe`, so the run really is serializing;
-    /// - the machine is measurably idle. Unknown load is not idle, the same
-    ///   conservative reading [`Self::from_observation`] gives it. Note this
-    ///   also excludes a backpressured `balanced` run, which by construction
-    ///   observed `load_per_core >= 0.75` or no reading at all — prview never
-    ///   suggests a budget the operator already asked for;
-    /// - at least three checks are waiting, so the wait is a queue and not the
-    ///   ordinary tail of a nearly-finished run.
-    #[must_use]
-    pub fn suggests_balanced_opt_in(&self, queued_checks: usize) -> bool {
-        const IDLE_LOAD_PER_CORE: f64 = 0.5;
-        const MIN_QUEUE: usize = 3;
-
-        self.effective == ResourceBudget::Safe
-            && self
-                .load_per_core
-                .is_some_and(|ratio| ratio < IDLE_LOAD_PER_CORE)
-            && queued_checks >= MIN_QUEUE
-    }
 }
 
 /// How much of the machine a task is expected to want.
@@ -926,54 +897,6 @@ mod tests {
         assert!(pressured.backpressured);
         assert_eq!(pressured.total_budget, 1);
         assert_eq!(pressured.worker_limit, 1);
-    }
-
-    /// The hint exists for exactly one situation: the operator is watching a
-    /// `safe` run serialize a real queue on a machine that has capacity to
-    /// spare. Anywhere else it is noise, and on a busy machine it is bad
-    /// advice.
-    #[test]
-    fn the_balanced_hint_fires_only_on_an_idle_machine_with_a_real_queue() {
-        let idle_safe = ResourcePlan::from_observation(ResourceBudget::Safe, 8, Some(0.8));
-        assert_eq!(idle_safe.effective, ResourceBudget::Safe);
-        assert!(
-            idle_safe.suggests_balanced_opt_in(7),
-            "an idle machine serializing seven checks is the whole point",
-        );
-        assert!(
-            idle_safe.suggests_balanced_opt_in(3),
-            "three waiting checks is already a queue",
-        );
-        assert!(
-            !idle_safe.suggests_balanced_opt_in(2),
-            "the tail of a nearly-finished run is not a queue worth a notice",
-        );
-
-        let busy_safe = ResourcePlan::from_observation(ResourceBudget::Safe, 8, Some(6.0));
-        assert!(
-            !busy_safe.suggests_balanced_opt_in(7),
-            "telling a loaded machine to run more in parallel is bad advice",
-        );
-
-        let unknown_load = ResourcePlan::from_observation(ResourceBudget::Safe, 8, None);
-        assert!(
-            !unknown_load.suggests_balanced_opt_in(7),
-            "an unreadable load average is pressure, not spare capacity",
-        );
-
-        let balanced = ResourcePlan::from_observation(ResourceBudget::Balanced, 16, Some(1.0));
-        assert_eq!(balanced.effective, ResourceBudget::Balanced);
-        assert!(
-            !balanced.suggests_balanced_opt_in(7),
-            "a run already on balanced has nothing to opt into",
-        );
-
-        let backpressured = ResourcePlan::from_observation(ResourceBudget::Balanced, 8, Some(7.0));
-        assert_eq!(backpressured.effective, ResourceBudget::Safe);
-        assert!(
-            !backpressured.suggests_balanced_opt_in(7),
-            "a balanced request already refused for load must not be re-suggested",
-        );
     }
 
     #[tokio::test]

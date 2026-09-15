@@ -202,10 +202,8 @@ recommended setting for ordinary developer machines.
 Under `safe` the budget is a single permit and admission is fair-FIFO, so
 **every check runs one at a time, light ones included** — a check that has not
 been admitted is waiting for the machine, not stuck. On a large repository the
-whole stage therefore takes roughly the sum of its checks, and an hour-long
-`--deep` run is the contract working rather than a hang. `balanced` is the
-opt-in when the machine is idle and you want the throughput; on an idle machine
-with a real queue prview prints that suggestion once per run.
+whole stage therefore takes roughly the sum of its checks, and a long `--deep`
+run is the contract working rather than a hang.
 
 The progress line reports this directly:
 
