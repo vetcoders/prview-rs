@@ -452,12 +452,6 @@ impl Check for VitestCheck {
         "Vitest"
     }
 
-    /// A test suite is capped at [`TEST_TIMEOUT_SECS`], not the default check
-    /// timeout; the progress line reports the cap the process actually has.
-    fn timeout_secs(&self) -> u64 {
-        TEST_TIMEOUT_SECS
-    }
-
     /// Heavy: see [`Check::resource_weight`] for the one list of tools that
     /// want the whole machine.
     fn resource_weight(&self) -> crate::governor::Weight {

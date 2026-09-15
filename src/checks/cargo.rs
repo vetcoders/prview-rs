@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 const MAX_CARGO_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// `cargo geiger` compiles the crate graph to reach it and is routinely slower
-/// than the default check timeout. Named here because two places have to agree:
-/// the runner that enforces it and [`Check::timeout_secs`], which puts it on the
-/// progress line.
+/// than the default check timeout, so it carries its own. Named rather than
+/// inlined at the call site: a bare `600` next to `CHECK_TIMEOUT_SECS` and
+/// `TEST_TIMEOUT_SECS` reads as an accident.
 const GEIGER_TIMEOUT_SECS: u64 = 600;
 
 pub struct CargoCheck;
@@ -1607,12 +1607,6 @@ impl Check for CargoTestCheck {
         "Cargo test"
     }
 
-    /// A test suite is capped at [`TEST_TIMEOUT_SECS`], not the default check
-    /// timeout; the progress line reports the cap the process actually has.
-    fn timeout_secs(&self) -> u64 {
-        TEST_TIMEOUT_SECS
-    }
-
     /// Heavy: see [`Check::resource_weight`] for the one list of tools that
     /// want the whole machine.
     fn resource_weight(&self) -> crate::governor::Weight {
@@ -2000,12 +1994,6 @@ fn count_cargo_audit_warning_items(value: &serde_json::Value) -> usize {
 impl Check for CargoGeigerCheck {
     fn name(&self) -> &str {
         "Cargo geiger"
-    }
-
-    /// Geiger gets its own, longer cap; the progress line reports the one the
-    /// process actually has.
-    fn timeout_secs(&self) -> u64 {
-        GEIGER_TIMEOUT_SECS
     }
 
     /// Heavy: see [`Check::resource_weight`] for the one list of tools that

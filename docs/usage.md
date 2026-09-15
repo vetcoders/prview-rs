@@ -208,19 +208,25 @@ run is the contract working rather than a hang.
 The progress line reports this directly:
 
 ```
-● Running: Vitest (312s/900s) · Queued: waiting for machine budget — Cargo check, Clippy, TypeScript
+● Running: Vitest (312s) · Queued: waiting for run resources — Cargo check, Clippy, TypeScript
 ```
 
 - the counter after each running check is **that check's own elapsed time**,
-  measured from the moment the governor admitted it, against **its own
-  timeout** (300 s for most checks, 900 s for test suites, 600 s for
-  `cargo geiger`). A check killed at its cap is the only thing that number can
-  reach — it is not the stage wall clock;
+  measured from the moment the run admitted it. It is not the stage wall clock,
+  so a large number means that check has genuinely been working that long;
+- no timeout is quoted beside it, deliberately. A check's clock starts at
+  admission, but the timeout that kills it starts when its command is spawned,
+  and some checks probe first (Pytest runs a bounded version probe,
+  `cargo geiger` a `cargo metadata` call). Printing the two as a ratio would
+  show impossible values such as `931s/900s` for a check whose command is still
+  inside its limit;
 - under `balanced` several checks can be running at once and each carries its
-  own pair of numbers;
-- the queued list names what it is waiting for: the machine budget. Those
-  checks have not started, so they have no elapsed time of their own, and the
-  "still running after Ns" notice ignores them for the same reason.
+  own counter;
+- queued checks have not started, so they have no elapsed time of their own,
+  and the "still running after Ns" notice ignores them for the same reason. The
+  wait is stated without guessing its cause: a queued check may be waiting for a
+  machine-budget permit or, in the cargo family, for the shared `target/` lock,
+  and the line does not claim to know which.
 
 `--resource-budget balanced` is an explicit throughput opt-in. It still admits
 at most two capped heavy parents and never creates more parent permits than the
