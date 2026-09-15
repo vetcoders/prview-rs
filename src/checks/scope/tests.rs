@@ -69,7 +69,7 @@ fn modified(path: &str) -> ChangedPath {
 }
 
 fn trustworthy(paths: Vec<ChangedPath>) -> ChangeSet {
-    ChangeSet::new(paths, true, true)
+    ChangeSet::new(paths, true)
 }
 
 fn never_generated(_: &str) -> bool {
@@ -80,15 +80,30 @@ fn never_generated(_: &str) -> bool {
 /// are repo-relative, exactly as a diff reports them.
 const REPO_ROOT: &str = "/w";
 
+/// The ordinary substrate: the run materialised a snapshot of the reviewed
+/// commit, so whatever the operator's own checkout looks like is irrelevant.
+fn reviewed_snapshot() -> ReviewedTree {
+    ReviewedTree::Snapshot(PathBuf::from(REPO_ROOT))
+}
+
 fn decide_with(
     change_set: Option<&ChangeSet>,
     profile: &DetectedProfile,
     workspace: Option<&Result<CargoWorkspace, WorkspaceError>>,
 ) -> ScopeDecisions {
+    decide_on(change_set, profile, workspace, &reviewed_snapshot())
+}
+
+fn decide_on(
+    change_set: Option<&ChangeSet>,
+    profile: &DetectedProfile,
+    workspace: Option<&Result<CargoWorkspace, WorkspaceError>>,
+    reviewed_tree: &ReviewedTree,
+) -> ScopeDecisions {
     decide(
         change_set,
         &ScopeInputs {
-            repo_root: Path::new(REPO_ROOT),
+            reviewed_tree,
             profile,
             cargo_workspace: workspace,
             is_generated: &never_generated,
@@ -111,7 +126,7 @@ fn app_and_core() -> Result<CargoWorkspace, WorkspaceError> {
 
 fn full_reason(decision: &ScopeDecision) -> &str {
     match decision {
-        ScopeDecision::Full { reason } => reason,
+        ScopeDecision::Full { reason, .. } => reason,
         ScopeDecision::ChangeScoped { .. } => {
             panic!("expected a full run, got a change-scoped selection")
         }
@@ -121,7 +136,7 @@ fn full_reason(decision: &ScopeDecision) -> &str {
 fn selected(decision: &ScopeDecision) -> &[String] {
     match decision {
         ScopeDecision::ChangeScoped { selected, .. } => selected,
-        ScopeDecision::Full { reason } => {
+        ScopeDecision::Full { reason, .. } => {
             panic!("expected a change-scoped selection, got: {reason}")
         }
     }
@@ -365,7 +380,7 @@ fn a_rename_escalates_the_ecosystem_the_content_left() {
 
 #[test]
 fn more_than_one_diff_base_escalates_both_ecosystems() {
-    let set = ChangeSet::new(vec![modified("src/app.ts")], false, true);
+    let set = ChangeSet::new(vec![modified("src/app.ts")], false);
     let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
     assert_eq!(full_reason(&decisions.cargo), reason::MULTIPLE_BASES);
     assert_eq!(full_reason(&decisions.vitest), reason::MULTIPLE_BASES);
@@ -378,17 +393,87 @@ fn no_change_set_at_all_escalates_both_ecosystems() {
     assert_eq!(full_reason(&decisions.vitest), reason::NO_CHANGE_SET);
 }
 
+/// When the checks read the operator's own checkout — which is what happens on
+/// an on-`HEAD` review, where `plan_check_run` hands them the repository root —
+/// uncommitted work IS what the tools compile, while the commit-range change
+/// set cannot list it. Selecting from a set that is missing files the tools
+/// will read is the silent narrowing the contract forbids.
 #[test]
-fn a_change_set_inconsistent_with_the_reviewed_snapshot_escalates_both() {
-    let set = ChangeSet::new(vec![modified("src/app.ts")], true, false);
-    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+fn a_dirty_tree_the_checks_actually_read_escalates_both() {
+    let set = trustworthy(vec![modified("src/app.ts")]);
+    let decisions = decide_on(
+        Some(&set),
+        &profile(true, true),
+        Some(&app_and_core()),
+        &ReviewedTree::LocalDirty(PathBuf::from(REPO_ROOT)),
+    );
     assert_eq!(
         full_reason(&decisions.cargo),
-        reason::NOT_SNAPSHOT_CONSISTENT
+        reason::CHECKS_READ_AN_UNCOMMITTED_TREE
     );
     assert_eq!(
         full_reason(&decisions.vitest),
-        reason::NOT_SNAPSHOT_CONSISTENT
+        reason::CHECKS_READ_AN_UNCOMMITTED_TREE
+    );
+}
+
+#[test]
+fn an_unidentifiable_reviewed_tree_escalates_both() {
+    let set = trustworthy(vec![modified("src/app.ts")]);
+    let decisions = decide_on(
+        Some(&set),
+        &profile(true, true),
+        Some(&app_and_core()),
+        &ReviewedTree::Unknown(PathBuf::from(REPO_ROOT)),
+    );
+    assert_eq!(full_reason(&decisions.cargo), reason::UNKNOWN_REVIEWED_TREE);
+    assert_eq!(
+        full_reason(&decisions.vitest),
+        reason::UNKNOWN_REVIEWED_TREE
+    );
+}
+
+/// A clean operator checkout IS the reviewed commit, so an on-`HEAD` review
+/// that reads it scopes normally. Together with the test above this pins both
+/// directions of the distinction.
+#[test]
+fn a_clean_tree_the_checks_read_scopes_like_a_snapshot() {
+    let set = trustworthy(vec![modified("src/app.ts")]);
+    let decisions = decide_on(
+        Some(&set),
+        &profile(true, true),
+        Some(&app_and_core()),
+        &ReviewedTree::LocalClean(PathBuf::from(REPO_ROOT)),
+    );
+    assert_eq!(selected(&decisions.vitest), ["src/app.ts".to_string()]);
+}
+
+/// `ReviewedTree::resolve` is where the two facts meet: what the ledger says
+/// the run materialised, and what the operator's checkout looked like. Only
+/// when there is NO snapshot does the checkout enter the picture at all.
+#[test]
+fn the_reviewed_tree_is_read_from_the_snapshot_first_and_the_checkout_second() {
+    let repo = Path::new("/repo");
+    let snapshot = PathBuf::from("/snap");
+    for clean in [Some(true), Some(false), None] {
+        assert_eq!(
+            ReviewedTree::resolve(repo, Some(snapshot.clone()), clean),
+            ReviewedTree::Snapshot(snapshot.clone()),
+            "a materialised snapshot settles the substrate on its own"
+        );
+    }
+    assert_eq!(
+        ReviewedTree::resolve(repo, None, Some(true)),
+        ReviewedTree::LocalClean(repo.to_path_buf())
+    );
+    assert_eq!(
+        ReviewedTree::resolve(repo, None, Some(false)),
+        ReviewedTree::LocalDirty(repo.to_path_buf())
+    );
+    assert_eq!(
+        ReviewedTree::resolve(repo, None, None),
+        ReviewedTree::Unknown(repo.to_path_buf()),
+        "an unreadable checkout is unknown, never assumed clean"
     );
 }
 
@@ -431,20 +516,189 @@ fn escalation_is_one_directional_within_a_run() {
 
 /// The explicit negative case from the contract's correction (2026-09-15).
 ///
-/// A dirty operator checkout is NOT a reason to widen the run. A `--pr` review
-/// is about the pinned target and the canonical PR diff, so uncommitted files
-/// in the operator's tree have nothing to do with it — escalating on them would
-/// make the feature useless during exactly the work it exists for. The proof is
-/// structural: worktree cleanliness is not an input to this decision at all,
-/// and a trustworthy pinned set scopes normally.
+/// A dirty operator checkout is NOT a reason to widen the run. When the run
+/// materialised a snapshot, the checks never read that tree at all — the review
+/// is about the pinned target and the canonical PR diff — so escalating on it
+/// would make the feature useless during exactly the work it exists for. Note
+/// the pairing with `a_dirty_tree_the_checks_actually_read_escalates_both`: the
+/// same dirty checkout means nothing here and everything there, and the fact
+/// that decides which is WHICH TREE THE CHECKS READ.
 #[test]
 fn a_dirty_operator_checkout_is_not_itself_a_reason_to_escalate() {
+    let dirty_checkout_with_a_snapshot = ReviewedTree::resolve(
+        Path::new(REPO_ROOT),
+        Some(PathBuf::from(REPO_ROOT)),
+        Some(false),
+    );
     let set = trustworthy(vec![modified("crates/core/src/lib.rs")]);
-    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    let decisions = decide_on(
+        Some(&set),
+        &profile(true, true),
+        Some(&app_and_core()),
+        &dirty_checkout_with_a_snapshot,
+    );
     assert_eq!(
         selected(&decisions.cargo),
         ["app".to_string(), "core".to_string()],
         "a trustworthy pinned change set scopes regardless of the operator's tree"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Shared tooling at the repository root
+// ---------------------------------------------------------------------------
+
+/// Substring matching on `"/__fixtures__/"` needs a leading separator a
+/// root-level path does not have, so every shared directory at the repository
+/// root fell through to "ordinary source" and got SCOPED where the contract
+/// demands escalation. One case per directory in the class, all at the root.
+#[test]
+fn a_shared_directory_at_the_repository_root_still_escalates() {
+    for directory in [
+        "tools",
+        "fixtures",
+        "__fixtures__",
+        "__mocks__",
+        "test-helpers",
+        "test_helpers",
+        "testutils",
+    ] {
+        let path = format!("{directory}/user.ts");
+        let set = trustworthy(vec![modified(&path)]);
+        let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+        assert_eq!(
+            full_reason(&decisions.vitest),
+            reason::shared_tooling(&path),
+            "root-level {directory}/ must escalate like a nested one"
+        );
+    }
+}
+
+#[test]
+fn a_shared_directory_nested_anywhere_escalates_too() {
+    for path in [
+        "packages/ui/__fixtures__/user.ts",
+        "crates/core/tests/fixtures/sample.rs",
+        "apps/web/src/__mocks__/api.ts",
+    ] {
+        let set = trustworthy(vec![modified(path)]);
+        let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+        assert!(
+            decisions.cargo.is_full() || decisions.vitest.is_full(),
+            "{path} must escalate its owning ecosystem"
+        );
+    }
+}
+
+/// Whole segments, not substrings: a file whose NAME merely starts with a
+/// shared directory's name is ordinary source.
+#[test]
+fn a_file_named_after_a_shared_directory_is_not_shared_tooling() {
+    let set = trustworthy(vec![modified("src/fixtures.ts")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    assert_eq!(selected(&decisions.vitest), ["src/fixtures.ts".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// Unsupported inputs (contract §2: an unknown file ends in a full run)
+// ---------------------------------------------------------------------------
+
+/// Neither selector can see these. Vitest walks the static import graph and
+/// cargo walks package membership; a JSON asset, a template, an `.env` file or
+/// a data file is read at runtime through `fs` or `include_str!`, from a path
+/// neither graph contains. Contributing nothing to the selection and calling
+/// the result change-scoped would be a silent narrowing.
+#[test]
+fn an_unsupported_input_escalates_both_ecosystems() {
+    for path in [
+        "src/locales/pl.json",
+        "src/templates/email.hbs",
+        ".env.test",
+        "src/data/seed.csv",
+        "docs/architecture.md",
+        ".github/workflows/ci.yml",
+        "assets/logo.svg",
+    ] {
+        let set = trustworthy(vec![modified(path)]);
+        let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+        assert_eq!(
+            full_reason(&decisions.vitest),
+            reason::unsupported_input(path),
+            "{path} is invisible to the vitest import graph"
+        );
+        assert_eq!(
+            full_reason(&decisions.cargo),
+            reason::unsupported_input(path),
+            "{path} is invisible to cargo package membership too"
+        );
+    }
+}
+
+#[test]
+fn generated_output_is_still_not_an_unsupported_input() {
+    // Build output is not an unknown file: it is a KNOWN non-source, and the
+    // tools never read it as an input. It neither selects nor escalates.
+    let is_generated: &dyn Fn(&str) -> bool = &|path: &str| path.starts_with("dist/");
+    let set = trustworthy(vec![modified("dist/locales.json"), modified("src/app.ts")]);
+    let decisions = decide(
+        Some(&set),
+        &ScopeInputs {
+            reviewed_tree: &reviewed_snapshot(),
+            profile: &profile(true, true),
+            cargo_workspace: Some(&app_and_core()),
+            is_generated,
+        },
+    );
+    assert_eq!(selected(&decisions.vitest), ["src/app.ts".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// The cargo root must be the REVIEWED one
+// ---------------------------------------------------------------------------
+
+/// `profile.cargo_root` is detected in the operator checkout, which on a `--pr`
+/// run is a different revision from the one under review. Reading metadata
+/// there would describe another revision's members and path edges while the
+/// change set describes this one.
+#[test]
+fn the_cargo_root_is_rebased_onto_the_reviewed_tree() {
+    assert_eq!(
+        rebase_cargo_root(
+            Path::new("/repo/src-tauri"),
+            Path::new("/repo"),
+            Path::new("/snap")
+        ),
+        CargoRoot::Reviewed(PathBuf::from("/snap/src-tauri")),
+        "a nested cargo root keeps its position inside the reviewed tree"
+    );
+    assert_eq!(
+        rebase_cargo_root(Path::new("/repo"), Path::new("/repo"), Path::new("/snap")),
+        CargoRoot::Reviewed(PathBuf::from("/snap")),
+        "a cargo root AT the repository root maps to the reviewed root itself"
+    );
+    assert_eq!(
+        rebase_cargo_root(Path::new("/repo"), Path::new("/repo"), Path::new("/repo")),
+        CargoRoot::Reviewed(PathBuf::from("/repo")),
+        "an on-HEAD review reads the repository root, and the mapping is identity"
+    );
+}
+
+#[test]
+fn a_cargo_root_outside_the_repository_escalates_rather_than_guessing() {
+    assert_eq!(
+        rebase_cargo_root(
+            Path::new("/elsewhere/crate"),
+            Path::new("/repo"),
+            Path::new("/snap")
+        ),
+        CargoRoot::Unlocatable
+    );
+    let unlocatable: Result<CargoWorkspace, WorkspaceError> = Err(WorkspaceError::UnlocatableRoot);
+    let set = trustworthy(vec![modified("crates/core/src/lib.rs")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&unlocatable));
+    assert_eq!(
+        full_reason(&decisions.cargo),
+        reason::resolution_failed(reason::REVIEWED_CARGO_ROOT_UNLOCATABLE)
     );
 }
 
@@ -541,7 +795,7 @@ fn generated_output_is_not_a_selector_input() {
     let decisions = decide(
         Some(&set),
         &ScopeInputs {
-            repo_root: Path::new(REPO_ROOT),
+            reviewed_tree: &reviewed_snapshot(),
             profile: &profile(true, true),
             cargo_workspace: Some(&app_and_core()),
             is_generated,
@@ -603,11 +857,35 @@ fn a_scopeable_decision_is_still_reported_as_full_while_commands_are_full() {
 
 #[test]
 fn a_real_escalation_keeps_its_own_reason_in_the_report() {
-    let set = trustworthy(vec![modified("Cargo.lock")]);
+    let set = trustworthy(vec![modified("Cargo.lock"), modified("src/app.ts")]);
     let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
     let report = decisions.cargo.report();
     assert_eq!(report.mode, "full");
     assert_eq!(report.reason, reason::manifest("Cargo.lock"));
+    assert_eq!(
+        report.inputs,
+        Some(2),
+        "a full run that counted two changed paths says two; `null` is reserved \
+         for having had nothing to count"
+    );
+    assert_eq!(report.selected, None);
+    assert_eq!(report.selector, None);
+}
+
+/// `inputs: null` is a distinct statement from `inputs: 0`, and it belongs to
+/// exactly one case: there was never a change set to count.
+#[test]
+fn only_a_missing_change_set_reports_an_unknown_input_count() {
+    let unknown = decide_with(None, &profile(true, true), Some(&app_and_core()));
+    assert_eq!(unknown.cargo.report().inputs, None);
+
+    let counted = ChangeSet::new(vec![modified("src/app.ts"), modified("src/b.ts")], false);
+    let decisions = decide_with(Some(&counted), &profile(true, true), Some(&app_and_core()));
+    assert_eq!(
+        decisions.vitest.report().inputs,
+        Some(2),
+        "a set that was read and rejected was still counted"
+    );
 }
 
 #[test]

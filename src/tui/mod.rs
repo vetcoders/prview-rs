@@ -597,7 +597,7 @@ pub async fn run_analysis(
         config.changed_paths = diff_bases
             .first()
             .and_then(|base| app.repo.changed_paths(base, &target).ok())
-            .map(|paths| crate::checks::scope::ChangeSet::new(paths, diff_bases.len() == 1, true));
+            .map(|paths| crate::checks::scope::ChangeSet::new(paths, diff_bases.len() == 1));
         config.pinned_diff_bases = Some(diff_bases);
         // app (with git2::Repository) is dropped here
         Ok((
@@ -621,10 +621,6 @@ pub async fn run_analysis(
         diffs: diffs.clone(),
     });
 
-    // Decided once per run, before the checks, and published on their rows. It
-    // does not yet change what any check executes.
-    let run_scope = crate::checks::scope::resolve_run_scope(&config).await;
-
     // Run all checks with event callbacks for real-time updates
     let tx_checks = tx.clone();
     let ledger = crate::ledger::TaskLedger::new();
@@ -635,6 +631,17 @@ pub async fn run_analysis(
         })
         .await?;
     ensure_analysis_active(&governor)?;
+
+    // The test scope, decided once per run and published on the check rows.
+    // Mirrors headless `App::run`, including WHY it is resolved after the
+    // checks: which tree they read is decided inside `run_all`, and the ledger
+    // is what records it.
+    let reviewed_tree = crate::checks::scope::ReviewedTree::resolve(
+        &config.repo_root,
+        ledger.scan_dir(),
+        worktree_clean,
+    );
+    let run_scope = crate::checks::scope::resolve_run_scope(&config, &reviewed_tree).await;
 
     // Run heuristics
     let heuristics = if let Some(ref snap) = target_snap {

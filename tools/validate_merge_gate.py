@@ -46,6 +46,11 @@ VALID_QUALITY_FAILURE_CLASSES = {
 # field folds case because its writer has shipped legacy spellings; this one has
 # only ever emitted lowercase.
 VALID_SCOPE_MODES = {"full", "change-scoped"}
+# Only a check that OWNS an ecosystem's test suite can carry a test scope. The
+# emitter attaches `scope` to exactly these rows; anywhere else the object would
+# be test-scope evidence pinned to a check that runs no tests, which a reader
+# could mistake for a narrowed lint or type-check.
+VALID_SCOPE_CHECK_NAMES = {"cargo test", "vitest"}
 VALID_CHECK_STATUSES = {"passed", "failed", "warnings", "skipped", "error"}
 VALID_EXECUTION_STATES = {"executed", "skipped", "unavailable", "unknown"}
 VALID_TOOL_OUTCOMES = {
@@ -675,6 +680,15 @@ def validate(path: Path) -> list[str]:
             # ambiguity the object exists to remove.
             scope = check.get("scope")
             if scope is not None:
+                name = check.get("name")
+                if (
+                    not isinstance(name, str)
+                    or name.strip().lower() not in VALID_SCOPE_CHECK_NAMES
+                ):
+                    issues.append(
+                        f"{ctx}.scope is only valid on "
+                        f"{sorted(VALID_SCOPE_CHECK_NAMES)}"
+                    )
                 if not isinstance(scope, dict):
                     issues.append(f"{ctx}.scope must be an object")
                 else:
@@ -685,10 +699,13 @@ def validate(path: Path) -> list[str]:
                     require_non_empty_string(
                         scope.get("reason"), f"{ctx}.scope.reason", issues
                     )
+                    # Counts of files and packages, so integers. A float here is
+                    # not a rounding detail: "1.5 of 1028 test files" is not a
+                    # statement any reader can act on.
                     for field in ("inputs", "selected", "universe"):
                         value = scope.get(field)
                         if value is not None:
-                            require_non_negative_number(
+                            require_non_negative_integer(
                                 value, f"{ctx}.scope.{field}", issues
                             )
                     selector = scope.get("selector")

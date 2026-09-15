@@ -217,19 +217,13 @@ impl App {
         // changes. `single_base` is false as soon as the run has more than one
         // base: a selection drawn from the union of several review ranges
         // cannot be pinned to any of them — the same reason Semgrep drops to a
-        // full scan there. The set is snapshot-consistent because a pinned
-        // target always materialises a shared snapshot for the checks, so the
-        // tree they scan is exactly the commit these paths came from.
+        // full scan there.
         check_config.changed_paths = run_headless_sync_stage(&self.governor, || {
             Ok(diff_bases
                 .first()
                 .and_then(|base| self.repo.changed_paths(base, &target).ok())
-                .map(|paths| checks::scope::ChangeSet::new(paths, diff_bases.len() == 1, true)))
+                .map(|paths| checks::scope::ChangeSet::new(paths, diff_bases.len() == 1)))
         })?;
-        // Decided once per run, before the checks, and published on their rows.
-        // It does not yet change what any check executes — see
-        // `checks::scope::SCOPED_EXECUTION_NOT_ENABLED`.
-        let run_scope = checks::scope::resolve_run_scope(&check_config).await;
         self.ensure_not_cancelled()?;
         let (check_results, skipped_checks) = if self.config.update_mode {
             // In update mode, skip heavy checks UNLESS user explicitly forced them
@@ -255,6 +249,25 @@ impl App {
         // replayed from the cache never builds the dispatcher's `select!` loop at
         // all — reaches the run here and nowhere earlier.
         self.ensure_not_cancelled()?;
+
+        // The test scope, decided once per run and published on the check rows.
+        // Resolved HERE and not before the checks because it depends on the
+        // tree the checks actually read, and that is decided inside `run_all`
+        // (`share_target_snapshot`): a pinned target does NOT always mean a
+        // snapshot — when the reviewed target is the checked-out `HEAD`,
+        // `plan_check_run` hands the gates the repository root itself, and the
+        // operator's uncommitted work is then part of what they compile. The
+        // ledger is what records which of the two happened. Reading the Cargo
+        // workspace from the same tree is the other half: `profile.cargo_root`
+        // is detected in the operator checkout, which on a `--pr` run is a
+        // different revision entirely. This still changes nothing about what
+        // any check executed — see `checks::scope::SCOPED_EXECUTION_NOT_ENABLED`.
+        let reviewed_tree = checks::scope::ReviewedTree::resolve(
+            &self.config.repo_root,
+            ledger.scan_dir(),
+            worktree.clean,
+        );
+        let run_scope = checks::scope::resolve_run_scope(&check_config, &reviewed_tree).await;
 
         // 6. Run heuristics (loctree-suite)
         // In remote/remote-only mode, use git snapshots for deterministic analysis.

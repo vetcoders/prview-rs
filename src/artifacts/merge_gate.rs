@@ -2389,9 +2389,11 @@ mod tests {
         let scope = ScopeDecisions {
             cargo: ScopeDecision::Full {
                 reason: "manifest or lockfile changed: Cargo.lock".to_string(),
+                inputs: Some(3),
             },
             vitest: ScopeDecision::Full {
                 reason: "no JavaScript or TypeScript source detected".to_string(),
+                inputs: Some(3),
             },
         };
 

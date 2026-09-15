@@ -59,44 +59,94 @@ pub struct ChangeSet {
     /// cannot be pinned to any of them — the same reason Semgrep drops to a
     /// full scan when the run has multiple bases.
     single_base: bool,
-    /// The paths were captured from the same pinned target commit the checks
-    /// will read. When they were not, the gates would scan a tree containing
-    /// work this set never listed, and selecting from it would silently drop
-    /// exactly that work.
-    snapshot_consistent: bool,
 }
 
 impl ChangeSet {
-    pub fn new(paths: Vec<ChangedPath>, single_base: bool, snapshot_consistent: bool) -> Self {
-        Self {
-            paths,
-            single_base,
-            snapshot_consistent,
-        }
+    pub fn new(paths: Vec<ChangedPath>, single_base: bool) -> Self {
+        Self { paths, single_base }
     }
 
     pub fn paths(&self) -> &[ChangedPath] {
         &self.paths
     }
 
-    /// Whether a selection may be made from this set at all.
-    ///
-    /// Note what is deliberately absent: the operator's working tree. A dirty
-    /// checkout is not a reason to widen the run. A `--pr` review is about the
-    /// pinned target and the canonical PR diff, so uncommitted files in the
-    /// operator's checkout have nothing to do with it — escalating on them
-    /// would make the feature useless during ordinary work. What escalates is
-    /// an untrustworthy *set*, which is a different fact.
-    pub fn is_trustworthy(&self) -> bool {
-        self.single_base && self.snapshot_consistent
-    }
-
     pub fn single_base(&self) -> bool {
         self.single_base
     }
+}
 
-    pub fn snapshot_consistent(&self) -> bool {
-        self.snapshot_consistent
+/// The tree the checks actually read, and how it relates to the reviewed
+/// commit.
+///
+/// This is the second half of "can a selection be trusted". The change set says
+/// what changed between two commits; this says whether the tree the tools read
+/// is exactly that. The two are separate facts and only knowable at different
+/// times — the substrate is decided by `share_target_snapshot` inside
+/// `checks::run_all`, long after the diff exists — so keeping them apart is
+/// what stops the flag from being a constant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewedTree {
+    /// The run materialised a snapshot of the reviewed commit and the checks
+    /// read that. The operator's own checkout is irrelevant to the review.
+    Snapshot(PathBuf),
+    /// No snapshot: the checks read the operator checkout, and it is exactly
+    /// the reviewed commit.
+    LocalClean(PathBuf),
+    /// No snapshot: the checks read the operator checkout, and it carries work
+    /// the commit range does not list.
+    LocalDirty(PathBuf),
+    /// The substrate could not be established.
+    Unknown(PathBuf),
+}
+
+impl ReviewedTree {
+    /// What the run ended up reading.
+    ///
+    /// `scan_dir` is the shared snapshot the run materialised, as the ledger
+    /// records it; `None` means `plan_check_run` returned the repository root
+    /// because the reviewed target IS the checked-out `HEAD`. Only in that
+    /// second case does the operator's working tree enter the picture at all.
+    pub fn resolve(
+        repo_root: &Path,
+        scan_dir: Option<PathBuf>,
+        operator_worktree_clean: Option<bool>,
+    ) -> Self {
+        match scan_dir {
+            Some(snapshot) => Self::Snapshot(snapshot),
+            None => match operator_worktree_clean {
+                Some(true) => Self::LocalClean(repo_root.to_path_buf()),
+                Some(false) => Self::LocalDirty(repo_root.to_path_buf()),
+                None => Self::Unknown(repo_root.to_path_buf()),
+            },
+        }
+    }
+
+    /// The directory the checks read. Repo-relative diff paths and
+    /// `cargo metadata` manifest paths must both be spoken in ITS coordinates.
+    pub fn root(&self) -> &Path {
+        match self {
+            Self::Snapshot(root)
+            | Self::LocalClean(root)
+            | Self::LocalDirty(root)
+            | Self::Unknown(root) => root,
+        }
+    }
+
+    /// Whether the tree the checks read contains exactly the reviewed commit
+    /// and nothing else.
+    ///
+    /// Note carefully what this does and does not say about a dirty checkout.
+    /// When the run reads a SNAPSHOT, the operator's uncommitted work is not in
+    /// the reviewed tree at all — the review is about the pinned target and the
+    /// canonical PR diff, so a dirty checkout is emphatically NOT a reason to
+    /// widen the run; escalating there would make the feature useless during
+    /// exactly the work it exists for. When the run reads the operator checkout
+    /// itself, the same uncommitted work IS what the tools compile and run,
+    /// while the change set cannot list it — and selecting from a set that is
+    /// missing files the tools will read is the silent narrowing this contract
+    /// forbids.
+    pub fn is_exactly_the_reviewed_commit(&self) -> bool {
+        matches!(self, Self::Snapshot(_) | Self::LocalClean(_))
     }
 }
 
@@ -133,7 +183,13 @@ impl Ecosystem {
 pub enum ScopeDecision {
     /// Everything runs. `reason` is the contract's `escalated_by`: it always
     /// names the specific fact that widened the run.
-    Full { reason: String },
+    Full {
+        reason: String,
+        /// Changed paths the decision counted before escalating. `None` ONLY
+        /// when there was never a set to count — it means "never got far
+        /// enough", not "zero".
+        inputs: Option<usize>,
+    },
     /// A narrower run is provably sufficient for this change.
     ChangeScoped {
         /// Changed paths taken into account.
@@ -152,9 +208,10 @@ pub enum ScopeDecision {
 }
 
 impl ScopeDecision {
-    fn full(reason: impl Into<String>) -> Self {
+    fn full(reason: impl Into<String>, inputs: Option<usize>) -> Self {
         Self::Full {
             reason: reason.into(),
+            inputs,
         }
     }
 
@@ -169,14 +226,16 @@ impl ScopeDecision {
     /// whether scoped execution is wired up. A `ChangeScoped` decision is
     /// reported as `full`, because full is what ran; `selected` and `selector`
     /// stay `null` for the same reason, since nothing was selected and no
-    /// selector was invoked. `inputs` and `universe` are what the decision
-    /// actually examined and so are reported as measured.
+    /// selector was invoked. `inputs` is what the decision actually counted,
+    /// escalation or not — a full run that examined seven changed paths says
+    /// seven, because `null` there is reserved for "there was nothing to
+    /// count".
     pub fn report(&self) -> ScopeReport {
         match self {
-            Self::Full { reason } => ScopeReport {
+            Self::Full { reason, inputs } => ScopeReport {
                 mode: "full",
                 reason: reason.clone(),
-                inputs: None,
+                inputs: *inputs,
                 selected: None,
                 universe: None,
                 selector: None,
@@ -268,10 +327,27 @@ pub struct ScopeReport {
 pub mod reason {
     pub const NO_CHANGE_SET: &str = "no change set pinned for this run";
     pub const MULTIPLE_BASES: &str = "multiple diff bases";
-    pub const NOT_SNAPSHOT_CONSISTENT: &str =
-        "change set is not consistent with the reviewed snapshot";
+    /// The checks read the operator checkout and it carries uncommitted work.
+    /// Not to be confused with "the operator's checkout is dirty": that alone
+    /// is never a reason (see [`super::ReviewedTree::is_exactly_the_reviewed_commit`]).
+    pub const CHECKS_READ_AN_UNCOMMITTED_TREE: &str =
+        "checks read the operator checkout, which carries work outside the reviewed commit";
+    pub const UNKNOWN_REVIEWED_TREE: &str = "the tree the checks read could not be identified";
     pub const NO_CARGO_ROOT: &str = "no cargo root detected";
     pub const NO_JS_SOURCE: &str = "no JavaScript or TypeScript source detected";
+    pub const REVIEWED_CARGO_ROOT_UNLOCATABLE: &str =
+        "the cargo root could not be located inside the reviewed tree";
+
+    /// A changed path that belongs to no recognised source language and to no
+    /// class this table knows how to reason about — a JSON asset, a template,
+    /// an `.env` file, a data fixture, documentation. Vitest selects by the
+    /// static import graph and cargo by package membership, and neither can see
+    /// a file read through `fs` or `include_str!`, so there is nothing to
+    /// select on and no proof the change is irrelevant. Contract §2: an unknown
+    /// file ends in a full run, never a silent narrowing.
+    pub fn unsupported_input(path: &str) -> String {
+        format!("unsupported input: {path}")
+    }
 
     pub fn manifest(path: &str) -> String {
         format!("manifest or lockfile changed: {path}")
@@ -325,6 +401,9 @@ pub struct CargoWorkspace {
 /// Why a workspace could not be read. Every variant escalates to a full run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceError {
+    /// The cargo root could not be placed inside the reviewed tree, so there is
+    /// no correct directory to read metadata from.
+    UnlocatableRoot,
     Spawn(String),
     ExitStatus(Option<i32>),
     Unparsable(String),
@@ -335,6 +414,7 @@ pub enum WorkspaceError {
 impl WorkspaceError {
     fn detail(&self) -> String {
         match self {
+            Self::UnlocatableRoot => reason::REVIEWED_CARGO_ROOT_UNLOCATABLE.to_string(),
             Self::Spawn(err) => format!("cargo metadata could not run: {err}"),
             Self::ExitStatus(Some(code)) => format!("cargo metadata exited with code {code}"),
             Self::ExitStatus(None) => "cargo metadata was terminated by a signal".to_string(),
@@ -584,19 +664,33 @@ fn is_rust_build_config(path: &str) -> bool {
         || normalized.ends_with(".cargo/config")
 }
 
-/// Helper and fixture surfaces shared by many tests: a change there can alter
-/// the behaviour of tests that never import the changed file by a path the
-/// import graph shows.
+/// Directories whose contents are shared by many tests: a change there can
+/// alter the behaviour of tests that never import the changed file by any path
+/// the import graph shows.
+const SHARED_TOOLING_DIRECTORIES: &[&str] = &[
+    "tools",
+    "fixtures",
+    "__fixtures__",
+    "__mocks__",
+    "test-helpers",
+    "test_helpers",
+    "testutils",
+];
+
+/// Path segments, separator-normalised.
+///
+/// Matching whole segments rather than substrings is what makes a REPO-ROOT
+/// `__fixtures__/user.ts` match: a `contains("/__fixtures__/")` test needs a
+/// leading separator the path does not have, so every root-level shared
+/// directory silently fell through to "ordinary source" and got scoped instead
+/// of escalated.
+fn path_segments(path: &str) -> impl Iterator<Item = &str> {
+    path.split(['/', '\\'])
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+}
+
 fn is_shared_tooling(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
-    normalized.starts_with("tools/")
-        || normalized.contains("/fixtures/")
-        || normalized.starts_with("fixtures/")
-        || normalized.contains("/__fixtures__/")
-        || normalized.contains("/__mocks__/")
-        || normalized.contains("/test-helpers/")
-        || normalized.contains("/test_helpers/")
-        || normalized.contains("/testutils/")
+    path_segments(path).any(|segment| SHARED_TOOLING_DIRECTORIES.contains(&segment))
 }
 
 fn is_rust_source(path: &str) -> bool {
@@ -629,15 +723,16 @@ fn owner(path: &str) -> Option<Ecosystem> {
 
 /// Everything [`decide`] needs that is not the change itself.
 pub struct ScopeInputs<'a> {
-    /// Root the change set's repo-relative paths are resolved against.
+    /// The tree the checks actually read, and the root its paths live under.
     ///
     /// `cargo metadata` reports absolute manifest paths, while a diff reports
     /// repo-relative ones; they have to be spoken in the same coordinates
-    /// before a file can be matched to a member. When they cannot be — a
-    /// symlinked or otherwise non-matching root — the file lands outside every
-    /// member, which escalates. Wrong here means "run everything", never
-    /// "select the wrong package".
-    pub repo_root: &'a Path,
+    /// before a file can be matched to a member — and those coordinates are the
+    /// REVIEWED tree's, not the operator checkout's. On a `--pr` run the two
+    /// are different revisions. When they cannot be reconciled the file lands
+    /// outside every member, which escalates: wrong here means "run
+    /// everything", never "select the wrong package".
+    pub reviewed_tree: &'a ReviewedTree,
     pub profile: &'a DetectedProfile,
     /// The workspace read for this run, or the failure that prevented it.
     /// `None` when Rust is not part of the profile at all.
@@ -653,13 +748,23 @@ pub struct ScopeInputs<'a> {
 /// the reason reported, and no later file narrows it again.
 pub fn decide(change_set: Option<&ChangeSet>, inputs: &ScopeInputs<'_>) -> ScopeDecisions {
     let Some(change_set) = change_set else {
-        return both(ScopeDecision::full(reason::NO_CHANGE_SET));
+        return both(ScopeDecision::full(reason::NO_CHANGE_SET, None));
     };
+    let counted = Some(change_set.paths().len());
     if !change_set.single_base {
-        return both(ScopeDecision::full(reason::MULTIPLE_BASES));
+        return both(ScopeDecision::full(reason::MULTIPLE_BASES, counted));
     }
-    if !change_set.snapshot_consistent {
-        return both(ScopeDecision::full(reason::NOT_SNAPSHOT_CONSISTENT));
+    match inputs.reviewed_tree {
+        ReviewedTree::Snapshot(_) | ReviewedTree::LocalClean(_) => {}
+        ReviewedTree::LocalDirty(_) => {
+            return both(ScopeDecision::full(
+                reason::CHECKS_READ_AN_UNCOMMITTED_TREE,
+                counted,
+            ));
+        }
+        ReviewedTree::Unknown(_) => {
+            return both(ScopeDecision::full(reason::UNKNOWN_REVIEWED_TREE, counted));
+        }
     }
 
     let mut cargo_escalation: Option<String> = None;
@@ -747,31 +852,45 @@ pub fn decide(change_set: Option<&ChangeSet>, inputs: &ScopeInputs<'_>) -> Scope
         if is_rust_source(path) {
             cargo_selector_inputs.push(path.to_string());
             match workspace {
-                Some(workspace) => match workspace.package_for_file(&inputs.repo_root.join(path)) {
-                    Some(package) => {
-                        if workspace.is_proc_macro(package) {
-                            escalate(Some(Ecosystem::Cargo), reason::proc_macro(package));
-                        } else {
-                            cargo_packages.extend(workspace.reverse_closure(package));
+                Some(workspace) => {
+                    match workspace.package_for_file(&inputs.reviewed_tree.root().join(path)) {
+                        Some(package) => {
+                            if workspace.is_proc_macro(package) {
+                                escalate(Some(Ecosystem::Cargo), reason::proc_macro(package));
+                            } else {
+                                cargo_packages.extend(workspace.reverse_closure(package));
+                            }
                         }
+                        None => escalate(
+                            Some(Ecosystem::Cargo),
+                            reason::resolution_failed(&format!(
+                                "{path} is outside every workspace member"
+                            )),
+                        ),
                     }
-                    None => escalate(
-                        Some(Ecosystem::Cargo),
-                        reason::resolution_failed(&format!(
-                            "{path} is outside every workspace member"
-                        )),
-                    ),
-                },
+                }
                 None => { /* already escalated */ }
             }
         } else if is_js_source(path) {
             vitest_inputs.push(path.to_string());
+        } else {
+            // Neither selector can see this file. Vitest walks the static
+            // import graph and cargo walks package membership; a JSON asset, a
+            // template, an `.env` file or a data fixture is read at runtime
+            // through `fs` or `include_str!`, from a path neither graph
+            // contains. There is nothing to select on and no proof the change
+            // is irrelevant, so it escalates BOTH ecosystems rather than
+            // quietly contributing nothing to either selection.
+            escalate(None, reason::unsupported_input(path));
         }
     }
 
     let inputs_considered = change_set.paths().len();
     let cargo = match cargo_escalation {
-        Some(reason) => ScopeDecision::Full { reason },
+        Some(reason) => ScopeDecision::Full {
+            reason,
+            inputs: Some(inputs_considered),
+        },
         None => ScopeDecision::ChangeScoped {
             inputs: inputs_considered,
             selected: cargo_packages.into_iter().collect(),
@@ -780,7 +899,10 @@ pub fn decide(change_set: Option<&ChangeSet>, inputs: &ScopeInputs<'_>) -> Scope
         },
     };
     let vitest = match vitest_escalation {
-        Some(reason) => ScopeDecision::Full { reason },
+        Some(reason) => ScopeDecision::Full {
+            reason,
+            inputs: Some(inputs_considered),
+        },
         None => ScopeDecision::ChangeScoped {
             inputs: inputs_considered,
             selected: vitest_inputs.clone(),
@@ -804,40 +926,104 @@ fn both(decision: ScopeDecision) -> ScopeDecisions {
 /// The metadata call is skipped entirely when the change set is missing or
 /// untrustworthy, because the answer is already "run everything" and paying for
 /// a subprocess to confirm it would be work the contract exists to avoid.
-pub async fn resolve_run_scope(config: &crate::config::Config) -> ScopeDecisions {
+pub async fn resolve_run_scope(
+    config: &crate::config::Config,
+    reviewed_tree: &ReviewedTree,
+) -> ScopeDecisions {
     let change_set = config.changed_paths.as_ref();
     // `cargo metadata` resolves manifest paths through the real directory, so
     // the root the diff's paths are joined onto has to be resolved the same way
     // or nothing will match. A root that cannot be canonicalised is used as
     // given; the worst case is an unmatched file, which escalates.
-    let repo_root = config
-        .repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| config.repo_root.clone());
-    if !change_set.is_some_and(ChangeSet::is_trustworthy) {
+    let reviewed_tree = canonicalized(reviewed_tree);
+    let can_select = change_set.is_some_and(ChangeSet::single_base)
+        && reviewed_tree.is_exactly_the_reviewed_commit();
+    if !can_select {
+        // No subprocess: the answer is already "run everything", and paying for
+        // a `cargo metadata` to confirm it would be exactly the work this
+        // contract exists to avoid.
         return decide(
             change_set,
             &ScopeInputs {
-                repo_root: &repo_root,
+                reviewed_tree: &reviewed_tree,
                 profile: &config.profile,
                 cargo_workspace: None,
                 is_generated: &|_| false,
             },
         );
     }
-    let workspace = match &config.profile.cargo_root {
-        Some(root) => Some(read_cargo_workspace(root).await),
-        None => None,
+    let workspace = match reviewed_cargo_root(config, reviewed_tree.root()) {
+        CargoRoot::None => None,
+        CargoRoot::Reviewed(root) => Some(read_cargo_workspace(&root).await),
+        CargoRoot::Unlocatable => Some(Err(WorkspaceError::UnlocatableRoot)),
     };
     decide(
         change_set,
         &ScopeInputs {
-            repo_root: &repo_root,
+            reviewed_tree: &reviewed_tree,
             profile: &config.profile,
             cargo_workspace: workspace.as_ref(),
             is_generated: &|path| crate::checks::is_generated_artifact_path(path, config),
         },
     )
+}
+
+fn canonicalized(tree: &ReviewedTree) -> ReviewedTree {
+    let resolved = tree
+        .root()
+        .canonicalize()
+        .unwrap_or_else(|_| tree.root().to_path_buf());
+    match tree {
+        ReviewedTree::Snapshot(_) => ReviewedTree::Snapshot(resolved),
+        ReviewedTree::LocalClean(_) => ReviewedTree::LocalClean(resolved),
+        ReviewedTree::LocalDirty(_) => ReviewedTree::LocalDirty(resolved),
+        ReviewedTree::Unknown(_) => ReviewedTree::Unknown(resolved),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CargoRoot {
+    /// Rust is not part of this repository at all.
+    None,
+    /// Where the cargo root lives INSIDE the reviewed tree.
+    Reviewed(PathBuf),
+    /// Rust is present, but its root cannot be placed inside the reviewed tree.
+    Unlocatable,
+}
+
+/// Where to read `cargo metadata` from.
+///
+/// `profile.cargo_root` is detected in the OPERATOR's checkout, which on a
+/// `--pr` or `--remote` run is a different revision from the one under review.
+/// Reading metadata there would describe another revision's members and path
+/// edges while the change set describes this one — members could be missing,
+/// added, or moved between them, and the resulting selection would be drawn
+/// from the wrong workspace. So the detected root is re-expressed relative to
+/// the repository root and rebased onto the reviewed tree.
+///
+/// When that cannot be done — a cargo root outside the repository, or roots
+/// that will not canonicalise onto each other — the answer is not "guess":
+/// Rust escalates to a full workspace run with that stated reason.
+fn reviewed_cargo_root(config: &crate::config::Config, reviewed_root: &Path) -> CargoRoot {
+    let Some(detected) = &config.profile.cargo_root else {
+        return CargoRoot::None;
+    };
+    let repo_root = config
+        .repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| config.repo_root.clone());
+    let detected = detected.canonicalize().unwrap_or_else(|_| detected.clone());
+    rebase_cargo_root(&detected, &repo_root, reviewed_root)
+}
+
+/// The pure half of [`reviewed_cargo_root`]: express the detected root relative
+/// to the repository and re-root it on the reviewed tree. A root that is not
+/// inside the repository has no reviewed counterpart to compute.
+fn rebase_cargo_root(detected: &Path, repo_root: &Path, reviewed_root: &Path) -> CargoRoot {
+    match detected.strip_prefix(repo_root) {
+        Ok(relative) => CargoRoot::Reviewed(reviewed_root.join(relative)),
+        Err(_) => CargoRoot::Unlocatable,
+    }
 }
 
 #[cfg(test)]

@@ -290,9 +290,18 @@ only ever sees a `Config`. So `Config::changed_paths` carries an optional
 `ChangeSet` — internal runtime state, never a CLI or manifest override, set once
 on the cloned check configuration beside `pinned_target` / `pinned_diff_bases`.
 `None` means today's behaviour: run everything. The set carries each path, its
-`FileStatus`, the pre-rename path for renames, and two trust facts: it came from
-exactly one diff base, and it was captured from the same pinned commit the
-checks scan.
+`FileStatus`, the pre-rename path for renames, and one trust fact: it came from
+exactly one diff base.
+
+**The substrate.** Whether a selection can be trusted also depends on which tree
+the checks actually read, and that is a separate fact decided later, inside
+`run_all` (`share_target_snapshot`). A pinned target does NOT always mean a
+snapshot: when the reviewed target is the checked-out `HEAD`, `plan_check_run`
+hands the gates the repository root itself. `ReviewedTree` names the four cases
+— `Snapshot`, `LocalClean`, `LocalDirty`, `Unknown` — and is resolved from what
+the ledger recorded plus the operator cleanliness frozen before the run. That is
+why the scope decision is resolved AFTER the checks: before them, the substrate
+is not yet knowable, and a constant there would have been a lie.
 
 **The decision** (`checks::scope::decide`) is pure and returns, per ecosystem,
 either `Full { reason }` or `ChangeScoped { .. }`. Every doubt resolves to
@@ -306,21 +315,43 @@ either `Full { reason }` or `ChangeScoped { .. }`. Every doubt resolves to
 | A proc-macro crate | Cargo (whole workspace) |
 | Deletions, and renames by the path the content left | the ecosystem that owned that path |
 | More than one diff base, or no change set at all | both |
-| A change set inconsistent with the reviewed snapshot | both |
-| Shared tooling, fixtures and test helpers (`tools/`, `__fixtures__/`, …) | the owning ecosystem, or both when no single ecosystem owns the file |
-| Any `cargo metadata` failure, or a Rust file inside no workspace member | Cargo |
+| The checks read the operator checkout and it carries uncommitted work, or the substrate is unknown | both |
+| Shared tooling, fixtures and test helpers — any path SEGMENT named `tools`, `fixtures`, `__fixtures__`, `__mocks__`, `test-helpers`, `test_helpers`, `testutils`, at the repository root or nested | the owning ecosystem, or both when no single ecosystem owns the file |
+| Any changed path that is neither recognised Rust/JS source nor one of the classes above — a JSON asset, a template, an `.env` file, a data file, documentation | both |
+| Any `cargo metadata` failure, a cargo root that cannot be placed inside the reviewed tree, or a Rust file inside no workspace member | Cargo |
 
 Escalation is one-directional: once an ecosystem is widened, no later file
 narrows it again.
 
-**Not an escalation:** a dirty operator checkout. A `--pr` review is about the
-pinned target and the canonical PR diff, so uncommitted files in the operator's
-tree have nothing to do with it — escalating on them would make the feature
-useless during exactly the work it exists for. What escalates is an
-untrustworthy *set*, which is a different fact.
+**Not an escalation:** a dirty operator checkout, *when the checks read a
+snapshot*. A `--pr` review is about the pinned target and the canonical PR diff;
+the gates never open the operator's tree, so escalating on it would make the
+feature useless during exactly the work it exists for.
+
+The mirror of that rule: when the run reads the operator checkout itself — an
+on-`HEAD` review — the same uncommitted work IS what the tools compile, while
+the commit-range change set cannot list it. Selecting from a set that is missing
+files the tools will read is the silent narrowing the contract forbids, so that
+case escalates. The fact that decides which of the two applies is never "is the
+checkout dirty" on its own; it is *which tree the checks read*.
+
+**Unsupported inputs escalate.** Contract §2: an unknown file ends in a full
+run. Vitest selects by the static import graph and cargo by package membership,
+so a file read at runtime through `fs` or `include_str!` — a JSON asset, a
+template, an `.env` file, a data fixture, documentation — appears in neither
+graph. There is nothing to select on and no proof the change is irrelevant, so
+it escalates both ecosystems. Build output classified by
+`is_generated_artifact_path` is the one exception: it is a *known* non-source
+that no tool reads as an input, so it neither selects nor escalates.
 
 **Rust workspace resolution.** One `cargo metadata --format-version 1 --no-deps
---frozen` per run, from `profile.cargo_root`, with its own timeout. This is not
+--frozen` per run, with its own timeout, read from the cargo root **inside the
+reviewed tree**. `profile.cargo_root` is detected in the operator checkout,
+which on a `--pr` or `--remote` run is a different revision entirely; reading
+metadata there would describe another revision's members and path edges while
+the change set describes this one. The detected root is therefore expressed
+relative to the repository root and rebased onto the reviewed tree, and a root
+that cannot be placed inside it escalates with that stated reason. This is not
 the network-capable full resolve `cargo.rs` refuses: `--no-deps` returns the
 members' own manifests without resolving the dependency graph, and `--frozen`
 guarantees no network access and no lockfile write. Files map to members by

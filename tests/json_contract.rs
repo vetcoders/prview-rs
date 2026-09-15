@@ -2881,11 +2881,21 @@ fn scope_object_validator_contract() {
     legacy["schema_version"] = serde_json::json!("3.0");
     validate(&legacy, true);
 
-    let with_scope = |scope: serde_json::Value| {
+    // `scope` is valid only on a check that owns an ecosystem's test suite. The
+    // fixture repository need not have run one, so the row is named explicitly
+    // rather than searched for — `name` is what the rule reads, and this keeps
+    // the test independent of which gates the fixture happens to produce.
+    assert!(
+        !original["checks"].as_array().expect("gate rows").is_empty(),
+        "the fixture gate must carry at least one check row"
+    );
+    let with_named_scope = |name: &str, scope: serde_json::Value| {
         let mut gate = original.clone();
+        gate["checks"][0]["name"] = serde_json::json!(name);
         gate["checks"][0]["scope"] = scope;
         gate
     };
+    let with_scope = |scope: serde_json::Value| with_named_scope("Cargo test", scope);
 
     validate(
         &with_scope(serde_json::json!({
@@ -2918,7 +2928,42 @@ fn scope_object_validator_contract() {
         serde_json::json!({"mode": "full", "reason": "why", "selected": 3}),
         serde_json::json!({"mode": "change-scoped", "reason": "why", "inputs": -1}),
         serde_json::json!("change-scoped"),
+        // Counts of files and packages are integers. "1.5 of 1028 test files"
+        // is not a statement a reviewer can act on.
+        serde_json::json!({"mode": "change-scoped", "reason": "why", "inputs": 1.5}),
+        serde_json::json!({"mode": "change-scoped", "reason": "why", "selected": 2.5}),
+        serde_json::json!({"mode": "change-scoped", "reason": "why", "universe": 10.5}),
     ] {
         validate(&with_scope(bad), false);
+    }
+
+    // The same honest object on the other test owner is still valid.
+    validate(
+        &with_named_scope(
+            "Vitest",
+            serde_json::json!({
+                "mode": "full",
+                "reason": "scoped execution not enabled yet",
+                "inputs": 7,
+            }),
+        ),
+        true,
+    );
+
+    // Test-scope evidence may not be pinned to a check that runs no tests: a
+    // `scope` on Clippy would read as a narrowed lint, which is a claim this
+    // contract never makes.
+    for name in ["Clippy", "Semgrep scan", "TypeScript"] {
+        validate(
+            &with_named_scope(
+                name,
+                serde_json::json!({
+                    "mode": "full",
+                    "reason": "manifest or lockfile changed: Cargo.lock",
+                    "inputs": 7,
+                }),
+            ),
+            false,
+        );
     }
 }

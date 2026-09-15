@@ -21,10 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and valid; `tools/validate_merge_gate.py` accepts `3.1` and validates `scope`
   when present. `Config::changed_paths` carries the run's `ChangeSet` as
   internal runtime state (never a CLI or manifest override), and Rust packages
-  are resolved with one `cargo metadata --no-deps --frozen` per run — metadata
-  only, not the network-capable full resolve. Every doubt escalates to a full
-  run with a stated reason; a dirty operator checkout is deliberately NOT such a
-  reason. **No user-facing behaviour changes yet:** every check still runs
+  are resolved with one `cargo metadata --no-deps --frozen` per run, read from
+  the cargo root inside the REVIEWED tree — metadata only, not the
+  network-capable full resolve. Every doubt escalates to a full run with a
+  stated reason, including an unknown file type. A dirty operator checkout is
+  deliberately NOT such a reason when the checks read a snapshot; it IS one when
+  the checks read that tree themselves. **No user-facing behaviour changes yet:** every check still runs
   exactly the command it ran before, so a scopeable decision is reported
   honestly as `mode: "full"` with reason `scoped execution not enabled yet`.
   Contract and rationale: `docs/architecture.md` ("How much of a test suite must
