@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Annotated tags used as a base or target now resolve to the tagged commit.
+  Ref resolution returned the tag object's id, so merge-base and diff lookups
+  failed with a git error (for example `prview gate --base v0.8.0`). A ref that
+  does not point to a commit, such as a tree or blob id, is reported as
+  unresolvable.
 - This repository's `Gate Shadow` workflow now reviews the change a push
   delivered. On a push to `main` the gate auto-detected `main` as the base while
   `main` was also the checked-out target, so it reviewed an empty change. Push

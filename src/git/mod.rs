@@ -563,22 +563,34 @@ impl Repository {
         if let Ok(branch) = self.inner.find_branch(name, git2::BranchType::Local)
             && let Some(target) = branch.get().target()
         {
-            return Ok(target.to_string());
+            return self.peel_to_commit_id(target, name);
         }
 
         // Try as reference
         if let Ok(reference) = self.inner.find_reference(name)
             && let Some(target) = reference.target()
         {
-            return Ok(target.to_string());
+            return self.peel_to_commit_id(target, name);
         }
 
         // Try as commit
         if let Ok(obj) = self.inner.revparse_single(name) {
-            return Ok(obj.id().to_string());
+            return self.peel_to_commit_id(obj.id(), name);
         }
 
         anyhow::bail!("Could not resolve ref: {}", name)
+    }
+
+    /// Every resolved ref is later used as a commit (merge-base, `find_commit`).
+    /// An annotated tag names a tag object, so peel it to the tagged commit; an
+    /// object that is not a commit-ish (a tree or blob) is not a reviewable ref.
+    fn peel_to_commit_id(&self, oid: git2::Oid, name: &str) -> Result<String> {
+        let commit = self
+            .inner
+            .find_object(oid, None)
+            .and_then(|object| object.peel_to_commit())
+            .with_context(|| format!("ref '{name}' does not point to a commit"))?;
+        Ok(commit.id().to_string())
     }
 
     /// Resolve a remote ref
@@ -595,7 +607,7 @@ impl Repository {
             .find_branch(&remote_name, git2::BranchType::Remote)
             && let Some(target) = branch.get().target()
         {
-            return Ok((target.to_string(), true));
+            return Ok((self.peel_to_commit_id(target, &remote_name)?, true));
         }
 
         // Try refs/remotes/
@@ -603,7 +615,7 @@ impl Repository {
         if let Ok(reference) = self.inner.find_reference(&ref_name)
             && let Some(target) = reference.target()
         {
-            return Ok((target.to_string(), true));
+            return Ok((self.peel_to_commit_id(target, &remote_name)?, true));
         }
 
         anyhow::bail!("Could not resolve remote ref: {}", remote_name)
@@ -1402,6 +1414,53 @@ mod tests {
             .expect("rev-parse");
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn resolve_ref_peels_tags_to_the_tagged_commit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let tagged = write_commit(tmp.path(), "file.txt", "tagged\n");
+        run_git(
+            tmp.path(),
+            &[
+                "-c",
+                "user.name=prview test",
+                "-c",
+                "user.email=prview@example.test",
+                "-c",
+                "tag.gpgsign=false",
+                "tag",
+                "-a",
+                "v1.0.0",
+                "-m",
+                "annotated",
+            ],
+        );
+        run_git(tmp.path(), &["tag", "light"]);
+        let head = write_commit(tmp.path(), "file.txt", "after tag\n");
+        assert_ne!(tagged, head);
+
+        let repo = Repository::open(tmp.path()).expect("repo");
+        let tag_object = repo
+            .inner
+            .revparse_single("v1.0.0")
+            .expect("annotated tag")
+            .id()
+            .to_string();
+        assert_ne!(
+            tag_object, tagged,
+            "fixture must be an annotated tag object"
+        );
+
+        for name in ["v1.0.0", "refs/tags/v1.0.0", tag_object.as_str(), "light"] {
+            assert_eq!(repo.resolve_ref(name).expect(name), tagged, "{name}");
+        }
+        // Branches and commits keep their own id.
+        assert_eq!(repo.resolve_ref("main").expect("main"), head);
+        assert_eq!(repo.resolve_ref(&head).expect("commit sha"), head);
+        // A tree is not a reviewable ref.
+        assert!(repo.resolve_ref("HEAD^{tree}").is_err());
     }
 
     fn init_repo_with_diverged_local_base() -> (tempfile::TempDir, String, String) {

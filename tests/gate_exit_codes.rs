@@ -440,6 +440,25 @@ fn gate_explicit_base_commit_reviews_the_pushed_change() {
 }
 
 #[test]
+fn gate_explicit_base_annotated_tag_reviews_the_change_since_the_tag() {
+    let (temp, _before) = create_pushed_main_fixture();
+    // Tag the first commit with an annotated tag: the ref names a tag object,
+    // which must be peeled to the tagged commit before the diff.
+    run_git(
+        temp.path(),
+        &["tag", "-a", "v0.1.0", "-m", "release", "HEAD~1"],
+    );
+    let path = path_without_semgrep(temp.path());
+
+    let home = tempfile::tempdir().expect("prview home");
+    let tagged = run_gate_json(temp.path(), &path, home.path(), &["--base", "v0.1.0"]);
+    assert!(
+        per_file_diff_count(&tagged) > 0,
+        "--base <annotated tag> must review a non-empty change: {tagged}"
+    );
+}
+
+#[test]
 fn gate_exits_three_for_unresolvable_explicit_base() {
     let home = tempfile::tempdir().expect("prview home");
     let temp = create_gate_fixture();
