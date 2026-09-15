@@ -711,6 +711,28 @@ def validate(path: Path) -> list[str]:
                     selector = scope.get("selector")
                     if selector is not None and not isinstance(selector, str):
                         issues.append(f"{ctx}.scope.selector must be a string or null")
+                    # Which changed paths were kept out of test selection, and
+                    # by which rule. The point of the list is that the call can
+                    # be challenged without reading the source, so an entry
+                    # without a named rule is worse than no entry at all.
+                    neutral = scope.get("non_participating")
+                    if neutral is not None:
+                        if not isinstance(neutral, list):
+                            issues.append(
+                                f"{ctx}.scope.non_participating must be an array"
+                            )
+                        else:
+                            for n, entry in enumerate(neutral):
+                                nctx = f"{ctx}.scope.non_participating[{n}]"
+                                if not isinstance(entry, dict):
+                                    issues.append(f"{nctx} must be an object")
+                                    continue
+                                require_non_empty_string(
+                                    entry.get("path"), f"{nctx}.path", issues
+                                )
+                                require_non_empty_string(
+                                    entry.get("rule"), f"{nctx}.rule", issues
+                                )
                     # A full run selected nothing, so it must not publish a
                     # selection count that a reader would take for coverage.
                     if scope.get("mode") == "full" and scope.get("selected") is not None:

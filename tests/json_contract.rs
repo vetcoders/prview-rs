@@ -2937,6 +2937,37 @@ fn scope_object_validator_contract() {
         validate(&with_scope(bad), false);
     }
 
+    // The classification list: an entry has to name both the path and the rule,
+    // because an unattributed entry cannot be challenged.
+    validate(
+        &with_scope(serde_json::json!({
+            "mode": "full",
+            "reason": "scoped execution not enabled yet",
+            "inputs": 3,
+            "non_participating": [
+                {"path": "CHANGELOG.md", "rule": "root-changelog"},
+                {"path": "docs/architecture.md", "rule": "docs-directory"},
+            ],
+        })),
+        true,
+    );
+    for bad_list in [
+        serde_json::json!("CHANGELOG.md"),
+        serde_json::json!([{"path": "CHANGELOG.md"}]),
+        serde_json::json!([{"rule": "root-changelog"}]),
+        serde_json::json!([{"path": "CHANGELOG.md", "rule": ""}]),
+        serde_json::json!(["CHANGELOG.md"]),
+    ] {
+        validate(
+            &with_scope(serde_json::json!({
+                "mode": "full",
+                "reason": "scoped execution not enabled yet",
+                "non_participating": bad_list,
+            })),
+            false,
+        );
+    }
+
     // The same honest object on the other test owner is still valid.
     validate(
         &with_named_scope(

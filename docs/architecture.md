@@ -317,7 +317,7 @@ either `Full { reason }` or `ChangeScoped { .. }`. Every doubt resolves to
 | More than one diff base, or no change set at all | both |
 | The checks read the operator checkout and it carries uncommitted work, or the substrate is unknown | both |
 | Shared tooling, fixtures and test helpers — any path SEGMENT named `tools`, `fixtures`, `__fixtures__`, `__mocks__`, `test-helpers`, `test_helpers`, `testutils`, at the repository root or nested | the owning ecosystem, or both when no single ecosystem owns the file |
-| Any changed path that is neither recognised Rust/JS source nor one of the classes above — a JSON asset, a template, an `.env` file, a data file, documentation | both |
+| Any changed path classified `unknown` — neither recognised Rust/JS source, nor one of the classes above, nor a named non-participating rule (see below) | both |
 | Any `cargo metadata` failure, a cargo root that cannot be placed inside the reviewed tree, or a Rust file inside no workspace member | Cargo |
 
 Escalation is one-directional: once an ecosystem is widened, no later file
@@ -335,14 +335,69 @@ files the tools will read is the silent narrowing the contract forbids, so that
 case escalates. The fact that decides which of the two applies is never "is the
 checkout dirty" on its own; it is *which tree the checks read*.
 
-**Unsupported inputs escalate.** Contract §2: an unknown file ends in a full
-run. Vitest selects by the static import graph and cargo by package membership,
-so a file read at runtime through `fs` or `include_str!` — a JSON asset, a
-template, an `.env` file, a data fixture, documentation — appears in neither
-graph. There is nothing to select on and no proof the change is irrelevant, so
-it escalates both ecosystems. Build output classified by
-`is_generated_artifact_path` is the one exception: it is a *known* non-source
-that no tool reads as an input, so it neither selects nor escalates.
+**Three states, not an ignore list (contract §6a).** The strict reading of §2 —
+an unknown file ends in a full run — made almost every real pull request
+escalate, because almost every pull request also touches a CHANGELOG, a document
+or a workflow file. The answer is an explicit third state, so that "we know this
+is not an input" is recorded as a different fact from "we do not know what this
+is":
+
+| State | Meaning | Effect on test selection |
+|---|---|---|
+| `relevant` | recognised Rust / JS-TS source | participates in selection |
+| `non-participating` | a narrow, NAMED class we can say is not an input to test selection | skipped for selection, does **not** escalate |
+| `unknown` | everything else | **escalates to FULL** |
+
+`unknown` keeps escalating: the third state does not weaken "doubt ⇒ FULL", it
+only separates it from the cases we can actually name. And the classification
+decides **one** thing — whether a path participates in choosing which tests to
+run. A non-participating file still appears in the diff, the artifacts, the
+signals and the verdict, exactly as before.
+
+The built-in list is deliberately tiny. Everything on it is something whose
+content no test runner loads, in any ecosystem, by any mechanism we know of; a
+rule that needs a "usually" belongs in `unknown` instead.
+
+| Rule | Matches |
+|---|---|
+| `root-changelog` | `CHANGELOG*` at the repository root |
+| `root-license` | `LICENSE*` / `LICENCE*` at the repository root |
+| `root-readme` | `README*` at the repository root |
+| `docs-directory` | a top-level `docs/` or `doc/` directory, restricted to prose extensions (`.md`, `.mdx`, `.rst`, `.txt`, `.adoc`) |
+| `ci-workflow` | `.github/workflows/*.yml` and `*.yaml` |
+
+What is deliberately **not** on it, because these are real runtime or test
+inputs often enough that "probably fine" is not good enough: translations and
+locale files, fixtures, `tools/`, and Markdown wholesale. A `.md` outside a
+documentation directory stays `unknown`. The named shared-tooling directories
+from the escalation table are checked FIRST, so `tools/README.md` is a shared
+tooling change, not a document.
+
+Build output classified by `is_generated_artifact_path` is separate again: it is
+a known non-source that no tool reads as an input, so it neither selects nor
+escalates.
+
+A repository can extend or disable the list in `prview.toml`:
+
+```toml
+[scope]
+non_participating = ["design/**", "*.drawio"]   # additive, glob over repo-relative paths
+non_participating_builtins = false               # restores strictly escalating behaviour
+```
+
+Recognised source always wins over every neutral rule, so a repository cannot
+declare its own `src/**` neutral and quietly stop testing it. An unparsable
+pattern is dropped with a warning rather than applied loosely.
+
+**The classification is published.** Every neutral path is reported with the
+rule that named it — in the `scope` object on the check rows that carry one, and
+as a `## Test scope` table in `MERGE_GATE.md` — so a reviewer who disagrees that
+a path is neutral can argue with the named rule instead of reading this code.
+
+**An empty selection is a skip, never a pass.** When nothing relevant remains
+after classification (the ordinary documentation-only pull request), the outcome
+is `selected = 0` and a `Skipped` carrying `no tests related to the change`
+(§8.1). Calling that `passed` would claim evidence the run never produced.
 
 **Rust workspace resolution.** One `cargo metadata --format-version 1 --no-deps
 --frozen` per run, with its own timeout, read from the cargo root **inside the

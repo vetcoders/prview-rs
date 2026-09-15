@@ -873,8 +873,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
                 failed_tests,
                 scope: input
                     .scope
-                    .and_then(|scope| scope.for_check(&c.name))
-                    .map(crate::checks::scope::ScopeDecision::report),
+                    .and_then(|scope| scope.report_for_check(&c.name)),
                 artifacts: CheckArtifacts {
                     log_path: Some(format!("20_quality/{}.log", id)),
                     result_json_path: Some(format!("20_quality/{}.result.json", id)),
@@ -1648,6 +1647,10 @@ test result: FAILED. 0 passed; 1 failed
                 reason: "no JavaScript or TypeScript source detected".to_string(),
                 inputs: Some(3),
             },
+            non_participating: vec![crate::checks::scope::NonParticipatingPath {
+                path: "CHANGELOG.md".to_string(),
+                rule: "root-changelog".to_string(),
+            }],
         };
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1677,6 +1680,14 @@ test result: FAILED. 0 passed; 1 failed
         assert_eq!(
             cargo_test["scope"]["reason"],
             "manifest or lockfile changed: Cargo.lock"
+        );
+        assert_eq!(
+            cargo_test["scope"]["non_participating"][0]["path"],
+            "CHANGELOG.md"
+        );
+        assert_eq!(
+            cargo_test["scope"]["non_participating"][0]["rule"],
+            "root-changelog"
         );
         let clippy = rows
             .iter()

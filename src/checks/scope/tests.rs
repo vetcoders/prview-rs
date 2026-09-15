@@ -100,6 +100,27 @@ fn decide_on(
     workspace: Option<&Result<CargoWorkspace, WorkspaceError>>,
     reviewed_tree: &ReviewedTree,
 ) -> ScopeDecisions {
+    decide_classified(
+        change_set,
+        profile,
+        workspace,
+        reviewed_tree,
+        &builtin_classifier(),
+    )
+}
+
+/// The shipped defaults: built-in neutral rules on, no repository patterns.
+fn builtin_classifier() -> PathClassifier {
+    PathClassifier::new(true, &[]).0
+}
+
+fn decide_classified(
+    change_set: Option<&ChangeSet>,
+    profile: &DetectedProfile,
+    workspace: Option<&Result<CargoWorkspace, WorkspaceError>>,
+    reviewed_tree: &ReviewedTree,
+    classifier: &PathClassifier,
+) -> ScopeDecisions {
     decide(
         change_set,
         &ScopeInputs {
@@ -107,6 +128,7 @@ fn decide_on(
             profile,
             cargo_workspace: workspace,
             is_generated: &never_generated,
+            classifier,
         },
     )
 }
@@ -615,8 +637,6 @@ fn an_unsupported_input_escalates_both_ecosystems() {
         "src/templates/email.hbs",
         ".env.test",
         "src/data/seed.csv",
-        "docs/architecture.md",
-        ".github/workflows/ci.yml",
         "assets/logo.svg",
     ] {
         let set = trustworthy(vec![modified(path)]);
@@ -647,9 +667,328 @@ fn generated_output_is_still_not_an_unsupported_input() {
             profile: &profile(true, true),
             cargo_workspace: Some(&app_and_core()),
             is_generated,
+            classifier: &builtin_classifier(),
         },
     );
     assert_eq!(selected(&decisions.vitest), ["src/app.ts".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// Three-state classification (contract §6a)
+// ---------------------------------------------------------------------------
+
+/// One case per built-in rule. Each of these is something whose content no test
+/// runner loads, in any ecosystem, by any mechanism we know of — that is the
+/// entire bar for the list, and the reason it is this short.
+#[test]
+fn every_builtin_rule_names_the_path_it_neutralised() {
+    for (path, rule) in [
+        ("CHANGELOG.md", "root-changelog"),
+        ("CHANGELOG", "root-changelog"),
+        ("LICENSE", "root-license"),
+        ("LICENCE.txt", "root-license"),
+        ("README.md", "root-readme"),
+        ("docs/architecture.md", "docs-directory"),
+        ("doc/usage.rst", "docs-directory"),
+        (".github/workflows/ci.yml", "ci-workflow"),
+        (".github/workflows/release.yaml", "ci-workflow"),
+    ] {
+        let set = trustworthy(vec![modified(path), modified("crates/core/src/lib.rs")]);
+        let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+        assert_eq!(
+            decisions.non_participating,
+            vec![NonParticipatingPath {
+                path: path.to_string(),
+                rule: rule.to_string(),
+            }],
+            "{path} must be neutral, and must say which rule decided that"
+        );
+        assert_eq!(
+            selected(&decisions.cargo),
+            ["app".to_string(), "core".to_string()],
+            "{path} must not disturb the selection the real source produced"
+        );
+    }
+}
+
+/// The classification is narrow ON PURPOSE. These are the cases the operator
+/// named as things we may NOT assume are neutral: they are real runtime or test
+/// inputs often enough that "probably fine" is not good enough.
+#[test]
+fn the_classes_the_operator_excluded_are_still_unknown() {
+    for path in [
+        // Translations drive runtime behaviour and snapshot assertions.
+        "src/locales/pl.json",
+        "locales/en.json",
+        "i18n/pl.yaml",
+        // Markdown is NOT neutral wholesale — only documentation directories
+        // and the named root files are.
+        "src/components/Button.md",
+        "crates/core/tests/cases/expected.md",
+        "notes/design.md",
+    ] {
+        let set = trustworthy(vec![modified(path)]);
+        let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+        assert!(
+            decisions.non_participating.is_empty(),
+            "{path} must not be classified neutral"
+        );
+        assert_eq!(
+            full_reason(&decisions.vitest),
+            reason::unsupported_input(path),
+            "{path} is unknown, and unknown still escalates"
+        );
+    }
+}
+
+/// Fixtures and `tools/` are escalating classes from §6 and stay that way: the
+/// neutral list is checked AFTER them and never overrides a named reason to
+/// widen. A document inside a shared tooling directory is a shared tooling
+/// change first.
+#[test]
+fn shared_tooling_wins_over_the_neutral_list() {
+    for path in [
+        "tools/README.md",
+        "tools/validate_merge_gate.py",
+        "fixtures/CHANGELOG.md",
+        "packages/ui/__fixtures__/docs.md",
+    ] {
+        let set = trustworthy(vec![modified(path)]);
+        let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+        assert!(
+            decisions.non_participating.is_empty(),
+            "{path} must not be classified neutral"
+        );
+        assert_eq!(
+            full_reason(&decisions.vitest),
+            reason::shared_tooling(path),
+            "{path} is shared tooling, which escalates"
+        );
+    }
+}
+
+/// A rename counts as neutral only when BOTH ends are. Moving a source file
+/// into `docs/` removes a real input, and the side the content left still has
+/// to escalate.
+#[test]
+fn a_rename_out_of_source_into_a_neutral_path_still_escalates() {
+    let set = trustworthy(vec![ChangedPath {
+        path: "docs/old-module.md".to_string(),
+        status: FileStatus::Renamed,
+        old_path: Some("src/module.ts".to_string()),
+    }]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    assert!(decisions.non_participating.is_empty());
+    assert_eq!(
+        full_reason(&decisions.vitest),
+        reason::removed_or_renamed("src/module.ts")
+    );
+}
+
+#[test]
+fn a_deleted_neutral_path_is_still_neutral() {
+    // Deleting a changelog cannot change which tests have to run.
+    let set = trustworthy(vec![
+        changed("CHANGELOG.md", FileStatus::Deleted),
+        modified("crates/core/src/lib.rs"),
+    ]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    assert_eq!(
+        decisions.non_participating,
+        vec![NonParticipatingPath {
+            path: "CHANGELOG.md".to_string(),
+            rule: "root-changelog".to_string(),
+        }]
+    );
+    assert_eq!(
+        selected(&decisions.cargo),
+        ["app".to_string(), "core".to_string()]
+    );
+}
+
+/// Recognised source always wins: a repository cannot declare its own
+/// TypeScript neutral and quietly stop testing it.
+#[test]
+fn recognised_source_can_never_be_declared_neutral() {
+    let (classifier, rejected) = PathClassifier::new(true, &["src/**".to_string()]);
+    assert!(rejected.is_empty());
+    assert_eq!(
+        classifier.classify("src/app.ts"),
+        PathClass::Relevant(Ecosystem::Vitest)
+    );
+    assert_eq!(
+        classifier.classify("src/lib.rs"),
+        PathClass::Relevant(Ecosystem::Cargo)
+    );
+}
+
+#[test]
+fn a_repository_can_extend_the_neutral_list_through_its_manifest() {
+    let (classifier, rejected) =
+        PathClassifier::new(true, &["design/**".to_string(), "*.drawio".to_string()]);
+    assert!(rejected.is_empty());
+    let set = trustworthy(vec![
+        modified("design/wireframe.png"),
+        modified("board.drawio"),
+        modified("crates/core/src/lib.rs"),
+    ]);
+    let decisions = decide_classified(
+        Some(&set),
+        &profile(true, true),
+        Some(&app_and_core()),
+        &reviewed_snapshot(),
+        &classifier,
+    );
+    assert_eq!(
+        decisions.non_participating,
+        vec![
+            NonParticipatingPath {
+                path: "design/wireframe.png".to_string(),
+                rule: "design/**".to_string(),
+            },
+            NonParticipatingPath {
+                path: "board.drawio".to_string(),
+                rule: "*.drawio".to_string(),
+            },
+        ],
+        "a repo-declared rule is reported by the pattern that matched"
+    );
+    assert_eq!(
+        selected(&decisions.cargo),
+        ["app".to_string(), "core".to_string()]
+    );
+}
+
+#[test]
+fn a_repository_can_disable_the_builtin_list_and_get_strict_escalation_back() {
+    let strict = PathClassifier::strict();
+    let set = trustworthy(vec![modified("CHANGELOG.md")]);
+    let decisions = decide_classified(
+        Some(&set),
+        &profile(true, true),
+        Some(&app_and_core()),
+        &reviewed_snapshot(),
+        &strict,
+    );
+    assert!(decisions.non_participating.is_empty());
+    assert_eq!(
+        full_reason(&decisions.vitest),
+        reason::unsupported_input("CHANGELOG.md"),
+        "with the built-ins off, a changelog is just another unknown file"
+    );
+
+    // Disabling the built-ins leaves a repository's own patterns in force —
+    // that is the difference between "off" and "empty".
+    let (own_rules_only, _) = PathClassifier::new(false, &["CHANGELOG.md".to_string()]);
+    let decisions = decide_classified(
+        Some(&set),
+        &profile(true, true),
+        Some(&app_and_core()),
+        &reviewed_snapshot(),
+        &own_rules_only,
+    );
+    assert_eq!(
+        decisions.non_participating,
+        vec![NonParticipatingPath {
+            path: "CHANGELOG.md".to_string(),
+            rule: "CHANGELOG.md".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn an_unparsable_repository_pattern_is_dropped_rather_than_applied_loosely() {
+    let (classifier, rejected) = PathClassifier::new(true, &["design/[".to_string()]);
+    assert_eq!(rejected, vec!["design/[".to_string()]);
+    assert_eq!(
+        classifier.classify("design/wireframe.png"),
+        PathClass::Unknown
+    );
+}
+
+/// Contract §6a.7 and §8.1. A documentation-only change leaves nothing relevant
+/// to select, and the honest outcome is a `Skipped` with a stated reason —
+/// never a `passed`, which would claim evidence the run never produced.
+#[test]
+fn a_documentation_only_change_selects_nothing_and_owes_an_honest_skip() {
+    let set = trustworthy(vec![
+        modified("CHANGELOG.md"),
+        modified("docs/architecture.md"),
+        modified("README.md"),
+    ]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+
+    assert_eq!(decisions.non_participating.len(), 3);
+    for ecosystem in [Ecosystem::Cargo, Ecosystem::Vitest] {
+        let decision = decisions.get(ecosystem);
+        assert!(
+            selected(decision).is_empty(),
+            "{ecosystem:?} has nothing to run for a documentation-only change"
+        );
+        assert_eq!(
+            decision.empty_selection_skip_reason(),
+            Some(NO_TESTS_RELATED_TO_THE_CHANGE),
+            "an empty selection owes a stated skip reason, never a silent pass"
+        );
+    }
+}
+
+#[test]
+fn a_selection_that_chose_something_owes_no_skip_reason() {
+    let set = trustworthy(vec![modified("crates/core/src/lib.rs")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    assert_eq!(decisions.cargo.empty_selection_skip_reason(), None);
+}
+
+/// A full run is not an empty selection: it selected nothing because it is
+/// running everything, and calling that "no tests related to the change" would
+/// invert the meaning.
+#[test]
+fn a_full_run_never_claims_an_empty_selection() {
+    let set = trustworthy(vec![modified("Cargo.lock")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    assert_eq!(decisions.cargo.empty_selection_skip_reason(), None);
+}
+
+/// §6a.6: the classification has to travel to the reader on the check rows that
+/// carry a scope, or it cannot be challenged without reading the source.
+#[test]
+fn the_published_scope_carries_every_neutral_path_and_its_rule() {
+    let set = trustworthy(vec![
+        modified("CHANGELOG.md"),
+        modified("crates/core/src/lib.rs"),
+    ]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    for check in ["Cargo test", "Vitest"] {
+        let report = decisions
+            .report_for_check(check)
+            .unwrap_or_else(|| panic!("{check} owns a test scope"));
+        assert_eq!(
+            report.non_participating,
+            vec![NonParticipatingPath {
+                path: "CHANGELOG.md".to_string(),
+                rule: "root-changelog".to_string(),
+            }],
+            "{check} must publish path -> rule for every neutral path"
+        );
+    }
+    assert!(
+        decisions.report_for_check("Clippy").is_none(),
+        "a check with no test suite still carries no scope at all"
+    );
+}
+
+#[test]
+fn a_run_that_neutralised_nothing_publishes_no_neutral_list() {
+    let set = trustworthy(vec![modified("crates/core/src/lib.rs")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    let report = decisions.report_for_check("Cargo test").expect("scope");
+    assert!(report.non_participating.is_empty());
+    let json = serde_json::to_value(&report).expect("serialize scope");
+    assert!(
+        json.get("non_participating").is_none(),
+        "the field is additive and omitted when empty, so an untouched run looks untouched"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -799,6 +1138,7 @@ fn generated_output_is_not_a_selector_input() {
             profile: &profile(true, true),
             cargo_workspace: Some(&app_and_core()),
             is_generated,
+            classifier: &builtin_classifier(),
         },
     );
     assert_eq!(selected(&decisions.vitest), ["src/app.ts".to_string()]);

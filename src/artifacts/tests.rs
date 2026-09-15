@@ -1910,6 +1910,10 @@ fn run_json_publishes_the_test_scope_on_the_checks_that_own_one() {
             reason: "no JavaScript or TypeScript source detected".to_string(),
             inputs: Some(3),
         },
+        non_participating: vec![crate::checks::scope::NonParticipatingPath {
+            path: "CHANGELOG.md".to_string(),
+            rule: "root-changelog".to_string(),
+        }],
     };
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1945,6 +1949,14 @@ fn run_json_publishes_the_test_scope_on_the_checks_that_own_one() {
     assert_eq!(
         cargo_test["scope"]["reason"].as_str(),
         Some("manifest or lockfile changed: Cargo.lock")
+    );
+    assert_eq!(
+        cargo_test["scope"]["non_participating"][0]["path"],
+        "CHANGELOG.md"
+    );
+    assert_eq!(
+        cargo_test["scope"]["non_participating"][0]["rule"],
+        "root-changelog"
     );
     let clippy = rows
         .iter()

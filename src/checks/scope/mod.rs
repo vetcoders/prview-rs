@@ -219,6 +219,23 @@ impl ScopeDecision {
         matches!(self, Self::Full { .. })
     }
 
+    /// The reason a check must report as `Skipped` because this decision chose
+    /// nothing to run, or `None` when something was selected.
+    ///
+    /// Not applied to any `CheckResult` in this build: the checks still execute
+    /// their full commands, and a run that executed the whole suite may not be
+    /// relabelled `Skipped`. Step 2 is where this reason reaches a check's
+    /// status, at the same moment the commands actually narrow. Defined and
+    /// tested here so the semantics land with the decision that produces them.
+    pub fn empty_selection_skip_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::ChangeScoped { selected, .. } if selected.is_empty() => {
+                Some(NO_TESTS_RELATED_TO_THE_CHANGE)
+            }
+            _ => None,
+        }
+    }
+
     /// The publishable view of this decision, given that this build still runs
     /// full commands.
     ///
@@ -239,6 +256,7 @@ impl ScopeDecision {
                 selected: None,
                 universe: None,
                 selector: None,
+                non_participating: Vec::new(),
             },
             Self::ChangeScoped {
                 inputs, universe, ..
@@ -249,16 +267,30 @@ impl ScopeDecision {
                 selected: None,
                 universe: *universe,
                 selector: None,
+                non_participating: Vec::new(),
             },
         }
     }
 }
+
+/// What a check must report when the scope selected nothing at all.
+///
+/// Contract §8.1 and §6a.7: an empty selection is an honest `Skipped` with this
+/// reason, NEVER a `passed`. A documentation-only change is the ordinary way to
+/// reach it — the relevant set is empty after classification, so there is no
+/// test the change could have broken, and saying "passed" would be claiming
+/// evidence the run never produced.
+pub const NO_TESTS_RELATED_TO_THE_CHANGE: &str = "no tests related to the change";
 
 /// The run's decision for every ecosystem it can scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeDecisions {
     pub cargo: ScopeDecision,
     pub vitest: ScopeDecision,
+    /// Changed paths this run decided are not inputs to test selection, with
+    /// the rule that said so. Ecosystem-independent: the classification is a
+    /// property of the path, not of the runner.
+    pub non_participating: Vec<NonParticipatingPath>,
 }
 
 impl ScopeDecisions {
@@ -277,6 +309,17 @@ impl ScopeDecisions {
             .into_iter()
             .find(|eco| check_name.eq_ignore_ascii_case(eco.check_name()))
             .map(|eco| self.get(eco))
+    }
+
+    /// The publishable `scope` object for a check row: the ecosystem's decision
+    /// plus the run's non-participating classification, which is what makes the
+    /// decision auditable.
+    pub fn report_for_check(&self, check_name: &str) -> Option<ScopeReport> {
+        self.for_check(check_name).map(|decision| {
+            let mut report = decision.report();
+            report.non_participating = self.non_participating.clone();
+            report
+        })
     }
 
     /// Review caveats owed to the merge gate because a check ran narrower than
@@ -313,6 +356,12 @@ pub struct ScopeReport {
     pub universe: Option<usize>,
     /// The selector's actual arguments. `null` when no selector ran.
     pub selector: Option<String>,
+    /// Changed paths classified as not inputs to test selection, each with the
+    /// rule that said so (contract §6a.6). Additive to the 3.1 shape and
+    /// omitted when empty, so a run that neutralised nothing looks exactly as
+    /// it did before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub non_participating: Vec<NonParticipatingPath>,
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +742,193 @@ fn is_shared_tooling(path: &str) -> bool {
     path_segments(path).any(|segment| SHARED_TOOLING_DIRECTORIES.contains(&segment))
 }
 
+// ---------------------------------------------------------------------------
+// Three-state classification of a changed path (contract §6a)
+// ---------------------------------------------------------------------------
+
+/// What a changed path is, as far as TEST SELECTION is concerned.
+///
+/// The strict reading of contract §2 — an unknown file ends in a full run —
+/// made almost every real pull request escalate, because almost every pull
+/// request also touches a CHANGELOG, a document or a workflow file. The answer
+/// (Monika, 2026-09-15, §6a) is deliberately NOT an ignore list. It is an
+/// explicit third state, so that "we know this is not an input" is recorded as
+/// a different fact from "we do not know what this is".
+///
+/// This classification decides ONE thing: whether a path participates in
+/// choosing which tests to run. It does not remove the file from the diff, the
+/// artifacts, the signals or the verdict, and it never makes a finding
+/// disappear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathClass<'a> {
+    /// Recognised source of an ecosystem: participates in selection.
+    Relevant(Ecosystem),
+    /// A narrow, NAMED class we can say is not an input to test selection.
+    /// Skipped for selection, and it does not escalate. Carries the rule that
+    /// said so, so the call can be challenged without reading this file.
+    NonParticipating(&'a str),
+    /// Everything else. Still escalates to a full run.
+    Unknown,
+}
+
+impl PathClass<'_> {
+    /// The rule that named this path non-participating, if that is what it is.
+    pub fn non_participating_rule(&self) -> Option<&str> {
+        match self {
+            Self::NonParticipating(rule) => Some(rule),
+            Self::Relevant(_) | Self::Unknown => None,
+        }
+    }
+}
+
+/// One built-in reason a path is not an input to test selection.
+///
+/// Each rule is named, and the name is published next to the path it matched.
+/// The list is deliberately tiny: everything on it is something whose content
+/// no test runner loads, in any ecosystem, by any mechanism we know of. A rule
+/// that needs a "usually" or a "probably" does not belong here — that is what
+/// `Unknown` is for.
+struct BuiltinRule {
+    name: &'static str,
+    matches: fn(&str) -> bool,
+}
+
+/// Prose extensions. A `docs/` directory can also hold a JSON schema or a
+/// script that a test really does read, so the documentation rules are bounded
+/// by extension rather than by directory alone.
+const DOCUMENTATION_EXTENSIONS: &[&str] = &[".md", ".mdx", ".rst", ".txt", ".adoc"];
+
+fn is_documentation_file(path: &str) -> bool {
+    DOCUMENTATION_EXTENSIONS
+        .iter()
+        .any(|extension| path.to_ascii_lowercase().ends_with(extension))
+}
+
+fn is_at_repository_root(path: &str) -> bool {
+    path_segments(path).count() == 1
+}
+
+fn root_file_named(path: &str, prefix: &str) -> bool {
+    is_at_repository_root(path)
+        && basename(path)
+            .to_ascii_uppercase()
+            .starts_with(&prefix.to_ascii_uppercase())
+}
+
+const BUILTIN_NON_PARTICIPATING: &[BuiltinRule] = &[
+    // The release log. Its content is never loaded by a test runner, and it
+    // changes in almost every pull request — which is exactly why the strict
+    // rule made scoping unreachable.
+    BuiltinRule {
+        name: "root-changelog",
+        matches: |path| root_file_named(path, "CHANGELOG"),
+    },
+    // Licence text at the repository root. Both spellings.
+    BuiltinRule {
+        name: "root-license",
+        matches: |path| root_file_named(path, "LICENSE") || root_file_named(path, "LICENCE"),
+    },
+    // The repository's front page.
+    BuiltinRule {
+        name: "root-readme",
+        matches: |path| root_file_named(path, "README"),
+    },
+    // Prose under a top-level documentation directory. NOT Markdown wholesale:
+    // a `.md` anywhere else — a fixture, a snapshot, a test's own input — stays
+    // `Unknown` and still escalates.
+    BuiltinRule {
+        name: "docs-directory",
+        matches: |path| {
+            matches!(path_segments(path).next(), Some("docs") | Some("doc"))
+                && is_documentation_file(path)
+        },
+    },
+    // CI workflow definitions. They describe how CI runs prview; they are not
+    // read by the code under test. Scoped to `.github/workflows/` only —
+    // composite actions and scripts elsewhere under `.github/` are not covered.
+    BuiltinRule {
+        name: "ci-workflow",
+        matches: |path| {
+            let mut segments = path_segments(path);
+            segments.next() == Some(".github")
+                && segments.next() == Some("workflows")
+                && (path.ends_with(".yml") || path.ends_with(".yaml"))
+        },
+    },
+];
+
+/// Decides the three states, built-ins plus whatever the repository declared.
+pub struct PathClassifier {
+    builtins_enabled: bool,
+    /// Repo-declared patterns, kept with their source text so the report can
+    /// name the pattern that matched rather than an opaque index.
+    repo_patterns: Vec<(String, glob::Pattern)>,
+}
+
+impl PathClassifier {
+    /// Build from a repository's manifest settings.
+    ///
+    /// An unparsable pattern is DROPPED rather than applied loosely: a rule we
+    /// cannot compile cannot be allowed to neutralise a path by accident, and
+    /// the strict side of this decision is the safe side. The dropped pattern
+    /// is returned so the caller can say so out loud.
+    pub fn new(builtins_enabled: bool, patterns: &[String]) -> (Self, Vec<String>) {
+        let mut repo_patterns = Vec::new();
+        let mut rejected = Vec::new();
+        for pattern in patterns {
+            match glob::Pattern::new(pattern) {
+                Ok(compiled) => repo_patterns.push((pattern.clone(), compiled)),
+                Err(_) => rejected.push(pattern.clone()),
+            }
+        }
+        (
+            Self {
+                builtins_enabled,
+                repo_patterns,
+            },
+            rejected,
+        )
+    }
+
+    /// The strictest classifier: nothing is neutral, every unrecognised path
+    /// escalates. This is what `non_participating_builtins = false` restores.
+    pub fn strict() -> Self {
+        Self {
+            builtins_enabled: false,
+            repo_patterns: Vec::new(),
+        }
+    }
+
+    /// The rule that says this path is not an input to test selection, if any.
+    fn non_participating(&self, path: &str) -> Option<&str> {
+        if self.builtins_enabled
+            && let Some(rule) = BUILTIN_NON_PARTICIPATING
+                .iter()
+                .find(|rule| (rule.matches)(path))
+        {
+            return Some(rule.name);
+        }
+        self.repo_patterns
+            .iter()
+            .find(|(_, compiled)| compiled.matches(path))
+            .map(|(source, _)| source.as_str())
+    }
+
+    /// Full three-state classification.
+    ///
+    /// Recognised source wins over every neutral rule: a repository cannot
+    /// declare its own `src/**/*.ts` neutral and quietly stop testing it.
+    pub fn classify<'a>(&'a self, path: &str) -> PathClass<'a> {
+        if let Some(ecosystem) = owner(path) {
+            return PathClass::Relevant(ecosystem);
+        }
+        match self.non_participating(path) {
+            Some(rule) => PathClass::NonParticipating(rule),
+            None => PathClass::Unknown,
+        }
+    }
+}
+
 fn is_rust_source(path: &str) -> bool {
     path.ends_with(".rs")
 }
@@ -740,6 +976,21 @@ pub struct ScopeInputs<'a> {
     /// Paths that are build output rather than source, as the JS checks already
     /// classify them. Injected so the decision stays pure.
     pub is_generated: &'a dyn Fn(&str) -> bool,
+    /// The three-state classifier (contract §6a), built from the repository's
+    /// manifest settings.
+    pub classifier: &'a PathClassifier,
+}
+
+/// A changed path the run decided is not an input to test selection, and the
+/// rule that said so.
+///
+/// Published so the call can be challenged without reading the source: a
+/// reviewer who disagrees that `docs/architecture.md` is neutral can see the
+/// exact rule name and argue with THAT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NonParticipatingPath {
+    pub path: String,
+    pub rule: String,
 }
 
 /// Decide, per ecosystem, what must run for this change.
@@ -805,6 +1056,7 @@ pub fn decide(change_set: Option<&ChangeSet>, inputs: &ScopeInputs<'_>) -> Scope
     let mut cargo_packages: BTreeSet<String> = BTreeSet::new();
     let mut cargo_selector_inputs: Vec<String> = Vec::new();
     let mut vitest_inputs: Vec<String> = Vec::new();
+    let mut non_participating: Vec<NonParticipatingPath> = Vec::new();
 
     for change in change_set.paths() {
         let path = change.path.as_str();
@@ -823,6 +1075,27 @@ pub fn decide(change_set: Option<&ChangeSet>, inputs: &ScopeInputs<'_>) -> Scope
         }
         if is_shared_tooling(path) {
             escalate(owner(path), reason::shared_tooling(path));
+            continue;
+        }
+        // Contract §6a. Checked AFTER every escalating class above, so a
+        // document that also lives in a shared tooling directory still
+        // escalates: the narrow neutral list never overrides a named reason to
+        // widen. A rename only counts as neutral when BOTH ends are — moving
+        // `src/a.ts` to `docs/a.md` removes a real source file, and the side the
+        // content left still has to escalate.
+        if let Some(rule) = inputs.classifier.classify(path).non_participating_rule()
+            && change.old_path.as_deref().is_none_or(|old| {
+                inputs
+                    .classifier
+                    .classify(old)
+                    .non_participating_rule()
+                    .is_some()
+            })
+        {
+            non_participating.push(NonParticipatingPath {
+                path: path.to_string(),
+                rule: rule.to_string(),
+            });
             continue;
         }
         match change.status {
@@ -874,13 +1147,15 @@ pub fn decide(change_set: Option<&ChangeSet>, inputs: &ScopeInputs<'_>) -> Scope
         } else if is_js_source(path) {
             vitest_inputs.push(path.to_string());
         } else {
-            // Neither selector can see this file. Vitest walks the static
-            // import graph and cargo walks package membership; a JSON asset, a
-            // template, an `.env` file or a data fixture is read at runtime
-            // through `fs` or `include_str!`, from a path neither graph
-            // contains. There is nothing to select on and no proof the change
-            // is irrelevant, so it escalates BOTH ecosystems rather than
-            // quietly contributing nothing to either selection.
+            // `Unknown`, and it stays escalating (contract §6a.1). Neither
+            // selector can see this file: vitest walks the static import graph
+            // and cargo walks package membership, while a locale file, a
+            // template or a data fixture is read at runtime through `fs` or
+            // `include_str!` from a path neither graph contains. There is
+            // nothing to select on and no proof the change is irrelevant, so it
+            // escalates BOTH ecosystems rather than quietly contributing
+            // nothing to either selection. The third state exists only to
+            // separate this case from the ones we can actually name.
             escalate(None, reason::unsupported_input(path));
         }
     }
@@ -910,13 +1185,18 @@ pub fn decide(change_set: Option<&ChangeSet>, inputs: &ScopeInputs<'_>) -> Scope
             selector_inputs: vitest_inputs,
         },
     };
-    ScopeDecisions { cargo, vitest }
+    ScopeDecisions {
+        cargo,
+        vitest,
+        non_participating,
+    }
 }
 
 fn both(decision: ScopeDecision) -> ScopeDecisions {
     ScopeDecisions {
         cargo: decision.clone(),
         vitest: decision,
+        non_participating: Vec::new(),
     }
 }
 
@@ -936,6 +1216,22 @@ pub async fn resolve_run_scope(
     // or nothing will match. A root that cannot be canonicalised is used as
     // given; the worst case is an unmatched file, which escalates.
     let reviewed_tree = canonicalized(reviewed_tree);
+    // Built from the repository's own manifest settings: a repo may add its own
+    // neutral patterns or turn the built-in list off entirely, and turning it
+    // off restores strictly escalating behaviour.
+    let (classifier, rejected_patterns) = PathClassifier::new(
+        config.scope_non_participating_builtins,
+        &config.scope_non_participating,
+    );
+    for pattern in &rejected_patterns {
+        // Loud, and strict: a rule we cannot compile is dropped rather than
+        // applied loosely, so an unparsable pattern can never neutralise a path
+        // by accident.
+        eprintln!(
+            "warning: ignoring unparsable `[scope] non_participating` pattern `{pattern}`; \
+             paths it was meant to cover will escalate to a full test run"
+        );
+    }
     let can_select = change_set.is_some_and(ChangeSet::single_base)
         && reviewed_tree.is_exactly_the_reviewed_commit();
     if !can_select {
@@ -949,6 +1245,7 @@ pub async fn resolve_run_scope(
                 profile: &config.profile,
                 cargo_workspace: None,
                 is_generated: &|_| false,
+                classifier: &classifier,
             },
         );
     }
@@ -964,6 +1261,7 @@ pub async fn resolve_run_scope(
             profile: &config.profile,
             cargo_workspace: workspace.as_ref(),
             is_generated: &|path| crate::checks::is_generated_artifact_path(path, config),
+            classifier: &classifier,
         },
     )
 }

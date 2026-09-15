@@ -24,9 +24,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are resolved with one `cargo metadata --no-deps --frozen` per run, read from
   the cargo root inside the REVIEWED tree — metadata only, not the
   network-capable full resolve. Every doubt escalates to a full run with a
-  stated reason, including an unknown file type. A dirty operator checkout is
-  deliberately NOT such a reason when the checks read a snapshot; it IS one when
-  the checks read that tree themselves. **No user-facing behaviour changes yet:** every check still runs
+  stated reason. A dirty operator checkout is deliberately NOT such a reason when
+  the checks read a snapshot; it IS one when the checks read that tree
+  themselves.
+
+- Changed paths are classified in three states for test selection: `relevant`
+  (recognised Rust / JS-TS source), `non-participating` (a narrow, named class
+  we can say is not an input) and `unknown` (everything else, which still
+  escalates to a full run). The classification affects test selection ONLY — a
+  non-participating file still appears in the diff, the artifacts, the signals
+  and the verdict. The built-in rules are `root-changelog`, `root-license`,
+  `root-readme`, `docs-directory` (prose extensions under a top-level `docs/` or
+  `doc/`) and `ci-workflow` (`.github/workflows/*.y[a]ml`). Translations,
+  fixtures, `tools/` and Markdown outside a documentation directory are
+  deliberately NOT neutral. A repository can extend the list with
+  `[scope] non_participating` in `prview.toml` or turn the built-ins off with
+  `[scope] non_participating_builtins = false`, which restores strictly
+  escalating behaviour. Every neutral path is published with the rule that named
+  it, in the `scope` object and as a `## Test scope` table in `MERGE_GATE.md`,
+  so the call can be challenged without reading the source.
+
+- **Library API (source-incompatible for consumers).** `Config` is re-exported
+  as `prview::Config` and its fields are public, so downstream code that builds
+  it with a struct literal must now also set the fields this release adds:
+  `changed_paths`, `scope_non_participating` and
+  `scope_non_participating_builtins`. All three are runtime-only state, kept on
+  `Config` deliberately — the same established pattern as `pinned_target`,
+  `pinned_diff_bases` and `scan_dir_override`. The next release is a minor
+  version bump. **No user-facing behaviour changes yet:** every check still runs
   exactly the command it ran before, so a scopeable decision is reported
   honestly as `mode: "full"` with reason `scoped execution not enabled yet`.
   Contract and rationale: `docs/architecture.md` ("How much of a test suite must

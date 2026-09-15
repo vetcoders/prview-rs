@@ -106,6 +106,7 @@ statement.
 | `selected` | integer \| null | Test files or packages selected. MUST be `null` when `mode` is `full`: a full run selected nothing, and a count there would read as coverage |
 | `universe` | integer \| null | The whole population the selection was drawn from, when knowable before the run |
 | `selector` | string \| null | The selector's actual arguments; `null` when no selector ran |
+| `non_participating` | object[] | Additive, omitted when empty. Changed paths classified as NOT inputs to test selection, each as `{ path, rule }`. Both fields are required and non-empty: an entry that does not name its rule cannot be challenged, which is the whole point of publishing the list |
 
 `mode: "full"` with reason `scoped execution not enabled yet` is the honest
 state of a build that computes the decision but still runs every test. A pack
@@ -114,6 +115,11 @@ must never state `change-scoped` for a run that executed the full command.
 `inputs`, `selected` and `universe` are counts of files and packages, so they
 are integers or `null`; a fractional count is rejected outright, because "1.5 of
 1028 test files" is not a statement a reviewer can act on.
+
+`non_participating` records a decision about TEST SELECTION ONLY. A path listed
+there is still in the diff, the artifacts, the signals and the verdict; it simply
+did not help decide which tests had to run. The same list is rendered as a
+`## Test scope` table in `MERGE_GATE.md`.
 
 Reading rule: absence means "this check has no test suite to scope, or this pack
 predates 3.1" — never "the full suite ran". Only a stated `mode` is evidence.

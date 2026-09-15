@@ -2133,8 +2133,8 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             // Additive: how much of this check's suite the run decided it had
             // to execute, and why. Present only on the checks that own an
             // ecosystem's test scope.
-            if let Some(decision) = scope.and_then(|scope| scope.for_check(&c.name)) {
-                entry["scope"] = json!(decision.report());
+            if let Some(report) = scope.and_then(|scope| scope.report_for_check(&c.name)) {
+                entry["scope"] = json!(report);
             }
             entry
         })

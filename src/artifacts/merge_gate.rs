@@ -161,10 +161,10 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         // Additive (schema 3.1): how much of this check's suite the run decided
         // had to execute, and why. Only the checks that own an ecosystem's test
         // scope carry it.
-        if let Some(decision) = scope.and_then(|scope| scope.for_check(&eval.name))
+        if let Some(report) = scope.and_then(|scope| scope.report_for_check(&eval.name))
             && let Some(row) = gate_checks.last_mut()
         {
-            row["scope"] = json!(decision.report());
+            row["scope"] = json!(report);
         }
 
         // A verdict may rest on evidence this run never produced. That is true
@@ -567,6 +567,25 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         );
     }
     append_review_signals(&mut md, all_review_caveats.iter().map(String::as_str));
+    // Which changed paths were excluded from TEST SELECTION, and by which rule.
+    // Published here so the call can be challenged without reading the source:
+    // a reviewer who disagrees that a path is neutral can argue with the named
+    // rule. It changes nothing else about the review — these files are still in
+    // the diff, the artifacts, the signals and the verdict.
+    if let Some(neutral) = scope.map(|scope| scope.non_participating.as_slice())
+        && !neutral.is_empty()
+    {
+        md.push_str("## Test scope\n\n");
+        md.push_str(
+            "These changed paths did not take part in choosing which tests to run. They are \
+             still reviewed everywhere else.\n\n",
+        );
+        md.push_str("| Path | Rule |\n|---|---|\n");
+        for entry in neutral {
+            let _ = writeln!(md, "| `{}` | `{}` |", entry.path, entry.rule);
+        }
+        md.push('\n');
+    }
     md.push_str("## Checks\n\n");
     md.push_str("| Check | Status | Class | Blocking |\n");
     md.push_str("|---|---|---|---|\n");
@@ -2395,6 +2414,10 @@ mod tests {
                 reason: "no JavaScript or TypeScript source detected".to_string(),
                 inputs: Some(3),
             },
+            non_participating: vec![crate::checks::scope::NonParticipatingPath {
+                path: "CHANGELOG.md".to_string(),
+                rule: "root-changelog".to_string(),
+            }],
         };
 
         generate_merge_gate(MergeGateInput {
@@ -2434,6 +2457,14 @@ mod tests {
             cargo_test["scope"]["selected"].is_null(),
             "a full run selected nothing and must not report a selection count"
         );
+        assert_eq!(
+            cargo_test["scope"]["non_participating"][0]["path"], "CHANGELOG.md",
+            "the gate row must name every path kept out of test selection"
+        );
+        assert_eq!(
+            cargo_test["scope"]["non_participating"][0]["rule"], "root-changelog",
+            "and the rule that decided it, so the call can be challenged"
+        );
         let clippy = rows
             .iter()
             .find(|row| row["name"] == "Clippy")
@@ -2441,6 +2472,13 @@ mod tests {
         assert!(
             clippy.get("scope").is_none(),
             "a check with no test suite to scope must not claim a scope"
+        );
+        let md = fs::read_to_string(summary.join("MERGE_GATE.md")).expect("gate markdown");
+        assert!(
+            md.contains("## Test scope")
+                && md.contains("`CHANGELOG.md`")
+                && md.contains("`root-changelog`"),
+            "the human gate must show path -> rule too, got:\n{md}"
         );
         assert!(
             gate["decision"]["review_caveats"]
