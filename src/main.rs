@@ -70,9 +70,12 @@ fn display_error(err: &anyhow::Error) {
         eprintln!("  {} {cause}", "caused by:".yellow());
     }
 
-    // Contextual hints based on error message content
+    // Contextual hints based on error message content. An error that embeds a
+    // user-supplied ref would match on the ref's name, not on the failure.
     let msg = format!("{err:?}").to_lowercase();
-    let hint = if msg.contains("repository") || msg.contains("git") {
+    let hint = if err.downcast_ref::<UnresolvableGateBase>().is_some() {
+        None
+    } else if msg.contains("repository") || msg.contains("git") {
         Some("make sure you're running prview from inside a git repository")
     } else if msg.contains("permission") || msg.contains("denied") {
         Some("check file permissions on ~/.prview/")
@@ -408,23 +411,40 @@ fn ensure_gate_base_is_unambiguous(cli: &Cli, args: &GateArgs) -> Result<()> {
     Ok(())
 }
 
+/// An explicit gate base that names no commit. Typed so `display_error` does not
+/// derive a hint from keywords inside the user's ref name (e.g. `remote-fix`).
+#[derive(Debug)]
+struct UnresolvableGateBase {
+    base: String,
+}
+
+impl std::fmt::Display for UnresolvableGateBase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gate base '{}' does not resolve to a commit \
+             (make sure the ref exists locally, or pass an existing branch, tag, or commit SHA)",
+            self.base
+        )
+    }
+}
+
+impl std::error::Error for UnresolvableGateBase {}
+
 /// The review resolves bases leniently: an unknown ref is dropped with a
 /// warning the quiet gate suppresses, leaving an empty change that would pass.
 /// A base the caller named explicitly must exist, so the gate fails to execute
 /// (exit 3) instead of approving a review of nothing.
 fn ensure_explicit_gate_base_resolves(app: &App, base: &str) -> Result<()> {
+    let base_error = || UnresolvableGateBase {
+        base: base.to_string(),
+    };
     let resolved = app
         .repo
         .resolve_bases(&app.config)
-        .with_context(|| format!("failed to resolve gate base '{base}'"))?;
+        .with_context(base_error)?;
     if resolved.is_empty() {
-        // `display_error` derives hints from keywords such as "git",
-        // "repository", or "fetch"; none of them describe this failure, so the
-        // message avoids them.
-        bail!(
-            "gate base '{base}' does not resolve to a commit \
-             (make sure the ref exists locally, or pass an existing branch, tag, or commit SHA)"
-        );
+        return Err(base_error().into());
     }
     Ok(())
 }

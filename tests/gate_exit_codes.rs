@@ -460,33 +460,41 @@ fn gate_explicit_base_annotated_tag_reviews_the_change_since_the_tag() {
 
 #[test]
 fn gate_exits_three_for_unresolvable_explicit_base() {
-    let home = tempfile::tempdir().expect("prview home");
     let temp = create_gate_fixture();
+    let path = path_without_semgrep(temp.path());
 
-    let output = prview_gate_command(temp.path(), home.path())
-        .args(["gate", "--base", "does-not-exist", "--json"])
-        .output()
-        .expect("run gate");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The second ref embeds keywords `display_error` maps to hints; the
+    // hint must come from the failure, never from the user's ref name.
+    for base in ["does-not-exist", "remote-fetch-git"] {
+        let home = tempfile::tempdir().expect("prview home");
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+            .current_dir(temp.path())
+            .env("PATH", &path)
+            .env("PRVIEW_HOME", home.path())
+            .args(["gate", "--base", base, "--json"])
+            .output()
+            .expect("run gate");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "stdout={stdout} stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("does-not-exist"),
-        "the error must name the unresolvable ref: {stderr}"
-    );
-    assert!(
-        !stderr.contains("hint:"),
-        "no generic repository/network hint applies to an unresolvable base: {stderr}"
-    );
-    assert!(
-        !stdout.contains("PASS"),
-        "no verdict may be claimed for an unresolvable base: {stdout}"
-    );
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{base}: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("gate base '{base}' does not resolve to a commit")),
+            "the error must name the unresolvable ref: {stderr}"
+        );
+        assert!(
+            !stderr.contains("hint:"),
+            "no generic repository/network hint applies to an unresolvable base: {stderr}"
+        );
+        assert!(
+            !stdout.contains("PASS"),
+            "no verdict may be claimed for an unresolvable base: {stdout}"
+        );
+    }
 }
 
 /// `--pr` swaps the review base for the pull request's own base, so it must
