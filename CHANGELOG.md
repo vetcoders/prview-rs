@@ -19,14 +19,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `3` with an error naming the ref, rather than silently reviewing an empty
   change. `docs/gate-playbook.md` documents passing `github.event.before` on CI
   `push` events.
+- `prview gate --base <REF> --exact-base` reviews `<REF>..HEAD` literally
+  instead of normalizing the base to its merge-base with the target. Merge-base
+  normalization is the three-dot review model and stays the default for every
+  base; it is wrong for one question only ("what did this push deliver?")
+  because on a force-push the pre-push commit is no longer an ancestor of the
+  new tip, so normalization would review
+  `merge-base(before, after)..after`, a different and larger range. The flag
+  requires `--base` and affects only the requested base. `Gate Shadow`
+  (`.github/workflows/gate.yml`) passes it on `push` events and records the
+  range mode, including whether the push was a force-push, in its job summary.
 
 ### Changed
 
-- Library API: `prview::GateArgs` gains the public field `base`, and
-  `prview::Config` gains the public field `required_base`; code that
-  constructs either with a struct literal must set the new field. This is
-  source-incompatible for library consumers, so the next release is a minor
-  version bump.
+- Library API: `prview::GateArgs` gains the public fields `base` and
+  `exact_base`, and `prview::Config` gains the public fields `required_base` and
+  `required_base_exact`; code that constructs either with a struct literal must
+  set the new fields. `prview::git::Repository::resolve_diff_bases` takes
+  `&Config` in place of its trailing `quiet: bool`, since the range mode is read
+  from the same runtime state as `quiet`. This is source-incompatible for
+  library consumers, so the next release is a minor version bump.
 - `install.sh` is fail-closed. It installs an official release binary or it
   installs nothing: the `cargo install` fallback is gone, along with every code
   path that could build, compile, or clone on the user's machine. `latest` is

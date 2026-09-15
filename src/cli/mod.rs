@@ -332,6 +332,11 @@ pub struct GateArgs {
     /// (default: auto-detect develop/main/master). An unresolvable ref exits 3.
     #[arg(long, value_name = "REF")]
     pub base: Option<String>,
+
+    /// Review `--base..HEAD` literally instead of normalizing the base to its
+    /// merge-base with the target. Only the requested base is affected.
+    #[arg(long, requires = "base")]
+    pub exact_base: bool,
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -1150,6 +1155,7 @@ mod tests {
                 fail_on_warnings: false,
                 json: true,
                 base: None,
+                exact_base: false,
             }))
         );
         assert_eq!(cli.target, None);
@@ -1166,6 +1172,7 @@ mod tests {
                 fail_on_warnings: false,
                 json: true,
                 base: Some("main".to_string()),
+                exact_base: false,
             }))
         );
         // The gate base is scoped to the subcommand, not the top-level positional bases.
@@ -1173,6 +1180,30 @@ mod tests {
         assert!(
             Cli::try_parse_from(["prview", "gate", "--base"]).is_err(),
             "--base requires a ref"
+        );
+    }
+
+    /// `--exact-base` changes what range `--base` means, so it is meaningless
+    /// without one: clap rejects it rather than letting it silently do nothing.
+    #[test]
+    fn test_parse_gate_exact_base_requires_a_base() {
+        let cli =
+            Cli::try_parse_from(["prview", "gate", "--base", "main", "--exact-base", "--json"])
+                .unwrap();
+
+        assert_eq!(
+            cli.command,
+            Some(CliCommand::Gate(GateArgs {
+                strict: false,
+                fail_on_warnings: false,
+                json: true,
+                base: Some("main".to_string()),
+                exact_base: true,
+            }))
+        );
+        assert!(
+            Cli::try_parse_from(["prview", "gate", "--exact-base"]).is_err(),
+            "--exact-base only qualifies an explicit --base"
         );
     }
 
@@ -1188,6 +1219,7 @@ mod tests {
                 fail_on_warnings: true,
                 json: true,
                 base: None,
+                exact_base: false,
             }))
         );
         assert!(

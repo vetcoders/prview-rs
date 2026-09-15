@@ -376,7 +376,7 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     config.apply_gate_profile(enforcement_mode);
     let mut app = App::from_config(config)?;
     if let Some(base) = &args.base {
-        pin_explicit_gate_base(&mut app, base)?;
+        pin_explicit_gate_base(&mut app, base, args.exact_base)?;
     }
     let governor = app.governor();
     let report =
@@ -452,7 +452,14 @@ impl std::error::Error for UnresolvableGateBase {}
 /// [`Config::required_base`], which makes the run's own resolution fail loud if
 /// the pin still fails to survive it, and which keeps the caller's spelling for
 /// the error message.
-fn pin_explicit_gate_base(app: &mut App, base: &str) -> Result<()> {
+///
+/// `exact` carries `--exact-base` into the run. Diff bases are otherwise
+/// normalized to their merge-base with the target, which is right for the
+/// three-dot review model and wrong for the one question a push asks: on a
+/// force-push the pre-push commit is not an ancestor of the new tip, so
+/// normalization would review `merge-base(before, after)..after` — a wider range
+/// than the push delivered. Set, it keeps this base pinned exactly as resolved.
+fn pin_explicit_gate_base(app: &mut App, base: &str, exact: bool) -> Result<()> {
     let base_error = || UnresolvableGateBase {
         base: base.to_string(),
     };
@@ -463,6 +470,7 @@ fn pin_explicit_gate_base(app: &mut App, base: &str) -> Result<()> {
     let pinned = resolved.into_iter().next().ok_or_else(base_error)?;
     app.config.bases = vec![pinned.commit_id.clone()];
     app.config.required_base = Some(pinned);
+    app.config.required_base_exact = exact;
     Ok(())
 }
 
@@ -940,6 +948,7 @@ mod gate_base_tests {
             fail_on_warnings: false,
             json: true,
             base: base.map(str::to_string),
+            exact_base: false,
         }
     }
 

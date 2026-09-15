@@ -567,7 +567,7 @@ pub async fn run_analysis(
         let bases = app.repo.resolve_bases(&app.config)?;
         let diff_bases = app
             .repo
-            .resolve_diff_bases(&target, &bases, app.config.quiet);
+            .resolve_diff_bases(&app.config, &target, &bases);
         let diffs = app
             .repo
             .generate_diffs(&target, &diff_bases, app.config.quiet)?;

@@ -77,6 +77,23 @@ pub struct Config {
     /// loud instead of dropping it. Internal runtime state, never a CLI or
     /// manifest override.
     pub required_base: Option<crate::git::ResolvedRef>,
+    /// Review the requested base literally, as `required_base..target`, instead
+    /// of normalizing it to its merge-base with the target.
+    ///
+    /// Merge-base normalization is what makes a review match GitHub's three-dot
+    /// "Files changed" model, and it stays the default for every base. It is
+    /// wrong for exactly one question: "what did this push deliver?". A push
+    /// hands the gate the commit that was there before it; on a fast-forward
+    /// that commit already *is* the merge-base, but on a force-push it is not an
+    /// ancestor of the new tip, and normalizing would widen the review to
+    /// `merge-base(before, after)..after` — a different, larger range than the
+    /// one the push actually delivered. When this is set, only
+    /// [`Config::required_base`] keeps its pinned `commit_id` through
+    /// `Repository::resolve_diff_bases`; every other base is unaffected.
+    ///
+    /// Internal runtime state, never a manifest override; set by
+    /// `prview gate --base <REF> --exact-base`.
+    pub required_base_exact: bool,
     pub bases: Vec<String>,
     pub profile: DetectedProfile,
 
@@ -719,6 +736,7 @@ impl Config {
             pinned_target: None,
             pinned_diff_bases: None,
             required_base: None,
+            required_base_exact: false,
             bases: vec![],
             profile,
             execution_mode: ExecutionMode::Standard,

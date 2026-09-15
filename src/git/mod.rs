@@ -439,18 +439,36 @@ impl Repository {
     /// base tip to the merge-base with the target. When histories are unrelated,
     /// fall back to the original base tip so callers still get the best local
     /// comparison available.
+    ///
+    /// [`Config::required_base_exact`] opts the one requested base out of that
+    /// normalization, so its pinned `commit_id` anchors the diff verbatim and
+    /// the review covers `base..target` literally. Auto-detected bases, and
+    /// every base of a run that did not ask for it, are untouched.
     pub fn resolve_diff_bases(
         &self,
+        config: &Config,
         target: &ResolvedRef,
         bases: &[ResolvedRef],
-        quiet: bool,
     ) -> Vec<ResolvedRef> {
         use colored::Colorize;
+
+        let quiet = config.quiet;
+        // Matched on the commit id, the same identity `resolve_bases` pinned the
+        // requested base to — a ref name could have been re-pointed since.
+        let exact_base_commit = config
+            .required_base_exact
+            .then(|| config.required_base.as_ref())
+            .flatten()
+            .map(|required| required.commit_id.as_str());
 
         bases
             .iter()
             .map(|base| {
                 if base.commit_id == target.commit_id {
+                    return base.clone();
+                }
+
+                if exact_base_commit == Some(base.commit_id.as_str()) {
                     return base.clone();
                 }
 
@@ -1599,7 +1617,7 @@ mod tests {
         let resolved_bases = repo.resolve_bases(&config).expect("resolve bases");
         assert_eq!(resolved_bases[0].commit_id, base_tip);
 
-        let diff_bases = repo.resolve_diff_bases(&resolved_target, &resolved_bases, true);
+        let diff_bases = repo.resolve_diff_bases(&config, &resolved_target, &resolved_bases);
 
         assert_eq!(diff_bases[0].name, "main");
         assert_eq!(diff_bases[0].commit_id, merge_base);
@@ -1611,6 +1629,65 @@ mod tests {
             .flat_map(|diff| diff.files.iter().map(|file| file.path.as_str()))
             .collect();
         assert_eq!(files, vec!["own.rs"]);
+    }
+
+    /// The push path's one question is "what did this push deliver?", and
+    /// merge-base normalization answers a different one as soon as the pre-push
+    /// commit stops being an ancestor of the new tip — a force-push. The fixture
+    /// is that shape: `main` and `feature` diverged, so `main` is not an
+    /// ancestor of the target. With `Config::required_base_exact` the pinned
+    /// base anchors the diff verbatim and the review is `base..target` literally,
+    /// which includes `unrelated.rs` disappearing — content the force-push
+    /// removed, and part of what it delivered. Without it the same run reviews
+    /// `merge-base..target`, a different and larger range.
+    #[test]
+    fn resolve_diff_bases_keeps_a_pinned_exact_base_verbatim() {
+        let (tmp, merge_base, target, base_tip) = init_repo_with_advanced_base();
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        let mut config = test_config_builder()
+            .repo_root(tmp.path())
+            .target(Some("feature"))
+            .bases(&["main"])
+            .profile(test_generic_profile())
+            .build();
+        config.quiet = true;
+
+        let resolved_target = repo.resolve_target(&config).expect("resolve target");
+        let resolved_bases = repo.resolve_bases(&config).expect("resolve bases");
+        assert_eq!(resolved_bases[0].commit_id, base_tip);
+        assert_ne!(
+            merge_base, base_tip,
+            "fixture: the base tip is not the merge base, i.e. not an ancestor of the target"
+        );
+
+        config.required_base = Some(resolved_bases[0].clone());
+        config.required_base_exact = true;
+
+        let diff_bases = repo.resolve_diff_bases(&config, &resolved_target, &resolved_bases);
+        assert_eq!(
+            diff_bases[0].commit_id, base_tip,
+            "an exact base must anchor the diff at the commit it was pinned to"
+        );
+        assert_eq!(
+            diff_bases[0].name, "main",
+            "exact mode changes the anchor commit, never the displayed base name"
+        );
+
+        let diff = repo
+            .diff_refs(&diff_bases[0], &resolved_target)
+            .expect("diff refs");
+        let files: Vec<_> = diff.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(
+            files,
+            vec!["own.rs", "unrelated.rs"],
+            "the literal range must include what the force-push removed"
+        );
+        // A non-ancestor base degrades honestly rather than inventing history:
+        // the commit list is `base..target` in the revwalk sense, so it names
+        // exactly the commits the new tip added and omits the ones only the base
+        // had — it never reports a commit that is not in the reviewed history.
+        let commit_ids: Vec<_> = diff.commits.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(commit_ids, vec![target.as_str()]);
     }
 
     /// An auto-detected base is a guess, so a ref that will not resolve is

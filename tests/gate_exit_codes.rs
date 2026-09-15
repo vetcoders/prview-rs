@@ -28,6 +28,9 @@
 //! * An explicit `--base` is pinned to the commit it names before the run, so
 //!   the run's own `git fetch --prune` cannot take it away mid-review, and pack
 //!   headers still show the ref the caller wrote.
+//! * `--base <before> --exact-base` reviews `before..HEAD` literally even when
+//!   `before` is not an ancestor of `HEAD` — the force-push shape — while the
+//!   same `--base` without the flag still normalizes to the merge-base.
 
 use assert_cmd::prelude::*;
 use prview::git::git_cmd;
@@ -439,6 +442,163 @@ fn gate_explicit_base_commit_reviews_the_pushed_change() {
     assert!(
         per_file_diff_count(&explicit) > 0,
         "--base <sha> must review a non-empty change: {explicit}"
+    );
+}
+
+fn rev_parse(repo: &Path, rev: &str) -> String {
+    let output = git_cmd()
+        .args(["rev-parse", rev])
+        .current_dir(repo)
+        .output()
+        .expect("rev-parse");
+    assert!(output.status.success(), "rev-parse {rev} failed");
+    String::from_utf8(output.stdout)
+        .expect("utf8 sha")
+        .trim()
+        .to_string()
+}
+
+/// `git diff --name-only <from> <to>` — the two-dot, tree-to-tree file set,
+/// which is exactly what a push delivered between those two commits.
+fn git_diff_name_only(repo: &Path, from: &str, to: &str) -> Vec<String> {
+    let output = git_cmd()
+        .args(["diff", "--name-only", from, to])
+        .current_dir(repo)
+        .output()
+        .expect("git diff --name-only");
+    assert!(output.status.success(), "git diff --name-only failed");
+    let mut paths: Vec<String> = String::from_utf8(output.stdout)
+        .expect("utf8 diff")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The file set the pack actually reviewed, read from the pack's own
+/// `report.json` rather than from what the gate was asked to do.
+fn reviewed_paths(gate_json: &serde_json::Value) -> Vec<String> {
+    let output_dir = gate_json["output_dir"]
+        .as_str()
+        .expect("gate json names its output_dir");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(Path::new(output_dir).join("report.json")).expect(
+            "pack report.json",
+        ))
+        .expect("report.json is valid JSON");
+    let mut paths: Vec<String> = report["diff"]["files"]
+        .as_array()
+        .expect("report.json names the reviewed files")
+        .iter()
+        .map(|file| {
+            file["path"]
+                .as_str()
+                .expect("each reviewed file has a path")
+                .to_string()
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// A repo whose checked-out tip is NOT a descendant of the commit a push
+/// reported as `before` — the shape of a force-push. The rewritten history also
+/// drops a file the pre-push tip carried, so the literal range and the
+/// merge-base range differ by more than line counts. Returns the fixture, the
+/// pre-push commit, and the merge-base that normalization would fall back to.
+fn create_force_pushed_main_fixture() -> (TempDir, String, String) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test User"]);
+    run_git(repo, &["config", "user.email", "test@example.com"]);
+
+    fs::write(repo.join("README.md"), "hello\n").expect("write file");
+    run_git(repo, &["add", "README.md"]);
+    run_git(repo, &["commit", "-m", "initial"]);
+    run_git(repo, &["branch", "-M", "main"]);
+    let common_ancestor = rev_parse(repo, "HEAD");
+
+    // The tip the push reports as `before`. It carries a file the rewrite drops.
+    fs::write(repo.join("README.md"), "hello\nworld\n").expect("update file");
+    fs::write(repo.join("dropped.md"), "dropped by the force push\n").expect("write file");
+    run_git(repo, &["add", "README.md", "dropped.md"]);
+    run_git(repo, &["commit", "-m", "pre-push tip"]);
+    let before = rev_parse(repo, "HEAD");
+
+    // The force push: history is rewritten off the common ancestor, so `before`
+    // stops being an ancestor of the new tip while staying a reachable object.
+    run_git(repo, &["reset", "--hard", common_ancestor.as_str()]);
+    fs::write(repo.join("README.md"), "hello\nrewritten\n").expect("update file");
+    run_git(repo, &["add", "README.md"]);
+    run_git(repo, &["commit", "-m", "force-pushed change"]);
+
+    (temp, before, common_ancestor)
+}
+
+/// The contract this whole path exists for: Gate Shadow reviews the range the
+/// push delivered. Diff bases are normalized to their merge-base with the
+/// target, which on an ordinary fast-forward is `before` itself and changes
+/// nothing — but on a force-push `before` is no longer an ancestor, and
+/// normalization silently widens the review to
+/// `merge-base(before, after)..after`. `--exact-base` opts that one base out, so
+/// the reviewed file set is `git diff --name-only <before> <after>` exactly,
+/// including the file the force push removed.
+#[test]
+fn gate_exact_base_reviews_the_literal_force_pushed_range() {
+    let (temp, before, common_ancestor) = create_force_pushed_main_fixture();
+    let path = path_without_semgrep(temp.path());
+    let after = rev_parse(temp.path(), "HEAD");
+
+    let is_ancestor = git_cmd()
+        .args(["merge-base", "--is-ancestor", before.as_str(), after.as_str()])
+        .current_dir(temp.path())
+        .status()
+        .expect("merge-base --is-ancestor");
+    assert!(
+        !is_ancestor.success(),
+        "fixture: the pre-push commit must not be an ancestor of the new tip"
+    );
+
+    let delivered = git_diff_name_only(temp.path(), &before, &after);
+    let normalized_range = git_diff_name_only(temp.path(), &common_ancestor, &after);
+    assert_ne!(
+        delivered, normalized_range,
+        "fixture: the two range models must disagree for this test to mean anything"
+    );
+    assert!(
+        delivered.contains(&"dropped.md".to_string()),
+        "fixture: the delivered range includes the file the force push removed: {delivered:?}"
+    );
+
+    let exact_home = tempfile::tempdir().expect("prview home");
+    let exact = run_gate_json(
+        temp.path(),
+        &path,
+        exact_home.path(),
+        &["--base", &before, "--exact-base"],
+    );
+    assert_eq!(
+        reviewed_paths(&exact),
+        delivered,
+        "--exact-base must review exactly what the push delivered: {exact}"
+    );
+
+    // Control: the same `--base` without the flag still normalizes to the
+    // merge-base, which is the unchanged contract for every other caller.
+    let normalized_home = tempfile::tempdir().expect("prview home");
+    let normalized = run_gate_json(temp.path(), &path, normalized_home.path(), &["--base", &before]);
+    assert_eq!(
+        reviewed_paths(&normalized),
+        normalized_range,
+        "without --exact-base the base is still normalized to the merge-base: {normalized}"
+    );
+    assert_ne!(
+        reviewed_paths(&exact),
+        reviewed_paths(&normalized),
+        "the two modes must produce different reviews on a force-push"
     );
 }
 
