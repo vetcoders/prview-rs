@@ -81,6 +81,23 @@ pub struct FileChange {
     pub deletions: usize,
 }
 
+/// One path touched between two exact revisions, carrying the rename/copy
+/// source when there is one.
+///
+/// Deliberately separate from [`FileChange`]. `FileChange` is the pack's
+/// per-file diff row — line stats, serialized into artifacts — while this is
+/// the rename-aware *path set* a test-scope decision is made from. Both come
+/// from the same pinned base/target with the same rename detection, so they
+/// describe the same change; they differ only in what they carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedPath {
+    pub path: String,
+    pub status: FileStatus,
+    /// The pre-rename/pre-copy path. `Some` only for `Renamed`/`Copied`, and
+    /// only when it actually differs from `path`.
+    pub old_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileStatus {
@@ -507,6 +524,77 @@ impl Repository {
             stats,
             commits,
         })
+    }
+
+    /// Rename-aware path set for one base→target range.
+    ///
+    /// Same two commits and the same rename/copy detection [`diff_refs`] uses,
+    /// so the two cannot describe different changes. What it deliberately does
+    /// NOT do is build a [`git2::Patch`] per file — computing hunks for every
+    /// delta is the expensive half of `diff_refs`, and a scope decision needs
+    /// paths and statuses, not hunks.
+    pub(crate) fn changed_paths(
+        &self,
+        base: &ResolvedRef,
+        target: &ResolvedRef,
+    ) -> Result<Vec<ChangedPath>> {
+        let base_commit = self
+            .inner
+            .find_commit(git2::Oid::from_str(&base.commit_id)?)?;
+        let target_commit = self
+            .inner
+            .find_commit(git2::Oid::from_str(&target.commit_id)?)?;
+
+        let mut opts = DiffOptions::new();
+        // No context lines and no patch generation: only the delta list is read.
+        opts.context_lines(0);
+        let mut diff = self.inner.diff_tree_to_tree(
+            Some(&base_commit.tree()?),
+            Some(&target_commit.tree()?),
+            Some(&mut opts),
+        )?;
+
+        let mut find_opts = git2::DiffFindOptions::new();
+        find_opts.renames(true);
+        find_opts.copies(true);
+        find_opts.rename_threshold(RENAME_SIMILARITY_THRESHOLD);
+        diff.find_similar(Some(&mut find_opts))?;
+
+        let mut paths = Vec::new();
+        for delta in diff.deltas() {
+            let new_path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let status = match delta.status() {
+                git2::Delta::Added => FileStatus::Added,
+                git2::Delta::Deleted => FileStatus::Deleted,
+                git2::Delta::Modified => FileStatus::Modified,
+                git2::Delta::Renamed => FileStatus::Renamed,
+                git2::Delta::Copied => FileStatus::Copied,
+                _ => FileStatus::Modified,
+            };
+            // The pre-rename side is the whole reason this method exists: which
+            // ecosystem owns a rename is decided by where the content came
+            // from, and `FileChange` (the pack's diff row) never carried it.
+            let old_path = matches!(status, FileStatus::Renamed | FileStatus::Copied)
+                .then(|| {
+                    delta
+                        .old_file()
+                        .path()
+                        .map(|p| p.to_string_lossy().to_string())
+                })
+                .flatten()
+                .filter(|old| old != &new_path);
+            paths.push(ChangedPath {
+                path: new_path,
+                status,
+                old_path,
+            });
+        }
+        Ok(paths)
     }
 
     /// Get commits between two refs.

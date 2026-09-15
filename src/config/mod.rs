@@ -140,6 +140,15 @@ pub struct Config {
     /// `false`, breaking findings stay visible as an informational caveat only.
     pub breaking_escalation: bool,
 
+    /// The change this run is reviewing, as the test-scope decision reads it.
+    ///
+    /// Internal runtime state, never a CLI or manifest override — the same
+    /// contract as `pinned_target` / `pinned_diff_bases`, and set in the same
+    /// place, on the cloned check configuration. `None` means "no scoping
+    /// information", which every consumer must treat as today's behaviour:
+    /// run everything.
+    pub changed_paths: Option<crate::checks::scope::ChangeSet>,
+
     /// Directory the file-scoped checks should scan, when the dispatcher has
     /// already materialised a shared target snapshot for the run. `None` = each
     /// check resolves its own scan dir via `plan_check_run`. Set once per run by
@@ -748,6 +757,7 @@ impl Config {
             bridge_stage: 0,
             lint_ignore_patterns,
             breaking_escalation,
+            changed_paths: None,
             scan_dir_override: None,
         }
     }
