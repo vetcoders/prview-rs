@@ -74,7 +74,8 @@ fn gate_help_documents_exit_code_contract() {
         .stdout(predicate::str::contains("warnings-only under --strict"))
         .stdout(predicate::str::contains("--fail-on-warnings"))
         .stdout(predicate::str::contains("2 = strict review-required"))
-        .stdout(predicate::str::contains("3 = gate could not execute"));
+        .stdout(predicate::str::contains("3 = gate could not execute"))
+        .stdout(predicate::str::contains("--base <REF>"));
 }
 
 #[test]

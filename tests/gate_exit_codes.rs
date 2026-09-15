@@ -23,12 +23,20 @@
 //!   BLOCK (exit 1).
 //! * Running the gate outside a git repository makes the review unable to
 //!   execute → exit 3.
+//! * An explicit `--base` that does not resolve is an execution error → exit 3,
+//!   never an empty review that passes.
+//! * An explicit `--base` is pinned to the commit it names before the run, so
+//!   the run's own `git fetch --prune` cannot take it away mid-review, and pack
+//!   headers still show the ref the caller wrote.
+//! * `--base <before> --exact-base` reviews `before..HEAD` literally even when
+//!   `before` is not an ancestor of `HEAD` — the force-push shape — while the
+//!   same `--base` without the flag still normalizes to the merge-base.
 
 use assert_cmd::prelude::*;
 use prview::git::git_cmd;
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -338,4 +346,613 @@ fn gate_exits_three_when_it_cannot_execute() {
         .arg("gate")
         .assert()
         .code(3);
+}
+
+/// A repo that sits on `main` with two commits — the shape of a CI checkout
+/// after a push to the default branch. Base auto-detection resolves `main` to
+/// the target itself, so only an explicit base yields a change to review.
+/// Returns the fixture and the SHA of the first (pre-push) commit.
+fn create_pushed_main_fixture() -> (TempDir, String) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test User"]);
+    run_git(repo, &["config", "user.email", "test@example.com"]);
+
+    fs::write(repo.join("README.md"), "hello\n").expect("write file");
+    run_git(repo, &["add", "README.md"]);
+    run_git(repo, &["commit", "-m", "initial"]);
+    run_git(repo, &["branch", "-M", "main"]);
+
+    let before = git_cmd()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("rev-parse HEAD");
+    assert!(before.status.success(), "rev-parse HEAD failed");
+    let before = String::from_utf8(before.stdout)
+        .expect("utf8 sha")
+        .trim()
+        .to_string();
+
+    fs::write(repo.join("README.md"), "hello\nworld\n").expect("update file");
+    run_git(repo, &["add", "README.md"]);
+    run_git(repo, &["commit", "-m", "pushed change"]);
+
+    (temp, before)
+}
+
+/// Run `prview gate --json` with extra args and return the parsed gate JSON.
+/// The pack lives under `home`, which must outlive the caller's assertions.
+fn run_gate_json(repo: &Path, path: &OsString, home: &Path, extra: &[&str]) -> serde_json::Value {
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+        .current_dir(repo)
+        .env("PATH", path)
+        .env("PRVIEW_HOME", home)
+        .arg("gate")
+        .args(extra)
+        .arg("--json")
+        .output()
+        .expect("run gate");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("gate json")
+}
+
+fn per_file_diff_count(gate_json: &serde_json::Value) -> usize {
+    let output_dir = gate_json["output_dir"]
+        .as_str()
+        .expect("gate json names its output_dir");
+    fs::read_dir(Path::new(output_dir).join("10_diff").join("per-file-diffs"))
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn gate_explicit_base_commit_reviews_the_pushed_change() {
+    let (temp, before) = create_pushed_main_fixture();
+    // Built once: the helper copies git into the fixture bin dir, which is not
+    // writable a second time.
+    let path = path_without_semgrep(temp.path());
+
+    // Control: auto-detection resolves `main` == target, so the review is empty.
+    let auto_home = tempfile::tempdir().expect("prview home");
+    let auto = run_gate_json(temp.path(), &path, auto_home.path(), &[]);
+    assert_eq!(
+        per_file_diff_count(&auto),
+        0,
+        "auto-detected base on main must review an empty change: {auto}"
+    );
+
+    // A raw 40-hex commit SHA as --base reviews the change since that commit.
+    assert_eq!(before.len(), 40, "fixture passes a full commit SHA");
+    let explicit_home = tempfile::tempdir().expect("prview home");
+    let explicit = run_gate_json(
+        temp.path(),
+        &path,
+        explicit_home.path(),
+        &["--base", &before],
+    );
+    assert!(
+        per_file_diff_count(&explicit) > 0,
+        "--base <sha> must review a non-empty change: {explicit}"
+    );
+}
+
+fn rev_parse(repo: &Path, rev: &str) -> String {
+    let output = git_cmd()
+        .args(["rev-parse", rev])
+        .current_dir(repo)
+        .output()
+        .expect("rev-parse");
+    assert!(output.status.success(), "rev-parse {rev} failed");
+    String::from_utf8(output.stdout)
+        .expect("utf8 sha")
+        .trim()
+        .to_string()
+}
+
+/// `git diff --name-only <from> <to>` — the two-dot, tree-to-tree file set,
+/// which is exactly what a push delivered between those two commits.
+fn git_diff_name_only(repo: &Path, from: &str, to: &str) -> Vec<String> {
+    let output = git_cmd()
+        .args(["diff", "--name-only", from, to])
+        .current_dir(repo)
+        .output()
+        .expect("git diff --name-only");
+    assert!(output.status.success(), "git diff --name-only failed");
+    let mut paths: Vec<String> = String::from_utf8(output.stdout)
+        .expect("utf8 diff")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The file set the pack actually reviewed, read from the pack's own
+/// `report.json` rather than from what the gate was asked to do.
+fn reviewed_paths(gate_json: &serde_json::Value) -> Vec<String> {
+    let output_dir = gate_json["output_dir"]
+        .as_str()
+        .expect("gate json names its output_dir");
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(Path::new(output_dir).join("report.json")).expect("pack report.json"),
+    )
+    .expect("report.json is valid JSON");
+    let mut paths: Vec<String> = report["diff"]["files"]
+        .as_array()
+        .expect("report.json names the reviewed files")
+        .iter()
+        .map(|file| {
+            file["path"]
+                .as_str()
+                .expect("each reviewed file has a path")
+                .to_string()
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// A repo whose checked-out tip is NOT a descendant of the commit a push
+/// reported as `before` — the shape of a force-push. The rewritten history also
+/// drops a file the pre-push tip carried, so the literal range and the
+/// merge-base range differ by more than line counts. Returns the fixture, the
+/// pre-push commit, and the merge-base that normalization would fall back to.
+fn create_force_pushed_main_fixture() -> (TempDir, String, String) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test User"]);
+    run_git(repo, &["config", "user.email", "test@example.com"]);
+
+    fs::write(repo.join("README.md"), "hello\n").expect("write file");
+    run_git(repo, &["add", "README.md"]);
+    run_git(repo, &["commit", "-m", "initial"]);
+    run_git(repo, &["branch", "-M", "main"]);
+    let common_ancestor = rev_parse(repo, "HEAD");
+
+    // The tip the push reports as `before`. It carries a file the rewrite drops.
+    fs::write(repo.join("README.md"), "hello\nworld\n").expect("update file");
+    fs::write(repo.join("dropped.md"), "dropped by the force push\n").expect("write file");
+    run_git(repo, &["add", "README.md", "dropped.md"]);
+    run_git(repo, &["commit", "-m", "pre-push tip"]);
+    let before = rev_parse(repo, "HEAD");
+
+    // The force push: history is rewritten off the common ancestor, so `before`
+    // stops being an ancestor of the new tip while staying a reachable object.
+    run_git(repo, &["reset", "--hard", common_ancestor.as_str()]);
+    fs::write(repo.join("README.md"), "hello\nrewritten\n").expect("update file");
+    run_git(repo, &["add", "README.md"]);
+    run_git(repo, &["commit", "-m", "force-pushed change"]);
+
+    (temp, before, common_ancestor)
+}
+
+/// The contract this whole path exists for: Gate Shadow reviews the range the
+/// push delivered. Diff bases are normalized to their merge-base with the
+/// target, which on an ordinary fast-forward is `before` itself and changes
+/// nothing — but on a force-push `before` is no longer an ancestor, and
+/// normalization silently widens the review to
+/// `merge-base(before, after)..after`. `--exact-base` opts that one base out, so
+/// the reviewed file set is `git diff --name-only <before> <after>` exactly,
+/// including the file the force push removed.
+#[test]
+fn gate_exact_base_reviews_the_literal_force_pushed_range() {
+    let (temp, before, common_ancestor) = create_force_pushed_main_fixture();
+    let path = path_without_semgrep(temp.path());
+    let after = rev_parse(temp.path(), "HEAD");
+
+    let is_ancestor = git_cmd()
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            before.as_str(),
+            after.as_str(),
+        ])
+        .current_dir(temp.path())
+        .status()
+        .expect("merge-base --is-ancestor");
+    assert!(
+        !is_ancestor.success(),
+        "fixture: the pre-push commit must not be an ancestor of the new tip"
+    );
+
+    let delivered = git_diff_name_only(temp.path(), &before, &after);
+    let normalized_range = git_diff_name_only(temp.path(), &common_ancestor, &after);
+    assert_ne!(
+        delivered, normalized_range,
+        "fixture: the two range models must disagree for this test to mean anything"
+    );
+    assert!(
+        delivered.contains(&"dropped.md".to_string()),
+        "fixture: the delivered range includes the file the force push removed: {delivered:?}"
+    );
+
+    let exact_home = tempfile::tempdir().expect("prview home");
+    let exact = run_gate_json(
+        temp.path(),
+        &path,
+        exact_home.path(),
+        &["--base", &before, "--exact-base"],
+    );
+    assert_eq!(
+        reviewed_paths(&exact),
+        delivered,
+        "--exact-base must review exactly what the push delivered: {exact}"
+    );
+
+    // Control: the same `--base` without the flag still normalizes to the
+    // merge-base, which is the unchanged contract for every other caller.
+    let normalized_home = tempfile::tempdir().expect("prview home");
+    let normalized = run_gate_json(
+        temp.path(),
+        &path,
+        normalized_home.path(),
+        &["--base", &before],
+    );
+    assert_eq!(
+        reviewed_paths(&normalized),
+        normalized_range,
+        "without --exact-base the base is still normalized to the merge-base: {normalized}"
+    );
+    assert_ne!(
+        reviewed_paths(&exact),
+        reviewed_paths(&normalized),
+        "the two modes must produce different reviews on a force-push"
+    );
+}
+
+/// Pinned verbatim. This sentence is a statement about range semantics, not a
+/// warning and not a review caveat — if a later change reworks it into one, or
+/// routes it through the caveat machinery, these tests fail.
+const REWRITTEN_RANGE_NOTE: &str = "Force-push detected: the file set reflects the pre-push \u{2192} current tree difference, so it may contain changes not attributable to any commit in the displayed commit list.";
+
+/// A reader holding the pack sees a file list and a commit list side by side.
+/// On a rewritten range the two legitimately disagree: the file set is the
+/// literal pinned-base-to-target tree difference, so it carries what the
+/// force-push removed, while no commit in the list removed it. The pack says so
+/// once, beside the base, on both human surfaces.
+#[test]
+fn gate_exact_base_states_the_rewritten_range_in_the_pack() {
+    let (temp, before, _common_ancestor) = create_force_pushed_main_fixture();
+    let path = path_without_semgrep(temp.path());
+    let home = tempfile::tempdir().expect("prview home");
+
+    let gate = run_gate_json(
+        temp.path(),
+        &path,
+        home.path(),
+        &["--base", &before, "--exact-base"],
+    );
+
+    for surface in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
+        let rendered = read_pack_file(&gate, surface);
+        assert!(
+            rendered.contains(REWRITTEN_RANGE_NOTE),
+            "{surface} must state the rewritten range verbatim: {}",
+            rendered.lines().take(12).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    // It explains correct behaviour, so it must not be a review caveat and must
+    // not have moved any verdict.
+    let caveats = gate["caveats"]
+        .as_array()
+        .expect("gate json lists its caveats");
+    assert!(
+        !caveats
+            .iter()
+            .any(|caveat| caveat.as_str().is_some_and(|c| c.contains("Force-push"))),
+        "the range note must not be routed through the caveat machinery: {caveats:?}"
+    );
+}
+
+/// The note is a claim about this run's range, not about the flag. An ordinary
+/// push is a fast-forward, the pinned base IS the merge-base, the file list and
+/// the commit list agree — and the pack stays silent even though `--exact-base`
+/// was passed.
+#[test]
+fn gate_exact_base_stays_silent_on_a_fast_forward() {
+    let (temp, before) = create_pushed_main_fixture();
+    let path = path_without_semgrep(temp.path());
+    let after = rev_parse(temp.path(), "HEAD");
+    let is_ancestor = git_cmd()
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            before.as_str(),
+            after.as_str(),
+        ])
+        .current_dir(temp.path())
+        .status()
+        .expect("merge-base --is-ancestor");
+    assert!(
+        is_ancestor.success(),
+        "fixture: the pre-push commit must be an ancestor of the tip"
+    );
+
+    let home = tempfile::tempdir().expect("prview home");
+    let gate = run_gate_json(
+        temp.path(),
+        &path,
+        home.path(),
+        &["--base", &before, "--exact-base"],
+    );
+
+    for surface in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
+        let rendered = read_pack_file(&gate, surface);
+        assert!(
+            !rendered.contains("Force-push detected"),
+            "{surface} must stay silent on a fast-forward range"
+        );
+    }
+}
+
+#[test]
+fn gate_explicit_base_annotated_tag_reviews_the_change_since_the_tag() {
+    let (temp, _before) = create_pushed_main_fixture();
+    // Tag the first commit with an annotated tag: the ref names a tag object,
+    // which must be peeled to the tagged commit before the diff.
+    run_git(
+        temp.path(),
+        &["tag", "-a", "v0.1.0", "-m", "release", "HEAD~1"],
+    );
+    let path = path_without_semgrep(temp.path());
+
+    let home = tempfile::tempdir().expect("prview home");
+    let tagged = run_gate_json(temp.path(), &path, home.path(), &["--base", "v0.1.0"]);
+    assert!(
+        per_file_diff_count(&tagged) > 0,
+        "--base <annotated tag> must review a non-empty change: {tagged}"
+    );
+}
+
+/// A working repo whose `origin` no longer carries the branch the caller names
+/// as the base. This is the shape `git fetch --prune` deletes: the
+/// remote-tracking ref resolves when the gate accepts `--base`, and is gone by
+/// the time the review resolves it. Returns the fixture, the work tree, and the
+/// commit that branch pointed at.
+fn create_pruned_remote_base_fixture() -> (TempDir, PathBuf, String) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let upstream = temp.path().join("upstream.git");
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).expect("create work dir");
+
+    run_git(temp.path(), &["init", "--bare", "--quiet", "upstream.git"]);
+
+    run_git(&work, &["init"]);
+    run_git(&work, &["config", "user.name", "Test User"]);
+    run_git(&work, &["config", "user.email", "test@example.com"]);
+    fs::write(work.join("README.md"), "hello\n").expect("write file");
+    run_git(&work, &["add", "README.md"]);
+    run_git(&work, &["commit", "-m", "initial"]);
+    run_git(&work, &["branch", "-M", "main"]);
+
+    let before = git_cmd()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&work)
+        .output()
+        .expect("rev-parse HEAD");
+    assert!(before.status.success(), "rev-parse HEAD failed");
+    let before = String::from_utf8(before.stdout)
+        .expect("utf8 sha")
+        .trim()
+        .to_string();
+
+    run_git(
+        &work,
+        &[
+            "remote",
+            "add",
+            "origin",
+            upstream.to_str().expect("utf8 path"),
+        ],
+    );
+    // Both remote branches start at the pre-change commit. No local branch is
+    // created: `origin/release-base` must be reachable only as a
+    // remote-tracking ref, which is the thing a prune can delete.
+    run_git(
+        &work,
+        &[
+            "push",
+            "--quiet",
+            "origin",
+            "main:main",
+            "main:release-base",
+        ],
+    );
+    run_git(&work, &["fetch", "--quiet", "origin"]);
+
+    // The change the review must actually see.
+    fs::write(work.join("README.md"), "hello\nworld\n").expect("update file");
+    run_git(&work, &["add", "README.md"]);
+    run_git(&work, &["commit", "-m", "pushed change"]);
+
+    // Upstream drops the branch. The ref still exists locally until the review's
+    // own `git fetch --prune` runs.
+    run_git(&upstream, &["update-ref", "-d", "refs/heads/release-base"]);
+
+    (temp, work, before)
+}
+
+fn read_pack_file(gate_json: &serde_json::Value, name: &str) -> String {
+    let output_dir = gate_json["output_dir"]
+        .as_str()
+        .expect("gate json names its output_dir");
+    fs::read_to_string(Path::new(output_dir).join(name))
+        .unwrap_or_else(|err| panic!("read {name} from the pack: {err}"))
+}
+
+/// The regression. `prview gate` accepts `--base` and only then starts the
+/// review, which opens with `git fetch --quiet --prune origin`. A
+/// `--base origin/<branch>` whose upstream branch has been deleted is pruned out
+/// from under the run; base resolution drops what it cannot resolve, so the
+/// review lost its only base, saw an empty change, and passed. Prune removes
+/// refs and never objects, so the run is handed the commit id: the base survives
+/// its own ref disappearing, and the pushed change is actually reviewed.
+#[test]
+fn gate_explicit_base_survives_a_prune_of_the_ref_it_named() {
+    let (_temp, work, before) = create_pruned_remote_base_fixture();
+    let path = path_without_semgrep(&work);
+    let home = tempfile::tempdir().expect("prview home");
+
+    let gate = run_gate_json(
+        &work,
+        &path,
+        home.path(),
+        &["--base", "origin/release-base"],
+    );
+
+    // The ref the caller named is gone by now: proof the prune really happened.
+    let pruned = git_cmd()
+        .args(["rev-parse", "--verify", "--quiet", "origin/release-base"])
+        .current_dir(&work)
+        .output()
+        .expect("rev-parse the pruned ref");
+    assert!(
+        !pruned.status.success(),
+        "the fixture must actually lose the ref to the review's prune"
+    );
+
+    assert!(
+        per_file_diff_count(&gate) > 0,
+        "a pruned --base must still review the change, not an empty diff: {gate}"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_str(&read_pack_file(&gate, "report.json")).expect("parse report.json");
+    assert_eq!(
+        report["meta"]["range"]["merge_base"],
+        serde_json::Value::String(before.clone()),
+        "the review must run from the commit the pruned ref named: {}",
+        report["meta"]["range"]
+    );
+}
+
+/// The pin is an identity for resolving a range, not a label for a person. Pack
+/// headers keep the ref the caller wrote and put the reviewed commit beside it,
+/// so a reviewer reads `origin/release-base (abc123456789)` rather than forty
+/// characters of hex.
+#[test]
+fn gate_explicit_base_renders_the_callers_ref_name_with_the_reviewed_commit() {
+    let (temp, before) = create_pushed_main_fixture();
+    run_git(temp.path(), &["branch", "release-base", &before]);
+    let path = path_without_semgrep(temp.path());
+    let home = tempfile::tempdir().expect("prview home");
+
+    let gate = run_gate_json(temp.path(), &path, home.path(), &["--base", "release-base"]);
+    let expected = format!("`release-base` (`{}`)", &before[..12]);
+
+    let pr_review = read_pack_file(&gate, "PR_REVIEW.md");
+    assert!(
+        pr_review.contains(&expected),
+        "PR_REVIEW.md must name the caller's ref and the reviewed commit ({expected}): {}",
+        pr_review.lines().take(12).collect::<Vec<_>>().join("\n")
+    );
+    let ai_index = read_pack_file(&gate, "AI_INDEX.md");
+    assert!(
+        ai_index.contains(&expected),
+        "AI_INDEX.md must name the caller's ref and the reviewed commit ({expected}): {}",
+        ai_index.lines().take(12).collect::<Vec<_>>().join("\n")
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_str(&read_pack_file(&gate, "report.json")).expect("parse report.json");
+    assert_eq!(
+        report["meta"]["range"]["base"],
+        serde_json::Value::String("release-base".to_string()),
+        "report.json keeps the caller's spelling too; the commit is its merge_base"
+    );
+}
+
+#[test]
+fn gate_exits_three_for_unresolvable_explicit_base() {
+    let temp = create_gate_fixture();
+    let path = path_without_semgrep(temp.path());
+
+    // The second ref embeds keywords `display_error` maps to hints; the
+    // hint must come from the failure, never from the user's ref name.
+    for base in ["does-not-exist", "remote-fetch-git"] {
+        let home = tempfile::tempdir().expect("prview home");
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+            .current_dir(temp.path())
+            .env("PATH", &path)
+            .env("PRVIEW_HOME", home.path())
+            .args(["gate", "--base", base, "--json"])
+            .output()
+            .expect("run gate");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{base}: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("gate base '{base}' does not resolve to a commit")),
+            "the error must name the unresolvable ref: {stderr}"
+        );
+        assert!(
+            !stderr.contains("hint:"),
+            "no generic repository/network hint applies to an unresolvable base: {stderr}"
+        );
+        assert!(
+            !stdout.contains("PASS"),
+            "no verdict may be claimed for an unresolvable base: {stdout}"
+        );
+    }
+}
+
+/// `--pr` swaps the review base for the pull request's own base, so it must
+/// never silently discard an explicit `--base`. Top-level flags cannot precede
+/// the `gate` subcommand, and the gate does not accept `--pr`. Both spellings
+/// therefore fail at parse time: offline, before any GitHub call, with no
+/// verdict. The gate's own guard for the combination is unit-tested in
+/// `src/main.rs`.
+#[test]
+fn gate_base_cannot_be_combined_with_pr() {
+    let home = tempfile::tempdir().expect("prview home");
+    let temp = create_gate_fixture();
+    // No `gh` on PATH: anything past argument parsing would fail differently.
+    // Built once, because the helper cannot copy git into the fixture bin dir twice.
+    let path = path_without_semgrep(temp.path());
+
+    for args in [
+        &["--pr", "42", "gate", "--base", "main", "--json"][..],
+        &["gate", "--base", "main", "--pr", "42", "--json"][..],
+    ] {
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("prview"))
+            .current_dir(temp.path())
+            .env("PRVIEW_HOME", home.path())
+            .env("PATH", &path)
+            .args(args)
+            .output()
+            .expect("run prview");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} must be a usage error: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("unexpected argument"),
+            "{args:?} must be rejected by the parser: {stderr}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "{args:?} must not emit a verdict: {stdout}"
+        );
+    }
 }

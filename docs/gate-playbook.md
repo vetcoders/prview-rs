@@ -32,6 +32,111 @@ missing, unparsable, or stamped with a `schema_version` this build cannot read.
 Plain `prview --ci` uses the same code for the same conditions: it never
 re-derives a verdict when the gate artifact cannot be read.
 
+## Choosing the base
+
+`prview gate` reviews the current checkout against a base. By default the base
+is auto-detected from `develop`, `main`, and `master`. Pass `--base <REF>` to
+name it explicitly — a branch, tag, or commit SHA:
+
+```sh
+prview gate --base origin/main
+prview gate --base 3f9c2a7d0b1e4c6f8a2d5e7b9c1f3a5d7e9b2c4f --json
+```
+
+The explicit base must already resolve in the local repository. If it does not,
+the gate exits `3` with an error naming the ref instead of reviewing an empty
+change. A base that resolves to the checked-out commit itself is not an error: the
+review simply has no change to judge.
+
+The ref is resolved once, before the review starts, and the review is handed the
+commit id it named rather than the name itself. The review opens with
+`git fetch --prune`, which deletes remote-tracking refs whose upstream branch is
+gone: pinning the commit is what stops a `--base origin/<branch>` that gets
+pruned mid-run from quietly vanishing and leaving an empty change to pass. If the
+pinned commit is missing anyway when the review resolves its bases, the gate
+exits `3` instead of reporting a verdict. The pin is an identity, not a label:
+`PR_REVIEW.md`, `AI_INDEX.md` and `report.json` still show the ref you wrote,
+with the reviewed commit beside it (`release-base (0f1e2d3c4b5a)`).
+
+`--base` is the only way to choose the gate's base, and it cannot be combined
+with `--pr`, because a pull request defines its own base. Top-level options and
+positional `<target> <bases>` arguments cannot precede the `gate` subcommand:
+`prview --pr 42 gate --base main` and `prview feature main gate --base main` are
+parser usage errors (exit `2`, no JSON on stdout) and never start a gate run.
+
+**CI on `push` events must pass the pre-push commit.** A push workflow checks
+out the pushed tip. On the default branch, auto-detection then resolves `main`
+to that same commit, so the gate reviews an empty change and passes without
+having looked at what the push delivered. Pass `github.event.before` as the base
+for push events and keep auto-detection for pull requests, where the target
+branch is the right base:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0 # the pre-push commit must be present locally
+- uses: vetcoders/prview-rs@vX.Y.Z # first release after 0.8.0 (includes gate --base)
+  with:
+    strict: "true"
+    version: "X.Y.Z"
+    args: ${{ github.event_name == 'push' && format('--base {0} --exact-base', github.event.before) || '' }}
+```
+
+`--exact-base` makes the review the literal `before..HEAD` range instead of
+normalizing the base to its merge-base with the tip; it changes nothing on an
+ordinary push and is what keeps a force-push honest. See
+[Merge-base normalization and `--exact-base`](#merge-base-normalization-and---exact-base).
+
+`gate --base` and `gate --exact-base` ship in the first release after `0.8.0`.
+The Action's `version` input (or whatever runtime is actually installed) must
+name that release or a newer one: with `0.8.0` the gate rejects `--base` as an
+unknown option. The
+Action ref itself needs no bump — it forwards `args` to `prview gate`
+unchanged, so `uses: vetcoders/prview-rs@v0.8.0` works fine as long as
+`version` names a release that has `--base`. Two push shapes need care: a push
+that creates a branch reports an all-zero `before` (no pre-push commit, so the
+explicit base is unresolvable and the gate exits `3`), and a force push may
+name a `before` commit that is no longer fetched. This repository's own `Gate
+Shadow` workflow (`.github/workflows/gate.yml`) handles both by falling back
+to auto-detection, and records the base it used in the job summary. A force
+push that still names a fetched `before` is reviewed as the range it delivered
+— see [`--exact-base`](#merge-base-normalization-and---exact-base) below.
+
+### Merge-base normalization and `--exact-base`
+
+Diff bases are resolved to their merge-base with the target before reviewing,
+unless base and target already match. That is the three-dot "Files changed"
+model GitHub shows, it is right for a pull request, and it stays the default for
+every base — including an explicit `--base`.
+
+It answers the wrong question for exactly one caller: a push. On an ordinary
+push, where `before` is an ancestor of `HEAD`, the merge-base *is* `before`, so
+normalization changes nothing. On a force-push `before` is no longer an
+ancestor, and normalization silently widens the review to
+`merge-base(before, HEAD)..HEAD` — a different, larger range than the one the
+push delivered.
+
+`prview gate --base <REF> --exact-base` opts that one base out. The pinned base
+anchors the diff verbatim, so the review is `<REF>..HEAD` literally: on a
+force-push that is the tree-to-tree delta the push actually produced, including
+files the rewrite removed. `--exact-base` requires `--base` (a bare
+`--exact-base` is a parser usage error), and it affects only the requested base:
+auto-detected bases, and every base of a run that did not pass it, keep
+merge-base normalization.
+
+When the range really was rewritten — `--exact-base` is in force and the pinned
+base is not an ancestor of the target — `PR_REVIEW.md` and `REVIEW_SUMMARY.md`
+state it once beside the base: *"Force-push detected: the file set reflects the
+pre-push → current tree difference, so it may contain changes not
+attributable to any commit in the displayed commit list."* That is a statement
+about range semantics, not a warning: it explains why the file list can carry a
+change no listed commit made, and it touches no verdict, disposition or quality
+signal. On a fast-forward it does not appear.
+
+This repository's own `Gate Shadow` workflow passes `--exact-base` on `push`
+events and records the resulting mode in its job summary, including whether the
+push was a force-push.
+
 ## Breaking-change escalation
 
 A genuine breaking API change — a confirmed removed, changed, relocated, or
@@ -305,6 +410,8 @@ warning-clean pack as well.
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | Hook blocks with exit `3` | `prview` is missing, the repo is not a valid git checkout, or a required tool failed before a verdict was produced | Install `prview`, run `prview gate` manually, and inspect the printed error |
+| Gate exits `3` naming a base ref | The explicit `--base` does not resolve locally (not fetched, typo, or an all-zero `before` from a new-branch push) | Fetch the ref (`fetch-depth: 0` in CI) or fall back to auto-detection; see [Choosing the base](#choosing-the-base) |
+| Push run on the default branch passes with nothing reviewed | The gate auto-detected `main` as the base while `main` is the checked-out target | Pass the pre-push commit: `--base ${{ github.event.before }} --exact-base` on push events |
 | Hook blocks with exit `1` | Merge gate verdict is `BLOCK` | Open the generated run directory and read `00_summary/MERGE_GATE.json` and `PR_REVIEW.md` |
 | Required CI blocks with exit `2` | The typed disposition is `review_required`, or warnings-only is running with `--fail-on-warnings` | Fix the typed cause, remove the warning-clean opt-in, or move the repo back to Warn until the signal is actionable |
 | Hook is too slow | Semgrep or language checks dominate the measured budget | Stay in Shadow, tune policy/check scope, then re-measure before Warn |

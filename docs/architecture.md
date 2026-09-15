@@ -192,7 +192,7 @@ pub struct Repository {
 impl Repository {
     pub fn resolve_target(&self, config: &Config) -> Result<ResolvedRef>;
     pub fn resolve_bases(&self, config: &Config) -> Result<Vec<ResolvedRef>>;
-    pub fn resolve_diff_bases(&self, target: &ResolvedRef, bases: &[ResolvedRef], quiet: bool) -> Vec<ResolvedRef>;
+    pub fn resolve_diff_bases(&self, config: &Config, target: &ResolvedRef, bases: &[ResolvedRef]) -> Vec<ResolvedRef>;
     pub fn generate_diffs(&self, target: &ResolvedRef, bases: &[ResolvedRef], quiet: bool) -> Result<Vec<Diff>>;
     pub fn commit_patch(&self, commit_id: &str) -> Result<String>;
 }
@@ -201,6 +201,13 @@ impl Repository {
 Artifact diffs use `resolve_diff_bases()` before `generate_diffs()`, so the
 review pack matches GitHub's three-dot "Files changed" model: branch names stay
 displayable as bases, while each diff is anchored at the target/base merge-base.
+
+`Config::required_base_exact` is the single opt-out, set by `prview gate --base
+<REF> --exact-base`. It keeps the one requested base pinned at the commit it
+resolved to, so the review is `<REF>..target` literally — the range a push
+delivered, which stops being the merge-base range as soon as the push was a
+force-push. Every other base in that run, and every base of every other run,
+keeps merge-base normalization.
 
 Advantages of git2 over the `git` CLI:
 - much faster for batch operations
@@ -777,7 +784,7 @@ repository is a planning error, including runs with no snapshot-backed gates;
 it cannot fall back to the operator checkout. The independent Semgrep planner
 enforces the same rule; only unpinned scans retain in-place fallback behavior.
 Its `--baseline-commit` range comes from `pinned_diff_bases` verbatim — the same
-merge-base commit the pack diff was computed from — and is never re-derived from
+commit the pack diff was computed from — and is never re-derived from
 a symbolic base ref, which a base branch advancing past the target mid-run would
 collapse onto the target and reduce the scanned delta to nothing while the pack
 diff stays non-empty. A pinned target carrying no captured base is the same class
@@ -859,8 +866,9 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
 
 - `target_sha` — commit whose tree the pack judges;
 - `bases[]` — every baseline the pack's patches were generated from, as
-  `{name, sha}` in diff order. Each `sha` is the **merge base** taken from its
-  diff (`Diff.base_commit_id`), not the tip of the base branch. The two differ
+  `{name, sha}` in diff order. Each `sha` is the anchor commit taken from its
+  diff (`Diff.base_commit_id`) — normally the **merge base**, or the pinned base
+  itself under `--exact-base` — not the tip of the base branch. The two differ
   whenever the base moved ahead of the branch point, and the patch, the
   changed-file list and every diff-scoped gate are all computed against the merge
   base — so recording the tip would describe a comparison the pack never made. A

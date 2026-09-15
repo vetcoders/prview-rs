@@ -1855,11 +1855,12 @@ struct ProvenanceJsonInput<'a> {
 /// Every baseline the pack's diffs were actually produced from, named.
 ///
 /// `resolved_bases` holds the base *tips* the operator named. When the branches
-/// have diverged the patch is generated from the merge base instead
-/// (`Repository::resolve_diff_bases`), so recording a tip here would name a
-/// commit no diff in the pack was computed against — the contradiction of a file
-/// whose whole job is to state what was compared. Reading the values off the
-/// diffs themselves makes that impossible by construction.
+/// have diverged the patch is generated from the merge base instead — unless
+/// the run pinned an exact base (`Repository::resolve_diff_bases`) — so
+/// recording a tip here would name a commit no diff in the pack was computed
+/// against — the contradiction of a file whose whole job is to state what was
+/// compared. Reading the values off the diffs themselves makes that impossible
+/// by construction, in both range modes.
 ///
 /// One entry per diff: `--base a --base b` produces a patch per base, each with
 /// its own merge base, and collapsing them to one row left a reviewer unable to

@@ -203,6 +203,17 @@ warnings-only contract and the Action's `fail-on-warnings` input. Set
 `fail-on-warnings: "true"` alongside `strict: "true"` to require a
 warning-clean pack as well.
 
+On `push` events the gate auto-detects the base from `develop`, `main`, and
+`master`, so a push to the default branch ends up comparing that branch with
+itself and reviews an empty change unless you pass the pre-push commit with
+`--base`. Add `--exact-base` there: a base is otherwise normalized to its
+merge-base with the target, which is the pre-push commit itself on an ordinary
+push but widens the review past what a force-push delivered. Both flags need a
+prview runtime newer than `0.8.0` — set the Action's `version` input (or
+whatever release you install) accordingly; the Action ref itself can stay
+pinned, since it just forwards `args`. See
+[`docs/gate-playbook.md#choosing-the-base`](docs/gate-playbook.md#choosing-the-base).
+
 GitHub code scanning accepts SARIF uploads through
 `github/codeql-action/upload-sarif`. Keep SARIF under GitHub's ingestion limits:
 10 MB gzip-compressed upload size and 50 displayed annotations per workflow
