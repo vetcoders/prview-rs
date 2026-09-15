@@ -26,13 +26,14 @@
 //! * An explicit `--base` that does not resolve is an execution error → exit 3,
 //!   never an empty review that passes.
 //! * An explicit `--base` is pinned to the commit it names before the run, so
-//!   the run's own `git fetch --prune` cannot take it away mid-review.
+//!   the run's own `git fetch --prune` cannot take it away mid-review, and pack
+//!   headers still show the ref the caller wrote.
 
 use assert_cmd::prelude::*;
 use prview::git::git_cmd;
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -460,40 +461,161 @@ fn gate_explicit_base_annotated_tag_reviews_the_change_since_the_tag() {
     );
 }
 
-/// The gate accepts `--base` before the review starts, and the review starts
-/// with `git fetch --quiet --prune origin`. Prune deletes remote-tracking refs
-/// whose upstream branch is gone, so a ref that resolved for the caller can be
-/// gone by the time the run resolves it — and base resolution drops what it
-/// cannot resolve, leaving an empty change that reviews clean. Prune removes
-/// refs, never objects, so the gate hands the run the commit id instead of the
-/// caller's ref name. `report.json` records the range the pack was built from,
-/// which is where the pin is observable.
-#[test]
-fn gate_explicit_base_is_pinned_to_a_commit_before_the_run() {
-    let (temp, before) = create_pushed_main_fixture();
-    // A named ref for the pre-push commit: the spelling a caller actually uses.
-    run_git(temp.path(), &["branch", "release-base", &before]);
-    let path = path_without_semgrep(temp.path());
+/// A working repo whose `origin` no longer carries the branch the caller names
+/// as the base. This is the shape `git fetch --prune` deletes: the
+/// remote-tracking ref resolves when the gate accepts `--base`, and is gone by
+/// the time the review resolves it. Returns the fixture, the work tree, and the
+/// commit that branch pointed at.
+fn create_pruned_remote_base_fixture() -> (TempDir, PathBuf, String) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let upstream = temp.path().join("upstream.git");
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).expect("create work dir");
 
-    let home = tempfile::tempdir().expect("prview home");
-    let gate = run_gate_json(temp.path(), &path, home.path(), &["--base", "release-base"]);
-    assert!(
-        per_file_diff_count(&gate) > 0,
-        "--base <branch> must still review the change since that branch: {gate}"
+    run_git(temp.path(), &["init", "--bare", "--quiet", "upstream.git"]);
+
+    run_git(&work, &["init"]);
+    run_git(&work, &["config", "user.name", "Test User"]);
+    run_git(&work, &["config", "user.email", "test@example.com"]);
+    fs::write(work.join("README.md"), "hello\n").expect("write file");
+    run_git(&work, &["add", "README.md"]);
+    run_git(&work, &["commit", "-m", "initial"]);
+    run_git(&work, &["branch", "-M", "main"]);
+
+    let before = git_cmd()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&work)
+        .output()
+        .expect("rev-parse HEAD");
+    assert!(before.status.success(), "rev-parse HEAD failed");
+    let before = String::from_utf8(before.stdout)
+        .expect("utf8 sha")
+        .trim()
+        .to_string();
+
+    run_git(
+        &work,
+        &[
+            "remote",
+            "add",
+            "origin",
+            upstream.to_str().expect("utf8 path"),
+        ],
     );
+    // Both remote branches start at the pre-change commit. No local branch is
+    // created: `origin/release-base` must be reachable only as a
+    // remote-tracking ref, which is the thing a prune can delete.
+    run_git(
+        &work,
+        &[
+            "push",
+            "--quiet",
+            "origin",
+            "main:main",
+            "main:release-base",
+        ],
+    );
+    run_git(&work, &["fetch", "--quiet", "origin"]);
 
-    let output_dir = gate["output_dir"]
+    // The change the review must actually see.
+    fs::write(work.join("README.md"), "hello\nworld\n").expect("update file");
+    run_git(&work, &["add", "README.md"]);
+    run_git(&work, &["commit", "-m", "pushed change"]);
+
+    // Upstream drops the branch. The ref still exists locally until the review's
+    // own `git fetch --prune` runs.
+    run_git(&upstream, &["update-ref", "-d", "refs/heads/release-base"]);
+
+    (temp, work, before)
+}
+
+fn read_pack_file(gate_json: &serde_json::Value, name: &str) -> String {
+    let output_dir = gate_json["output_dir"]
         .as_str()
         .expect("gate json names its output_dir");
-    let report: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(Path::new(output_dir).join("report.json")).expect("read report.json"),
-    )
-    .expect("parse report.json");
+    fs::read_to_string(Path::new(output_dir).join(name))
+        .unwrap_or_else(|err| panic!("read {name} from the pack: {err}"))
+}
+
+/// The regression. `prview gate` accepts `--base` and only then starts the
+/// review, which opens with `git fetch --quiet --prune origin`. A
+/// `--base origin/<branch>` whose upstream branch has been deleted is pruned out
+/// from under the run; base resolution drops what it cannot resolve, so the
+/// review lost its only base, saw an empty change, and passed. Prune removes
+/// refs and never objects, so the run is handed the commit id: the base survives
+/// its own ref disappearing, and the pushed change is actually reviewed.
+#[test]
+fn gate_explicit_base_survives_a_prune_of_the_ref_it_named() {
+    let (_temp, work, before) = create_pruned_remote_base_fixture();
+    let path = path_without_semgrep(&work);
+    let home = tempfile::tempdir().expect("prview home");
+
+    let gate = run_gate_json(
+        &work,
+        &path,
+        home.path(),
+        &["--base", "origin/release-base"],
+    );
+
+    // The ref the caller named is gone by now: proof the prune really happened.
+    let pruned = git_cmd()
+        .args(["rev-parse", "--verify", "--quiet", "origin/release-base"])
+        .current_dir(&work)
+        .output()
+        .expect("rev-parse the pruned ref");
+    assert!(
+        !pruned.status.success(),
+        "the fixture must actually lose the ref to the review's prune"
+    );
+
+    assert!(
+        per_file_diff_count(&gate) > 0,
+        "a pruned --base must still review the change, not an empty diff: {gate}"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_str(&read_pack_file(&gate, "report.json")).expect("parse report.json");
+    assert_eq!(
+        report["meta"]["range"]["merge_base"],
+        serde_json::Value::String(before.clone()),
+        "the review must run from the commit the pruned ref named: {}",
+        report["meta"]["range"]
+    );
+}
+
+/// The pin is an identity for resolving a range, not a label for a person. Pack
+/// headers keep the ref the caller wrote and put the reviewed commit beside it,
+/// so a reviewer reads `origin/release-base (abc123456789)` rather than forty
+/// characters of hex.
+#[test]
+fn gate_explicit_base_renders_the_callers_ref_name_with_the_reviewed_commit() {
+    let (temp, before) = create_pushed_main_fixture();
+    run_git(temp.path(), &["branch", "release-base", &before]);
+    let path = path_without_semgrep(temp.path());
+    let home = tempfile::tempdir().expect("prview home");
+
+    let gate = run_gate_json(temp.path(), &path, home.path(), &["--base", "release-base"]);
+    let expected = format!("`release-base` (`{}`)", &before[..12]);
+
+    let pr_review = read_pack_file(&gate, "PR_REVIEW.md");
+    assert!(
+        pr_review.contains(&expected),
+        "PR_REVIEW.md must name the caller's ref and the reviewed commit ({expected}): {}",
+        pr_review.lines().take(12).collect::<Vec<_>>().join("\n")
+    );
+    let ai_index = read_pack_file(&gate, "AI_INDEX.md");
+    assert!(
+        ai_index.contains(&expected),
+        "AI_INDEX.md must name the caller's ref and the reviewed commit ({expected}): {}",
+        ai_index.lines().take(12).collect::<Vec<_>>().join("\n")
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_str(&read_pack_file(&gate, "report.json")).expect("parse report.json");
     assert_eq!(
         report["meta"]["range"]["base"],
-        serde_json::Value::String(before.clone()),
-        "the run must receive the commit the branch named, not the branch name: {}",
-        report["meta"]["range"]
+        serde_json::Value::String("release-base".to_string()),
+        "report.json keeps the caller's spelling too; the commit is its merge_base"
     );
 }
 

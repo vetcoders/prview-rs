@@ -18,14 +18,24 @@ pub(crate) fn generate_pr_review(
     let profile = config.profile.kind.as_str();
     let cargo_tree = load_cargo_tree_index(dir);
 
-    let (target, base) = if let Some(diff) = diffs.first() {
-        (diff.target.as_str(), diff.base.as_str())
+    let (target, base, base_commit) = if let Some(diff) = diffs.first() {
+        (
+            diff.target.as_str(),
+            diff.base.as_str(),
+            diff.base_commit_id.as_str(),
+        )
     } else {
         (
             config.target.as_deref().unwrap_or("HEAD"),
-            config.bases.first().map(|s| s.as_str()).unwrap_or("main"),
+            display_base_name(config),
+            config
+                .required_base
+                .as_ref()
+                .map_or("", |required| required.commit_id.as_str()),
         )
     };
+    // The header names the ref; the commit beside it says which one that was.
+    let base_display = base_ref_display(base, base_commit);
 
     // Count files
     let all_files: Vec<&crate::git::FileChange> = diffs.iter().flat_map(|d| &d.files).collect();
@@ -60,7 +70,7 @@ pub(crate) fn generate_pr_review(
     writeln!(
         md,
         "> **Branch:** {} | **Base:** {} | **Profile:** {}",
-        target, base, profile
+        target, base_display, profile
     )?;
     writeln!(
         md,
@@ -74,7 +84,7 @@ pub(crate) fn generate_pr_review(
     writeln!(md, "| | |")?;
     writeln!(md, "|---|---|")?;
     writeln!(md, "| **Branch** | `{}` |", target)?;
-    writeln!(md, "| **Base** | `{}` |", base)?;
+    writeln!(md, "| **Base** | {} |", base_display)?;
     writeln!(md, "| **Generated** | {} |", timestamp)?;
     writeln!(md)?;
 

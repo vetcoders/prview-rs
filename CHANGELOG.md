@@ -58,7 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty change, and passed. The resolved commit id is handed to the review
   instead of the ref name, and a pinned base that is still missing when the review
   resolves its bases exits `3` naming the ref the caller typed, rather than
-  reporting a verdict.
+  reporting a verdict. Pack headers are unaffected by the pin: `PR_REVIEW.md`,
+  `AI_INDEX.md` and `report.json` keep the ref as it was written and now show the
+  reviewed commit beside it.
 - Annotated tags used as a base or target now resolve to the tagged commit.
   Ref resolution returned the tag object's id, so merge-base and diff lookups
   failed with a git error (for example `prview gate --base v0.8.0`). A ref that

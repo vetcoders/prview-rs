@@ -54,7 +54,9 @@ commit id it named rather than the name itself. The review opens with
 gone: pinning the commit is what stops a `--base origin/<branch>` that gets
 pruned mid-run from quietly vanishing and leaving an empty change to pass. If the
 pinned commit is missing anyway when the review resolves its bases, the gate
-exits `3` instead of reporting a verdict.
+exits `3` instead of reporting a verdict. The pin is an identity, not a label:
+`PR_REVIEW.md`, `AI_INDEX.md` and `report.json` still show the ref you wrote,
+with the reviewed commit beside it (`release-base (0f1e2d3c4b5a)`).
 
 `--base` is the only way to choose the gate's base, and it cannot be combined
 with `--pr`, because a pull request defines its own base. Top-level options and

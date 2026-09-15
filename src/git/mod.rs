@@ -379,16 +379,24 @@ impl Repository {
             }
         }
 
-        if let Some(required) = &config.required_base
-            && !resolved
-                .iter()
-                .any(|base| base.commit_id == required.commit_id)
-        {
-            return Err(MissingRequiredBase {
-                requested: required.name.clone(),
-                commit_id: required.commit_id.clone(),
-            }
-            .into());
+        if let Some(required) = &config.required_base {
+            let Some(pinned) = resolved
+                .iter_mut()
+                .find(|base| base.commit_id == required.commit_id)
+            else {
+                return Err(MissingRequiredBase {
+                    requested: required.name.clone(),
+                    commit_id: required.commit_id.clone(),
+                }
+                .into());
+            };
+            // Resolution is finished, and it was done against the commit id so a
+            // mid-run prune could not take the base away. What remains is the
+            // display name every pack header carries (`Diff::base`): a reader
+            // wants the ref they asked for, not the forty characters it was
+            // pinned to. The id stays in `commit_id`, which is what every range
+            // computation from here on actually uses.
+            pinned.name.clone_from(&required.name);
         }
 
         Ok(resolved)
@@ -1637,6 +1645,10 @@ mod tests {
         let resolved = repo.resolve_bases(&survives).expect("resolve bases");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].commit_id, base_tip);
+        assert_eq!(
+            resolved[0].name, "origin/gone",
+            "the caller's spelling is what pack headers display; the pin stays in commit_id"
+        );
 
         // The hole: the requested base no longer resolves, so lenient resolution
         // drops it and leaves nothing to review.

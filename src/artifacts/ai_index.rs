@@ -24,8 +24,11 @@ pub(crate) fn generate_ai_index(
     } else {
         (
             config.target.as_deref().unwrap_or("HEAD"),
-            config.bases.first().map(|s| s.as_str()).unwrap_or("main"),
-            "",
+            display_base_name(config),
+            config
+                .required_base
+                .as_ref()
+                .map_or("", |required| required.commit_id.as_str()),
             "",
         )
     };
@@ -47,7 +50,7 @@ pub(crate) fn generate_ai_index(
             .pr_number
             .map_or("n/a".to_string(), |n| n.to_string())
     )?;
-    writeln!(md, "- Base: `{}`", base)?;
+    writeln!(md, "- Base: {}", base_ref_display(base, base_sha))?;
     writeln!(md, "- Head: `{}`", target)?;
     writeln!(md, "- Commits: {}", commit_count)?;
     writeln!(md, "- Files changed: {}", files_changed)?;
@@ -221,4 +224,35 @@ pub(crate) fn generate_ai_index(
 
 pub(crate) fn short_or_empty(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
+}
+
+/// The base a pack header shows a person: the ref as it was named, with the
+/// commit the review was actually taken from beside it.
+///
+/// A base the caller requested is pinned to a commit id before the run, because
+/// a ref name can stop naming the same commit while the run is in flight. That
+/// id is the right identity for resolving a range and the wrong one to print in
+/// a header, so the name is what is shown and the id is what disambiguates it.
+/// An empty id renders the name alone rather than an empty pair of backticks.
+pub(crate) fn base_ref_display(name: &str, commit_id: &str) -> String {
+    if commit_id.is_empty() {
+        format!("`{name}`")
+    } else {
+        format!("`{name}` (`{}`)", short_or_empty(commit_id))
+    }
+}
+
+/// The base name to display when the run produced no diff to read it from.
+///
+/// `Config::bases` holds the *resolution* input, which for an explicitly
+/// requested base is the pinned commit id. `Config::required_base` is the only
+/// place the caller's own spelling survives, so it wins; the pinned id is the
+/// fallback, never the other way round.
+pub(crate) fn display_base_name(config: &Config) -> &str {
+    config
+        .required_base
+        .as_ref()
+        .map(|required| required.name.as_str())
+        .or_else(|| config.bases.first().map(String::as_str))
+        .unwrap_or("main")
 }
