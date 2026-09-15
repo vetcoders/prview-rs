@@ -1596,6 +1596,12 @@ impl Check for PytestCheck {
         "Pytest"
     }
 
+    /// A test suite is capped at [`TEST_TIMEOUT_SECS`], not the default check
+    /// timeout; the progress line reports the cap the process actually has.
+    fn timeout_secs(&self) -> u64 {
+        TEST_TIMEOUT_SECS
+    }
+
     fn check_eligibility(&self, config: &Config) -> super::CheckEligibility {
         if !config.profile.runs_python_checks() {
             return super::CheckEligibility::Skip(format!(

@@ -14,6 +14,12 @@ use std::path::{Path, PathBuf};
 
 const MAX_CARGO_CONFIG_BYTES: u64 = 1024 * 1024;
 
+/// `cargo geiger` compiles the crate graph to reach it and is routinely slower
+/// than the default check timeout. Named here because two places have to agree:
+/// the runner that enforces it and [`Check::timeout_secs`], which puts it on the
+/// progress line.
+const GEIGER_TIMEOUT_SECS: u64 = 600;
+
 pub struct CargoCheck;
 pub struct ClippyCheck;
 pub struct CargoTestCheck;
@@ -1601,6 +1607,12 @@ impl Check for CargoTestCheck {
         "Cargo test"
     }
 
+    /// A test suite is capped at [`TEST_TIMEOUT_SECS`], not the default check
+    /// timeout; the progress line reports the cap the process actually has.
+    fn timeout_secs(&self) -> u64 {
+        TEST_TIMEOUT_SECS
+    }
+
     /// Heavy: see [`Check::resource_weight`] for the one list of tools that
     /// want the whole machine.
     fn resource_weight(&self) -> crate::governor::Weight {
@@ -1990,6 +2002,12 @@ impl Check for CargoGeigerCheck {
         "Cargo geiger"
     }
 
+    /// Geiger gets its own, longer cap; the progress line reports the one the
+    /// process actually has.
+    fn timeout_secs(&self) -> u64 {
+        GEIGER_TIMEOUT_SECS
+    }
+
     /// Heavy: see [`Check::resource_weight`] for the one list of tools that
     /// want the whole machine.
     fn resource_weight(&self) -> crate::governor::Weight {
@@ -2061,7 +2079,14 @@ impl Check for CargoGeigerCheck {
         }
 
         let args = &["geiger", "--output-format", "Ratio"];
-        let output = match run_command_with_timeout_and_env("cargo", args, cwd, 600, &run.env).await
+        let output = match run_command_with_timeout_and_env(
+            "cargo",
+            args,
+            cwd,
+            GEIGER_TIMEOUT_SECS,
+            &run.env,
+        )
+        .await
         {
             Ok(output) => output,
             Err(err) if super::is_timeout_error(&err) => {
