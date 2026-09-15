@@ -73,7 +73,11 @@ fn display_error(err: &anyhow::Error) {
     // Contextual hints based on error message content. An error that embeds a
     // user-supplied ref would match on the ref's name, not on the failure.
     let msg = format!("{err:?}").to_lowercase();
-    let hint = if err.downcast_ref::<UnresolvableGateBase>().is_some() {
+    let hint = if err.downcast_ref::<UnresolvableGateBase>().is_some()
+        || err
+            .downcast_ref::<prview::git::MissingRequiredBase>()
+            .is_some()
+    {
         None
     } else if msg.contains("repository") || msg.contains("git") {
         Some("make sure you're running prview from inside a git repository")
@@ -370,9 +374,9 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
         args.fail_on_warnings,
     );
     config.apply_gate_profile(enforcement_mode);
-    let app = App::from_config(config)?;
+    let mut app = App::from_config(config)?;
     if let Some(base) = &args.base {
-        ensure_explicit_gate_base_resolves(&app, base)?;
+        pin_explicit_gate_base(&mut app, base)?;
     }
     let governor = app.governor();
     let report =
@@ -431,11 +435,24 @@ impl std::fmt::Display for UnresolvableGateBase {
 
 impl std::error::Error for UnresolvableGateBase {}
 
-/// The review resolves bases leniently: an unknown ref is dropped with a
-/// warning the quiet gate suppresses, leaving an empty change that would pass.
-/// A base the caller named explicitly must exist, so the gate fails to execute
-/// (exit 3) instead of approving a review of nothing.
-fn ensure_explicit_gate_base_resolves(app: &App, base: &str) -> Result<()> {
+/// Pin an explicit gate base to the commit it names, before the run starts.
+///
+/// Two failures are closed here. The first is a base that names nothing: the
+/// review resolves bases leniently, so an unknown ref is dropped with a warning
+/// the quiet gate suppresses, leaving an empty change that would pass. The gate
+/// fails to execute (exit 3) instead of approving a review of nothing.
+///
+/// The second is a base that stops naming the same thing mid-run. `App::run`
+/// begins with `git fetch --quiet --prune origin`, which deletes
+/// remote-tracking refs whose upstream branch is gone — so `--base
+/// origin/feature` can resolve here and be gone by the time the run resolves it,
+/// with the same silent-empty-review result. Prune removes refs, never objects,
+/// so the run is handed the commit id rather than the caller's ref name: a
+/// pinned object cannot be pruned out from under it. The id is also recorded in
+/// [`Config::required_base`], which makes the run's own resolution fail loud if
+/// the pin still fails to survive it, and which keeps the caller's spelling for
+/// the error message.
+fn pin_explicit_gate_base(app: &mut App, base: &str) -> Result<()> {
     let base_error = || UnresolvableGateBase {
         base: base.to_string(),
     };
@@ -443,9 +460,9 @@ fn ensure_explicit_gate_base_resolves(app: &App, base: &str) -> Result<()> {
         .repo
         .resolve_bases(&app.config)
         .with_context(base_error)?;
-    if resolved.is_empty() {
-        return Err(base_error().into());
-    }
+    let pinned = resolved.into_iter().next().ok_or_else(base_error)?;
+    app.config.bases = vec![pinned.commit_id.clone()];
+    app.config.required_base = Some(pinned);
     Ok(())
 }
 

@@ -66,6 +66,17 @@ pub struct Config {
     /// runtime state, never a CLI or manifest override; cloned check
     /// configurations retain this range.
     pub pinned_diff_bases: Option<Vec<crate::git::ResolvedRef>>,
+    /// A base the caller named explicitly, pinned to the commit it resolved to
+    /// before the run started. `name` is what the caller typed; `commit_id` is
+    /// the object the run must review against.
+    ///
+    /// Base resolution is deliberately lenient — a ref it cannot resolve is
+    /// dropped with a warning — which is right for an auto-detected base and
+    /// wrong for a requested one: a dropped explicit base leaves an empty change
+    /// that reviews clean. When this is set, `Repository::resolve_bases` fails
+    /// loud instead of dropping it. Internal runtime state, never a CLI or
+    /// manifest override.
+    pub required_base: Option<crate::git::ResolvedRef>,
     pub bases: Vec<String>,
     pub profile: DetectedProfile,
 
@@ -707,6 +718,7 @@ impl Config {
             target: None,
             pinned_target: None,
             pinned_diff_bases: None,
+            required_base: None,
             bases: vec![],
             profile,
             execution_mode: ExecutionMode::Standard,

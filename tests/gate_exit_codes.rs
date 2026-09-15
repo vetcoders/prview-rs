@@ -25,6 +25,8 @@
 //!   execute → exit 3.
 //! * An explicit `--base` that does not resolve is an execution error → exit 3,
 //!   never an empty review that passes.
+//! * An explicit `--base` is pinned to the commit it names before the run, so
+//!   the run's own `git fetch --prune` cannot take it away mid-review.
 
 use assert_cmd::prelude::*;
 use prview::git::git_cmd;
@@ -455,6 +457,43 @@ fn gate_explicit_base_annotated_tag_reviews_the_change_since_the_tag() {
     assert!(
         per_file_diff_count(&tagged) > 0,
         "--base <annotated tag> must review a non-empty change: {tagged}"
+    );
+}
+
+/// The gate accepts `--base` before the review starts, and the review starts
+/// with `git fetch --quiet --prune origin`. Prune deletes remote-tracking refs
+/// whose upstream branch is gone, so a ref that resolved for the caller can be
+/// gone by the time the run resolves it — and base resolution drops what it
+/// cannot resolve, leaving an empty change that reviews clean. Prune removes
+/// refs, never objects, so the gate hands the run the commit id instead of the
+/// caller's ref name. `report.json` records the range the pack was built from,
+/// which is where the pin is observable.
+#[test]
+fn gate_explicit_base_is_pinned_to_a_commit_before_the_run() {
+    let (temp, before) = create_pushed_main_fixture();
+    // A named ref for the pre-push commit: the spelling a caller actually uses.
+    run_git(temp.path(), &["branch", "release-base", &before]);
+    let path = path_without_semgrep(temp.path());
+
+    let home = tempfile::tempdir().expect("prview home");
+    let gate = run_gate_json(temp.path(), &path, home.path(), &["--base", "release-base"]);
+    assert!(
+        per_file_diff_count(&gate) > 0,
+        "--base <branch> must still review the change since that branch: {gate}"
+    );
+
+    let output_dir = gate["output_dir"]
+        .as_str()
+        .expect("gate json names its output_dir");
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(Path::new(output_dir).join("report.json")).expect("read report.json"),
+    )
+    .expect("parse report.json");
+    assert_eq!(
+        report["meta"]["range"]["base"],
+        serde_json::Value::String(before.clone()),
+        "the run must receive the commit the branch named, not the branch name: {}",
+        report["meta"]["range"]
     );
 }
 

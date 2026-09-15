@@ -48,6 +48,14 @@ the gate exits `3` with an error naming the ref instead of reviewing an empty
 change. A base that resolves to the checked-out commit itself is not an error: the
 review simply has no change to judge.
 
+The ref is resolved once, before the review starts, and the review is handed the
+commit id it named rather than the name itself. The review opens with
+`git fetch --prune`, which deletes remote-tracking refs whose upstream branch is
+gone: pinning the commit is what stops a `--base origin/<branch>` that gets
+pruned mid-run from quietly vanishing and leaving an empty change to pass. If the
+pinned commit is missing anyway when the review resolves its bases, the gate
+exits `3` instead of reporting a verdict.
+
 `--base` is the only way to choose the gate's base, and it cannot be combined
 with `--pr`, because a pull request defines its own base. Top-level options and
 positional `<target> <bases>` arguments cannot precede the `gate` subcommand:

@@ -61,6 +61,42 @@ pub struct ResolvedRef {
     pub is_remote: bool,
 }
 
+/// A base the caller named explicitly, pinned to a commit before the run
+/// ([`Config::required_base`]), that is missing from the bases the run actually
+/// resolved.
+///
+/// The run starts with `git fetch --prune`, so a remote-tracking ref the caller
+/// named can cease to exist between the caller's own resolution and the run's
+/// (`--base origin/feature` after the branch is deleted upstream). Lenient
+/// resolution would drop it, the review would have no base, and a review of
+/// nothing passes. This stops the run instead, so no verdict is ever computed
+/// over a change the caller never asked to review.
+///
+/// Typed rather than a bare message so the CLI's error hints, which are keyed on
+/// words in the error text, cannot be triggered by words inside the ref name the
+/// caller typed.
+#[derive(Debug, Clone)]
+pub struct MissingRequiredBase {
+    /// The ref as the caller wrote it.
+    pub requested: String,
+    /// The commit it resolved to before the run.
+    pub commit_id: String,
+}
+
+impl std::fmt::Display for MissingRequiredBase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "requested review base '{}' ({}) is not among the bases this run resolved; \
+             refusing to review an empty change",
+            self.requested,
+            short_sha(&self.commit_id),
+        )
+    }
+}
+
+impl std::error::Error for MissingRequiredBase {}
+
 /// Diff between two refs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diff {
@@ -293,7 +329,13 @@ impl Repository {
         })
     }
 
-    /// Resolve base branches
+    /// Resolve base branches.
+    ///
+    /// Resolution is lenient by design: a base this cannot resolve is reported
+    /// and dropped, because an auto-detected base list is a set of guesses and a
+    /// wrong guess must not abort the review. A base the caller *asked* for is
+    /// not a guess, so [`Config::required_base`] turns that leniency off for it
+    /// — see [`MissingRequiredBase`].
     pub fn resolve_bases(&self, config: &Config) -> Result<Vec<ResolvedRef>> {
         let mut resolved = Vec::new();
 
@@ -335,6 +377,18 @@ impl Repository {
                     }
                 }
             }
+        }
+
+        if let Some(required) = &config.required_base
+            && !resolved
+                .iter()
+                .any(|base| base.commit_id == required.commit_id)
+        {
+            return Err(MissingRequiredBase {
+                requested: required.name.clone(),
+                commit_id: required.commit_id.clone(),
+            }
+            .into());
         }
 
         Ok(resolved)
@@ -1549,6 +1603,82 @@ mod tests {
             .flat_map(|diff| diff.files.iter().map(|file| file.path.as_str()))
             .collect();
         assert_eq!(files, vec!["own.rs"]);
+    }
+
+    /// An auto-detected base is a guess, so a ref that will not resolve is
+    /// dropped and the review continues. That leniency is the silent-empty-review
+    /// hole for a base the caller *asked* for: `App::run` starts with
+    /// `git fetch --prune`, which can delete the remote-tracking ref the caller
+    /// named after it was already accepted, and the review is then left with no
+    /// base at all — an empty change that passes. `Config::required_base` turns
+    /// the leniency off for that one base. Injected here rather than reproduced
+    /// through a real prune: the contract is "the pinned base survived
+    /// resolution", and losing the ref is the only thing a prune contributes.
+    #[test]
+    fn resolve_bases_fails_when_a_required_base_did_not_survive_resolution() {
+        let (tmp, _merge_base, _target, base_tip) = init_repo_with_advanced_base();
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        let required = ResolvedRef {
+            name: "origin/gone".to_string(),
+            commit_id: base_tip.clone(),
+            is_remote: true,
+        };
+
+        // Control: the requested base is among the resolved bases, so the run
+        // proceeds exactly as it did before.
+        let mut survives = test_config_builder()
+            .repo_root(tmp.path())
+            .target(Some("feature"))
+            .bases(&["main"])
+            .profile(test_generic_profile())
+            .build();
+        survives.quiet = true;
+        survives.required_base = Some(required.clone());
+        let resolved = repo.resolve_bases(&survives).expect("resolve bases");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].commit_id, base_tip);
+
+        // The hole: the requested base no longer resolves, so lenient resolution
+        // drops it and leaves nothing to review.
+        let mut dropped = test_config_builder()
+            .repo_root(tmp.path())
+            .target(Some("feature"))
+            .bases(&["origin/gone"])
+            .profile(test_generic_profile())
+            .build();
+        dropped.quiet = true;
+        dropped.required_base = Some(required);
+        let err = repo
+            .resolve_bases(&dropped)
+            .expect_err("a dropped required base must stop the run");
+        assert!(
+            err.downcast_ref::<MissingRequiredBase>().is_some(),
+            "the failure must be typed so the CLI cannot derive a hint from the \
+             caller's ref name: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("origin/gone") && message.contains(short_sha(&base_tip)),
+            "the error must name what the caller typed and what it was pinned to: {message}"
+        );
+    }
+
+    /// An auto-detected base list keeps its leniency: nothing was requested, so
+    /// a base that will not resolve is still a dropped guess, not a failure.
+    #[test]
+    fn resolve_bases_still_drops_an_unresolvable_auto_detected_base() {
+        let (tmp, _merge_base, _target, _base_tip) = init_repo_with_advanced_base();
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        let mut config = test_config_builder()
+            .repo_root(tmp.path())
+            .target(Some("feature"))
+            .bases(&["origin/gone"])
+            .profile(test_generic_profile())
+            .build();
+        config.quiet = true;
+
+        let resolved = repo.resolve_bases(&config).expect("lenient resolution");
+        assert!(resolved.is_empty());
     }
 
     #[test]

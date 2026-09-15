@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `prview gate --base <REF>` is pinned to a commit before the review starts. The
+  review opens with `git fetch --quiet --prune origin`, and base resolution drops
+  a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch
+  had been deleted was pruned away mid-run: the review lost its base, reviewed an
+  empty change, and passed. The resolved commit id is handed to the review
+  instead of the ref name, and a pinned base that is still missing when the review
+  resolves its bases exits `3` naming the ref the caller typed, rather than
+  reporting a verdict.
 - Annotated tags used as a base or target now resolve to the tagged commit.
   Ref resolution returned the tag object's id, so merge-base and diff lookups
   failed with a git error (for example `prview gate --base v0.8.0`). A ref that
