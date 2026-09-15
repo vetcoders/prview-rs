@@ -788,6 +788,14 @@ impl PathClass<'_> {
 /// no test runner loads, in any ecosystem, by any mechanism we know of. A rule
 /// that needs a "usually" or a "probably" does not belong here — that is what
 /// `Unknown` is for.
+///
+/// A worked example of the bar, and of why it is set where it is: the
+/// repository's root `README` is deliberately NOT here. Rust crates really do
+/// pull it into the build with `#![doc = include_str!("../README.md")]`, which
+/// puts it in front of `cargo test --doc`, so a built-in rule calling it
+/// neutral would be a false neutral — a silently missed test — in every
+/// repository that does. A repository whose tests demonstrably never read it
+/// can opt it in through `[scope] non_participating`.
 struct BuiltinRule {
     name: &'static str,
     matches: fn(&str) -> bool,
@@ -827,11 +835,6 @@ const BUILTIN_NON_PARTICIPATING: &[BuiltinRule] = &[
     BuiltinRule {
         name: "root-license",
         matches: |path| root_file_named(path, "LICENSE") || root_file_named(path, "LICENCE"),
-    },
-    // The repository's front page.
-    BuiltinRule {
-        name: "root-readme",
-        matches: |path| root_file_named(path, "README"),
     },
     // Prose under a top-level documentation directory. NOT Markdown wholesale:
     // a `.md` anywhere else — a fixture, a snapshot, a test's own input — stays

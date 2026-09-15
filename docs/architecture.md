@@ -362,16 +362,26 @@ rule that needs a "usually" belongs in `unknown` instead.
 |---|---|
 | `root-changelog` | `CHANGELOG*` at the repository root |
 | `root-license` | `LICENSE*` / `LICENCE*` at the repository root |
-| `root-readme` | `README*` at the repository root |
 | `docs-directory` | a top-level `docs/` or `doc/` directory, restricted to prose extensions (`.md`, `.mdx`, `.rst`, `.txt`, `.adoc`) |
 | `ci-workflow` | `.github/workflows/*.yml` and `*.yaml` |
 
 What is deliberately **not** on it, because these are real runtime or test
 inputs often enough that "probably fine" is not good enough: translations and
-locale files, fixtures, `tools/`, and Markdown wholesale. A `.md` outside a
-documentation directory stays `unknown`. The named shared-tooling directories
-from the escalation table are checked FIRST, so `tools/README.md` is a shared
-tooling change, not a document.
+locale files, fixtures, `tools/`, the root `README`, and Markdown wholesale. A
+`.md` outside a documentation directory stays `unknown`. The named
+shared-tooling directories from the escalation table are checked FIRST, so
+`tools/README.md` is a shared tooling change, not a document.
+
+Two of those exclusions have concrete, checkable reasons rather than cautious
+ones. Translations are compiled into binaries: *this* repository does exactly
+that, with `include_str!("../../../locales/en.json")` in
+`artifacts/dashboard/assets.rs`, so a locale change really can break a test. And
+a Rust crate can pull its own front page into the build with
+`#![doc = include_str!("../README.md")]`, which puts `README.md` in front of
+`cargo test --doc` — a built-in rule calling it neutral would be a false
+neutral, and a false neutral is a silently missed test. A repository whose tests
+demonstrably never read its README can opt it in through
+`[scope] non_participating`, which is precisely what the override exists for.
 
 Build output classified by `is_generated_artifact_path` is separate again: it is
 a known non-source that no tool reads as an input, so it neither selects nor

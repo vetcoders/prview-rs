@@ -34,10 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escalates to a full run). The classification affects test selection ONLY — a
   non-participating file still appears in the diff, the artifacts, the signals
   and the verdict. The built-in rules are `root-changelog`, `root-license`,
-  `root-readme`, `docs-directory` (prose extensions under a top-level `docs/` or
-  `doc/`) and `ci-workflow` (`.github/workflows/*.y[a]ml`). Translations,
-  fixtures, `tools/` and Markdown outside a documentation directory are
-  deliberately NOT neutral. A repository can extend the list with
+  `docs-directory` (prose extensions under a top-level `docs/` or `doc/`) and
+  `ci-workflow` (`.github/workflows/*.y[a]ml`). Translations, fixtures,
+  `tools/`, the root `README` and Markdown outside a documentation directory are
+  deliberately NOT neutral — a crate can pull its README into the build with
+  `#![doc = include_str!("../README.md")]`, and locale files are routinely
+  compiled in the same way. A repository can extend the list with
   `[scope] non_participating` in `prview.toml` or turn the built-ins off with
   `[scope] non_participating_builtins = false`, which restores strictly
   escalating behaviour. Every neutral path is published with the rule that named

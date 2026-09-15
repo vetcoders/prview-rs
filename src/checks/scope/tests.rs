@@ -687,7 +687,6 @@ fn every_builtin_rule_names_the_path_it_neutralised() {
         ("CHANGELOG", "root-changelog"),
         ("LICENSE", "root-license"),
         ("LICENCE.txt", "root-license"),
-        ("README.md", "root-readme"),
         ("docs/architecture.md", "docs-directory"),
         ("doc/usage.rst", "docs-directory"),
         (".github/workflows/ci.yml", "ci-workflow"),
@@ -711,13 +710,60 @@ fn every_builtin_rule_names_the_path_it_neutralised() {
     }
 }
 
+/// A root `README` is NOT a built-in neutral, and the reason is concrete rather
+/// than cautious: Rust crates pull it into the build with
+/// `#![doc = include_str!("../README.md")]`, which puts it in front of
+/// `cargo test --doc`. A built-in rule calling it neutral would be a false
+/// neutral — a silently missed test — in every repository that does that. A
+/// repository whose tests demonstrably never read it can opt it in through
+/// `[scope] non_participating`, which is what the override is for.
+#[test]
+fn a_root_readme_is_not_neutral_by_default() {
+    let set = trustworthy(vec![modified("README.md")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    assert!(
+        decisions.non_participating.is_empty(),
+        "README must not be classified neutral by a built-in rule"
+    );
+    assert_eq!(
+        full_reason(&decisions.cargo),
+        reason::unsupported_input("README.md"),
+        "README is unknown, and unknown escalates"
+    );
+    assert_eq!(
+        full_reason(&decisions.vitest),
+        reason::unsupported_input("README.md")
+    );
+
+    // ...and a repository that knows better can say so.
+    let (opted_in, _) = PathClassifier::new(true, &["README.md".to_string()]);
+    let decisions = decide_classified(
+        Some(&set),
+        &profile(true, true),
+        Some(&app_and_core()),
+        &reviewed_snapshot(),
+        &opted_in,
+    );
+    assert_eq!(
+        decisions.non_participating,
+        vec![NonParticipatingPath {
+            path: "README.md".to_string(),
+            rule: "README.md".to_string(),
+        }]
+    );
+}
+
 /// The classification is narrow ON PURPOSE. These are the cases the operator
 /// named as things we may NOT assume are neutral: they are real runtime or test
 /// inputs often enough that "probably fine" is not good enough.
 #[test]
 fn the_classes_the_operator_excluded_are_still_unknown() {
     for path in [
-        // Translations drive runtime behaviour and snapshot assertions.
+        // Translations drive runtime behaviour and snapshot assertions — and
+        // are compiled straight into the binary often enough that this is not
+        // hypothetical: prview itself does it in
+        // `artifacts/dashboard/assets.rs` with
+        // `include_str!("../../../locales/en.json")`.
         "src/locales/pl.json",
         "locales/en.json",
         "i18n/pl.yaml",
@@ -914,7 +960,7 @@ fn a_documentation_only_change_selects_nothing_and_owes_an_honest_skip() {
     let set = trustworthy(vec![
         modified("CHANGELOG.md"),
         modified("docs/architecture.md"),
-        modified("README.md"),
+        modified("docs/usage.md"),
     ]);
     let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
 
