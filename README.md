@@ -199,6 +199,12 @@ warnings-only contract and the Action's `fail-on-warnings` input. Set
 `fail-on-warnings: "true"` alongside `strict: "true"` to require a
 warning-clean pack as well.
 
+On `push` events the gate auto-detects the pushed branch as its own base, so a
+push to the default branch reviews an empty change unless you pass the pre-push
+commit with `--base`. That flag needs a prview release newer than `0.8.0` (Action ref
+and `version` input); see
+[`docs/gate-playbook.md#choosing-the-base`](docs/gate-playbook.md#choosing-the-base).
+
 GitHub code scanning accepts SARIF uploads through
 `github/codeql-action/upload-sarif`. Keep SARIF under GitHub's ingestion limits:
 10 MB gzip-compressed upload size and 50 displayed annotations per workflow

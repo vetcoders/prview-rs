@@ -72,8 +72,10 @@ branch is the right base:
     args: ${{ github.event_name == 'push' && format('--base {0}', github.event.before) || '' }}
 ```
 
-`gate --base` ships after `0.8.0`, so pin an Action/runtime release that
-includes it. Two push shapes need care: a push that creates a branch reports an
+`gate --base` ships in the first release after `0.8.0`. Both the Action ref
+(`uses: vetcoders/prview-rs@...`) and its `version` input (the installed
+runtime) must name that release or a newer one: with `0.8.0` the gate rejects
+`--base` as an unknown option. Two push shapes need care: a push that creates a branch reports an
 all-zero `before` (no pre-push commit, so the explicit base is unresolvable and the
 gate exits `3`), and a force push may name a `before` commit that is no longer
 fetched. This repository's own `Gate Shadow` workflow (`.github/workflows/gate.yml`)
