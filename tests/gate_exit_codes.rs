@@ -482,11 +482,10 @@ fn reviewed_paths(gate_json: &serde_json::Value) -> Vec<String> {
     let output_dir = gate_json["output_dir"]
         .as_str()
         .expect("gate json names its output_dir");
-    let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(Path::new(output_dir).join("report.json")).expect(
-            "pack report.json",
-        ))
-        .expect("report.json is valid JSON");
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(Path::new(output_dir).join("report.json")).expect("pack report.json"),
+    )
+    .expect("report.json is valid JSON");
     let mut paths: Vec<String> = report["diff"]["files"]
         .as_array()
         .expect("report.json names the reviewed files")
@@ -553,7 +552,12 @@ fn gate_exact_base_reviews_the_literal_force_pushed_range() {
     let after = rev_parse(temp.path(), "HEAD");
 
     let is_ancestor = git_cmd()
-        .args(["merge-base", "--is-ancestor", before.as_str(), after.as_str()])
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            before.as_str(),
+            after.as_str(),
+        ])
         .current_dir(temp.path())
         .status()
         .expect("merge-base --is-ancestor");
@@ -589,7 +593,12 @@ fn gate_exact_base_reviews_the_literal_force_pushed_range() {
     // Control: the same `--base` without the flag still normalizes to the
     // merge-base, which is the unchanged contract for every other caller.
     let normalized_home = tempfile::tempdir().expect("prview home");
-    let normalized = run_gate_json(temp.path(), &path, normalized_home.path(), &["--base", &before]);
+    let normalized = run_gate_json(
+        temp.path(),
+        &path,
+        normalized_home.path(),
+        &["--base", &before],
+    );
     assert_eq!(
         reviewed_paths(&normalized),
         normalized_range,

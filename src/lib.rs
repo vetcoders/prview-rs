@@ -188,9 +188,7 @@ impl App {
 
         // 4. Generate diffs
         let (diff_bases, diffs) = run_headless_sync_stage(&self.governor, || {
-            let diff_bases = self
-                .repo
-                .resolve_diff_bases(&self.config, &target, &bases);
+            let diff_bases = self.repo.resolve_diff_bases(&self.config, &target, &bases);
             let diffs = self
                 .repo
                 .generate_diffs(&target, &diff_bases, self.config.quiet)?;
@@ -574,9 +572,7 @@ impl App {
                 self.repo.resolve_bases(&self.config)?
             };
             self.ensure_not_cancelled()?;
-            let diff_bases = self
-                .repo
-                .resolve_diff_bases(&self.config, &target, &bases);
+            let diff_bases = self.repo.resolve_diff_bases(&self.config, &target, &bases);
             let diffs = self
                 .repo
                 .generate_diffs(&target, &diff_bases, self.config.quiet)?;
