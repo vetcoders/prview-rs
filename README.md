@@ -199,9 +199,10 @@ warnings-only contract and the Action's `fail-on-warnings` input. Set
 `fail-on-warnings: "true"` alongside `strict: "true"` to require a
 warning-clean pack as well.
 
-On `push` events the gate auto-detects the pushed branch as its own base, so a
-push to the default branch reviews an empty change unless you pass the pre-push
-commit with `--base`. That flag needs a prview runtime newer than `0.8.0` — set
+On `push` events the gate auto-detects the base from `develop`, `main`, and
+`master`, so a push to the default branch ends up comparing that branch with
+itself and reviews an empty change unless you pass the pre-push commit with
+`--base`. That flag needs a prview runtime newer than `0.8.0` — set
 the Action's `version` input (or whatever release you install) accordingly; the
 Action ref itself can stay pinned, since it just forwards `args`. See
 [`docs/gate-playbook.md#choosing-the-base`](docs/gate-playbook.md#choosing-the-base).
