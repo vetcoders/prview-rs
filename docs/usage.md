@@ -199,6 +199,31 @@ prview feature/x main
 runs at a time and supported descendant pools receive one worker. This is the
 recommended setting for ordinary developer machines.
 
+Under `safe` the budget is a single permit and admission is fair-FIFO, so
+**every check runs one at a time, light ones included** — a check that has not
+been admitted is waiting for the machine, not stuck. On a large repository the
+whole stage therefore takes roughly the sum of its checks, and an hour-long
+`--deep` run is the contract working rather than a hang. `balanced` is the
+opt-in when the machine is idle and you want the throughput; on an idle machine
+with a real queue prview prints that suggestion once per run.
+
+The progress line reports this directly:
+
+```
+● Running: Vitest (312s/900s) · Queued: waiting for machine budget — Cargo check, Clippy, TypeScript
+```
+
+- the counter after each running check is **that check's own elapsed time**,
+  measured from the moment the governor admitted it, against **its own
+  timeout** (300 s for most checks, 900 s for test suites, 600 s for
+  `cargo geiger`). A check killed at its cap is the only thing that number can
+  reach — it is not the stage wall clock;
+- under `balanced` several checks can be running at once and each carries its
+  own pair of numbers;
+- the queued list names what it is waiting for: the machine budget. Those
+  checks have not started, so they have no elapsed time of their own, and the
+  "still running after Ns" notice ignores them for the same reason.
+
 `--resource-budget balanced` is an explicit throughput opt-in. It still admits
 at most two capped heavy parents and never creates more parent permits than the
 detected logical-core count; a one-core host therefore remains single-parent

@@ -128,7 +128,11 @@ The full flag reference is always one command away: `prview --help`. A written g
 Deep reviews use a conservative whole-machine resource contract by default:
 one expensive tool and one supported child worker at a time. The preflight names
 the effective budget, expensive checks, and schedule; `balanced` remains capped
-and falls back to `safe` under load.
+and falls back to `safe` under load. Because `safe` admits one check at a time,
+a big repository's check stage is serialized by design — the progress line
+reports each running check's own elapsed time against its own timeout and says
+that the rest are waiting for the machine budget. See
+[`docs/usage.md`](docs/usage.md#resource-budget) for the full contract.
 
 On Unix, cancellation and timeout cleanup also follows live PPID ancestry when
 a tool descendant leaves its inherited process group with `setsid` or

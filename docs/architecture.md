@@ -1387,7 +1387,14 @@ Job Object contract cannot disappear with an unrelated dependency change.
 
 Admission is what makes the distinction real, so the run reports it:
 
-- the progress line separates the two — `Running: X (12s) · Queued: Y, Z`;
+- the progress line separates the two, and every number on it belongs to the
+  check it is printed next to —
+  `Running: Vitest (312s/900s) · Queued: waiting for machine budget — Y, Z`.
+  The counter is the running check's own elapsed time measured from admission,
+  against its own [`Check::timeout_secs`] cap, NOT the stage wall clock: under
+  `safe` a check admitted thirty seconds ago can sit behind half an hour of
+  queue, and printing the stage clock beside its name made an ordinary
+  serialized run read as a hang;
 - the ledger's `started_at` is the moment of admission, not the first poll of the
   check's future, so `started_at − queued_at` is time spent waiting for the
   machine;

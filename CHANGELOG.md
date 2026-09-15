@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- On an idle machine with at least three checks parked on the budget, a `safe`
+  run prints one line naming the sanctioned throughput opt-in:
+  `machine is mostly idle; --resource-budget balanced runs capped tools in
+  parallel`. It changes nothing about the plan — `safe` stays `safe` — and it
+  is suppressed under `--quiet` and `--json`, when the load average is
+  unreadable, and when `balanced` was already requested (including a
+  `balanced` request that backpressure already lowered).
+
 ### Changed
 
 - `install.sh` is fail-closed. It installs an official release binary or it
@@ -38,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The check progress line reported the STAGE's wall clock as the running
+  check's elapsed time, so `Running: Vitest (2000s)` could mean a Vitest
+  admitted thirty seconds ago behind half an hour of queue. Combined with a
+  bare `Queued:` list, an ordinary `--resource-budget safe` run — one permit,
+  fair-FIFO, every check admitted one at a time by design — read as a hang, and
+  operators aborted healthy runs. Each running check now reports its own
+  elapsed time, measured from admission, against its own timeout
+  (`Running: Vitest (312s/900s)`), and the queue says what it is waiting for
+  (`Queued: waiting for machine budget — Cargo check, Clippy`). The resource
+  contract itself is unchanged: same budget, same weights, same child-worker
+  caps.
 - The curl installer no longer silently substitutes a locally compiled binary
   for an official one. Previously a failed download, a missing artifact, or an
   unsupported platform fell through to `cargo install prview --locked --force`,
