@@ -651,8 +651,15 @@ fn contained_in_snapshot(cwd: PathBuf, scan_dir: &Path) -> Result<PathBuf> {
 /// registry, no resolve. What it still does not cover is a member outside that
 /// subtree, a `[patch]` in `.cargo/config.toml`, and anything a build script
 /// does — it refuses what it can prove escapes rather than pretending to be
-/// complete, because resolving the true graph means `cargo metadata`, a
+/// complete, because resolving the true graph means a full `cargo metadata`, a
 /// network-capable second resolve for each of six gates.
+///
+/// That refusal is about the FULL resolve, and only about it. It is not a
+/// refusal of `cargo metadata --no-deps --frozen`, which is a different
+/// contract: it returns the workspace members' own manifests without resolving
+/// the dependency graph, cannot reach the network and cannot write a lockfile.
+/// The test-scope decision uses exactly that call, once per run, to map files
+/// to packages — see `crate::checks::scope`.
 fn dependency_paths_stay_in_snapshot(cwd: &Path, scan_dir: &Path) -> Result<()> {
     let Ok(root) = scan_dir.canonicalize() else {
         return Ok(());

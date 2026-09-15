@@ -66,6 +66,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         dir,
         config,
         ledger,
+        scope,
         checks,
         heuristics,
         inline,
@@ -157,6 +158,14 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
                 .as_ref()
                 .map(|id| format!("20_quality/{}.log", id)),
         }));
+        // Additive (schema 3.1): how much of this check's suite the run decided
+        // had to execute, and why. Only the checks that own an ecosystem's test
+        // scope carry it.
+        if let Some(report) = scope.and_then(|scope| scope.report_for_check(&eval.name))
+            && let Some(row) = gate_checks.last_mut()
+        {
+            row["scope"] = json!(report);
+        }
 
         // A verdict may rest on evidence this run never produced. That is true
         // for a stale failure holding the merge AND for a stale pass allowing a
@@ -350,6 +359,13 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     all_review_caveats.extend(cargo_audit_review_caveats(checks));
     all_review_caveats.extend(cargo_audit_baseline_review_caveats(inline));
     all_review_caveats.extend(semgrep_partial_parse_review_caveats(checks));
+    // Advisory only: a narrower test run is still a real result, but a reviewer
+    // must be told the suite was not exhaustive. Never moves the verdict.
+    all_review_caveats.extend(
+        scope
+            .map(crate::checks::scope::ScopeDecisions::review_caveats)
+            .unwrap_or_default(),
+    );
     all_review_caveats.extend(skipped_requested_security_review_caveats(
         config,
         checks,
@@ -551,6 +567,25 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         );
     }
     append_review_signals(&mut md, all_review_caveats.iter().map(String::as_str));
+    // Which changed paths were excluded from TEST SELECTION, and by which rule.
+    // Published here so the call can be challenged without reading the source:
+    // a reviewer who disagrees that a path is neutral can argue with the named
+    // rule. It changes nothing else about the review — these files are still in
+    // the diff, the artifacts, the signals and the verdict.
+    if let Some(neutral) = scope.map(|scope| scope.non_participating.as_slice())
+        && !neutral.is_empty()
+    {
+        md.push_str("## Test scope\n\n");
+        md.push_str(
+            "These changed paths did not take part in choosing which tests to run. They are \
+             still reviewed everywhere else.\n\n",
+        );
+        md.push_str("| Path | Rule |\n|---|---|\n");
+        for entry in neutral {
+            let _ = writeln!(md, "| `{}` | `{}` |", entry.path, entry.rule);
+        }
+        md.push('\n');
+    }
     md.push_str("## Checks\n\n");
     md.push_str("| Check | Status | Class | Blocking |\n");
     md.push_str("|---|---|---|---|\n");
@@ -809,6 +844,7 @@ mod tests {
             dir: &summary,
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -861,6 +897,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -904,6 +941,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks,
             heuristics: None,
             inline: &inline,
@@ -1100,6 +1138,7 @@ mod tests {
             run_started_at: "2026-09-11T00:00:00Z",
             heuristics: None,
             regression: None,
+            scope: None,
             provenance: &provenance,
         })
         .expect("report.json");
@@ -1186,6 +1225,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -1249,6 +1289,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &ledger,
+            scope: None,
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -1401,6 +1442,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -1447,6 +1489,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -1502,6 +1545,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -1548,6 +1592,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -1607,6 +1652,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -1674,6 +1720,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -2040,6 +2087,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -2174,6 +2222,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -2217,6 +2266,7 @@ mod tests {
             dir: tmp.path(),
             config: &config,
             ledger: &empty_ledger(),
+            scope: None,
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -2325,6 +2375,121 @@ mod tests {
         assert_eq!(
             gate["decision"]["unclassified_quality_failures"][0].as_str(),
             Some("Semgrep scan")
+        );
+    }
+
+    /// Schema 3.1: the gate row for a check that owns an ecosystem's test scope
+    /// states how much of that suite ran and why. The merge gate is where a
+    /// reviewer decides whether the evidence is enough, so a narrowed suite
+    /// must be visible exactly there.
+    #[test]
+    fn the_gate_row_publishes_the_test_scope_of_the_checks_that_own_one() {
+        use crate::checks::scope::{ScopeDecision, ScopeDecisions};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let summary = tmp.path().join("00_summary");
+        fs::create_dir(&summary).expect("summary directory");
+        let config = test_config();
+        let inline = InlineFindingsSummary {
+            status: "passed".into(),
+            findings_count: 0,
+            dashboard_findings: vec![],
+        };
+        let coverage = empty_coverage();
+        let (target, bases) = resolved_refs();
+        let checks = ["Cargo test", "Clippy"].map(|name| CheckResult {
+            name: name.to_string(),
+            status: CheckStatus::Passed,
+            duration: std::time::Duration::from_secs(1),
+            output: String::new(),
+            cached: false,
+            provenance: None,
+        });
+        let scope = ScopeDecisions {
+            cargo: ScopeDecision::Full {
+                reason: "manifest or lockfile changed: Cargo.lock".to_string(),
+                inputs: Some(3),
+            },
+            vitest: ScopeDecision::Full {
+                reason: "no JavaScript or TypeScript source detected".to_string(),
+                inputs: Some(3),
+            },
+            non_participating: vec![crate::checks::scope::NonParticipatingPath {
+                path: "CHANGELOG.md".to_string(),
+                rule: "root-changelog".to_string(),
+            }],
+        };
+
+        generate_merge_gate(MergeGateInput {
+            dir: &summary,
+            config: &config,
+            ledger: &empty_ledger(),
+            scope: Some(&scope),
+            checks: &checks,
+            heuristics: None,
+            inline: &inline,
+            breaking: &[],
+            rust_api_delta: None,
+            coverage: &coverage,
+            diffs: &[],
+            skipped_checks: &[],
+            resolved_target: &target,
+            resolved_bases: &bases,
+            clean_comparison: CleanComparison::for_test(true, true),
+            snapshot_integrity: None,
+        })
+        .expect("merge gate");
+
+        let gate: serde_json::Value =
+            serde_json::from_slice(&fs::read(summary.join("MERGE_GATE.json")).unwrap()).unwrap();
+        assert_eq!(gate["schema_version"], "3.1");
+        let rows = gate["checks"].as_array().expect("gate rows");
+        let cargo_test = rows
+            .iter()
+            .find(|row| row["name"] == "Cargo test")
+            .expect("cargo test row");
+        assert_eq!(cargo_test["scope"]["mode"], "full");
+        assert_eq!(
+            cargo_test["scope"]["reason"],
+            "manifest or lockfile changed: Cargo.lock"
+        );
+        assert!(
+            cargo_test["scope"]["selected"].is_null(),
+            "a full run selected nothing and must not report a selection count"
+        );
+        assert_eq!(
+            cargo_test["scope"]["non_participating"][0]["path"], "CHANGELOG.md",
+            "the gate row must name every path kept out of test selection"
+        );
+        assert_eq!(
+            cargo_test["scope"]["non_participating"][0]["rule"], "root-changelog",
+            "and the rule that decided it, so the call can be challenged"
+        );
+        let clippy = rows
+            .iter()
+            .find(|row| row["name"] == "Clippy")
+            .expect("clippy row");
+        assert!(
+            clippy.get("scope").is_none(),
+            "a check with no test suite to scope must not claim a scope"
+        );
+        let md = fs::read_to_string(summary.join("MERGE_GATE.md")).expect("gate markdown");
+        assert!(
+            md.contains("## Test scope")
+                && md.contains("`CHANGELOG.md`")
+                && md.contains("`root-changelog`"),
+            "the human gate must show path -> rule too, got:\n{md}"
+        );
+        assert!(
+            gate["decision"]["review_caveats"]
+                .as_array()
+                .expect("caveat list")
+                .iter()
+                .all(|caveat| !caveat
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("change-scoped")),
+            "no run was narrowed, so no narrowing caveat may be raised"
         );
     }
 }

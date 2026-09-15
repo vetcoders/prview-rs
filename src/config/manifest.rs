@@ -9,6 +9,8 @@ pub struct PrviewManifest {
     pub lint: LintConfig,
     #[serde(default)]
     pub gate: GateConfig,
+    #[serde(default)]
+    pub scope: ScopeConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -29,6 +31,27 @@ pub struct GateConfig {
     /// to keep the breaking findings visible as an informational caveat only,
     /// with no effect on the verdict.
     pub breaking_escalation: Option<bool>,
+}
+
+/// `[scope]` section of `prview.toml`. Controls which changed paths are treated
+/// as inputs to TEST SELECTION — and nothing else. A path named here still
+/// appears in the diff, the artifacts, the signals and the verdict exactly as
+/// before; it simply does not decide which tests have to run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScopeConfig {
+    /// Extra paths this repository can say are not inputs to test selection,
+    /// as glob patterns matched against repo-relative paths. Additive to the
+    /// built-in list unless that list is disabled.
+    ///
+    /// This is NOT an ignore list: a matching path is classified
+    /// `non-participating`, which means "known not to be an input", and is
+    /// skipped for selection without escalating. Anything the classifier cannot
+    /// name stays `unknown` and still forces a full run.
+    pub non_participating: Option<Vec<String>>,
+    /// Whether prview's built-in non-participating rules apply. `None` → on.
+    /// Set to `false` to restore strictly escalating behaviour, where only the
+    /// repository's own `non_participating` patterns (if any) are neutral.
+    pub non_participating_builtins: Option<bool>,
 }
 
 impl PrviewManifest {
@@ -160,6 +183,34 @@ breaking_escalation = false
 
         let manifest = PrviewManifest::load_from(tmp.path()).expect("manifest loads");
         assert_eq!(manifest.gate.breaking_escalation, None);
+    }
+
+    #[test]
+    fn test_load_scope_non_participating_knobs() {
+        let tmp = TempDir::new().unwrap();
+        let toml_content = r#"
+[scope]
+non_participating = ["design/**", "*.drawio"]
+non_participating_builtins = false
+"#;
+        fs::write(tmp.path().join("prview.toml"), toml_content).unwrap();
+
+        let manifest = PrviewManifest::load_from(tmp.path()).expect("manifest loads");
+        assert_eq!(
+            manifest.scope.non_participating.as_deref(),
+            Some(vec!["design/**".to_string(), "*.drawio".to_string()]).as_deref()
+        );
+        assert_eq!(manifest.scope.non_participating_builtins, Some(false));
+    }
+
+    #[test]
+    fn test_scope_section_defaults_to_none_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("prview.toml"), "[project]\n").unwrap();
+
+        let manifest = PrviewManifest::load_from(tmp.path()).expect("manifest loads");
+        assert_eq!(manifest.scope.non_participating, None);
+        assert_eq!(manifest.scope.non_participating_builtins, None);
     }
 
     #[test]

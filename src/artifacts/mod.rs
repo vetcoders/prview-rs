@@ -143,6 +143,10 @@ pub struct GenerateInput<'a> {
     /// generators fall back to the local checkout and a `--pr` pack ends up
     /// mixing two revisions (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`).
     pub ledger: &'a TaskLedger,
+    /// The run's test-scope decision, decided once before the checks ran.
+    /// `None` when no checks ran at all (`--watch`/quick), so there was nothing
+    /// to decide a scope for. See [`crate::checks::scope`].
+    pub scope: Option<&'a crate::checks::scope::ScopeDecisions>,
     pub diffs: &'a [Diff],
     pub checks: &'a [CheckResult],
     pub heuristics: Option<&'a HeuristicsResult>,
@@ -188,6 +192,7 @@ struct RunJsonInput<'a> {
     context_command_timings: &'a [ContextCommandTiming],
     /// The run's task ledger, serialized as the additive `ledger` view.
     ledger: &'a TaskLedger,
+    scope: Option<&'a crate::checks::scope::ScopeDecisions>,
     regression: Option<&'a regression::RegressionReport>,
 }
 
@@ -199,6 +204,10 @@ struct MergeGateInput<'a> {
     /// a days-old replay earns the advisory `stale_cache_caveats` entry because
     /// both stale failures and stale passes can support the decision.
     ledger: &'a TaskLedger,
+    /// The run's test-scope decision, published on the gate rows and — once a
+    /// check really runs narrower than its full suite — as an advisory review
+    /// caveat. It never moves a verdict.
+    scope: Option<&'a crate::checks::scope::ScopeDecisions>,
     checks: &'a [CheckResult],
     heuristics: Option<&'a HeuristicsResult>,
     inline: &'a InlineFindingsSummary,
@@ -526,6 +535,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
     let GenerateInput {
         config,
         ledger,
+        scope,
         diffs,
         checks,
         heuristics,
@@ -878,6 +888,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         dir: &summary_dir,
         config,
         ledger,
+        scope,
         checks: &all_checks,
         heuristics,
         inline: &inline_summary,
@@ -1049,6 +1060,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         heuristics,
         regression: Some(&regression_report),
         provenance: &provenance_consistency,
+        scope,
     })?;
     generate_consistency_check(&summary_dir, &out_dir, diffs, &provenance_consistency)?;
     stage_timings.push(finish_timing(emit_human_stdout, "report.json", t));
@@ -1104,6 +1116,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         context_artifacts: &context_artifacts,
         context_command_timings: &context_command_timings,
         ledger,
+        scope,
         regression: Some(&regression_report),
     })?;
     stage_timings.push(finish_timing(emit_human_stdout, "RUN.json", t));
@@ -2086,6 +2099,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
         context_artifacts,
         context_command_timings,
         ledger,
+        scope,
         regression,
     } = input;
 
@@ -2115,6 +2129,12 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
                 if let Some(state) = prov.tree_state {
                     entry["tree_state"] = json!(state.as_str());
                 }
+            }
+            // Additive: how much of this check's suite the run decided it had
+            // to execute, and why. Present only on the checks that own an
+            // ecosystem's test scope.
+            if let Some(report) = scope.and_then(|scope| scope.report_for_check(&c.name)) {
+                entry["scope"] = json!(report);
             }
             entry
         })

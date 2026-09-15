@@ -11,17 +11,22 @@ use std::path::Path;
 pub const GATE_EXECUTION_ERROR_EXIT_CODE: i32 = 3;
 
 /// `schema_version` this build stamps into `MERGE_GATE.json`.
-pub const MERGE_GATE_SCHEMA_VERSION: &str = "3.0";
+///
+/// 3.1 adds the additive `scope` object on a gate check row: how much of that
+/// check's suite the run decided had to execute, and why. A 3.0 reader loses
+/// the field and nothing else.
+pub const MERGE_GATE_SCHEMA_VERSION: &str = "3.1";
 
 /// `MERGE_GATE.json` schemas this build has actually seen, as `(MAJOR, MINOR)`.
 ///
 /// This is the SAME set `tools/validate_merge_gate.py` accepts verbatim
-/// (`1.0` / `2.0` / `2.1` / `2.2` / `2.3` / `3.0`), so "readable by the CLI/MCP" and "valid per the
+/// (`1.0` / `2.0` / `2.1` / `2.2` / `2.3` / `3.0` / `3.1`), so "readable by the CLI/MCP" and "valid per the
 /// contract validator" cannot drift apart for a version in the set. The reader
 /// is deliberately broader in exactly two documented directions — an absent
 /// field and a newer MINOR of a known MAJOR — and both are announced rather
 /// than silent.
-const MERGE_GATE_KNOWN_SCHEMAS: &[(u32, u32)] = &[(1, 0), (2, 0), (2, 1), (2, 2), (2, 3), (3, 0)];
+const MERGE_GATE_KNOWN_SCHEMAS: &[(u32, u32)] =
+    &[(1, 0), (2, 0), (2, 1), (2, 2), (2, 3), (3, 0), (3, 1)];
 
 /// Schema 2.3 is the first version that can prove a `CONDITIONAL` is only a
 /// warning. Schema 3.x and forward-compatible 2.x packs inherit that requirement; older packs
@@ -1611,6 +1616,7 @@ mod tests {
     #[test]
     fn schema_check_accepts_absent_and_known_versions_silently() {
         assert_eq!(check_merge_gate_schema(None).unwrap(), None);
+        assert_eq!(check_merge_gate_schema(Some("3.1")).unwrap(), None);
         assert_eq!(check_merge_gate_schema(Some("3.0")).unwrap(), None);
         assert_eq!(check_merge_gate_schema(Some("2.3")).unwrap(), None);
         assert_eq!(check_merge_gate_schema(Some("2.2")).unwrap(), None);
@@ -1621,7 +1627,7 @@ mod tests {
 
     #[test]
     fn schema_three_retains_typed_enforcement_requirements() {
-        for version in ["2.3", "2.9", "3.0", "3.7"] {
+        for version in ["2.3", "2.9", "3.0", "3.1", "3.7"] {
             assert!(schema_requires_enforcement_disposition(Some(
                 &serde_json::json!(version)
             )));

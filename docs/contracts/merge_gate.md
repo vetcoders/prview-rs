@@ -1,4 +1,4 @@
-# MERGE_GATE Contract (schema 3.0)
+# MERGE_GATE Contract (schema 3.1)
 
 `MERGE_GATE.json` is the policy-aware merge decision emitted at
 `00_summary/MERGE_GATE.json`. It is the single machine-readable verdict surface
@@ -11,7 +11,7 @@ document disagree, the code is the contract and this document is the bug.
 
 | Field | Type | Notes |
 |---|---|---|
-| `schema_version` | string | `"3.0"` |
+| `schema_version` | string | `"3.1"` |
 | `generated_at` | string | RFC 3339 local datetime |
 | `bridge_stage` | integer | `0..4` |
 | `target` | string | Resolved target branch name (not raw CLI input) |
@@ -90,6 +90,39 @@ Every element of `checks` is one policy evaluation record:
 | `reason` | string \| null | Policy reason, when present |
 | `evidence` | string | `20_quality/<artifact_id>.result.json` for an executed check; otherwise the reason text or `"skipped — no artifact generated"` |
 | `log` | string \| null | `20_quality/<artifact_id>.log` for an executed check, else `null` |
+| `scope` | object \| null | Additive (3.1). How much of this check's test suite the run decided had to execute, and why. Valid ONLY on the checks that own an ecosystem's test scope (`Cargo test`, `Vitest`); the validator rejects it on any other row, because test-scope evidence pinned to a check that runs no tests would read as a narrowed lint (see below) |
+
+### `scope` (schema 3.1, additive)
+
+Review must be proportional to the change, not to the size of the repository —
+but a narrower run is only acceptable if the artifact says so. `scope` is that
+statement.
+
+| Field | Type | Notes |
+|---|---|---|
+| `mode` | string | `full` \| `change-scoped` — a CLOSED vocabulary |
+| `reason` | string | Non-empty. For `full` it is the escalation reason (`escalated_by`), naming the specific fact that widened the run |
+| `inputs` | integer \| null | Changed paths the decision took into account, escalation or not. `null` means ONLY "there was never a set to count" — it is not a synonym for `0` |
+| `selected` | integer \| null | Test files or packages selected. MUST be `null` when `mode` is `full`: a full run selected nothing, and a count there would read as coverage |
+| `universe` | integer \| null | The whole population the selection was drawn from, when knowable before the run |
+| `selector` | string \| null | The selector's actual arguments; `null` when no selector ran |
+| `non_participating` | object[] | Additive, omitted when empty. Changed paths classified as NOT inputs to test selection, each as `{ path, rule }`. Both fields are required and non-empty: an entry that does not name its rule cannot be challenged, which is the whole point of publishing the list |
+
+`mode: "full"` with reason `scoped execution not enabled yet` is the honest
+state of a build that computes the decision but still runs every test. A pack
+must never state `change-scoped` for a run that executed the full command.
+
+`inputs`, `selected` and `universe` are counts of files and packages, so they
+are integers or `null`; a fractional count is rejected outright, because "1.5 of
+1028 test files" is not a statement a reviewer can act on.
+
+`non_participating` records a decision about TEST SELECTION ONLY. A path listed
+there is still in the diff, the artifacts, the signals and the verdict; it simply
+did not help decide which tests had to run. The same list is rendered as a
+`## Test scope` table in `MERGE_GATE.md`.
+
+Reading rule: absence means "this check has no test suite to scope, or this pack
+predates 3.1" — never "the full suite ran". Only a stated `mode` is evidence.
 
 Semgrep disabled by `--skip-security` uses the shared `security disabled` mode
 reason, with `execution_state: skipped` and `outcome: skipped`. At `block`

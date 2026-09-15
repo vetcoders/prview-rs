@@ -94,6 +94,7 @@ fn generate_fixture_pack_with_ledger_and_diffs(
     generate(GenerateInput {
         config: &config,
         ledger,
+        scope: None,
         diffs: options.diffs,
         checks: &[],
         heuristics: None,
@@ -1352,6 +1353,7 @@ macro_rules! generate_merge_gate_test {
             // Nothing recorded: these packs replay no stored result, so no gate
             // row can carry a stale-cache caveat.
             ledger: &crate::ledger::TaskLedger::new(),
+            scope: None,
             checks: $checks,
             heuristics: $heuristics,
             inline: $inline,
@@ -1389,6 +1391,7 @@ macro_rules! generate_run_json_test {
     ($dir:expr, $artifacts_root:expr, $config:expr, $checks:expr, $heuristics:expr, $resolved_target:expr, $resolved_bases:expr, ($run_started_at:expr, $total_duration_secs:expr), $stage_timings:expr, $context_artifacts:expr, $context_command_timings:expr, $regression:expr, $ledger:expr $(,)?) => {
         generate_run_json(RunJsonInput {
             ledger: $ledger,
+            scope: None,
             dir: $dir,
             artifacts_root: $artifacts_root,
             config: $config,
@@ -1859,6 +1862,110 @@ fn run_json_reports_explicit_update_mode_without_guessing_from_disabled_checks()
     assert_eq!(run["flags"]["update"].as_bool(), Some(true));
     assert_eq!(run["flags"]["quick"].as_bool(), Some(false));
     assert_eq!(run["flags"]["deep"].as_bool(), Some(false));
+}
+
+/// The run record must say how much of a test suite was executed and why —
+/// `RUN.json` is the run's own account of the work it did, and "we ran the
+/// tests" without a scope is the sentence this contract exists to qualify.
+/// Only the checks that own an ecosystem's test scope carry the object.
+#[test]
+fn run_json_publishes_the_test_scope_on_the_checks_that_own_one() {
+    use crate::checks::scope::{ScopeDecision, ScopeDecisions};
+
+    let config = create_test_config(PolicyConfig::default());
+    let resolved_target = ResolvedRef {
+        name: "feature/scope".to_string(),
+        commit_id: "abc1234abc1234abc1234abc1234abc1234ab".to_string(),
+        is_remote: false,
+    };
+    let resolved_bases = vec![ResolvedRef {
+        name: "origin/main".to_string(),
+        commit_id: "def5678def5678def5678def5678def5678de".to_string(),
+        is_remote: true,
+    }];
+    let checks = vec![
+        CheckResult {
+            name: "Cargo test".to_string(),
+            status: CheckStatus::Passed,
+            duration: Duration::from_secs(1),
+            output: String::new(),
+            cached: false,
+            provenance: None,
+        },
+        CheckResult {
+            name: "Clippy".to_string(),
+            status: CheckStatus::Passed,
+            duration: Duration::from_secs(1),
+            output: String::new(),
+            cached: false,
+            provenance: None,
+        },
+    ];
+    let scope = ScopeDecisions {
+        cargo: ScopeDecision::Full {
+            reason: "manifest or lockfile changed: Cargo.lock".to_string(),
+            inputs: Some(3),
+        },
+        vitest: ScopeDecision::Full {
+            reason: "no JavaScript or TypeScript source detected".to_string(),
+            inputs: Some(3),
+        },
+        non_participating: vec![crate::checks::scope::NonParticipatingPath {
+            path: "CHANGELOG.md".to_string(),
+            rule: "root-changelog".to_string(),
+        }],
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    generate_run_json(RunJsonInput {
+        dir: tmp.path(),
+        artifacts_root: tmp.path(),
+        config: &config,
+        checks: &checks,
+        skipped_checks: &[],
+        heuristics: None,
+        resolved_target: &resolved_target,
+        resolved_bases: &resolved_bases,
+        run_started_at: "2026-09-15T12:00:00Z",
+        total_duration_secs: 1.5,
+        stage_timings: &[],
+        context_artifacts: &[],
+        context_command_timings: &[],
+        ledger: &crate::ledger::TaskLedger::new(),
+        scope: Some(&scope),
+        regression: None,
+    })
+    .expect("run json");
+
+    let run: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tmp.path().join("RUN.json")).unwrap())
+            .expect("parse run json");
+    let rows = run["checks"].as_array().expect("check rows");
+    let cargo_test = rows
+        .iter()
+        .find(|row| row["name"] == "Cargo test")
+        .expect("cargo test row");
+    assert_eq!(cargo_test["scope"]["mode"].as_str(), Some("full"));
+    assert_eq!(
+        cargo_test["scope"]["reason"].as_str(),
+        Some("manifest or lockfile changed: Cargo.lock")
+    );
+    assert_eq!(
+        cargo_test["scope"]["non_participating"][0]["path"],
+        "CHANGELOG.md"
+    );
+    assert_eq!(
+        cargo_test["scope"]["non_participating"][0]["rule"],
+        "root-changelog"
+    );
+    let clippy = rows
+        .iter()
+        .find(|row| row["name"] == "Clippy")
+        .expect("clippy row");
+    assert!(
+        clippy.get("scope").is_none(),
+        "a check with no test suite to scope must not claim a scope"
+    );
 }
 
 #[test]
@@ -3726,8 +3833,9 @@ fn merge_gate_names_the_origin_of_every_quality_failure_entry() {
     );
     assert_eq!(
         crate::gate::MERGE_GATE_SCHEMA_VERSION,
-        "3.0",
-        "nullable policy source changes the MAJOR while retaining typed enforcement proof"
+        "3.1",
+        "nullable policy source changed the MAJOR while retaining typed enforcement proof; \
+         3.1 adds the additive per-check `scope` object"
     );
 }
 
@@ -7529,6 +7637,7 @@ fn informational_notes_keep_current_and_historical_counts_comparable() {
         run_started_at: "2026-01-01T00:00:00Z",
         heuristics: None,
         regression: None,
+        scope: None,
         provenance: &ProvenanceConsistency::default(),
     })
     .expect("previous report.json");
@@ -7662,6 +7771,7 @@ fn snapshot_integrity_gate_preserves_check_results_and_dashboard_parity() {
             dir: output.path(),
             config: &config,
             ledger: &ledger,
+            scope: None,
             checks: &checks,
             heuristics: None,
             inline: &inline,
