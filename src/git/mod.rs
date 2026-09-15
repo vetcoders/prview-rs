@@ -457,7 +457,7 @@ impl Repository {
         // requested base to — a ref name could have been re-pointed since.
         let exact_base_commit = config
             .required_base_exact
-            .then(|| config.required_base.as_ref())
+            .then_some(config.required_base.as_ref())
             .flatten()
             .map(|required| required.commit_id.as_str());
 
