@@ -72,15 +72,25 @@ branch is the right base:
     args: ${{ github.event_name == 'push' && format('--base {0}', github.event.before) || '' }}
 ```
 
-`gate --base` ships in the first release after `0.8.0`. Both the Action ref
-(`uses: vetcoders/prview-rs@...`) and its `version` input (the installed
-runtime) must name that release or a newer one: with `0.8.0` the gate rejects
-`--base` as an unknown option. Two push shapes need care: a push that creates a branch reports an
-all-zero `before` (no pre-push commit, so the explicit base is unresolvable and the
-gate exits `3`), and a force push may name a `before` commit that is no longer
-fetched. This repository's own `Gate Shadow` workflow (`.github/workflows/gate.yml`)
-handles both by falling back to auto-detection, and records the base it used in
-the job summary.
+`gate --base` ships in the first release after `0.8.0`. The Action's `version`
+input (or whatever runtime is actually installed) must name that release or a
+newer one: with `0.8.0` the gate rejects `--base` as an unknown option. The
+Action ref itself needs no bump — it forwards `args` to `prview gate`
+unchanged, so `uses: vetcoders/prview-rs@v0.8.0` works fine as long as
+`version` names a release that has `--base`. Two push shapes need care: a push
+that creates a branch reports an all-zero `before` (no pre-push commit, so the
+explicit base is unresolvable and the gate exits `3`), and a force push may
+name a `before` commit that is no longer fetched. This repository's own `Gate
+Shadow` workflow (`.github/workflows/gate.yml`) handles both by falling back
+to auto-detection, and records the base it used in the job summary.
+
+Diff bases are also resolved to their merge-base with the target before
+reviewing, unless base and target already match — so on an ordinary push,
+where `before` is an ancestor of `HEAD`, the merge-base is `before` itself and
+the gate reviews exactly the range the push delivered. On a force-push to the
+default branch, `before` is no longer an ancestor, so the gate instead reviews
+`merge-base(before, HEAD)..HEAD` — a superset of the pushed range that can
+include changes the push did not deliver, but never less.
 
 ## Breaking-change escalation
 

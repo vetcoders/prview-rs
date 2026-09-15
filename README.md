@@ -201,8 +201,9 @@ warning-clean pack as well.
 
 On `push` events the gate auto-detects the pushed branch as its own base, so a
 push to the default branch reviews an empty change unless you pass the pre-push
-commit with `--base`. That flag needs a prview release newer than `0.8.0` (Action ref
-and `version` input); see
+commit with `--base`. That flag needs a prview runtime newer than `0.8.0` — set
+the Action's `version` input (or whatever release you install) accordingly; the
+Action ref itself can stay pinned, since it just forwards `args`. See
 [`docs/gate-playbook.md#choosing-the-base`](docs/gate-playbook.md#choosing-the-base).
 
 GitHub code scanning accepts SARIF uploads through

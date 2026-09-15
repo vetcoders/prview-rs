@@ -171,10 +171,10 @@ require a warning-clean pack as well.
 On `push` events the checkout is the pushed tip, so a push to the default
 branch auto-detects that branch as its own base and reviews an empty change.
 Pass the pre-push commit through `args` (`--base ${{ github.event.before }}`,
-guarded to push events). `--base` requires a prview release newer than `0.8.0`
-for both the Action ref and its `version` input, so it does not work with the
-`v0.8.0` example above. The guarded example, version requirement, and edge cases
-are in
+guarded to push events). `--base` requires a prview runtime newer than `0.8.0`,
+so it does not work with the `version: "0.8.0"` example above — the Action ref
+itself needs no bump, since it just forwards `args`. The guarded example,
+version requirement, and edge cases are in
 [`docs/gate-playbook.md#choosing-the-base`](gate-playbook.md#choosing-the-base).
 
 The Action prefers `cargo-binstall` when that binary is already available on the
