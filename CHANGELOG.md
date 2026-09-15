@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Library API: `prview::GateArgs` gains the public field `base`; code that
-  constructs `GateArgs` with a struct literal must set it. This is
+- Library API: `prview::GateArgs` gains the public field `base`, and
+  `prview::Config` gains the public field `required_base`; code that
+  constructs either with a struct literal must set the new field. This is
   source-incompatible for library consumers, so the next release is a minor
   version bump.
 - `install.sh` is fail-closed. It installs an official release binary or it
