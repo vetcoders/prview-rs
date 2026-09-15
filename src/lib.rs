@@ -212,6 +212,25 @@ impl App {
         // merge-base equal the target), so the scanner would see an empty delta
         // while the pack diff is non-empty. One captured range, one truth.
         check_config.pinned_diff_bases = Some(diff_bases.clone());
+        // The change the test-scope decision reads, captured from the SAME
+        // pinned range the pack diff used so the two cannot describe different
+        // changes. `single_base` is false as soon as the run has more than one
+        // base: a selection drawn from the union of several review ranges
+        // cannot be pinned to any of them — the same reason Semgrep drops to a
+        // full scan there. The set is snapshot-consistent because a pinned
+        // target always materialises a shared snapshot for the checks, so the
+        // tree they scan is exactly the commit these paths came from.
+        check_config.changed_paths = run_headless_sync_stage(&self.governor, || {
+            Ok(diff_bases
+                .first()
+                .and_then(|base| self.repo.changed_paths(base, &target).ok())
+                .map(|paths| checks::scope::ChangeSet::new(paths, diff_bases.len() == 1, true)))
+        })?;
+        // Decided once per run, before the checks, and published on their rows.
+        // It does not yet change what any check executes — see
+        // `checks::scope::SCOPED_EXECUTION_NOT_ENABLED`.
+        let run_scope = checks::scope::resolve_run_scope(&check_config).await;
+        self.ensure_not_cancelled()?;
         let (check_results, skipped_checks) = if self.config.update_mode {
             // In update mode, skip heavy checks UNLESS user explicitly forced them
             // via --with-tests or --with-security (respect user intent over preset)
@@ -265,6 +284,7 @@ impl App {
             artifacts::generate(artifacts::GenerateInput {
                 config: &self.config,
                 ledger: &ledger,
+                scope: Some(&run_scope),
                 diffs: &diffs,
                 checks: &check_results,
                 heuristics: Some(&heuristics_result),
@@ -593,6 +613,9 @@ impl App {
             artifacts::generate(artifacts::GenerateInput {
                 config: &self.config,
                 ledger: &ledger,
+                // `--watch`/quick runs no checks at all, so there is no test
+                // scope to decide and nothing to report one on.
+                scope: None,
                 diffs: &diffs,
                 checks: &[],
                 heuristics: None,

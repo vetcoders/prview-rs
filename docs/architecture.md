@@ -266,6 +266,92 @@ remaining count; this display bound does not truncate the underlying error set.
 In standard execution mode, tests and lint are enabled by default, unless a
 preset (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*` disables them.
 
+#### How much of a test suite must run (`checks/scope.rs`)
+
+Review is proportional to the change, not to the size of the repository. A PR
+touching three files should not pay for a thousand unrelated test files — but
+**change-scoped is not minimal-scoped**: the goal is the full, honest review the
+change demands, minus only the work prview can *prove* is irrelevant to it.
+
+Three separate mechanisms, deliberately never mixed:
+
+| Mechanism | Question it answers |
+|---|---|
+| Scope (`checks/scope.rs`) | how much MUST run to review this properly |
+| Governor (`governor/`) | how to run that work without frying the machine |
+| Deadline | what happens when the necessary work does not fit |
+
+The governor may not turn a thousand necessary tests into a hundred; it runs
+them more calmly. A deadline may not call a hundred of a thousand a PASS; it
+reports a typed incompleteness.
+
+**The seam.** Diffs exist before the checks run (`lib.rs` step 4), and a check
+only ever sees a `Config`. So `Config::changed_paths` carries an optional
+`ChangeSet` — internal runtime state, never a CLI or manifest override, set once
+on the cloned check configuration beside `pinned_target` / `pinned_diff_bases`.
+`None` means today's behaviour: run everything. The set carries each path, its
+`FileStatus`, the pre-rename path for renames, and two trust facts: it came from
+exactly one diff base, and it was captured from the same pinned commit the
+checks scan.
+
+**The decision** (`checks::scope::decide`) is pure and returns, per ecosystem,
+either `Full { reason }` or `ChangeScoped { .. }`. Every doubt resolves to
+`Full`, and the reason is always published. Escalations:
+
+| Class | Escalates |
+|---|---|
+| Manifests and lockfiles (`Cargo.toml`, `Cargo.lock`, `package.json`, lockfiles, `pyproject.toml`) | both ecosystems |
+| Vitest tooling config (`vitest.config.*`, `vite.config.*`, `tsconfig*.json`, conventionally named setup files) | Vitest |
+| Rust build config (`build.rs`, `.cargo/config.toml`, `rust-toolchain.toml`) | Cargo |
+| A proc-macro crate | Cargo (whole workspace) |
+| Deletions, and renames by the path the content left | the ecosystem that owned that path |
+| More than one diff base, or no change set at all | both |
+| A change set inconsistent with the reviewed snapshot | both |
+| Shared tooling, fixtures and test helpers (`tools/`, `__fixtures__/`, …) | the owning ecosystem, or both when no single ecosystem owns the file |
+| Any `cargo metadata` failure, or a Rust file inside no workspace member | Cargo |
+
+Escalation is one-directional: once an ecosystem is widened, no later file
+narrows it again.
+
+**Not an escalation:** a dirty operator checkout. A `--pr` review is about the
+pinned target and the canonical PR diff, so uncommitted files in the operator's
+tree have nothing to do with it — escalating on them would make the feature
+useless during exactly the work it exists for. What escalates is an
+untrustworthy *set*, which is a different fact.
+
+**Rust workspace resolution.** One `cargo metadata --format-version 1 --no-deps
+--frozen` per run, from `profile.cargo_root`, with its own timeout. This is not
+the network-capable full resolve `cargo.rs` refuses: `--no-deps` returns the
+members' own manifests without resolving the dependency graph, and `--frozen`
+guarantees no network access and no lockfile write. Files map to members by
+longest matching member directory (no arbitrary depth walk), and
+`packages[].dependencies[].path` gives the transitive reverse graph inside the
+workspace. Registry dependencies create no edge. Inherited dependencies
+(`dep = { workspace = true }`) need no special case: cargo resolves the
+inheritance before emitting metadata, so they carry `path` exactly like a
+directly declared path dependency (falsified on cargo 1.93.1, 2026-09-15). The call is skipped entirely
+when the change set is missing or untrustworthy, because the answer is already
+"run everything".
+
+**Known blind spots**, stated rather than hidden. Vitest selects by the static
+import graph, so dynamic imports with computed paths, files read through `fs`,
+templates, JSON assets and env-driven branches are invisible to it. A setup file
+referenced from `setupFiles` under an unconventional name is not recognised by
+the escalation table either — changing the config that names it does escalate.
+A full run stays available locally and remains the recipe in CI.
+
+**Reporting.** Every decision is published as the additive `scope` object on the
+owning check's row in `RUN.json`, `report.json` (schema 3.1) and
+`MERGE_GATE.json` (schema 3.1), and — once a run is really narrowed — as an
+advisory review caveat that never moves the verdict. See
+`docs/contracts/merge_gate.md`.
+
+**Current state.** The decision is computed and reported; it does not yet change
+what any check executes. A scopeable decision is therefore published as
+`mode: "full"` with reason `scoped execution not enabled yet`. Emitting
+`change-scoped` for a run that executed everything would be the exact lie this
+machinery exists to prevent.
+
 #### Where checks run
 
 Checks must judge the *reviewed* commit, not whatever happens to be checked out

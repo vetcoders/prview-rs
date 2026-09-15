@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Test scope is decided from the change and reported. A new `checks/scope.rs`
+  decides, per ecosystem, whether a change requires the whole test suite or a
+  narrower run, and publishes the answer as the additive `scope` object on the
+  owning check's row in `RUN.json`, `report.json` (schema `3.0` → `3.1`) and
+  `MERGE_GATE.json` (schema `3.0` → `3.1`). Both schema versions stay readable
+  and valid; `tools/validate_merge_gate.py` accepts `3.1` and validates `scope`
+  when present. `Config::changed_paths` carries the run's `ChangeSet` as
+  internal runtime state (never a CLI or manifest override), and Rust packages
+  are resolved with one `cargo metadata --no-deps --frozen` per run — metadata
+  only, not the network-capable full resolve. Every doubt escalates to a full
+  run with a stated reason; a dirty operator checkout is deliberately NOT such a
+  reason. **No user-facing behaviour changes yet:** every check still runs
+  exactly the command it ran before, so a scopeable decision is reported
+  honestly as `mode: "full"` with reason `scoped execution not enabled yet`.
+  Contract and rationale: `docs/architecture.md` ("How much of a test suite must
+  run").
+
 ### Changed
 
 - `install.sh` is fail-closed. It installs an official release binary or it

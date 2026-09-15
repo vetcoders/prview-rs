@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate MERGE_GATE.json contract (schema 1.0/2.0/2.1/2.2/2.3/3.0)."""
+"""Validate MERGE_GATE.json contract (schema 1.0/2.0/2.1/2.2/2.3/3.0/3.1)."""
 
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ VALID_QUALITY_FAILURE_CLASSES = {
 # `--ci --fail-on-warnings` report a warning it cannot attribute. The inline
 # field folds case because its writer has shipped legacy spellings; this one has
 # only ever emitted lowercase.
+VALID_SCOPE_MODES = {"full", "change-scoped"}
 VALID_CHECK_STATUSES = {"passed", "failed", "warnings", "skipped", "error"}
 VALID_EXECUTION_STATES = {"executed", "skipped", "unavailable", "unknown"}
 VALID_TOOL_OUTCOMES = {
@@ -439,9 +440,9 @@ def validate(path: Path) -> list[str]:
 
     if not isinstance(data["schema_version"], str):
         issues.append("schema_version must be a string")
-    elif data["schema_version"] not in ("1.0", "2.0", "2.1", "2.2", "2.3", "3.0"):
+    elif data["schema_version"] not in ("1.0", "2.0", "2.1", "2.2", "2.3", "3.0", "3.1"):
         issues.append(
-            "schema_version must be '1.0', '2.0', '2.1', '2.2', '2.3', or '3.0'"
+            "schema_version must be '1.0', '2.0', '2.1', '2.2', '2.3', '3.0', or '3.1'"
         )
     require_iso_datetime(data["generated_at"], "generated_at", issues)
     if (
@@ -666,6 +667,39 @@ def validate(path: Path) -> list[str]:
             require_boolean(check.get("blocking"), f"{ctx}.blocking", issues)
             require_non_negative_number(check.get("duration_secs"), f"{ctx}.duration_secs", issues)
             require_non_empty_string(check.get("evidence"), f"{ctx}.evidence", issues)
+            # Schema 3.1: `scope` is ADDITIVE and optional — only the checks
+            # that own an ecosystem's test scope carry it, and a 3.0 pack has
+            # none at all. When it is present it must be honest: a stated mode
+            # from the closed vocabulary and a non-empty reason, because "some
+            # of the suite ran" without saying which part or why is exactly the
+            # ambiguity the object exists to remove.
+            scope = check.get("scope")
+            if scope is not None:
+                if not isinstance(scope, dict):
+                    issues.append(f"{ctx}.scope must be an object")
+                else:
+                    if scope.get("mode") not in VALID_SCOPE_MODES:
+                        issues.append(
+                            f"{ctx}.scope.mode must be one of {sorted(VALID_SCOPE_MODES)}"
+                        )
+                    require_non_empty_string(
+                        scope.get("reason"), f"{ctx}.scope.reason", issues
+                    )
+                    for field in ("inputs", "selected", "universe"):
+                        value = scope.get(field)
+                        if value is not None:
+                            require_non_negative_number(
+                                value, f"{ctx}.scope.{field}", issues
+                            )
+                    selector = scope.get("selector")
+                    if selector is not None and not isinstance(selector, str):
+                        issues.append(f"{ctx}.scope.selector must be a string or null")
+                    # A full run selected nothing, so it must not publish a
+                    # selection count that a reader would take for coverage.
+                    if scope.get("mode") == "full" and scope.get("selected") is not None:
+                        issues.append(
+                            f"{ctx}.scope.selected must be null when mode is 'full'"
+                        )
             if schema_at_least(data.get("schema_version"), (2, 3)):
                 issues.extend(
                     ensure_keys(
