@@ -26,9 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because on a force-push the pre-push commit is no longer an ancestor of the
   new tip, so normalization would review
   `merge-base(before, after)..after`, a different and larger range. The flag
-  requires `--base` and affects only the requested base. `Gate Shadow`
-  (`.github/workflows/gate.yml`) passes it on `push` events and records the
-  range mode, including whether the push was a force-push, in its job summary.
+  requires `--base` and affects only the requested base. When the range really
+  was rewritten — the flag is in force and the pinned base is not an ancestor of
+  the target — `PR_REVIEW.md` and `REVIEW_SUMMARY.md` state that once beside the
+  base, so a reader knows why the file list can carry a change no listed commit
+  made; it is a statement about range semantics, not a caveat, and touches no
+  verdict or quality signal. `Gate Shadow` (`.github/workflows/gate.yml`) passes
+  the flag on `push` events and records the range mode, including whether the
+  push was a force-push, in its job summary.
 
 ### Changed
 

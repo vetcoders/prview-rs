@@ -611,6 +611,92 @@ fn gate_exact_base_reviews_the_literal_force_pushed_range() {
     );
 }
 
+/// Pinned verbatim. This sentence is a statement about range semantics, not a
+/// warning and not a review caveat — if a later change reworks it into one, or
+/// routes it through the caveat machinery, these tests fail.
+const REWRITTEN_RANGE_NOTE: &str = "Force-push detected: the file set reflects the pre-push \u{2192} current tree difference, so it may contain changes not attributable to any commit in the displayed commit list.";
+
+/// A reader holding the pack sees a file list and a commit list side by side.
+/// On a rewritten range the two legitimately disagree: the file set is the
+/// literal pinned-base-to-target tree difference, so it carries what the
+/// force-push removed, while no commit in the list removed it. The pack says so
+/// once, beside the base, on both human surfaces.
+#[test]
+fn gate_exact_base_states_the_rewritten_range_in_the_pack() {
+    let (temp, before, _common_ancestor) = create_force_pushed_main_fixture();
+    let path = path_without_semgrep(temp.path());
+    let home = tempfile::tempdir().expect("prview home");
+
+    let gate = run_gate_json(
+        temp.path(),
+        &path,
+        home.path(),
+        &["--base", &before, "--exact-base"],
+    );
+
+    for surface in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
+        let rendered = read_pack_file(&gate, surface);
+        assert!(
+            rendered.contains(REWRITTEN_RANGE_NOTE),
+            "{surface} must state the rewritten range verbatim: {}",
+            rendered.lines().take(12).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    // It explains correct behaviour, so it must not be a review caveat and must
+    // not have moved any verdict.
+    let caveats = gate["caveats"]
+        .as_array()
+        .expect("gate json lists its caveats");
+    assert!(
+        !caveats
+            .iter()
+            .any(|caveat| caveat.as_str().is_some_and(|c| c.contains("Force-push"))),
+        "the range note must not be routed through the caveat machinery: {caveats:?}"
+    );
+}
+
+/// The note is a claim about this run's range, not about the flag. An ordinary
+/// push is a fast-forward, the pinned base IS the merge-base, the file list and
+/// the commit list agree — and the pack stays silent even though `--exact-base`
+/// was passed.
+#[test]
+fn gate_exact_base_stays_silent_on_a_fast_forward() {
+    let (temp, before) = create_pushed_main_fixture();
+    let path = path_without_semgrep(temp.path());
+    let after = rev_parse(temp.path(), "HEAD");
+    let is_ancestor = git_cmd()
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            before.as_str(),
+            after.as_str(),
+        ])
+        .current_dir(temp.path())
+        .status()
+        .expect("merge-base --is-ancestor");
+    assert!(
+        is_ancestor.success(),
+        "fixture: the pre-push commit must be an ancestor of the tip"
+    );
+
+    let home = tempfile::tempdir().expect("prview home");
+    let gate = run_gate_json(
+        temp.path(),
+        &path,
+        home.path(),
+        &["--base", &before, "--exact-base"],
+    );
+
+    for surface in ["PR_REVIEW.md", "REVIEW_SUMMARY.md"] {
+        let rendered = read_pack_file(&gate, surface);
+        assert!(
+            !rendered.contains("Force-push detected"),
+            "{surface} must stay silent on a fast-forward range"
+        );
+    }
+}
+
 #[test]
 fn gate_explicit_base_annotated_tag_reviews_the_change_since_the_tag() {
     let (temp, _before) = create_pushed_main_fixture();

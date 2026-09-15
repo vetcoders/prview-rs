@@ -124,6 +124,15 @@ files the rewrite removed. `--exact-base` requires `--base` (a bare
 auto-detected bases, and every base of a run that did not pass it, keep
 merge-base normalization.
 
+When the range really was rewritten — `--exact-base` is in force and the pinned
+base is not an ancestor of the target — `PR_REVIEW.md` and `REVIEW_SUMMARY.md`
+state it once beside the base: *"Force-push detected: the file set reflects the
+pre-push → current tree difference, so it may contain changes not
+attributable to any commit in the displayed commit list."* That is a statement
+about range semantics, not a warning: it explains why the file list can carry a
+change no listed commit made, and it touches no verdict, disposition or quality
+signal. On a fast-forward it does not appear.
+
 This repository's own `Gate Shadow` workflow passes `--exact-base` on `push`
 events and records the resulting mode in its job summary, including whether the
 push was a force-push.

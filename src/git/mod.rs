@@ -728,6 +728,22 @@ impl Repository {
         Ok(self.inner.merge_base(a_oid, b_oid)?.to_string())
     }
 
+    /// Whether `ancestor` is an ancestor of `descendant`.
+    ///
+    /// A commit is its own ancestor, matching `git merge-base --is-ancestor`.
+    /// `graph_descendant_of` answers the strict question, so equality is
+    /// handled here rather than left to differ from the shell equivalent.
+    pub(crate) fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let ancestor_oid = git2::Oid::from_str(ancestor)?;
+        let descendant_oid = git2::Oid::from_str(descendant)?;
+        if ancestor_oid == descendant_oid {
+            return Ok(true);
+        }
+        Ok(self
+            .inner
+            .graph_descendant_of(descendant_oid, ancestor_oid)?)
+    }
+
     /// True if the commit is a merge commit (more than one parent).
     pub fn is_merge_commit(&self, commit_id: &str) -> Result<bool> {
         let oid = git2::Oid::from_str(commit_id)?;

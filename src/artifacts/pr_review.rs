@@ -2,6 +2,43 @@
 
 use super::*;
 
+/// Stated verbatim when the pack reviewed a rewritten range.
+///
+/// This is a statement about range semantics, not a warning and not a review
+/// caveat. It explains correct behaviour: with `--exact-base` the reviewed file
+/// set is the literal tree difference between the pinned base and the target,
+/// and a force-push makes that base a commit the target's history never passed
+/// through — so a file can appear in the file list without any commit in the
+/// commit list having touched it. It is deliberately kept out of the caveat
+/// machinery: it must never reach the verdict, the gate disposition or any
+/// quality signal.
+pub(crate) const REWRITTEN_RANGE_NOTE: &str = "Force-push detected: the file set reflects the pre-push \u{2192} current tree difference, so it may contain changes not attributable to any commit in the displayed commit list.";
+
+/// Whether this run actually reviewed a rewritten range: `--exact-base` is in
+/// force for this very base, and the pinned base is not an ancestor of the
+/// target.
+///
+/// The ancestry question is asked of the repository rather than inferred from
+/// the CI event or the workflow that invoked the gate, so the note is true for
+/// any caller of `--exact-base`. An unreadable repository or an unanswerable
+/// ancestry query says "ancestor", which prints nothing: a claim that cannot be
+/// proven is not made.
+fn reviewed_a_rewritten_range(config: &Config, base_commit: &str, target_commit: &str) -> bool {
+    if !config.required_base_exact {
+        return false;
+    }
+    let Some(required) = config.required_base.as_ref() else {
+        return false;
+    };
+    if required.commit_id != base_commit {
+        return false;
+    }
+    let Ok(repo) = crate::git::Repository::open(&config.repo_root) else {
+        return false;
+    };
+    !repo.is_ancestor(base_commit, target_commit).unwrap_or(true)
+}
+
 pub(crate) fn generate_pr_review(
     dir: &Path,
     config: &Config,
@@ -36,6 +73,14 @@ pub(crate) fn generate_pr_review(
     };
     // The header names the ref; the commit beside it says which one that was.
     let base_display = base_ref_display(base, base_commit);
+    // Emitted only when the range really was rewritten, so a reader who sees a
+    // file the commit list does not account for knows why.
+    let rewritten_range_note = diffs
+        .first()
+        .filter(|diff| {
+            reviewed_a_rewritten_range(config, &diff.base_commit_id, &diff.target_commit_id)
+        })
+        .map(|_| REWRITTEN_RANGE_NOTE);
 
     // Count files
     let all_files: Vec<&crate::git::FileChange> = diffs.iter().flat_map(|d| &d.files).collect();
@@ -78,6 +123,10 @@ pub(crate) fn generate_pr_review(
         commit_count, files_changed, code_files, test_files, non_code_files
     )?;
     writeln!(md, "> **Generated:** {}", timestamp)?;
+    if let Some(note) = rewritten_range_note {
+        writeln!(md, ">")?;
+        writeln!(md, "> {}", note)?;
+    }
     writeln!(md)?;
 
     // Summary table
