@@ -1057,4 +1057,186 @@ src/styles/app.css
             Some((2, 0, 2))
         );
     }
+    // -----------------------------------------------------------------------
+    // Change-scoped execution
+    // -----------------------------------------------------------------------
+
+    use crate::checks::scope::{ExecutedScope, ScopeDecision, ScopeDecisions};
+
+    /// A config whose Vitest decision is exactly `decision`; Cargo is pinned to
+    /// full so a stray read of the wrong ecosystem would be visible.
+    fn config_with_vitest_scope(decision: ScopeDecision) -> Config {
+        let mut config = create_test_config(true);
+        config.test_scope = Some(ScopeDecisions {
+            cargo: ScopeDecision::Full {
+                reason: "not under test".to_string(),
+                inputs: None,
+            },
+            vitest: decision,
+            non_participating: Vec::new(),
+        });
+        config
+    }
+
+    fn vitest_scoped(inputs: &[&str]) -> ScopeDecision {
+        ScopeDecision::ChangeScoped {
+            inputs: inputs.len(),
+            selected: inputs.iter().map(|i| (*i).to_string()).collect(),
+            universe: None,
+            selector_inputs: inputs.iter().map(|i| (*i).to_string()).collect(),
+        }
+    }
+
+    /// A reviewed tree that really contains `files`, because the missing-input
+    /// escalation is a filesystem fact.
+    fn reviewed_tree_with(files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for file in files {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(path, "export const x = 1;\n").expect("write");
+        }
+        dir
+    }
+
+    fn vitest_run_args(plan: &VitestPlan) -> &[String] {
+        match plan {
+            VitestPlan::Run { args, .. } => args,
+            VitestPlan::Skip => panic!("expected a run, got a skip"),
+        }
+    }
+
+    fn vitest_executed(plan: &VitestPlan) -> Option<&ExecutedScope> {
+        match plan {
+            VitestPlan::Run { executed, .. } => executed.as_ref(),
+            VitestPlan::Skip => panic!("expected a run, got a skip"),
+        }
+    }
+
+    #[test]
+    fn a_scoped_vitest_decision_runs_only_the_related_tests() {
+        let tree = reviewed_tree_with(&["src/a.ts", "src/b.ts"]);
+        let config = config_with_vitest_scope(vitest_scoped(&["src/a.ts", "src/b.ts"]));
+
+        let plan = plan_vitest_run(&config, tree.path());
+
+        assert_eq!(
+            vitest_run_args(&plan),
+            [
+                "related",
+                "--run",
+                "--maxWorkers",
+                "1",
+                "--passWithNoTests",
+                "src/a.ts",
+                "src/b.ts"
+            ],
+        );
+        let Some(ExecutedScope::ChangeScoped { selected, selector }) = vitest_executed(&plan)
+        else {
+            panic!("a narrowed run reports a narrowed scope");
+        };
+        assert_eq!(*selected, 2);
+        assert!(
+            vitest_run_args(&plan).join(" ").contains(selector.as_str()),
+            "selector {selector:?} must be a verbatim fragment of the command line",
+        );
+    }
+
+    #[test]
+    fn a_full_vitest_decision_runs_todays_command_unchanged() {
+        let tree = reviewed_tree_with(&[]);
+        let config = config_with_vitest_scope(ScopeDecision::Full {
+            reason: "unsupported input".to_string(),
+            inputs: Some(2),
+        });
+
+        let plan = plan_vitest_run(&config, tree.path());
+
+        assert_eq!(vitest_run_args(&plan), ["run", "--maxWorkers", "1"]);
+        assert_eq!(vitest_executed(&plan), None);
+    }
+
+    #[test]
+    fn an_empty_vitest_selection_plans_no_run_at_all() {
+        let tree = reviewed_tree_with(&[]);
+        let config = config_with_vitest_scope(ScopeDecision::ChangeScoped {
+            inputs: 3,
+            selected: Vec::new(),
+            universe: None,
+            selector_inputs: Vec::new(),
+        });
+
+        assert!(matches!(
+            plan_vitest_run(&config, tree.path()),
+            VitestPlan::Skip
+        ));
+    }
+
+    #[test]
+    fn an_input_missing_from_the_reviewed_tree_widens_the_run() {
+        // Handing Vitest a path that is not there would silently shrink the
+        // selection to whatever remains: a narrower run than the one decided.
+        let tree = reviewed_tree_with(&["src/a.ts"]);
+        let config = config_with_vitest_scope(vitest_scoped(&["src/a.ts", "src/gone.ts"]));
+
+        let plan = plan_vitest_run(&config, tree.path());
+
+        assert_eq!(vitest_run_args(&plan), ["run", "--maxWorkers", "1"]);
+        let Some(ExecutedScope::Full { reason }) = vitest_executed(&plan) else {
+            panic!("a missing input must widen the run, loudly");
+        };
+        assert!(
+            reason.contains("src/gone.ts"),
+            "the reason must name the missing input: {reason}",
+        );
+    }
+
+    #[test]
+    fn the_tests_pattern_filters_inside_the_vitest_selection() {
+        let tree = reviewed_tree_with(&["src/a.ts"]);
+        let mut config = config_with_vitest_scope(vitest_scoped(&["src/a.ts"]));
+        config.tests_pattern = Some("renders".to_string());
+
+        assert_eq!(
+            vitest_run_args(&plan_vitest_run(&config, tree.path())),
+            [
+                "related",
+                "--run",
+                "--maxWorkers",
+                "1",
+                "--passWithNoTests",
+                "--testNamePattern",
+                "renders",
+                "src/a.ts"
+            ],
+        );
+    }
+
+    #[test]
+    fn an_empty_related_set_is_recognised_in_vitest_output() {
+        assert!(vitest_found_no_test_files(
+            "No test files found, exiting with code 0\n"
+        ));
+        assert!(vitest_found_no_test_files("no test files found"));
+        assert!(!vitest_found_no_test_files(
+            " Test Files  2 passed (2)\n      Tests  7 passed (7)\n"
+        ));
+    }
+
+    #[test]
+    fn an_operators_lint_ignore_does_not_hide_a_file_from_test_selection() {
+        // `lint_ignore_patterns` says "do not lint this", never "this file
+        // cannot affect a test". Test selection reads only the built-in
+        // build-output half of the predicate.
+        let mut config = create_test_config(true);
+        config.lint_ignore_patterns = vec!["src/legacy/**".to_string()];
+
+        assert!(is_generated_artifact_path("src/legacy/foo.ts", &config));
+        assert!(!is_builtin_generated_output_path("src/legacy/foo.ts"));
+        assert!(is_builtin_generated_output_path("dist/foo.js"));
+        assert!(is_builtin_generated_output_path(
+            "node_modules/pkg/index.js"
+        ));
+    }
 }

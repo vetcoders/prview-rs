@@ -5597,4 +5597,153 @@ test result: ok. 2 passed; 0 failed
         assert!(replayed_provenance(Some("{ not json")).is_none());
         assert!(replayed_provenance(Some(r#"{"unrelated":true}"#)).is_none());
     }
+    // -----------------------------------------------------------------------
+    // The scope seam
+    // -----------------------------------------------------------------------
+
+    /// A gate that owns a test scope and records the decision it was handed, so
+    /// a test can assert what the CHECK saw rather than what the run published.
+    struct ScopeSpyCheck {
+        name: &'static str,
+        seen: Arc<std::sync::Mutex<Option<Option<scope::ScopeDecisions>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Check for ScopeSpyCheck {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+            CheckEligibility::Run
+        }
+        async fn run(&self, config: &Config) -> Result<CheckResult> {
+            *self.seen.lock().expect("spy lock") = Some(config.test_scope.clone());
+            Ok(CheckResult {
+                name: self.name.to_string(),
+                status: CheckStatus::Passed,
+                duration: Duration::from_millis(1),
+                output: "ok".to_string(),
+                cached: false,
+                provenance: None,
+            })
+        }
+    }
+
+    /// A JS review of one source file, with the operator's own checkout left
+    /// dirty — the fixture's point is that the dirt is irrelevant when the
+    /// gates read a snapshot.
+    fn scoped_js_config(repo_root: &std::path::Path) -> Config {
+        let mut config = test_config();
+        config.profile = crate::config::test_js_profile(true);
+        config.repo_root = repo_root.to_path_buf();
+        config.execution_mode = ExecutionMode::Standard;
+        config.do_fetch = false;
+        config.use_cache = false;
+        config.create_zip = false;
+        config.quiet = true;
+        config.operator_worktree_clean = Some(false);
+        config.changed_paths = Some(scope::ChangeSet::new(
+            vec![crate::git::ChangedPath {
+                path: "src/app.ts".to_string(),
+                status: crate::git::FileStatus::Modified,
+                old_path: None,
+            }],
+            true,
+        ));
+        config
+    }
+
+    async fn scope_seen_by_the_check(
+        config: &Config,
+        checks: Vec<Box<dyn Check>>,
+        seen: &Arc<std::sync::Mutex<Option<Option<scope::ScopeDecisions>>>>,
+    ) -> (Option<scope::ScopeDecisions>, TaskLedger) {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::new());
+        run_all_checks(checks, cache, config, &ledger, &governor)
+            .await
+            .expect("run_all_checks");
+        let seen = seen
+            .lock()
+            .expect("spy lock")
+            .clone()
+            .expect("the spy gate must have run");
+        (seen, ledger)
+    }
+
+    /// The seam's reason for existing: scope follows the tree the gates READ.
+    /// The operator's checkout is dirty AND holds a different revision; neither
+    /// fact may reach the decision, because neither is what Vitest will open.
+    #[tokio::test]
+    async fn the_seam_scopes_the_snapshot_not_the_operators_dirty_checkout() {
+        let (repo, _target) = repo_with_off_head_target();
+        let mut config = scoped_js_config(repo.path());
+        config.target = Some("feature".to_string());
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(ScopeSpyCheck {
+            name: "Vitest",
+            seen: Arc::clone(&seen),
+        })];
+        let (seen, ledger) = scope_seen_by_the_check(&config, checks, &seen).await;
+
+        let decisions = seen.expect("a runnable Vitest gate must be handed a decision");
+        assert!(
+            matches!(
+                decisions.get(scope::Ecosystem::Vitest),
+                scope::ScopeDecision::ChangeScoped { .. }
+            ),
+            "a dirty operator checkout must not widen a snapshot-backed run: {:?}",
+            decisions.vitest,
+        );
+        // Both copies exist for a reason: the check reads `Config`, the
+        // artifacts read the ledger, and they must be the same decision.
+        assert_eq!(ledger.test_scope(), Some(decisions));
+    }
+
+    /// The mirror image: with nothing pinned, the gates read the operator's
+    /// working tree, and an uncommitted edit there means the tree under test is
+    /// not the tree the diff describes.
+    #[tokio::test]
+    async fn a_dirty_tree_that_is_actually_read_widens_the_run() {
+        let (repo, _target) = repo_with_off_head_target();
+        let config = scoped_js_config(repo.path());
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(ScopeSpyCheck {
+            name: "Vitest",
+            seen: Arc::clone(&seen),
+        })];
+        let (seen, _ledger) = scope_seen_by_the_check(&config, checks, &seen).await;
+
+        let decisions = seen.expect("a runnable Vitest gate must be handed a decision");
+        assert_eq!(
+            decisions.get(scope::Ecosystem::Vitest),
+            &scope::ScopeDecision::Full {
+                reason: scope::reason::CHECKS_READ_AN_UNCOMMITTED_TREE.to_string(),
+                inputs: Some(1),
+            },
+        );
+    }
+
+    /// No gate owns a test scope, so there is no scope to resolve — and, in
+    /// particular, no `cargo metadata` subprocess to pay for.
+    #[tokio::test]
+    async fn a_run_without_a_test_gate_resolves_no_scope_at_all() {
+        let (repo, _target) = repo_with_off_head_target();
+        let mut config = scoped_js_config(repo.path());
+        config.target = Some("feature".to_string());
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(ScopeSpyCheck {
+            name: "TypeScript",
+            seen: Arc::clone(&seen),
+        })];
+        let (seen, ledger) = scope_seen_by_the_check(&config, checks, &seen).await;
+
+        assert_eq!(seen, None);
+        assert_eq!(ledger.test_scope(), None);
+    }
 }

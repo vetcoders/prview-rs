@@ -701,6 +701,24 @@ mod tests {
     }
 
     #[test]
+    fn full_tests_defaults_off_and_is_an_explicit_opt_in() {
+        assert!(
+            !Cli::try_parse_from(["prview"])
+                .expect("default CLI")
+                .full_tests,
+            "narrowing is the contract's default; the escape hatch is opt-in",
+        );
+        assert!(
+            Cli::try_parse_from(["prview", "--full-tests"])
+                .expect("full tests CLI")
+                .full_tests,
+        );
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--full-tests"), "got: {help}");
+    }
+
+    #[test]
     fn tests_pattern_help_names_runner_specific_contract() {
         let cli = Cli::try_parse_from(["prview", "--tests-pattern", "critical_path"])
             .expect("tests pattern");

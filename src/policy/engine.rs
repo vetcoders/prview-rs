@@ -709,4 +709,100 @@ mod tests {
             "declared mode skips must not masquerade as unknown tool loss"
         );
     }
+    // -----------------------------------------------------------------------
+    // A test suite that does not apply to this change
+    // -----------------------------------------------------------------------
+
+    /// A gate that ran, found the change touches nothing it covers, and
+    /// executed nothing.
+    fn scope_skipped(name: &str, reason: &str) -> CheckResult {
+        CheckResult {
+            name: name.to_string(),
+            status: CheckStatus::Skipped,
+            duration: std::time::Duration::from_millis(1),
+            output: reason.to_string(),
+            cached: false,
+            provenance: None,
+        }
+    }
+
+    fn config_requiring_cargo_test() -> Config {
+        let mut config = crate::config::test_config();
+        config.policy.mode = crate::policy::PolicyMode::Block;
+        config
+            .policy
+            .checks
+            .insert("cargo_test".to_string(), PolicySeverity::Block);
+        config
+    }
+
+    /// A docs-only PR: the decision selected no package, so `cargo test` ran
+    /// nothing. Before this branch, a repository that REQUIRES the test gate
+    /// would have been blocked by its own narrowing.
+    #[test]
+    fn a_required_suite_with_no_related_tests_does_not_block_the_merge() {
+        let config = config_requiring_cargo_test();
+        let engine = PolicyEngine::new(&config);
+
+        let eval = engine.evaluate_run(&scope_skipped(
+            "Cargo test",
+            crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE,
+        ));
+
+        assert_eq!(eval.conclusion, PolicyConclusion::Satisfied);
+        assert_eq!(eval.confidence_impact, AnalysisStatus::Complete);
+        assert_eq!(eval.merge_impact, MergeRecommendation::Approve);
+        // Never relabelled as a pass: the row still says a suite did not run.
+        assert_eq!(eval.raw_status, "skipped");
+        assert_eq!(eval.outcome, ToolOutcome::Skipped);
+        assert_eq!(eval.execution_state, CheckExecutionState::Skipped);
+    }
+
+    /// Vitest appends its own detail after the constant, because the empty set
+    /// is only knowable after the tool has resolved the import graph.
+    #[test]
+    fn the_branch_survives_the_detail_vitest_appends() {
+        let config = config_requiring_cargo_test();
+        let engine = PolicyEngine::new(&config);
+
+        let eval = engine.evaluate_run(&scope_skipped(
+            "Vitest",
+            &format!(
+                "{} (none of the 3 changed source files are imported by a test)",
+                crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE
+            ),
+        ));
+
+        assert_eq!(eval.conclusion, PolicyConclusion::Satisfied);
+        assert_eq!(eval.merge_impact, MergeRecommendation::Approve);
+    }
+
+    /// The branch is narrow on purpose: a gate that could not run at all is
+    /// still a hole in the evidence, and still blocks.
+    #[test]
+    fn a_required_suite_that_could_not_run_still_blocks() {
+        let config = config_requiring_cargo_test();
+        let engine = PolicyEngine::new(&config);
+
+        let eval = engine.evaluate_run(&scope_skipped("Cargo test", "cargo not installed"));
+
+        assert_eq!(eval.conclusion, PolicyConclusion::Blocked);
+        assert_eq!(eval.merge_impact, MergeRecommendation::Block);
+        assert_eq!(eval.execution_state, CheckExecutionState::Unavailable);
+    }
+
+    /// Only prview's own wording reaches the branch. A tool that prints
+    /// something similar is not prview saying it proved anything.
+    #[test]
+    fn the_branch_matches_only_prviews_own_reason() {
+        let config = config_requiring_cargo_test();
+        let engine = PolicyEngine::new(&config);
+
+        let eval = engine.evaluate_run(&scope_skipped(
+            "Cargo test",
+            "the harness reported no tests related to the change",
+        ));
+
+        assert_eq!(eval.conclusion, PolicyConclusion::Blocked);
+    }
 }

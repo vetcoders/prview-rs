@@ -4719,4 +4719,228 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             None,
         );
     }
+    // -----------------------------------------------------------------------
+    // Change-scoped execution
+    // -----------------------------------------------------------------------
+
+    use crate::checks::scope::{
+        CargoWorkspace, ChangeSet, Ecosystem, ExecutedScope, PathClassifier, ReviewedTree,
+        ScopeDecision, ScopeDecisions, ScopeInputs, decide,
+    };
+    use crate::git::{ChangedPath, FileStatus};
+
+    /// A config whose Cargo decision is exactly `decision`; Vitest is pinned to
+    /// full so a stray read of the wrong ecosystem would be visible.
+    fn config_with_cargo_scope(decision: ScopeDecision) -> Config {
+        let mut config = create_test_config(true, false, true);
+        config.test_scope = Some(ScopeDecisions {
+            cargo: decision,
+            vitest: ScopeDecision::Full {
+                reason: "not under test".to_string(),
+                inputs: None,
+            },
+            non_participating: Vec::new(),
+        });
+        config
+    }
+
+    fn scoped(packages: &[&str]) -> ScopeDecision {
+        ScopeDecision::ChangeScoped {
+            inputs: packages.len(),
+            selected: packages.iter().map(|p| (*p).to_string()).collect(),
+            universe: Some(4),
+            selector_inputs: Vec::new(),
+        }
+    }
+
+    fn planned(config: &Config) -> CargoTestPlan {
+        plan_cargo_test(config).expect("planning a cargo test run")
+    }
+
+    fn run_args(plan: &CargoTestPlan) -> &[String] {
+        match plan {
+            CargoTestPlan::Run { args, .. } => args,
+            CargoTestPlan::Skip => panic!("expected a run, got a skip"),
+        }
+    }
+
+    fn executed(plan: &CargoTestPlan) -> Option<&ExecutedScope> {
+        match plan {
+            CargoTestPlan::Run { executed, .. } => executed.as_ref(),
+            CargoTestPlan::Skip => panic!("expected a run, got a skip"),
+        }
+    }
+
+    #[test]
+    fn a_scoped_cargo_decision_narrows_the_run_to_its_packages() {
+        let plan = planned(&config_with_cargo_scope(scoped(&["app", "core"])));
+
+        assert_eq!(
+            run_args(&plan),
+            [
+                "test",
+                "--all-targets",
+                "--no-fail-fast",
+                "-p",
+                "app",
+                "-p",
+                "core"
+            ],
+        );
+        assert_eq!(
+            executed(&plan),
+            Some(&ExecutedScope::ChangeScoped {
+                selected: 2,
+                selector: "-p app -p core".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn the_cargo_selector_is_a_verbatim_fragment_of_the_command_line() {
+        let plan = planned(&config_with_cargo_scope(scoped(&["app", "core"])));
+        let command_line = run_args(&plan).join(" ");
+
+        let Some(ExecutedScope::ChangeScoped { selector, .. }) = executed(&plan) else {
+            panic!("a narrowed run reports a narrowed scope");
+        };
+        assert!(
+            command_line.contains(selector.as_str()),
+            "selector {selector:?} is not a substring of {command_line:?}",
+        );
+    }
+
+    #[test]
+    fn a_full_cargo_decision_runs_todays_command_unchanged() {
+        let plan = planned(&config_with_cargo_scope(ScopeDecision::Full {
+            reason: "unsupported input".to_string(),
+            inputs: Some(3),
+        }));
+
+        assert_eq!(run_args(&plan), ["test", "--all-targets", "--no-fail-fast"]);
+        // The DECISION's reason is the honest report; the check does not
+        // duplicate it as execution evidence.
+        assert_eq!(executed(&plan), None);
+    }
+
+    #[test]
+    fn no_decision_at_all_runs_todays_command_unchanged() {
+        let mut config = create_test_config(true, false, true);
+        config.test_scope = None;
+
+        assert_eq!(
+            run_args(&planned(&config)),
+            ["test", "--all-targets", "--no-fail-fast"],
+        );
+    }
+
+    #[test]
+    fn the_tests_pattern_stays_the_last_argument_when_the_run_narrows() {
+        let mut config = config_with_cargo_scope(scoped(&["core"]));
+        config.tests_pattern = Some("parses".to_string());
+
+        // `cargo test` reads the filter as a positional argument: anything
+        // after it belongs to the test binary, not to cargo.
+        assert_eq!(
+            run_args(&planned(&config)),
+            [
+                "test",
+                "--all-targets",
+                "--no-fail-fast",
+                "-p",
+                "core",
+                "parses"
+            ],
+        );
+    }
+
+    #[test]
+    fn an_empty_cargo_selection_plans_no_run_at_all() {
+        let plan = planned(&config_with_cargo_scope(ScopeDecision::ChangeScoped {
+            inputs: 2,
+            selected: Vec::new(),
+            universe: Some(4),
+            selector_inputs: Vec::new(),
+        }));
+
+        assert!(matches!(plan, CargoTestPlan::Skip));
+    }
+
+    #[test]
+    fn a_package_name_that_cannot_be_spelled_widens_the_run() {
+        let plan = planned(&config_with_cargo_scope(scoped(&["core", "two words"])));
+
+        assert_eq!(run_args(&plan), ["test", "--all-targets", "--no-fail-fast"]);
+        let Some(ExecutedScope::Full { reason }) = executed(&plan) else {
+            panic!("an unusable selector must widen the run, loudly");
+        };
+        assert!(
+            reason.contains("two words"),
+            "the reason must name the fact that widened the run: {reason}",
+        );
+    }
+
+    #[test]
+    fn a_dependent_package_is_tested_when_only_its_dependency_changed() {
+        // app -> core. Changing core must run app's tests too: the reverse
+        // path-dependency closure is what makes narrowing safe.
+        let metadata = br#"{"packages":[
+            {"name":"app","manifest_path":"/w/crates/app/Cargo.toml",
+             "targets":[{"kind":["lib"],"name":"app"}],
+             "dependencies":[{"name":"core","path":"/w/crates/core"}]},
+            {"name":"core","manifest_path":"/w/crates/core/Cargo.toml",
+             "targets":[{"kind":["lib"],"name":"core"}],
+             "dependencies":[]},
+            {"name":"unrelated","manifest_path":"/w/crates/unrelated/Cargo.toml",
+             "targets":[{"kind":["lib"],"name":"unrelated"}],
+             "dependencies":[]}
+        ],"workspace_root":"/w"}"#;
+        let workspace = Ok(CargoWorkspace::from_metadata_json(metadata).expect("metadata parses"));
+        let mut profile = test_rust_profile(true);
+        profile.cargo_root = Some(PathBuf::from("/w"));
+        profile.is_workspace = true;
+        let change_set = ChangeSet::new(
+            vec![ChangedPath {
+                path: "crates/core/src/lib.rs".to_string(),
+                status: FileStatus::Modified,
+                old_path: None,
+            }],
+            true,
+        );
+        let never_generated = |_: &str| false;
+        let decisions = decide(
+            Some(&change_set),
+            &ScopeInputs {
+                reviewed_tree: &ReviewedTree::Snapshot(PathBuf::from("/w")),
+                profile: &profile,
+                cargo_workspace: Some(&workspace),
+                is_generated: &never_generated,
+                classifier: &PathClassifier::strict(),
+            },
+        );
+
+        let mut config = create_test_config(true, false, true);
+        config.test_scope = Some(decisions.clone());
+        assert!(
+            matches!(
+                decisions.get(Ecosystem::Cargo),
+                ScopeDecision::ChangeScoped { .. }
+            ),
+            "a plain source edit inside a member is scopeable: {:?}",
+            decisions.cargo,
+        );
+        assert_eq!(
+            run_args(&planned(&config)),
+            [
+                "test",
+                "--all-targets",
+                "--no-fail-fast",
+                "-p",
+                "app",
+                "-p",
+                "core"
+            ],
+            "the dependent package must run, and `unrelated` must not",
+        );
+    }
 }
