@@ -37,12 +37,40 @@ jobs:
       - name: Run prview gate
         id: gate
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           runner_temp="${RUNNER_TEMP:-/tmp}"
           json_path="${runner_temp}/prview-gate.json"
 
+          # A push to the default branch checks out the pushed tip, so base
+          # auto-detection resolves main == target and reviews an empty change.
+          # Review the delivered range instead: the pre-push commit is the base,
+          # and --exact-base keeps it literal. Without it the base would be
+          # normalized to its merge-base with the tip, which equals the pre-push
+          # commit on a fast-forward but widens the review on a force-push.
+          gate_args=()
+          base_row="auto-detected, normalized to the merge-base"
+          if [ "$EVENT_NAME" != "push" ]; then
+            base_row="auto-detected (${EVENT_NAME} event), normalized to the merge-base"
+          elif [ -z "$PUSH_BEFORE" ] || [ -z "${PUSH_BEFORE//0/}" ]; then
+            base_row="auto-detected (new branch push, no pre-push commit), normalized to the merge-base"
+          elif ! git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            base_row="auto-detected (pre-push commit \`${PUSH_BEFORE}\` unavailable), normalized to the merge-base"
+          else
+            gate_args=(--base "$PUSH_BEFORE" --exact-base)
+            # The object is present (checked above), so this is a local lookup.
+            if git merge-base --is-ancestor "$PUSH_BEFORE" HEAD 2>/dev/null; then
+              push_shape="fast-forward push"
+            else
+              push_shape="force-push, so this is the delivered range, not the merge-base superset"
+            fi
+            base_row="\`${PUSH_BEFORE}\` (pre-push commit), exact range \`${PUSH_BEFORE}..HEAD\` (${push_shape})"
+          fi
+
           set +e
-          ./target/release/prview gate --json > "$json_path"
+          ./target/release/prview gate "${gate_args[@]}" --json > "$json_path"
           status=$?
           set -e
 
@@ -84,6 +112,7 @@ jobs:
             echo "|---|---|"
             echo "| Mode | shadow / non-strict |"
             echo "| Decision source | exit code only |"
+            echo "| Base | ${base_row} |"
             echo "| Exit code | \`${status}\` |"
             echo "| Result | ${result} |"
             if [ -n "$verdict" ]; then

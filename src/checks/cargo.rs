@@ -14,6 +14,12 @@ use std::path::{Path, PathBuf};
 
 const MAX_CARGO_CONFIG_BYTES: u64 = 1024 * 1024;
 
+/// `cargo geiger` compiles the crate graph to reach it and is routinely slower
+/// than the default check timeout, so it carries its own. Named rather than
+/// inlined at the call site: a bare `600` next to `CHECK_TIMEOUT_SECS` and
+/// `TEST_TIMEOUT_SECS` reads as an accident.
+const GEIGER_TIMEOUT_SECS: u64 = 600;
+
 pub struct CargoCheck;
 pub struct ClippyCheck;
 pub struct CargoTestCheck;
@@ -2068,7 +2074,14 @@ impl Check for CargoGeigerCheck {
         }
 
         let args = &["geiger", "--output-format", "Ratio"];
-        let output = match run_command_with_timeout_and_env("cargo", args, cwd, 600, &run.env).await
+        let output = match run_command_with_timeout_and_env(
+            "cargo",
+            args,
+            cwd,
+            GEIGER_TIMEOUT_SECS,
+            &run.env,
+        )
+        .await
         {
             Ok(output) => output,
             Err(err) if super::is_timeout_error(&err) => {

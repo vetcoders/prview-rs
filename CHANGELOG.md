@@ -13,6 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `prview gate --base <REF>` reviews the current checkout against an explicit
+  branch, tag, or commit SHA instead of the auto-detected
+  `develop`/`main`/`master` base. An explicit base that does not resolve exits
+  `3` with an error naming the ref, rather than silently reviewing an empty
+  change. `docs/gate-playbook.md` documents passing `github.event.before` on CI
+  `push` events.
+- `prview gate --base <REF> --exact-base` reviews `<REF>..HEAD` literally
+  instead of normalizing the base to its merge-base with the target. Merge-base
+  normalization is the three-dot review model and stays the default for every
+  base; it is wrong for one question only ("what did this push deliver?")
+  because on a force-push the pre-push commit is no longer an ancestor of the
+  new tip, so normalization would review
+  `merge-base(before, after)..after`, a different and larger range. The flag
+  requires `--base` and affects only the requested base. When the range really
+  was rewritten — the flag is in force and the pinned base is not an ancestor of
+  the target — `PR_REVIEW.md` and `REVIEW_SUMMARY.md` state that once beside the
+  base, so a reader knows why the file list can carry a change no listed commit
+  made; it is a statement about range semantics, not a caveat, and touches no
+  verdict or quality signal. `Gate Shadow` (`.github/workflows/gate.yml`) passes
+  the flag on `push` events and records the range mode, including whether the
+  push was a force-push, in its job summary.
 - Test scope is decided from the change and reported. A new `checks/scope.rs`
   decides, per ecosystem, whether a change requires the whole test suite or a
   narrower run, and publishes the answer as the additive `scope` object on the
@@ -61,6 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Library API: `prview::GateArgs` gains the public fields `base` and
+  `exact_base`, and `prview::Config` gains the public fields `required_base` and
+  `required_base_exact`; code that constructs either with a struct literal must
+  set the new fields. `prview::git::Repository::resolve_diff_bases` takes
+  `&Config` in place of its trailing `quiet: bool`, since the range mode is read
+  from the same runtime state as `quiet`. This is source-incompatible for
+  library consumers, so the next release is a minor version bump.
 - `install.sh` is fail-closed. It installs an official release binary or it
   installs nothing: the `cargo install` fallback is gone, along with every code
   path that could build, compile, or clone on the user's machine. `latest` is
@@ -86,6 +114,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `prview gate --base <REF>` is pinned to a commit before the review starts. The
+  review opens with `git fetch --quiet --prune origin`, and base resolution drops
+  a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch
+  had been deleted was pruned away mid-run: the review lost its base, reviewed an
+  empty change, and passed. The resolved commit id is handed to the review
+  instead of the ref name, and a pinned base that is still missing when the review
+  resolves its bases exits `3` naming the ref the caller typed, rather than
+  reporting a verdict. Pack headers are unaffected by the pin: `PR_REVIEW.md`,
+  `AI_INDEX.md` and `report.json` keep the ref as it was written and now show the
+  reviewed commit beside it.
+- Annotated tags used as a base or target now resolve to the tagged commit.
+  Ref resolution returned the tag object's id, so merge-base and diff lookups
+  failed with a git error (for example `prview gate --base v0.8.0`). A ref that
+  does not point to a commit, such as a tree or blob id, is reported as
+  unresolvable.
+- This repository's `Gate Shadow` workflow now reviews the change a push
+  delivered. On a push to `main` the gate auto-detected `main` as the base while
+  `main` was also the checked-out target, so it reviewed an empty change. Push
+  runs now pass the pre-push commit (`github.event.before`) as `--base`, falling
+  back to auto-detection for new-branch pushes or an unavailable pre-push commit;
+  the job summary records which base was used. Pull request and manual runs are
+  unchanged.
+- The check progress line reported the STAGE's wall clock as the running
+  check's elapsed time, so `Running: Vitest (2000s)` could mean a Vitest
+  admitted thirty seconds ago behind half an hour of queue. Combined with a
+  bare `Queued:` list, an ordinary `--resource-budget safe` run — one permit,
+  fair-FIFO, every check admitted one at a time by design — read as a hang, and
+  operators aborted healthy runs. Each running check now reports its own
+  elapsed time, measured from admission (`Running: Vitest (312s)`), and the
+  queue states that it is waiting on run resources
+  (`Queued: waiting for run resources — Cargo check, Clippy`) without claiming
+  which one, since a queued cargo check may be held by the shared `target/`
+  lock rather than the machine budget. No timeout is printed beside the
+  counter: elapsed runs from admission while the timeouts run from command
+  spawn, and checks that probe first (Pytest, `cargo geiger`) would otherwise
+  render impossible pairs such as `931s/900s`. The resource contract itself is
+  unchanged: same budget, same weights, same child-worker caps.
 - The curl installer no longer silently substitutes a locally compiled binary
   for an official one. Previously a failed download, a missing artifact, or an
   unsupported platform fell through to `cargo install prview --locked --force`,

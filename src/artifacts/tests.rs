@@ -1547,7 +1547,7 @@ async fn artifact_pipeline_diffs_from_merge_base_when_base_advanced() {
     let resolved_bases = repo
         .resolve_bases(&app.config)
         .expect("resolve bases after run");
-    let diff_bases = repo.resolve_diff_bases(&resolved_target, &resolved_bases, true);
+    let diff_bases = repo.resolve_diff_bases(&app.config, &resolved_target, &resolved_bases);
     assert_eq!(
         diff_bases.first().map(|base| base.commit_id.as_str()),
         Some(merge_base.as_str())

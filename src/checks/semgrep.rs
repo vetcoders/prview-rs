@@ -1176,7 +1176,7 @@ mod tests {
         let repo = Repository::open(tmp.path()).expect("open repo");
         let resolved_target = repo.resolve_target(&config).expect("resolve target");
         let resolved_bases = repo.resolve_bases(&config).expect("resolve bases");
-        let diff_bases = repo.resolve_diff_bases(&resolved_target, &resolved_bases, true);
+        let diff_bases = repo.resolve_diff_bases(&config, &resolved_target, &resolved_bases);
 
         assert_eq!(
             merge_base_for_baseline(&repo, &config, &resolved_target)
@@ -1218,7 +1218,7 @@ mod tests {
         let resolved_target = repo.resolve_target(&config).expect("resolve target");
         assert_eq!(resolved_target.commit_id, target);
         let resolved_bases = repo.resolve_bases(&config).expect("resolve bases");
-        let diff_bases = repo.resolve_diff_bases(&resolved_target, &resolved_bases, true);
+        let diff_bases = repo.resolve_diff_bases(&config, &resolved_target, &resolved_bases);
         assert_eq!(
             diff_bases.first().map(|base| base.commit_id.as_str()),
             Some(captured_base.as_str()),

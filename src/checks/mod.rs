@@ -496,7 +496,8 @@ struct RunBoard {
 
 struct BoardEntry {
     name: String,
-    /// When the check was admitted by the governor; `None` while it waits.
+    /// When the check was admitted and its own clock started; `None` while it
+    /// is still waiting for a resource the run holds.
     started_at: Option<std::time::Instant>,
 }
 
@@ -551,22 +552,57 @@ impl RunBoard {
 
     /// The progress line's payload — `None` when nothing is outstanding.
     ///
-    /// `elapsed_secs` is the stage's wall clock, unchanged from before the
-    /// governor: it answers "how long have I been waiting for this stage", which
-    /// is the question the operator staring at the line is asking.
-    fn progress_line(&self, elapsed_secs: u64) -> Option<String> {
-        let running = self.names_where(true);
+    /// Every number on this line belongs to the check it is printed next to.
+    /// The counter used to be the STAGE's wall clock rendered once after the
+    /// running names, so `Running: Vitest (2000s)` could mean a Vitest admitted
+    /// thirty seconds ago behind half an hour of queue. Under the default
+    /// `safe` budget — one permit, fair-FIFO — that is the normal shape of a
+    /// run, and the line read as a hang. Each running check now reports its own
+    /// elapsed time, measured from the moment it was admitted.
+    ///
+    /// It reports NO cap beside that number, deliberately. A check's elapsed
+    /// time starts at admission, but the timeout that actually kills it
+    /// ([`CHECK_TIMEOUT_SECS`], [`TEST_TIMEOUT_SECS`], geiger's own) starts when
+    /// its COMMAND is spawned, and several checks probe first — Pytest runs a
+    /// bounded version probe, `Cargo geiger` a `cargo metadata` call. Pairing
+    /// the two would print `931s/900s` for a Pytest whose child still has time
+    /// left: a fresh lie in the opposite direction. Nor is there a whole-check
+    /// deadline to quote instead, because nothing enforces one. So the line
+    /// states only what it can prove — how long this check has been running —
+    /// and the caps stay where they are actually applied.
+    ///
+    /// The queue's wording is neutral for the same reason. [`admit_check`]
+    /// takes the cargo `target/` lock BEFORE the governor's budget, so an
+    /// unstarted cargo check may be waiting on that lock while permits sit
+    /// free; naming "the machine budget" would misattribute the wait. The board
+    /// knows that a check has not started and that the run holds what it needs
+    /// — not which of the two it is parked on — so it says exactly that.
+    ///
+    /// The literal tokens `Running:` and `Queued:` are contract —
+    /// `tools/bounded_runtime_acceptance.py` asserts the CLI shows both.
+    fn progress_line(&self, now: std::time::Instant) -> Option<String> {
+        let running: Vec<String> = self
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let started_at = entry.started_at?;
+                Some(format!(
+                    "{} ({}s)",
+                    entry.name,
+                    now.duration_since(started_at).as_secs(),
+                ))
+            })
+            .collect();
         let queued = self.names_where(false);
         let mut parts = Vec::new();
         if !running.is_empty() {
-            parts.push(format!(
-                "Running: {} ({}s)",
-                running.join(", "),
-                elapsed_secs
-            ));
+            parts.push(format!("Running: {}", running.join(", ")));
         }
         if !queued.is_empty() {
-            parts.push(format!("Queued: {}", queued.join(", ")));
+            parts.push(format!(
+                "Queued: waiting for run resources — {}",
+                queued.join(", ")
+            ));
         }
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
@@ -753,7 +789,9 @@ async fn run_all_checks(
             print!(
                 "  {} {}",
                 "●".blue(),
-                lock_board(&board).progress_line(0).unwrap_or_default()
+                lock_board(&board)
+                    .progress_line(std::time::Instant::now())
+                    .unwrap_or_default()
             );
             let _ = std::io::stdout().flush();
         }
@@ -789,8 +827,8 @@ async fn run_all_checks(
             })
             .collect();
 
-        // Elapsed timer — ticks every second on the progress line
-        let start = std::time::Instant::now();
+        // Redraw timer — ticks every second so each running check's own elapsed
+        // time stays current on the progress line.
         let mut timer = tokio::time::interval(tokio::time::Duration::from_secs(1));
         timer.tick().await; // consume immediate first tick
 
@@ -831,7 +869,7 @@ async fn run_all_checks(
 
                         // Show the updated progress line if checks remain
                         if let Some(line) =
-                            lock_board(&board).progress_line(start.elapsed().as_secs())
+                            lock_board(&board).progress_line(std::time::Instant::now())
                         {
                             print!("  {} {}", "●".blue(), line);
                             let _ = std::io::stdout().flush();
@@ -870,7 +908,6 @@ async fn run_all_checks(
 
                 _ = timer.tick(), if emit && !lock_board(&board).is_empty() => {
                     let now = std::time::Instant::now();
-                    let elapsed = start.elapsed().as_secs();
                     let board = lock_board(&board);
                     // PV-18: when a check has been RUNNING past a soft threshold,
                     // print a one-time note naming it and how to bail. Measured
@@ -892,8 +929,8 @@ async fn run_all_checks(
                             board.names_where(true).join(", "),
                         );
                     }
-                    // Update elapsed time on the progress line
-                    if let Some(line) = board.progress_line(elapsed) {
+                    // Refresh each running check's own elapsed time.
+                    if let Some(line) = board.progress_line(now) {
                         print!("\r\x1b[2K  {} {}", "●".blue(), line);
                         let _ = std::io::stdout().flush();
                     }
@@ -4624,7 +4661,8 @@ test result: ok. 2 passed; 0 failed
             .acquire(crate::governor::Weight::Heavy)
             .await
             .expect("budget");
-        lock_board(&board).mark_running("Admitted", std::time::Instant::now());
+        let now = std::time::Instant::now();
+        lock_board(&board).mark_running("Admitted", now - Duration::from_secs(12));
 
         let waiter = {
             let governor = Arc::clone(&governor);
@@ -4641,9 +4679,12 @@ test result: ok. 2 passed; 0 failed
             assert_eq!(board.names_where(true), vec!["Admitted"]);
             assert_eq!(board.names_where(false), vec!["Waiting"]);
             let line = board
-                .progress_line(12)
+                .progress_line(now)
                 .expect("two outstanding checks produce a line");
-            assert_eq!(line, "Running: Admitted (12s) · Queued: Waiting");
+            assert_eq!(
+                line, "Running: Admitted (12s) · Queued: waiting for run resources — Waiting",
+                "the counter is the admitted check's own clock, and the queue says it is waiting",
+            );
         }
 
         drop(hog);
@@ -4655,6 +4696,222 @@ test result: ok. 2 passed; 0 failed
             lock_board(&board).names_where(false),
             Vec::<&str>::new(),
             "an admitted check leaves the queue",
+        );
+    }
+
+    /// The Vista report, reproduced without a single real tool.
+    ///
+    /// Under the default `safe` plan the governor holds ONE permit and tokio's
+    /// semaphore is fair-FIFO, so every other check — light ones included —
+    /// queues behind whatever got in first. That is the contract working, and
+    /// the run genuinely takes as long as the sum of its parts. What made it
+    /// look broken was the line: a stage wall clock printed as the running
+    /// check's elapsed time, and a bare "Queued:" that reads as "stuck".
+    ///
+    /// This drives the same admission path `run_all_checks` uses — one Heavy
+    /// check parked on a signal while the rest wait — and asserts what the
+    /// operator sees.
+    #[tokio::test]
+    async fn a_serialized_safe_run_reports_its_own_clock_and_names_the_wait() {
+        use async_trait::async_trait;
+
+        struct Mock(&'static str, Weight);
+
+        #[async_trait]
+        impl Check for Mock {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+            fn resource_weight(&self) -> Weight {
+                self.1
+            }
+            async fn run(&self, _config: &Config) -> Result<CheckResult> {
+                unreachable!("only admission and the board are under test")
+            }
+        }
+
+        // The `safe` plan: one permit for the whole machine.
+        let governor = Arc::new(ResourceGovernor::with_budget(1, 1));
+        let cargo_lock = Arc::new(Semaphore::new(1));
+        let names = ["Vitest", "TypeScript", "ESLint", "Stylelint"];
+        let board = Arc::new(std::sync::Mutex::new(RunBoard::new(names.into_iter())));
+
+        // "Vitest" wins the single permit and holds it, as a running test suite
+        // would; the release signal replaces a real process exiting.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let blocker = {
+            let governor = Arc::clone(&governor);
+            let cargo_lock = Arc::clone(&cargo_lock);
+            let board = Arc::clone(&board);
+            tokio::spawn(async move {
+                let check = Mock("Vitest", Weight::Heavy);
+                let (_started_at, _admission) =
+                    admit_check(&check, &cargo_lock, &governor, &board).await?;
+                let _ = released.await;
+                Ok::<_, Cancelled>(())
+            })
+        };
+        // Give the blocker the permit before the rest ask for it, so the queue
+        // order is the dispatch order and the assertions are deterministic.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lock_board(&board).names_where(true).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the blocker must take the single permit");
+
+        let waiters: Vec<_> = names[1..]
+            .iter()
+            .copied()
+            .map(|name| {
+                let governor = Arc::clone(&governor);
+                let cargo_lock = Arc::clone(&cargo_lock);
+                let board = Arc::clone(&board);
+                tokio::spawn(async move {
+                    let check = Mock(name, Weight::Light);
+                    admit_check(&check, &cargo_lock, &governor, &board)
+                        .await
+                        .map(|_| ())
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        {
+            let mut board = lock_board(&board);
+            // Pin the admitted check's clock so the rendered line is exact
+            // rather than a function of how fast the test host scheduled it.
+            let now = std::time::Instant::now();
+            board.mark_running("Vitest", now - Duration::from_secs(312));
+
+            assert_eq!(
+                board.names_where(true),
+                vec!["Vitest"],
+                "one permit admits exactly one check, whatever its weight",
+            );
+            assert_eq!(
+                board.names_where(false),
+                vec!["TypeScript", "ESLint", "Stylelint"],
+                "light checks are NOT exempt from a fair-FIFO single-permit budget",
+            );
+
+            // The queued checks own no clock at all: nothing has started for
+            // them to have been slow at.
+            assert_eq!(
+                board.longest_running_secs(now),
+                Some(312),
+                "the only clock on the board belongs to the admitted check",
+            );
+
+            let line = board.progress_line(now).expect("outstanding checks");
+            assert!(
+                line.starts_with("Running: Vitest (312s)"),
+                "the running check reports its own elapsed time, not the stage clock: {line}",
+            );
+            assert!(
+                line.contains("Queued: waiting for run resources — TypeScript, ESLint, Stylelint"),
+                "the queue has to say it is waiting, without guessing on what: {line}",
+            );
+            for queued in &names[1..] {
+                assert!(
+                    !line.contains(&format!("{queued} (")),
+                    "a queued check must not be given an elapsed time: {line}",
+                );
+            }
+        }
+
+        let _ = release.send(());
+        blocker
+            .await
+            .expect("blocker must not panic")
+            .expect("the blocker was admitted");
+        for waiter in waiters {
+            waiter
+                .await
+                .expect("waiter must not panic")
+                .expect("a released permit drains the queue");
+        }
+        assert!(
+            lock_board(&board).names_where(false).is_empty(),
+            "every check is admitted once the budget frees up",
+        );
+    }
+
+    /// The rendering itself, over a fabricated board: no governor, no tasks.
+    #[test]
+    fn the_progress_line_reports_only_what_the_board_can_prove() {
+        let now = std::time::Instant::now();
+
+        assert_eq!(
+            RunBoard::new(std::iter::empty::<&str>()).progress_line(now),
+            None,
+            "an empty board has nothing to report",
+        );
+
+        // Everything admitted: no queue clause at all, one clock per check.
+        let mut all_running = RunBoard::new(["Cargo check", "Cargo test"].into_iter());
+        all_running.mark_running("Cargo check", now - Duration::from_secs(41));
+        all_running.mark_running("Cargo test", now - Duration::from_secs(612));
+        assert_eq!(
+            all_running.progress_line(now).as_deref(),
+            Some("Running: Cargo check (41s), Cargo test (612s)"),
+            "a balanced budget runs several checks and each carries its own clock",
+        );
+
+        // Mixed: the running clause keeps dispatch order, the queue says it waits.
+        let mut mixed = RunBoard::new(["Clippy", "ESLint"].into_iter());
+        mixed.mark_running("Clippy", now - Duration::from_secs(7));
+        assert_eq!(
+            mixed.progress_line(now).as_deref(),
+            Some("Running: Clippy (7s) · Queued: waiting for run resources — ESLint"),
+        );
+
+        // The stage is old, the check is young: the bug this line had.
+        let mut fresh = RunBoard::new(["Vitest"].into_iter());
+        fresh.mark_running("Vitest", now - Duration::from_secs(30));
+        assert_eq!(
+            fresh.progress_line(now).as_deref(),
+            Some("Running: Vitest (30s)"),
+            "a check admitted 30s ago reports 30s, however long the stage has been open",
+        );
+    }
+
+    /// A check's elapsed time and its command timeout do not start at the same
+    /// instant, so the line must not present them as a ratio.
+    ///
+    /// `Pytest` is admitted, runs a bounded version probe (30s cap), and only
+    /// then spawns the command that `TEST_TIMEOUT_SECS` applies to. A Pytest
+    /// 931s past admission can therefore still be 900s-capped and perfectly
+    /// healthy — its child has been up for 901s at most. Printing
+    /// `931s/900s` would claim the process is over a limit it has not reached:
+    /// the same class of lie as the stage clock, pointing the other way.
+    ///
+    /// There is no honest denominator to substitute either. No code enforces a
+    /// whole-check deadline, so "probe budget + command cap" would be a number
+    /// nothing kills the check at. The board prints the one quantity it owns.
+    #[test]
+    fn elapsed_past_a_command_cap_is_reported_plainly_not_as_an_impossible_ratio() {
+        let now = std::time::Instant::now();
+
+        let mut board = RunBoard::new(["Pytest", "Cargo geiger"].into_iter());
+        // 931s since admission: 30s of probe plus 901s of a 900s-capped command.
+        board.mark_running("Pytest", now - Duration::from_secs(931));
+        // 661s since admission: 60s of `cargo metadata` plus 601s of a 600s cap.
+        board.mark_running("Cargo geiger", now - Duration::from_secs(661));
+
+        let line = board.progress_line(now).expect("two admitted checks");
+        assert_eq!(
+            line, "Running: Pytest (931s), Cargo geiger (661s)",
+            "elapsed is stated on its own; no cap is quoted beside it",
+        );
+        assert!(
+            !line.contains('/'),
+            "the line must never pair admission-relative elapsed with a \
+             command-relative cap: {line}",
         );
     }
 
@@ -4828,8 +5085,8 @@ test result: ok. 2 passed; 0 failed
             "nothing admitted, so nothing has been running for any time at all",
         );
         assert_eq!(
-            board.progress_line(90).as_deref(),
-            Some("Queued: Queued only"),
+            board.progress_line(now).as_deref(),
+            Some("Queued: waiting for run resources — Queued only"),
             "a line with nothing admitted claims nothing is running",
         );
 

@@ -74,6 +74,8 @@ prview gate
 prview gate --strict
 prview gate --strict --fail-on-warnings
 prview gate --json
+prview gate --base origin/main
+prview gate --base "$GIT_PUSH_BEFORE" --exact-base
 ```
 
 `prview gate` runs the standard fast gate profile, consumes the existing
@@ -92,8 +94,19 @@ the verdict, `enforcement_disposition`, caveats, blocking issues, and artifact
 paths. Only a schema 2.3 or 3.x pack with typed warning proof can use the warnings-only
 strict exception; older or malformed packs remain strict-rejected.
 
-Local pre-push hook recipes and the recommended Shadow -> Warn -> Block rollout
-are in [`docs/gate-playbook.md`](gate-playbook.md).
+`--base <REF>` replaces base auto-detection (`develop`/`main`/`master`) with an
+explicit branch, tag, or commit; an unresolvable explicit base exits `3`.
+
+`--exact-base` (which requires `--base`) reviews `<REF>..HEAD` literally instead
+of normalizing the base to its merge-base with the target. Normalization is the
+default for every base and is what makes a review match GitHub's three-dot
+"Files changed" view; `--exact-base` is for the one caller that asks "what did
+this push deliver?", where a force-push makes the merge-base range a different,
+larger range than the push produced.
+
+Local pre-push hook recipes, base selection for CI `push` events, and the
+recommended Shadow -> Warn -> Block rollout are in
+[`docs/gate-playbook.md`](gate-playbook.md).
 
 #### Gate profile and measured pre-push budget
 
@@ -163,6 +176,17 @@ separated `args`. Under `strict: "true"` every `CONDITIONAL` is rejected while
 typed warnings-only remains successful; set `fail-on-warnings: "true"` to
 require a warning-clean pack as well.
 
+On `push` events the checkout is the pushed tip, so a push to the default
+branch auto-detects that branch as its own base and reviews an empty change.
+Pass the pre-push commit through `args`
+(`--base ${{ github.event.before }} --exact-base`, guarded to push events);
+`--exact-base` keeps a force-push reviewed as the range it delivered. Both flags
+require a prview runtime newer than `0.8.0`, so they do not work with the
+`version: "0.8.0"` example above — the Action ref
+itself needs no bump, since it just forwards `args`. The guarded example,
+version requirement, and edge cases are in
+[`docs/gate-playbook.md#choosing-the-base`](gate-playbook.md#choosing-the-base).
+
 The Action prefers `cargo-binstall` when that binary is already available on the
 runner and falls back to `cargo install prview --locked --force`. The base gate
 exists from `0.6.0`; typed warnings-only enforcement and the
@@ -198,6 +222,35 @@ prview feature/x main
 `prview` defaults to `--resource-budget safe`: at most one whole-machine tool
 runs at a time and supported descendant pools receive one worker. This is the
 recommended setting for ordinary developer machines.
+
+Under `safe` the budget is a single permit and admission is fair-FIFO, so
+**every check runs one at a time, light ones included** — a check that has not
+been admitted is waiting for the machine, not stuck. On a large repository the
+whole stage therefore takes roughly the sum of its checks, and a long `--deep`
+run is the contract working rather than a hang.
+
+The progress line reports this directly:
+
+```
+● Running: Vitest (312s) · Queued: waiting for run resources — Cargo check, Clippy, TypeScript
+```
+
+- the counter after each running check is **that check's own elapsed time**,
+  measured from the moment the run admitted it. It is not the stage wall clock,
+  so a large number means that check has genuinely been working that long;
+- no timeout is quoted beside it, deliberately. A check's clock starts at
+  admission, but the timeout that kills it starts when its command is spawned,
+  and some checks probe first (Pytest runs a bounded version probe,
+  `cargo geiger` a `cargo metadata` call). Printing the two as a ratio would
+  show impossible values such as `931s/900s` for a check whose command is still
+  inside its limit;
+- under `balanced` several checks can be running at once and each carries its
+  own counter;
+- queued checks have not started, so they have no elapsed time of their own,
+  and the "still running after Ns" notice ignores them for the same reason. The
+  wait is stated without guessing its cause: a queued check may be waiting for a
+  machine-budget permit or, in the cargo family, for the shared `target/` lock,
+  and the line does not claim to know which.
 
 `--resource-budget balanced` is an explicit throughput opt-in. It still admits
 at most two capped heavy parents and never creates more parent permits than the

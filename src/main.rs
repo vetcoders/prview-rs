@@ -70,9 +70,16 @@ fn display_error(err: &anyhow::Error) {
         eprintln!("  {} {cause}", "caused by:".yellow());
     }
 
-    // Contextual hints based on error message content
+    // Contextual hints based on error message content. An error that embeds a
+    // user-supplied ref would match on the ref's name, not on the failure.
     let msg = format!("{err:?}").to_lowercase();
-    let hint = if msg.contains("repository") || msg.contains("git") {
+    let hint = if err.downcast_ref::<UnresolvableGateBase>().is_some()
+        || err
+            .downcast_ref::<prview::git::MissingRequiredBase>()
+            .is_some()
+    {
+        None
+    } else if msg.contains("repository") || msg.contains("git") {
         Some("make sure you're running prview from inside a git repository")
     } else if msg.contains("permission") || msg.contains("denied") {
         Some("check file permissions on ~/.prview/")
@@ -337,6 +344,8 @@ async fn supervised_config_result(cli: &Cli) -> Result<Result<Config>> {
 }
 
 async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
+    // Before config loading: `Config::from_cli` resolves `--pr` through GitHub.
+    ensure_gate_base_is_unambiguous(cli, args)?;
     let mut run_cli = cli.clone();
     run_cli.command = None;
     run_cli.quick = true;
@@ -353,6 +362,11 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     // `gate` forces `ci = false` and derives its exit from the gate contract, so
     // the `--ci`-scoped warnings escape hatch must not leak into it.
     run_cli.fail_on_warnings = false;
+    // An explicit gate base replaces base auto-detection; the target stays the
+    // current checkout.
+    if let Some(base) = &args.base {
+        run_cli.bases = vec![base.clone()];
+    }
 
     let mut config = supervised_config(&run_cli).await?;
     let enforcement_mode = prview::policy::engine::EnforcementMode::from_gate_flags(
@@ -360,7 +374,10 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
         args.fail_on_warnings,
     );
     config.apply_gate_profile(enforcement_mode);
-    let app = App::from_config(config)?;
+    let mut app = App::from_config(config)?;
+    if let Some(base) = &args.base {
+        pin_explicit_gate_base(&mut app, base, args.exact_base)?;
+    }
     let governor = app.governor();
     let report =
         with_cancellation_after_commit_if(app.run(), &governor, CtrlC, |report| !report.unchanged)
@@ -384,6 +401,77 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
     }
 
     Ok(summary.exit_code)
+}
+
+/// `--pr` makes `Config::from_cli` replace the bases with the pull request's
+/// base, which would silently discard an explicit `--base`. Clap already
+/// rejects top-level flags before a subcommand (`args_conflicts_with_subcommands`),
+/// so this guards the gate path itself rather than today's parser.
+fn ensure_gate_base_is_unambiguous(cli: &Cli, args: &GateArgs) -> Result<()> {
+    if args.base.is_some() && cli.pr.is_some() {
+        // Worded to avoid the keywords `display_error` turns into hints.
+        bail!("gate --base cannot be combined with --pr: the pull request defines its own base");
+    }
+    Ok(())
+}
+
+/// An explicit gate base that names no commit. Typed so `display_error` does not
+/// derive a hint from keywords inside the user's ref name (e.g. `remote-fix`).
+#[derive(Debug)]
+struct UnresolvableGateBase {
+    base: String,
+}
+
+impl std::fmt::Display for UnresolvableGateBase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gate base '{}' does not resolve to a commit \
+             (make sure the ref exists locally, or pass an existing branch, tag, or commit SHA)",
+            self.base
+        )
+    }
+}
+
+impl std::error::Error for UnresolvableGateBase {}
+
+/// Pin an explicit gate base to the commit it names, before the run starts.
+///
+/// Two failures are closed here. The first is a base that names nothing: the
+/// review resolves bases leniently, so an unknown ref is dropped with a warning
+/// the quiet gate suppresses, leaving an empty change that would pass. The gate
+/// fails to execute (exit 3) instead of approving a review of nothing.
+///
+/// The second is a base that stops naming the same thing mid-run. `App::run`
+/// begins with `git fetch --quiet --prune origin`, which deletes
+/// remote-tracking refs whose upstream branch is gone — so `--base
+/// origin/feature` can resolve here and be gone by the time the run resolves it,
+/// with the same silent-empty-review result. Prune removes refs, never objects,
+/// so the run is handed the commit id rather than the caller's ref name: a
+/// pinned object cannot be pruned out from under it. The id is also recorded in
+/// [`Config::required_base`], which makes the run's own resolution fail loud if
+/// the pin still fails to survive it, and which keeps the caller's spelling for
+/// the error message.
+///
+/// `exact` carries `--exact-base` into the run. Diff bases are otherwise
+/// normalized to their merge-base with the target, which is right for the
+/// three-dot review model and wrong for the one question a push asks: on a
+/// force-push the pre-push commit is not an ancestor of the new tip, so
+/// normalization would review `merge-base(before, after)..after` — a wider range
+/// than the push delivered. Set, it keeps this base pinned exactly as resolved.
+fn pin_explicit_gate_base(app: &mut App, base: &str, exact: bool) -> Result<()> {
+    let base_error = || UnresolvableGateBase {
+        base: base.to_string(),
+    };
+    let resolved = app
+        .repo
+        .resolve_bases(&app.config)
+        .with_context(base_error)?;
+    let pinned = resolved.into_iter().next().ok_or_else(base_error)?;
+    app.config.bases = vec![pinned.commit_id.clone()];
+    app.config.required_base = Some(pinned);
+    app.config.required_base_exact = exact;
+    Ok(())
 }
 
 fn print_gate_summary(summary: &prview::gate::GateJsonOutput) {
@@ -847,6 +935,38 @@ async fn run_mcp_command(args: &McpArgs) -> Result<()> {
         prview::mcp::probe(args.json).await
     } else {
         prview::mcp::serve().await
+    }
+}
+
+#[cfg(test)]
+mod gate_base_tests {
+    use super::*;
+
+    fn gate_args(base: Option<&str>) -> GateArgs {
+        GateArgs {
+            strict: false,
+            fail_on_warnings: false,
+            json: true,
+            base: base.map(str::to_string),
+            exact_base: false,
+        }
+    }
+
+    #[test]
+    fn explicit_gate_base_conflicts_with_pr() {
+        let mut cli = Cli::parse_from(["prview"]);
+        cli.pr = Some(42);
+
+        let err = ensure_gate_base_is_unambiguous(&cli, &gate_args(Some("main")))
+            .expect_err("--base with --pr must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "gate --base cannot be combined with --pr: the pull request defines its own base"
+        );
+        assert!(ensure_gate_base_is_unambiguous(&cli, &gate_args(None)).is_ok());
+
+        cli.pr = None;
+        assert!(ensure_gate_base_is_unambiguous(&cli, &gate_args(Some("main"))).is_ok());
     }
 }
 

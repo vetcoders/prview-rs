@@ -128,7 +128,11 @@ The full flag reference is always one command away: `prview --help`. A written g
 Deep reviews use a conservative whole-machine resource contract by default:
 one expensive tool and one supported child worker at a time. The preflight names
 the effective budget, expensive checks, and schedule; `balanced` remains capped
-and falls back to `safe` under load.
+and falls back to `safe` under load. Because `safe` admits one check at a time,
+a big repository's check stage is serialized by design — the progress line
+reports each running check's own elapsed time and says that the rest are
+waiting on run resources. See
+[`docs/usage.md`](docs/usage.md#resource-budget) for the full contract.
 
 On Unix, cancellation and timeout cleanup also follows live PPID ancestry when
 a tool descendant leaves its inherited process group with `setsid` or
@@ -198,6 +202,17 @@ currently published `v0.8.0` Action/runtime, which carries the typed
 warnings-only contract and the Action's `fail-on-warnings` input. Set
 `fail-on-warnings: "true"` alongside `strict: "true"` to require a
 warning-clean pack as well.
+
+On `push` events the gate auto-detects the base from `develop`, `main`, and
+`master`, so a push to the default branch ends up comparing that branch with
+itself and reviews an empty change unless you pass the pre-push commit with
+`--base`. Add `--exact-base` there: a base is otherwise normalized to its
+merge-base with the target, which is the pre-push commit itself on an ordinary
+push but widens the review past what a force-push delivered. Both flags need a
+prview runtime newer than `0.8.0` — set the Action's `version` input (or
+whatever release you install) accordingly; the Action ref itself can stay
+pinned, since it just forwards `args`. See
+[`docs/gate-playbook.md#choosing-the-base`](docs/gate-playbook.md#choosing-the-base).
 
 GitHub code scanning accepts SARIF uploads through
 `github/codeql-action/upload-sarif`. Keep SARIF under GitHub's ingestion limits:
