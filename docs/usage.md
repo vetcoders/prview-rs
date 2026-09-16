@@ -405,8 +405,13 @@ A local `prview --pr N --deep` stays change-scoped. `--ci --full-tests` is legal
 and simply names the operator as the one who asked. `prview gate` is unaffected:
 the gate profile runs no tests at all.
 
-**Reading it in the pack.** Every `Cargo test` / `Vitest` row in `RUN.json`,
-`report.json` and `MERGE_GATE.json` carries a `scope` object: `mode`
+**Reading it in the pack.** Every `Cargo test` / `Vitest` row **with an executed
+result** in `RUN.json`, `report.json` and `MERGE_GATE.json` carries a `scope`
+object. A check that never ran at all — disabled by a preset, ruled out by the
+profile, missing its tool — is listed as a pre-flight skip and carries no
+`scope`: there is no command to describe, and a decision alone is not one.
+
+The object holds `mode`
 (`full` or `change-scoped`), the `reason`, how many inputs were considered, how
 many units were selected out of what universe — Cargo counts packages, Vitest
 counts the test files its reporter collected — and the `selector`, the exact
