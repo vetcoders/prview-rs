@@ -623,6 +623,16 @@ def assert_mixed(
         "related" in vitest_selector and "src/math.js" in vitest_selector,
         f"Vitest selector does not name the related selection: {vitest_selector!r}",
     )
+    # Contract §7: Vitest counts TEST FILES, and the fixture has exactly one
+    # importing `src/math.js`. Counting the changed source instead would happen
+    # to give 1 here too, so the selector above (one source) and this count
+    # (one test file) are asserted as the separate facts they are.
+    add_assertion(
+        violations,
+        vitest_scope.get("selected") == 1,
+        f"Vitest selected {vitest_scope.get('selected')!r} test files, not the 1 "
+        "that imports the changed source",
+    )
     vitest_command = gate_command(pack, "tests")
     add_assertion(
         violations,
@@ -671,6 +681,12 @@ def assert_js_only(
         violations,
         vitest_scope.get("mode") == "change-scoped",
         f"Vitest scope mode is {vitest_scope.get('mode')!r}, not change-scoped",
+    )
+    add_assertion(
+        violations,
+        vitest_scope.get("selected") == 1,
+        f"Vitest selected {vitest_scope.get('selected')!r} test files, not the 1 "
+        "that imports the changed source",
     )
     vitest_command = gate_command(pack, "tests")
     add_assertion(

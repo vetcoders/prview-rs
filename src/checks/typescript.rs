@@ -186,6 +186,17 @@ fn read_vitest_execution(path: &Path) -> std::result::Result<VitestExecution, St
     })
 }
 
+/// A finished Vitest run, as the check reads it.
+struct VitestVerdict {
+    status: CheckStatus,
+    output: String,
+    /// Test files the reporter says it collected, for a narrowed run whose
+    /// report could be read. `None` for a full run (nothing narrowed, nothing
+    /// to count) and for a narrowed run whose report is missing or unreadable —
+    /// which is the same thing as not knowing.
+    collected: Option<usize>,
+}
+
 /// Turn a finished Vitest run into a verdict.
 ///
 /// `report_path` is `Some` exactly for a narrowed run. For that run the exit
@@ -202,16 +213,22 @@ fn classify_vitest_outcome(
     success: bool,
     selected_inputs: usize,
     combined: &str,
-) -> (CheckStatus, String) {
+) -> VitestVerdict {
     let Some(report_path) = report_path else {
         // A full run: the exit code is the whole verdict, exactly as before.
-        return if success {
-            (CheckStatus::Passed, combined.to_string())
-        } else {
-            (CheckStatus::Failed, combined.to_string())
+        return VitestVerdict {
+            status: if success {
+                CheckStatus::Passed
+            } else {
+                CheckStatus::Failed
+            },
+            output: combined.to_string(),
+            collected: None,
         };
     };
-    match read_vitest_execution(report_path) {
+    let execution = read_vitest_execution(report_path);
+    let collected = execution.as_ref().ok().map(|execution| execution.results);
+    let (status, output) = match execution {
         // Nothing was collected and nothing ran: the narrowing was correct and
         // this change has no related test (contract §8.1).
         Ok(execution) if execution.total_suites == 0 && execution.results == 0 => (
@@ -255,6 +272,38 @@ fn classify_vitest_outcome(
                  missing): {detail}\n{combined}"
             ),
         ),
+    };
+    VitestVerdict {
+        status,
+        output,
+        collected,
+    }
+}
+
+/// The executed scope a narrowed run publishes once its reporter has spoken.
+///
+/// Contract §7 counts SELECTED UNITS, and for Vitest a unit is a TEST FILE —
+/// not a changed source file, which is an input to the selector. The plan can
+/// only count inputs, because which test files they pull in is a property of
+/// the import graph that Vitest resolves at run time; so the planned count is
+/// replaced by the reporter's once the run is over.
+///
+/// A report that could not be read leaves nothing proven, and therefore nothing
+/// counted: `selected: 0` beside a non-null selector, on a row the classifier
+/// has already turned into an `Error`. The selector itself is never rewritten —
+/// it is what was asked for, and that did not change.
+fn published_executed_scope(
+    planned: Option<crate::checks::scope::ExecutedScope>,
+    collected: Option<usize>,
+) -> Option<crate::checks::scope::ExecutedScope> {
+    match planned {
+        Some(crate::checks::scope::ExecutedScope::ChangeScoped { selector, .. }) => {
+            Some(crate::checks::scope::ExecutedScope::ChangeScoped {
+                selected: collected.unwrap_or(0),
+                selector,
+            })
+        }
+        other => other,
     }
 }
 
@@ -843,12 +892,14 @@ impl Check for VitestCheck {
             Some(crate::checks::scope::ExecutedScope::ChangeScoped { selected, .. }) => *selected,
             _ => 0,
         };
-        let (status, output_text) = classify_vitest_outcome(
+        let verdict = classify_vitest_outcome(
             report.as_ref().map(|report| report.path.as_path()),
             output.status.success(),
             selected_inputs,
             &combined,
         );
+
+        let executed_scope = published_executed_scope(executed_scope, verdict.collected);
 
         let js_runner = if which::which("pnpm").is_ok() {
             "pnpm exec"
@@ -858,9 +909,9 @@ impl Check for VitestCheck {
         let cmd_str = format!("{} vitest {}", js_runner, args.join(" "));
         Ok(CheckResult {
             name: self.name().to_string(),
-            status,
+            status: verdict.status,
             duration: start.elapsed(),
-            output: output_text,
+            output: verdict.output,
             cached: false,
             provenance: Some(
                 CheckProvenance {
@@ -1426,15 +1477,24 @@ src/styles/app.css
         let dir = tempfile::tempdir().expect("temp dir");
         let report = vitest_report_file(dir.path(), 0, 0, 0);
 
-        let (status, output) = classify_vitest_outcome(
+        let verdict = classify_vitest_outcome(
             Some(&report),
             true,
             2,
             "No test files found, exiting with code 0\n",
         );
 
-        assert_eq!(status, CheckStatus::Skipped);
-        assert!(output.starts_with(crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE));
+        assert_eq!(verdict.status, CheckStatus::Skipped);
+        assert!(
+            verdict
+                .output
+                .starts_with(crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE)
+        );
+        assert_eq!(
+            verdict.collected,
+            Some(0),
+            "a skip after a real run selected no test file, and says so",
+        );
     }
 
     #[test]
@@ -1444,15 +1504,24 @@ src/styles/app.css
         let dir = tempfile::tempdir().expect("temp dir");
         let report = vitest_report_file(dir.path(), 3, 7, 2);
 
-        let (status, output) = classify_vitest_outcome(
+        let verdict = classify_vitest_outcome(
             Some(&report),
             true,
             2,
             "stdout: No test files found\n Test Files  2 passed (2)\n",
         );
 
-        assert_eq!(status, CheckStatus::Passed);
-        assert!(!output.contains(crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE));
+        assert_eq!(verdict.status, CheckStatus::Passed);
+        assert!(
+            !verdict
+                .output
+                .contains(crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE)
+        );
+        assert_eq!(
+            verdict.collected,
+            Some(2),
+            "the published selection counts the test files the reporter collected",
+        );
     }
 
     #[test]
@@ -1463,12 +1532,19 @@ src/styles/app.css
         let dir = tempfile::tempdir().expect("temp dir");
         let missing = dir.path().join("vitest-scope.json");
 
-        let (status, output) = classify_vitest_outcome(Some(&missing), true, 2, "all good\n");
+        let verdict = classify_vitest_outcome(Some(&missing), true, 2, "all good\n");
 
-        assert_eq!(status, CheckStatus::Error);
+        assert_eq!(verdict.status, CheckStatus::Error);
         assert!(
-            output.contains("could not verify that the narrowed Vitest run executed any test"),
-            "the error must say what could not be verified: {output}",
+            verdict
+                .output
+                .contains("could not verify that the narrowed Vitest run executed any test"),
+            "the error must say what could not be verified: {}",
+            verdict.output,
+        );
+        assert_eq!(
+            verdict.collected, None,
+            "an unreadable report counts nothing, rather than counting its inputs",
         );
     }
 
@@ -1478,21 +1554,72 @@ src/styles/app.css
         let path = dir.path().join("vitest-scope.json");
         std::fs::write(&path, "{ not json").expect("write report");
 
-        let (status, _) = classify_vitest_outcome(Some(&path), true, 1, "");
+        let verdict = classify_vitest_outcome(Some(&path), true, 1, "");
 
-        assert_eq!(status, CheckStatus::Error);
+        assert_eq!(verdict.status, CheckStatus::Error);
     }
 
     #[test]
     fn a_full_run_is_still_classified_by_its_exit_code_alone() {
         assert_eq!(
-            classify_vitest_outcome(None, true, 0, "No test files found\n").0,
+            classify_vitest_outcome(None, true, 0, "No test files found\n").status,
             CheckStatus::Passed,
         );
         assert_eq!(
-            classify_vitest_outcome(None, false, 0, "boom\n").0,
+            classify_vitest_outcome(None, false, 0, "boom\n").status,
             CheckStatus::Failed,
         );
+    }
+
+    /// Contract §7: for Vitest the selected unit is a test file. The plan can
+    /// only name the changed sources it hands to `vitest related`; how many test
+    /// files those pull in is the reporter's answer, and it is the one the pack
+    /// publishes.
+    #[test]
+    fn the_published_selection_counts_test_files_not_changed_sources() {
+        use crate::checks::scope::ExecutedScope;
+
+        let planned = || {
+            Some(ExecutedScope::ChangeScoped {
+                selected: 3,
+                selector: "related --run src/a.ts src/b.ts src/c.ts".to_string(),
+            })
+        };
+
+        assert_eq!(
+            published_executed_scope(planned(), Some(1)),
+            Some(ExecutedScope::ChangeScoped {
+                selected: 1,
+                selector: "related --run src/a.ts src/b.ts src/c.ts".to_string(),
+            }),
+            "three changed sources can import a single test file",
+        );
+        assert_eq!(
+            published_executed_scope(planned(), Some(0)),
+            Some(ExecutedScope::ChangeScoped {
+                selected: 0,
+                selector: "related --run src/a.ts src/b.ts src/c.ts".to_string(),
+            }),
+            "a run that collected nothing selected nothing, and keeps its selector",
+        );
+        assert_eq!(
+            published_executed_scope(planned(), None),
+            Some(ExecutedScope::ChangeScoped {
+                selected: 0,
+                selector: "related --run src/a.ts src/b.ts src/c.ts".to_string(),
+            }),
+            "an unreadable report proves no selection, and must not publish the input count",
+        );
+
+        let escalated = Some(ExecutedScope::Full {
+            reason: "manifest or lockfile changed: package-lock.json".to_string(),
+        });
+        assert_eq!(
+            published_executed_scope(escalated.clone(), Some(7)),
+            escalated,
+            "a full run has no selection to count",
+        );
+        assert_eq!(published_executed_scope(None, Some(7)), None);
     }
 
     #[test]
@@ -1500,9 +1627,9 @@ src/styles/app.css
         let dir = tempfile::tempdir().expect("temp dir");
         let report = vitest_report_file(dir.path(), 1, 1, 1);
 
-        let (status, _) = classify_vitest_outcome(Some(&report), false, 1, "1 failed\n");
+        let verdict = classify_vitest_outcome(Some(&report), false, 1, "1 failed\n");
 
-        assert_eq!(status, CheckStatus::Failed);
+        assert_eq!(verdict.status, CheckStatus::Failed);
     }
 
     #[test]

@@ -512,6 +512,15 @@ review), and the counters in it are the witness:
 Zero executed tests is never green, and an unverified run is never green either.
 A full `vitest run` is unchanged and still classified by its exit code alone.
 
+The same report settles the published `selected` count. Each ecosystem counts in
+its own unit — Cargo in workspace packages, Vitest in TEST FILES the reporter
+collected — and only Vitest's is unknowable before the run: the plan can name the
+changed sources it hands to `vitest related`, but which test files those pull in
+is a property of the import graph the tool resolves at run time. So the planned
+count is replaced by the reporter's (`testResults.len()`) once the run is over,
+and an unreadable report publishes `0` rather than the input count. The selector
+is never rewritten: it is what was asked for.
+
 **The report describes what ran, not what was decided.** `CheckProvenance`
 carries an additive `executed_scope`, written by the check itself, and
 `mode: "change-scoped"` is published only against that evidence. A scopeable

@@ -43,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already ran the whole suite keeps running it without changing its invocation;
   narrowing is for the reviewer's machine, and a local `--deep` stays narrowed.
   `prview gate` is unaffected, because the gate profile runs no tests.
+- Vitest's published `selected` count is test files, not changed sources.
+  Contract §7 counts selected units, and a Vitest unit is a test file; the count
+  now comes from the run's JSON reporter (`testResults`) instead of from the
+  number of changed source files handed to `vitest related`. A narrowed run
+  whose reporter could not be read publishes `0`, because nothing was proven
+  collected. Cargo still counts workspace packages, and the `selector` is
+  unchanged in both.
 - An empty test selection publishes its own proof. A `Cargo test` / `Vitest`
   row that runs nothing because the change has no related test now records
   provenance with `command: "<no command recorded>"` and

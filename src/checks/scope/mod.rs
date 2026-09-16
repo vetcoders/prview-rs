@@ -271,8 +271,10 @@ pub enum ExecutedScope {
     NothingSelected,
     /// A narrowed suite ran.
     ChangeScoped {
-        /// How many units the selector named: packages for Cargo, source files
-        /// for Vitest.
+        /// How many units the run selected, each ecosystem in its own unit:
+        /// packages for Cargo, test files the reporter collected for Vitest.
+        /// Vitest's count is knowable only after the run, so it is written from
+        /// the reporter rather than from the selector's inputs.
         selected: usize,
         /// The selection fragment of the command line, VERBATIM. Pinned by test
         /// to be a substring of `provenance.command`, so a reader can hold the

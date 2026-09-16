@@ -408,7 +408,8 @@ the gate profile runs no tests at all.
 **Reading it in the pack.** Every `Cargo test` / `Vitest` row in `RUN.json`,
 `report.json` and `MERGE_GATE.json` carries a `scope` object: `mode`
 (`full` or `change-scoped`), the `reason`, how many inputs were considered, how
-many units were selected out of what universe, and the `selector` — the exact
+many units were selected out of what universe — Cargo counts packages, Vitest
+counts the test files its reporter collected — and the `selector`, the exact
 fragment of the command line that narrowed the run. The selector is a substring
 of the `command` recorded in `20_quality/<gate>.result.json`, so the claim can be
 checked against the command itself. `mode` describes what RAN: a run that
