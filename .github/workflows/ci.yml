@@ -132,7 +132,9 @@ jobs:
   ordinary-machine-resource-acceptance:
     name: Ordinary-machine bounded deep review
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Three deep reviews of the fixture now, one per scope case, each with its
+    # own npm install and its own cargo/semgrep/vitest passes.
+    timeout-minutes: 60
     env:
       PRVIEW_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
@@ -175,6 +177,9 @@ jobs:
             --fixture "$GITHUB_WORKSPACE/tools/fixtures/bounded-runtime" \
             --receipt-dir "$PRVIEW_ACCEPTANCE_DIR" \
             --source-sha "$PRVIEW_SOURCE_SHA" \
+            --case mixed \
+            --case js-only \
+            --case unknown-input \
             --timeout-seconds 1200
       - name: Upload bounded-runtime receipt
         if: always()

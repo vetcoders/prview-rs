@@ -1,3 +1,11 @@
+# A two-member workspace on purpose: the change-scoped acceptance case needs a
+# package that NOTHING depends on, so a narrowed `cargo test` can be seen
+# leaving it out. `crates/unrelated` has exactly one test and no reverse
+# dependency, which makes `-p prview-bounded-runtime-fixture` a falsifiable
+# claim rather than a tautology on a single-member workspace.
+[workspace]
+members = ["crates/unrelated"]
+
 [package]
 name = "prview-bounded-runtime-fixture"
 version = "0.1.0"
