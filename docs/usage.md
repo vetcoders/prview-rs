@@ -367,6 +367,50 @@ explicit mutating `prview fix` command still invokes formatter/fixer toolchains
 synchronously and is not yet governed by `--resource-budget`; do not treat the
 review envelope as a product-wide cap for that separate command.
 
+### Change-scoped test runs
+
+prview decides, per ecosystem, how much of a test suite a change actually
+requires, and then runs exactly that:
+
+| What changed | `Cargo test` | `Vitest` |
+|---|---|---|
+| Rust source inside a workspace member | that package **and everything that depends on it**, as `-p <pkg>` arguments | unaffected |
+| JS/TS source | unaffected | `vitest related <changed files>` — the tests that import them, directly or transitively |
+| Nothing the suite covers | `Skipped`, `no tests related to the change` — no command runs | the same |
+| Anything the decision cannot account for | the full suite, with the reason published | the full suite, with the reason published |
+
+**Doubt always widens the run.** A manifest or lockfile, a build script, a test
+config, a deletion or rename, a file under `tools/` or `fixtures/`, more than one
+diff base, a file type neither selector can see — any of these runs everything
+and says which fact widened it. A narrowing is never a guess.
+
+**Blind spots, stated rather than hidden.** Vitest selects by the STATIC import
+graph: dynamic imports with computed paths, files read through `fs`, templates,
+JSON assets and env-driven branches are invisible to it. Cargo selects by package
+membership and path dependencies: a test that reaches another crate through a
+registry version, or reads a file with `include_str!`, is invisible the same way.
+Both are covered by the escalation rules above wherever the change touches
+something recognisable — but if your suite depends on data neither graph
+contains, `--full-tests` is the answer.
+
+`--full-tests` runs both suites in full regardless of the change, and the pack
+records `full test run requested (--full-tests)` as the reason. Nothing else
+changes: the same commands, the same caps.
+
+**Reading it in the pack.** Every `Cargo test` / `Vitest` row in `RUN.json`,
+`report.json` and `MERGE_GATE.json` carries a `scope` object: `mode`
+(`full` or `change-scoped`), the `reason`, how many inputs were considered, how
+many units were selected out of what universe, and the `selector` — the exact
+fragment of the command line that narrowed the run. The selector is a substring
+of the `command` recorded in `20_quality/<gate>.result.json`, so the claim can be
+checked against the command itself. `mode` describes what RAN: a run that
+escalated at execution time reports `full`, never `change-scoped`. A narrowed or
+skipped suite also adds an advisory line to `decision.review_caveats`; it never
+moves the verdict.
+
+An empty selection is reported as `change-scoped` with `selected: 0`, a null
+selector and a `skipped` row. It is never reported as a pass — no suite ran.
+
 ### Test selection
 
 `--tests-pattern PATTERN` is runner-aware rather than one portable regex:
@@ -381,6 +425,11 @@ A Mixed JS/Rust review runs both Vitest and Cargo with the same value, so the
 portable contract is their literal intersection. A regex-specific value makes
 the Cargo check `ERROR`; use a literal substring common to both runners, omit
 the shared selector, or run runner-specific test commands separately.
+
+`--tests-pattern` filters INSIDE whatever the scope decision selected; it never
+widens a narrowed run and never replaces the selection. On a change-scoped run
+the two compose: the packages or files come from the change, the pattern picks
+tests within them.
 
 A filtered Cargo run is `ERROR`, not `PASS`, unless standard libtest summaries
 prove that at least one selected test executed. This prevents both zero-match
@@ -460,6 +509,7 @@ prview --help
 | `--security-full` | Full security tier: runs full-tree Semgrep and adds cargo-geiger's unsafe scan (slow; off even under `--deep`) |
 | `--resource-budget safe\|balanced` | Select the whole-machine envelope (`safe` is the default; `balanced` is capped and load-aware) |
 | `--tests-pattern PATTERN` | Filter Vitest by regex or Cargo/libtest by literal substring; Mixed uses the literal intersection and Pytest remains unfiltered |
+| `--full-tests` | Run every test regardless of what changed, disabling change-scoped narrowing for this run |
 
 An explicit `--skip-security` disables Semgrep before tool discovery, including
 in quick review runs. This is separate from the heavy-security opt-in; an

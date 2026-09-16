@@ -34,7 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verdict or quality signal. `Gate Shadow` (`.github/workflows/gate.yml`) passes
   the flag on `push` events and records the range mode, including whether the
   push was a force-push, in its job summary.
-- Test scope is decided from the change and reported. A new `checks/scope.rs`
+- `--full-tests` runs every test regardless of what changed, disabling
+  change-scoped narrowing for that run. The pack states
+  `full test run requested (--full-tests)` as the reason, because a run that is
+  wider than the change requires is still a fact about what executed. The flag
+  short-circuits before any `cargo metadata`.
+- Test scope is decided from the change and reported. A new `checks/scope/`
   decides, per ecosystem, whether a change requires the whole test suite or a
   narrower run, and publishes the answer as the additive `scope` object on the
   owning check's row in `RUN.json`, `report.json` (schema `3.0` → `3.1`) and
@@ -73,15 +78,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `changed_paths`, `scope_non_participating` and
   `scope_non_participating_builtins`. All three are runtime-only state, kept on
   `Config` deliberately — the same established pattern as `pinned_target`,
-  `pinned_diff_bases` and `scan_dir_override`. The next release is a minor
-  version bump. **No user-facing behaviour changes yet:** every check still runs
-  exactly the command it ran before, so a scopeable decision is reported
-  honestly as `mode: "full"` with reason `scoped execution not enabled yet`.
-  Contract and rationale: `docs/architecture.md` ("How much of a test suite must
-  run").
+  `pinned_diff_bases` and `scan_dir_override`, joined in the same release by
+  `test_scope`, `operator_worktree_clean` and `full_tests`. The next release is a
+  minor version bump. Contract and rationale: `docs/architecture.md` ("How much
+  of a test suite must run").
 
 ### Changed
 
+- Test execution now obeys the scope decision. `Cargo test` appends `-p <pkg>`
+  for each selected package, before the optional positional test filter;
+  `Vitest` switches to `related --run --maxWorkers 1 --passWithNoTests <inputs>`.
+  A decision that selects nothing executes nothing at all and returns `Skipped`
+  with `no tests related to the change` — never a pass, since no suite ran — and
+  a narrowed Vitest run that finds no test file is `Skipped` for the same reason,
+  because `--passWithNoTests` makes that exit 0. A full decision runs exactly
+  the command it ran before, and `--tests-pattern` keeps filtering INSIDE the
+  selection. Escalation continues at runtime and stays one-directional: a
+  selector input missing from the reviewed tree, or a package name that cannot
+  be spelled on a command line, runs the full suite with the reason stated.
+  The decision is resolved once, immediately after the run's shared snapshot is
+  settled and before any check runs, and only when a gate that owns a test scope
+  is actually runnable.
+- The reported scope describes what EXECUTED. `CheckProvenance` carries an
+  additive `executed_scope` (`report.json` / `MERGE_GATE.json` stay schema 3.1;
+  all changes are additive), and `mode: "change-scoped"` is published only
+  against that evidence — a scopeable decision from a check that left none is
+  reported as `full` with `scoped execution not confirmed by the check`. The
+  published `selector` is a verbatim fragment of the command the check ran, and
+  `tools/validate_merge_gate.py` now rejects a `selector` beside `mode: "full"`
+  as well as a `selected` count, since either makes a pack contradict itself
+  about whether the whole suite ran.
+- A test gate skipped because the change touches nothing it covers no longer
+  blocks a merge in a repository that requires it. `Skipped` carrying prview's
+  own `no tests related to the change` is `Satisfied / Complete / Approve` — the
+  check applies to the repository but not to this change, proved by a
+  classification that escalates everything it cannot name. The row still reads
+  `skipped` with `outcome: skipped`; every other skip reason keeps its existing
+  policy outcome, including a missing tool, which still blocks.
+- A snapshot the ledger reports as dirty, or whose substrate cannot be
+  identified, now escalates to a full test run: the bytes the gates read are
+  then not the reviewed commit, and a selection drawn from a diff that does not
+  describe them would be a silent narrowing.
+- Test selection reads only the built-in half of the generated-output
+  predicate. Folding in the operator's `[lint] ignore_patterns` was harmless
+  while nothing narrowed; now it would silently stop testing a source file
+  because someone chose not to lint it.
 - Library API: `prview::GateArgs` gains the public fields `base` and
   `exact_base`, and `prview::Config` gains the public fields `required_base` and
   `required_base_exact`; code that constructs either with a struct literal must

@@ -105,12 +105,30 @@ statement.
 | `inputs` | integer \| null | Changed paths the decision took into account, escalation or not. `null` means ONLY "there was never a set to count" — it is not a synonym for `0` |
 | `selected` | integer \| null | Test files or packages selected. MUST be `null` when `mode` is `full`: a full run selected nothing, and a count there would read as coverage |
 | `universe` | integer \| null | The whole population the selection was drawn from, when knowable before the run |
-| `selector` | string \| null | The selector's actual arguments; `null` when no selector ran |
+| `selector` | string \| null | The fragment of the command line that narrowed the run, VERBATIM: `-p <pkg> [-p <pkg>…]` for Cargo, the whole `related …` argument line for Vitest. It is a substring of `command` in the check's `20_quality/<id>.result.json`. MUST be `null` when `mode` is `full`, and is `null` for an empty selection, which spawned no command at all |
 | `non_participating` | object[] | Additive, omitted when empty. Changed paths classified as NOT inputs to test selection, each as `{ path, rule }`. Both fields are required and non-empty: an entry that does not name its rule cannot be challenged, which is the whole point of publishing the list |
 
-`mode: "full"` with reason `scoped execution not enabled yet` is the honest
-state of a build that computes the decision but still runs every test. A pack
-must never state `change-scoped` for a run that executed the full command.
+A pack must never state `change-scoped` for a run that executed the full
+command. `mode` is a claim about a command that ran, not about a decision that
+was taken: it is published only against execution evidence the check itself
+left, so a scopeable decision from a check that did not narrow is reported as
+`full` with reason `scoped execution not confirmed by the check`, and a run that
+escalated at execution time reports `full` with the runtime reason. For the same
+reason a row for a check that never ran carries no `scope` at all — there is no
+command to describe.
+
+**An empty selection is a skip, never a pass.** `mode: "change-scoped"`,
+`selected: 0`, `selector: null`, on a row whose `status` is `skipped` and whose
+`outcome` is `skipped`, with `no tests related to the change` as the reason.
+That row does not block: the suite applies to the repository but not to this
+change, and the classification that proved it escalates anything it cannot name.
+It is never relabelled `passed` — no suite ran.
+
+**Caveats.** Every narrowed or skipped test run owes `decision.review_caveats`
+one advisory line, derived from the very `scope` objects published on the rows,
+so a caveat cannot describe a narrowing the rows do not show and a narrowed row
+cannot reach a reviewer uncaveated. Caveats are advisory: scope never moves a
+verdict.
 
 `inputs`, `selected` and `universe` are counts of files and packages, so they
 are integers or `null`; a fractional count is rejected outright, because "1.5 of
