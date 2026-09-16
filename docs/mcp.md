@@ -134,6 +134,15 @@ MCP lifecycle contract.
 | `repo` | yes | Absolute path to the git repo to review. |
 | `base` | no | Base ref to diff against. Default: detected repo default branch (`origin/HEAD`, then `remote.origin.HEAD`); if detection fails, falls back to existing `develop` / `main` / `master` candidates and marks `base_fallback: true`. |
 | `profile` | no | `"quick"` (default) or `"deep"`. An unknown value is a fail-loud `run_failed`. |
+| `full_tests` | no | `false` (default) or `true`: run every test instead of the ones related to the change (the CLI's `--full-tests`). |
+
+**A review over MCP is change-scoped, including `deep`.** Both profiles run on
+the caller's machine, so prview narrows each ecosystem's test suite to what the
+change can affect and publishes the decision in the pack's `scope` objects; a
+`deep` review is deeper in everything else, not wider in tests. A caller whose
+change travels through a channel no import graph describes asks for the whole
+suite with `full_tests: true`, which passes `--full-tests` to the review and is
+published as `full test run requested (--full-tests)`.
 
 **`quick` is synchronous.** It blocks until the pack is written, under a hard
 **120-second budget**. Exceeding the budget runs bounded whole-tree containment

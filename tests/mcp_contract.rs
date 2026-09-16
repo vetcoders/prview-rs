@@ -703,6 +703,51 @@ fn mcp_initialize_and_lists_six_tools() {
     }
 }
 
+/// Contract §9: a review over MCP narrows its test suites like any local run,
+/// and a caller who needs everything has to be able to say so. The argument is
+/// optional and defaults to false, so every existing client keeps working.
+#[test]
+fn run_review_offers_the_full_tests_argument() {
+    let mut s = McpSession::start(&[]);
+    let tools = s.list_tools();
+    let run_review = tools["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|tool| tool["name"].as_str() == Some("run_review"))
+        .expect("run_review is published");
+
+    let schema = &run_review["inputSchema"];
+    let full_tests = &schema["properties"]["full_tests"];
+    assert!(
+        !full_tests.is_null(),
+        "run_review must publish a full_tests argument: {schema}"
+    );
+    let declared_type = full_tests["type"].as_str();
+    assert!(
+        declared_type == Some("boolean")
+            || full_tests["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|t| t.as_str() == Some("boolean"))),
+        "full_tests must be a boolean: {full_tests}"
+    );
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|i| i.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !required.contains(&"full_tests"),
+        "full_tests must stay optional: {schema}"
+    );
+    assert!(
+        run_review["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("full_tests"),
+        "the tool description must tell a caller the argument exists: {run_review}"
+    );
+}
+
 #[test]
 fn health_without_repo_has_null_deps_repo() {
     let mut s = McpSession::start(&[]);

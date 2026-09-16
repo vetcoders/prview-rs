@@ -473,6 +473,7 @@ pub async fn start(
     repo: &Path,
     base: Option<String>,
     profile: Profile,
+    full_tests: bool,
 ) -> Result<serde_json::Value, ToolError> {
     // A durable RUNNING.json marker must name one process incarnation, not
     // merely a recyclable PID. Refuse before taking a lock or spawning the
@@ -523,6 +524,13 @@ pub async fn start(
         run_dir.to_string_lossy().to_string(),
         profile.cli_flag().to_string(),
     ];
+    // Contract §9: a review over MCP runs on the caller's machine, so it narrows
+    // its test suites like any local run. The caller who knows this change
+    // travels through a channel no import graph describes asks for everything
+    // explicitly, with the same flag an operator would use.
+    if full_tests {
+        args.push("--full-tests".to_string());
+    }
     args.extend(positional_args(repo, &selection));
 
     match profile {

@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already ran the whole suite keeps running it without changing its invocation;
   narrowing is for the reviewer's machine, and a local `--deep` stays narrowed.
   `prview gate` is unaffected, because the gate profile runs no tests.
+- MCP `run_review` accepts `full_tests: bool` (default `false`), which passes
+  `--full-tests` to the review. A review over MCP runs on the caller's machine
+  and narrows its test suites like any local run, `deep` included; the argument
+  is how a caller asks for the whole suite anyway.
 - `PR_REVIEW.md` and `REVIEW_SUMMARY.md` state the test scope in prose
   (contract §7): a `## Test Scope` section with one sentence per scope-owning
   check that ran, rendered from the same `ScopeReport` the gate rows publish.
