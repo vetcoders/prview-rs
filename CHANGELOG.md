@@ -247,6 +247,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limit. On a cold cache after a `Cargo.lock` change, compilation alone took
   almost four minutes and the timed step failed before any test ran; the
   limit now covers only the test run, which takes a few seconds.
+- The `ordinary-machine-resource-acceptance` CI job installed the Rust
+  toolchain with `dtolnay/rust-toolchain` and no `components`, so `Clippy`
+  failed in ~0.1s for a missing component and `Rustfmt` was skipped for a
+  missing `cargo-fmt` — an environmental false signal that downgraded the
+  acceptance verdict to `CONDITIONAL` on every run. The step now requests
+  `components: clippy, rustfmt`, and `tools/bounded_runtime_acceptance.py`
+  requires both checks to have their own live, non-cached `passed` row in
+  `RUN.json`, matching the other six required checks.
 
 ## [0.8.0] - 2026-09-13
 
