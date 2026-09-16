@@ -79,6 +79,71 @@ class CommandCensusTests(unittest.TestCase):
         self.assertEqual(MODULE.observed_cargo_test_commands(census), [])
 
 
+class CargoShimTests(unittest.TestCase):
+    """The shim is the complete record; the census is only a sample of one."""
+
+    def test_recognises_a_test_run_by_its_subcommand(self) -> None:
+        census = {
+            "cargo_invocations": [
+                "test --all-targets --no-fail-fast -p core",
+                "+nightly test --lib",
+            ]
+        }
+
+        self.assertEqual(len(MODULE.shim_cargo_test_invocations(census)), 2)
+
+    def test_ignores_other_subcommands_and_flags_that_say_test(self) -> None:
+        census = {
+            "cargo_invocations": [
+                "clippy --all-targets --tests",
+                "check --tests",
+                "metadata --no-deps --frozen",
+                "",
+            ]
+        }
+
+        self.assertEqual(MODULE.shim_cargo_test_invocations(census), [])
+
+    def test_the_shim_execs_the_real_cargo_and_logs_every_invocation(self) -> None:
+        import os
+        import subprocess
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        work = pathlib.Path(temp.name)
+        real_dir = work / "bin"
+        real_dir.mkdir()
+        real = real_dir / "cargo"
+        real.write_text("#!/bin/sh\nprintf 'real cargo: %s\\n' \"$*\"\n", encoding="utf-8")
+        real.chmod(0o755)
+        env = {"PATH": str(real_dir)}
+
+        log = MODULE.install_cargo_shim(work, env)
+
+        self.assertIsNotNone(log)
+        completed = subprocess.run(
+            ["cargo", "test", "-p", "core"],
+            env={**os.environ, "PATH": env["PATH"]},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("real cargo: test -p core", completed.stdout)
+        census = {"cargo_invocations": MODULE.cargo_shim_invocations(log)}
+        self.assertEqual(census["cargo_invocations"], ["test -p core"])
+        self.assertEqual(
+            MODULE.shim_cargo_test_invocations(census), ["test -p core"]
+        )
+
+    def test_a_missing_log_reads_as_no_evidence(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        missing = pathlib.Path(temp.name) / "cargo-invocations.log"
+
+        self.assertEqual(MODULE.cargo_shim_invocations(missing), [])
+        self.assertEqual(MODULE.cargo_shim_invocations(None), [])
+
+
 class RowHelperTests(unittest.TestCase):
     def test_reads_the_named_row_and_its_scope(self) -> None:
         run = {
@@ -129,10 +194,17 @@ class EmptySelectionAssertionTests(unittest.TestCase):
                 ],
             },
         }
-        return run, gate, {"observed_commands": set()}
+        census = {
+            "observed_commands": set(),
+            "truncated": False,
+            # The shim saw cargo run — just never `cargo test`. An empty log
+            # would mean the shim was not on PATH, which proves nothing.
+            "cargo_invocations": ["check --all-targets", "clippy --all-targets"],
+        }
+        return run, gate, census
 
     def pack_with_vitest_command(self, command: str) -> pathlib.Path:
-        """A minimal pack carrying the command the Vitest gate really spawned."""
+        """A minimal pack carrying the commands the gates really spawned."""
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         pack = pathlib.Path(temp.name)
@@ -140,6 +212,9 @@ class EmptySelectionAssertionTests(unittest.TestCase):
         quality.mkdir(parents=True, exist_ok=True)
         (quality / "tests.result.json").write_text(
             json.dumps({"command": command}), encoding="utf-8"
+        )
+        (quality / "cargo_test.result.json").write_text(
+            json.dumps({"command": MODULE.NO_COMMAND_RECORDED}), encoding="utf-8"
         )
         return pack
 
@@ -187,6 +262,59 @@ class EmptySelectionAssertionTests(unittest.TestCase):
         MODULE.assert_js_only(violations, run, gate, pack, census)
 
         self.assertTrue(any("no JSON reporter" in item for item in violations))
+
+    def test_rejects_a_cargo_test_run_the_shim_recorded(self) -> None:
+        # The shim is the complete record: every cargo invocation passes through
+        # it, so a `cargo test` line there refutes the skip outright.
+        run, gate, census = self.passing_inputs()
+        census["cargo_invocations"].append("test --all-targets --no-fail-fast")
+        violations: list[str] = []
+
+        MODULE.assert_js_only(violations, run, gate, self.narrowed_vitest_pack(), census)
+
+        self.assertTrue(any("cargo test was invoked" in item for item in violations))
+
+    def test_rejects_a_silent_shim(self) -> None:
+        # No recorded invocation at all means the shim never reached PATH. Its
+        # silence is then absence of evidence, and must not read as proof.
+        run, gate, census = self.passing_inputs()
+        census["cargo_invocations"] = []
+        violations: list[str] = []
+
+        MODULE.assert_js_only(violations, run, gate, self.narrowed_vitest_pack(), census)
+
+        self.assertTrue(
+            any("cannot witness anything" in item for item in violations)
+        )
+
+    def test_rejects_a_truncated_census(self) -> None:
+        # The census stops recording at its cap. An absence read off a partial
+        # set is not an absence, so the case fails instead of passing.
+        run, gate, census = self.passing_inputs()
+        census["truncated"] = True
+        violations: list[str] = []
+
+        MODULE.assert_js_only(violations, run, gate, self.narrowed_vitest_pack(), census)
+
+        self.assertTrue(
+            any("cannot witness an absence" in item for item in violations)
+        )
+
+    def test_rejects_a_pack_that_published_a_command_for_the_skip(self) -> None:
+        # The pack has to tell the same story: a gate that ran nothing records
+        # no command.
+        run, gate, census = self.passing_inputs()
+        pack = self.narrowed_vitest_pack()
+        (pack / "20_quality" / "cargo_test.result.json").write_text(
+            json.dumps({"command": "cargo test --all-targets"}), encoding="utf-8"
+        )
+        violations: list[str] = []
+
+        MODULE.assert_js_only(violations, run, gate, pack, census)
+
+        self.assertTrue(
+            any("not '<no command recorded>'" in item for item in violations)
+        )
 
     def test_rejects_a_blocking_gate_row(self) -> None:
         run, gate, census = self.passing_inputs()

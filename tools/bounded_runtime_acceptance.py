@@ -356,6 +356,12 @@ def sample_owned_tree(root_pid: int, census: dict[str, Any]) -> None:
         # sampler keeps them (bounded, so a long run cannot grow unboundedly).
         if len(census["observed_commands"]) < MAX_OBSERVED_COMMANDS:
             census["observed_commands"].add(command)
+        elif command not in census["observed_commands"]:
+            # The cap is reached and this command was dropped. Every claim of
+            # the form "no such process existed" is now unprovable from the
+            # census, and the assertions that make it must fail rather than
+            # pass on an incomplete set.
+            census["truncated"] = True
         tool = tool_by_pid.get(pid)
         if tool:
             active_tools.add(tool)
@@ -515,6 +521,8 @@ def add_assertion(violations: list[str], condition: bool, message: str) -> None:
 CARGO_TEST_CHECK = "Cargo test"
 VITEST_CHECK = "Vitest"
 NO_TESTS_RELATED = "no tests related to the change"
+# What a check publishes as its `command` when it spawned no process at all.
+NO_COMMAND_RECORDED = "<no command recorded>"
 
 
 def check_row(document: dict[str, Any] | None, name: str) -> dict[str, Any]:
@@ -536,6 +544,67 @@ def gate_command(pack: pathlib.Path, gate_id: str) -> str:
     result = read_json(pack / "20_quality" / f"{gate_id}.result.json") or {}
     command = result.get("command")
     return command if isinstance(command, str) else ""
+
+
+def install_cargo_shim(work: pathlib.Path, env: dict[str, str]) -> pathlib.Path | None:
+    """Put a logging `cargo` in front of PATH; return the log it writes.
+
+    The census samples the process table every 50ms, which can only ever say
+    "we did not happen to see it". This shim is the other kind of evidence: a
+    `cargo` that every invocation must pass through, so its log is a complete
+    record of what ran rather than a sample of it.
+
+    The real cargo is resolved BEFORE the shim reaches PATH — `which` would
+    otherwise find the shim and it would exec itself forever. Resolution keeps
+    whatever `cargo` the machine uses, rustup proxy included: the proxy execs
+    the toolchain binary directly and never re-resolves the name, so the shim
+    dispatches exactly as an unshimmed run would. `exec` also means the shim
+    leaves no extra process in the tree, so descendant counts and the
+    `CARGO_BUILD_JOBS` census read the same processes with the same
+    environment they always did.
+    """
+    real = shutil.which("cargo", path=env.get("PATH"))
+    if real is None:
+        return None
+    shim_dir = work / "cargo-shim"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    log = work / "cargo-invocations.log"
+    shim = shim_dir / "cargo"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {json.dumps(str(log))}\n"
+        f"exec {json.dumps(str(real))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    env["PATH"] = f"{shim_dir}{os.pathsep}{env.get('PATH', '')}"
+    return log
+
+
+def cargo_shim_invocations(log: pathlib.Path | None) -> list[str]:
+    """Every `cargo` argument line the shim recorded, in order."""
+    if log is None or not log.exists():
+        return []
+    return [
+        line.strip()
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+
+
+def shim_cargo_test_invocations(census: dict[str, Any]) -> list[str]:
+    """The recorded invocations that are `cargo test`, by subcommand."""
+    found = []
+    for invocation in census.get("cargo_invocations") or []:
+        parts = invocation.split()
+        # The subcommand is the first non-flag word: `cargo +nightly test` and
+        # `cargo test` are both a test run, `cargo clippy --tests` is not.
+        subcommand = next(
+            (part for part in parts if not part.startswith(("-", "+"))), None
+        )
+        if subcommand == "test":
+            found.append(invocation)
+    return found
 
 
 def observed_cargo_test_commands(census: dict[str, Any]) -> list[str]:
@@ -603,6 +672,23 @@ def assert_mixed(
         violations,
         "-p prview-bounded-runtime-unrelated" not in cargo_command,
         f"the narrowed command still tested the unrelated package: {cargo_command!r}",
+    )
+    # Same claim, from the other side: the shim records every cargo invocation,
+    # so the narrowed test run has to appear there exactly as the pack describes
+    # it. The pack says what prview believes it ran; this says what ran.
+    shimmed = shim_cargo_test_invocations(census)
+    add_assertion(
+        violations,
+        any("-p prview-bounded-runtime-fixture" in invocation for invocation in shimmed),
+        f"the cargo shim recorded no narrowed test run: {shimmed}",
+    )
+    add_assertion(
+        violations,
+        all(
+            "-p prview-bounded-runtime-unrelated" not in invocation
+            for invocation in shimmed
+        ),
+        f"a cargo test run reached the unrelated package: {shimmed}",
     )
 
     vitest = check_row(run, VITEST_CHECK)
@@ -722,13 +808,41 @@ def assert_js_only(
         cargo_scope.get("selector") is None,
         f"an empty selection published a selector: {cargo_scope.get('selector')!r}",
     )
-    # The decisive one: an empty selection must cost nothing. A `cargo test`
-    # process anywhere in the tree would mean the suite ran and the row lied.
+    # The decisive one: an empty selection must cost nothing. The canonical
+    # witness is the `cargo` shim every invocation passes through — a complete
+    # record, unlike the process census, which can only say what it happened to
+    # sample. The shim must have recorded SOMETHING (this review runs Cargo
+    # check and Clippy), or it was not on PATH and its silence proves nothing.
+    add_assertion(
+        violations,
+        bool(census.get("cargo_invocations")),
+        "the cargo shim recorded no invocation at all, so it cannot witness anything",
+    )
+    shimmed = shim_cargo_test_invocations(census)
+    add_assertion(
+        violations,
+        not shimmed,
+        f"cargo test was invoked for an empty selection: {shimmed}",
+    )
+    # The process census corroborates it, and says so only while it is complete.
+    add_assertion(
+        violations,
+        not census.get("truncated"),
+        "the process census hit its command cap, so it cannot witness an absence",
+    )
     stray = observed_cargo_test_commands(census)
     add_assertion(
         violations,
         not stray,
         f"a cargo test process ran for an empty selection: {stray}",
+    )
+    # The pack must tell the same story: no command recorded for the gate that
+    # ran nothing, in the very artifact a reader would check.
+    cargo_command = gate_command(pack, "cargo_test")
+    add_assertion(
+        violations,
+        cargo_command == NO_COMMAND_RECORDED,
+        f"the skipped Cargo test gate published {cargo_command!r}, not {NO_COMMAND_RECORDED!r}",
     )
 
     gate_cargo = check_row(gate, CARGO_TEST_CHECK)
@@ -975,6 +1089,8 @@ def evaluate(
         "review_caveats": ((gate or {}).get("decision") or {}).get("review_caveats"),
         "verdict": ((gate or {}).get("decision") or {}).get("verdict"),
         "cargo_test_processes": observed_cargo_test_commands(census),
+        "cargo_invocations": census.get("cargo_invocations") or [],
+        "census_truncated": bool(census.get("truncated")),
     }
     case["assert_scope"](violations, run, gate, pack, census)
 
@@ -1046,6 +1162,8 @@ def run_case(args: argparse.Namespace, case_name: str) -> dict[str, Any]:
         },
         "seen_tools": {tool: False for tool in WHOLE_MACHINE_TOOLS},
         "observed_commands": set(),
+        "truncated": False,
+        "cargo_invocations": [],
         "observed_caps": {
             "cargo_build_jobs": set(),
             "vitest_max_workers": set(),
@@ -1125,6 +1243,10 @@ def run_case(args: argparse.Namespace, case_name: str) -> dict[str, Any]:
             receipt["command"] = command
             env = os.environ.copy()
             env.update({"CI": "true", "NO_COLOR": "1"})
+            # Canonical evidence for "which cargo commands ran". Installed last,
+            # so PATH resolution for the real cargo happened against the
+            # machine's own PATH.
+            cargo_log = install_cargo_shim(work, env)
             with log_path.open("a", encoding="utf-8") as stream:
                 stream.write(f"$ {' '.join(command)}\n")
                 stream.flush()
@@ -1150,6 +1272,7 @@ def run_case(args: argparse.Namespace, case_name: str) -> dict[str, Any]:
                 else:
                     receipt["process"]["exit_code"] = process.wait()
                 receipt["process"]["wall_secs"] = round(time.monotonic() - started, 3)
+            census["cargo_invocations"] = cargo_shim_invocations(cargo_log)
             evaluate(receipt, census, pack, log_path, case)
     finally:
         error = sys.exc_info()[1]
