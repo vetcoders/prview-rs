@@ -731,6 +731,7 @@ mod tests {
                 finished_at: "2026-09-11T10:00:01+02:00".to_string(),
                 hard_fail_signatures: Vec::new(),
                 cache_key: None,
+                executed_scope: None,
             }),
         }
     }

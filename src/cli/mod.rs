@@ -241,6 +241,19 @@ pub struct Cli {
     )]
     pub tests_pattern: Option<String>,
 
+    /// Run every test the repository has, ignoring the change-scoped selection
+    #[arg(
+        long = "full-tests",
+        long_help = "Run the complete test suite for every ecosystem instead of the selection \
+                     derived from the change. prview narrows test execution to what the diff can \
+                     affect and escalates to a full run on its own whenever it cannot prove the \
+                     narrower set is sufficient; this flag is for the cases it cannot know about, \
+                     such as behaviour reached through a channel no import graph or package \
+                     manifest describes. The pack reports the run as scope mode 'full' with this \
+                     as the stated reason."
+    )]
+    pub full_tests: bool,
+
     /// PR URL to embed in artifact metadata (e.g. for traceability in RUN.json)
     #[arg(long = "pr-url", value_name = "URL")]
     pub pr_url: Option<String>,
@@ -658,6 +671,7 @@ mod tests {
             soft_exit: false,
             fail_on_warnings: false,
             tests_pattern: None,
+            full_tests: false,
             pr_url: None,
             policy_file: None,
             policy_mode: None,

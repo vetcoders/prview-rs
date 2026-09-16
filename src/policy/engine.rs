@@ -406,6 +406,25 @@ impl<'a> PolicyEngine<'a> {
                 AnalysisStatus::Complete,
                 MergeRecommendation::Approve,
             )
+        } else if is_no_tests_related_skip(reason) {
+            // Sibling of the profile branch, and deliberately as narrow. The
+            // check applies to this REPOSITORY but not to this CHANGE, and that
+            // is not an assumption: the scope decision proved it, through a
+            // classification in which anything unrecognised escalates to a full
+            // run instead of landing here. There is no gap in the evidence to
+            // report, because there was no test the change could have broken.
+            //
+            // The honesty of this branch rests entirely on that escalation and
+            // on where the reason comes from. It is produced by prview itself
+            // (`scope::NO_TESTS_RELATED_TO_THE_CHANGE`), never by a tool's
+            // output, so no third party can spell its way past a required gate.
+            // The row still reads `skipped` with `outcome: skipped` — a suite
+            // that never ran is never relabelled `passed` (contract §2.4).
+            (
+                PolicyConclusion::Satisfied,
+                AnalysisStatus::Complete,
+                MergeRecommendation::Approve,
+            )
         } else if severity == PolicySeverity::Block {
             if reason.contains("fast remote-only preset") && self.config.remote_only {
                 // Preserve the existing fast remote-only contract: the check is
@@ -498,6 +517,15 @@ impl<'a> PolicyEngine<'a> {
     }
 }
 
+/// Whether a skip reason is prview's own "this change has no related test".
+///
+/// Prefix-matched on the constant, the same shape as [`is_mode_skip_reason`]:
+/// the check may append how many inputs it considered, and that detail must not
+/// change the classification.
+fn is_no_tests_related_skip(reason: &str) -> bool {
+    reason.starts_with(crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE)
+}
+
 fn is_mode_skip_reason(reason: &str) -> bool {
     matches!(
         reason,
@@ -534,6 +562,7 @@ fn classify_skip_execution_state(reason: &str) -> CheckExecutionState {
     }
     if reason.starts_with("profile")
         || is_mode_skip_reason(reason)
+        || is_no_tests_related_skip(reason)
         || reason.contains("fast remote-only preset")
     {
         return CheckExecutionState::Skipped;

@@ -249,6 +249,12 @@ pub(crate) struct DashboardContextInput<'a> {
     /// contradictions have to reach it or those three surfaces stay silent about
     /// a disagreement `MERGE_GATE.json` names.
     provenance: &'a ProvenanceConsistency,
+    /// The run's test-scope decision, for the same reason `provenance` is here:
+    /// a narrowed test run is a review caveat, and MERGE_GATE.json already
+    /// carries it. Without this the dashboard, `report.json`'s
+    /// `gate.review_caveats` and the "Copy PR comment" projection would tell a
+    /// reviewer the suite ran in full when one artifact says it did not.
+    scope: Option<&'a crate::checks::scope::ScopeDecisions>,
 }
 
 /// Provenance for the synthetic `heuristics_loctree` result.
@@ -306,6 +312,7 @@ fn heuristics_provenance(
         finished_at: heuristics.finished_at.clone().unwrap_or_default(),
         hard_fail_signatures: Vec::new(),
         cache_key: None,
+        executed_scope: None,
     })
 }
 
@@ -1044,6 +1051,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         clean_comparison,
         snapshot_integrity: snapshot_integrity.as_ref(),
         provenance: &provenance_consistency,
+        scope,
     });
 
     // Root-level report.json (generated first so dashboard can embed it)
@@ -2134,7 +2142,7 @@ fn generate_run_json(input: RunJsonInput<'_>) -> Result<()> {
             // Additive: how much of this check's suite the run decided it had
             // to execute, and why. Present only on the checks that own an
             // ecosystem's test scope.
-            if let Some(report) = scope.and_then(|scope| scope.report_for_check(&c.name)) {
+            if let Some(report) = scope.and_then(|scope| scope.report_for_check(c)) {
                 entry["scope"] = json!(report);
             }
             entry

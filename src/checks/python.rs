@@ -1488,6 +1488,7 @@ impl Check for RuffCheck {
                     cache_key: self.cache_key(config),
                     target_sha: None,
                     tree_state: None,
+                    executed_scope: None,
                 }
                 .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
@@ -1583,6 +1584,7 @@ impl Check for MypyCheck {
                     cache_key: self.cache_key(config),
                     target_sha: None,
                     tree_state: None,
+                    executed_scope: None,
                 }
                 .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
@@ -1718,6 +1720,7 @@ impl Check for PytestCheck {
                     cache_key: self.cache_key(config),
                     target_sha: None,
                     tree_state: None,
+                    executed_scope: None,
                 }
                 .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),

@@ -490,6 +490,7 @@ mod tests {
                 finished_at: String::new(),
                 hard_fail_signatures: vec![],
                 cache_key: None,
+                executed_scope: None,
             }),
         }
     }

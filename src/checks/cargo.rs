@@ -444,6 +444,79 @@ fn cargo_literal_test_filter(pattern: &str) -> Result<&str> {
     Ok(pattern)
 }
 
+/// What `cargo test` will run, and the evidence of it, given this run's scope
+/// decision.
+enum CargoTestPlan {
+    /// Spawn these arguments; `executed` is the provenance evidence, `None`
+    /// when the run is full because the DECISION said so — the decision's own
+    /// reason is then the honest report, and duplicating it here would create a
+    /// second place for it to drift.
+    Run {
+        args: Vec<String>,
+        executed: Option<crate::checks::scope::ExecutedScope>,
+    },
+    /// Execute nothing: the decision selected no package.
+    Skip,
+}
+
+/// The `-p` fragment, exactly as it appears in the command line.
+///
+/// Packages come from the decision already sorted (a `BTreeSet` produced them),
+/// so the selector is stable across runs and diffable between packs.
+fn cargo_package_selector(packages: &[String]) -> String {
+    packages
+        .iter()
+        .map(|package| format!("-p {package}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn plan_cargo_test(config: &Config) -> Result<CargoTestPlan> {
+    use crate::checks::scope::{Ecosystem, ExecutedScope, ScopeDecision, reason};
+
+    let full = |executed| cargo_test_args(config).map(|args| CargoTestPlan::Run { args, executed });
+    let Some(ScopeDecision::ChangeScoped { selected, .. }) = config
+        .test_scope
+        .as_ref()
+        .map(|scope| scope.get(Ecosystem::Cargo))
+    else {
+        return full(None);
+    };
+    if selected.is_empty() {
+        return Ok(CargoTestPlan::Skip);
+    }
+    // A package name that cannot be spelled on a command line cannot narrow a
+    // run. Widening is the only safe answer: a dropped `-p` would quietly test
+    // a different set than the one the decision named.
+    if let Some(unusable) = selected
+        .iter()
+        .find(|package| package.trim().is_empty() || package.split_whitespace().count() > 1)
+    {
+        return full(Some(ExecutedScope::Full {
+            reason: reason::resolution_failed(&format!(
+                "package name {unusable:?} cannot be passed to cargo -p"
+            )),
+        }));
+    }
+    let mut args = cargo_test_args(config)?;
+    // Inserted before the optional literal test filter, which `cargo test`
+    // reads as a positional argument: options after it would be handed to the
+    // test binaries instead of to cargo.
+    let filter = args.len() - usize::from(config.tests_pattern.is_some());
+    let selector_args: Vec<String> = selected
+        .iter()
+        .flat_map(|package| ["-p".to_string(), package.clone()])
+        .collect();
+    args.splice(filter..filter, selector_args);
+    Ok(CargoTestPlan::Run {
+        args,
+        executed: Some(ExecutedScope::ChangeScoped {
+            selected: selected.len(),
+            selector: cargo_package_selector(selected),
+        }),
+    })
+}
+
 fn cargo_test_args(config: &Config) -> Result<Vec<String>> {
     let mut args = vec![
         "test".to_string(),
@@ -1653,7 +1726,22 @@ impl Check for CargoTestCheck {
 
         // Validate before planning/materialising a remote snapshot. Invalid or
         // semantically unsupported selectors must not start any Cargo work.
-        let owned_args = cargo_test_args(config)?;
+        let (owned_args, executed_scope) = match plan_cargo_test(config)? {
+            CargoTestPlan::Run { args, executed } => (args, executed),
+            // No cargo process at all: the decision proved no package in this
+            // workspace can be affected by the change. Provenance stays `None`
+            // because there is no execution to describe.
+            CargoTestPlan::Skip => {
+                return Ok(CheckResult {
+                    name: self.name().to_string(),
+                    status: CheckStatus::Skipped,
+                    duration: start.elapsed(),
+                    output: crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE.to_string(),
+                    cached: false,
+                    provenance: None,
+                });
+            }
+        };
         let run = plan_cargo_run(config)?;
         let cwd = run.cwd.as_path();
 
@@ -1697,7 +1785,8 @@ impl Check for CargoTestCheck {
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_repo_relative_cwd(),
+                .build_repo_relative_cwd()
+                .with_executed_scope(executed_scope),
             ),
         })
     }

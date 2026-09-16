@@ -216,6 +216,11 @@ impl App {
         // base: a selection drawn from the union of several review ranges
         // cannot be pinned to any of them — the same reason Semgrep drops to a
         // full scan there.
+        // The other half of what the scope decision needs: whether the tree the
+        // checks may end up reading is the operator's own, and whether it is
+        // clean. Frozen before the run like every other provenance fact, so a
+        // file written during the run cannot retroactively change the decision.
+        check_config.operator_worktree_clean = worktree.clean;
         check_config.changed_paths = run_headless_sync_stage(&self.governor, || {
             Ok(diff_bases
                 .first()
@@ -248,24 +253,13 @@ impl App {
         // all — reaches the run here and nowhere earlier.
         self.ensure_not_cancelled()?;
 
-        // The test scope, decided once per run and published on the check rows.
-        // Resolved HERE and not before the checks because it depends on the
-        // tree the checks actually read, and that is decided inside `run_all`
-        // (`share_target_snapshot`): a pinned target does NOT always mean a
-        // snapshot — when the reviewed target is the checked-out `HEAD`,
-        // `plan_check_run` hands the gates the repository root itself, and the
-        // operator's uncommitted work is then part of what they compile. The
-        // ledger is what records which of the two happened. Reading the Cargo
-        // workspace from the same tree is the other half: `profile.cargo_root`
-        // is detected in the operator checkout, which on a `--pr` run is a
-        // different revision entirely. This still changes nothing about what
-        // any check executed — see `checks::scope::SCOPED_EXECUTION_NOT_ENABLED`.
-        let reviewed_tree = checks::scope::ReviewedTree::resolve(
-            &self.config.repo_root,
-            ledger.scan_dir(),
-            worktree.clean,
-        );
-        let run_scope = checks::scope::resolve_run_scope(&check_config, &reviewed_tree).await;
+        // The test scope as the CHECKS saw it. Decided inside `run_all`, at the
+        // first point where the tree they read is known, and parked on the
+        // ledger because the config it was installed on died with that frame.
+        // Re-deriving it here would be a second computation of a decision the
+        // commands have already acted on, and a second computation is a second
+        // answer.
+        let run_scope = ledger.test_scope();
 
         // 6. Run heuristics (loctree-suite)
         // In remote/remote-only mode, use git snapshots for deterministic analysis.
@@ -295,7 +289,7 @@ impl App {
             artifacts::generate(artifacts::GenerateInput {
                 config: &self.config,
                 ledger: &ledger,
-                scope: Some(&run_scope),
+                scope: run_scope.as_ref(),
                 diffs: &diffs,
                 checks: &check_results,
                 heuristics: Some(&heuristics_result),

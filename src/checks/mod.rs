@@ -41,7 +41,7 @@ pub use python::{MypyCheck, PytestCheck, RuffCheck};
 pub use semgrep::SemgrepCheck;
 pub(crate) use semgrep::output_reports_scan_errors as semgrep_output_reports_scan_errors;
 pub(crate) use semgrep::scan_error_paths as semgrep_scan_error_paths;
-pub(crate) use typescript::is_generated_artifact_path;
+pub(crate) use typescript::is_builtin_generated_output_path;
 pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 
 /// Which tree a check's command actually read.
@@ -300,6 +300,16 @@ pub struct CheckProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree_state: Option<TreeState>,
     pub exit_code: Option<i32>,
+    /// How much of this check's suite the command actually ran, and why.
+    ///
+    /// The scope DECISION lives on the run; this is the check's own evidence
+    /// that it honoured that decision, and it is what lets a `change-scoped`
+    /// report be refused when no check confirms one (see
+    /// [`scope::ScopeDecision::report_for_result`]). Additive and optional:
+    /// absent from packs written before this field existed, and from every
+    /// check that does not own a test scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed_scope: Option<scope::ExecutedScope>,
     pub started_at: String,
     pub finished_at: String,
     pub hard_fail_signatures: Vec<String>,
@@ -320,6 +330,17 @@ impl CheckProvenance {
         let substrate = resolve_scan_substrate(cwd, repo_root, consumable_scaffolding(check));
         self.target_sha = substrate.target_sha;
         self.tree_state = substrate.tree_state;
+        self
+    }
+
+    /// Record what the command narrowed to, if anything.
+    ///
+    /// Chained on rather than threaded through [`ProvenanceBuilder`] because
+    /// only two checks in the whole run can answer it, and every other call site
+    /// would have to carry a `None` that means nothing to it.
+    #[must_use]
+    pub fn with_executed_scope(mut self, executed: Option<scope::ExecutedScope>) -> Self {
+        self.executed_scope = executed;
         self
     }
 }
@@ -769,6 +790,9 @@ async fn run_all_checks(
     // does not prepare the environment the checks consume.
     let mut config = config.clone();
     share_target_snapshot(&mut config, &runnable_checks, ledger)?;
+    // The reviewed tree is now known, so the test scope can be — and must be,
+    // because the checks below read it off the config they are handed.
+    install_run_scope(&mut config, &runnable_checks, ledger).await;
 
     // Pre-sync Python venv if any Python checks will run and uv is available.
     // This separates venv build time from the per-check timeout budget.
@@ -1221,6 +1245,9 @@ where
     // does. The TUI must not sync an off-HEAD dependency set into repo_root.
     let mut config = config.clone();
     share_target_snapshot(&mut config, &runnable_checks, ledger)?;
+    // Same seam as headless, through the same helper: one place decides how
+    // much of a suite has to run, whichever front end asked for the review.
+    install_run_scope(&mut config, &runnable_checks, ledger).await;
 
     // Pre-sync Python venv before running checks, through the SAME helper the
     // headless dispatcher uses. It was a bare `run_command_with_timeout` under a
@@ -1448,6 +1475,7 @@ fn errored_check_provenance(
             cache_key,
             target_sha: None,
             tree_state: None,
+            executed_scope: None,
         }
         .with_scan_substrate(name, &scan_dir, &config.repo_root),
     )
@@ -1827,6 +1855,54 @@ fn share_target_snapshot_with(
     Ok(())
 }
 
+/// Decide the run's test scope at the first moment it can be decided, and
+/// install it where both the checks and the artifacts will read it.
+///
+/// WHY HERE. Two facts have to be true before a selection can be trusted, and
+/// they become true at different times. The change set exists long before the
+/// checks (it is captured with the pinned diff range), but WHICH TREE the
+/// checks read is settled by [`share_target_snapshot`] a few lines above: a
+/// pinned target does not always mean a snapshot, because when the reviewed
+/// target IS the checked-out `HEAD` the gates are handed the repository root
+/// and the operator's uncommitted work becomes part of what they compile.
+/// Deciding earlier would mean guessing that; deciding later — where both
+/// dispatchers used to — is after the commands have already run, which is
+/// exactly the gap this cut closes.
+///
+/// WHY TWICE. `config.test_scope` is the checks' copy: they receive nothing but
+/// a `Config`. `ledger.test_scope()` is the ARTIFACTS' copy, because the ledger
+/// outlives this frame while the cloned check config does not. Both are written
+/// from the same value in the same statement, so they cannot describe different
+/// decisions.
+///
+/// WHY THE GUARD. `resolve_run_scope` spawns `cargo metadata`. With no check in
+/// the runnable set that owns a test scope, that subprocess would compute an
+/// answer nobody reads — precisely the disproportionate work this contract
+/// exists to remove.
+async fn install_run_scope(
+    config: &mut Config,
+    runnable_checks: &[Box<dyn Check>],
+    ledger: &TaskLedger,
+) {
+    if !runnable_checks
+        .iter()
+        .any(|check| scope::owns_test_scope(check.name()))
+    {
+        return;
+    }
+    let reviewed_tree = scope::ReviewedTree::resolve(
+        &config.repo_root,
+        ledger.scan_dir(),
+        ledger
+            .resolved_substrate()
+            .and_then(|substrate| substrate.tree_state),
+        config.operator_worktree_clean,
+    );
+    let decisions = scope::resolve_run_scope(config, &reviewed_tree).await;
+    config.test_scope = Some(decisions.clone());
+    ledger.set_test_scope(decisions);
+}
+
 /// How each tool reads `scan_dir`, for re-keying the entries decided before the
 /// run knew which tree it was reading.
 ///
@@ -1969,6 +2045,7 @@ impl ProvenanceBuilder<'_> {
             cache_key: self.cache_key,
             target_sha: None,
             tree_state: None,
+            executed_scope: None,
         }
         .with_scan_substrate(self.check, self.cwd, self.repo_root)
     }
@@ -5472,6 +5549,7 @@ test result: ok. 2 passed; 0 failed
                         finished_at: "2026-08-22T10:00:01+02:00".to_string(),
                         hard_fail_signatures: vec![],
                         cache_key: Some("mock-key".to_string()),
+                        executed_scope: None,
                     }),
                 })
             }

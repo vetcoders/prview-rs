@@ -86,6 +86,50 @@ fn reviewed_snapshot() -> ReviewedTree {
     ReviewedTree::Snapshot(PathBuf::from(REPO_ROOT))
 }
 
+/// A check result carrying whatever evidence of narrowing the check left.
+///
+/// The report is a statement about EXECUTION, so every reporting test below has
+/// to name what the check did, not only what the decision said.
+fn result_with(name: &str, status: CheckStatus, executed: Option<ExecutedScope>) -> CheckResult {
+    CheckResult {
+        name: name.to_string(),
+        status,
+        duration: std::time::Duration::ZERO,
+        output: String::new(),
+        cached: false,
+        provenance: executed.map(|executed| crate::checks::CheckProvenance {
+            command: "cargo test --all-targets --no-fail-fast -p core".to_string(),
+            tool_version: None,
+            cwd: REPO_ROOT.to_string(),
+            target_sha: None,
+            tree_state: None,
+            exit_code: Some(0),
+            executed_scope: Some(executed),
+            started_at: String::new(),
+            finished_at: String::new(),
+            hard_fail_signatures: Vec::new(),
+            cache_key: None,
+        }),
+    }
+}
+
+/// A check that ran and left no scope evidence at all — the shape of every
+/// check written before this field existed.
+fn ran_without_evidence(name: &str) -> CheckResult {
+    result_with(name, CheckStatus::Passed, None)
+}
+
+fn narrowed(name: &str, selected: usize, selector: &str) -> CheckResult {
+    result_with(
+        name,
+        CheckStatus::Passed,
+        Some(ExecutedScope::ChangeScoped {
+            selected,
+            selector: selector.to_string(),
+        }),
+    )
+}
+
 fn decide_with(
     change_set: Option<&ChangeSet>,
     profile: &DetectedProfile,
@@ -475,27 +519,98 @@ fn a_clean_tree_the_checks_read_scopes_like_a_snapshot() {
 /// when there is NO snapshot does the checkout enter the picture at all.
 #[test]
 fn the_reviewed_tree_is_read_from_the_snapshot_first_and_the_checkout_second() {
+    use crate::checks::TreeState;
     let repo = Path::new("/repo");
     let snapshot = PathBuf::from("/snap");
     for clean in [Some(true), Some(false), None] {
         assert_eq!(
-            ReviewedTree::resolve(repo, Some(snapshot.clone()), clean),
+            ReviewedTree::resolve(
+                repo,
+                Some(snapshot.clone()),
+                Some(TreeState::Snapshot),
+                clean
+            ),
             ReviewedTree::Snapshot(snapshot.clone()),
             "a materialised snapshot settles the substrate on its own"
         );
     }
     assert_eq!(
-        ReviewedTree::resolve(repo, None, Some(true)),
+        ReviewedTree::resolve(repo, None, None, Some(true)),
         ReviewedTree::LocalClean(repo.to_path_buf())
     );
     assert_eq!(
-        ReviewedTree::resolve(repo, None, Some(false)),
+        ReviewedTree::resolve(repo, None, None, Some(false)),
         ReviewedTree::LocalDirty(repo.to_path_buf())
     );
     assert_eq!(
-        ReviewedTree::resolve(repo, None, None),
+        ReviewedTree::resolve(repo, None, None, None),
         ReviewedTree::Unknown(repo.to_path_buf()),
         "an unreadable checkout is unknown, never assumed clean"
+    );
+}
+
+/// The half of the substrate a snapshot's mere existence cannot answer.
+///
+/// `SnapshotDirty` means the worktree carries bytes the reviewed commit does
+/// not — a generated lockfile, a tool that wrote into the checkout — and those
+/// bytes are what the compiler and the test runner will read. A change set
+/// computed between two commits cannot list them, so a selection drawn from it
+/// would be narrower than the tree it is about. `SnapshotBorrowedDeps` is the
+/// explicit opposite: only the dependency links came from elsewhere, and the
+/// reviewed SOURCE is still exactly the commit, which is all test selection
+/// reads.
+#[test]
+fn a_snapshot_that_no_longer_holds_the_reviewed_commit_is_unknown() {
+    use crate::checks::TreeState;
+    let repo = Path::new("/repo");
+    let snapshot = PathBuf::from("/snap");
+    let resolve = |state: Option<TreeState>| {
+        ReviewedTree::resolve(repo, Some(snapshot.clone()), state, Some(true))
+    };
+
+    assert_eq!(
+        resolve(Some(TreeState::SnapshotBorrowedDeps)),
+        ReviewedTree::Snapshot(snapshot.clone()),
+        "borrowed dependencies leave the reviewed SOURCE exact, which is what selection reads"
+    );
+    for opaque in [
+        Some(TreeState::SnapshotDirty),
+        Some(TreeState::Foreign),
+        Some(TreeState::LocalDirty),
+        // A snapshot on disk whose substrate the run never resolved is a tree
+        // nobody has identified; "unknown" is the honest name for it.
+        None,
+    ] {
+        assert_eq!(
+            resolve(opaque),
+            ReviewedTree::Unknown(snapshot.clone()),
+            "{opaque:?} is not evidence the snapshot still holds the reviewed commit"
+        );
+    }
+}
+
+/// And the consequence: an unidentified tree escalates both ecosystems rather
+/// than selecting from a change set that may not describe it.
+#[test]
+fn a_dirty_snapshot_escalates_instead_of_selecting() {
+    use crate::checks::TreeState;
+    let tree = ReviewedTree::resolve(
+        Path::new(REPO_ROOT),
+        Some(PathBuf::from(REPO_ROOT)),
+        Some(TreeState::SnapshotDirty),
+        Some(true),
+    );
+    let set = trustworthy(vec![modified("crates/core/src/lib.rs")]);
+    let decisions = decide_on(
+        Some(&set),
+        &profile(true, true),
+        Some(&app_and_core()),
+        &tree,
+    );
+    assert_eq!(full_reason(&decisions.cargo), reason::UNKNOWN_REVIEWED_TREE);
+    assert_eq!(
+        full_reason(&decisions.vitest),
+        reason::UNKNOWN_REVIEWED_TREE
     );
 }
 
@@ -550,6 +665,7 @@ fn a_dirty_operator_checkout_is_not_itself_a_reason_to_escalate() {
     let dirty_checkout_with_a_snapshot = ReviewedTree::resolve(
         Path::new(REPO_ROOT),
         Some(PathBuf::from(REPO_ROOT)),
+        Some(crate::checks::TreeState::Snapshot),
         Some(false),
     );
     let set = trustworthy(vec![modified("crates/core/src/lib.rs")]);
@@ -1007,7 +1123,7 @@ fn the_published_scope_carries_every_neutral_path_and_its_rule() {
     let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
     for check in ["Cargo test", "Vitest"] {
         let report = decisions
-            .report_for_check(check)
+            .report_for_check(&ran_without_evidence(check))
             .unwrap_or_else(|| panic!("{check} owns a test scope"));
         assert_eq!(
             report.non_participating,
@@ -1019,7 +1135,9 @@ fn the_published_scope_carries_every_neutral_path_and_its_rule() {
         );
     }
     assert!(
-        decisions.report_for_check("Clippy").is_none(),
+        decisions
+            .report_for_check(&ran_without_evidence("Clippy"))
+            .is_none(),
         "a check with no test suite still carries no scope at all"
     );
 }
@@ -1028,7 +1146,9 @@ fn the_published_scope_carries_every_neutral_path_and_its_rule() {
 fn a_run_that_neutralised_nothing_publishes_no_neutral_list() {
     let set = trustworthy(vec![modified("crates/core/src/lib.rs")]);
     let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
-    let report = decisions.report_for_check("Cargo test").expect("scope");
+    let report = decisions
+        .report_for_check(&narrowed("Cargo test", 1, "-p core"))
+        .expect("scope");
     assert!(report.non_participating.is_empty());
     let json = serde_json::to_value(&report).expect("serialize scope");
     assert!(
@@ -1220,32 +1340,109 @@ fn a_cargo_selection_names_packages_and_a_vitest_selection_names_files() {
 // Reporting honesty
 // ---------------------------------------------------------------------------
 
+/// The decision alone is never enough. A `ChangeScoped` decision from a check
+/// that left no evidence of narrowing describes a run that did not happen, so
+/// the report says `full` and names the missing confirmation.
 #[test]
-fn a_scopeable_decision_is_still_reported_as_full_while_commands_are_full() {
-    // The lie this contract forbids is reporting `change-scoped` for a run that
-    // executed everything. Until the invocations change, the mode stays `full`
-    // and the reason says exactly why.
+fn a_scopeable_decision_without_evidence_is_reported_as_full() {
     let set = trustworthy(vec![modified("src/app.ts")]);
     let decisions = decide_with(Some(&set), &profile(true, false), None);
-    let report = decisions.vitest.report();
+    let report = decisions
+        .report_for_check(&ran_without_evidence("Vitest"))
+        .expect("Vitest owns a test scope");
     assert_eq!(report.mode, "full");
-    assert_eq!(report.reason, SCOPED_EXECUTION_NOT_ENABLED);
+    assert_eq!(report.reason, SCOPED_EXECUTION_NOT_CONFIRMED);
     assert_eq!(report.inputs, Some(1));
     assert_eq!(
         report.selected, None,
-        "a full run selected nothing, and must not claim otherwise"
+        "an unconfirmed narrowing must not publish a selection count"
     );
+    assert_eq!(report.selector, None);
+}
+
+/// And the positive case: evidence from the check is what unlocks
+/// `change-scoped`, together with the selector the command actually carried.
+#[test]
+fn a_confirmed_narrowing_is_reported_from_the_checks_own_evidence() {
+    let set = trustworthy(vec![modified("crates/core/src/lib.rs")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    let report = decisions
+        .report_for_check(&narrowed("Cargo test", 2, "-p app -p core"))
+        .expect("Cargo test owns a test scope");
+    assert_eq!(report.mode, "change-scoped");
+    assert_eq!(report.reason, CHANGE_SCOPED_SELECTION);
+    assert_eq!(report.selected, Some(2));
+    assert_eq!(report.selector.as_deref(), Some("-p app -p core"));
     assert_eq!(
-        report.selector, None,
-        "no selector ran, so no selector arguments may be published"
+        report.universe,
+        Some(2),
+        "the population the selection was drawn from stays visible"
     );
+}
+
+/// A check that escalated at RUNTIME overrides a scopeable decision: what ran
+/// is what gets reported, with the runtime reason rather than the decision's
+/// optimism.
+#[test]
+fn a_runtime_escalation_overrides_the_decision_in_the_report() {
+    let set = trustworthy(vec![modified("src/app.ts")]);
+    let decisions = decide_with(Some(&set), &profile(true, false), None);
+    let escalated = result_with(
+        "Vitest",
+        CheckStatus::Passed,
+        Some(ExecutedScope::Full {
+            reason: reason::resolution_failed("src/app.ts is missing from the reviewed tree"),
+        }),
+    );
+    let report = decisions
+        .report_for_check(&escalated)
+        .expect("Vitest owns a test scope");
+    assert_eq!(report.mode, "full");
+    assert_eq!(
+        report.reason,
+        reason::resolution_failed("src/app.ts is missing from the reviewed tree")
+    );
+    assert_eq!(report.selected, None);
+    assert_eq!(report.selector, None);
+}
+
+/// An empty selection is the one `change-scoped` report with no selector: there
+/// was a decision, it selected nothing, and the check honoured it by skipping.
+/// `selected: 0` beside a skipped row is the honest shape; `passed` never is.
+#[test]
+fn an_empty_selection_reports_change_scoped_with_no_selector() {
+    let set = trustworthy(vec![modified("CHANGELOG.md")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    let skipped = result_with("Cargo test", CheckStatus::Skipped, None);
+    let report = decisions
+        .report_for_check(&skipped)
+        .expect("Cargo test owns a test scope");
+    assert_eq!(report.mode, "change-scoped");
+    assert_eq!(report.reason, CHANGE_SCOPED_SELECTION);
+    assert_eq!(report.selected, Some(0));
+    assert_eq!(report.selector, None);
+}
+
+/// The same empty decision from a check that did NOT skip is not evidence of
+/// anything: something ran, and nothing says it was narrowed.
+#[test]
+fn an_empty_selection_a_check_ignored_is_not_reported_as_narrowed() {
+    let set = trustworthy(vec![modified("CHANGELOG.md")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    let report = decisions
+        .report_for_check(&ran_without_evidence("Cargo test"))
+        .expect("Cargo test owns a test scope");
+    assert_eq!(report.mode, "full");
+    assert_eq!(report.reason, SCOPED_EXECUTION_NOT_CONFIRMED);
 }
 
 #[test]
 fn a_real_escalation_keeps_its_own_reason_in_the_report() {
     let set = trustworthy(vec![modified("Cargo.lock"), modified("src/app.ts")]);
     let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
-    let report = decisions.cargo.report();
+    let report = decisions
+        .report_for_check(&ran_without_evidence("Cargo test"))
+        .expect("Cargo test owns a test scope");
     assert_eq!(report.mode, "full");
     assert_eq!(report.reason, reason::manifest("Cargo.lock"));
     assert_eq!(
@@ -1263,12 +1460,21 @@ fn a_real_escalation_keeps_its_own_reason_in_the_report() {
 #[test]
 fn only_a_missing_change_set_reports_an_unknown_input_count() {
     let unknown = decide_with(None, &profile(true, true), Some(&app_and_core()));
-    assert_eq!(unknown.cargo.report().inputs, None);
+    assert_eq!(
+        unknown
+            .report_for_check(&ran_without_evidence("Cargo test"))
+            .expect("scope")
+            .inputs,
+        None
+    );
 
     let counted = ChangeSet::new(vec![modified("src/app.ts"), modified("src/b.ts")], false);
     let decisions = decide_with(Some(&counted), &profile(true, true), Some(&app_and_core()));
     assert_eq!(
-        decisions.vitest.report().inputs,
+        decisions
+            .report_for_check(&ran_without_evidence("Vitest"))
+            .expect("scope")
+            .inputs,
         Some(2),
         "a set that was read and rejected was still counted"
     );
@@ -1286,14 +1492,67 @@ fn the_scope_object_lands_only_on_the_checks_that_own_a_test_scope() {
     );
     assert!(decisions.for_check("Clippy").is_none());
     assert!(decisions.for_check("Semgrep scan").is_none());
+    assert!(owns_test_scope("Cargo test") && owns_test_scope("Vitest"));
+    assert!(!owns_test_scope("Clippy"));
 }
 
+/// Caveats are derived from the very reports the artifacts publish, so a
+/// reviewer cannot be told the suite ran in full while a row says otherwise —
+/// and cannot be left uninformed when a row says it narrowed.
 #[test]
-fn no_review_caveat_is_raised_while_no_check_actually_runs_narrower() {
-    let set = trustworthy(vec![modified("src/app.ts")]);
-    let decisions = decide_with(Some(&set), &profile(true, false), None);
+fn review_caveats_follow_the_published_reports() {
+    let set = trustworthy(vec![modified("crates/core/src/lib.rs")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+
     assert!(
-        decisions.review_caveats().is_empty(),
+        decisions
+            .review_caveats(&[ran_without_evidence("Cargo test")])
+            .is_empty(),
         "a caveat about a narrowed run must not appear before any run is narrowed"
     );
+
+    let narrowed_run = decisions.review_caveats(&[narrowed("Cargo test", 2, "-p app -p core")]);
+    assert_eq!(narrowed_run.len(), 1);
+    assert!(
+        narrowed_run[0].starts_with("Cargo test ran a change-scoped test selection"),
+        "got: {narrowed_run:?}"
+    );
+}
+
+/// A skip is a different statement from a narrowing, and the caveat has to say
+/// which one happened — a reviewer reading "ran a narrower selection" about a
+/// suite that ran nothing at all has been told the wrong thing.
+#[test]
+fn an_empty_selection_raises_a_skip_caveat_not_a_narrowing_one() {
+    let set = trustworthy(vec![modified("CHANGELOG.md")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    let caveats =
+        decisions.review_caveats(&[result_with("Cargo test", CheckStatus::Skipped, None)]);
+    assert_eq!(
+        caveats,
+        vec![format!(
+            "Cargo test skipped: {NO_TESTS_RELATED_TO_THE_CHANGE}"
+        )]
+    );
+}
+
+/// Contract §9: the operator asked for everything, so nothing is decided and no
+/// `cargo metadata` is worth paying for. Both ecosystems say so in one voice.
+#[tokio::test]
+async fn full_tests_pins_both_ecosystems_to_a_full_run() {
+    let mut config = crate::config::test_config();
+    config.profile = profile(true, true);
+    config.full_tests = true;
+    config.changed_paths = Some(trustworthy(vec![modified("crates/core/src/lib.rs")]));
+
+    // Returns before any subprocess: the flag is read ahead of the metadata
+    // call, so a full-test run never pays for a decision it will not use.
+    let decisions = resolve_run_scope(&config, &reviewed_snapshot()).await;
+    for ecosystem in Ecosystem::ALL {
+        assert_eq!(
+            full_reason(decisions.get(ecosystem)),
+            reason::FULL_TESTS_REQUESTED,
+            "{ecosystem:?} must report the operator's request verbatim"
+        );
+    }
 }

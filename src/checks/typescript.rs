@@ -78,9 +78,140 @@ fn vitest_args(config: &Config) -> Vec<String> {
     args
 }
 
-pub(crate) fn is_generated_artifact_path(path: &str, config: &Config) -> bool {
+/// The change-scoped Vitest command line.
+///
+/// `related` selects by the STATIC import graph, so the arguments are source
+/// files, not test files — Vitest resolves the latter itself, which is also why
+/// `selected` here counts inputs rather than specs.
+///
+/// `--passWithNoTests` is required rather than optional: an empty related set is
+/// not a tool error, and without the flag Vitest exits non-zero and the check
+/// would report a failure for a change that simply has no related tests. The
+/// emptiness is recognised from the output instead and reported as `Skipped`
+/// (contract §8.1) — never `Passed`, which would claim evidence from zero
+/// executed tests.
+///
+/// Everything the full command carries is preserved: the one-worker ceiling and
+/// `--testNamePattern`, which keeps filtering INSIDE the selection (contract
+/// §4.3) rather than widening it.
+fn vitest_scoped_args(config: &Config, selector_inputs: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "related".to_string(),
+        "--run".to_string(),
+        "--maxWorkers".to_string(),
+        "1".to_string(),
+        "--passWithNoTests".to_string(),
+    ];
+    if let Some(pattern) = &config.tests_pattern {
+        args.extend(["--testNamePattern".to_string(), pattern.clone()]);
+    }
+    args.extend(selector_inputs.iter().cloned());
+    args
+}
+
+/// Vitest's own words for "the selection resolved to no spec at all".
+///
+/// Matched case-insensitively on the phrase rather than the whole sentence: 3.x
+/// and 4.x differ in the tail (`, exiting with code 0`) and in whether a filter
+/// is echoed after it, and the phrase is what both builds print. Only ever
+/// consulted for a run that carried `--passWithNoTests`, where exit 0 alone
+/// cannot distinguish "everything passed" from "nothing ran".
+fn vitest_found_no_test_files(output: &str) -> bool {
+    output.to_ascii_lowercase().contains("no test files found")
+}
+
+/// What Vitest will run, and the evidence of it, given this run's scope
+/// decision.
+///
+/// `Err` is not used for tool failure — it is the one shape that says "no
+/// command at all", which is what an empty selection means.
+enum VitestPlan {
+    /// Run these arguments; `executed` is the provenance evidence, `None` when
+    /// the run was full because the decision itself said so (the decision's own
+    /// reason is then the honest report).
+    Run {
+        args: Vec<String>,
+        executed: Option<crate::checks::scope::ExecutedScope>,
+    },
+    /// Execute nothing: the decision selected no input.
+    Skip,
+}
+
+fn plan_vitest_run(config: &Config, run_dir: &std::path::Path) -> VitestPlan {
+    use crate::checks::scope::{Ecosystem, ExecutedScope, ScopeDecision, reason};
+
+    let Some(decision) = config
+        .test_scope
+        .as_ref()
+        .map(|scope| scope.get(Ecosystem::Vitest))
+    else {
+        return VitestPlan::Run {
+            args: vitest_args(config),
+            executed: None,
+        };
+    };
+    let ScopeDecision::ChangeScoped {
+        selector_inputs, ..
+    } = decision
+    else {
+        return VitestPlan::Run {
+            args: vitest_args(config),
+            executed: None,
+        };
+    };
+    if selector_inputs.is_empty() {
+        return VitestPlan::Skip;
+    }
+    // Contract §4.1: the inputs must exist on disk in the tree that is about to
+    // be read. The decision was made against the reviewed tree's path list; if
+    // one of those paths is not actually there, the selection describes a tree
+    // this command is not going to read, and handing Vitest a missing file
+    // would silently shrink the selection instead of failing it.
+    if let Some(missing) = selector_inputs
+        .iter()
+        .find(|input| !run_dir.join(input).exists())
+    {
+        return VitestPlan::Run {
+            args: vitest_args(config),
+            executed: Some(ExecutedScope::Full {
+                reason: reason::resolution_failed(&format!(
+                    "{missing} is missing from the reviewed tree"
+                )),
+            }),
+        };
+    }
+    let args = vitest_scoped_args(config, selector_inputs);
+    VitestPlan::Run {
+        executed: Some(ExecutedScope::ChangeScoped {
+            selected: selector_inputs.len(),
+            // The whole argument line from the subcommand onward: with Vitest
+            // the SUBCOMMAND is half the selector, so the fragment that
+            // expresses the selection is the invocation itself. Rendered from
+            // the very arguments about to be spawned, so it cannot drift from
+            // `provenance.command`.
+            selector: args.join(" "),
+        }),
+        args,
+    }
+}
+
+/// Build output, by prview's own built-in knowledge of where tools write it.
+///
+/// Split out from [`is_generated_artifact_path`] because the two questions are
+/// not the same one. THIS answers "is this file a tool's output rather than
+/// source", which is a fact about the repository layout. The other one also
+/// folds in the operator's `lint_ignore_patterns`, which answer "do I want to
+/// see lint findings here" — a preference, and one that says nothing about
+/// whether a test reads the file.
+///
+/// Test selection must use this half alone. A repository that lint-ignores
+/// `src/legacy/**` still has tests importing `src/legacy/foo.ts`, and dropping
+/// that path from the selector inputs would stop running them without anyone
+/// asking for it — invisible, because the lint setting is where nobody would
+/// look for it.
+pub(crate) fn is_builtin_generated_output_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
-    let mut is_gen = normalized.contains("/node_modules/")
+    normalized.contains("/node_modules/")
         || normalized.starts_with("node_modules/")
         || normalized.contains("/coverage/")
         || normalized.starts_with("coverage/")
@@ -92,17 +223,18 @@ pub(crate) fn is_generated_artifact_path(path: &str, config: &Config) -> bool {
         || normalized.starts_with(".next/")
         || normalized.starts_with("target/")
         || (normalized.contains("/target/")
-            && (normalized.contains("/debug/") || normalized.contains("/release/")));
+            && (normalized.contains("/debug/") || normalized.contains("/release/")))
+}
 
-    for pattern in &config.lint_ignore_patterns {
-        let stripped = pattern.trim_matches('*').trim_matches('/');
-        if !stripped.is_empty()
-            && (normalized.contains(stripped) || normalized.starts_with(stripped))
-        {
-            is_gen = true;
-        }
+pub(crate) fn is_generated_artifact_path(path: &str, config: &Config) -> bool {
+    if is_builtin_generated_output_path(path) {
+        return true;
     }
-    is_gen
+    let normalized = path.replace('\\', "/");
+    config.lint_ignore_patterns.iter().any(|pattern| {
+        let stripped = pattern.trim_matches('*').trim_matches('/');
+        !stripped.is_empty() && (normalized.contains(stripped) || normalized.starts_with(stripped))
+    })
 }
 
 fn sanitize_grouped_lint_output<F>(
@@ -299,6 +431,7 @@ impl Check for TypeScriptCheck {
                     cache_key: self.cache_key(config),
                     target_sha: None,
                     tree_state: None,
+                    executed_scope: None,
                 }
                 .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
@@ -387,6 +520,7 @@ impl Check for ESLintCheck {
                     cache_key: self.cache_key(config),
                     target_sha: None,
                     tree_state: None,
+                    executed_scope: None,
                 }
                 .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),
@@ -493,7 +627,22 @@ impl Check for VitestCheck {
 
         // Vitest's supported worker cap bounds its descendant pool. Keep owned
         // strings because the limit is selected at runtime.
-        let args = vitest_args(config);
+        let (args, executed_scope) = match plan_vitest_run(config, run_dir) {
+            VitestPlan::Run { args, executed } => (args, executed),
+            // No command is spawned at all: the decision proved this change has
+            // no related test. Provenance stays `None` because there is no
+            // execution to describe — no command, no exit code, no tree read.
+            VitestPlan::Skip => {
+                return Ok(CheckResult {
+                    name: self.name().to_string(),
+                    status: CheckStatus::Skipped,
+                    duration: start.elapsed(),
+                    output: crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE.to_string(),
+                    cached: false,
+                    provenance: None,
+                });
+            }
+        };
         let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
 
         // Use longer timeout for tests
@@ -505,10 +654,33 @@ impl Check for VitestCheck {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}\n{}", stdout, stderr);
 
-        let status = if output.status.success() {
-            CheckStatus::Passed
+        // `--passWithNoTests` makes an empty related set exit 0, which is right
+        // for the tool and wrong for a review: zero executed tests is not
+        // evidence that anything passed (contract §2.4/§8.1). Recognised only
+        // on a narrowed run, since that is the only one that carries the flag.
+        let ran_narrowed = matches!(
+            executed_scope,
+            Some(crate::checks::scope::ExecutedScope::ChangeScoped { .. })
+        );
+        let selected_inputs = match &executed_scope {
+            Some(crate::checks::scope::ExecutedScope::ChangeScoped { selected, .. }) => *selected,
+            _ => 0,
+        };
+        let (status, output_text) = if output.status.success() {
+            if ran_narrowed && vitest_found_no_test_files(&combined) {
+                (
+                    CheckStatus::Skipped,
+                    format!(
+                        "{}\nVitest found no test file importing any of the {selected_inputs} \
+                         changed source file(s).\n{combined}",
+                        crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE
+                    ),
+                )
+            } else {
+                (CheckStatus::Passed, combined.clone())
+            }
         } else {
-            CheckStatus::Failed
+            (CheckStatus::Failed, combined.clone())
         };
 
         let js_runner = if which::which("pnpm").is_ok() {
@@ -521,7 +693,7 @@ impl Check for VitestCheck {
             name: self.name().to_string(),
             status,
             duration: start.elapsed(),
-            output: combined.clone(),
+            output: output_text,
             cached: false,
             provenance: Some(
                 CheckProvenance {
@@ -535,8 +707,10 @@ impl Check for VitestCheck {
                     cache_key: self.cache_key(config),
                     target_sha: None,
                     tree_state: None,
+                    executed_scope: None,
                 }
-                .with_scan_substrate(self.name(), run_dir, &config.repo_root),
+                .with_scan_substrate(self.name(), run_dir, &config.repo_root)
+                .with_executed_scope(executed_scope),
             ),
         })
     }
@@ -627,6 +801,7 @@ impl Check for StylelintCheck {
                     cache_key: self.cache_key(config),
                     target_sha: None,
                     tree_state: None,
+                    executed_scope: None,
                 }
                 .with_scan_substrate(self.name(), run_dir, &config.repo_root),
             ),

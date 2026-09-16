@@ -3246,6 +3246,7 @@ fn merge_gate_splits_preexisting_quality_failures_from_inline_findings() {
                 cache_key: None,
                 target_sha: None,
                 tree_state: None,
+                executed_scope: None,
             }),
         },
         // Satisfy required Rust quality signals so they don't add unclassified gaps
@@ -4121,6 +4122,7 @@ fn gate_result_json_carries_the_scanned_tree_provenance() {
             cache_key: None,
             target_sha: Some("a".repeat(40)),
             tree_state: Some(crate::checks::TreeState::Snapshot),
+            executed_scope: None,
         }),
     };
 
@@ -4180,6 +4182,7 @@ test result: FAILED. 0 passed; 1 failed
             cache_key: None,
             target_sha: None,
             tree_state: None,
+            executed_scope: None,
         }),
     }];
 
@@ -4233,6 +4236,7 @@ test result: FAILED. 0 passed; 1 failed
             cache_key: None,
             target_sha: None,
             tree_state: None,
+            executed_scope: None,
         }),
     }];
 
@@ -4313,6 +4317,7 @@ fn inline_findings_emits_one_sarif_result_per_cargo_audit_advisory() {
             cache_key: None,
             target_sha: None,
             tree_state: None,
+            executed_scope: None,
         }),
     }];
 
@@ -7084,6 +7089,7 @@ fn snapshot_provenance(target_sha: &str) -> CheckProvenance {
         finished_at: "2026-08-22T10:00:01+02:00".to_string(),
         hard_fail_signatures: vec![],
         cache_key: Some("commit-deadbeef".to_string()),
+        executed_scope: None,
     }
 }
 
@@ -7595,6 +7601,7 @@ fn informational_notes_keep_current_and_historical_counts_comparable() {
     let context_for = |out_dir: &Path| {
         build_dashboard_context(DashboardContextInput {
             config: &config,
+            scope: None,
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -7788,6 +7795,7 @@ fn snapshot_integrity_gate_preserves_check_results_and_dashboard_parity() {
         .unwrap();
         let dashboard = build_dashboard_context(DashboardContextInput {
             config: &config,
+            scope: None,
             checks: &checks,
             heuristics: None,
             inline: &inline,

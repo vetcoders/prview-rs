@@ -189,6 +189,35 @@ pub struct Config {
     /// run everything.
     pub changed_paths: Option<crate::checks::scope::ChangeSet>,
 
+    /// Whether the operator's own working tree was clean when the run froze its
+    /// provenance, as `capture_worktree_provenance` saw it.
+    ///
+    /// Internal runtime state, never a CLI or manifest override. It only ever
+    /// matters when the checks read the repository root itself — with a
+    /// snapshot the operator's uncommitted work is not in the reviewed tree at
+    /// all. `None` means cleanliness could not be established, which is not the
+    /// same as dirty and is not treated as clean either.
+    pub operator_worktree_clean: Option<bool>,
+
+    /// How much of each test suite this run decided has to execute.
+    ///
+    /// Internal runtime state, never a CLI or manifest override: set once by
+    /// `checks::run_all`/`run_all_with_events` on the cloned check config, at
+    /// the first point where the tree the checks will read is known. `None`
+    /// means no decision was made, which every consumer must treat as today's
+    /// behaviour — run everything.
+    pub test_scope: Option<crate::checks::scope::ScopeDecisions>,
+
+    /// Run every test the repository has, whatever the change touched
+    /// (`--full-tests`, contract §9).
+    ///
+    /// An operator-facing escape hatch, not a fallback: scope escalation is
+    /// automatic wherever the selection cannot be proven sufficient, and this
+    /// flag exists for the cases prview cannot know about — a change whose
+    /// effect travels through a channel no import graph and no package manifest
+    /// describes.
+    pub full_tests: bool,
+
     /// Directory the file-scoped checks should scan, when the dispatcher has
     /// already materialised a shared target snapshot for the run. `None` = each
     /// check resolves its own scan dir via `plan_check_run`. Set once per run by
@@ -806,6 +835,9 @@ impl Config {
             scope_non_participating,
             scope_non_participating_builtins: scope_builtins,
             changed_paths: None,
+            operator_worktree_clean: None,
+            test_scope: None,
+            full_tests: false,
             scan_dir_override: None,
         }
     }
@@ -953,6 +985,7 @@ impl Config {
         config.pr_base_oid = pr_base_oid;
         config.gh_repo = gh_repo;
         config.tests_pattern = cli.tests_pattern.clone();
+        config.full_tests = cli.full_tests;
         config.why_blocked = cli.why_blocked;
         config.bridge_stage = cli.bridge_stage.min(4);
 

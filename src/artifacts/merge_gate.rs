@@ -161,7 +161,11 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
         // Additive (schema 3.1): how much of this check's suite the run decided
         // had to execute, and why. Only the checks that own an ecosystem's test
         // scope carry it.
-        if let Some(report) = scope.and_then(|scope| scope.report_for_check(&eval.name))
+        // Pinned to the EXECUTED result, not to the policy row: `scope.mode`
+        // is a claim about a command that ran, and a row for a check that never
+        // ran has no command to describe.
+        if let Some(report) =
+            executed_check.and_then(|check| scope.and_then(|scope| scope.report_for_check(check)))
             && let Some(row) = gate_checks.last_mut()
         {
             row["scope"] = json!(report);
@@ -363,7 +367,7 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     // must be told the suite was not exhaustive. Never moves the verdict.
     all_review_caveats.extend(
         scope
-            .map(crate::checks::scope::ScopeDecisions::review_caveats)
+            .map(|scope| scope.review_caveats(checks))
             .unwrap_or_default(),
     );
     all_review_caveats.extend(skipped_requested_security_review_caveats(
@@ -980,6 +984,7 @@ mod tests {
                 finished_at: "2026-09-11T10:00:01+02:00".into(),
                 hard_fail_signatures: Vec::new(),
                 cache_key: None,
+                executed_scope: None,
             }),
         }
     }
@@ -1111,6 +1116,7 @@ mod tests {
         };
         let dashboard = build_dashboard_context(DashboardContextInput {
             config: &config,
+            scope: None,
             checks: &checks,
             heuristics: None,
             inline: &inline,
@@ -1673,6 +1679,7 @@ mod tests {
         let gate: serde_json::Value = serde_json::from_str(&raw).expect("parse gate json");
         let dashboard = build_dashboard_context(DashboardContextInput {
             config: &config,
+            scope: None,
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -1741,6 +1748,7 @@ mod tests {
 
         let dashboard = build_dashboard_context(DashboardContextInput {
             config: &config,
+            scope: None,
             checks: &[],
             heuristics: None,
             inline: &inline,
