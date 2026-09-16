@@ -212,8 +212,8 @@ prview feature/x main
 |------|--------------|
 | standard (default) | Full review with tests and lint enabled by default |
 | `--quick` | Light pass: skip tests/lint/bundle/heuristics |
-| `--deep` | All heavier checks enabled (including security and heuristics) |
-| `--ci` | Like deep, tuned for automation: no colors; non-zero on Block/quality failure |
+| `--deep` | All heavier checks enabled (including security and heuristics); tests stay narrowed to the change |
+| `--ci` | Like deep, tuned for automation: no colors; non-zero on Block/quality failure; runs the FULL test suite |
 | `--update` | Incremental rerun after new commits, skipping heavy checks unless forced |
 | `--ai-only` | Minimal artifact pack for AI/review flows |
 
@@ -367,6 +367,86 @@ explicit mutating `prview fix` command still invokes formatter/fixer toolchains
 synchronously and is not yet governed by `--resource-budget`; do not treat the
 review envelope as a product-wide cap for that separate command.
 
+### Change-scoped test runs
+
+prview decides, per ecosystem, how much of a test suite a change actually
+requires, and then runs exactly that:
+
+| What changed | `Cargo test` | `Vitest` |
+|---|---|---|
+| Rust source inside a workspace member | that package **and everything that depends on it**, as `-p <pkg>` arguments | unaffected |
+| JS/TS source | unaffected | `vitest related <changed files>` — the tests that import them, directly or transitively |
+| Nothing the suite covers | `Skipped`, `no tests related to the change` — no command runs | the same |
+| Anything the decision cannot account for | the full suite, with the reason published | the full suite, with the reason published |
+
+**Doubt always widens the run.** A manifest or lockfile, a build script, a test
+config, a deletion or rename, a file under `tools/` or `fixtures/`, more than one
+diff base, a file type neither selector can see — any of these runs everything
+and says which fact widened it. A narrowing is never a guess.
+
+**Blind spots, stated rather than hidden.** Vitest selects by the STATIC import
+graph: dynamic imports with computed paths, files read through `fs`, templates,
+JSON assets and env-driven branches are invisible to it. Cargo selects by package
+membership and path dependencies: a test that reaches another crate through a
+registry version, or reads a file with `include_str!`, is invisible the same way.
+Both are covered by the escalation rules above wherever the change touches
+something recognisable — but if your suite depends on data neither graph
+contains, `--full-tests` is the answer.
+
+`--full-tests` runs both suites in full regardless of the change, and the pack
+records `full test run requested (--full-tests)` as the reason. Nothing else
+changes: the same commands, the same caps.
+
+**`--ci` runs everything; `--deep` narrows.** Narrowing exists to keep a
+reviewer's laptop usable, and a runner is not a laptop — so the automation
+preset pins both suites to the full run and the pack records
+`full test run requested (--ci)`, naming the preset rather than an operator.
+A local `prview --pr N --deep` stays change-scoped. `--ci --full-tests` is legal
+and simply names the operator as the one who asked. `prview gate` is unaffected:
+the gate profile runs no tests at all.
+
+**Reading it in the pack.** Every `Cargo test` / `Vitest` row **with an executed
+result** in `RUN.json`, `report.json` and `MERGE_GATE.json` carries a `scope`
+object. A check that never ran at all — disabled by a preset, ruled out by the
+profile, missing its tool — is listed as a pre-flight skip and carries no
+`scope`: there is no command to describe, and a decision alone is not one.
+
+The object holds `mode`
+(`full` or `change-scoped`), the `reason`, how many inputs were considered, how
+many units were selected out of what universe — Cargo counts packages, Vitest
+counts the test files its reporter collected — and the `selector`, the exact
+fragment of the command line that narrowed the run. The selector is a substring
+of the `command` recorded in `20_quality/<gate>.result.json`, so the claim can be
+checked against the command itself. `mode` describes what RAN: a run that
+escalated at execution time reports `full`, never `change-scoped`. A narrowed or
+skipped suite also adds an advisory line to `decision.review_caveats`; it never
+moves the verdict.
+
+An empty selection is reported as `change-scoped` with `selected: 0`, a null
+selector and a `skipped` row. It is never reported as a pass — no suite ran. The
+check proves that skip rather than leaving a blank: its row in
+`20_quality/<gate>.result.json` carries `command: "<no command recorded>"`, and
+the pack keys the empty selection on that record. A test row that was skipped
+for any other reason — a missing tool, a preset, a crash — reports `full` with
+`scoped execution not confirmed by the check`.
+
+**In prose, too.** `PR_REVIEW.md` carries a `## Test Scope` section with one
+sentence per suite that ran — `Cargo test: full run (manifest or lockfile
+changed: Cargo.lock)`, `Vitest: change-scoped — 1 of 12 test files related to the
+diff ran`, `Cargo test: skipped — no tests related to the change` — and
+`REVIEW_SUMMARY.md` embeds it. The sentences are rendered from the very `scope`
+objects above, so the prose and the JSON cannot disagree.
+
+**How prview knows a narrowed Vitest run found nothing.** From Vitest's JSON
+reporter, which the narrowed command carries (`--reporter=default
+--reporter=json --outputFile.json=…`, written to a temporary file), never from
+the words in its output — a test is free to print anything, including Vitest's
+own "No test files found". Zero suites and zero collected files is the skip;
+executed tests hand the verdict back to the exit code. If that report is missing
+or unreadable, the row is an `error` saying the run could not be verified, not a
+pass and not a skip. A full `vitest run` is untouched: same command, same
+exit-code verdict.
+
 ### Test selection
 
 `--tests-pattern PATTERN` is runner-aware rather than one portable regex:
@@ -381,6 +461,11 @@ A Mixed JS/Rust review runs both Vitest and Cargo with the same value, so the
 portable contract is their literal intersection. A regex-specific value makes
 the Cargo check `ERROR`; use a literal substring common to both runners, omit
 the shared selector, or run runner-specific test commands separately.
+
+`--tests-pattern` filters INSIDE whatever the scope decision selected; it never
+widens a narrowed run and never replaces the selection. On a change-scoped run
+the two compose: the packages or files come from the change, the pattern picks
+tests within them.
 
 A filtered Cargo run is `ERROR`, not `PASS`, unless standard libtest summaries
 prove that at least one selected test executed. This prevents both zero-match
@@ -460,6 +545,7 @@ prview --help
 | `--security-full` | Full security tier: runs full-tree Semgrep and adds cargo-geiger's unsafe scan (slow; off even under `--deep`) |
 | `--resource-budget safe\|balanced` | Select the whole-machine envelope (`safe` is the default; `balanced` is capped and load-aware) |
 | `--tests-pattern PATTERN` | Filter Vitest by regex or Cargo/libtest by literal substring; Mixed uses the literal intersection and Pytest remains unfiltered |
+| `--full-tests` | Run every test regardless of what changed, disabling change-scoped narrowing for this run (implied by `--ci`) |
 
 An explicit `--skip-security` disables Semgrep before tool discovery, including
 in quick review runs. This is separate from the heavy-security opt-in; an

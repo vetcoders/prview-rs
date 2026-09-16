@@ -16,22 +16,43 @@
 //! `Full`: an unknown file, an unmapped path, a failed metadata read, more than
 //! one diff base. Nothing here runs a tool or builds a command line.
 //!
-//! **What this build does NOT do yet.** The checks still run their full
-//! commands. The decision is computed and published so the machinery is
-//! visible and reviewable, but a `ChangeScoped` decision is reported as
-//! `mode: "full"` with the reason [`SCOPED_EXECUTION_NOT_ENABLED`] — see
-//! [`ScopeDecision::report`]. Emitting `change-scoped` while running everything
-//! would be precisely the lie the contract forbids.
+//! **Deciding is not executing, and the report follows execution.** The checks
+//! read the decision off [`crate::config::Config::test_scope`] and narrow their
+//! own command lines; what they actually ran comes back as [`ExecutedScope`] on
+//! the provenance. [`ScopeDecisions::report_for_check`] takes the executed
+//! [`CheckResult`] precisely so `mode: "change-scoped"` can only be emitted
+//! against evidence that the check narrowed. A decision with no such evidence
+//! reports `full` with [`SCOPED_EXECUTION_NOT_CONFIRMED`]: claiming a narrower
+//! run than the one that happened is the lie the contract forbids, in either
+//! direction.
 
+use crate::checks::{CheckResult, CheckStatus};
 use crate::config::DetectedProfile;
 use crate::git::{ChangedPath, FileStatus};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// Reported reason when the decision says a narrower run would be sound but
-/// this build still executes the full command.
-pub const SCOPED_EXECUTION_NOT_ENABLED: &str = "scoped execution not enabled yet";
+/// Reported reason when a `ChangeScoped` decision came back from a check that
+/// left no evidence of having narrowed anything.
+///
+/// The decision is one half of the truth and the execution is the other. A
+/// check may escalate at runtime, fail before it builds a command, or simply
+/// predate this field, and in every one of those cases what ran was the full
+/// suite. Reporting `change-scoped` on the strength of the decision alone would
+/// describe a run that did not happen.
+pub const SCOPED_EXECUTION_NOT_CONFIRMED: &str = "scoped execution not confirmed by the check";
+
+/// The reason a check row carries when the run really did narrow.
+pub const CHANGE_SCOPED_SELECTION: &str = "change-scoped selection";
+
+/// Reason pinned to both ecosystems when the operator asked for everything
+/// (contract §9, `--full-tests`).
+pub const FULL_TESTS_REQUESTED: &str = "full test run requested (--full-tests)";
+
+/// The same pin, asked for by the automation preset instead (contract §9: the
+/// CI recipe runs the full suite, because CI is where the machines are).
+pub const FULL_TESTS_REQUESTED_BY_CI: &str = "full test run requested (--ci)";
 
 /// Hard ceiling for the one `cargo metadata` call a run makes.
 ///
@@ -106,13 +127,38 @@ impl ReviewedTree {
     /// records it; `None` means `plan_check_run` returned the repository root
     /// because the reviewed target IS the checked-out `HEAD`. Only in that
     /// second case does the operator's working tree enter the picture at all.
+    ///
+    /// `snapshot_tree_state` is the run-wide substrate the ledger resolved for
+    /// that snapshot, and it is not a formality. "A snapshot exists" is not
+    /// "the snapshot holds the reviewed commit": a tool that wrote into the
+    /// worktree (a generated `Cargo.lock`, a build script) leaves
+    /// [`TreeState::SnapshotDirty`], and the bytes the checks then compile are
+    /// no longer `target_sha`. Selecting packages or test files from a change
+    /// set that cannot list those extra bytes is the silent narrowing the
+    /// contract forbids, so that state resolves to [`Self::Unknown`] and the run
+    /// escalates.
+    ///
+    /// [`TreeState::SnapshotBorrowedDeps`] is deliberately NOT in that group.
+    /// Its reviewed SOURCE is exactly `target_sha` — only the dependency links
+    /// came from the operator checkout — and source is the whole of what test
+    /// selection reads.
     pub fn resolve(
         repo_root: &Path,
         scan_dir: Option<PathBuf>,
+        snapshot_tree_state: Option<crate::checks::TreeState>,
         operator_worktree_clean: Option<bool>,
     ) -> Self {
+        use crate::checks::TreeState;
         match scan_dir {
-            Some(snapshot) => Self::Snapshot(snapshot),
+            Some(snapshot) => match snapshot_tree_state {
+                Some(TreeState::Snapshot | TreeState::SnapshotBorrowedDeps) => {
+                    Self::Snapshot(snapshot)
+                }
+                // Includes `None`: a snapshot on disk whose substrate the run
+                // never resolved is a tree nobody has identified. Unknown is the
+                // honest name for it, and it escalates.
+                _ => Self::Unknown(snapshot),
+            },
             None => match operator_worktree_clean {
                 Some(true) => Self::LocalClean(repo_root.to_path_buf()),
                 Some(false) => Self::LocalDirty(repo_root.to_path_buf()),
@@ -176,6 +222,78 @@ impl Ecosystem {
             Self::Vitest => "Vitest",
         }
     }
+
+    /// What one unit of this ecosystem's selection IS, singular, for prose.
+    ///
+    /// The two are counted in different units and saying so is the point: a
+    /// reader who is told "2 selected" without the noun cannot tell a pair of
+    /// packages from a pair of test files.
+    pub fn selection_unit(self) -> &'static str {
+        match self {
+            Self::Cargo => "package",
+            Self::Vitest => "test file",
+        }
+    }
+
+    /// Every ecosystem a run can scope, in reporting order.
+    pub const ALL: [Self; 2] = [Self::Cargo, Self::Vitest];
+
+    /// The ecosystem whose test scope this check owns, if any. Matching is by
+    /// display name — the same identity the merge gate uses to pair a policy row
+    /// with an executed check.
+    pub fn owning_check(check_name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|eco| check_name.eq_ignore_ascii_case(eco.check_name()))
+    }
+}
+
+/// Whether this check is the one that decides how much of an ecosystem's test
+/// suite runs.
+///
+/// The dispatcher asks before resolving anything: with no check in the runnable
+/// set that could consume a decision, the run must not pay for a `cargo
+/// metadata` subprocess to compute an answer nobody reads.
+pub fn owns_test_scope(check_name: &str) -> bool {
+    Ecosystem::owning_check(check_name).is_some()
+}
+
+/// What a check ACTUALLY ran, recorded on its provenance.
+///
+/// The decision says what should be sufficient; this says what the command line
+/// ended up being. They diverge legitimately — a check can escalate at runtime
+/// when the narrowed command cannot be built — and the report is owed the
+/// second fact, not the first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+pub enum ExecutedScope {
+    /// The full suite ran. `reason` is why, in the same vocabulary as
+    /// [`ScopeDecision::Full`].
+    Full { reason: String },
+    /// Nothing ran, because the selection was empty: the decision proved that
+    /// no test in this ecosystem can be affected by the change.
+    ///
+    /// A separate variant rather than `ChangeScoped { selected: 0 }`, because
+    /// the two are different facts. A narrowed run that collected nothing
+    /// executed a command and can name its selector; this one never spawned a
+    /// process and has no selector to name. It is also the evidence that
+    /// distinguishes an honest empty selection from a check that was never
+    /// dispatched at all — the reason the ledger, the report and the policy can
+    /// key on a proof instead of on the absence of one.
+    NothingSelected,
+    /// A narrowed suite ran.
+    ChangeScoped {
+        /// How many units the run selected, each ecosystem in its own unit:
+        /// packages for Cargo, test files the reporter collected for Vitest.
+        /// Vitest's count is knowable only after the run, so it is written from
+        /// the reporter rather than from the selector's inputs.
+        selected: usize,
+        /// The selection fragment of the command line, VERBATIM. Pinned by test
+        /// to be a substring of `provenance.command`, so a reader can hold the
+        /// reported scope against the command that produced it without trusting
+        /// either one alone.
+        selector: String,
+    },
 }
 
 /// What must run for one ecosystem, and why.
@@ -222,11 +340,9 @@ impl ScopeDecision {
     /// The reason a check must report as `Skipped` because this decision chose
     /// nothing to run, or `None` when something was selected.
     ///
-    /// Not applied to any `CheckResult` in this build: the checks still execute
-    /// their full commands, and a run that executed the whole suite may not be
-    /// relabelled `Skipped`. Step 2 is where this reason reaches a check's
-    /// status, at the same moment the commands actually narrow. Defined and
-    /// tested here so the semantics land with the decision that produces them.
+    /// A check that reaches this returns `Skipped` with this reason and NO
+    /// provenance: there is no command, no exit code and no tree read, so a
+    /// provenance row would be a record of an execution that never happened.
     pub fn empty_selection_skip_reason(&self) -> Option<&'static str> {
         match self {
             Self::ChangeScoped { selected, .. } if selected.is_empty() => {
@@ -236,38 +352,80 @@ impl ScopeDecision {
         }
     }
 
-    /// The publishable view of this decision, given that this build still runs
-    /// full commands.
-    ///
-    /// A real escalation keeps its own reason — that fact is true regardless of
-    /// whether scoped execution is wired up. A `ChangeScoped` decision is
-    /// reported as `full`, because full is what ran; `selected` and `selector`
-    /// stay `null` for the same reason, since nothing was selected and no
-    /// selector was invoked. `inputs` is what the decision actually counted,
-    /// escalation or not — a full run that examined seven changed paths says
-    /// seven, because `null` there is reserved for "there was nothing to
-    /// count".
-    pub fn report(&self) -> ScopeReport {
+    /// Changed paths this decision counted, in the shape the report publishes.
+    fn reported_inputs(&self) -> Option<usize> {
         match self {
-            Self::Full { reason, inputs } => ScopeReport {
-                mode: "full",
-                reason: reason.clone(),
-                inputs: *inputs,
-                selected: None,
-                universe: None,
-                selector: None,
-                non_participating: Vec::new(),
-            },
-            Self::ChangeScoped {
-                inputs, universe, ..
-            } => ScopeReport {
-                mode: "full",
-                reason: SCOPED_EXECUTION_NOT_ENABLED.to_string(),
-                inputs: Some(*inputs),
-                selected: None,
-                universe: *universe,
-                selector: None,
-                non_participating: Vec::new(),
+            Self::Full { inputs, .. } => *inputs,
+            Self::ChangeScoped { inputs, .. } => Some(*inputs),
+        }
+    }
+
+    /// The population the selection was drawn from, when the decision knew it.
+    fn reported_universe(&self) -> Option<usize> {
+        match self {
+            Self::Full { .. } => None,
+            Self::ChangeScoped { universe, .. } => *universe,
+        }
+    }
+
+    /// The publishable view of a run that executed the full suite, for the
+    /// stated reason.
+    ///
+    /// `inputs` is what the decision actually counted, escalation or not — a
+    /// full run that examined seven changed paths says seven, because `null`
+    /// there is reserved for "there was nothing to count". `selected` and
+    /// `universe` are null: a full run selects by not selecting, and publishing
+    /// a count beside it would read as coverage.
+    fn full_report(&self, reason: String) -> ScopeReport {
+        ScopeReport {
+            mode: "full",
+            reason,
+            inputs: self.reported_inputs(),
+            selected: None,
+            universe: None,
+            selector: None,
+            non_participating: Vec::new(),
+        }
+    }
+
+    /// The publishable view of a run that really did narrow.
+    fn scoped_report(&self, selected: usize, selector: Option<String>) -> ScopeReport {
+        ScopeReport {
+            mode: "change-scoped",
+            reason: CHANGE_SCOPED_SELECTION.to_string(),
+            inputs: self.reported_inputs(),
+            selected: Some(selected),
+            universe: self.reported_universe(),
+            selector,
+            non_participating: Vec::new(),
+        }
+    }
+
+    /// The publishable view of this decision GIVEN what the check did with it.
+    ///
+    /// The ordering is the contract. An escalated decision reports its own
+    /// reason, because nothing downstream could have narrowed anyway. A
+    /// `ChangeScoped` decision reports what the check's own [`ExecutedScope`]
+    /// proves it did: an empty selection ([`ExecutedScope::NothingSelected`]),
+    /// a narrowed command, or a runtime escalation. Absent evidence means
+    /// `full` with [`SCOPED_EXECUTION_NOT_CONFIRMED`]: never `change-scoped` on
+    /// a decision alone, not even an empty one. A check that skipped for its own
+    /// reasons — tooling missing, preset, crash — must not be able to inherit
+    /// the decision's empty selection as if it had honoured it.
+    pub fn report_for_result(&self, result: &CheckResult) -> ScopeReport {
+        let executed = result
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.executed_scope.as_ref());
+        match self {
+            Self::Full { reason, .. } => self.full_report(reason.clone()),
+            Self::ChangeScoped { .. } => match executed {
+                Some(ExecutedScope::NothingSelected) => self.scoped_report(0, None),
+                Some(ExecutedScope::ChangeScoped { selected, selector }) => {
+                    self.scoped_report(*selected, Some(selector.clone()))
+                }
+                Some(ExecutedScope::Full { reason }) => self.full_report(reason.clone()),
+                None => self.full_report(SCOPED_EXECUTION_NOT_CONFIRMED.to_string()),
             },
         }
     }
@@ -305,39 +463,77 @@ impl ScopeDecisions {
     /// ecosystem's test runner. Matching is by display name, the same identity
     /// the merge gate uses to pair a policy row with an executed check.
     pub fn for_check(&self, check_name: &str) -> Option<&ScopeDecision> {
-        [Ecosystem::Cargo, Ecosystem::Vitest]
-            .into_iter()
-            .find(|eco| check_name.eq_ignore_ascii_case(eco.check_name()))
-            .map(|eco| self.get(eco))
+        Ecosystem::owning_check(check_name).map(|eco| self.get(eco))
     }
 
-    /// The publishable `scope` object for a check row: the ecosystem's decision
-    /// plus the run's non-participating classification, which is what makes the
-    /// decision auditable.
-    pub fn report_for_check(&self, check_name: &str) -> Option<ScopeReport> {
-        self.for_check(check_name).map(|decision| {
-            let mut report = decision.report();
+    /// The publishable `scope` object for an EXECUTED check row: the
+    /// ecosystem's decision as the check actually carried it out, plus the
+    /// run's non-participating classification, which is what makes the decision
+    /// auditable.
+    ///
+    /// Takes the result rather than the name because the mode is a claim about
+    /// execution. A row with no executed result gets no `scope` at all — there
+    /// is no run to describe.
+    pub fn report_for_check(&self, result: &CheckResult) -> Option<ScopeReport> {
+        self.for_check(&result.name).map(|decision| {
+            let mut report = decision.report_for_result(result);
             report.non_participating = self.non_participating.clone();
             report
         })
     }
 
-    /// Review caveats owed to the merge gate because a check ran narrower than
-    /// its full suite. Advisory only — scope never changes a verdict.
+    /// One sentence per scope-owning check that produced a result, for the
+    /// human-readable artifacts (contract §7).
     ///
-    /// Empty in this build: nothing reports `change-scoped` while the commands
-    /// stay full. The renderer exists here so the caveat cannot be forgotten
-    /// when execution is wired up, and so its wording is pinned by a test now.
-    pub fn review_caveats(&self) -> Vec<String> {
-        [Ecosystem::Cargo, Ecosystem::Vitest]
+    /// Same source as `report_for_check`, so `PR_REVIEW.md` and
+    /// `REVIEW_SUMMARY.md` state exactly what `MERGE_GATE.json` publishes; the
+    /// prose is a rendering of the report, never a second count. A check with no
+    /// executed result contributes nothing — there is no run to describe.
+    pub fn review_sentences(&self, checks: &[CheckResult]) -> Vec<String> {
+        Ecosystem::ALL
             .into_iter()
-            .filter(|eco| self.get(*eco).report().mode == "change-scoped")
-            .map(|eco| {
-                format!(
-                    "{} ran a change-scoped test selection; tests unrelated to the diff by static \
-                     analysis were not executed",
-                    eco.check_name()
-                )
+            .filter_map(|eco| {
+                let result = checks
+                    .iter()
+                    .find(|check| check.name.eq_ignore_ascii_case(eco.check_name()))?;
+                Some(self.report_for_check(result)?.sentence(eco.check_name()))
+            })
+            .collect()
+    }
+
+    /// Review caveats owed to the merge gate because a check did not run its
+    /// full suite. Advisory only — scope never changes a verdict.
+    ///
+    /// Derived from the same `report_for_check` the artifacts publish, so a
+    /// caveat cannot describe a narrowing the check rows do not show, and a
+    /// narrowed row cannot reach a reviewer uncaveated.
+    pub fn review_caveats(&self, checks: &[CheckResult]) -> Vec<String> {
+        Ecosystem::ALL
+            .into_iter()
+            .filter_map(|eco| {
+                let result = checks
+                    .iter()
+                    .find(|check| check.name.eq_ignore_ascii_case(eco.check_name()))?;
+                let report = self.report_for_check(result)?;
+                if report.mode != "change-scoped" {
+                    return None;
+                }
+                // A skip is not a narrower run, it is no run at all, and a
+                // reviewer needs to be told which of the two happened. Both
+                // roads lead here: a decision that selected nothing, and a
+                // selection whose inputs turned out to import no test.
+                Some(if result.status == CheckStatus::Skipped {
+                    format!(
+                        "{} skipped: {NO_TESTS_RELATED_TO_THE_CHANGE}",
+                        eco.check_name()
+                    )
+                } else {
+                    format!(
+                        "{} ran a change-scoped test selection; tests unrelated to the diff by \
+                         static analysis were not executed",
+                        eco.check_name()
+                    )
+                })
             })
             .collect()
     }
@@ -364,6 +560,45 @@ pub struct ScopeReport {
     pub non_participating: Vec<NonParticipatingPath>,
 }
 
+impl ScopeReport {
+    /// One sentence for a human-readable artifact, contract §7.
+    ///
+    /// `PR_REVIEW.md` and `REVIEW_SUMMARY.md` owe the reader the same fact the
+    /// machine-readable rows carry: how much of this suite ran, and why. Written
+    /// from the very report the pack publishes, so the prose cannot claim a
+    /// scope the JSON contradicts, and phrased in the ecosystem's own unit,
+    /// because "2 selected" is not a statement anyone can act on.
+    pub fn sentence(&self, check_name: &str) -> String {
+        let unit = Ecosystem::owning_check(check_name)
+            .map(Ecosystem::selection_unit)
+            .unwrap_or("unit");
+        if self.mode != "change-scoped" {
+            return format!("{check_name}: full run ({}).", self.reason);
+        }
+        match self.selected {
+            // A narrowed decision that selected nothing, or a narrowed run that
+            // collected nothing: either way no test executed, and the sentence
+            // must not leave a reader thinking the suite passed.
+            Some(0) | None => {
+                format!("{check_name}: skipped — {NO_TESTS_RELATED_TO_THE_CHANGE}.")
+            }
+            Some(selected) => {
+                let plural = if selected == 1 { "" } else { "s" };
+                match self.universe {
+                    Some(universe) => format!(
+                        "{check_name}: change-scoped — {selected} of {universe} {unit}{plural} \
+                         related to the diff ran."
+                    ),
+                    None => format!(
+                        "{check_name}: change-scoped — {selected} {unit}{plural} related to the \
+                         diff ran."
+                    ),
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Escalation reasons
 // ---------------------------------------------------------------------------
@@ -374,6 +609,21 @@ pub struct ScopeReport {
 /// `RUN.json`, `report.json` and `MERGE_GATE.json`, so they are part of the
 /// artifact contract and are pinned by tests.
 pub mod reason {
+    /// Contract §9: the operator asked for the full suite explicitly.
+    pub const FULL_TESTS_REQUESTED: &str = super::FULL_TESTS_REQUESTED;
+    /// Contract §9: the `--ci` preset asked for it.
+    pub const FULL_TESTS_REQUESTED_BY_CI: &str = super::FULL_TESTS_REQUESTED_BY_CI;
+
+    /// The published reason for a run pinned to the full suite, by request.
+    ///
+    /// One place, so the two sentences cannot drift apart and no caller has to
+    /// assemble either of them by hand.
+    pub fn full_tests_requested(request: crate::config::FullTestsRequest) -> &'static str {
+        match request {
+            crate::config::FullTestsRequest::Flag => FULL_TESTS_REQUESTED,
+            crate::config::FullTestsRequest::CiPreset => FULL_TESTS_REQUESTED_BY_CI,
+        }
+    }
     pub const NO_CHANGE_SET: &str = "no change set pinned for this run";
     pub const MULTIPLE_BASES: &str = "multiple diff bases";
     /// The checks read the operator checkout and it carries uncommitted work.
@@ -1214,6 +1464,16 @@ pub async fn resolve_run_scope(
     reviewed_tree: &ReviewedTree,
 ) -> ScopeDecisions {
     let change_set = config.changed_paths.as_ref();
+    if let Some(request) = config.full_tests {
+        // Contract §9: everything was asked for, so there is nothing to decide
+        // and nothing to pay a subprocess for. Stated as an ordinary escalation
+        // reason, because that is what it is — the run is wider than the change
+        // requires, on purpose, and the pack must say who widened it.
+        return both(ScopeDecision::full(
+            reason::full_tests_requested(request),
+            change_set.map(|set| set.paths().len()),
+        ));
+    }
     // `cargo metadata` resolves manifest paths through the real directory, so
     // the root the diff's paths are joined onto has to be resolved the same way
     // or nothing will match. A root that cannot be canonicalised is used as
@@ -1263,7 +1523,12 @@ pub async fn resolve_run_scope(
             reviewed_tree: &reviewed_tree,
             profile: &config.profile,
             cargo_workspace: workspace.as_ref(),
-            is_generated: &|path| crate::checks::is_generated_artifact_path(path, config),
+            // The BUILT-IN half only, deliberately. `is_generated_artifact_path`
+            // also folds in the operator's `lint_ignore_patterns`, which say
+            // "do not lint this", not "no test reads this". Now that the
+            // selection really narrows, letting a lint preference drop a source
+            // file out of `selector_inputs` would silently stop testing it.
+            is_generated: &crate::checks::is_builtin_generated_output_path,
             classifier: &classifier,
         },
     )

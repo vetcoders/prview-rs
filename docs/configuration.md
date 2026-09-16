@@ -42,6 +42,14 @@ ignore_patterns = [
 # Whether a detected breaking API change escalates the merge verdict.
 # Default: true (escalation on out-of-the-box).
 breaking_escalation = true
+
+[scope]
+# Changed paths this repository knows are not inputs to TEST SELECTION.
+# Additive globs over repo-relative paths, on top of the built-in list.
+non_participating = ["design/**", "*.drawio"]
+# Set to false to drop the built-in list entirely and escalate everything
+# that is not recognised source.
+non_participating_builtins = true
 ```
 
 ### Options
@@ -80,6 +88,30 @@ Tunes how the merge-gate verdict reacts to structural signals.
   Added-only Rust API touch is informational. Typed unknown Rust regions are a
   confidence failure rather than a confirmed break: they require review even
   when breaking escalation is disabled, but never force `BLOCK` by themselves.
+
+#### `[scope]`
+
+Tunes which changed paths are allowed to participate in deciding **how much of a
+test suite has to run**. It affects test selection only: a path listed here is
+still in the diff, the artifacts, the signals and the verdict.
+
+* **`non_participating`**: additional `glob` patterns for paths this repository
+  knows no test runner reads. They are added to the built-in list
+  (`CHANGELOG*` and `LICENSE*`/`LICENCE*` at the repository root, prose under a
+  top-level `docs/`/`doc/`, and `.github/workflows/*.yml`). Recognised Rust and
+  JS/TS source always wins: a repository cannot declare its own `src/**` neutral
+  and quietly stop testing it. An unparsable pattern is dropped with a warning
+  rather than applied loosely — a rule prview cannot compile must not neutralise
+  a path by accident.
+* **`non_participating_builtins`** (default `true`): set to `false` to disable
+  the built-in list. This restores strictly escalating behaviour, where every
+  path that is not recognised source runs the full suite. Safer and far slower;
+  in practice almost every pull request also touches a CHANGELOG or a document.
+
+Everything declared here is **published**: each neutralised path appears with
+the rule that named it in the `scope` object on the test rows and as a
+`## Test scope` table in `MERGE_GATE.md`, so a reviewer who disagrees with the
+call can argue with the rule rather than read the source.
 
 ---
 

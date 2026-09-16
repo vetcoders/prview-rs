@@ -1,0 +1,11 @@
+# Deliberately unreachable from the root package: no other member lists it as a
+# dependency, so the reverse path-dependency closure of a root-package change
+# must never reach it.
+[package]
+name = "prview-bounded-runtime-unrelated"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"

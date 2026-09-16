@@ -20,6 +20,10 @@ import time
 from typing import Any
 
 WHOLE_MACHINE_TOOLS = ("cargo", "vitest", "semgrep", "tsc", "eslint", "stylelint")
+# The census keeps every distinct command it sampled, up to this many. A deep
+# review of the fixture produces far fewer; the cap only bounds a pathological
+# run.
+MAX_OBSERVED_COMMANDS = 400
 REQUIRED_RUN_CHECKS = {
     "cargo": "Cargo check",
     "vitest": "Vitest",
@@ -64,8 +68,81 @@ def run_checked(command: list[str], cwd: pathlib.Path, log: pathlib.Path) -> Non
         )
 
 
+NORMALIZED_MATH_JS = (
+    "export function add(left, right) {\n"
+    "  return Number(left) + Number(right);\n"
+    "}\n"
+)
+
+# A second public function plus its test, so the Rust half of the `mixed` case
+# is a real source edit inside the root package rather than a whitespace churn.
+EXTENDED_LIB_RS = """pub fn add(left: i32, right: i32) -> i32 {
+    left + right
+}
+
+pub fn triple(value: i32) -> i32 {
+    value * 3
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn adds_two_numbers() {
+        assert_eq!(super::add(2, 3), 5);
+    }
+
+    #[test]
+    fn triples_a_number() {
+        assert_eq!(super::triple(3), 9);
+    }
+}
+"""
+
+# Neither selector can see this file: vitest walks the static import graph and
+# cargo walks package membership, while a data file is read at runtime. It is
+# the contract's `Unknown` class, and it must widen both ecosystems.
+UNKNOWN_INPUT_YAML = "max_items: 32\n"
+
+
+def commit_candidate(
+    repo: pathlib.Path, log: pathlib.Path, paths: list[str], message: str
+) -> None:
+    run_checked(["git", "add", *paths], repo, log)
+    run_checked(["git", "commit", "-m", message], repo, log)
+
+
+def mutate_js_only(repo: pathlib.Path, log: pathlib.Path) -> None:
+    (repo / "src" / "math.js").write_text(NORMALIZED_MATH_JS, encoding="utf-8")
+    commit_candidate(repo, log, ["src/math.js"], "fix: normalize numeric inputs")
+
+
+def mutate_mixed(repo: pathlib.Path, log: pathlib.Path) -> None:
+    (repo / "src" / "math.js").write_text(NORMALIZED_MATH_JS, encoding="utf-8")
+    (repo / "src" / "lib.rs").write_text(EXTENDED_LIB_RS, encoding="utf-8")
+    commit_candidate(
+        repo,
+        log,
+        ["src/math.js", "src/lib.rs"],
+        "feat: normalize numeric inputs and add triple",
+    )
+
+
+def mutate_unknown_input(repo: pathlib.Path, log: pathlib.Path) -> None:
+    (repo / "src" / "math.js").write_text(NORMALIZED_MATH_JS, encoding="utf-8")
+    (repo / "src" / "limits.yaml").write_text(UNKNOWN_INPUT_YAML, encoding="utf-8")
+    commit_candidate(
+        repo,
+        log,
+        ["src/math.js", "src/limits.yaml"],
+        "feat: normalize numeric inputs and declare limits",
+    )
+
+
 def prepare_fixture(
-    source: pathlib.Path, work: pathlib.Path, log: pathlib.Path
+    source: pathlib.Path,
+    work: pathlib.Path,
+    log: pathlib.Path,
+    mutate: Any,
 ) -> pathlib.Path:
     repo = work / "mixed-review"
     shutil.copytree(
@@ -84,15 +161,7 @@ def prepare_fixture(
     run_checked(["git", "add", "."], repo, log)
     run_checked(["git", "commit", "-m", "test: add bounded runtime fixture"], repo, log)
     run_checked(["git", "switch", "-c", "candidate"], repo, log)
-    math = repo / "src" / "math.js"
-    math.write_text(
-        "export function add(left, right) {\n"
-        "  return Number(left) + Number(right);\n"
-        "}\n",
-        encoding="utf-8",
-    )
-    run_checked(["git", "add", "src/math.js"], repo, log)
-    run_checked(["git", "commit", "-m", "fix: normalize numeric inputs"], repo, log)
+    mutate(repo, log)
     return repo
 
 
@@ -282,6 +351,17 @@ def sample_owned_tree(root_pid: int, census: dict[str, Any]) -> None:
         if state.startswith("Z"):
             continue
         commands.append(command)
+        # The whole-run command census. "No `cargo test` process existed" is
+        # only provable against the set of commands actually observed, so the
+        # sampler keeps them (bounded, so a long run cannot grow unboundedly).
+        if len(census["observed_commands"]) < MAX_OBSERVED_COMMANDS:
+            census["observed_commands"].add(command)
+        elif command not in census["observed_commands"]:
+            # The cap is reached and this command was dropped. Every claim of
+            # the form "no such process existed" is now unprovable from the
+            # census, and the assertions that make it must fail rather than
+            # pass on an incomplete set.
+            census["truncated"] = True
         tool = tool_by_pid.get(pid)
         if tool:
             active_tools.add(tool)
@@ -434,15 +514,440 @@ def add_assertion(violations: list[str], condition: bool, message: str) -> None:
         violations.append(message)
 
 
+# ---------------------------------------------------------------------------
+# Change-scoped execution: what each case proves
+# ---------------------------------------------------------------------------
+
+CARGO_TEST_CHECK = "Cargo test"
+VITEST_CHECK = "Vitest"
+NO_TESTS_RELATED = "no tests related to the change"
+# What a check publishes as its `command` when it spawned no process at all.
+NO_COMMAND_RECORDED = "<no command recorded>"
+
+
+def check_row(document: dict[str, Any] | None, name: str) -> dict[str, Any]:
+    """The named row of a RUN.json / MERGE_GATE.json check list, or `{}`."""
+    rows = (document or {}).get("checks") or []
+    for row in rows:
+        if isinstance(row, dict) and row.get("name") == name:
+            return row
+    return {}
+
+
+def scope_of(document: dict[str, Any] | None, name: str) -> dict[str, Any]:
+    scope = check_row(document, name).get("scope")
+    return scope if isinstance(scope, dict) else {}
+
+
+def gate_command(pack: pathlib.Path, gate_id: str) -> str:
+    """The command a gate actually spawned, from its own result artifact."""
+    result = read_json(pack / "20_quality" / f"{gate_id}.result.json") or {}
+    command = result.get("command")
+    return command if isinstance(command, str) else ""
+
+
+def install_cargo_shim(work: pathlib.Path, env: dict[str, str]) -> pathlib.Path | None:
+    """Put a logging `cargo` in front of PATH; return the log it writes.
+
+    The census samples the process table every 50ms, which can only ever say
+    "we did not happen to see it". This shim is the other kind of evidence: a
+    `cargo` that every invocation must pass through, so its log is a complete
+    record of what ran rather than a sample of it.
+
+    The real cargo is resolved BEFORE the shim reaches PATH — `which` would
+    otherwise find the shim and it would exec itself forever. Resolution keeps
+    whatever `cargo` the machine uses, rustup proxy included: the proxy execs
+    the toolchain binary directly and never re-resolves the name, so the shim
+    dispatches exactly as an unshimmed run would. `exec` also means the shim
+    leaves no extra process in the tree, so descendant counts and the
+    `CARGO_BUILD_JOBS` census read the same processes with the same
+    environment they always did.
+    """
+    real = shutil.which("cargo", path=env.get("PATH"))
+    if real is None:
+        return None
+    shim_dir = work / "cargo-shim"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    log = work / "cargo-invocations.log"
+    shim = shim_dir / "cargo"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {json.dumps(str(log))}\n"
+        f"exec {json.dumps(str(real))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    env["PATH"] = f"{shim_dir}{os.pathsep}{env.get('PATH', '')}"
+    return log
+
+
+def cargo_shim_invocations(log: pathlib.Path | None) -> list[str]:
+    """Every `cargo` argument line the shim recorded, in order."""
+    if log is None or not log.exists():
+        return []
+    return [
+        line.strip()
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+
+
+def shim_cargo_test_invocations(census: dict[str, Any]) -> list[str]:
+    """The recorded invocations that are `cargo test`, by subcommand."""
+    found = []
+    for invocation in census.get("cargo_invocations") or []:
+        parts = invocation.split()
+        # The subcommand is the first non-flag word: `cargo +nightly test` and
+        # `cargo test` are both a test run, `cargo clippy --tests` is not.
+        subcommand = next(
+            (part for part in parts if not part.startswith(("-", "+"))), None
+        )
+        if subcommand == "test":
+            found.append(invocation)
+    return found
+
+
+def observed_cargo_test_commands(census: dict[str, Any]) -> list[str]:
+    """Every sampled process that is a `cargo test` invocation."""
+    found = []
+    for command in census["observed_commands"]:
+        parts = command.split()
+        if not parts:
+            continue
+        if pathlib.Path(parts[0]).name != "cargo":
+            continue
+        if "test" in parts[1:2]:
+            found.append(command)
+    return found
+
+
+def assert_mixed(
+    violations: list[str],
+    run: dict[str, Any] | None,
+    gate: dict[str, Any] | None,
+    pack: pathlib.Path,
+    census: dict[str, Any],
+) -> None:
+    """A Rust edit and a JS edit: both suites narrow, neither is skipped."""
+    cargo = check_row(run, CARGO_TEST_CHECK)
+    cargo_scope = scope_of(run, CARGO_TEST_CHECK)
+    add_assertion(
+        violations,
+        cargo.get("status") == "passed" and cargo.get("cached") is False,
+        "Cargo test did not run live and pass",
+    )
+    add_assertion(
+        violations,
+        cargo_scope.get("mode") == "change-scoped",
+        f"Cargo test scope mode is {cargo_scope.get('mode')!r}, not change-scoped",
+    )
+    add_assertion(
+        violations,
+        cargo_scope.get("selected") == 1,
+        f"Cargo test selected {cargo_scope.get('selected')!r} packages, not 1",
+    )
+    add_assertion(
+        violations,
+        cargo_scope.get("universe") == 2,
+        f"Cargo test universe is {cargo_scope.get('universe')!r}, not the 2 workspace members",
+    )
+    cargo_selector = cargo_scope.get("selector") or ""
+    add_assertion(
+        violations,
+        "-p prview-bounded-runtime-fixture" in cargo_selector,
+        f"Cargo selector does not name the changed package: {cargo_selector!r}",
+    )
+    add_assertion(
+        violations,
+        "unrelated" not in cargo_selector,
+        f"Cargo selector reaches a package nothing depends on: {cargo_selector!r}",
+    )
+    cargo_command = gate_command(pack, "cargo_test")
+    add_assertion(
+        violations,
+        cargo_selector != "" and cargo_selector in cargo_command,
+        f"reported selector {cargo_selector!r} is not part of {cargo_command!r}",
+    )
+    add_assertion(
+        violations,
+        "-p prview-bounded-runtime-unrelated" not in cargo_command,
+        f"the narrowed command still tested the unrelated package: {cargo_command!r}",
+    )
+    # Same claim, from the other side: the shim records every cargo invocation,
+    # so the narrowed test run has to appear there exactly as the pack describes
+    # it. The pack says what prview believes it ran; this says what ran.
+    shimmed = shim_cargo_test_invocations(census)
+    add_assertion(
+        violations,
+        any("-p prview-bounded-runtime-fixture" in invocation for invocation in shimmed),
+        f"the cargo shim recorded no narrowed test run: {shimmed}",
+    )
+    add_assertion(
+        violations,
+        all(
+            "-p prview-bounded-runtime-unrelated" not in invocation
+            for invocation in shimmed
+        ),
+        f"a cargo test run reached the unrelated package: {shimmed}",
+    )
+
+    vitest = check_row(run, VITEST_CHECK)
+    vitest_scope = scope_of(run, VITEST_CHECK)
+    add_assertion(
+        violations,
+        vitest.get("status") == "passed" and vitest.get("cached") is False,
+        "Vitest did not run live and pass",
+    )
+    add_assertion(
+        violations,
+        vitest_scope.get("mode") == "change-scoped",
+        f"Vitest scope mode is {vitest_scope.get('mode')!r}, not change-scoped",
+    )
+    vitest_selector = vitest_scope.get("selector") or ""
+    add_assertion(
+        violations,
+        "related" in vitest_selector and "src/math.js" in vitest_selector,
+        f"Vitest selector does not name the related selection: {vitest_selector!r}",
+    )
+    # Contract §7: Vitest counts TEST FILES, and the fixture has exactly one
+    # importing `src/math.js`. Counting the changed source instead would happen
+    # to give 1 here too, so the selector above (one source) and this count
+    # (one test file) are asserted as the separate facts they are.
+    add_assertion(
+        violations,
+        vitest_scope.get("selected") == 1,
+        f"Vitest selected {vitest_scope.get('selected')!r} test files, not the 1 "
+        "that imports the changed source",
+    )
+    vitest_command = gate_command(pack, "tests")
+    add_assertion(
+        violations,
+        vitest_selector != "" and vitest_selector in vitest_command,
+        f"reported selector {vitest_selector!r} is not part of the Vitest command",
+    )
+    # A narrowed Vitest run is only believable if it can prove what it executed,
+    # and the proof is the JSON reporter. Without these flags the check would be
+    # back to reading the tool's prose.
+    add_assertion(
+        violations,
+        "--reporter=json" in vitest_command and "--outputFile.json=" in vitest_command,
+        f"the narrowed Vitest command carries no JSON reporter: {vitest_command!r}",
+    )
+
+    caveats = ((gate or {}).get("decision") or {}).get("review_caveats") or []
+    for name in (CARGO_TEST_CHECK, VITEST_CHECK):
+        add_assertion(
+            violations,
+            any(
+                isinstance(caveat, str)
+                and name in caveat
+                and "change-scoped test selection" in caveat
+                for caveat in caveats
+            ),
+            f"MERGE_GATE does not caveat the narrowed {name} run",
+        )
+
+
+def assert_js_only(
+    violations: list[str],
+    run: dict[str, Any] | None,
+    gate: dict[str, Any] | None,
+    pack: pathlib.Path,
+    census: dict[str, Any],
+) -> None:
+    """A JS-only change: the Rust suite has nothing to run, and runs nothing."""
+    vitest = check_row(run, VITEST_CHECK)
+    vitest_scope = scope_of(run, VITEST_CHECK)
+    add_assertion(
+        violations,
+        vitest.get("status") == "passed" and vitest.get("cached") is False,
+        "Vitest did not run live and pass",
+    )
+    add_assertion(
+        violations,
+        vitest_scope.get("mode") == "change-scoped",
+        f"Vitest scope mode is {vitest_scope.get('mode')!r}, not change-scoped",
+    )
+    add_assertion(
+        violations,
+        vitest_scope.get("selected") == 1,
+        f"Vitest selected {vitest_scope.get('selected')!r} test files, not the 1 "
+        "that imports the changed source",
+    )
+    vitest_command = gate_command(pack, "tests")
+    add_assertion(
+        violations,
+        "--reporter=json" in vitest_command and "--outputFile.json=" in vitest_command,
+        f"the narrowed Vitest command carries no JSON reporter: {vitest_command!r}",
+    )
+
+    cargo = check_row(run, CARGO_TEST_CHECK)
+    cargo_scope = scope_of(run, CARGO_TEST_CHECK)
+    add_assertion(
+        violations,
+        cargo.get("status") == "skipped",
+        f"Cargo test status is {cargo.get('status')!r}, not skipped",
+    )
+    add_assertion(
+        violations,
+        cargo.get("cached") is False,
+        "Cargo test was replayed from cache instead of deciding live",
+    )
+    add_assertion(
+        violations,
+        cargo_scope.get("mode") == "change-scoped",
+        f"Cargo test scope mode is {cargo_scope.get('mode')!r}, not change-scoped",
+    )
+    add_assertion(
+        violations,
+        cargo_scope.get("selected") == 0,
+        f"Cargo test selected {cargo_scope.get('selected')!r} packages, not 0",
+    )
+    add_assertion(
+        violations,
+        cargo_scope.get("selector") is None,
+        f"an empty selection published a selector: {cargo_scope.get('selector')!r}",
+    )
+    # The decisive one: an empty selection must cost nothing. The canonical
+    # witness is the `cargo` shim every invocation passes through — a complete
+    # record, unlike the process census, which can only say what it happened to
+    # sample. The shim must have recorded SOMETHING (this review runs Cargo
+    # check and Clippy), or it was not on PATH and its silence proves nothing.
+    add_assertion(
+        violations,
+        bool(census.get("cargo_invocations")),
+        "the cargo shim recorded no invocation at all, so it cannot witness anything",
+    )
+    shimmed = shim_cargo_test_invocations(census)
+    add_assertion(
+        violations,
+        not shimmed,
+        f"cargo test was invoked for an empty selection: {shimmed}",
+    )
+    # The process census corroborates it, and says so only while it is complete.
+    add_assertion(
+        violations,
+        not census.get("truncated"),
+        "the process census hit its command cap, so it cannot witness an absence",
+    )
+    stray = observed_cargo_test_commands(census)
+    add_assertion(
+        violations,
+        not stray,
+        f"a cargo test process ran for an empty selection: {stray}",
+    )
+    # The pack must tell the same story: no command recorded for the gate that
+    # ran nothing, in the very artifact a reader would check.
+    cargo_command = gate_command(pack, "cargo_test")
+    add_assertion(
+        violations,
+        cargo_command == NO_COMMAND_RECORDED,
+        f"the skipped Cargo test gate published {cargo_command!r}, not {NO_COMMAND_RECORDED!r}",
+    )
+
+    gate_cargo = check_row(gate, CARGO_TEST_CHECK)
+    add_assertion(
+        violations,
+        gate_cargo.get("outcome") == "skipped",
+        f"MERGE_GATE outcome for Cargo test is {gate_cargo.get('outcome')!r}, not skipped",
+    )
+    add_assertion(
+        violations,
+        gate_cargo.get("blocking") is False,
+        "a suite with nothing to run blocked the merge",
+    )
+    add_assertion(
+        violations,
+        NO_TESTS_RELATED in str(gate_cargo.get("reason") or ""),
+        f"MERGE_GATE does not state why Cargo test ran nothing: {gate_cargo.get('reason')!r}",
+    )
+    decision = (gate or {}).get("decision") or {}
+    add_assertion(
+        violations,
+        decision.get("verdict") != "BLOCK",
+        f"verdict is {decision.get('verdict')!r} on a change with no related Rust tests",
+    )
+    caveats = decision.get("review_caveats") or []
+    add_assertion(
+        violations,
+        any(
+            isinstance(caveat, str)
+            and CARGO_TEST_CHECK in caveat
+            and NO_TESTS_RELATED in caveat
+            for caveat in caveats
+        ),
+        "MERGE_GATE does not caveat the skipped Cargo test suite",
+    )
+
+
+def assert_unknown_input(
+    violations: list[str],
+    run: dict[str, Any] | None,
+    gate: dict[str, Any] | None,
+    pack: pathlib.Path,
+    census: dict[str, Any],
+) -> None:
+    """A file neither selector can see: doubt widens BOTH suites."""
+    for name, gate_id in ((CARGO_TEST_CHECK, "cargo_test"), (VITEST_CHECK, "tests")):
+        row = check_row(run, name)
+        scope = scope_of(run, name)
+        add_assertion(
+            violations,
+            row.get("status") == "passed" and row.get("cached") is False,
+            f"{name} did not run live and pass",
+        )
+        add_assertion(
+            violations,
+            scope.get("mode") == "full",
+            f"{name} scope mode is {scope.get('mode')!r}, not full",
+        )
+        add_assertion(
+            violations,
+            scope.get("selector") is None,
+            f"{name} published a selector for a full run: {scope.get('selector')!r}",
+        )
+        add_assertion(
+            violations,
+            "unsupported input: src/limits.yaml" in str(scope.get("reason") or ""),
+            f"{name} does not name the file that widened the run: {scope.get('reason')!r}",
+        )
+        command = gate_command(pack, gate_id)
+        add_assertion(
+            violations,
+            " -p " not in f" {command} " and " related " not in f" {command} ",
+            f"{name} ran a narrowed command despite a full decision: {command!r}",
+        )
+        # The JSON reporter belongs to a narrowed Vitest run and to nothing
+        # else: a full run is judged by its exit code, exactly as it always was.
+        add_assertion(
+            violations,
+            "--reporter=json" not in command,
+            f"{name} ran a full command carrying the narrowed run's reporter: {command!r}",
+        )
+
+
+CASES: dict[str, dict[str, Any]] = {
+    "mixed": {"mutate": mutate_mixed, "assert_scope": assert_mixed},
+    "js-only": {"mutate": mutate_js_only, "assert_scope": assert_js_only},
+    "unknown-input": {
+        "mutate": mutate_unknown_input,
+        "assert_scope": assert_unknown_input,
+    },
+}
+
+
 def evaluate(
     receipt: dict[str, Any],
     census: dict[str, Any],
     pack: pathlib.Path,
     log: pathlib.Path,
+    case: dict[str, Any],
 ) -> None:
     run_path = pack / "00_summary" / "RUN.json"
     incomplete_path = pack / "00_summary" / "INCOMPLETE.json"
+    gate_path = pack / "00_summary" / "MERGE_GATE.json"
     run = read_json(run_path)
+    gate = read_json(gate_path)
     resources = (run or {}).get("resources", {})
     cap = resources.get("child_worker_limit")
     violations = receipt["violations"]
@@ -570,6 +1075,25 @@ def evaluate(
         "final SANITY.json or MERGE_GATE.json is missing",
     )
 
+    # What this case is actually here to prove, plus the evidence in readable
+    # form: the receipt should let a reader check the claim without the pack.
+    receipt["scope_evidence"] = {
+        "cargo_test": {
+            "scope": scope_of(run, CARGO_TEST_CHECK) or None,
+            "command": gate_command(pack, "cargo_test") or None,
+        },
+        "vitest": {
+            "scope": scope_of(run, VITEST_CHECK) or None,
+            "command": gate_command(pack, "tests") or None,
+        },
+        "review_caveats": ((gate or {}).get("decision") or {}).get("review_caveats"),
+        "verdict": ((gate or {}).get("decision") or {}).get("verdict"),
+        "cargo_test_processes": observed_cargo_test_commands(census),
+        "cargo_invocations": census.get("cargo_invocations") or [],
+        "census_truncated": bool(census.get("truncated")),
+    }
+    case["assert_scope"](violations, run, gate, pack, census)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -579,18 +1103,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=1200)
     parser.add_argument("--initialize-only", action="store_true")
+    parser.add_argument(
+        "--case",
+        action="append",
+        dest="cases",
+        choices=list(CASES),
+        help=(
+            "Which acceptance case to run; repeatable. Each case gets its own "
+            "fixture history and its own receipt. Default: all of them."
+        ),
+    )
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    args.receipt_dir.mkdir(parents=True, exist_ok=True)
-    receipt_path = args.receipt_dir / "receipt.json"
-    log_path = args.receipt_dir / "prview.log"
-    receipt: dict[str, Any] = {
+def new_receipt(case_name: str, source_sha: str) -> dict[str, Any]:
+    """A receipt that reads as a failure until the harness proves otherwise."""
+    return {
         "schema": "prview.bounded-runtime-acceptance.v2",
+        "case": case_name,
         "status": "failed",
-        "source_sha": args.source_sha,
+        "source_sha": source_sha,
         "started_at": utc_now(),
         "finished_at": None,
         "machine": machine_observation(),
@@ -599,14 +1131,22 @@ def main() -> int:
         "census": None,
         "violations": [],
     }
-    if args.initialize_only:
-        receipt["violations"] = ["acceptance harness did not complete"]
-        receipt["finished_at"] = utc_now()
-        receipt_path.write_text(
-            json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        print(json.dumps({"status": receipt["status"], "receipt": str(receipt_path)}))
-        return 0
+
+
+def write_receipt(path: pathlib.Path, receipt: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def run_case(args: argparse.Namespace, case_name: str) -> dict[str, Any]:
+    """Run one acceptance case end to end and write its receipt."""
+    case = CASES[case_name]
+    receipt_dir = args.receipt_dir / case_name
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    receipt_path = receipt_dir / "receipt.json"
+    log_path = receipt_dir / "prview.log"
+    receipt = new_receipt(case_name, args.source_sha)
 
     process: subprocess.Popen[str] | None = None
     census: dict[str, Any] = {
@@ -621,6 +1161,9 @@ def main() -> int:
             "semgrep_core_processes": 0,
         },
         "seen_tools": {tool: False for tool in WHOLE_MACHINE_TOOLS},
+        "observed_commands": set(),
+        "truncated": False,
+        "cargo_invocations": [],
         "observed_caps": {
             "cargo_build_jobs": set(),
             "vitest_max_workers": set(),
@@ -680,7 +1223,9 @@ def main() -> int:
             raise RuntimeError("invalid harness inputs")
         with tempfile.TemporaryDirectory(prefix="prview-bounded-runtime-") as temp:
             work = pathlib.Path(temp)
-            repo = prepare_fixture(args.fixture.resolve(), work, log_path)
+            repo = prepare_fixture(
+                args.fixture.resolve(), work, log_path, case["mutate"]
+            )
             pack = repo / ".acceptance-pack"
             command = [
                 str(binary),
@@ -698,9 +1243,14 @@ def main() -> int:
             receipt["command"] = command
             env = os.environ.copy()
             env.update({"CI": "true", "NO_COLOR": "1"})
+            # Canonical evidence for "which cargo commands ran". Installed last,
+            # so PATH resolution for the real cargo happened against the
+            # machine's own PATH.
+            cargo_log = install_cargo_shim(work, env)
             with log_path.open("a", encoding="utf-8") as stream:
                 stream.write(f"$ {' '.join(command)}\n")
                 stream.flush()
+                started = time.monotonic()
                 process = subprocess.Popen(
                     command,
                     cwd=repo,
@@ -710,7 +1260,7 @@ def main() -> int:
                     env=env,
                     start_new_session=True,
                 )
-                deadline = time.monotonic() + args.timeout_seconds
+                deadline = started + args.timeout_seconds
                 while process.poll() is None and time.monotonic() < deadline:
                     sample_owned_tree(process.pid, census)
                     time.sleep(0.05)
@@ -721,7 +1271,9 @@ def main() -> int:
                     receipt["process"]["exit_code"] = termination["exit_code"]
                 else:
                     receipt["process"]["exit_code"] = process.wait()
-            evaluate(receipt, census, pack, log_path)
+                receipt["process"]["wall_secs"] = round(time.monotonic() - started, 3)
+            census["cargo_invocations"] = cargo_shim_invocations(cargo_log)
+            evaluate(receipt, census, pack, log_path, case)
     finally:
         error = sys.exc_info()[1]
         if error is not None:
@@ -736,24 +1288,63 @@ def main() -> int:
         serializable_census["observed_caps"] = {
             key: sorted(value) for key, value in census["observed_caps"].items()
         }
+        serializable_census["observed_commands"] = sorted(census["observed_commands"])
         receipt["census"] = serializable_census
         receipt["finished_at"] = utc_now()
         if not receipt["violations"]:
             receipt["status"] = "success"
-        receipt_path.write_text(
-            json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        write_receipt(receipt_path, receipt)
 
-    print(
-        json.dumps(
+    receipt["receipt_path"] = str(receipt_path)
+    return receipt
+
+
+def main() -> int:
+    args = parse_args()
+    selected = args.cases or list(CASES)
+    args.receipt_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.initialize_only:
+        # A failure-shaped receipt per case, so a run killed before it finishes
+        # leaves evidence of every case it owed rather than silence.
+        summary = []
+        for case_name in selected:
+            receipt_dir = args.receipt_dir / case_name
+            receipt_dir.mkdir(parents=True, exist_ok=True)
+            receipt = new_receipt(case_name, args.source_sha)
+            receipt["violations"] = ["acceptance harness did not complete"]
+            receipt["finished_at"] = utc_now()
+            path = receipt_dir / "receipt.json"
+            write_receipt(path, receipt)
+            summary.append(
+                {
+                    "case": case_name,
+                    "status": receipt["status"],
+                    "receipt": str(path),
+                }
+            )
+        print(json.dumps({"cases": summary}))
+        return 0
+
+    results = []
+    for case_name in selected:
+        receipt = run_case(args, case_name)
+        results.append(
             {
+                "case": case_name,
                 "status": receipt["status"],
-                "receipt": str(receipt_path),
+                "receipt": receipt.get("receipt_path"),
+                "wall_secs": receipt["process"].get("wall_secs"),
                 "violations": receipt["violations"],
             }
         )
-    )
-    return 0 if receipt["status"] == "success" else 1
+        # Printed as each case finishes: a later case failing must not hide an
+        # earlier case's evidence behind a killed process.
+        print(json.dumps(results[-1]), flush=True)
+
+    failed = [result["case"] for result in results if result["status"] != "success"]
+    print(json.dumps({"cases": results, "failed": failed}))
+    return 0 if not failed else 1
 
 
 if __name__ == "__main__":

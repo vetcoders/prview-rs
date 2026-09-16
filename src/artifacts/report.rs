@@ -871,9 +871,7 @@ fn build_report(input: &ReportInput<'_>) -> Report {
                     finding_stats_from_output(&c.output)
                 },
                 failed_tests,
-                scope: input
-                    .scope
-                    .and_then(|scope| scope.report_for_check(&c.name)),
+                scope: input.scope.and_then(|scope| scope.report_for_check(c)),
                 artifacts: CheckArtifacts {
                     log_path: Some(format!("20_quality/{}.log", id)),
                     result_json_path: Some(format!("20_quality/{}.result.json", id)),
@@ -2727,6 +2725,7 @@ test result: FAILED. 0 passed; 1 failed
                 finished_at: "2026-09-11T10:00:01+02:00".to_string(),
                 hard_fail_signatures: Vec::new(),
                 cache_key: None,
+                executed_scope: None,
             }),
         }];
         let provenance = detect_provenance_contradictions(

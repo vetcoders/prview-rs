@@ -166,6 +166,14 @@ pub struct TaskLedger {
     /// with the frame that created it.
     shared_snapshot: Mutex<Option<WorktreeSnapshot>>,
     resolved_substrate: Mutex<Option<SubstrateKey>>,
+    /// How much of each test suite this run decided had to execute.
+    ///
+    /// The ledger owns it for the same reason it owns the shared snapshot: the
+    /// decision is made inside the check dispatcher, on a CLONED config that
+    /// dies with that frame, and the artifact stage still has to publish what
+    /// was decided. Reading it from anywhere else would mean recomputing it,
+    /// and a second computation is a second answer.
+    test_scope: Mutex<Option<crate::checks::scope::ScopeDecisions>>,
     snapshot_observations: Mutex<Vec<crate::checks::snapshot_integrity::SnapshotObservation>>,
     // One blocking diff at a time per run; waiting never parks an async worker.
     snapshot_observation_gate: Arc<tokio::sync::Mutex<()>>,
@@ -311,6 +319,22 @@ impl TaskLedger {
     #[must_use]
     pub fn resolved_substrate(&self) -> Option<SubstrateKey> {
         self.resolved_substrate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Record the run's test-scope decision. Written once, by the check
+    /// dispatcher, at the moment the reviewed tree becomes known.
+    pub fn set_test_scope(&self, decisions: crate::checks::scope::ScopeDecisions) {
+        *self.test_scope.lock().unwrap_or_else(|e| e.into_inner()) = Some(decisions);
+    }
+
+    /// The run's test-scope decision, or `None` when no check that owns a test
+    /// scope was runnable — in which case there was nothing to decide.
+    #[must_use]
+    pub fn test_scope(&self) -> Option<crate::checks::scope::ScopeDecisions> {
+        self.test_scope
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()

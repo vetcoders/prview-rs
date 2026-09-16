@@ -273,7 +273,7 @@ remaining count; this display bound does not truncate the underlying error set.
 In standard execution mode, tests and lint are enabled by default, unless a
 preset (`--quick`, `--update`, `--ai-only`) or an explicit `--skip-*` disables them.
 
-#### How much of a test suite must run (`checks/scope.rs`)
+#### How much of a test suite must run (`checks/scope/`)
 
 Review is proportional to the change, not to the size of the repository. A PR
 touching three files should not pay for a thousand unrelated test files — but
@@ -284,7 +284,7 @@ Three separate mechanisms, deliberately never mixed:
 
 | Mechanism | Question it answers |
 |---|---|
-| Scope (`checks/scope.rs`) | how much MUST run to review this properly |
+| Scope (`checks/scope/`) | how much MUST run to review this properly |
 | Governor (`governor/`) | how to run that work without frying the machine |
 | Deadline | what happens when the necessary work does not fit |
 
@@ -306,9 +306,24 @@ the checks actually read, and that is a separate fact decided later, inside
 snapshot: when the reviewed target is the checked-out `HEAD`, `plan_check_run`
 hands the gates the repository root itself. `ReviewedTree` names the four cases
 — `Snapshot`, `LocalClean`, `LocalDirty`, `Unknown` — and is resolved from what
-the ledger recorded plus the operator cleanliness frozen before the run. That is
-why the scope decision is resolved AFTER the checks: before them, the substrate
-is not yet knowable, and a constant there would have been a lie.
+the ledger recorded plus the operator cleanliness frozen before the run. A
+snapshot the ledger reports as `SnapshotDirty`, or one whose substrate cannot be
+identified, is `Unknown`: the bytes on disk are then not the reviewed commit, and
+a selection drawn from a diff that does not describe them would be a silent
+narrowing. `SnapshotBorrowedDeps` stays a snapshot — the borrowed half is
+`node_modules` / `.venv`, while the SOURCE is still the target commit.
+
+**Where the decision is made.** `install_run_scope` (`checks/mod.rs`), called
+from both dispatchers immediately after `share_target_snapshot` and before any
+check runs. That is the earliest point where the substrate is settled, and the
+latest point that is still before execution. It resolves nothing at all unless a
+gate that owns a test scope (`Cargo test`, `Vitest`) is in the runnable set, so a
+run that will not use the answer never pays for the `cargo metadata` that
+produces it. The result is installed in two places on purpose: `Config::test_scope`,
+because a check receives nothing but a `Config`, and the ledger, because the
+cloned check config dies with that frame while the artifacts are written later.
+The headless and TUI entry points read the ledger's copy; neither resolves its
+own.
 
 **The decision** (`checks::scope::decide`) is pure and returns, per ecosystem,
 either `Full { reason }` or `ChangeScoped { .. }`. Every doubt resolves to
@@ -416,6 +431,14 @@ after classification (the ordinary documentation-only pull request), the outcome
 is `selected = 0` and a `Skipped` carrying `no tests related to the change`
 (§8.1). Calling that `passed` would claim evidence the run never produced.
 
+The skip is PUBLISHED, not inferred. The check writes provenance with no command
+(`<no command recorded>`, the literal the task ledger already reads as "no
+process") and `executed_scope: {"mode": "nothing-selected"}`. That record is
+what the ledger, the `scope` object and the merge policy key on, so an empty
+selection cannot be confused with a check that was skipped by a preset, lost its
+tool, or died before it built a command. Absence of provenance is absence of
+evidence, and buys no exception anywhere.
+
 **Rust workspace resolution.** One `cargo metadata --format-version 1 --no-deps
 --frozen` per run, with its own timeout, read from the cargo root **inside the
 reviewed tree**. `profile.cargo_root` is detected in the operator checkout,
@@ -449,11 +472,107 @@ owning check's row in `RUN.json`, `report.json` (schema 3.1) and
 advisory review caveat that never moves the verdict. See
 `docs/contracts/merge_gate.md`.
 
-**Current state.** The decision is computed and reported; it does not yet change
-what any check executes. A scopeable decision is therefore published as
-`mode: "full"` with reason `scoped execution not enabled yet`. Emitting
-`change-scoped` for a run that executed everything would be the exact lie this
-machinery exists to prevent.
+**What the checks execute.**
+
+| Decision | `Cargo test` | `Vitest` |
+|---|---|---|
+| `Full { reason }`, or no decision at all | `cargo test --all-targets --no-fail-fast [<literal filter>]` — today's command, unchanged | `vitest run --maxWorkers 1 [--testNamePattern <p>]` — today's command, unchanged |
+| `ChangeScoped`, non-empty selection | the same command plus `-p <pkg>` per selected package, inserted **before** the positional filter | `vitest related --run --maxWorkers 1 --passWithNoTests [--testNamePattern <p>] <selector inputs>`, followed by `--reporter=default --reporter=json --outputFile.json=<temp>/vitest-scope.json` |
+| `ChangeScoped`, empty selection | nothing is spawned: `Skipped` with `no tests related to the change`, and provenance whose `command` is `<no command recorded>` and whose `executed_scope` is `nothing-selected` | the same |
+
+`--tests-pattern` filters INSIDE the selection; it never replaces it. Every
+existing cap is untouched: the scope decides how much to run, the governor
+decides how to run it.
+
+**Escalation continues at runtime, one-directionally.** A selector input that is
+not present in the tree about to be read (checked by BOTH checks, against
+`CargoRun::scan_dir` and the Vitest run directory respectively), or a package
+name that cannot be spelled on a command line, runs the full suite and says why
+— handing a runner a path that is not there would silently shrink the selection
+instead of failing it. A tool failure on a narrowed command stays a typed
+failure.
+
+**How a narrowed Vitest run is judged.** Not by its exit code, which
+`--passWithNoTests` makes 0 whether everything related passed or nothing ran,
+and not by its prose: stdout carries the reviewed code's own output, so a test
+that prints Vitest's empty-set sentence could otherwise spoof a skip. The
+narrowed command therefore carries the JSON reporter, written to a temporary
+file (a check is handed a `Config`, whose `artifacts_dir()` is only a prediction
+of the pack path, and writing into the reviewed tree would mutate the tree under
+review), and the counters in it are the witness:
+
+| Reporter says | Verdict |
+|---|---|
+| `numTotalTestSuites == 0` and `testResults` empty | `Skipped` with `no tests related to the change` |
+| `numTotalTests > 0` | the run's own exit code: `Passed` or `Failed` |
+| files collected, no test executed, non-zero exit | `Failed` |
+| files collected, no test executed, zero exit | `Error` |
+| missing or unreadable | `Error`: `could not verify that the narrowed Vitest run executed any test` |
+
+Zero executed tests is never green, and an unverified run is never green either.
+A full `vitest run` is unchanged and still classified by its exit code alone.
+
+The same report settles the published `selected` count. Each ecosystem counts in
+its own unit — Cargo in workspace packages, Vitest in TEST FILES the reporter
+collected — and only Vitest's is unknowable before the run: the plan can name the
+changed sources it hands to `vitest related`, but which test files those pull in
+is a property of the import graph the tool resolves at run time. So the planned
+count is replaced by the reporter's (`testResults.len()`) once the run is over,
+and an unreadable report publishes `0` rather than the input count. The selector
+is never rewritten: it is what was asked for.
+
+**The report describes what ran, not what was decided.** `CheckProvenance`
+carries an additive `executed_scope`, written by the check itself, and
+`mode: "change-scoped"` is published only against that evidence. A scopeable
+decision from a check that left none is reported as `full` with
+`scoped execution not confirmed by the check`, and a runtime escalation
+overrides the decision in the report. The published `selector` is a verbatim
+fragment of `provenance.command` (`-p a -p b` for Cargo, the whole `related …`
+argument line for Vitest), so a reader can hold the reported scope against the
+command that produced it without trusting either alone.
+
+**The human artifacts say it too** (contract §7). `PR_REVIEW.md` renders a
+`## Test Scope` section — one sentence per scope-owning check that produced a
+result — and `REVIEW_SUMMARY.md` embeds that file. Both come from
+`ScopeDecisions::review_sentences`, which renders the same `ScopeReport` the gate
+rows carry: the prose is a view of the report, never a second count, and each
+sentence uses the ecosystem's own unit (packages for Cargo, test files for
+Vitest).
+
+**Policy.** A `Skipped` whose reason is prview's own
+`no tests related to the change` is `Satisfied / Complete / Approve` — a sibling
+of the profile-mismatch branch, and as narrow. The check applies to the
+repository but not to this change, and the classification that proved it
+escalates everything it does not recognise. The row still reads `skipped` with
+`outcome: skipped`; a suite that never ran is never relabelled `passed`.
+
+That exception is keyed on evidence rather than on the sentence. Three facts
+must hold together (`proved_empty_test_scope`): the row belongs to a check that
+OWNS an ecosystem's test scope (`Ecosystem::owning_check`, so a lint printing
+the same words is not eligible), the skip came out of a real execution
+(`evaluate_run`; a pre-flight `SkippedCheck` never qualifies, because a check
+that was never dispatched cannot have resolved a selection), and the check's own
+provenance says what it did — `nothing-selected` for an empty selection, or an
+`executed_scope` that records a narrowed run. A row with no provenance at all
+proves nothing and gets no exception. A test check that
+ran the FULL suite and then reported this reason contradicts itself, and the
+contradiction is resolved against the claim: it blocks wherever policy requires
+the gate. The same proof drives the execution-state classification, so the two
+cannot disagree about what the skip was.
+
+**The escape hatch.** `--full-tests` pins both ecosystems to `Full` before any
+metadata call, with `full test run requested (--full-tests)` as the published
+reason. The run is then wider than the change requires, on purpose, and the pack
+says so.
+
+The `--ci` preset pins the same thing for a different reason, so the two are one
+`Option<FullTestsRequest>` on `Config` rather than two booleans: `Flag` for the
+operator's request, `CiPreset` for the automation recipe, resolved once in
+`Config::from_cli` and rendered by `reason::full_tests_requested` as
+`full test run requested (--ci)`. The distinction is not cosmetic — a reader who
+finds a full suite behind a one-line diff has to be able to tell a human's
+escape hatch from a job's policy. An explicit `--full-tests` outranks the
+preset, because naming the operator is the more specific truth.
 
 #### Where checks run
 

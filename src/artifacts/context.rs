@@ -126,6 +126,7 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         clean_comparison,
         snapshot_integrity,
         provenance,
+        scope,
     } = input;
     use crate::policy::engine::{AnalysisStatus, MergeRecommendation, PolicyEngine};
 
@@ -228,6 +229,14 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
     review_caveats.extend(cargo_audit_review_caveats(checks));
     review_caveats.extend(cargo_audit_baseline_review_caveats(inline));
     review_caveats.extend(semgrep_partial_parse_review_caveats(checks));
+    // Advisory only, and from the same renderer MERGE_GATE.json reads: a suite
+    // that did not run in full is a fact a reviewer needs on every surface, not
+    // only in the artifact nobody opens by hand.
+    review_caveats.extend(
+        scope
+            .map(|scope| scope.review_caveats(checks))
+            .unwrap_or_default(),
+    );
     review_caveats.extend(skipped_requested_security_review_caveats(
         config,
         checks,

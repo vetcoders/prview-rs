@@ -592,6 +592,9 @@ pub async fn run_analysis(
         // The change the test-scope decision reads, from the SAME pinned range
         // the pack diff used. Mirrors headless `App::run`; see
         // `crate::checks::scope`.
+        // Frozen before the run, exactly as headless does it: whether the tree
+        // the checks may read is the operator's own, and whether it is clean.
+        config.operator_worktree_clean = worktree_clean;
         config.changed_paths = diff_bases
             .first()
             .and_then(|base| app.repo.changed_paths(base, &target).ok())
@@ -630,16 +633,11 @@ pub async fn run_analysis(
         .await?;
     ensure_analysis_active(&governor)?;
 
-    // The test scope, decided once per run and published on the check rows.
-    // Mirrors headless `App::run`, including WHY it is resolved after the
-    // checks: which tree they read is decided inside `run_all`, and the ledger
-    // is what records it.
-    let reviewed_tree = crate::checks::scope::ReviewedTree::resolve(
-        &config.repo_root,
-        ledger.scan_dir(),
-        worktree_clean,
-    );
-    let run_scope = crate::checks::scope::resolve_run_scope(&config, &reviewed_tree).await;
+    // The test scope as the CHECKS saw it, read back from the ledger. Mirrors
+    // headless `App::run`: the decision is made inside `run_all`, where the
+    // tree the checks read first becomes known, and the ledger is what carries
+    // it past the frame that made it.
+    let run_scope = ledger.test_scope();
 
     // Run heuristics
     let heuristics = if let Some(ref snap) = target_snap {
@@ -681,7 +679,7 @@ pub async fn run_analysis(
         crate::artifacts::generate(crate::artifacts::GenerateInput {
             config: &config,
             ledger: &ledger,
-            scope: Some(&run_scope),
+            scope: run_scope.as_ref(),
             diffs: &diffs,
             checks: &check_results,
             heuristics: Some(&heuristics),

@@ -41,7 +41,7 @@ pub use python::{MypyCheck, PytestCheck, RuffCheck};
 pub use semgrep::SemgrepCheck;
 pub(crate) use semgrep::output_reports_scan_errors as semgrep_output_reports_scan_errors;
 pub(crate) use semgrep::scan_error_paths as semgrep_scan_error_paths;
-pub(crate) use typescript::is_generated_artifact_path;
+pub(crate) use typescript::is_builtin_generated_output_path;
 pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 
 /// Which tree a check's command actually read.
@@ -300,6 +300,16 @@ pub struct CheckProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree_state: Option<TreeState>,
     pub exit_code: Option<i32>,
+    /// How much of this check's suite the command actually ran, and why.
+    ///
+    /// The scope DECISION lives on the run; this is the check's own evidence
+    /// that it honoured that decision, and it is what lets a `change-scoped`
+    /// report be refused when no check confirms one (see
+    /// [`scope::ScopeDecision::report_for_result`]). Additive and optional:
+    /// absent from packs written before this field existed, and from every
+    /// check that does not own a test scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed_scope: Option<scope::ExecutedScope>,
     pub started_at: String,
     pub finished_at: String,
     pub hard_fail_signatures: Vec<String>,
@@ -320,6 +330,17 @@ impl CheckProvenance {
         let substrate = resolve_scan_substrate(cwd, repo_root, consumable_scaffolding(check));
         self.target_sha = substrate.target_sha;
         self.tree_state = substrate.tree_state;
+        self
+    }
+
+    /// Record what the command narrowed to, if anything.
+    ///
+    /// Chained on rather than threaded through [`ProvenanceBuilder`] because
+    /// only two checks in the whole run can answer it, and every other call site
+    /// would have to carry a `None` that means nothing to it.
+    #[must_use]
+    pub fn with_executed_scope(mut self, executed: Option<scope::ExecutedScope>) -> Self {
+        self.executed_scope = executed;
         self
     }
 }
@@ -769,6 +790,9 @@ async fn run_all_checks(
     // does not prepare the environment the checks consume.
     let mut config = config.clone();
     share_target_snapshot(&mut config, &runnable_checks, ledger)?;
+    // The reviewed tree is now known, so the test scope can be — and must be,
+    // because the checks below read it off the config they are handed.
+    install_run_scope(&mut config, &runnable_checks, ledger).await;
 
     // Pre-sync Python venv if any Python checks will run and uv is available.
     // This separates venv build time from the per-check timeout budget.
@@ -1221,6 +1245,9 @@ where
     // does. The TUI must not sync an off-HEAD dependency set into repo_root.
     let mut config = config.clone();
     share_target_snapshot(&mut config, &runnable_checks, ledger)?;
+    // Same seam as headless, through the same helper: one place decides how
+    // much of a suite has to run, whichever front end asked for the review.
+    install_run_scope(&mut config, &runnable_checks, ledger).await;
 
     // Pre-sync Python venv before running checks, through the SAME helper the
     // headless dispatcher uses. It was a bare `run_command_with_timeout` under a
@@ -1396,6 +1423,46 @@ fn replayed_provenance(stored: Option<&str>) -> Option<CheckProvenance> {
 /// the field sees an absence rather than a plausible-looking command line.
 const NO_COMMAND_RECORDED: &str = "<no command recorded>";
 
+/// Provenance for a test check whose scope decision selected nothing.
+///
+/// No process is spawned, so almost every field is honestly empty — but the row
+/// is not. It carries the tree the decision was taken against and, in
+/// `executed_scope`, the decision itself: [`scope::ExecutedScope::NothingSelected`].
+/// That is the difference between "this suite has no test related to the change"
+/// and "this check never ran, for reasons unknown", and everything downstream —
+/// the ledger, the `scope` object in the pack, the merge policy — reads that
+/// proof rather than inferring an empty selection from missing provenance.
+///
+/// `command` is the same [`NO_COMMAND_RECORDED`] literal the ledger already
+/// understands as "no process", so an empty selection is recorded as a skip
+/// rather than as a run that took no time.
+///
+/// `cwd_display` is passed in because each check renders its own working
+/// directory its own way, and a skipped row must read like that check's
+/// executed rows.
+fn nothing_selected_provenance(
+    check: &str,
+    cwd: &Path,
+    cwd_display: String,
+    repo_root: &Path,
+    started_at: String,
+) -> CheckProvenance {
+    CheckProvenance {
+        command: NO_COMMAND_RECORDED.to_string(),
+        tool_version: None,
+        cwd: cwd_display,
+        exit_code: None,
+        started_at,
+        finished_at: chrono::Local::now().to_rfc3339(),
+        hard_fail_signatures: Vec::new(),
+        cache_key: None,
+        target_sha: None,
+        tree_state: None,
+        executed_scope: Some(scope::ExecutedScope::NothingSelected),
+    }
+    .with_scan_substrate(check, cwd, repo_root)
+}
+
 /// The directory a check WOULD have read, for an execution that ended in `Err`.
 ///
 /// Resolved WITHOUT materialising anything: the shared snapshot is already on
@@ -1448,6 +1515,7 @@ fn errored_check_provenance(
             cache_key,
             target_sha: None,
             tree_state: None,
+            executed_scope: None,
         }
         .with_scan_substrate(name, &scan_dir, &config.repo_root),
     )
@@ -1827,6 +1895,54 @@ fn share_target_snapshot_with(
     Ok(())
 }
 
+/// Decide the run's test scope at the first moment it can be decided, and
+/// install it where both the checks and the artifacts will read it.
+///
+/// WHY HERE. Two facts have to be true before a selection can be trusted, and
+/// they become true at different times. The change set exists long before the
+/// checks (it is captured with the pinned diff range), but WHICH TREE the
+/// checks read is settled by [`share_target_snapshot`] a few lines above: a
+/// pinned target does not always mean a snapshot, because when the reviewed
+/// target IS the checked-out `HEAD` the gates are handed the repository root
+/// and the operator's uncommitted work becomes part of what they compile.
+/// Deciding earlier would mean guessing that; deciding later — where both
+/// dispatchers used to — is after the commands have already run, which is
+/// exactly the gap this cut closes.
+///
+/// WHY TWICE. `config.test_scope` is the checks' copy: they receive nothing but
+/// a `Config`. `ledger.test_scope()` is the ARTIFACTS' copy, because the ledger
+/// outlives this frame while the cloned check config does not. Both are written
+/// from the same value in the same statement, so they cannot describe different
+/// decisions.
+///
+/// WHY THE GUARD. `resolve_run_scope` spawns `cargo metadata`. With no check in
+/// the runnable set that owns a test scope, that subprocess would compute an
+/// answer nobody reads — precisely the disproportionate work this contract
+/// exists to remove.
+async fn install_run_scope(
+    config: &mut Config,
+    runnable_checks: &[Box<dyn Check>],
+    ledger: &TaskLedger,
+) {
+    if !runnable_checks
+        .iter()
+        .any(|check| scope::owns_test_scope(check.name()))
+    {
+        return;
+    }
+    let reviewed_tree = scope::ReviewedTree::resolve(
+        &config.repo_root,
+        ledger.scan_dir(),
+        ledger
+            .resolved_substrate()
+            .and_then(|substrate| substrate.tree_state),
+        config.operator_worktree_clean,
+    );
+    let decisions = scope::resolve_run_scope(config, &reviewed_tree).await;
+    config.test_scope = Some(decisions.clone());
+    ledger.set_test_scope(decisions);
+}
+
 /// How each tool reads `scan_dir`, for re-keying the entries decided before the
 /// run knew which tree it was reading.
 ///
@@ -1969,6 +2085,7 @@ impl ProvenanceBuilder<'_> {
             cache_key: self.cache_key,
             target_sha: None,
             tree_state: None,
+            executed_scope: None,
         }
         .with_scan_substrate(self.check, self.cwd, self.repo_root)
     }
@@ -3904,6 +4021,59 @@ test result: ok. 2 passed; 0 failed
         );
     }
 
+    /// An empty test selection is a skip the ledger can see, because the check
+    /// publishes the proof: no command, and `NothingSelected` as what executed.
+    /// Recording it as a `Run` of a few microseconds would put a suite that
+    /// never started into the run's live coverage.
+    #[test]
+    fn ledger_reads_an_empty_test_selection_as_a_skip() {
+        use crate::ledger::{TaskKey, TaskState};
+
+        let ledger = TaskLedger::new();
+        let now = std::time::Instant::now();
+        let config = rust_config(false, true, true);
+        let reason = scope::NO_TESTS_RELATED_TO_THE_CHANGE.to_string();
+        let empty_selection = CheckResult {
+            name: "Cargo test".to_string(),
+            status: CheckStatus::Skipped,
+            duration: Duration::from_millis(3),
+            output: reason.clone(),
+            cached: false,
+            provenance: Some(nothing_selected_provenance(
+                "Cargo test",
+                &config.repo_root,
+                config.repo_root.display().to_string(),
+                &config.repo_root,
+                chrono::Local::now().to_rfc3339(),
+            )),
+        };
+        let provenance = empty_selection
+            .provenance
+            .as_ref()
+            .expect("an empty selection publishes its proof");
+        assert_eq!(provenance.command, NO_COMMAND_RECORDED);
+        assert_eq!(provenance.exit_code, None);
+        assert_eq!(
+            provenance.executed_scope,
+            Some(scope::ExecutedScope::NothingSelected)
+        );
+
+        let key = TaskKey::new(
+            "Cargo test",
+            ledger_substrate(empty_selection.provenance.as_ref(), &ledger),
+        );
+        record_completed_check(&empty_selection, &ledger, now, now);
+
+        assert_eq!(
+            ledger
+                .lookup(&key)
+                .expect("empty-selection ledger row")
+                .state,
+            TaskState::Skipped { reason },
+            "a suite that never spawned a process is not a run",
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn run_js_command_prefers_local_node_modules_bin() {
@@ -5472,6 +5642,7 @@ test result: ok. 2 passed; 0 failed
                         finished_at: "2026-08-22T10:00:01+02:00".to_string(),
                         hard_fail_signatures: vec![],
                         cache_key: Some("mock-key".to_string()),
+                        executed_scope: None,
                     }),
                 })
             }
@@ -5518,5 +5689,154 @@ test result: ok. 2 passed; 0 failed
         assert!(replayed_provenance(None).is_none());
         assert!(replayed_provenance(Some("{ not json")).is_none());
         assert!(replayed_provenance(Some(r#"{"unrelated":true}"#)).is_none());
+    }
+    // -----------------------------------------------------------------------
+    // The scope seam
+    // -----------------------------------------------------------------------
+
+    /// A gate that owns a test scope and records the decision it was handed, so
+    /// a test can assert what the CHECK saw rather than what the run published.
+    struct ScopeSpyCheck {
+        name: &'static str,
+        seen: Arc<std::sync::Mutex<Option<Option<scope::ScopeDecisions>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Check for ScopeSpyCheck {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+            CheckEligibility::Run
+        }
+        async fn run(&self, config: &Config) -> Result<CheckResult> {
+            *self.seen.lock().expect("spy lock") = Some(config.test_scope.clone());
+            Ok(CheckResult {
+                name: self.name.to_string(),
+                status: CheckStatus::Passed,
+                duration: Duration::from_millis(1),
+                output: "ok".to_string(),
+                cached: false,
+                provenance: None,
+            })
+        }
+    }
+
+    /// A JS review of one source file, with the operator's own checkout left
+    /// dirty — the fixture's point is that the dirt is irrelevant when the
+    /// gates read a snapshot.
+    fn scoped_js_config(repo_root: &std::path::Path) -> Config {
+        let mut config = test_config();
+        config.profile = crate::config::test_js_profile(true);
+        config.repo_root = repo_root.to_path_buf();
+        config.execution_mode = ExecutionMode::Standard;
+        config.do_fetch = false;
+        config.use_cache = false;
+        config.create_zip = false;
+        config.quiet = true;
+        config.operator_worktree_clean = Some(false);
+        config.changed_paths = Some(scope::ChangeSet::new(
+            vec![crate::git::ChangedPath {
+                path: "src/app.ts".to_string(),
+                status: crate::git::FileStatus::Modified,
+                old_path: None,
+            }],
+            true,
+        ));
+        config
+    }
+
+    async fn scope_seen_by_the_check(
+        config: &Config,
+        checks: Vec<Box<dyn Check>>,
+        seen: &Arc<std::sync::Mutex<Option<Option<scope::ScopeDecisions>>>>,
+    ) -> (Option<scope::ScopeDecisions>, TaskLedger) {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::with_dir(cache_dir.path().to_path_buf(), false);
+        let ledger = TaskLedger::new();
+        let governor = Arc::new(ResourceGovernor::new());
+        run_all_checks(checks, cache, config, &ledger, &governor)
+            .await
+            .expect("run_all_checks");
+        let seen = seen
+            .lock()
+            .expect("spy lock")
+            .clone()
+            .expect("the spy gate must have run");
+        (seen, ledger)
+    }
+
+    /// The seam's reason for existing: scope follows the tree the gates READ.
+    /// The operator's checkout is dirty AND holds a different revision; neither
+    /// fact may reach the decision, because neither is what Vitest will open.
+    #[tokio::test]
+    async fn the_seam_scopes_the_snapshot_not_the_operators_dirty_checkout() {
+        let (repo, _target) = repo_with_off_head_target();
+        let mut config = scoped_js_config(repo.path());
+        config.target = Some("feature".to_string());
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(ScopeSpyCheck {
+            name: "Vitest",
+            seen: Arc::clone(&seen),
+        })];
+        let (seen, ledger) = scope_seen_by_the_check(&config, checks, &seen).await;
+
+        let decisions = seen.expect("a runnable Vitest gate must be handed a decision");
+        assert!(
+            matches!(
+                decisions.get(scope::Ecosystem::Vitest),
+                scope::ScopeDecision::ChangeScoped { .. }
+            ),
+            "a dirty operator checkout must not widen a snapshot-backed run: {:?}",
+            decisions.vitest,
+        );
+        // Both copies exist for a reason: the check reads `Config`, the
+        // artifacts read the ledger, and they must be the same decision.
+        assert_eq!(ledger.test_scope(), Some(decisions));
+    }
+
+    /// The mirror image: with nothing pinned, the gates read the operator's
+    /// working tree, and an uncommitted edit there means the tree under test is
+    /// not the tree the diff describes.
+    #[tokio::test]
+    async fn a_dirty_tree_that_is_actually_read_widens_the_run() {
+        let (repo, _target) = repo_with_off_head_target();
+        let config = scoped_js_config(repo.path());
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(ScopeSpyCheck {
+            name: "Vitest",
+            seen: Arc::clone(&seen),
+        })];
+        let (seen, _ledger) = scope_seen_by_the_check(&config, checks, &seen).await;
+
+        let decisions = seen.expect("a runnable Vitest gate must be handed a decision");
+        assert_eq!(
+            decisions.get(scope::Ecosystem::Vitest),
+            &scope::ScopeDecision::Full {
+                reason: scope::reason::CHECKS_READ_AN_UNCOMMITTED_TREE.to_string(),
+                inputs: Some(1),
+            },
+        );
+    }
+
+    /// No gate owns a test scope, so there is no scope to resolve — and, in
+    /// particular, no `cargo metadata` subprocess to pay for.
+    #[tokio::test]
+    async fn a_run_without_a_test_gate_resolves_no_scope_at_all() {
+        let (repo, _target) = repo_with_off_head_target();
+        let mut config = scoped_js_config(repo.path());
+        config.target = Some("feature".to_string());
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let checks: Vec<Box<dyn Check>> = vec![Box::new(ScopeSpyCheck {
+            name: "TypeScript",
+            seen: Arc::clone(&seen),
+        })];
+        let (seen, ledger) = scope_seen_by_the_check(&config, checks, &seen).await;
+
+        assert_eq!(seen, None);
+        assert_eq!(ledger.test_scope(), None);
     }
 }

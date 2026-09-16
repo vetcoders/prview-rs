@@ -3246,6 +3246,7 @@ fn merge_gate_splits_preexisting_quality_failures_from_inline_findings() {
                 cache_key: None,
                 target_sha: None,
                 tree_state: None,
+                executed_scope: None,
             }),
         },
         // Satisfy required Rust quality signals so they don't add unclassified gaps
@@ -4121,6 +4122,7 @@ fn gate_result_json_carries_the_scanned_tree_provenance() {
             cache_key: None,
             target_sha: Some("a".repeat(40)),
             tree_state: Some(crate::checks::TreeState::Snapshot),
+            executed_scope: None,
         }),
     };
 
@@ -4180,6 +4182,7 @@ test result: FAILED. 0 passed; 1 failed
             cache_key: None,
             target_sha: None,
             tree_state: None,
+            executed_scope: None,
         }),
     }];
 
@@ -4233,6 +4236,7 @@ test result: FAILED. 0 passed; 1 failed
             cache_key: None,
             target_sha: None,
             tree_state: None,
+            executed_scope: None,
         }),
     }];
 
@@ -4313,6 +4317,7 @@ fn inline_findings_emits_one_sarif_result_per_cargo_audit_advisory() {
             cache_key: None,
             target_sha: None,
             tree_state: None,
+            executed_scope: None,
         }),
     }];
 
@@ -6548,6 +6553,141 @@ fn mixed_failures_include_both_preexisting_and_introduced_in_output() {
     );
 }
 
+/// Contract §7: the human artifacts owe the reader one sentence per test suite
+/// about how much of it ran. All three modes, in both files, from the same
+/// `ScopeReport` the merge gate publishes.
+#[test]
+fn the_human_artifacts_state_the_test_scope_in_every_mode() {
+    use crate::checks::scope::{ExecutedScope, ScopeDecision, ScopeDecisions};
+
+    fn scoped_result(name: &str, status: CheckStatus, executed: ExecutedScope) -> CheckResult {
+        CheckResult {
+            name: name.to_string(),
+            status,
+            duration: Duration::from_secs(1),
+            output: String::new(),
+            cached: false,
+            provenance: Some(crate::checks::CheckProvenance {
+                command: "cargo test".to_string(),
+                tool_version: None,
+                cwd: ".".to_string(),
+                target_sha: None,
+                tree_state: None,
+                exit_code: Some(0),
+                executed_scope: Some(executed),
+                started_at: String::new(),
+                finished_at: String::new(),
+                hard_fail_signatures: Vec::new(),
+                cache_key: None,
+            }),
+        }
+    }
+
+    fn rendered(decisions: ScopeDecisions, checks: &[CheckResult]) -> (String, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = create_test_config(PolicyConfig::default());
+        config.test_scope = Some(decisions);
+        generate_pr_review(
+            tmp.path(),
+            &config,
+            &[],
+            checks,
+            &[],
+            &CoverageDelta {
+                total_source: 0,
+                covered_count: 0,
+                pct: None,
+                uncovered: vec![],
+                covered: vec![],
+                non_code_count: 0,
+                ghost_tests: vec![],
+            },
+            None,
+        )
+        .expect("pr review");
+        generate_review_summary(tmp.path()).expect("review summary");
+        (
+            fs::read_to_string(tmp.path().join("PR_REVIEW.md")).expect("read review"),
+            fs::read_to_string(tmp.path().join("REVIEW_SUMMARY.md")).expect("read summary"),
+        )
+    }
+
+    let escalation = "manifest or lockfile changed: Cargo.lock";
+    let (review, summary) = rendered(
+        ScopeDecisions {
+            cargo: ScopeDecision::Full {
+                reason: escalation.to_string(),
+                inputs: Some(3),
+            },
+            vitest: ScopeDecision::ChangeScoped {
+                inputs: 1,
+                selected: vec!["src/math.js".to_string()],
+                universe: None,
+                selector_inputs: vec!["src/math.js".to_string()],
+            },
+            non_participating: Vec::new(),
+        },
+        &[
+            scoped_result(
+                "Cargo test",
+                CheckStatus::Passed,
+                ExecutedScope::Full {
+                    reason: escalation.to_string(),
+                },
+            ),
+            scoped_result(
+                "Vitest",
+                CheckStatus::Passed,
+                ExecutedScope::ChangeScoped {
+                    selected: 1,
+                    selector: "related --run src/math.js".to_string(),
+                },
+            ),
+        ],
+    );
+    for artifact in [&review, &summary] {
+        assert!(
+            artifact.contains(&format!("Cargo test: full run ({escalation}).")),
+            "the full run must name what widened it:\n{artifact}"
+        );
+        assert!(
+            artifact.contains("Vitest: change-scoped — 1 test file related to the diff ran."),
+            "a narrowed run must say how much ran, in test files:\n{artifact}"
+        );
+    }
+
+    let (review, summary) = rendered(
+        ScopeDecisions {
+            cargo: ScopeDecision::ChangeScoped {
+                inputs: 2,
+                selected: Vec::new(),
+                universe: Some(2),
+                selector_inputs: Vec::new(),
+            },
+            vitest: ScopeDecision::Full {
+                reason: escalation.to_string(),
+                inputs: Some(2),
+            },
+            non_participating: Vec::new(),
+        },
+        &[scoped_result(
+            "Cargo test",
+            CheckStatus::Skipped,
+            ExecutedScope::NothingSelected,
+        )],
+    );
+    for artifact in [&review, &summary] {
+        assert!(
+            artifact.contains("Cargo test: skipped — no tests related to the change."),
+            "an empty selection is a skip, and must never read as a pass:\n{artifact}"
+        );
+        assert!(
+            !artifact.contains("Vitest:"),
+            "a check with no executed result has no run to describe:\n{artifact}"
+        );
+    }
+}
+
 // ── generate_review_summary tests ─────────────────────────────────
 
 #[test]
@@ -7084,6 +7224,7 @@ fn snapshot_provenance(target_sha: &str) -> CheckProvenance {
         finished_at: "2026-08-22T10:00:01+02:00".to_string(),
         hard_fail_signatures: vec![],
         cache_key: Some("commit-deadbeef".to_string()),
+        executed_scope: None,
     }
 }
 
@@ -7595,6 +7736,7 @@ fn informational_notes_keep_current_and_historical_counts_comparable() {
     let context_for = |out_dir: &Path| {
         build_dashboard_context(DashboardContextInput {
             config: &config,
+            scope: None,
             checks: &[],
             heuristics: None,
             inline: &inline,
@@ -7788,6 +7930,7 @@ fn snapshot_integrity_gate_preserves_check_results_and_dashboard_parity() {
         .unwrap();
         let dashboard = build_dashboard_context(DashboardContextInput {
             config: &config,
+            scope: None,
             checks: &checks,
             heuristics: None,
             inline: &inline,

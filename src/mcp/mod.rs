@@ -45,6 +45,10 @@ pub struct RunReviewArgs {
     /// "quick" (synchronous, 120s budget) or "deep" (async; poll verdict). Default quick.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Run every test instead of the ones related to the change (`--full-tests`).
+    /// Default false: an MCP review narrows its test suites like any local run.
+    #[serde(default)]
+    pub full_tests: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -220,7 +224,7 @@ impl PrviewMcp {
 
     #[tool(
         name = "run_review",
-        description = "Generate a review pack. profile=quick is synchronous (120s budget). profile=deep returns immediately with run_id; poll verdict(run_id) for completion."
+        description = "Generate a review pack. profile=quick is synchronous (120s budget). profile=deep returns immediately with run_id; poll verdict(run_id) for completion. Test suites are narrowed to the change; pass full_tests=true to run everything."
     )]
     async fn run_review(&self, Parameters(args): Parameters<RunReviewArgs>) -> CallToolResult {
         let root = match read::resolve_repo_root(&args.repo) {
@@ -231,7 +235,7 @@ impl PrviewMcp {
             Ok(p) => p,
             Err(e) => return e.into_result(),
         };
-        match run::start(&root, args.base, profile).await {
+        match run::start(&root, args.base, profile, args.full_tests).await {
             Ok(body) => types::tool_success(body),
             Err(e) => e.into_result(),
         }

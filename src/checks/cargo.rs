@@ -41,6 +41,11 @@ struct CargoRun {
     /// Directory to run `cargo` in — the reviewed snapshot's cargo root in
     /// `--pr`/`--remote` mode, the local cargo root otherwise.
     cwd: PathBuf,
+    /// Root of the tree those commands read: the reviewed snapshot in
+    /// `--pr`/`--remote` mode, the repo root otherwise. `cwd` always lies
+    /// inside it, and every repo-relative path this run reasons about — the
+    /// scope decision's `selector_inputs` above all — resolves against it.
+    scan_dir: PathBuf,
     /// Extra child environment. Every Cargo invocation receives the canonical
     /// `CARGO_BUILD_JOBS` cap; snapshot runs also redirect `CARGO_TARGET_DIR`.
     env: Vec<(String, String)>,
@@ -81,6 +86,7 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
         return Ok(CargoRun {
             env: vec![cargo_jobs_env(config, &cwd)],
             cwd,
+            scan_dir: plan.scan_dir,
             _snapshot: plan._snapshot,
         });
     }
@@ -124,6 +130,7 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
             ),
         ],
         cwd,
+        scan_dir: plan.scan_dir,
         _snapshot: plan._snapshot,
     })
 }
@@ -442,6 +449,101 @@ fn cargo_literal_test_filter(pattern: &str) -> Result<&str> {
         );
     }
     Ok(pattern)
+}
+
+/// What `cargo test` will run, and the evidence of it, given this run's scope
+/// decision.
+enum CargoTestPlan {
+    /// Spawn these arguments; `executed` is the provenance evidence, `None`
+    /// when the run is full because the DECISION said so — the decision's own
+    /// reason is then the honest report, and duplicating it here would create a
+    /// second place for it to drift.
+    Run {
+        args: Vec<String>,
+        executed: Option<crate::checks::scope::ExecutedScope>,
+    },
+    /// Execute nothing: the decision selected no package.
+    Skip,
+}
+
+/// The `-p` fragment, exactly as it appears in the command line.
+///
+/// Packages come from the decision already sorted (a `BTreeSet` produced them),
+/// so the selector is stable across runs and diffable between packs.
+fn cargo_package_selector(packages: &[String]) -> String {
+    packages
+        .iter()
+        .map(|package| format!("-p {package}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `tree_dir` is the root of the tree the command will read (`CargoRun::scan_dir`);
+/// the decision's `selector_inputs` are repo-relative paths inside it.
+fn plan_cargo_test(config: &Config, tree_dir: &Path) -> Result<CargoTestPlan> {
+    use crate::checks::scope::{Ecosystem, ExecutedScope, ScopeDecision, reason};
+
+    let full = |executed| cargo_test_args(config).map(|args| CargoTestPlan::Run { args, executed });
+    let Some(ScopeDecision::ChangeScoped {
+        selected,
+        selector_inputs,
+        ..
+    }) = config
+        .test_scope
+        .as_ref()
+        .map(|scope| scope.get(Ecosystem::Cargo))
+    else {
+        return full(None);
+    };
+    if selected.is_empty() {
+        return Ok(CargoTestPlan::Skip);
+    }
+    // A package name that cannot be spelled on a command line cannot narrow a
+    // run. Widening is the only safe answer: a dropped `-p` would quietly test
+    // a different set than the one the decision named.
+    if let Some(unusable) = selected
+        .iter()
+        .find(|package| package.trim().is_empty() || package.split_whitespace().count() > 1)
+    {
+        return full(Some(ExecutedScope::Full {
+            reason: reason::resolution_failed(&format!(
+                "package name {unusable:?} cannot be passed to cargo -p"
+            )),
+        }));
+    }
+    // Contract §4.1, the same gate the Vitest path applies to its own inputs:
+    // the decision was taken against the reviewed tree's path list, and `-p`
+    // narrows to the packages those paths belong to. If one of them is not in
+    // the tree this command is about to read, the selection describes a
+    // different tree, and narrowing on it would quietly stop testing whatever
+    // that file belongs to. Widening is the only safe answer.
+    if let Some(missing) = selector_inputs
+        .iter()
+        .find(|input| !tree_dir.join(input).exists())
+    {
+        return full(Some(ExecutedScope::Full {
+            reason: reason::resolution_failed(&format!(
+                "{missing} is missing from the reviewed tree"
+            )),
+        }));
+    }
+    let mut args = cargo_test_args(config)?;
+    // Inserted before the optional literal test filter, which `cargo test`
+    // reads as a positional argument: options after it would be handed to the
+    // test binaries instead of to cargo.
+    let filter = args.len() - usize::from(config.tests_pattern.is_some());
+    let selector_args: Vec<String> = selected
+        .iter()
+        .flat_map(|package| ["-p".to_string(), package.clone()])
+        .collect();
+    args.splice(filter..filter, selector_args);
+    Ok(CargoTestPlan::Run {
+        args,
+        executed: Some(ExecutedScope::ChangeScoped {
+            selected: selected.len(),
+            selector: cargo_package_selector(selected),
+        }),
+    })
 }
 
 fn cargo_test_args(config: &Config) -> Result<Vec<String>> {
@@ -1651,11 +1753,40 @@ impl Check for CargoTestCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        // Validate before planning/materialising a remote snapshot. Invalid or
-        // semantically unsupported selectors must not start any Cargo work.
-        let owned_args = cargo_test_args(config)?;
+        // Resolve where the run happens first: the plan has to be judged
+        // against the tree that will actually be read, not against whatever
+        // tree the decision was taken in. No cargo process is started until the
+        // plan below says so, so an invalid or semantically unsupported
+        // selector still costs no Cargo work.
         let run = plan_cargo_run(config)?;
         let cwd = run.cwd.as_path();
+
+        let (owned_args, executed_scope) = match plan_cargo_test(config, &run.scan_dir)? {
+            CargoTestPlan::Run { args, executed } => (args, executed),
+            // No cargo process at all: the decision proved no package in this
+            // workspace can be affected by the change. That is a finding, not a
+            // blank, so it is published as provenance — no command, and the
+            // empty selection itself as the executed scope.
+            CargoTestPlan::Skip => {
+                return Ok(CheckResult {
+                    name: self.name().to_string(),
+                    status: CheckStatus::Skipped,
+                    duration: start.elapsed(),
+                    output: crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE.to_string(),
+                    cached: false,
+                    provenance: Some(super::nothing_selected_provenance(
+                        self.name(),
+                        cwd,
+                        crate::paths::normalize_path_display(
+                            &cwd.display().to_string(),
+                            &config.repo_root,
+                        ),
+                        &config.repo_root,
+                        started_at,
+                    )),
+                });
+            }
+        };
 
         let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         let mut env = run.env.clone();
@@ -1697,7 +1828,8 @@ impl Check for CargoTestCheck {
                     finished_at: &finished_at,
                     cache_key: self.cache_key(config),
                 }
-                .build_repo_relative_cwd(),
+                .build_repo_relative_cwd()
+                .with_executed_scope(executed_scope),
             ),
         })
     }
@@ -4628,6 +4760,296 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         assert_eq!(
             snapshot_cargo_root(Path::new("/elsewhere/crate"), repo_root, scan_dir),
             None,
+        );
+    }
+    // -----------------------------------------------------------------------
+    // Change-scoped execution
+    // -----------------------------------------------------------------------
+
+    use crate::checks::scope::{
+        CargoWorkspace, ChangeSet, Ecosystem, ExecutedScope, PathClassifier, ReviewedTree,
+        ScopeDecision, ScopeDecisions, ScopeInputs, decide,
+    };
+    use crate::git::{ChangedPath, FileStatus};
+
+    /// A config whose Cargo decision is exactly `decision`; Vitest is pinned to
+    /// full so a stray read of the wrong ecosystem would be visible.
+    fn config_with_cargo_scope(decision: ScopeDecision) -> Config {
+        let mut config = create_test_config(true, false, true);
+        config.test_scope = Some(ScopeDecisions {
+            cargo: decision,
+            vitest: ScopeDecision::Full {
+                reason: "not under test".to_string(),
+                inputs: None,
+            },
+            non_participating: Vec::new(),
+        });
+        config
+    }
+
+    fn scoped(packages: &[&str]) -> ScopeDecision {
+        ScopeDecision::ChangeScoped {
+            inputs: packages.len(),
+            selected: packages.iter().map(|p| (*p).to_string()).collect(),
+            universe: Some(4),
+            selector_inputs: Vec::new(),
+        }
+    }
+
+    /// Plans against `tree_dir`, the root the decision's `selector_inputs` are
+    /// resolved against — the same directory `CargoRun::scan_dir` names at
+    /// runtime.
+    fn planned_in(config: &Config, tree_dir: &Path) -> CargoTestPlan {
+        plan_cargo_test(config, tree_dir).expect("planning a cargo test run")
+    }
+
+    /// For decisions with no selector inputs, where the tree is irrelevant.
+    fn planned(config: &Config) -> CargoTestPlan {
+        planned_in(config, &config.repo_root)
+    }
+
+    fn run_args(plan: &CargoTestPlan) -> &[String] {
+        match plan {
+            CargoTestPlan::Run { args, .. } => args,
+            CargoTestPlan::Skip => panic!("expected a run, got a skip"),
+        }
+    }
+
+    fn executed(plan: &CargoTestPlan) -> Option<&ExecutedScope> {
+        match plan {
+            CargoTestPlan::Run { executed, .. } => executed.as_ref(),
+            CargoTestPlan::Skip => panic!("expected a run, got a skip"),
+        }
+    }
+
+    #[test]
+    fn a_scoped_cargo_decision_narrows_the_run_to_its_packages() {
+        let plan = planned(&config_with_cargo_scope(scoped(&["app", "core"])));
+
+        assert_eq!(
+            run_args(&plan),
+            [
+                "test",
+                "--all-targets",
+                "--no-fail-fast",
+                "-p",
+                "app",
+                "-p",
+                "core"
+            ],
+        );
+        assert_eq!(
+            executed(&plan),
+            Some(&ExecutedScope::ChangeScoped {
+                selected: 2,
+                selector: "-p app -p core".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn the_cargo_selector_is_a_verbatim_fragment_of_the_command_line() {
+        let plan = planned(&config_with_cargo_scope(scoped(&["app", "core"])));
+        let command_line = run_args(&plan).join(" ");
+
+        let Some(ExecutedScope::ChangeScoped { selector, .. }) = executed(&plan) else {
+            panic!("a narrowed run reports a narrowed scope");
+        };
+        assert!(
+            command_line.contains(selector.as_str()),
+            "selector {selector:?} is not a substring of {command_line:?}",
+        );
+    }
+
+    #[test]
+    fn a_full_cargo_decision_runs_todays_command_unchanged() {
+        let plan = planned(&config_with_cargo_scope(ScopeDecision::Full {
+            reason: "unsupported input".to_string(),
+            inputs: Some(3),
+        }));
+
+        assert_eq!(run_args(&plan), ["test", "--all-targets", "--no-fail-fast"]);
+        // The DECISION's reason is the honest report; the check does not
+        // duplicate it as execution evidence.
+        assert_eq!(executed(&plan), None);
+    }
+
+    #[test]
+    fn no_decision_at_all_runs_todays_command_unchanged() {
+        let mut config = create_test_config(true, false, true);
+        config.test_scope = None;
+
+        assert_eq!(
+            run_args(&planned(&config)),
+            ["test", "--all-targets", "--no-fail-fast"],
+        );
+    }
+
+    #[test]
+    fn the_tests_pattern_stays_the_last_argument_when_the_run_narrows() {
+        let mut config = config_with_cargo_scope(scoped(&["core"]));
+        config.tests_pattern = Some("parses".to_string());
+
+        // `cargo test` reads the filter as a positional argument: anything
+        // after it belongs to the test binary, not to cargo.
+        assert_eq!(
+            run_args(&planned(&config)),
+            [
+                "test",
+                "--all-targets",
+                "--no-fail-fast",
+                "-p",
+                "core",
+                "parses"
+            ],
+        );
+    }
+
+    #[test]
+    fn an_empty_cargo_selection_plans_no_run_at_all() {
+        let plan = planned(&config_with_cargo_scope(ScopeDecision::ChangeScoped {
+            inputs: 2,
+            selected: Vec::new(),
+            universe: Some(4),
+            selector_inputs: Vec::new(),
+        }));
+
+        assert!(matches!(plan, CargoTestPlan::Skip));
+    }
+
+    #[test]
+    fn a_package_name_that_cannot_be_spelled_widens_the_run() {
+        let plan = planned(&config_with_cargo_scope(scoped(&["core", "two words"])));
+
+        assert_eq!(run_args(&plan), ["test", "--all-targets", "--no-fail-fast"]);
+        let Some(ExecutedScope::Full { reason }) = executed(&plan) else {
+            panic!("an unusable selector must widen the run, loudly");
+        };
+        assert!(
+            reason.contains("two words"),
+            "the reason must name the fact that widened the run: {reason}",
+        );
+    }
+
+    /// A narrowed decision that also names the paths it was drawn from.
+    fn scoped_with_inputs(packages: &[&str], inputs: &[&str]) -> ScopeDecision {
+        ScopeDecision::ChangeScoped {
+            inputs: inputs.len(),
+            selected: packages.iter().map(|p| (*p).to_string()).collect(),
+            universe: Some(4),
+            selector_inputs: inputs.iter().map(|p| (*p).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_selector_input_missing_from_the_reviewed_tree_widens_the_run() {
+        // The decision was taken against some tree; this run reads another one.
+        // A `-p` list drawn from paths that are not here narrows to the wrong
+        // set, so the run widens and says which path it could not find.
+        let tree = tempfile::tempdir().expect("tempdir");
+        let config = config_with_cargo_scope(scoped_with_inputs(&["core"], &["src/gone.rs"]));
+
+        let plan = planned_in(&config, tree.path());
+
+        assert_eq!(run_args(&plan), ["test", "--all-targets", "--no-fail-fast"]);
+        let Some(ExecutedScope::Full { reason }) = executed(&plan) else {
+            panic!("a selector input that is not in the tree must widen the run");
+        };
+        assert!(
+            reason.contains("src/gone.rs") && reason.contains("missing from the reviewed tree"),
+            "the reason must name the path that widened the run: {reason}",
+        );
+    }
+
+    #[test]
+    fn a_selector_input_present_in_the_reviewed_tree_keeps_the_run_narrow() {
+        let tree = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tree.path().join("src")).expect("fixture dirs");
+        std::fs::write(tree.path().join("src/there.rs"), "").expect("fixture file");
+        let config = config_with_cargo_scope(scoped_with_inputs(&["core"], &["src/there.rs"]));
+
+        let plan = planned_in(&config, tree.path());
+
+        assert_eq!(
+            run_args(&plan),
+            ["test", "--all-targets", "--no-fail-fast", "-p", "core"],
+        );
+        assert_eq!(
+            executed(&plan),
+            Some(&ExecutedScope::ChangeScoped {
+                selected: 1,
+                selector: "-p core".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_dependent_package_is_tested_when_only_its_dependency_changed() {
+        // app -> core. Changing core must run app's tests too: the reverse
+        // path-dependency closure is what makes narrowing safe.
+        let metadata = br#"{"packages":[
+            {"name":"app","manifest_path":"/w/crates/app/Cargo.toml",
+             "targets":[{"kind":["lib"],"name":"app"}],
+             "dependencies":[{"name":"core","path":"/w/crates/core"}]},
+            {"name":"core","manifest_path":"/w/crates/core/Cargo.toml",
+             "targets":[{"kind":["lib"],"name":"core"}],
+             "dependencies":[]},
+            {"name":"unrelated","manifest_path":"/w/crates/unrelated/Cargo.toml",
+             "targets":[{"kind":["lib"],"name":"unrelated"}],
+             "dependencies":[]}
+        ],"workspace_root":"/w"}"#;
+        let workspace = Ok(CargoWorkspace::from_metadata_json(metadata).expect("metadata parses"));
+        let mut profile = test_rust_profile(true);
+        profile.cargo_root = Some(PathBuf::from("/w"));
+        profile.is_workspace = true;
+        let change_set = ChangeSet::new(
+            vec![ChangedPath {
+                path: "crates/core/src/lib.rs".to_string(),
+                status: FileStatus::Modified,
+                old_path: None,
+            }],
+            true,
+        );
+        let never_generated = |_: &str| false;
+        let decisions = decide(
+            Some(&change_set),
+            &ScopeInputs {
+                reviewed_tree: &ReviewedTree::Snapshot(PathBuf::from("/w")),
+                profile: &profile,
+                cargo_workspace: Some(&workspace),
+                is_generated: &never_generated,
+                classifier: &PathClassifier::strict(),
+            },
+        );
+
+        let mut config = create_test_config(true, false, true);
+        config.test_scope = Some(decisions.clone());
+        assert!(
+            matches!(
+                decisions.get(Ecosystem::Cargo),
+                ScopeDecision::ChangeScoped { .. }
+            ),
+            "a plain source edit inside a member is scopeable: {:?}",
+            decisions.cargo,
+        );
+        // The decision carries a real selector input, so it is planned against
+        // a tree that actually holds it.
+        let tree = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tree.path().join("crates/core/src")).expect("fixture dirs");
+        std::fs::write(tree.path().join("crates/core/src/lib.rs"), "").expect("fixture file");
+
+        assert_eq!(
+            run_args(&planned_in(&config, tree.path())),
+            [
+                "test",
+                "--all-targets",
+                "--no-fail-fast",
+                "-p",
+                "app",
+                "-p",
+                "core"
+            ],
+            "the dependent package must run, and `unrelated` must not",
         );
     }
 }

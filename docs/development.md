@@ -121,6 +121,19 @@ It has an internal 20-minute deadline inside a 45-minute Actions timeout, then
 always uploads a compact JSON receipt plus the captured CLI log.
 Only the published job on the exact candidate SHA is platform evidence; a local
 run validates the harness, not the `ubuntu-latest` envelope.
+The same harness also proves the change-scoped test contract on a real run, and
+one of its claims is an ABSENCE: on a JS-only change no `cargo test` may run at
+all. A 50ms process sample can only ever say "we did not happen to see it", so
+the canonical witness is a `cargo` shim the harness puts in front of `PATH`,
+which logs every invocation's arguments and then `exec`s the real cargo (resolved
+before the shim reaches `PATH`, and `exec`ed so no extra process joins the tree).
+The receipt carries that log. A shim that recorded nothing at all fails the case
+rather than passing it — it means the shim never reached `PATH` — and the process
+census, which corroborates the shim, stops being usable as proof of an absence
+once it hits its command cap, so `truncated: true` fails the case too. The pack
+must tell the same story: the skipped `Cargo test` gate publishes
+`<no command recorded>` as its command.
+
 The mixed fixture intentionally has no Python project, so this receipt does not
 prove uv/PEP 517/pytest-xdist limits; those are covered by the Rust contract
 tests and their real behavior remains part of repository-specific dogfood.

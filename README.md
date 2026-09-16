@@ -70,8 +70,11 @@ Full instructions — release binaries, checksums, and PATH setup — live in [`
 # Fast local review of the current branch vs the default base
 prview --quick
 
-# Review a GitHub PR with stricter presets
+# Review a GitHub PR with stricter presets (tests narrowed to the change)
 prview --pr 23 --deep
+
+# The same review on a runner, with every test executed
+prview --ci
 
 # Run the automation gate with contractual exit codes
 prview gate
