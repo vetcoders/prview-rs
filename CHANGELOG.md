@@ -89,13 +89,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for each selected package, before the optional positional test filter;
   `Vitest` switches to `related --run --maxWorkers 1 --passWithNoTests <inputs>`.
   A decision that selects nothing executes nothing at all and returns `Skipped`
-  with `no tests related to the change` — never a pass, since no suite ran — and
-  a narrowed Vitest run that finds no test file is `Skipped` for the same reason,
-  because `--passWithNoTests` makes that exit 0. A full decision runs exactly
-  the command it ran before, and `--tests-pattern` keeps filtering INSIDE the
-  selection. Escalation continues at runtime and stays one-directional: a
-  selector input missing from the reviewed tree, or a package name that cannot
-  be spelled on a command line, runs the full suite with the reason stated.
+  with `no tests related to the change` — never a pass, since no suite ran. A
+  narrowed Vitest run is judged by Vitest's JSON reporter rather than by its exit
+  code or its prose: the narrowed command carries
+  `--reporter=default --reporter=json --outputFile.json=<temp file>`, zero
+  suites with no collected file is `Skipped` for the same reason as above,
+  executed tests hand the verdict back to the exit code, and a missing or
+  unreadable report is an `error` (`could not verify that the narrowed Vitest run
+  executed any test`) — never a pass and never a skip, so no output a test prints
+  can spoof either. A full decision runs exactly the command it ran before, and
+  `--tests-pattern` keeps filtering INSIDE the selection. Escalation continues at
+  runtime and stays one-directional: a selector input missing from the tree the
+  runner is about to read (checked now by `Cargo test` as well as `Vitest`), or a
+  package name that cannot be spelled on a command line, runs the full suite with
+  the reason stated.
   The decision is resolved once, immediately after the run's shared snapshot is
   settled and before any check runs, and only when a gate that owns a test scope
   is actually runnable.
@@ -112,9 +119,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocks a merge in a repository that requires it. `Skipped` carrying prview's
   own `no tests related to the change` is `Satisfied / Complete / Approve` — the
   check applies to the repository but not to this change, proved by a
-  classification that escalates everything it cannot name. The row still reads
-  `skipped` with `outcome: skipped`; every other skip reason keeps its existing
-  policy outcome, including a missing tool, which still blocks.
+  classification that escalates everything it cannot name. The exception is
+  keyed on evidence, not on the sentence: only a check that owns an ecosystem's
+  test scope, only from a real execution (never a pre-flight skip), and only
+  when its own provenance agrees (no command at all, or a recorded narrowed
+  run). A lint that prints those words, and a test check that ran the full suite
+  before reporting them, keep blocking. The row still reads `skipped` with
+  `outcome: skipped`; every other skip reason keeps its existing policy outcome,
+  including a missing tool, which still blocks.
 - A snapshot the ledger reports as dirty, or whose substrate cannot be
   identified, now escalates to a full test run: the bytes the gates read are
   then not the reviewed commit, and a selection drawn from a diff that does not

@@ -411,6 +411,16 @@ moves the verdict.
 An empty selection is reported as `change-scoped` with `selected: 0`, a null
 selector and a `skipped` row. It is never reported as a pass — no suite ran.
 
+**How prview knows a narrowed Vitest run found nothing.** From Vitest's JSON
+reporter, which the narrowed command carries (`--reporter=default
+--reporter=json --outputFile.json=…`, written to a temporary file), never from
+the words in its output — a test is free to print anything, including Vitest's
+own "No test files found". Zero suites and zero collected files is the skip;
+executed tests hand the verdict back to the exit code. If that report is missing
+or unreadable, the row is an `error` saying the run could not be verified, not a
+pass and not a skip. A full `vitest run` is untouched: same command, same
+exit-code verdict.
+
 ### Test selection
 
 `--tests-pattern PATTERN` is runner-aware rather than one portable regex:

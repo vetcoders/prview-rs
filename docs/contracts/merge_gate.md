@@ -105,7 +105,7 @@ statement.
 | `inputs` | integer \| null | Changed paths the decision took into account, escalation or not. `null` means ONLY "there was never a set to count" — it is not a synonym for `0` |
 | `selected` | integer \| null | Test files or packages selected. MUST be `null` when `mode` is `full`: a full run selected nothing, and a count there would read as coverage |
 | `universe` | integer \| null | The whole population the selection was drawn from, when knowable before the run |
-| `selector` | string \| null | The fragment of the command line that narrowed the run, VERBATIM: `-p <pkg> [-p <pkg>…]` for Cargo, the whole `related …` argument line for Vitest. It is a substring of `command` in the check's `20_quality/<id>.result.json`. MUST be `null` when `mode` is `full`, and is `null` for an empty selection, which spawned no command at all |
+| `selector` | string \| null | The fragment of the command line that narrowed the run, VERBATIM: `-p <pkg> [-p <pkg>…]` for Cargo, the `related …` argument line up to and including the selector inputs for Vitest (the reporter flags that follow it say how the run was OBSERVED, not what it selected, and stay out). It is a substring of `command` in the check's `20_quality/<id>.result.json`. MUST be `null` when `mode` is `full`, and is `null` for an empty selection, which spawned no command at all |
 | `non_participating` | object[] | Additive, omitted when empty. Changed paths classified as NOT inputs to test selection, each as `{ path, rule }`. Both fields are required and non-empty: an entry that does not name its rule cannot be challenged, which is the whole point of publishing the list |
 
 A pack must never state `change-scoped` for a run that executed the full
@@ -123,6 +123,14 @@ command to describe.
 That row does not block: the suite applies to the repository but not to this
 change, and the classification that proved it escalates anything it cannot name.
 It is never relabelled `passed` — no suite ran.
+
+A narrowed run can reach the same reason a second way: the selection was
+non-empty, but the runner found no test related to it. For Vitest that verdict
+comes from its JSON reporter (zero suites, no collected file) rather than from
+anything printed in the log, and a narrowed run whose report cannot be read is
+an `error` — `could not verify that the narrowed Vitest run executed any test` —
+so an unverified run is never green and never a skip either. Such a row keeps
+its `selector`: a command did run, and the pack says which one.
 
 **Caveats.** Every narrowed or skipped test run owes `decision.review_caveats`
 one advisory line, derived from the very `scope` objects published on the rows,

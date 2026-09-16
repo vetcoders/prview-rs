@@ -469,7 +469,7 @@ advisory review caveat that never moves the verdict. See
 | Decision | `Cargo test` | `Vitest` |
 |---|---|---|
 | `Full { reason }`, or no decision at all | `cargo test --all-targets --no-fail-fast [<literal filter>]` — today's command, unchanged | `vitest run --maxWorkers 1 [--testNamePattern <p>]` — today's command, unchanged |
-| `ChangeScoped`, non-empty selection | the same command plus `-p <pkg>` per selected package, inserted **before** the positional filter | `vitest related --run --maxWorkers 1 --passWithNoTests [--testNamePattern <p>] <selector inputs>` |
+| `ChangeScoped`, non-empty selection | the same command plus `-p <pkg>` per selected package, inserted **before** the positional filter | `vitest related --run --maxWorkers 1 --passWithNoTests [--testNamePattern <p>] <selector inputs>`, followed by `--reporter=default --reporter=json --outputFile.json=<temp>/vitest-scope.json` |
 | `ChangeScoped`, empty selection | nothing is spawned: `Skipped` with `no tests related to the change` and no provenance | the same |
 
 `--tests-pattern` filters INSIDE the selection; it never replaces it. Every
@@ -477,13 +477,32 @@ existing cap is untouched: the scope decides how much to run, the governor
 decides how to run it.
 
 **Escalation continues at runtime, one-directionally.** A selector input that is
-not present in the tree about to be read, or a package name that cannot be
-spelled on a command line, runs the full suite and says why — handing a runner a
-path that is not there would silently shrink the selection instead of failing
-it. A narrowed Vitest run that Vitest reports as finding no test file is
-`Skipped`, not `Passed`: `--passWithNoTests` makes that exit 0, and zero executed
-tests is never evidence of a pass. A tool failure on a narrowed command stays a
-typed failure.
+not present in the tree about to be read (checked by BOTH checks, against
+`CargoRun::scan_dir` and the Vitest run directory respectively), or a package
+name that cannot be spelled on a command line, runs the full suite and says why
+— handing a runner a path that is not there would silently shrink the selection
+instead of failing it. A tool failure on a narrowed command stays a typed
+failure.
+
+**How a narrowed Vitest run is judged.** Not by its exit code, which
+`--passWithNoTests` makes 0 whether everything related passed or nothing ran,
+and not by its prose: stdout carries the reviewed code's own output, so a test
+that prints Vitest's empty-set sentence could otherwise spoof a skip. The
+narrowed command therefore carries the JSON reporter, written to a temporary
+file (a check is handed a `Config`, whose `artifacts_dir()` is only a prediction
+of the pack path, and writing into the reviewed tree would mutate the tree under
+review), and the counters in it are the witness:
+
+| Reporter says | Verdict |
+|---|---|
+| `numTotalTestSuites == 0` and `testResults` empty | `Skipped` with `no tests related to the change` |
+| `numTotalTests > 0` | the run's own exit code: `Passed` or `Failed` |
+| files collected, no test executed, non-zero exit | `Failed` |
+| files collected, no test executed, zero exit | `Error` |
+| missing or unreadable | `Error`: `could not verify that the narrowed Vitest run executed any test` |
+
+Zero executed tests is never green, and an unverified run is never green either.
+A full `vitest run` is unchanged and still classified by its exit code alone.
 
 **The report describes what ran, not what was decided.** `CheckProvenance`
 carries an additive `executed_scope`, written by the check itself, and
@@ -501,6 +520,19 @@ of the profile-mismatch branch, and as narrow. The check applies to the
 repository but not to this change, and the classification that proved it
 escalates everything it does not recognise. The row still reads `skipped` with
 `outcome: skipped`; a suite that never ran is never relabelled `passed`.
+
+That exception is keyed on evidence rather than on the sentence. Three facts
+must hold together (`proved_empty_test_scope`): the row belongs to a check that
+OWNS an ecosystem's test scope (`Ecosystem::owning_check`, so a lint printing
+the same words is not eligible), the skip came out of a real execution
+(`evaluate_run`; a pre-flight `SkippedCheck` never qualifies, because a check
+that was never dispatched cannot have resolved a selection), and the check's own
+provenance agrees — either absent, which is what an empty selection leaves
+behind, or an `executed_scope` that records a narrowed run. A test check that
+ran the FULL suite and then reported this reason contradicts itself, and the
+contradiction is resolved against the claim: it blocks wherever policy requires
+the gate. The same proof drives the execution-state classification, so the two
+cannot disagree about what the skip was.
 
 **The escape hatch.** `--full-tests` pins both ecosystems to `Full` before any
 metadata call, with `full test run requested (--full-tests)` as the published
