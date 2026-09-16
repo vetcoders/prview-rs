@@ -144,6 +144,12 @@ change travels through a channel no import graph describes asks for the whole
 suite with `full_tests: true`, which passes `--full-tests` to the review and is
 published as `full test run requested (--full-tests)`.
 
+**A review over MCP is bounded in time.** It inherits the CLI's local default of
+30 minutes; a run that exceeds it is stopped exactly like a cancelled one and
+reported as `run_failed` rather than left hanging on the caller's machine. There
+is no per-call override — a tool call that needs a different bound is a CLI run
+(`prview --deadline <time>`), not a wider MCP surface.
+
 **`quick` is synchronous.** It blocks until the pack is written, under a hard
 **120-second budget**. Exceeding the budget runs bounded whole-tree containment
 and returns `run_timeout` with `retry_hint.profile: "deep"` plus

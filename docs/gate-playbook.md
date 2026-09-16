@@ -13,7 +13,7 @@ they must not parse stdout.
 | `1` | `BLOCK` | Block in Warn and Required |
 | `2` | Review-required under `--strict`, or warnings-only with `--strict --fail-on-warnings` | Block in Required |
 | `3` | Gate execution failed before a trustworthy verdict was available | Block in Warn and Required |
-| `130` | The operator cancelled the run (Ctrl-C) | Block in Warn and Required |
+| `130` | The operator cancelled the run (Ctrl-C) — a deadline is `3`, not this | Block in Warn and Required |
 
 Use `prview gate --json` when CI needs a machine-readable summary, artifact
 paths, or SARIF path discovery. Pass/fail still comes from the process exit code.
@@ -27,10 +27,22 @@ SIGINT; a runner or workflow cancel still can. A local hook should treat it
 exactly like `3`.
 
 Exit `3` covers every way the run can end without a trustworthy verdict — the
-review failing to execute, and the pack's `00_summary/MERGE_GATE.json` being
-missing, unparsable, or stamped with a `schema_version` this build cannot read.
+review failing to execute, the run exceeding its deadline, and the pack's
+`00_summary/MERGE_GATE.json` being missing, unparsable, or stamped with a
+`schema_version` this build cannot read.
 Plain `prview --ci` uses the same code for the same conditions: it never
 re-derives a verdict when the gate artifact cannot be read.
+
+## The gate is bounded in time
+
+`prview gate` and `prview --ci` give a run 60 minutes before stopping it, so a
+hung tool cannot hold a job open until the runner's own timeout kills it without
+explanation. An expired run terminates its child tree, publishes no verdict, and
+exits `3` — the hook effect above therefore already covers it. Override with a
+budget typed before the subcommand (`prview --deadline 2h gate`, unit required)
+or remove the bound with `prview --no-deadline gate`; `prview --ci` takes the
+same flags directly. Keep the workflow's own `timeout-minutes` above the
+deadline so prview is the thing that reports the timeout.
 
 ## Choosing the base
 

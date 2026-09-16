@@ -137,6 +137,13 @@ reports each running check's own elapsed time and says that the rest are
 waiting on run resources. See
 [`docs/usage.md`](docs/usage.md#resource-budget) for the full contract.
 
+Every run is also bounded in time. A local review gets 30 minutes, `--ci` and
+`prview gate` get 60, and `--deadline 45m` or `--no-deadline` overrides either.
+An expired run is stopped the same way Ctrl-C stops it — the same governor, the
+same child cleanup, the same `INCOMPLETE.json` instead of a partial verdict —
+but it exits 3, not 130, because nobody cancelled it. See
+[`docs/usage.md`](docs/usage.md#run-deadline).
+
 On Unix, cancellation and timeout cleanup also follows live PPID ancestry when
 a tool descendant leaves its inherited process group with `setsid` or
 `setpgid`; Windows uses Job Object ownership. An already-reparented Unix
@@ -157,7 +164,7 @@ generated merge-gate artifact, and exits with the automation contract:
 | `0` | `PASS`, advisory `CONDITIONAL`, or a typed warnings-only decision under `--strict` |
 | `1` | `BLOCK` |
 | `2` | Review-required under `--strict`, or warnings-only with `--strict --fail-on-warnings` |
-| `3` | Gate execution failed before a trustworthy verdict was available |
+| `3` | Gate execution failed before a trustworthy verdict was available, including a run stopped by its deadline |
 | `130` | A headless/preflight Ctrl-C or second raw-mode TUI Ctrl-C event forced cancellation; the CLI reports no new verdict, while any pack already durably committed remains discoverable |
 
 Use `prview gate --json` for schema-friendly stdout with the verdict, caveats,
