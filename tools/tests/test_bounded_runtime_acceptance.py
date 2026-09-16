@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
+import tempfile
 import unittest
 
 
@@ -129,11 +131,29 @@ class EmptySelectionAssertionTests(unittest.TestCase):
         }
         return run, gate, {"observed_commands": set()}
 
+    def pack_with_vitest_command(self, command: str) -> pathlib.Path:
+        """A minimal pack carrying the command the Vitest gate really spawned."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        pack = pathlib.Path(temp.name)
+        quality = pack / "20_quality"
+        quality.mkdir(parents=True, exist_ok=True)
+        (quality / "tests.result.json").write_text(
+            json.dumps({"command": command}), encoding="utf-8"
+        )
+        return pack
+
+    def narrowed_vitest_pack(self) -> pathlib.Path:
+        return self.pack_with_vitest_command(
+            "pnpm exec vitest related --run --maxWorkers 1 --passWithNoTests src/math.js "
+            "--reporter=default --reporter=json --outputFile.json=/tmp/x/vitest-scope.json"
+        )
+
     def test_accepts_a_genuinely_empty_selection(self) -> None:
         run, gate, census = self.passing_inputs()
         violations: list[str] = []
 
-        MODULE.assert_js_only(violations, run, gate, pathlib.Path("/nonexistent"), census)
+        MODULE.assert_js_only(violations, run, gate, self.narrowed_vitest_pack(), census)
 
         self.assertEqual(violations, [])
 
@@ -142,7 +162,7 @@ class EmptySelectionAssertionTests(unittest.TestCase):
         run["checks"][1]["status"] = "passed"
         violations: list[str] = []
 
-        MODULE.assert_js_only(violations, run, gate, pathlib.Path("/nonexistent"), census)
+        MODULE.assert_js_only(violations, run, gate, self.narrowed_vitest_pack(), census)
 
         self.assertTrue(any("not skipped" in item for item in violations))
 
@@ -151,9 +171,22 @@ class EmptySelectionAssertionTests(unittest.TestCase):
         census["observed_commands"] = {"cargo test --all-targets --no-fail-fast"}
         violations: list[str] = []
 
-        MODULE.assert_js_only(violations, run, gate, pathlib.Path("/nonexistent"), census)
+        MODULE.assert_js_only(violations, run, gate, self.narrowed_vitest_pack(), census)
 
         self.assertTrue(any("cargo test process ran" in item for item in violations))
+
+    def test_rejects_a_narrowed_vitest_run_without_its_reporter(self) -> None:
+        # The anti-spoof guarantee is the JSON reporter. A narrowed command
+        # without it is back to trusting whatever the tool printed.
+        run, gate, census = self.passing_inputs()
+        pack = self.pack_with_vitest_command(
+            "pnpm exec vitest related --run --maxWorkers 1 --passWithNoTests src/math.js"
+        )
+        violations: list[str] = []
+
+        MODULE.assert_js_only(violations, run, gate, pack, census)
+
+        self.assertTrue(any("no JSON reporter" in item for item in violations))
 
     def test_rejects_a_blocking_gate_row(self) -> None:
         run, gate, census = self.passing_inputs()
@@ -161,7 +194,7 @@ class EmptySelectionAssertionTests(unittest.TestCase):
         gate["decision"]["verdict"] = "BLOCK"
         violations: list[str] = []
 
-        MODULE.assert_js_only(violations, run, gate, pathlib.Path("/nonexistent"), census)
+        MODULE.assert_js_only(violations, run, gate, self.narrowed_vitest_pack(), census)
 
         self.assertEqual(len(violations), 2)
 

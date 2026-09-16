@@ -8,6 +8,7 @@ use crate::Config;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Local;
+use std::path::{Path, PathBuf};
 
 pub struct TypeScriptCheck;
 pub struct ESLintCheck;
@@ -87,9 +88,9 @@ fn vitest_args(config: &Config) -> Vec<String> {
 /// `--passWithNoTests` is required rather than optional: an empty related set is
 /// not a tool error, and without the flag Vitest exits non-zero and the check
 /// would report a failure for a change that simply has no related tests. The
-/// emptiness is recognised from the output instead and reported as `Skipped`
-/// (contract §8.1) — never `Passed`, which would claim evidence from zero
-/// executed tests.
+/// emptiness is then read from the JSON reporter (see [`vitest_reporter_args`])
+/// and reported as `Skipped` (contract §8.1) — never `Passed`, which would claim
+/// evidence from zero executed tests.
 ///
 /// Everything the full command carries is preserved: the one-worker ceiling and
 /// `--testNamePattern`, which keeps filtering INSIDE the selection (contract
@@ -109,15 +110,152 @@ fn vitest_scoped_args(config: &Config, selector_inputs: &[String]) -> Vec<String
     args
 }
 
-/// Vitest's own words for "the selection resolved to no spec at all".
+/// The machine-readable proof of how much a narrowed run actually executed.
 ///
-/// Matched case-insensitively on the phrase rather than the whole sentence: 3.x
-/// and 4.x differ in the tail (`, exiting with code 0`) and in whether a filter
-/// is echoed after it, and the phrase is what both builds print. Only ever
-/// consulted for a run that carried `--passWithNoTests`, where exit 0 alone
-/// cannot distinguish "everything passed" from "nothing ran".
-fn vitest_found_no_test_files(output: &str) -> bool {
-    output.to_ascii_lowercase().contains("no test files found")
+/// Appended AFTER the selector arguments so the selector stays a contiguous
+/// verbatim fragment of the command line; Vitest accepts options after the
+/// positional filters (verified on 3.2.4).
+///
+/// `--reporter=default` is repeated explicitly because naming a second reporter
+/// replaces the default one: without it the run would lose its human-readable
+/// log, which is the check's `output`. `--outputFile.json=` is the per-reporter
+/// form — plain `--outputFile` would apply to whichever reporter claims it.
+fn vitest_reporter_args(report_path: &Path) -> Vec<String> {
+    vec![
+        "--reporter=default".to_string(),
+        "--reporter=json".to_string(),
+        format!("--outputFile.json={}", report_path.display()),
+    ]
+}
+
+/// Where a narrowed run writes its JSON report, alive until the run has been
+/// classified.
+///
+/// A temporary directory rather than the artifact pack: a check is handed a
+/// `Config`, and `artifacts_dir()` there is only a PREDICTION of the pack path
+/// (the real one is allocated per run and can differ), while writing into the
+/// reviewed tree would mutate the very tree under review. The report is
+/// evidence for the verdict, not an artifact of its own — what survives into
+/// the pack is the status and the reason it earned.
+struct VitestReportFile {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl VitestReportFile {
+    fn create() -> std::io::Result<Self> {
+        let dir = tempfile::Builder::new()
+            .prefix("prview-vitest-")
+            .tempdir()?;
+        let path = dir.path().join("vitest-scope.json");
+        Ok(Self { _dir: dir, path })
+    }
+}
+
+/// What the JSON reporter said about the run that just happened.
+struct VitestExecution {
+    total_suites: u64,
+    total_tests: u64,
+    results: usize,
+}
+
+/// Read the reporter's own numbers, or say why they cannot be trusted.
+///
+/// Every failure mode collapses into `Err`, because the check treats them
+/// identically: an unverifiable narrowed run is never green and never a skip.
+fn read_vitest_execution(path: &Path) -> std::result::Result<VitestExecution, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| format!("{} could not be read: {error}", path.display()))?;
+    let report: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("{} is not valid JSON: {error}", path.display()))?;
+    let number = |key: &str| {
+        report
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("{} has no numeric {key}", path.display()))
+    };
+    let results = report
+        .get("testResults")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{} has no testResults array", path.display()))?
+        .len();
+    Ok(VitestExecution {
+        total_suites: number("numTotalTestSuites")?,
+        total_tests: number("numTotalTests")?,
+        results,
+    })
+}
+
+/// Turn a finished Vitest run into a verdict.
+///
+/// `report_path` is `Some` exactly for a narrowed run. For that run the exit
+/// code alone cannot tell "everything related passed" from "nothing ran"
+/// (`--passWithNoTests` makes both exit 0), and the tool's prose cannot be
+/// trusted to tell them apart either: stdout carries the reviewed code's own
+/// output, so a test that prints "No test files found" would otherwise spoof a
+/// skip. The JSON reporter's counters are the only witness that is not under
+/// the reviewed tree's control.
+///
+/// A full run keeps exactly the classification it has always had.
+fn classify_vitest_outcome(
+    report_path: Option<&Path>,
+    success: bool,
+    selected_inputs: usize,
+    combined: &str,
+) -> (CheckStatus, String) {
+    let Some(report_path) = report_path else {
+        // A full run: the exit code is the whole verdict, exactly as before.
+        return if success {
+            (CheckStatus::Passed, combined.to_string())
+        } else {
+            (CheckStatus::Failed, combined.to_string())
+        };
+    };
+    match read_vitest_execution(report_path) {
+        // Nothing was collected and nothing ran: the narrowing was correct and
+        // this change has no related test (contract §8.1).
+        Ok(execution) if execution.total_suites == 0 && execution.results == 0 => (
+            CheckStatus::Skipped,
+            format!(
+                "{}\nVitest found no test file importing any of the {selected_inputs} changed \
+                 source file(s).\n{combined}",
+                crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE
+            ),
+        ),
+        // Tests ran, so the tool's own verdict is the verdict.
+        Ok(execution) if execution.total_tests > 0 => {
+            if success {
+                (CheckStatus::Passed, combined.to_string())
+            } else {
+                (CheckStatus::Failed, combined.to_string())
+            }
+        }
+        // Test files were collected but no test came out of them. Neither a
+        // pass nor "no tests related to the change": something was there and it
+        // did not run.
+        Ok(execution) if !success => (
+            CheckStatus::Failed,
+            format!(
+                "the narrowed Vitest run collected {} test file(s) and executed no test\n{combined}",
+                execution.results
+            ),
+        ),
+        Ok(execution) => (
+            CheckStatus::Error,
+            format!(
+                "could not verify that the narrowed Vitest run executed any test: it collected {} \
+                 suite(s) in {} test file(s) and executed none\n{combined}",
+                execution.total_suites, execution.results
+            ),
+        ),
+        Err(detail) => (
+            CheckStatus::Error,
+            format!(
+                "could not verify that the narrowed Vitest run executed any test (reporter output \
+                 missing): {detail}\n{combined}"
+            ),
+        ),
+    }
 }
 
 /// What Vitest will run, and the evidence of it, given this run's scope
@@ -128,16 +266,19 @@ fn vitest_found_no_test_files(output: &str) -> bool {
 enum VitestPlan {
     /// Run these arguments; `executed` is the provenance evidence, `None` when
     /// the run was full because the decision itself said so (the decision's own
-    /// reason is then the honest report).
+    /// reason is then the honest report). `report` is `Some` exactly for a
+    /// narrowed run — the only run whose result cannot be read off the exit
+    /// code — and names the file its JSON reporter must produce.
     Run {
         args: Vec<String>,
         executed: Option<crate::checks::scope::ExecutedScope>,
+        report: Option<VitestReportFile>,
     },
     /// Execute nothing: the decision selected no input.
     Skip,
 }
 
-fn plan_vitest_run(config: &Config, run_dir: &std::path::Path) -> VitestPlan {
+fn plan_vitest_run(config: &Config, run_dir: &Path) -> VitestPlan {
     use crate::checks::scope::{Ecosystem, ExecutedScope, ScopeDecision, reason};
 
     let Some(decision) = config
@@ -148,6 +289,7 @@ fn plan_vitest_run(config: &Config, run_dir: &std::path::Path) -> VitestPlan {
         return VitestPlan::Run {
             args: vitest_args(config),
             executed: None,
+            report: None,
         };
     };
     let ScopeDecision::ChangeScoped {
@@ -157,6 +299,7 @@ fn plan_vitest_run(config: &Config, run_dir: &std::path::Path) -> VitestPlan {
         return VitestPlan::Run {
             args: vitest_args(config),
             executed: None,
+            report: None,
         };
     };
     if selector_inputs.is_empty() {
@@ -178,20 +321,45 @@ fn plan_vitest_run(config: &Config, run_dir: &std::path::Path) -> VitestPlan {
                     "{missing} is missing from the reviewed tree"
                 )),
             }),
+            report: None,
         };
     }
-    let args = vitest_scoped_args(config, selector_inputs);
+    // A narrowed run is only allowed to be believed if it can prove what it
+    // executed, and the proof is a file. With nowhere to write it the narrowing
+    // itself is abandoned — widening keeps the review honest, while running
+    // narrow-but-unverifiable would trade a real verdict for a guess.
+    let report = match VitestReportFile::create() {
+        Ok(report) => report,
+        Err(error) => {
+            return VitestPlan::Run {
+                args: vitest_args(config),
+                executed: Some(ExecutedScope::Full {
+                    reason: reason::resolution_failed(&format!(
+                        "the narrowed run has nowhere to write its JSON report ({error})"
+                    )),
+                }),
+                report: None,
+            };
+        }
+    };
+    let selector_args = vitest_scoped_args(config, selector_inputs);
+    // The whole argument line from the subcommand onward: with Vitest the
+    // SUBCOMMAND is half the selector, so the fragment that expresses the
+    // selection is the invocation itself. Rendered from the very arguments
+    // about to be spawned, so it cannot drift from `provenance.command`. The
+    // reporter flags are appended after it and stay OUT of the selector: they
+    // are how the run is observed, not what it selects, and their temporary
+    // path would change from run to run.
+    let selector = selector_args.join(" ");
+    let mut args = selector_args;
+    args.extend(vitest_reporter_args(&report.path));
     VitestPlan::Run {
         executed: Some(ExecutedScope::ChangeScoped {
             selected: selector_inputs.len(),
-            // The whole argument line from the subcommand onward: with Vitest
-            // the SUBCOMMAND is half the selector, so the fragment that
-            // expresses the selection is the invocation itself. Rendered from
-            // the very arguments about to be spawned, so it cannot drift from
-            // `provenance.command`.
-            selector: args.join(" "),
+            selector,
         }),
         args,
+        report: Some(report),
     }
 }
 
@@ -627,8 +795,12 @@ impl Check for VitestCheck {
 
         // Vitest's supported worker cap bounds its descendant pool. Keep owned
         // strings because the limit is selected at runtime.
-        let (args, executed_scope) = match plan_vitest_run(config, run_dir) {
-            VitestPlan::Run { args, executed } => (args, executed),
+        let (args, executed_scope, report) = match plan_vitest_run(config, run_dir) {
+            VitestPlan::Run {
+                args,
+                executed,
+                report,
+            } => (args, executed, report),
             // No command is spawned at all: the decision proved this change has
             // no related test. Provenance stays `None` because there is no
             // execution to describe — no command, no exit code, no tree read.
@@ -656,32 +828,20 @@ impl Check for VitestCheck {
 
         // `--passWithNoTests` makes an empty related set exit 0, which is right
         // for the tool and wrong for a review: zero executed tests is not
-        // evidence that anything passed (contract §2.4/§8.1). Recognised only
-        // on a narrowed run, since that is the only one that carries the flag.
-        let ran_narrowed = matches!(
-            executed_scope,
-            Some(crate::checks::scope::ExecutedScope::ChangeScoped { .. })
-        );
+        // evidence that anything passed (contract §2.4/§8.1). A narrowed run is
+        // therefore classified from its JSON reporter, not from its exit code
+        // and never from its prose — stdout belongs to the code under review,
+        // which could print any sentence a substring match looks for.
         let selected_inputs = match &executed_scope {
             Some(crate::checks::scope::ExecutedScope::ChangeScoped { selected, .. }) => *selected,
             _ => 0,
         };
-        let (status, output_text) = if output.status.success() {
-            if ran_narrowed && vitest_found_no_test_files(&combined) {
-                (
-                    CheckStatus::Skipped,
-                    format!(
-                        "{}\nVitest found no test file importing any of the {selected_inputs} \
-                         changed source file(s).\n{combined}",
-                        crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE
-                    ),
-                )
-            } else {
-                (CheckStatus::Passed, combined.clone())
-            }
-        } else {
-            (CheckStatus::Failed, combined.clone())
-        };
+        let (status, output_text) = classify_vitest_outcome(
+            report.as_ref().map(|report| report.path.as_path()),
+            output.status.success(),
+            selected_inputs,
+            &combined,
+        );
 
         let js_runner = if which::which("pnpm").is_ok() {
             "pnpm exec"
@@ -1113,6 +1273,39 @@ src/styles/app.css
         }
     }
 
+    /// The reporter flags a narrowed run appends, with the temporary path it
+    /// was actually given.
+    fn vitest_reporter_tail(plan: &VitestPlan) -> Vec<String> {
+        let VitestPlan::Run {
+            report: Some(report),
+            ..
+        } = plan
+        else {
+            panic!("expected a narrowed run with a report file");
+        };
+        vitest_reporter_args(&report.path)
+    }
+
+    /// A JSON report exactly as Vitest's `json` reporter writes one, reduced to
+    /// the fields the check reads.
+    fn vitest_report_file(dir: &std::path::Path, suites: u64, tests: u64, files: usize) -> PathBuf {
+        let results: Vec<serde_json::Value> = (0..files)
+            .map(|index| serde_json::json!({ "name": format!("src/{index}.test.ts") }))
+            .collect();
+        let path = dir.join("vitest-scope.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "numTotalTestSuites": suites,
+                "numTotalTests": tests,
+                "testResults": results,
+            })
+            .to_string(),
+        )
+        .expect("write report");
+        path
+    }
+
     #[test]
     fn a_scoped_vitest_decision_runs_only_the_related_tests() {
         let tree = reviewed_tree_with(&["src/a.ts", "src/b.ts"]);
@@ -1120,23 +1313,29 @@ src/styles/app.css
 
         let plan = plan_vitest_run(&config, tree.path());
 
-        assert_eq!(
-            vitest_run_args(&plan),
-            [
-                "related",
-                "--run",
-                "--maxWorkers",
-                "1",
-                "--passWithNoTests",
-                "src/a.ts",
-                "src/b.ts"
-            ],
-        );
+        let mut expected = vec![
+            "related".to_string(),
+            "--run".to_string(),
+            "--maxWorkers".to_string(),
+            "1".to_string(),
+            "--passWithNoTests".to_string(),
+            "src/a.ts".to_string(),
+            "src/b.ts".to_string(),
+        ];
+        // The reporter flags come last, after the positional inputs, so the
+        // selector stays one contiguous fragment of the command line.
+        expected.extend(vitest_reporter_tail(&plan));
+        assert_eq!(vitest_run_args(&plan), expected.as_slice());
+
         let Some(ExecutedScope::ChangeScoped { selected, selector }) = vitest_executed(&plan)
         else {
             panic!("a narrowed run reports a narrowed scope");
         };
         assert_eq!(*selected, 2);
+        assert_eq!(
+            selector, "related --run --maxWorkers 1 --passWithNoTests src/a.ts src/b.ts",
+            "the selector is what was selected, not how the run was observed",
+        );
         assert!(
             vitest_run_args(&plan).join(" ").contains(selector.as_str()),
             "selector {selector:?} must be a verbatim fragment of the command line",
@@ -1198,30 +1397,105 @@ src/styles/app.css
         let mut config = config_with_vitest_scope(vitest_scoped(&["src/a.ts"]));
         config.tests_pattern = Some("renders".to_string());
 
-        assert_eq!(
-            vitest_run_args(&plan_vitest_run(&config, tree.path())),
-            [
-                "related",
-                "--run",
-                "--maxWorkers",
-                "1",
-                "--passWithNoTests",
-                "--testNamePattern",
-                "renders",
-                "src/a.ts"
-            ],
+        let plan = plan_vitest_run(&config, tree.path());
+        let mut expected = vec![
+            "related".to_string(),
+            "--run".to_string(),
+            "--maxWorkers".to_string(),
+            "1".to_string(),
+            "--passWithNoTests".to_string(),
+            "--testNamePattern".to_string(),
+            "renders".to_string(),
+            "src/a.ts".to_string(),
+        ];
+        expected.extend(vitest_reporter_tail(&plan));
+        assert_eq!(vitest_run_args(&plan), expected.as_slice());
+    }
+
+    #[test]
+    fn a_narrowed_run_that_collected_nothing_is_a_skip() {
+        // Vitest's own counters, not its prose: zero suites and zero collected
+        // files is the one shape that means "no test relates to this change".
+        let dir = tempfile::tempdir().expect("temp dir");
+        let report = vitest_report_file(dir.path(), 0, 0, 0);
+
+        let (status, output) = classify_vitest_outcome(
+            Some(&report),
+            true,
+            2,
+            "No test files found, exiting with code 0\n",
+        );
+
+        assert_eq!(status, CheckStatus::Skipped);
+        assert!(output.starts_with(crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE));
+    }
+
+    #[test]
+    fn a_narrowed_run_that_executed_tests_cannot_be_spoofed_into_a_skip() {
+        // The reviewed code owns stdout. A test that prints Vitest's empty-set
+        // sentence must not turn an executed, passing run into a skip.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let report = vitest_report_file(dir.path(), 3, 7, 2);
+
+        let (status, output) = classify_vitest_outcome(
+            Some(&report),
+            true,
+            2,
+            "stdout: No test files found\n Test Files  2 passed (2)\n",
+        );
+
+        assert_eq!(status, CheckStatus::Passed);
+        assert!(!output.contains(crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE));
+    }
+
+    #[test]
+    fn a_narrowed_run_without_reporter_output_is_an_error_not_a_pass() {
+        // Exit 0 plus `--passWithNoTests` proves nothing at all. Without the
+        // reporter there is no witness, and an unverified run is neither green
+        // nor a skip.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("vitest-scope.json");
+
+        let (status, output) = classify_vitest_outcome(Some(&missing), true, 2, "all good\n");
+
+        assert_eq!(status, CheckStatus::Error);
+        assert!(
+            output.contains("could not verify that the narrowed Vitest run executed any test"),
+            "the error must say what could not be verified: {output}",
         );
     }
 
     #[test]
-    fn an_empty_related_set_is_recognised_in_vitest_output() {
-        assert!(vitest_found_no_test_files(
-            "No test files found, exiting with code 0\n"
-        ));
-        assert!(vitest_found_no_test_files("no test files found"));
-        assert!(!vitest_found_no_test_files(
-            " Test Files  2 passed (2)\n      Tests  7 passed (7)\n"
-        ));
+    fn a_narrowed_run_whose_report_is_unreadable_is_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("vitest-scope.json");
+        std::fs::write(&path, "{ not json").expect("write report");
+
+        let (status, _) = classify_vitest_outcome(Some(&path), true, 1, "");
+
+        assert_eq!(status, CheckStatus::Error);
+    }
+
+    #[test]
+    fn a_full_run_is_still_classified_by_its_exit_code_alone() {
+        assert_eq!(
+            classify_vitest_outcome(None, true, 0, "No test files found\n").0,
+            CheckStatus::Passed,
+        );
+        assert_eq!(
+            classify_vitest_outcome(None, false, 0, "boom\n").0,
+            CheckStatus::Failed,
+        );
+    }
+
+    #[test]
+    fn a_failing_narrowed_run_stays_a_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let report = vitest_report_file(dir.path(), 1, 1, 1);
+
+        let (status, _) = classify_vitest_outcome(Some(&report), false, 1, "1 failed\n");
+
+        assert_eq!(status, CheckStatus::Failed);
     }
 
     #[test]

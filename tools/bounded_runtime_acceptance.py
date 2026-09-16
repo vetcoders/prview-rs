@@ -623,10 +623,19 @@ def assert_mixed(
         "related" in vitest_selector and "src/math.js" in vitest_selector,
         f"Vitest selector does not name the related selection: {vitest_selector!r}",
     )
+    vitest_command = gate_command(pack, "tests")
     add_assertion(
         violations,
-        vitest_selector != "" and vitest_selector in gate_command(pack, "tests"),
+        vitest_selector != "" and vitest_selector in vitest_command,
         f"reported selector {vitest_selector!r} is not part of the Vitest command",
+    )
+    # A narrowed Vitest run is only believable if it can prove what it executed,
+    # and the proof is the JSON reporter. Without these flags the check would be
+    # back to reading the tool's prose.
+    add_assertion(
+        violations,
+        "--reporter=json" in vitest_command and "--outputFile.json=" in vitest_command,
+        f"the narrowed Vitest command carries no JSON reporter: {vitest_command!r}",
     )
 
     caveats = ((gate or {}).get("decision") or {}).get("review_caveats") or []
@@ -662,6 +671,12 @@ def assert_js_only(
         violations,
         vitest_scope.get("mode") == "change-scoped",
         f"Vitest scope mode is {vitest_scope.get('mode')!r}, not change-scoped",
+    )
+    vitest_command = gate_command(pack, "tests")
+    add_assertion(
+        violations,
+        "--reporter=json" in vitest_command and "--outputFile.json=" in vitest_command,
+        f"the narrowed Vitest command carries no JSON reporter: {vitest_command!r}",
     )
 
     cargo = check_row(run, CARGO_TEST_CHECK)
@@ -771,6 +786,13 @@ def assert_unknown_input(
             violations,
             " -p " not in f" {command} " and " related " not in f" {command} ",
             f"{name} ran a narrowed command despite a full decision: {command!r}",
+        )
+        # The JSON reporter belongs to a narrowed Vitest run and to nothing
+        # else: a full run is judged by its exit code, exactly as it always was.
+        add_assertion(
+            violations,
+            "--reporter=json" not in command,
+            f"{name} ran a full command carrying the narrowed run's reporter: {command!r}",
         )
 
 
