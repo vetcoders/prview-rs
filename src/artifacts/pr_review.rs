@@ -364,6 +364,22 @@ pub(crate) fn generate_pr_review(
     }
     writeln!(md)?;
 
+    // Contract §7: how much of each test suite ran, in prose, for the reader who
+    // never opens MERGE_GATE.json. Rendered from the same `ScopeReport` those
+    // rows carry, so the sentence and the JSON cannot disagree. REVIEW_SUMMARY.md
+    // embeds this file, which is how it inherits the same statement.
+    if let Some(scope) = config.test_scope.as_ref() {
+        let sentences = scope.review_sentences(checks);
+        if !sentences.is_empty() {
+            writeln!(md, "## Test Scope")?;
+            writeln!(md)?;
+            for sentence in sentences {
+                writeln!(md, "- {}", sentence)?;
+            }
+            writeln!(md)?;
+        }
+    }
+
     // Failed details
     let failures: Vec<&CheckResult> = checks.iter().filter(|c| c.is_failure()).collect();
     if !failures.is_empty() {

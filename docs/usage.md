@@ -425,6 +425,13 @@ the pack keys the empty selection on that record. A test row that was skipped
 for any other reason — a missing tool, a preset, a crash — reports `full` with
 `scoped execution not confirmed by the check`.
 
+**In prose, too.** `PR_REVIEW.md` carries a `## Test Scope` section with one
+sentence per suite that ran — `Cargo test: full run (manifest or lockfile
+changed: Cargo.lock)`, `Vitest: change-scoped — 1 of 12 test files related to the
+diff ran`, `Cargo test: skipped — no tests related to the change` — and
+`REVIEW_SUMMARY.md` embeds it. The sentences are rendered from the very `scope`
+objects above, so the prose and the JSON cannot disagree.
+
 **How prview knows a narrowed Vitest run found nothing.** From Vitest's JSON
 reporter, which the narrowed command carries (`--reporter=default
 --reporter=json --outputFile.json=…`, written to a temporary file), never from

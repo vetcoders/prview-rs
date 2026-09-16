@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already ran the whole suite keeps running it without changing its invocation;
   narrowing is for the reviewer's machine, and a local `--deep` stays narrowed.
   `prview gate` is unaffected, because the gate profile runs no tests.
+- `PR_REVIEW.md` and `REVIEW_SUMMARY.md` state the test scope in prose
+  (contract §7): a `## Test Scope` section with one sentence per scope-owning
+  check that ran, rendered from the same `ScopeReport` the gate rows publish.
+  A reader who never opens `MERGE_GATE.json` is no longer left to assume the
+  whole suite ran.
 - Vitest's published `selected` count is test files, not changed sources.
   Contract §7 counts selected units, and a Vitest unit is a test file; the count
   now comes from the run's JSON reporter (`testResults`) instead of from the

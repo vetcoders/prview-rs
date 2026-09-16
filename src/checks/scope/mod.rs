@@ -223,6 +223,18 @@ impl Ecosystem {
         }
     }
 
+    /// What one unit of this ecosystem's selection IS, singular, for prose.
+    ///
+    /// The two are counted in different units and saying so is the point: a
+    /// reader who is told "2 selected" without the noun cannot tell a pair of
+    /// packages from a pair of test files.
+    pub fn selection_unit(self) -> &'static str {
+        match self {
+            Self::Cargo => "package",
+            Self::Vitest => "test file",
+        }
+    }
+
     /// Every ecosystem a run can scope, in reporting order.
     pub const ALL: [Self; 2] = [Self::Cargo, Self::Vitest];
 
@@ -470,6 +482,25 @@ impl ScopeDecisions {
         })
     }
 
+    /// One sentence per scope-owning check that produced a result, for the
+    /// human-readable artifacts (contract §7).
+    ///
+    /// Same source as `report_for_check`, so `PR_REVIEW.md` and
+    /// `REVIEW_SUMMARY.md` state exactly what `MERGE_GATE.json` publishes; the
+    /// prose is a rendering of the report, never a second count. A check with no
+    /// executed result contributes nothing — there is no run to describe.
+    pub fn review_sentences(&self, checks: &[CheckResult]) -> Vec<String> {
+        Ecosystem::ALL
+            .into_iter()
+            .filter_map(|eco| {
+                let result = checks
+                    .iter()
+                    .find(|check| check.name.eq_ignore_ascii_case(eco.check_name()))?;
+                Some(self.report_for_check(result)?.sentence(eco.check_name()))
+            })
+            .collect()
+    }
+
     /// Review caveats owed to the merge gate because a check did not run its
     /// full suite. Advisory only — scope never changes a verdict.
     ///
@@ -527,6 +558,45 @@ pub struct ScopeReport {
     /// it did before.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub non_participating: Vec<NonParticipatingPath>,
+}
+
+impl ScopeReport {
+    /// One sentence for a human-readable artifact, contract §7.
+    ///
+    /// `PR_REVIEW.md` and `REVIEW_SUMMARY.md` owe the reader the same fact the
+    /// machine-readable rows carry: how much of this suite ran, and why. Written
+    /// from the very report the pack publishes, so the prose cannot claim a
+    /// scope the JSON contradicts, and phrased in the ecosystem's own unit,
+    /// because "2 selected" is not a statement anyone can act on.
+    pub fn sentence(&self, check_name: &str) -> String {
+        let unit = Ecosystem::owning_check(check_name)
+            .map(Ecosystem::selection_unit)
+            .unwrap_or("unit");
+        if self.mode != "change-scoped" {
+            return format!("{check_name}: full run ({}).", self.reason);
+        }
+        match self.selected {
+            // A narrowed decision that selected nothing, or a narrowed run that
+            // collected nothing: either way no test executed, and the sentence
+            // must not leave a reader thinking the suite passed.
+            Some(0) | None => {
+                format!("{check_name}: skipped — {NO_TESTS_RELATED_TO_THE_CHANGE}.")
+            }
+            Some(selected) => {
+                let plural = if selected == 1 { "" } else { "s" };
+                match self.universe {
+                    Some(universe) => format!(
+                        "{check_name}: change-scoped — {selected} of {universe} {unit}{plural} \
+                         related to the diff ran."
+                    ),
+                    None => format!(
+                        "{check_name}: change-scoped — {selected} {unit}{plural} related to the \
+                         diff ran."
+                    ),
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

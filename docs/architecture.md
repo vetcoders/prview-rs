@@ -531,6 +531,14 @@ fragment of `provenance.command` (`-p a -p b` for Cargo, the whole `related …`
 argument line for Vitest), so a reader can hold the reported scope against the
 command that produced it without trusting either alone.
 
+**The human artifacts say it too** (contract §7). `PR_REVIEW.md` renders a
+`## Test Scope` section — one sentence per scope-owning check that produced a
+result — and `REVIEW_SUMMARY.md` embeds that file. Both come from
+`ScopeDecisions::review_sentences`, which renders the same `ScopeReport` the gate
+rows carry: the prose is a view of the report, never a second count, and each
+sentence uses the ecosystem's own unit (packages for Cargo, test files for
+Vitest).
+
 **Policy.** A `Skipped` whose reason is prview's own
 `no tests related to the change` is `Satisfied / Complete / Approve` — a sibling
 of the profile-mismatch branch, and as narrow. The check applies to the
