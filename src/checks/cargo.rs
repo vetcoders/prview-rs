@@ -41,6 +41,11 @@ struct CargoRun {
     /// Directory to run `cargo` in — the reviewed snapshot's cargo root in
     /// `--pr`/`--remote` mode, the local cargo root otherwise.
     cwd: PathBuf,
+    /// Root of the tree those commands read: the reviewed snapshot in
+    /// `--pr`/`--remote` mode, the repo root otherwise. `cwd` always lies
+    /// inside it, and every repo-relative path this run reasons about — the
+    /// scope decision's `selector_inputs` above all — resolves against it.
+    scan_dir: PathBuf,
     /// Extra child environment. Every Cargo invocation receives the canonical
     /// `CARGO_BUILD_JOBS` cap; snapshot runs also redirect `CARGO_TARGET_DIR`.
     env: Vec<(String, String)>,
@@ -81,6 +86,7 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
         return Ok(CargoRun {
             env: vec![cargo_jobs_env(config, &cwd)],
             cwd,
+            scan_dir: plan.scan_dir,
             _snapshot: plan._snapshot,
         });
     }
@@ -124,6 +130,7 @@ fn plan_cargo_run(config: &Config) -> Result<CargoRun> {
             ),
         ],
         cwd,
+        scan_dir: plan.scan_dir,
         _snapshot: plan._snapshot,
     })
 }
@@ -471,11 +478,17 @@ fn cargo_package_selector(packages: &[String]) -> String {
         .join(" ")
 }
 
-fn plan_cargo_test(config: &Config) -> Result<CargoTestPlan> {
+/// `tree_dir` is the root of the tree the command will read (`CargoRun::scan_dir`);
+/// the decision's `selector_inputs` are repo-relative paths inside it.
+fn plan_cargo_test(config: &Config, tree_dir: &Path) -> Result<CargoTestPlan> {
     use crate::checks::scope::{Ecosystem, ExecutedScope, ScopeDecision, reason};
 
     let full = |executed| cargo_test_args(config).map(|args| CargoTestPlan::Run { args, executed });
-    let Some(ScopeDecision::ChangeScoped { selected, .. }) = config
+    let Some(ScopeDecision::ChangeScoped {
+        selected,
+        selector_inputs,
+        ..
+    }) = config
         .test_scope
         .as_ref()
         .map(|scope| scope.get(Ecosystem::Cargo))
@@ -495,6 +508,22 @@ fn plan_cargo_test(config: &Config) -> Result<CargoTestPlan> {
         return full(Some(ExecutedScope::Full {
             reason: reason::resolution_failed(&format!(
                 "package name {unusable:?} cannot be passed to cargo -p"
+            )),
+        }));
+    }
+    // Contract §4.1, the same gate the Vitest path applies to its own inputs:
+    // the decision was taken against the reviewed tree's path list, and `-p`
+    // narrows to the packages those paths belong to. If one of them is not in
+    // the tree this command is about to read, the selection describes a
+    // different tree, and narrowing on it would quietly stop testing whatever
+    // that file belongs to. Widening is the only safe answer.
+    if let Some(missing) = selector_inputs
+        .iter()
+        .find(|input| !tree_dir.join(input).exists())
+    {
+        return full(Some(ExecutedScope::Full {
+            reason: reason::resolution_failed(&format!(
+                "{missing} is missing from the reviewed tree"
             )),
         }));
     }
@@ -1724,9 +1753,15 @@ impl Check for CargoTestCheck {
         let start = std::time::Instant::now();
         let started_at = Local::now().to_rfc3339();
 
-        // Validate before planning/materialising a remote snapshot. Invalid or
-        // semantically unsupported selectors must not start any Cargo work.
-        let (owned_args, executed_scope) = match plan_cargo_test(config)? {
+        // Resolve where the run happens first: the plan has to be judged
+        // against the tree that will actually be read, not against whatever
+        // tree the decision was taken in. No cargo process is started until the
+        // plan below says so, so an invalid or semantically unsupported
+        // selector still costs no Cargo work.
+        let run = plan_cargo_run(config)?;
+        let cwd = run.cwd.as_path();
+
+        let (owned_args, executed_scope) = match plan_cargo_test(config, &run.scan_dir)? {
             CargoTestPlan::Run { args, executed } => (args, executed),
             // No cargo process at all: the decision proved no package in this
             // workspace can be affected by the change. Provenance stays `None`
@@ -1742,8 +1777,6 @@ impl Check for CargoTestCheck {
                 });
             }
         };
-        let run = plan_cargo_run(config)?;
-        let cwd = run.cwd.as_path();
 
         let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         let mut env = run.env.clone();
@@ -4753,8 +4786,16 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         }
     }
 
+    /// Plans against `tree_dir`, the root the decision's `selector_inputs` are
+    /// resolved against — the same directory `CargoRun::scan_dir` names at
+    /// runtime.
+    fn planned_in(config: &Config, tree_dir: &Path) -> CargoTestPlan {
+        plan_cargo_test(config, tree_dir).expect("planning a cargo test run")
+    }
+
+    /// For decisions with no selector inputs, where the tree is irrelevant.
     fn planned(config: &Config) -> CargoTestPlan {
-        plan_cargo_test(config).expect("planning a cargo test run")
+        planned_in(config, &config.repo_root)
     }
 
     fn run_args(plan: &CargoTestPlan) -> &[String] {
@@ -4880,6 +4921,58 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         );
     }
 
+    /// A narrowed decision that also names the paths it was drawn from.
+    fn scoped_with_inputs(packages: &[&str], inputs: &[&str]) -> ScopeDecision {
+        ScopeDecision::ChangeScoped {
+            inputs: inputs.len(),
+            selected: packages.iter().map(|p| (*p).to_string()).collect(),
+            universe: Some(4),
+            selector_inputs: inputs.iter().map(|p| (*p).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_selector_input_missing_from_the_reviewed_tree_widens_the_run() {
+        // The decision was taken against some tree; this run reads another one.
+        // A `-p` list drawn from paths that are not here narrows to the wrong
+        // set, so the run widens and says which path it could not find.
+        let tree = tempfile::tempdir().expect("tempdir");
+        let config = config_with_cargo_scope(scoped_with_inputs(&["core"], &["src/gone.rs"]));
+
+        let plan = planned_in(&config, tree.path());
+
+        assert_eq!(run_args(&plan), ["test", "--all-targets", "--no-fail-fast"]);
+        let Some(ExecutedScope::Full { reason }) = executed(&plan) else {
+            panic!("a selector input that is not in the tree must widen the run");
+        };
+        assert!(
+            reason.contains("src/gone.rs") && reason.contains("missing from the reviewed tree"),
+            "the reason must name the path that widened the run: {reason}",
+        );
+    }
+
+    #[test]
+    fn a_selector_input_present_in_the_reviewed_tree_keeps_the_run_narrow() {
+        let tree = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tree.path().join("src")).expect("fixture dirs");
+        std::fs::write(tree.path().join("src/there.rs"), "").expect("fixture file");
+        let config = config_with_cargo_scope(scoped_with_inputs(&["core"], &["src/there.rs"]));
+
+        let plan = planned_in(&config, tree.path());
+
+        assert_eq!(
+            run_args(&plan),
+            ["test", "--all-targets", "--no-fail-fast", "-p", "core"],
+        );
+        assert_eq!(
+            executed(&plan),
+            Some(&ExecutedScope::ChangeScoped {
+                selected: 1,
+                selector: "-p core".to_string(),
+            }),
+        );
+    }
+
     #[test]
     fn a_dependent_package_is_tested_when_only_its_dependency_changed() {
         // app -> core. Changing core must run app's tests too: the reverse
@@ -4929,8 +5022,14 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             "a plain source edit inside a member is scopeable: {:?}",
             decisions.cargo,
         );
+        // The decision carries a real selector input, so it is planned against
+        // a tree that actually holds it.
+        let tree = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tree.path().join("crates/core/src")).expect("fixture dirs");
+        std::fs::write(tree.path().join("crates/core/src/lib.rs"), "").expect("fixture file");
+
         assert_eq!(
-            run_args(&planned(&config)),
+            run_args(&planned_in(&config, tree.path())),
             [
                 "test",
                 "--all-targets",
