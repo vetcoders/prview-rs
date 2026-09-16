@@ -41,6 +41,33 @@ class SuccessfulLiveCheckTests(unittest.TestCase):
                 )
 
 
+class RequiredRunChecksTests(unittest.TestCase):
+    def test_clippy_and_rustfmt_are_required_live_checks(self) -> None:
+        self.assertEqual(MODULE.REQUIRED_RUN_CHECKS["clippy"], "Clippy")
+        self.assertEqual(MODULE.REQUIRED_RUN_CHECKS["rustfmt"], "Rustfmt")
+        self.assertIn("clippy", MODULE.REQUIRED_LIVE_CHECKS_ONLY)
+        self.assertIn("rustfmt", MODULE.REQUIRED_LIVE_CHECKS_ONLY)
+
+        run = {
+            "checks": [
+                {"name": "Clippy", "status": "passed", "cached": False},
+                {"name": "Rustfmt", "status": "passed", "cached": False},
+            ]
+        }
+        self.assertTrue(MODULE.has_successful_live_check(run, "Clippy"))
+        self.assertTrue(MODULE.has_successful_live_check(run, "Rustfmt"))
+
+    def test_rejects_a_missing_toolchain_component(self) -> None:
+        run = {
+            "checks": [
+                {"name": "Clippy", "status": "failed", "cached": False},
+                {"name": "Rustfmt", "status": "skipped", "cached": False},
+            ]
+        }
+        self.assertFalse(MODULE.has_successful_live_check(run, "Clippy"))
+        self.assertFalse(MODULE.has_successful_live_check(run, "Rustfmt"))
+
+
 class CaseCatalogueTests(unittest.TestCase):
     def test_every_case_has_a_mutation_and_an_assertion(self) -> None:
         self.assertEqual(

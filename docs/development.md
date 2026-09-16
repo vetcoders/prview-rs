@@ -104,6 +104,11 @@ stdlib-only `tools/bounded_runtime_acceptance.py` sampler requires all six tool
 families (Cargo, Vitest, Semgrep, TSC, ESLint, and Stylelint) to appear in the
 owned process census and to have an exact, live, non-cached `passed` row in
 `RUN.json`; a skipped or failed process launch is not acceptance evidence. It
+also requires the `Clippy` and `Rustfmt` checks (both of which invoke `cargo`
+under the hood, so they don't add a seventh whole-machine process family) to
+have their own exact, live, non-cached `passed` row, which is why the job's
+`dtolnay/rust-toolchain` step installs the `clippy` and `rustfmt` components
+explicitly rather than relying on the default profile. It
 fails when more than one
 whole-machine tool is active, when a Cargo/rustc, Vitest, or Semgrep pool
 exceeds the selected cap, or when the final pack and its resource metadata do
