@@ -32,6 +32,20 @@ def validate(name: str) -> list[str]:
     return MODULE.validate(FIXTURES / f"{name}.json")
 
 
+def validate_with_scope(scope: object, check_name: str = "Cargo test") -> list[str]:
+    """Validate the real control gate with one `scope` object grafted on."""
+    import json
+    import tempfile
+
+    gate = json.loads((FIXTURES / "valid_base.json").read_text(encoding="utf-8"))
+    row = next(check for check in gate["checks"] if check["name"] == check_name)
+    row["scope"] = scope
+    with tempfile.TemporaryDirectory() as temp:
+        path = pathlib.Path(temp) / "MERGE_GATE.json"
+        path.write_text(json.dumps(gate), encoding="utf-8")
+        return MODULE.validate(path)
+
+
 class ProvenanceContradictionContractTests(unittest.TestCase):
     def test_real_gate_without_contradictions_validates(self) -> None:
         # The control. A validator that cannot pass this rejects live packs.
@@ -77,6 +91,81 @@ class ProvenanceContradictionContractTests(unittest.TestCase):
         self.assertTrue(
             any("check_id" in issue for issue in issues),
             issues,
+        )
+
+
+class ScopeObjectContractTests(unittest.TestCase):
+    """`scope` describes a command that ran. It may not contradict itself."""
+
+    def test_an_honest_narrowed_scope_validates(self) -> None:
+        self.assertEqual(
+            validate_with_scope(
+                {
+                    "mode": "change-scoped",
+                    "reason": "change-scoped selection",
+                    "inputs": 3,
+                    "selected": 2,
+                    "universe": 4,
+                    "selector": "-p app -p core",
+                }
+            ),
+            [],
+        )
+
+    def test_an_honest_full_scope_validates(self) -> None:
+        self.assertEqual(
+            validate_with_scope(
+                {
+                    "mode": "full",
+                    "reason": "unsupported input: src/limits.yaml",
+                    "inputs": 3,
+                    "selected": None,
+                    "universe": None,
+                    "selector": None,
+                }
+            ),
+            [],
+        )
+
+    def test_a_full_run_may_not_publish_a_selector(self) -> None:
+        # The one shape that makes the pack contradict itself: the mode says
+        # the whole suite ran, the selector says a fragment of it did.
+        issues = validate_with_scope(
+            {
+                "mode": "full",
+                "reason": "unsupported input: src/limits.yaml",
+                "selector": "-p core",
+            }
+        )
+        self.assertTrue(
+            any("selector must be null when mode is 'full'" in issue for issue in issues),
+            issues,
+        )
+
+    def test_a_full_run_may_not_publish_a_selection_count(self) -> None:
+        issues = validate_with_scope(
+            {"mode": "full", "reason": "why", "selected": 2}
+        )
+        self.assertTrue(
+            any("selected must be null when mode is 'full'" in issue for issue in issues),
+            issues,
+        )
+
+    def test_an_empty_selection_is_a_valid_narrowing(self) -> None:
+        # Nothing to run is a real answer, and the row that carries it is a
+        # `skipped` one. It must not need a selector to be valid.
+        self.assertEqual(
+            validate_with_scope(
+                {
+                    "mode": "change-scoped",
+                    "reason": "change-scoped selection",
+                    "inputs": 1,
+                    "selected": 0,
+                    "universe": 2,
+                    "selector": None,
+                }
+            ),
+            [],
         )
 
 

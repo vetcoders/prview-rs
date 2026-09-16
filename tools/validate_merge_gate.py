@@ -739,6 +739,15 @@ def validate(path: Path) -> list[str]:
                         issues.append(
                             f"{ctx}.scope.selected must be null when mode is 'full'"
                         )
+                    # Same rule, the other half. `selector` is the fragment of
+                    # the command line that narrowed the run, so a full run has
+                    # nothing to put there — and a selector beside `mode: full`
+                    # is the one shape that makes the pack contradict itself
+                    # about whether the whole suite ran.
+                    if scope.get("mode") == "full" and scope.get("selector") is not None:
+                        issues.append(
+                            f"{ctx}.scope.selector must be null when mode is 'full'"
+                        )
             if schema_at_least(data.get("schema_version"), (2, 3)):
                 issues.extend(
                     ensure_keys(

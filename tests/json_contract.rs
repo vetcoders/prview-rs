@@ -2920,6 +2920,20 @@ fn scope_object_validator_contract() {
         })),
         true,
     );
+    // Nothing to run is a real answer, not a malformed one. The row carrying
+    // it is `skipped`, and there is no command to quote, so the selector is
+    // null while the mode stays `change-scoped`.
+    validate(
+        &with_scope(serde_json::json!({
+            "mode": "change-scoped",
+            "reason": "change-scoped selection",
+            "inputs": 2,
+            "selected": 0,
+            "universe": 4,
+            "selector": null,
+        })),
+        true,
+    );
 
     // An unstated mode, a blank reason, or a selection count beside a full run
     // are each a scope a reader cannot act on.
@@ -2927,6 +2941,11 @@ fn scope_object_validator_contract() {
         serde_json::json!({"mode": "partial", "reason": "why"}),
         serde_json::json!({"mode": "full", "reason": ""}),
         serde_json::json!({"mode": "full", "reason": "why", "selected": 3}),
+        // The other half of the same rule: `selector` is the fragment of the
+        // command line that narrowed the run, so a full run has nothing to put
+        // there, and a selector beside `mode: full` makes the pack contradict
+        // itself about whether the whole suite ran.
+        serde_json::json!({"mode": "full", "reason": "why", "selector": "-p core"}),
         serde_json::json!({"mode": "change-scoped", "reason": "why", "inputs": -1}),
         serde_json::json!("change-scoped"),
         // Counts of files and packages are integers. "1.5 of 1028 test files"
@@ -2943,7 +2962,7 @@ fn scope_object_validator_contract() {
     validate(
         &with_scope(serde_json::json!({
             "mode": "full",
-            "reason": "scoped execution not enabled yet",
+            "reason": "manifest or lockfile changed: Cargo.lock",
             "inputs": 3,
             "non_participating": [
                 {"path": "CHANGELOG.md", "rule": "root-changelog"},
@@ -2962,7 +2981,7 @@ fn scope_object_validator_contract() {
         validate(
             &with_scope(serde_json::json!({
                 "mode": "full",
-                "reason": "scoped execution not enabled yet",
+                "reason": "manifest or lockfile changed: Cargo.lock",
                 "non_participating": bad_list,
             })),
             false,
@@ -2975,7 +2994,7 @@ fn scope_object_validator_contract() {
             "Vitest",
             serde_json::json!({
                 "mode": "full",
-                "reason": "scoped execution not enabled yet",
+                "reason": "manifest or lockfile changed: Cargo.lock",
                 "inputs": 7,
             }),
         ),
