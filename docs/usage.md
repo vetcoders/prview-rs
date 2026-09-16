@@ -417,7 +417,12 @@ skipped suite also adds an advisory line to `decision.review_caveats`; it never
 moves the verdict.
 
 An empty selection is reported as `change-scoped` with `selected: 0`, a null
-selector and a `skipped` row. It is never reported as a pass — no suite ran.
+selector and a `skipped` row. It is never reported as a pass — no suite ran. The
+check proves that skip rather than leaving a blank: its row in
+`20_quality/<gate>.result.json` carries `command: "<no command recorded>"`, and
+the pack keys the empty selection on that record. A test row that was skipped
+for any other reason — a missing tool, a preset, a crash — reports `full` with
+`scoped execution not confirmed by the check`.
 
 **How prview knows a narrowed Vitest run found nothing.** From Vitest's JSON
 reporter, which the narrowed command carries (`--reporter=default

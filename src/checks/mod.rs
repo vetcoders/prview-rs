@@ -1423,6 +1423,46 @@ fn replayed_provenance(stored: Option<&str>) -> Option<CheckProvenance> {
 /// the field sees an absence rather than a plausible-looking command line.
 const NO_COMMAND_RECORDED: &str = "<no command recorded>";
 
+/// Provenance for a test check whose scope decision selected nothing.
+///
+/// No process is spawned, so almost every field is honestly empty — but the row
+/// is not. It carries the tree the decision was taken against and, in
+/// `executed_scope`, the decision itself: [`scope::ExecutedScope::NothingSelected`].
+/// That is the difference between "this suite has no test related to the change"
+/// and "this check never ran, for reasons unknown", and everything downstream —
+/// the ledger, the `scope` object in the pack, the merge policy — reads that
+/// proof rather than inferring an empty selection from missing provenance.
+///
+/// `command` is the same [`NO_COMMAND_RECORDED`] literal the ledger already
+/// understands as "no process", so an empty selection is recorded as a skip
+/// rather than as a run that took no time.
+///
+/// `cwd_display` is passed in because each check renders its own working
+/// directory its own way, and a skipped row must read like that check's
+/// executed rows.
+fn nothing_selected_provenance(
+    check: &str,
+    cwd: &Path,
+    cwd_display: String,
+    repo_root: &Path,
+    started_at: String,
+) -> CheckProvenance {
+    CheckProvenance {
+        command: NO_COMMAND_RECORDED.to_string(),
+        tool_version: None,
+        cwd: cwd_display,
+        exit_code: None,
+        started_at,
+        finished_at: chrono::Local::now().to_rfc3339(),
+        hard_fail_signatures: Vec::new(),
+        cache_key: None,
+        target_sha: None,
+        tree_state: None,
+        executed_scope: Some(scope::ExecutedScope::NothingSelected),
+    }
+    .with_scan_substrate(check, cwd, repo_root)
+}
+
 /// The directory a check WOULD have read, for an execution that ended in `Err`.
 ///
 /// Resolved WITHOUT materialising anything: the shared snapshot is already on
@@ -3978,6 +4018,59 @@ test result: ok. 2 passed; 0 failed
                 duration: Duration::from_millis(7)
             },
             "status Skipped alone is not proof that no command ran"
+        );
+    }
+
+    /// An empty test selection is a skip the ledger can see, because the check
+    /// publishes the proof: no command, and `NothingSelected` as what executed.
+    /// Recording it as a `Run` of a few microseconds would put a suite that
+    /// never started into the run's live coverage.
+    #[test]
+    fn ledger_reads_an_empty_test_selection_as_a_skip() {
+        use crate::ledger::{TaskKey, TaskState};
+
+        let ledger = TaskLedger::new();
+        let now = std::time::Instant::now();
+        let config = rust_config(false, true, true);
+        let reason = scope::NO_TESTS_RELATED_TO_THE_CHANGE.to_string();
+        let empty_selection = CheckResult {
+            name: "Cargo test".to_string(),
+            status: CheckStatus::Skipped,
+            duration: Duration::from_millis(3),
+            output: reason.clone(),
+            cached: false,
+            provenance: Some(nothing_selected_provenance(
+                "Cargo test",
+                &config.repo_root,
+                config.repo_root.display().to_string(),
+                &config.repo_root,
+                chrono::Local::now().to_rfc3339(),
+            )),
+        };
+        let provenance = empty_selection
+            .provenance
+            .as_ref()
+            .expect("an empty selection publishes its proof");
+        assert_eq!(provenance.command, NO_COMMAND_RECORDED);
+        assert_eq!(provenance.exit_code, None);
+        assert_eq!(
+            provenance.executed_scope,
+            Some(scope::ExecutedScope::NothingSelected)
+        );
+
+        let key = TaskKey::new(
+            "Cargo test",
+            ledger_substrate(empty_selection.provenance.as_ref(), &ledger),
+        );
+        record_completed_check(&empty_selection, &ledger, now, now);
+
+        assert_eq!(
+            ledger
+                .lookup(&key)
+                .expect("empty-selection ledger row")
+                .state,
+            TaskState::Skipped { reason },
+            "a suite that never spawned a process is not a run",
         );
     }
 

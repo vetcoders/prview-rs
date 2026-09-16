@@ -119,6 +119,15 @@ fn ran_without_evidence(name: &str) -> CheckResult {
     result_with(name, CheckStatus::Passed, None)
 }
 
+/// A check that skipped because its selection was empty, carrying the proof.
+fn nothing_selected(name: &str) -> CheckResult {
+    result_with(
+        name,
+        CheckStatus::Skipped,
+        Some(ExecutedScope::NothingSelected),
+    )
+}
+
 fn narrowed(name: &str, selected: usize, selector: &str) -> CheckResult {
     result_with(
         name,
@@ -1407,19 +1416,37 @@ fn a_runtime_escalation_overrides_the_decision_in_the_report() {
 }
 
 /// An empty selection is the one `change-scoped` report with no selector: there
-/// was a decision, it selected nothing, and the check honoured it by skipping.
-/// `selected: 0` beside a skipped row is the honest shape; `passed` never is.
+/// was a decision, it selected nothing, and the check says so with
+/// `ExecutedScope::NothingSelected`. `selected: 0` beside a skipped row is the
+/// honest shape; `passed` never is.
 #[test]
 fn an_empty_selection_reports_change_scoped_with_no_selector() {
     let set = trustworthy(vec![modified("CHANGELOG.md")]);
     let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
-    let skipped = result_with("Cargo test", CheckStatus::Skipped, None);
     let report = decisions
-        .report_for_check(&skipped)
+        .report_for_check(&nothing_selected("Cargo test"))
         .expect("Cargo test owns a test scope");
     assert_eq!(report.mode, "change-scoped");
     assert_eq!(report.reason, CHANGE_SCOPED_SELECTION);
     assert_eq!(report.selected, Some(0));
+    assert_eq!(report.selector, None);
+}
+
+/// A skip is not self-certifying. The decision selected nothing, but this check
+/// left no record of having executed that decision — it may have been skipped
+/// by a preset, by a missing tool, or by a crash before it built a command. The
+/// report describes what is proven, which is nothing narrower than the full
+/// suite.
+#[test]
+fn a_skip_without_the_empty_selection_proof_is_not_reported_as_narrowed() {
+    let set = trustworthy(vec![modified("CHANGELOG.md")]);
+    let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
+    let report = decisions
+        .report_for_check(&result_with("Cargo test", CheckStatus::Skipped, None))
+        .expect("Cargo test owns a test scope");
+    assert_eq!(report.mode, "full");
+    assert_eq!(report.reason, SCOPED_EXECUTION_NOT_CONFIRMED);
+    assert_eq!(report.selected, None);
     assert_eq!(report.selector, None);
 }
 
@@ -1526,13 +1553,21 @@ fn review_caveats_follow_the_published_reports() {
 fn an_empty_selection_raises_a_skip_caveat_not_a_narrowing_one() {
     let set = trustworthy(vec![modified("CHANGELOG.md")]);
     let decisions = decide_with(Some(&set), &profile(true, true), Some(&app_and_core()));
-    let caveats =
-        decisions.review_caveats(&[result_with("Cargo test", CheckStatus::Skipped, None)]);
+    let caveats = decisions.review_caveats(&[nothing_selected("Cargo test")]);
     assert_eq!(
         caveats,
         vec![format!(
             "Cargo test skipped: {NO_TESTS_RELATED_TO_THE_CHANGE}"
         )]
+    );
+
+    // Same decision, no proof: the row reports a full run, so there is no
+    // narrowing to caveat. A reviewer is never told a suite was skipped for an
+    // empty selection the check cannot show it honoured.
+    assert!(
+        decisions
+            .review_caveats(&[result_with("Cargo test", CheckStatus::Skipped, None)])
+            .is_empty()
     );
 }
 

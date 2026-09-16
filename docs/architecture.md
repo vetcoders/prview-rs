@@ -431,6 +431,14 @@ after classification (the ordinary documentation-only pull request), the outcome
 is `selected = 0` and a `Skipped` carrying `no tests related to the change`
 (§8.1). Calling that `passed` would claim evidence the run never produced.
 
+The skip is PUBLISHED, not inferred. The check writes provenance with no command
+(`<no command recorded>`, the literal the task ledger already reads as "no
+process") and `executed_scope: {"mode": "nothing-selected"}`. That record is
+what the ledger, the `scope` object and the merge policy key on, so an empty
+selection cannot be confused with a check that was skipped by a preset, lost its
+tool, or died before it built a command. Absence of provenance is absence of
+evidence, and buys no exception anywhere.
+
 **Rust workspace resolution.** One `cargo metadata --format-version 1 --no-deps
 --frozen` per run, with its own timeout, read from the cargo root **inside the
 reviewed tree**. `profile.cargo_root` is detected in the operator checkout,
@@ -470,7 +478,7 @@ advisory review caveat that never moves the verdict. See
 |---|---|---|
 | `Full { reason }`, or no decision at all | `cargo test --all-targets --no-fail-fast [<literal filter>]` — today's command, unchanged | `vitest run --maxWorkers 1 [--testNamePattern <p>]` — today's command, unchanged |
 | `ChangeScoped`, non-empty selection | the same command plus `-p <pkg>` per selected package, inserted **before** the positional filter | `vitest related --run --maxWorkers 1 --passWithNoTests [--testNamePattern <p>] <selector inputs>`, followed by `--reporter=default --reporter=json --outputFile.json=<temp>/vitest-scope.json` |
-| `ChangeScoped`, empty selection | nothing is spawned: `Skipped` with `no tests related to the change` and no provenance | the same |
+| `ChangeScoped`, empty selection | nothing is spawned: `Skipped` with `no tests related to the change`, and provenance whose `command` is `<no command recorded>` and whose `executed_scope` is `nothing-selected` | the same |
 
 `--tests-pattern` filters INSIDE the selection; it never replaces it. Every
 existing cap is untouched: the scope decides how much to run, the governor
@@ -527,8 +535,9 @@ OWNS an ecosystem's test scope (`Ecosystem::owning_check`, so a lint printing
 the same words is not eligible), the skip came out of a real execution
 (`evaluate_run`; a pre-flight `SkippedCheck` never qualifies, because a check
 that was never dispatched cannot have resolved a selection), and the check's own
-provenance agrees — either absent, which is what an empty selection leaves
-behind, or an `executed_scope` that records a narrowed run. A test check that
+provenance says what it did — `nothing-selected` for an empty selection, or an
+`executed_scope` that records a narrowed run. A row with no provenance at all
+proves nothing and gets no exception. A test check that
 ran the FULL suite and then reported this reason contradicts itself, and the
 contradiction is resolved against the claim: it blocks wherever policy requires
 the gate. The same proof drives the execution-state classification, so the two

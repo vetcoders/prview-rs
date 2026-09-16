@@ -120,6 +120,11 @@ command to describe.
 **An empty selection is a skip, never a pass.** `mode: "change-scoped"`,
 `selected: 0`, `selector: null`, on a row whose `status` is `skipped` and whose
 `outcome` is `skipped`, with `no tests related to the change` as the reason.
+This shape too is published only against the check's own evidence: the empty
+selection is recorded as `executed_scope: {"mode": "nothing-selected"}` beside a
+`command` of `<no command recorded>` in `20_quality/<gate>.result.json`. A
+skipped row without that record is reported as `full` with
+`scoped execution not confirmed by the check`, like any other unproven claim.
 That row does not block: the suite applies to the repository but not to this
 change, and the classification that proved it escalates anything it cannot name.
 It is never relabelled `passed` — no suite ran.

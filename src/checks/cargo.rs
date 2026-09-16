@@ -1764,8 +1764,9 @@ impl Check for CargoTestCheck {
         let (owned_args, executed_scope) = match plan_cargo_test(config, &run.scan_dir)? {
             CargoTestPlan::Run { args, executed } => (args, executed),
             // No cargo process at all: the decision proved no package in this
-            // workspace can be affected by the change. Provenance stays `None`
-            // because there is no execution to describe.
+            // workspace can be affected by the change. That is a finding, not a
+            // blank, so it is published as provenance — no command, and the
+            // empty selection itself as the executed scope.
             CargoTestPlan::Skip => {
                 return Ok(CheckResult {
                     name: self.name().to_string(),
@@ -1773,7 +1774,16 @@ impl Check for CargoTestCheck {
                     duration: start.elapsed(),
                     output: crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE.to_string(),
                     cached: false,
-                    provenance: None,
+                    provenance: Some(super::nothing_selected_provenance(
+                        self.name(),
+                        cwd,
+                        crate::paths::normalize_path_display(
+                            &cwd.display().to_string(),
+                            &config.repo_root,
+                        ),
+                        &config.repo_root,
+                        started_at,
+                    )),
                 });
             }
         };

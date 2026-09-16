@@ -424,9 +424,11 @@ impl<'a> PolicyEngine<'a> {
             // The honesty of this branch rests on THREE facts checked together
             // by `proved_empty_test_scope`, not on the wording of the reason: a
             // check that owns a test scope, a skip decided by a real execution
-            // (never a pre-flight one), and provenance that agrees with the
-            // claim. A lint that prints this sentence, or a test check that ran
-            // the FULL suite and then skipped, falls through to the branches
+            // (never a pre-flight one), and provenance that RECORDS the empty
+            // selection or the narrowed run that found nothing. A lint that
+            // prints this sentence, a check that leaves no such record, or a
+            // test check that ran the FULL suite and then skipped, falls
+            // through to the branches
             // below and still blocks where policy requires it. The row itself
             // reads `skipped` with `outcome: skipped` — a suite that never ran
             // is never relabelled `passed` (contract §2.4).
@@ -548,24 +550,25 @@ fn is_no_tests_related_skip(reason: &str) -> bool {
 /// 2. it produced this result by running — the caller is `evaluate_run`; a
 ///    pre-flight `SkippedCheck` never reaches here, because a check that was
 ///    never dispatched cannot have resolved a selection;
-/// 3. its own provenance agrees: either there is none at all (the empty
-///    selection spawned no command, so there is nothing to describe) or it
-///    records a narrowed execution. A check that ran the FULL suite and then
-///    reported this reason is contradicting itself, and the contradiction is
-///    resolved against the claim.
+/// 3. its own provenance says what it did: either
+///    [`ExecutedScope::NothingSelected`], the empty selection that spawned no
+///    command, or a narrowed execution that collected no test. Missing
+///    provenance is NOT evidence — a check that reports this sentence while
+///    leaving no record of having decided anything gets no exception, and a
+///    check that ran the FULL suite and then reported it contradicts itself.
+///    Either way the contradiction is resolved against the claim.
 fn proved_empty_test_scope(result: &CheckResult, reason: &str) -> bool {
     use crate::checks::scope::{Ecosystem, ExecutedScope};
 
     if Ecosystem::owning_check(&result.name).is_none() || !is_no_tests_related_skip(reason) {
         return false;
     }
-    match &result.provenance {
-        None => true,
-        Some(provenance) => matches!(
+    result.provenance.as_ref().is_some_and(|provenance| {
+        matches!(
             provenance.executed_scope,
-            Some(ExecutedScope::ChangeScoped { .. })
-        ),
-    }
+            Some(ExecutedScope::NothingSelected | ExecutedScope::ChangeScoped { .. })
+        )
+    })
 }
 
 fn is_mode_skip_reason(reason: &str) -> bool {
@@ -760,7 +763,9 @@ mod tests {
 
     /// A gate that ran, found the change touches nothing it covers, and
     /// executed nothing.
-    fn scope_skipped(name: &str, reason: &str) -> CheckResult {
+    /// A skipped row with no provenance at all: nothing says what, if anything,
+    /// this check decided or executed.
+    fn skipped_without_provenance(name: &str, reason: &str) -> CheckResult {
         CheckResult {
             name: name.to_string(),
             status: CheckStatus::Skipped,
@@ -769,6 +774,26 @@ mod tests {
             cached: false,
             provenance: None,
         }
+    }
+
+    /// The shape a real test check produces for an empty selection: no command
+    /// was spawned, and the empty selection itself is the recorded evidence.
+    fn scope_skipped(name: &str, reason: &str) -> CheckResult {
+        let mut result = skipped_without_provenance(name, reason);
+        result.provenance = Some(crate::checks::CheckProvenance {
+            command: "<no command recorded>".to_string(),
+            tool_version: None,
+            cwd: ".".to_string(),
+            exit_code: None,
+            started_at: "2026-09-16T00:00:00+00:00".to_string(),
+            finished_at: "2026-09-16T00:00:00+00:00".to_string(),
+            hard_fail_signatures: Vec::new(),
+            cache_key: None,
+            target_sha: None,
+            tree_state: None,
+            executed_scope: Some(crate::checks::scope::ExecutedScope::NothingSelected),
+        });
+        result
     }
 
     fn config_requiring_cargo_test() -> Config {
@@ -857,7 +882,7 @@ mod tests {
         reason: &str,
         executed: Option<crate::checks::scope::ExecutedScope>,
     ) -> CheckResult {
-        let mut result = scope_skipped(name, reason);
+        let mut result = skipped_without_provenance(name, reason);
         result.provenance = Some(crate::checks::CheckProvenance {
             command: format!("{name} --some-argument"),
             tool_version: None,
@@ -972,5 +997,42 @@ mod tests {
         ));
 
         assert_eq!(eval.conclusion, PolicyConclusion::Blocked);
+    }
+
+    /// Absent provenance is absence of evidence, not evidence of an empty
+    /// selection. A required gate that reports this sentence while recording
+    /// nothing about what it decided keeps blocking — the exception is earned
+    /// by a proof the check publishes, never by a row that says nothing.
+    #[test]
+    fn a_skip_with_no_provenance_at_all_does_not_reach_the_branch() {
+        let config = config_requiring_cargo_test();
+        let engine = PolicyEngine::new(&config);
+
+        let eval = engine.evaluate_run(&skipped_without_provenance(
+            "Cargo test",
+            crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE,
+        ));
+
+        assert_eq!(eval.conclusion, PolicyConclusion::Blocked);
+        assert_eq!(eval.merge_impact, MergeRecommendation::Block);
+    }
+
+    /// The empty selection the checks actually publish: no command, and
+    /// `NothingSelected` as the executed scope. This is the row the exception
+    /// exists for.
+    #[test]
+    fn a_proven_empty_selection_is_approved() {
+        let config = config_requiring_cargo_test();
+        let engine = PolicyEngine::new(&config);
+
+        let eval = engine.evaluate_run(&scope_skipped_with(
+            "Cargo test",
+            crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE,
+            Some(crate::checks::scope::ExecutedScope::NothingSelected),
+        ));
+
+        assert_eq!(eval.conclusion, PolicyConclusion::Satisfied);
+        assert_eq!(eval.merge_impact, MergeRecommendation::Approve);
+        assert_eq!(eval.execution_state, CheckExecutionState::Skipped);
     }
 }

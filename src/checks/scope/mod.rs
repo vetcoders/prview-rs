@@ -258,6 +258,17 @@ pub enum ExecutedScope {
     /// The full suite ran. `reason` is why, in the same vocabulary as
     /// [`ScopeDecision::Full`].
     Full { reason: String },
+    /// Nothing ran, because the selection was empty: the decision proved that
+    /// no test in this ecosystem can be affected by the change.
+    ///
+    /// A separate variant rather than `ChangeScoped { selected: 0 }`, because
+    /// the two are different facts. A narrowed run that collected nothing
+    /// executed a command and can name its selector; this one never spawned a
+    /// process and has no selector to name. It is also the evidence that
+    /// distinguishes an honest empty selection from a check that was never
+    /// dispatched at all — the reason the ledger, the report and the policy can
+    /// key on a proof instead of on the absence of one.
+    NothingSelected,
     /// A narrowed suite ran.
     ChangeScoped {
         /// How many units the selector named: packages for Cargo, source files
@@ -380,12 +391,13 @@ impl ScopeDecision {
     ///
     /// The ordering is the contract. An escalated decision reports its own
     /// reason, because nothing downstream could have narrowed anyway. A
-    /// `ChangeScoped` decision that selected nothing reports the empty selection
-    /// — but only against a check that honoured it by skipping, since a check
-    /// that ran anyway did not execute this decision. Otherwise the check's own
-    /// [`ExecutedScope`] is the evidence, and its absence means `full` with
-    /// [`SCOPED_EXECUTION_NOT_CONFIRMED`]: never `change-scoped` on a decision
-    /// alone.
+    /// `ChangeScoped` decision reports what the check's own [`ExecutedScope`]
+    /// proves it did: an empty selection ([`ExecutedScope::NothingSelected`]),
+    /// a narrowed command, or a runtime escalation. Absent evidence means
+    /// `full` with [`SCOPED_EXECUTION_NOT_CONFIRMED`]: never `change-scoped` on
+    /// a decision alone, not even an empty one. A check that skipped for its own
+    /// reasons — tooling missing, preset, crash — must not be able to inherit
+    /// the decision's empty selection as if it had honoured it.
     pub fn report_for_result(&self, result: &CheckResult) -> ScopeReport {
         let executed = result
             .provenance
@@ -393,12 +405,8 @@ impl ScopeDecision {
             .and_then(|provenance| provenance.executed_scope.as_ref());
         match self {
             Self::Full { reason, .. } => self.full_report(reason.clone()),
-            Self::ChangeScoped { selected, .. }
-                if selected.is_empty() && result.status == CheckStatus::Skipped =>
-            {
-                self.scoped_report(0, None)
-            }
             Self::ChangeScoped { .. } => match executed {
+                Some(ExecutedScope::NothingSelected) => self.scoped_report(0, None),
                 Some(ExecutedScope::ChangeScoped { selected, selector }) => {
                     self.scoped_report(*selected, Some(selector.clone()))
                 }

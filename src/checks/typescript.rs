@@ -802,8 +802,9 @@ impl Check for VitestCheck {
                 report,
             } => (args, executed, report),
             // No command is spawned at all: the decision proved this change has
-            // no related test. Provenance stays `None` because there is no
-            // execution to describe — no command, no exit code, no tree read.
+            // no related test. The row still carries provenance — no command and
+            // no exit code, but the tree that was read to decide and the empty
+            // selection itself, which is what proves the skip was earned.
             VitestPlan::Skip => {
                 return Ok(CheckResult {
                     name: self.name().to_string(),
@@ -811,7 +812,13 @@ impl Check for VitestCheck {
                     duration: start.elapsed(),
                     output: crate::checks::scope::NO_TESTS_RELATED_TO_THE_CHANGE.to_string(),
                     cached: false,
-                    provenance: None,
+                    provenance: Some(super::nothing_selected_provenance(
+                        self.name(),
+                        run_dir,
+                        run_dir.display().to_string(),
+                        &config.repo_root,
+                        started_at,
+                    )),
                 });
             }
         };

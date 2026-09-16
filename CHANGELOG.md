@@ -43,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already ran the whole suite keeps running it without changing its invocation;
   narrowing is for the reviewer's machine, and a local `--deep` stays narrowed.
   `prview gate` is unaffected, because the gate profile runs no tests.
+- An empty test selection publishes its own proof. A `Cargo test` / `Vitest`
+  row that runs nothing because the change has no related test now records
+  provenance with `command: "<no command recorded>"` and
+  `executed_scope: {"mode": "nothing-selected"}` instead of leaving provenance
+  blank. The task ledger reads it as a skip rather than a run of a few
+  microseconds, the pack publishes `mode: change-scoped, selected: 0` only
+  against that record, and the merge policy's empty-selection exception requires
+  it: a required test gate that reports "no tests related to the change" while
+  recording nothing about what it decided now blocks, where it used to approve.
+  The artifact contract is unchanged — the new value lives on the check's own
+  provenance, and `scope` keeps the shape `3.1` already defines.
 - Test scope is decided from the change and reported. A new `checks/scope/`
   decides, per ecosystem, whether a change requires the whole test suite or a
   narrower run, and publishes the answer as the additive `scope` object on the
