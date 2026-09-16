@@ -81,6 +81,54 @@ impl FullTestsRequest {
     }
 }
 
+/// How long a local run may take before it is stopped without a verdict.
+///
+/// Contract §10, decision D1: a local run is BOUNDED BY DEFAULT, because an
+/// opt-in safety net is no safety net for the person running prview for the
+/// first time on an ordinary laptop. The number is a measurement, not a taste:
+/// a full `--deep` self-review of prview-rs on a 14-core laptop took 616 s
+/// (2026-09-16, `cargo test` alone 429 s of it), so the default is roughly
+/// three times the longest run anybody has measured — long enough that no
+/// honest run ever meets it, short enough that a stuck one ends while the
+/// operator is still watching.
+pub const DEFAULT_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// The same safety net for automation, which has the machines and the patience
+/// a laptop does not: `--ci` and `prview gate`.
+///
+/// Twice the local budget, and still inside the one-hour job timeout the
+/// project's own CI gives its heaviest acceptance job — a deadline that only
+/// ever fires after the runner has already killed the job would be decoration.
+pub const DEFAULT_CI_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Resolve the whole-run deadline the operator asked for.
+///
+/// CLI beats preset, and an explicit `--no-deadline` beats both.
+fn resolve_run_deadline(cli: &Cli) -> Option<std::time::Duration> {
+    resolve_deadline(cli, cli.ci)
+}
+
+/// The budget `prview gate` runs on.
+///
+/// The gate is automation, so its default is the automation default — but the
+/// operator may still have typed a budget before the subcommand, and a flag the
+/// parser accepted must not be silently overruled by the profile.
+pub fn resolve_gate_deadline(cli: &Cli) -> Option<std::time::Duration> {
+    resolve_deadline(cli, true)
+}
+
+fn resolve_deadline(cli: &Cli, automation: bool) -> Option<std::time::Duration> {
+    if cli.no_deadline {
+        None
+    } else if let Some(deadline) = cli.deadline {
+        Some(deadline)
+    } else if automation {
+        Some(DEFAULT_CI_DEADLINE)
+    } else {
+        Some(DEFAULT_RUN_DEADLINE)
+    }
+}
+
 /// Runtime configuration derived from CLI and environment
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -260,6 +308,16 @@ pub struct Config {
     /// `checks::run_all`/`run_all_with_events` so every snapshot-backed check
     /// shares one ephemeral worktree instead of creating its own.
     pub scan_dir_override: Option<PathBuf>,
+
+    /// How long this run may take in total before it is stopped WITHOUT a
+    /// verdict. `None` = unbounded (`--no-deadline`).
+    ///
+    /// Independent of both narrowing and the governor (contract §2): the scope
+    /// decides how much work is necessary, the governor decides how gently to
+    /// do it, and this decides what happens when the necessary work did not
+    /// fit. It never turns a partial run into a partial PASS — an expired run
+    /// reports no verdict at all.
+    pub deadline: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -875,6 +933,7 @@ impl Config {
             test_scope: None,
             full_tests: None,
             scan_dir_override: None,
+            deadline: Some(DEFAULT_RUN_DEADLINE),
         }
     }
 
@@ -1022,6 +1081,7 @@ impl Config {
         config.gh_repo = gh_repo;
         config.tests_pattern = cli.tests_pattern.clone();
         config.full_tests = FullTestsRequest::from_cli(cli);
+        config.deadline = resolve_run_deadline(cli);
         config.why_blocked = cli.why_blocked;
         config.bridge_stage = cli.bridge_stage.min(4);
 
@@ -1033,7 +1093,11 @@ impl Config {
     /// The `gate` subcommand owns its check budget: global step opt-ins such as
     /// `--with-tests`, `--with-lint`, or `--security-full` must not accidentally
     /// turn the pre-push gate into a deep review.
-    pub fn apply_gate_profile(&mut self, enforcement_mode: EnforcementMode) {
+    pub fn apply_gate_profile(
+        &mut self,
+        enforcement_mode: EnforcementMode,
+        deadline: Option<std::time::Duration>,
+    ) {
         self.execution_mode = ExecutionMode::Quick;
         self.enforcement_mode = enforcement_mode;
         self.update_mode = false;
@@ -1050,6 +1114,10 @@ impl Config {
         self.quiet = true;
         self.json = false;
         self.soft_exit = false;
+
+        // The gate is automation, and automation runs on the CI budget unless
+        // the caller resolved a different one (`resolve_gate_deadline`).
+        self.deadline = deadline;
     }
 
     /// Create a minimal Config for state-only TUI viewer.
@@ -1849,7 +1917,7 @@ mod tests {
             let mut config = test_config().with_step_flags(flags);
             assert!(config.skip_security);
             assert!(!config.run_security);
-            config.apply_gate_profile(config.enforcement_mode);
+            config.apply_gate_profile(config.enforcement_mode, Some(DEFAULT_CI_DEADLINE));
             assert!(config.skip_security, "gate must preserve explicit opt-outs");
         }
         let cli = Cli::parse_from(["prview"]);
@@ -1867,6 +1935,73 @@ mod tests {
         );
     }
 
+    /// Contract §10 / decision D1: a local run is bounded WITHOUT being asked,
+    /// automation gets the longer budget, and both are the operator's to
+    /// change.
+    #[test]
+    fn a_local_run_is_bounded_by_default_and_ci_gets_the_longer_budget() {
+        for args in [
+            vec!["prview"],
+            vec!["prview", "--quick"],
+            vec!["prview", "--deep"],
+        ] {
+            assert_eq!(
+                resolve_run_deadline(&Cli::parse_from(args.clone())),
+                Some(DEFAULT_RUN_DEADLINE),
+                "{args:?} must be bounded by default",
+            );
+        }
+
+        assert_eq!(
+            resolve_run_deadline(&Cli::parse_from(["prview", "--ci"])),
+            Some(DEFAULT_CI_DEADLINE),
+        );
+        assert_eq!(
+            resolve_run_deadline(&Cli::parse_from(["prview", "--deadline", "45m"])),
+            Some(std::time::Duration::from_secs(2700)),
+        );
+        assert_eq!(
+            resolve_run_deadline(&Cli::parse_from(["prview", "--ci", "--deadline", "45m"])),
+            Some(std::time::Duration::from_secs(2700)),
+            "an explicit budget beats the preset",
+        );
+        assert_eq!(
+            resolve_run_deadline(&Cli::parse_from(["prview", "--no-deadline"])),
+            None,
+        );
+        assert!(
+            DEFAULT_CI_DEADLINE > DEFAULT_RUN_DEADLINE,
+            "CI has the machines a laptop does not",
+        );
+    }
+
+    /// The gate is automation and runs on the automation budget — unless the
+    /// operator typed a budget before the subcommand, which the parser accepts
+    /// and the profile must therefore not overrule.
+    #[test]
+    fn the_gate_profile_runs_on_the_ci_budget() {
+        let mut config = test_config();
+        config.deadline = Some(std::time::Duration::from_secs(1));
+
+        config.apply_gate_profile(config.enforcement_mode, Some(DEFAULT_CI_DEADLINE));
+        assert_eq!(config.deadline, Some(DEFAULT_CI_DEADLINE));
+
+        let bare = Cli::try_parse_from(["prview", "gate"]).expect("a bare gate parses");
+        assert_eq!(resolve_gate_deadline(&bare), Some(DEFAULT_CI_DEADLINE));
+
+        let widened = Cli::try_parse_from(["prview", "--deadline", "2h", "gate"])
+            .expect("a budget before the subcommand parses");
+        assert_eq!(
+            resolve_gate_deadline(&widened),
+            Some(std::time::Duration::from_secs(7200)),
+            "an explicit budget survives the gate profile",
+        );
+
+        let unbounded =
+            Cli::try_parse_from(["prview", "--no-deadline", "gate"]).expect("--no-deadline parses");
+        assert_eq!(resolve_gate_deadline(&unbounded), None);
+    }
+
     #[cfg(unix)]
     struct InterruptWhenFileExists {
         path: PathBuf,
@@ -1875,7 +2010,7 @@ mod tests {
 
     #[cfg(unix)]
     impl crate::governor::Interrupts for InterruptWhenFileExists {
-        async fn next(&mut self) {
+        async fn next(&mut self) -> crate::governor::Interrupt {
             if self.delivered {
                 std::future::pending::<()>().await;
             }
@@ -1883,6 +2018,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             self.delivered = true;
+            crate::governor::Interrupt::Operator
         }
     }
 

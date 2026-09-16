@@ -20,12 +20,13 @@
 mod supervisor;
 
 pub(crate) use supervisor::InterruptSupervisor;
-pub use supervisor::{CtrlC, Interrupts, blocking_stage};
+pub use supervisor::{CtrlC, DeadlineOrCtrlC, Interrupt, Interrupts, blocking_stage};
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, PoisonError};
+use std::time::Duration;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -186,7 +187,186 @@ impl std::error::Error for Cancelled {}
 /// the run never reached.
 #[must_use]
 pub fn is_cancellation(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<Cancelled>().is_some()
+    err.downcast_ref::<Cancelled>().is_some() || err.downcast_ref::<DeadlineExceeded>().is_some()
+}
+
+/// The run ran out of its own time budget before it could reach a verdict.
+///
+/// A sibling of [`Cancelled`] rather than a field on it: every existing
+/// cancellation site keeps producing the unit error it always produced, and
+/// [`is_cancellation`] answers for both, because to everything between the
+/// governor and `main` the two are the same fact — no verdict exists. The one
+/// consumer that must tell them apart is the process exit code, and it asks
+/// through [`deadline_exceeded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineExceeded {
+    /// The budget the run was given, as the operator could have changed it.
+    pub budget: Duration,
+}
+
+impl std::fmt::Display for DeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "run deadline of {} exceeded: the resource governor is no longer granting work",
+            format_budget(self.budget)
+        )
+    }
+}
+
+impl std::error::Error for DeadlineExceeded {}
+
+/// The budget of a run that was stopped by its deadline, if that is what `err`
+/// reports.
+///
+/// `main` exits 3 (`prview cannot report a verdict`) for this and 130 (the
+/// shell's interrupt convention) for an operator's Ctrl-C: a deadline is not an
+/// operator, and claiming it was would misreport who stopped the run.
+#[must_use]
+pub fn deadline_exceeded(err: &anyhow::Error) -> Option<Duration> {
+    err.downcast_ref::<DeadlineExceeded>()
+        .map(|deadline| deadline.budget)
+}
+
+/// Why a run was cancelled — the one distinction the governor has to remember.
+///
+/// The governor is where both halves meet: the interrupt supervisor publishes
+/// the reason when it stops the run, and the artifact stage reads it back when
+/// it writes typed incompleteness, several frames away and long after the
+/// interrupt itself is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// The operator asked, with Ctrl-C or the TUI's own key handling.
+    Operator,
+    /// The run exhausted the whole-run deadline it was given.
+    Deadline {
+        /// The budget that was exceeded.
+        budget: Duration,
+    },
+}
+
+/// Which stage of the run is currently in flight.
+///
+/// Recorded so an interrupt can say WHERE the run was stopped. A deadline that
+/// lands in the checks is a run with no pack at all; one that lands in artifact
+/// generation leaves a pack marked incomplete. The operator reading stderr
+/// needs to know which of the two they have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStage {
+    /// Everything before the checks: refs, diffs, worktree snapshots.
+    Preparing,
+    /// The checks stage.
+    Checks,
+    /// Artifact generation and publication.
+    Artifacts,
+}
+
+impl RunStage {
+    /// The stable label used in operator-facing messages.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparation",
+            Self::Checks => "checks",
+            Self::Artifacts => "artifact generation",
+        }
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::Preparing => 0,
+            Self::Checks => 1,
+            Self::Artifacts => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Checks,
+            2 => Self::Artifacts,
+            _ => Self::Preparing,
+        }
+    }
+}
+
+/// A duration as an operator would type it back into `--deadline`.
+///
+/// Round numbers only, because that is all a budget ever is: `30m`, `1h`,
+/// `1h30m`, `90s`.
+#[must_use]
+pub fn format_budget(budget: Duration) -> String {
+    let total = budget.as_secs();
+    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
+    let mut rendered = String::new();
+    if hours > 0 {
+        rendered.push_str(&format!("{hours}h"));
+    }
+    if minutes > 0 {
+        rendered.push_str(&format!("{minutes}m"));
+    }
+    if seconds > 0 || rendered.is_empty() {
+        rendered.push_str(&format!("{seconds}s"));
+    }
+    rendered
+}
+
+/// Parse an operator-typed run deadline such as `90s`, `30m`, `1h`, `1h30m`.
+///
+/// A unit is REQUIRED. A bare number is the one input whose meaning a reader
+/// cannot recover — `--deadline 30` is thirty seconds to one person and thirty
+/// minutes to the next — and guessing either would silently cut a run short or
+/// silently leave it unbounded for half an hour.
+///
+/// # Errors
+///
+/// Returns a message naming what was wrong and what is accepted.
+pub fn parse_deadline(raw: &str) -> std::result::Result<Duration, String> {
+    const ACCEPTED: &str = "expected a duration with a unit, such as 90s, 30m, 1h or 1h30m";
+
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err(format!("empty deadline: {ACCEPTED}"));
+    }
+
+    let mut total = 0u64;
+    let mut digits = String::new();
+    let mut units_seen = 0u32;
+    for character in text.chars() {
+        if character.is_ascii_digit() {
+            digits.push(character);
+            continue;
+        }
+        let multiplier = match character {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            _ => return Err(format!("unsupported unit {character:?}: {ACCEPTED}")),
+        };
+        if digits.is_empty() {
+            return Err(format!("unit {character:?} without a number: {ACCEPTED}"));
+        }
+        let value: u64 = digits
+            .parse()
+            .map_err(|_| format!("deadline value out of range: {raw}"))?;
+        total = total
+            .checked_add(value.saturating_mul(multiplier))
+            .ok_or_else(|| format!("deadline value out of range: {raw}"))?;
+        digits.clear();
+        units_seen += 1;
+    }
+
+    if !digits.is_empty() {
+        return Err(format!("missing unit in {raw:?}: {ACCEPTED}"));
+    }
+    if units_seen == 0 {
+        return Err(format!("missing unit in {raw:?}: {ACCEPTED}"));
+    }
+    if total == 0 {
+        return Err(format!(
+            "a zero deadline would stop the run before it started: {ACCEPTED}"
+        ));
+    }
+    Ok(Duration::from_secs(total))
 }
 
 /// A slice of the run's budget, held for exactly as long as the task runs.
@@ -252,6 +432,14 @@ pub struct ResourceGovernor {
     /// answers the cheap question ("is it over?"); this answers the blocking one
     /// ("tell me when").
     cancel_tx: watch::Sender<bool>,
+    /// Why the run was cancelled, written once by whoever cancelled first.
+    ///
+    /// A `OnceLock` because cancellation is idempotent and the FIRST reason is
+    /// the true one: an operator's second Ctrl-C after a deadline must not
+    /// rewrite history into "the operator stopped it".
+    cancel_reason: OnceLock<CancelReason>,
+    /// The stage the run believes it is in, as [`RunStage::code`].
+    stage: AtomicU8,
 }
 
 impl Default for ResourceGovernor {
@@ -283,6 +471,8 @@ impl ResourceGovernor {
             inflight: Mutex::new(HashMap::new()),
             cancelled: Arc::new(AtomicBool::new(false)),
             cancel_tx,
+            cancel_reason: OnceLock::new(),
+            stage: AtomicU8::new(RunStage::Preparing.code()),
         }
     }
 
@@ -470,7 +660,55 @@ impl ResourceGovernor {
     /// because a pid whose process died between the two calls may by then belong
     /// to somebody else.
     pub fn cancel(&self) {
-        self.begin_cancel().terminate();
+        self.cancel_with(CancelReason::Operator);
+    }
+
+    /// End the run and say why.
+    ///
+    /// [`ResourceGovernor::cancel`] is this with [`CancelReason::Operator`],
+    /// which is what every pre-deadline caller meant.
+    pub fn cancel_with(&self, reason: CancelReason) {
+        self.begin_cancel_with(reason).terminate();
+    }
+
+    /// Why this run was cancelled, or `None` while it is still running.
+    #[must_use]
+    pub fn cancel_reason(&self) -> Option<CancelReason> {
+        if !self.is_cancelled() {
+            return None;
+        }
+        // A cancel that raced ahead of its reason is still an operator cancel:
+        // that is the reason every caller but the deadline publishes.
+        Some(
+            self.cancel_reason
+                .get()
+                .copied()
+                .unwrap_or(CancelReason::Operator),
+        )
+    }
+
+    /// The typed error a cancelled run must end in, matching its reason.
+    ///
+    /// One reader, so the deadline's exit code cannot depend on which frame
+    /// happened to build the error.
+    #[must_use]
+    pub fn cancellation_error(&self) -> anyhow::Error {
+        match self.cancel_reason() {
+            Some(CancelReason::Deadline { budget }) => DeadlineExceeded { budget }.into(),
+            _ => Cancelled.into(),
+        }
+    }
+
+    /// Record which stage of the run is in flight, so an interrupt can say
+    /// where it landed.
+    pub fn enter_stage(&self, stage: RunStage) {
+        self.stage.store(stage.code(), Ordering::SeqCst);
+    }
+
+    /// The stage the run last reported entering.
+    #[must_use]
+    pub fn stage(&self) -> RunStage {
+        RunStage::from_code(self.stage.load(Ordering::SeqCst))
     }
 
     /// Publish cancellation and take exclusive ownership of every child that
@@ -480,7 +718,10 @@ impl ResourceGovernor {
     /// every waiter/newcomer is refused and late child registration takes its
     /// own termination path. Platform process-tree termination is kept in the
     /// returned batch because Windows' `taskkill` fallback is a blocking wait.
-    fn begin_cancel(&self) -> CancellationBatch {
+    fn begin_cancel_with(&self, reason: CancelReason) -> CancellationBatch {
+        // Before the atomic: a reader that has already seen `is_cancelled` must
+        // not find the reason missing and fall back to "operator".
+        let _ = self.cancel_reason.set(reason);
         self.cancelled.store(true, Ordering::SeqCst);
         // Closing wakes every task parked on the budget with an error, so a
         // waiter is refused exactly like a newcomer.
@@ -502,7 +743,15 @@ impl ResourceGovernor {
     /// blocking pool, so callers can keep polling a second Ctrl-C while still
     /// awaiting ordinary cleanup when the operator does not force an exit.
     pub(crate) fn begin_background_cancel(&self) -> tokio::task::JoinHandle<()> {
-        let batch = self.begin_cancel();
+        self.begin_background_cancel_with(CancelReason::Operator)
+    }
+
+    /// [`ResourceGovernor::begin_background_cancel`], naming the reason.
+    pub(crate) fn begin_background_cancel_with(
+        &self,
+        reason: CancelReason,
+    ) -> tokio::task::JoinHandle<()> {
+        let batch = self.begin_cancel_with(reason);
         spawn_blocking_cancellation(move || batch.terminate())
     }
 
@@ -1314,6 +1563,103 @@ mod tests {
         assert!(
             gone,
             "grandchild {grandchild} survived cancellation of its group leader"
+        );
+    }
+
+    #[test]
+    fn a_plain_cancel_is_the_operator() {
+        let governor = ResourceGovernor::with_budget(2, 1);
+        assert_eq!(governor.cancel_reason(), None, "a live run has no reason");
+
+        governor.cancel();
+
+        assert_eq!(governor.cancel_reason(), Some(CancelReason::Operator));
+        assert!(
+            governor
+                .cancellation_error()
+                .downcast_ref::<Cancelled>()
+                .is_some(),
+            "an operator cancel keeps the error every existing consumer matches on",
+        );
+    }
+
+    #[test]
+    fn a_deadline_cancel_remembers_its_budget() {
+        let governor = ResourceGovernor::with_budget(2, 1);
+        let budget = Duration::from_secs(1800);
+
+        governor.cancel_with(CancelReason::Deadline { budget });
+
+        assert_eq!(
+            governor.cancel_reason(),
+            Some(CancelReason::Deadline { budget })
+        );
+        let error = governor.cancellation_error();
+        assert!(is_cancellation(&error), "{error:#}");
+        assert_eq!(deadline_exceeded(&error), Some(budget));
+    }
+
+    /// The operator's second Ctrl-C arrives at a governor that is already
+    /// cancelled. Letting it overwrite the reason would report the operator as
+    /// the author of a stop the deadline caused.
+    #[test]
+    fn the_first_reason_wins() {
+        let governor = ResourceGovernor::with_budget(2, 1);
+        let budget = Duration::from_secs(60);
+
+        governor.cancel_with(CancelReason::Deadline { budget });
+        governor.cancel();
+
+        assert_eq!(
+            governor.cancel_reason(),
+            Some(CancelReason::Deadline { budget })
+        );
+    }
+
+    #[test]
+    fn a_run_reports_the_stage_it_entered() {
+        let governor = ResourceGovernor::with_budget(2, 1);
+        assert_eq!(governor.stage(), RunStage::Preparing);
+
+        governor.enter_stage(RunStage::Checks);
+        assert_eq!(governor.stage(), RunStage::Checks);
+        assert_eq!(governor.stage().label(), "checks");
+
+        governor.enter_stage(RunStage::Artifacts);
+        assert_eq!(governor.stage().label(), "artifact generation");
+    }
+
+    #[test]
+    fn a_deadline_parses_only_with_a_unit() {
+        assert_eq!(parse_deadline("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_deadline("30m"), Ok(Duration::from_secs(1800)));
+        assert_eq!(parse_deadline("1h"), Ok(Duration::from_secs(3600)));
+        assert_eq!(parse_deadline("1h30m"), Ok(Duration::from_secs(5400)));
+        assert_eq!(parse_deadline(" 45m "), Ok(Duration::from_secs(2700)));
+
+        for rejected in ["30", "", "m", "30x", "1h30", "0s", "-5m"] {
+            let error = parse_deadline(rejected)
+                .expect_err(&format!("{rejected:?} must not parse as a deadline"));
+            assert!(
+                error.contains("30m") || error.contains("out of range"),
+                "the error must say what is accepted: {error}",
+            );
+        }
+    }
+
+    /// The formatter is what the operator reads back in the stderr message, so
+    /// it has to produce something they could type into `--deadline`.
+    #[test]
+    fn a_budget_renders_as_something_the_operator_could_type() {
+        assert_eq!(format_budget(Duration::from_secs(90)), "1m30s");
+        assert_eq!(format_budget(Duration::from_secs(1800)), "30m");
+        assert_eq!(format_budget(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_budget(Duration::from_secs(5400)), "1h30m");
+        assert_eq!(format_budget(Duration::from_secs(0)), "0s");
+        assert_eq!(
+            parse_deadline(&format_budget(Duration::from_secs(5400))),
+            Ok(Duration::from_secs(5400)),
+            "every rendered budget must parse back to itself",
         );
     }
 }

@@ -351,6 +351,9 @@ def sample_owned_tree(root_pid: int, census: dict[str, Any]) -> None:
         if state.startswith("Z"):
             continue
         commands.append(command)
+        # Every pid this run ever owned. "The deadline left nothing behind" is
+        # only provable against the set of children that actually existed.
+        census["seen_pids"].add(pid)
         # The whole-run command census. "No `cargo test` process existed" is
         # only provable against the set of commands actually observed, so the
         # sampler keeps them (bounded, so a long run cannot grow unboundedly).
@@ -926,12 +929,86 @@ def assert_unknown_input(
         )
 
 
+def evaluate_deadline(
+    receipt: dict[str, Any],
+    census: dict[str, Any],
+    pack: pathlib.Path,
+    log: pathlib.Path,
+    case: dict[str, Any],
+) -> None:
+    """Contract §10: an expired run reports no verdict, and leaves nothing running.
+
+    A deliberately tiny budget on the same mixed fixture the other cases use.
+    The run is stopped while its checks are still working, so there is no pack
+    at all — the artifact-stage half of the contract (an `INCOMPLETE.json`
+    naming the deadline) is asserted at unit level, where the seam can be hit
+    deterministically.
+    """
+    del case
+    violations = receipt["violations"]
+    log_text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+    receipt["pack"] = {
+        "run_json": (pack / "00_summary" / "RUN.json").exists(),
+        "merge_gate_json": (pack / "00_summary" / "MERGE_GATE.json").exists(),
+        "incomplete_json": (pack / "00_summary" / "INCOMPLETE.json").exists(),
+    }
+
+    add_assertion(
+        violations,
+        receipt["process"]["exit_code"] == 3,
+        f"an expired run must exit 3, got {receipt['process']['exit_code']}",
+    )
+    add_assertion(
+        violations,
+        not receipt["process"]["timed_out"],
+        "the deadline did not stop the run; the harness had to",
+    )
+    add_assertion(
+        violations,
+        "deadline" in log_text.lower(),
+        "the run did not say that its deadline stopped it",
+    )
+    add_assertion(
+        violations,
+        not receipt["pack"]["merge_gate_json"] and not receipt["pack"]["run_json"],
+        "an expired run published a verdict-shaped surface",
+    )
+    published = [
+        surface
+        for surface in (
+            "report.json",
+            "dashboard.html",
+            "review.html",
+            "PR_REVIEW.md",
+            "00_summary/MERGE_GATE.md",
+        )
+        if (pack / surface).exists()
+    ]
+    add_assertion(
+        violations,
+        not published,
+        f"an expired run left success-shaped surfaces behind: {published}",
+    )
+    remaining = sorted(live_pids(set(census["seen_pids"])))
+    receipt["orphans"] = remaining
+    add_assertion(
+        violations,
+        not remaining,
+        f"the expired run left live descendants behind: {remaining}",
+    )
+
+
 CASES: dict[str, dict[str, Any]] = {
     "mixed": {"mutate": mutate_mixed, "assert_scope": assert_mixed},
     "js-only": {"mutate": mutate_js_only, "assert_scope": assert_js_only},
     "unknown-input": {
         "mutate": mutate_unknown_input,
         "assert_scope": assert_unknown_input,
+    },
+    "deadline": {
+        "mutate": mutate_mixed,
+        "extra_args": ["--deadline", "2s"],
+        "evaluate": evaluate_deadline,
     },
 }
 
@@ -1162,6 +1239,7 @@ def run_case(args: argparse.Namespace, case_name: str) -> dict[str, Any]:
         },
         "seen_tools": {tool: False for tool in WHOLE_MACHINE_TOOLS},
         "observed_commands": set(),
+        "seen_pids": set(),
         "truncated": False,
         "cargo_invocations": [],
         "observed_caps": {
@@ -1237,6 +1315,7 @@ def run_case(args: argparse.Namespace, case_name: str) -> dict[str, Any]:
                 "--no-zip",
                 "--output-dir",
                 str(pack),
+                *case.get("extra_args", []),
                 "candidate",
                 "main",
             ]
@@ -1273,7 +1352,7 @@ def run_case(args: argparse.Namespace, case_name: str) -> dict[str, Any]:
                     receipt["process"]["exit_code"] = process.wait()
                 receipt["process"]["wall_secs"] = round(time.monotonic() - started, 3)
             census["cargo_invocations"] = cargo_shim_invocations(cargo_log)
-            evaluate(receipt, census, pack, log_path, case)
+            case.get("evaluate", evaluate)(receipt, census, pack, log_path, case)
     finally:
         error = sys.exc_info()[1]
         if error is not None:
@@ -1289,6 +1368,7 @@ def run_case(args: argparse.Namespace, case_name: str) -> dict[str, Any]:
             key: sorted(value) for key, value in census["observed_caps"].items()
         }
         serializable_census["observed_commands"] = sorted(census["observed_commands"])
+        serializable_census["seen_pids"] = sorted(census["seen_pids"])
         receipt["census"] = serializable_census
         receipt["finished_at"] = utc_now()
         if not receipt["violations"]:

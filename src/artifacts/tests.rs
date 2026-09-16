@@ -387,6 +387,51 @@ fn cancellation_injection_stops_every_artifact_generation_seam() {
     }
 }
 
+/// A deadline reaching artifact generation produces the same typed
+/// incompleteness as an operator's Ctrl-C — and names itself, because "the
+/// operator stopped this" and "prview ran out of time" send the reader looking
+/// in two different places.
+#[test]
+fn a_deadline_during_generation_names_itself_in_the_incomplete_marker() {
+    let publication_home = tempfile::tempdir().expect("publication home");
+    let _publication_home =
+        crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base_sha, target_sha) = init_advanced_base_fixture();
+    let output = tempfile::tempdir().expect("output tempdir");
+    let output_dir = output.path().join("pack");
+    let governor = crate::governor::ResourceGovernor::new();
+    let budget = Duration::from_secs(1800);
+    let seam = ArtifactGenerationSeam::MergeGate;
+    let probe = generation_seam_test_hook::ProbeGuard::install_with_reason(
+        Some(seam),
+        crate::governor::CancelReason::Deadline { budget },
+    );
+
+    let error = generate_fixture_pack(repo.path(), &output_dir, &target_sha, &base_sha, &governor)
+        .expect_err("an expired run must stop artifact generation");
+    drop(probe);
+
+    assert!(crate::governor::is_cancellation(&error), "{error:#}");
+    assert_eq!(
+        crate::governor::deadline_exceeded(&error),
+        Some(budget),
+        "the artifact stage must return the run's own typed deadline: {error:#}"
+    );
+    assert_no_success_surfaces(&output_dir, seam);
+    assert_cancelled_pack_is_not_published(&output_dir, seam);
+
+    let incomplete: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("00_summary/INCOMPLETE.json"))
+            .expect("incomplete marker"),
+    )
+    .expect("valid incomplete JSON");
+    assert_eq!(incomplete["schema_version"], "1.0");
+    assert_eq!(incomplete["status"], "incomplete");
+    assert_eq!(incomplete["reason"], "deadline exceeded");
+    assert_eq!(incomplete["deadline_secs"], 1800);
+    assert_eq!(incomplete["stage"], seam.label());
+}
+
 #[test]
 fn cancellation_at_publication_preserves_existing_latest() {
     let publication_home = tempfile::tempdir().expect("publication home");

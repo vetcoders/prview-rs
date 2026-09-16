@@ -254,6 +254,37 @@ pub struct Cli {
     )]
     pub full_tests: bool,
 
+    /// Widen the whole-run deadline, e.g. 90s, 30m, 1h, 1h30m
+    #[arg(
+        long = "deadline",
+        value_name = "TIME",
+        value_parser = crate::governor::parse_deadline,
+        conflicts_with = "no_deadline",
+        // `--watch` is a session of many reviews, not one run, so it is
+        // deliberately unbounded. Accepting a budget there and ignoring it
+        // would be the one thing worse than having no budget.
+        conflicts_with = "watch",
+        long_help = "Bound the whole run at this duration instead of the default. A unit is \
+                     required (90s, 30m, 1h, 1h30m): a bare number means thirty seconds to one \
+                     reader and thirty minutes to the next. When the budget runs out the \
+                     governor stops granting work and kills the tools the run started; the run \
+                     reports NO verdict and exits 3, with an incomplete pack marker if it had \
+                     reached artifact generation. This is a safety net, not a scheduler: it \
+                     never narrows what a run checks. --watch is a session rather than a run \
+                     and is never bounded, so the two are refused together."
+    )]
+    pub deadline: Option<std::time::Duration>,
+
+    /// Let the run take as long as it needs, with no whole-run deadline
+    #[arg(
+        long = "no-deadline",
+        long_help = "Remove the whole-run deadline. Runs are bounded by default so a first \
+                     review on an ordinary laptop ends in a message rather than in an operator \
+                     wondering whether prview has hung; an unbounded run is the deliberate \
+                     opposite of that and can only end on its own or on Ctrl-C."
+    )]
+    pub no_deadline: bool,
+
     /// PR URL to embed in artifact metadata (e.g. for traceability in RUN.json)
     #[arg(long = "pr-url", value_name = "URL")]
     pub pr_url: Option<String>,
@@ -672,6 +703,8 @@ mod tests {
             fail_on_warnings: false,
             tests_pattern: None,
             full_tests: false,
+            deadline: None,
+            no_deadline: false,
             pr_url: None,
             policy_file: None,
             policy_mode: None,
@@ -716,6 +749,47 @@ mod tests {
 
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--full-tests"), "got: {help}");
+    }
+
+    #[test]
+    fn a_deadline_flag_requires_a_unit_and_rejects_its_own_opposite() {
+        assert_eq!(
+            Cli::try_parse_from(["prview", "--deadline", "30m"])
+                .expect("an explicit deadline parses")
+                .deadline,
+            Some(std::time::Duration::from_secs(1800)),
+        );
+
+        let bare = Cli::try_parse_from(["prview", "--deadline", "30"])
+            .expect_err("a bare number is ambiguous and must be refused");
+        assert!(
+            bare.to_string().contains("30m"),
+            "the error must show what is accepted: {bare}",
+        );
+
+        assert!(
+            Cli::try_parse_from(["prview", "--no-deadline"])
+                .expect("--no-deadline parses")
+                .no_deadline,
+        );
+
+        Cli::try_parse_from(["prview", "--deadline", "30m", "--no-deadline"])
+            .expect_err("asking for a budget and for no budget is a contradiction");
+
+        // A watch session is never bounded, so a budget it would ignore is
+        // refused rather than accepted and dropped.
+        Cli::try_parse_from(["prview", "--watch", "--deadline", "30m"])
+            .expect_err("a watch session cannot carry a run deadline");
+        Cli::try_parse_from(["prview", "--watch", "--no-deadline"])
+            .expect("--no-deadline only restates what watch already does");
+
+        let cli = Cli::try_parse_from(["prview"]).expect("default CLI");
+        assert_eq!(cli.deadline, None, "the CLI holds only what was typed");
+        assert!(!cli.no_deadline);
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--deadline"), "got: {help}");
+        assert!(help.contains("--no-deadline"), "got: {help}");
     }
 
     #[test]
