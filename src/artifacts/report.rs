@@ -67,6 +67,9 @@ pub struct ReportInput<'a> {
     /// `MERGE_GATE.json` and `CONSISTENCY_CHECK.json` cannot name different
     /// contradictions.
     pub provenance: &'a ProvenanceConsistency,
+    /// The run's test-scope decision, published on the check rows it applies
+    /// to. `None` when no checks ran. See [`crate::checks::scope`].
+    pub scope: Option<&'a crate::checks::scope::ScopeDecisions>,
 }
 
 /// Generate `report.json` in the artifact root directory.
@@ -234,6 +237,11 @@ struct CheckEntry {
     finding_stats: Option<FindingStats>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     failed_tests: Vec<String>,
+    /// How much of this check's suite the run decided had to execute, and why
+    /// (schema 3.1, additive). Present only on a check that owns an
+    /// ecosystem's test scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<crate::checks::scope::ScopeReport>,
     artifacts: CheckArtifacts,
 }
 
@@ -863,6 +871,9 @@ fn build_report(input: &ReportInput<'_>) -> Report {
                     finding_stats_from_output(&c.output)
                 },
                 failed_tests,
+                scope: input
+                    .scope
+                    .and_then(|scope| scope.report_for_check(&c.name)),
                 artifacts: CheckArtifacts {
                     log_path: Some(format!("20_quality/{}.log", id)),
                     result_json_path: Some(format!("20_quality/{}.result.json", id)),
@@ -1213,7 +1224,10 @@ fn build_report(input: &ReportInput<'_>) -> Report {
         // 3.0: `quality.breaking_changes.md_path` is nullable and
         // `gate.status` carries the canonical
         // PASS/CONDITIONAL/BLOCK verdict. Readers must migrate from 2.0.
-        schema_version: "3.0",
+        // 3.1: check rows may carry the additive `scope` object — how much of
+        // that check's suite the run decided had to execute, and why. Additive
+        // only; a 3.0 reader loses the field and nothing else.
+        schema_version: "3.1",
         meta,
         gate,
         checks: check_entries,
@@ -1483,6 +1497,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-09T00:00:00Z",
             heuristics: None,
             regression: None,
+            scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
 
@@ -1545,6 +1560,143 @@ test result: FAILED. 0 passed; 1 failed
                 assert!(entry.get("finding_stats").is_none());
             }
         }
+    }
+
+    /// Schema 3.1: a check row that owns an ecosystem's test scope publishes
+    /// how much of that suite the run decided had to execute, and why. A check
+    /// with no test suite to narrow carries nothing — an empty scope object on
+    /// Clippy would invite a reader to think a scope decision applied to it.
+    #[test]
+    fn report_publishes_the_test_scope_on_the_checks_that_own_one() {
+        use crate::artifacts::DashboardContext;
+        use crate::artifacts::signal::CoverageDelta;
+        use crate::checks::CheckResult;
+        use crate::checks::scope::{ScopeDecision, ScopeDecisions};
+        use crate::cli::ExecutionMode;
+        use crate::config::test_config;
+        use crate::git::ResolvedRef;
+        use std::time::Duration;
+
+        let mut config = test_config();
+        config.execution_mode = ExecutionMode::Standard;
+
+        let checks = ["Cargo test", "Clippy"].map(|name| CheckResult {
+            name: name.to_string(),
+            status: CheckStatus::Passed,
+            duration: Duration::from_secs(1),
+            output: String::new(),
+            cached: false,
+            provenance: None,
+        });
+        let ctx = DashboardContext {
+            verdict: "PASS",
+            analysis_status: crate::policy::engine::AnalysisStatus::Complete,
+            merge_recommendation: crate::policy::engine::MergeRecommendation::Approve,
+            allow_merge: true,
+            quality_pass: true,
+            policy_allow_merge: true,
+            recommended_merge: true,
+            review_caveats: vec![],
+            quality_failures: vec![],
+            introduced_quality_failures: vec![],
+            preexisting_quality_failures: vec![],
+            mixed_quality_failures: vec![],
+            unclassified_quality_failures: vec![],
+            quality_failure_details: vec![],
+            policy_mode: "warn",
+            blocking_issues: vec![],
+            check_gates: vec![],
+            breaking: vec![],
+            rust_api_delta: None,
+            coverage: CoverageDelta {
+                total_source: 0,
+                covered_count: 0,
+                pct: None,
+                uncovered: vec![],
+                covered: vec![],
+                non_code_count: 0,
+                ghost_tests: vec![],
+            },
+            findings: vec![],
+            per_file_diff_files: vec![],
+            skipped_checks: vec![],
+            previous_run: None,
+            run_history: vec![],
+            flaky_scores: vec![],
+            lint_metrics: vec![],
+            ownership_map: vec![],
+            risk_scores: vec![],
+            i18n_delta: None,
+        };
+        let target = ResolvedRef {
+            name: "feature/scope".to_string(),
+            commit_id: "deadbeef".to_string(),
+            is_remote: false,
+        };
+        let bases = vec![ResolvedRef {
+            name: "main".to_string(),
+            commit_id: "cafebabe".to_string(),
+            is_remote: false,
+        }];
+        let scope = ScopeDecisions {
+            cargo: ScopeDecision::Full {
+                reason: "manifest or lockfile changed: Cargo.lock".to_string(),
+                inputs: Some(3),
+            },
+            vitest: ScopeDecision::Full {
+                reason: "no JavaScript or TypeScript source detected".to_string(),
+                inputs: Some(3),
+            },
+            non_participating: vec![crate::checks::scope::NonParticipatingPath {
+                path: "CHANGELOG.md".to_string(),
+                rule: "root-changelog".to_string(),
+            }],
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let report = build_report(&ReportInput {
+            dir: tmp.path(),
+            config: &config,
+            diffs: &[],
+            checks: &checks,
+            resolved_target: &target,
+            resolved_bases: &bases,
+            ctx: &ctx,
+            run_started_at: "2026-09-15T00:00:00Z",
+            heuristics: None,
+            regression: None,
+            scope: Some(&scope),
+            provenance: &ProvenanceConsistency::default(),
+        });
+        let json = serde_json::to_value(&report).expect("serialize report");
+
+        assert_eq!(json["schema_version"], "3.1");
+        let rows = json["checks"].as_array().expect("check rows");
+        let cargo_test = rows
+            .iter()
+            .find(|row| row["name"] == "Cargo test")
+            .expect("cargo test row");
+        assert_eq!(cargo_test["scope"]["mode"], "full");
+        assert_eq!(
+            cargo_test["scope"]["reason"],
+            "manifest or lockfile changed: Cargo.lock"
+        );
+        assert_eq!(
+            cargo_test["scope"]["non_participating"][0]["path"],
+            "CHANGELOG.md"
+        );
+        assert_eq!(
+            cargo_test["scope"]["non_participating"][0]["rule"],
+            "root-changelog"
+        );
+        let clippy = rows
+            .iter()
+            .find(|row| row["name"] == "Clippy")
+            .expect("clippy row");
+        assert!(
+            clippy.get("scope").is_none(),
+            "a check with no test suite to scope must not claim a scope"
+        );
     }
 
     #[test]
@@ -1638,6 +1790,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-09T00:00:00Z",
             heuristics: None,
             regression: None,
+            scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
 
@@ -1756,6 +1909,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-09T00:00:00Z",
             heuristics: None,
             regression: None,
+            scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
 
@@ -1880,6 +2034,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-12T00:00:00Z",
             heuristics: None,
             regression: None,
+            scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
 
@@ -2020,6 +2175,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-12T00:00:00Z",
             heuristics: Some(&heuristics),
             regression: None,
+            scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
 
@@ -2120,6 +2276,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-12T00:00:00Z",
             heuristics,
             regression: None,
+            scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
         serde_json::to_value(build_report(&input)).expect("serialize report")
@@ -2204,6 +2361,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-09-09T00:00:00Z",
             heuristics: None,
             regression: None,
+            scope: None,
             provenance: &ProvenanceConsistency::default(),
         });
         let report = serde_json::to_value(report).expect("serialize report");
@@ -2307,8 +2465,9 @@ test result: FAILED. 0 passed; 1 failed
         );
         assert_eq!(
             json["schema_version"].as_str(),
-            Some("3.0"),
-            "a nullable field and omittable counters are not an additive change"
+            Some("3.1"),
+            "a nullable field and omittable counters are not an additive change; \
+             3.1 adds the additive per-check `scope` object on top of that shape"
         );
         assert!(json["quality"]["breaking_changes"]["md_path"].is_null());
     }
@@ -2515,6 +2674,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-03-12T00:00:00Z",
             heuristics: None,
             regression: None,
+            scope: None,
             provenance: &ProvenanceConsistency::default(),
         };
 
@@ -2606,6 +2766,7 @@ test result: FAILED. 0 passed; 1 failed
             run_started_at: "2026-09-11T00:00:00Z",
             heuristics: None,
             regression: None,
+            scope: None,
             provenance: &provenance,
         };
 

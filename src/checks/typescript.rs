@@ -78,7 +78,7 @@ fn vitest_args(config: &Config) -> Vec<String> {
     args
 }
 
-fn is_generated_artifact_path(path: &str, config: &Config) -> bool {
+pub(crate) fn is_generated_artifact_path(path: &str, config: &Config) -> bool {
     let normalized = path.replace('\\', "/");
     let mut is_gen = normalized.contains("/node_modules/")
         || normalized.starts_with("node_modules/")

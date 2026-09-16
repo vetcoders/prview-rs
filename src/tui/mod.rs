@@ -589,6 +589,13 @@ pub async fn run_analysis(
         // Pin the captured base range with the target: a check that needs a base
         // must read the SHA this pack's diff was computed from, never re-resolve
         // a symbolic base ref that may have moved since capture.
+        // The change the test-scope decision reads, from the SAME pinned range
+        // the pack diff used. Mirrors headless `App::run`; see
+        // `crate::checks::scope`.
+        config.changed_paths = diff_bases
+            .first()
+            .and_then(|base| app.repo.changed_paths(base, &target).ok())
+            .map(|paths| crate::checks::scope::ChangeSet::new(paths, diff_bases.len() == 1));
         config.pinned_diff_bases = Some(diff_bases);
         // app (with git2::Repository) is dropped here
         Ok((
@@ -622,6 +629,17 @@ pub async fn run_analysis(
         })
         .await?;
     ensure_analysis_active(&governor)?;
+
+    // The test scope, decided once per run and published on the check rows.
+    // Mirrors headless `App::run`, including WHY it is resolved after the
+    // checks: which tree they read is decided inside `run_all`, and the ledger
+    // is what records it.
+    let reviewed_tree = crate::checks::scope::ReviewedTree::resolve(
+        &config.repo_root,
+        ledger.scan_dir(),
+        worktree_clean,
+    );
+    let run_scope = crate::checks::scope::resolve_run_scope(&config, &reviewed_tree).await;
 
     // Run heuristics
     let heuristics = if let Some(ref snap) = target_snap {
@@ -663,6 +681,7 @@ pub async fn run_analysis(
         crate::artifacts::generate(crate::artifacts::GenerateInput {
             config: &config,
             ledger: &ledger,
+            scope: Some(&run_scope),
             diffs: &diffs,
             checks: &check_results,
             heuristics: Some(&heuristics),

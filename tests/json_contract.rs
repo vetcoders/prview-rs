@@ -375,7 +375,7 @@ fn operator_policy_rank_invariants_validator_contract() {
 
     let raw = fs::read_to_string(&merge_gate).expect("read generated merge gate");
     let original: serde_json::Value = serde_json::from_str(&raw).expect("parse merge gate");
-    assert_eq!(original["schema_version"], "3.0");
+    assert_eq!(original["schema_version"], "3.1");
     assert!(
         original["decision"]["enforcement_disposition"]
             .as_str()
@@ -963,7 +963,7 @@ fn validator_rejects_schema_two_two_without_a_usable_origin() {
     let mut original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
     assert_eq!(
         original["schema_version"].as_str(),
-        Some("3.0"),
+        Some("3.1"),
         "the current writer retains the 2.2 `origin` requirement"
     );
     original["schema_version"] = serde_json::json!("2.2");
@@ -1155,7 +1155,7 @@ fn validator_requires_a_boolean_quality_pass_from_schema_two_two() {
     let original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
     assert_eq!(
         original["schema_version"].as_str(),
-        Some("3.0"),
+        Some("3.1"),
         "the current writer retains the 2.2 quality_pass requirement"
     );
     assert!(
@@ -1424,7 +1424,7 @@ fn validator_requires_the_decision_axes_schema_two_two_emits() {
     let mut original: serde_json::Value = serde_json::from_str(&raw).expect("parse gate");
     assert_eq!(
         original["schema_version"].as_str(),
-        Some("3.0"),
+        Some("3.1"),
         "the current writer retains the decision axes introduced in 2.2"
     );
     original["schema_version"] = serde_json::json!("2.2");
@@ -2729,11 +2729,11 @@ fn provenance_contradiction_validator_contract() {
     let original: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&merge_gate).expect("read generated merge gate"))
             .expect("parse merge gate");
-    assert_eq!(original["schema_version"], "3.0");
+    assert_eq!(original["schema_version"], "3.1");
     assert!(
         original["provenance_contradictions"]
             .as_array()
-            .expect("a 3.0 gate always carries the array")
+            .expect("a 3.x gate always carries the array")
             .is_empty(),
         "the fixture run reads one substrate"
     );
@@ -2832,4 +2832,170 @@ fn provenance_contradiction_validator_contract() {
         .expect("contradiction row")
         .remove("check_id");
     validate(&missing_field, false);
+}
+
+/// Schema 3.1 adds the additive per-check `scope` object. The contract is
+/// two-sided: a 3.0 pack without it stays valid, and a pack that carries it
+/// must be honest about it — a stated mode, a reason, and no selection count
+/// beside a full run. "Ran a narrower suite" with no way to tell which part or
+/// why is exactly the ambiguity the object exists to remove.
+#[test]
+fn scope_object_validator_contract() {
+    let temp = create_fixture_repo();
+    let repo = temp.path();
+
+    let payload = run_json_quiet(repo, &["feature/json-contract", "main"]);
+    let output_dir = Path::new(
+        payload["output_dir"]
+            .as_str()
+            .expect("output_dir should be a string"),
+    );
+    let merge_gate = output_dir.join("00_summary/MERGE_GATE.json");
+    let validator = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/validate_merge_gate.py");
+    let original: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&merge_gate).expect("read generated merge gate"))
+            .expect("parse merge gate");
+    assert_eq!(original["schema_version"], "3.1");
+
+    let validate = |gate: &serde_json::Value, must_validate: bool| {
+        fs::write(
+            &merge_gate,
+            serde_json::to_vec_pretty(gate).expect("serialize gate"),
+        )
+        .expect("write merge gate vector");
+        let assertion = Command::new("python3")
+            .arg(&validator)
+            .arg(&merge_gate)
+            .assert()
+            .stderr(predicate::str::contains("Traceback").not());
+        if must_validate {
+            assertion.success();
+        } else {
+            assertion.failure();
+        }
+    };
+
+    validate(&original, true);
+
+    // A pack predating the field is still readable and still valid.
+    let mut legacy = original.clone();
+    legacy["schema_version"] = serde_json::json!("3.0");
+    validate(&legacy, true);
+
+    // `scope` is valid only on a check that owns an ecosystem's test suite. The
+    // fixture repository need not have run one, so the row is named explicitly
+    // rather than searched for — `name` is what the rule reads, and this keeps
+    // the test independent of which gates the fixture happens to produce.
+    assert!(
+        !original["checks"].as_array().expect("gate rows").is_empty(),
+        "the fixture gate must carry at least one check row"
+    );
+    let with_named_scope = |name: &str, scope: serde_json::Value| {
+        let mut gate = original.clone();
+        gate["checks"][0]["name"] = serde_json::json!(name);
+        gate["checks"][0]["scope"] = scope;
+        gate
+    };
+    let with_scope = |scope: serde_json::Value| with_named_scope("Cargo test", scope);
+
+    validate(
+        &with_scope(serde_json::json!({
+            "mode": "full",
+            "reason": "manifest or lockfile changed: Cargo.lock",
+            "inputs": 7,
+            "selected": null,
+            "universe": null,
+            "selector": null,
+        })),
+        true,
+    );
+    validate(
+        &with_scope(serde_json::json!({
+            "mode": "change-scoped",
+            "reason": "change-scoped selection",
+            "inputs": 7,
+            "selected": 12,
+            "universe": 1028,
+            "selector": "vitest related --run src/a.ts",
+        })),
+        true,
+    );
+
+    // An unstated mode, a blank reason, or a selection count beside a full run
+    // are each a scope a reader cannot act on.
+    for bad in [
+        serde_json::json!({"mode": "partial", "reason": "why"}),
+        serde_json::json!({"mode": "full", "reason": ""}),
+        serde_json::json!({"mode": "full", "reason": "why", "selected": 3}),
+        serde_json::json!({"mode": "change-scoped", "reason": "why", "inputs": -1}),
+        serde_json::json!("change-scoped"),
+        // Counts of files and packages are integers. "1.5 of 1028 test files"
+        // is not a statement a reviewer can act on.
+        serde_json::json!({"mode": "change-scoped", "reason": "why", "inputs": 1.5}),
+        serde_json::json!({"mode": "change-scoped", "reason": "why", "selected": 2.5}),
+        serde_json::json!({"mode": "change-scoped", "reason": "why", "universe": 10.5}),
+    ] {
+        validate(&with_scope(bad), false);
+    }
+
+    // The classification list: an entry has to name both the path and the rule,
+    // because an unattributed entry cannot be challenged.
+    validate(
+        &with_scope(serde_json::json!({
+            "mode": "full",
+            "reason": "scoped execution not enabled yet",
+            "inputs": 3,
+            "non_participating": [
+                {"path": "CHANGELOG.md", "rule": "root-changelog"},
+                {"path": "docs/architecture.md", "rule": "docs-directory"},
+            ],
+        })),
+        true,
+    );
+    for bad_list in [
+        serde_json::json!("CHANGELOG.md"),
+        serde_json::json!([{"path": "CHANGELOG.md"}]),
+        serde_json::json!([{"rule": "root-changelog"}]),
+        serde_json::json!([{"path": "CHANGELOG.md", "rule": ""}]),
+        serde_json::json!(["CHANGELOG.md"]),
+    ] {
+        validate(
+            &with_scope(serde_json::json!({
+                "mode": "full",
+                "reason": "scoped execution not enabled yet",
+                "non_participating": bad_list,
+            })),
+            false,
+        );
+    }
+
+    // The same honest object on the other test owner is still valid.
+    validate(
+        &with_named_scope(
+            "Vitest",
+            serde_json::json!({
+                "mode": "full",
+                "reason": "scoped execution not enabled yet",
+                "inputs": 7,
+            }),
+        ),
+        true,
+    );
+
+    // Test-scope evidence may not be pinned to a check that runs no tests: a
+    // `scope` on Clippy would read as a narrowed lint, which is a claim this
+    // contract never makes.
+    for name in ["Clippy", "Semgrep scan", "TypeScript"] {
+        validate(
+            &with_named_scope(
+                name,
+                serde_json::json!({
+                    "mode": "full",
+                    "reason": "manifest or lockfile changed: Cargo.lock",
+                    "inputs": 7,
+                }),
+            ),
+            false,
+        );
+    }
 }

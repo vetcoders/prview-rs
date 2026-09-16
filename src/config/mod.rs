@@ -168,6 +168,27 @@ pub struct Config {
     /// `false`, breaking findings stay visible as an informational caveat only.
     pub breaking_escalation: bool,
 
+    /// Extra paths this repository declares are not inputs to TEST SELECTION,
+    /// as glob patterns over repo-relative paths. Sourced from
+    /// `[scope] non_participating` in `prview.toml`; additive to the built-in
+    /// rules. See [`crate::checks::scope`] for what the classification does and,
+    /// just as importantly, what it does not touch.
+    pub scope_non_participating: Vec<String>,
+
+    /// Whether prview's built-in non-participating rules apply. Sourced from
+    /// `[scope] non_participating_builtins`; defaults to `true`. `false`
+    /// restores strictly escalating behaviour.
+    pub scope_non_participating_builtins: bool,
+
+    /// The change this run is reviewing, as the test-scope decision reads it.
+    ///
+    /// Internal runtime state, never a CLI or manifest override — the same
+    /// contract as `pinned_target` / `pinned_diff_bases`, and set in the same
+    /// place, on the cloned check configuration. `None` means "no scoping
+    /// information", which every consumer must treat as today's behaviour:
+    /// run everything.
+    pub changed_paths: Option<crate::checks::scope::ChangeSet>,
+
     /// Directory the file-scoped checks should scan, when the dispatcher has
     /// already materialised a shared target snapshot for the run. `None` = each
     /// check resolves its own scan dir via `plan_check_run`. Set once per run by
@@ -721,14 +742,18 @@ impl Config {
         policy: PolicyConfig,
         manifest: Option<PrviewManifest>,
     ) -> Self {
-        let (lint_ignore_patterns, breaking_escalation) = match manifest {
-            Some(m) => (
-                m.lint.ignore_patterns.unwrap_or_default(),
-                // Absent `[gate]` section or key → escalation on by default.
-                m.gate.breaking_escalation.unwrap_or(true),
-            ),
-            None => (Vec::new(), true),
-        };
+        let (lint_ignore_patterns, breaking_escalation, scope_non_participating, scope_builtins) =
+            match manifest {
+                Some(m) => (
+                    m.lint.ignore_patterns.unwrap_or_default(),
+                    // Absent `[gate]` section or key → escalation on by default.
+                    m.gate.breaking_escalation.unwrap_or(true),
+                    m.scope.non_participating.unwrap_or_default(),
+                    // Absent `[scope]` section or key → built-in rules on.
+                    m.scope.non_participating_builtins.unwrap_or(true),
+                ),
+                None => (Vec::new(), true, Vec::new(), true),
+            };
 
         Self {
             repo_root,
@@ -778,6 +803,9 @@ impl Config {
             bridge_stage: 0,
             lint_ignore_patterns,
             breaking_escalation,
+            scope_non_participating,
+            scope_non_participating_builtins: scope_builtins,
+            changed_paths: None,
             scan_dir_override: None,
         }
     }
@@ -2647,6 +2675,7 @@ mod tests {
             },
             lint: Default::default(),
             gate: Default::default(),
+            scope: Default::default(),
         };
 
         let (has_cargo, cargo_root, rust_dirs, _) =

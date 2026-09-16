@@ -27,6 +27,7 @@ pub const TEST_TIMEOUT_SECS: u64 = 900;
 mod cargo;
 mod pytest_home;
 mod python;
+pub mod scope;
 mod semgrep;
 pub(crate) mod snapshot_integrity;
 mod typescript;
@@ -40,6 +41,7 @@ pub use python::{MypyCheck, PytestCheck, RuffCheck};
 pub use semgrep::SemgrepCheck;
 pub(crate) use semgrep::output_reports_scan_errors as semgrep_output_reports_scan_errors;
 pub(crate) use semgrep::scan_error_paths as semgrep_scan_error_paths;
+pub(crate) use typescript::is_generated_artifact_path;
 pub use typescript::{ESLintCheck, StylelintCheck, TypeScriptCheck, VitestCheck};
 
 /// Which tree a check's command actually read.
