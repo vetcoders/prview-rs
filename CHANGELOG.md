@@ -38,7 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change-scoped narrowing for that run. The pack states
   `full test run requested (--full-tests)` as the reason, because a run that is
   wider than the change requires is still a fact about what executed. The flag
-  short-circuits before any `cargo metadata`.
+  short-circuits before any `cargo metadata`. `--ci` pins the same full run and
+  publishes `full test run requested (--ci)`, so an existing automation job that
+  already ran the whole suite keeps running it without changing its invocation;
+  narrowing is for the reviewer's machine, and a local `--deep` stays narrowed.
+  `prview gate` is unaffected, because the gate profile runs no tests.
 - Test scope is decided from the change and reported. A new `checks/scope/`
   decides, per ecosystem, whether a change requires the whole test suite or a
   narrower run, and publishes the answer as the additive `scope` object on the

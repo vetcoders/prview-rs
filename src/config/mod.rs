@@ -50,6 +50,37 @@ fn gh_cmd() -> Command {
     command
 }
 
+/// What pinned a run to the whole test suite (contract §9).
+///
+/// Two requests, one behaviour and two different sentences in the pack: a
+/// reader who finds a full suite behind a one-line diff has to be able to tell
+/// an operator's explicit escape hatch from the automation recipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullTestsRequest {
+    /// `--full-tests`: the operator asked for everything.
+    Flag,
+    /// The `--ci` preset: CI has the machines, the reviewer's laptop does not.
+    CiPreset,
+}
+
+impl FullTestsRequest {
+    /// Which request, if any, pins this run to the whole suite.
+    ///
+    /// Contract §9: the CI recipe runs everything. Resolved here rather than in
+    /// the parser, so `--ci` stays a preset over an explicit flag and
+    /// `--ci --full-tests` remains a legal, non-contradictory pair that names
+    /// the operator as the one who asked.
+    fn from_cli(cli: &Cli) -> Option<Self> {
+        if cli.full_tests {
+            Some(Self::Flag)
+        } else if cli.ci {
+            Some(Self::CiPreset)
+        } else {
+            None
+        }
+    }
+}
+
 /// Runtime configuration derived from CLI and environment
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -208,15 +239,20 @@ pub struct Config {
     /// behaviour — run everything.
     pub test_scope: Option<crate::checks::scope::ScopeDecisions>,
 
-    /// Run every test the repository has, whatever the change touched
-    /// (`--full-tests`, contract §9).
+    /// Run every test the repository has, whatever the change touched, and say
+    /// who asked (contract §9). `None` means the scope decides for itself.
     ///
-    /// An operator-facing escape hatch, not a fallback: scope escalation is
-    /// automatic wherever the selection cannot be proven sufficient, and this
-    /// flag exists for the cases prview cannot know about — a change whose
-    /// effect travels through a channel no import graph and no package manifest
-    /// describes.
-    pub full_tests: bool,
+    /// `--full-tests` is an operator-facing escape hatch, not a fallback: scope
+    /// escalation is automatic wherever the selection cannot be proven
+    /// sufficient, and the flag exists for the cases prview cannot know about —
+    /// a change whose effect travels through a channel no import graph and no
+    /// package manifest describes. `--ci` pins it too, for a different reason:
+    /// the automation recipe is the one that has the machines.
+    ///
+    /// The variant is kept rather than flattened to a `bool` because the pack
+    /// must publish WHICH request widened the run; a reader who sees a full run
+    /// on a one-line diff needs to know whether an operator asked for it.
+    pub full_tests: Option<FullTestsRequest>,
 
     /// Directory the file-scoped checks should scan, when the dispatcher has
     /// already materialised a shared target snapshot for the run. `None` = each
@@ -837,7 +873,7 @@ impl Config {
             changed_paths: None,
             operator_worktree_clean: None,
             test_scope: None,
-            full_tests: false,
+            full_tests: None,
             scan_dir_override: None,
         }
     }
@@ -985,7 +1021,7 @@ impl Config {
         config.pr_base_oid = pr_base_oid;
         config.gh_repo = gh_repo;
         config.tests_pattern = cli.tests_pattern.clone();
-        config.full_tests = cli.full_tests;
+        config.full_tests = FullTestsRequest::from_cli(cli);
         config.why_blocked = cli.why_blocked;
         config.bridge_stage = cli.bridge_stage.min(4);
 
@@ -1777,6 +1813,28 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn the_ci_preset_asks_for_the_whole_suite_and_the_flag_keeps_its_name() {
+        let cases = [
+            (vec!["prview"], None),
+            (vec!["prview", "--deep"], None),
+            (vec!["prview", "--ci"], Some(FullTestsRequest::CiPreset)),
+            (vec!["prview", "--full-tests"], Some(FullTestsRequest::Flag)),
+            (
+                vec!["prview", "--ci", "--full-tests"],
+                Some(FullTestsRequest::Flag),
+            ),
+        ];
+        for (args, expected) in cases {
+            let cli = Cli::parse_from(&args);
+            assert_eq!(
+                FullTestsRequest::from_cli(&cli),
+                expected,
+                "{args:?} must resolve the full-suite request it published"
+            );
+        }
+    }
 
     #[test]
     fn explicit_security_opt_out_survives_step_flags_and_gate_profile() {

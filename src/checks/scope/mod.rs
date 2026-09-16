@@ -50,6 +50,10 @@ pub const CHANGE_SCOPED_SELECTION: &str = "change-scoped selection";
 /// (contract §9, `--full-tests`).
 pub const FULL_TESTS_REQUESTED: &str = "full test run requested (--full-tests)";
 
+/// The same pin, asked for by the automation preset instead (contract §9: the
+/// CI recipe runs the full suite, because CI is where the machines are).
+pub const FULL_TESTS_REQUESTED_BY_CI: &str = "full test run requested (--ci)";
+
 /// Hard ceiling for the one `cargo metadata` call a run makes.
 ///
 /// Measured at well under a second on every repo the contract falsified
@@ -527,6 +531,19 @@ pub struct ScopeReport {
 pub mod reason {
     /// Contract §9: the operator asked for the full suite explicitly.
     pub const FULL_TESTS_REQUESTED: &str = super::FULL_TESTS_REQUESTED;
+    /// Contract §9: the `--ci` preset asked for it.
+    pub const FULL_TESTS_REQUESTED_BY_CI: &str = super::FULL_TESTS_REQUESTED_BY_CI;
+
+    /// The published reason for a run pinned to the full suite, by request.
+    ///
+    /// One place, so the two sentences cannot drift apart and no caller has to
+    /// assemble either of them by hand.
+    pub fn full_tests_requested(request: crate::config::FullTestsRequest) -> &'static str {
+        match request {
+            crate::config::FullTestsRequest::Flag => FULL_TESTS_REQUESTED,
+            crate::config::FullTestsRequest::CiPreset => FULL_TESTS_REQUESTED_BY_CI,
+        }
+    }
     pub const NO_CHANGE_SET: &str = "no change set pinned for this run";
     pub const MULTIPLE_BASES: &str = "multiple diff bases";
     /// The checks read the operator checkout and it carries uncommitted work.
@@ -1367,13 +1384,13 @@ pub async fn resolve_run_scope(
     reviewed_tree: &ReviewedTree,
 ) -> ScopeDecisions {
     let change_set = config.changed_paths.as_ref();
-    if config.full_tests {
-        // Contract §9: the operator asked for everything, so there is nothing to
-        // decide and nothing to pay a subprocess for. Stated as an ordinary
-        // escalation reason, because that is what it is — the run is wider than
-        // the change requires, on purpose, and the pack must say so.
+    if let Some(request) = config.full_tests {
+        // Contract §9: everything was asked for, so there is nothing to decide
+        // and nothing to pay a subprocess for. Stated as an ordinary escalation
+        // reason, because that is what it is — the run is wider than the change
+        // requires, on purpose, and the pack must say who widened it.
         return both(ScopeDecision::full(
-            reason::FULL_TESTS_REQUESTED,
+            reason::full_tests_requested(request),
             change_set.map(|set| set.paths().len()),
         ));
     }

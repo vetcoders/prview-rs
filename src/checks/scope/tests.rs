@@ -1542,7 +1542,7 @@ fn an_empty_selection_raises_a_skip_caveat_not_a_narrowing_one() {
 async fn full_tests_pins_both_ecosystems_to_a_full_run() {
     let mut config = crate::config::test_config();
     config.profile = profile(true, true);
-    config.full_tests = true;
+    config.full_tests = Some(crate::config::FullTestsRequest::Flag);
     config.changed_paths = Some(trustworthy(vec![modified("crates/core/src/lib.rs")]));
 
     // Returns before any subprocess: the flag is read ahead of the metadata
@@ -1553,6 +1553,26 @@ async fn full_tests_pins_both_ecosystems_to_a_full_run() {
             full_reason(decisions.get(ecosystem)),
             reason::FULL_TESTS_REQUESTED,
             "{ecosystem:?} must report the operator's request verbatim"
+        );
+    }
+}
+
+/// Contract §9: the CI recipe runs the whole suite. The pack says `--ci` asked
+/// for it, not `--full-tests`, so a reader can tell an automation policy from an
+/// operator's escape hatch.
+#[tokio::test]
+async fn the_ci_preset_pins_both_ecosystems_and_names_itself() {
+    let mut config = crate::config::test_config();
+    config.profile = profile(true, true);
+    config.full_tests = Some(crate::config::FullTestsRequest::CiPreset);
+    config.changed_paths = Some(trustworthy(vec![modified("crates/core/src/lib.rs")]));
+
+    let decisions = resolve_run_scope(&config, &reviewed_snapshot()).await;
+    for ecosystem in Ecosystem::ALL {
+        assert_eq!(
+            full_reason(decisions.get(ecosystem)),
+            reason::FULL_TESTS_REQUESTED_BY_CI,
+            "{ecosystem:?} must name the preset that widened the run"
         );
     }
 }

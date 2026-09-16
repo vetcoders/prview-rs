@@ -539,6 +539,15 @@ metadata call, with `full test run requested (--full-tests)` as the published
 reason. The run is then wider than the change requires, on purpose, and the pack
 says so.
 
+The `--ci` preset pins the same thing for a different reason, so the two are one
+`Option<FullTestsRequest>` on `Config` rather than two booleans: `Flag` for the
+operator's request, `CiPreset` for the automation recipe, resolved once in
+`Config::from_cli` and rendered by `reason::full_tests_requested` as
+`full test run requested (--ci)`. The distinction is not cosmetic — a reader who
+finds a full suite behind a one-line diff has to be able to tell a human's
+escape hatch from a job's policy. An explicit `--full-tests` outranks the
+preset, because naming the operator is the more specific truth.
+
 #### Where checks run
 
 Checks must judge the *reviewed* commit, not whatever happens to be checked out

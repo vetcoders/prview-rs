@@ -212,8 +212,8 @@ prview feature/x main
 |------|--------------|
 | standard (default) | Full review with tests and lint enabled by default |
 | `--quick` | Light pass: skip tests/lint/bundle/heuristics |
-| `--deep` | All heavier checks enabled (including security and heuristics) |
-| `--ci` | Like deep, tuned for automation: no colors; non-zero on Block/quality failure |
+| `--deep` | All heavier checks enabled (including security and heuristics); tests stay narrowed to the change |
+| `--ci` | Like deep, tuned for automation: no colors; non-zero on Block/quality failure; runs the FULL test suite |
 | `--update` | Incremental rerun after new commits, skipping heavy checks unless forced |
 | `--ai-only` | Minimal artifact pack for AI/review flows |
 
@@ -397,6 +397,14 @@ contains, `--full-tests` is the answer.
 records `full test run requested (--full-tests)` as the reason. Nothing else
 changes: the same commands, the same caps.
 
+**`--ci` runs everything; `--deep` narrows.** Narrowing exists to keep a
+reviewer's laptop usable, and a runner is not a laptop — so the automation
+preset pins both suites to the full run and the pack records
+`full test run requested (--ci)`, naming the preset rather than an operator.
+A local `prview --pr N --deep` stays change-scoped. `--ci --full-tests` is legal
+and simply names the operator as the one who asked. `prview gate` is unaffected:
+the gate profile runs no tests at all.
+
 **Reading it in the pack.** Every `Cargo test` / `Vitest` row in `RUN.json`,
 `report.json` and `MERGE_GATE.json` carries a `scope` object: `mode`
 (`full` or `change-scoped`), the `reason`, how many inputs were considered, how
@@ -519,7 +527,7 @@ prview --help
 | `--security-full` | Full security tier: runs full-tree Semgrep and adds cargo-geiger's unsafe scan (slow; off even under `--deep`) |
 | `--resource-budget safe\|balanced` | Select the whole-machine envelope (`safe` is the default; `balanced` is capped and load-aware) |
 | `--tests-pattern PATTERN` | Filter Vitest by regex or Cargo/libtest by literal substring; Mixed uses the literal intersection and Pytest remains unfiltered |
-| `--full-tests` | Run every test regardless of what changed, disabling change-scoped narrowing for this run |
+| `--full-tests` | Run every test regardless of what changed, disabling change-scoped narrowing for this run (implied by `--ci`) |
 
 An explicit `--skip-security` disables Semgrep before tool discovery, including
 in quick review runs. This is separate from the heavy-security opt-in; an
