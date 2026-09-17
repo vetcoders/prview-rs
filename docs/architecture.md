@@ -2104,7 +2104,7 @@ preflight already has its own probe timeouts.
 
 | Mode | Default |
 |------|---------|
-| local review, `--tui`, MCP `run_review` | 30 minutes |
+| local review, `--tui`, detached MCP `run_review deep` | 30 minutes |
 | `--ci`, `prview gate` | 60 minutes |
 | `--watch`, startup preflight | none |
 

@@ -458,7 +458,8 @@ and says so — it never reports what it managed to finish as a verdict.
 | `--ci` | 60 minutes |
 | `prview gate` | 60 minutes (`prview --deadline 2h gate` — the flag goes before the subcommand) |
 | `--watch` | none: a watch session is a loop, not a review — `--deadline` is refused with it rather than ignored |
-| `prview mcp` `run_review` | the local default it inherits from the CLI it spawns |
+| `prview mcp` `run_review` (`deep`) | the local default it inherits from the CLI it spawns |
+| `prview mcp` `run_review` (`quick`) | the server's own 120-second budget, which is always the tighter one |
 
 ```bash
 prview --deep --deadline 2h        # a big repo, deliberately
@@ -467,7 +468,8 @@ prview --deep --no-deadline        # no net at all
 
 `--deadline` requires a unit — `90s`, `30m`, `1h`, `1h30m`. A bare `30` is
 thirty seconds to one reader and thirty minutes to the next, so it is refused
-rather than guessed. `--deadline` and `--no-deadline` cannot be combined.
+rather than guessed, and so is a number too large for the runtime clock to
+hold. `--deadline` and `--no-deadline` cannot be combined.
 
 **It is a safety net, not a scheduler.** The deadline decides nothing about
 what a review checks: the change decides how much work is necessary (see

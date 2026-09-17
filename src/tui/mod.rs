@@ -67,9 +67,20 @@ impl AnalysisTask {
     }
 
     /// Stop watching the clock: this analysis is over, one way or another.
-    fn disarm_deadline(&self) {
-        if let Some(deadline) = &self.deadline {
+    ///
+    /// Returns the deadline task when it has ALREADY fired, because that task
+    /// owns the process-tree kill and somebody has to wait for it. An unfired
+    /// deadline owns nothing and is simply aborted.
+    fn disarm_deadline(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let deadline = self.deadline.take()?;
+        if matches!(
+            self.governor.cancel_reason(),
+            Some(crate::governor::CancelReason::Deadline { .. })
+        ) {
+            Some(deadline)
+        } else {
             deadline.abort();
+            None
         }
     }
 }
@@ -88,13 +99,36 @@ fn arm_deadline(
         // Background termination: the platform tree-kill may block, and this
         // task must not hold the runtime while the event loop still has to
         // redraw and the operator can still press Ctrl-C.
-        // The returned handle is a JoinHandle; the termination it owns runs on
-        // its own blocking thread, so there is nothing here to await.
-        drop(
-            expiring
-                .begin_background_cancel_with(crate::governor::CancelReason::Deadline { budget }),
-        );
+        let termination = expiring
+            .begin_background_cancel_with(crate::governor::CancelReason::Deadline { budget });
+        // But it must be OWNED to completion. Whoever waits on this task is
+        // waiting for the descendants to be gone, not merely for the kill to
+        // have been started: `main` ends an expired TUI with `process::exit(3)`,
+        // which waits for no worker at all.
+        let _ = termination.await;
     }))
+}
+
+/// Wait out a fired deadline's process-tree kill before the TUI gives up.
+///
+/// A second Ctrl-C remains the operator declining to wait, exactly as it is
+/// during an ordinary cancel join.
+async fn wait_for_deadline_termination(mut termination: tokio::task::JoinHandle<()>) -> Result<()> {
+    loop {
+        tokio::select! {
+            biased;
+            input = next_terminal_event(Duration::from_millis(100)) => {
+                if is_raw_ctrl_c(input?.as_ref()) {
+                    return Err(crate::governor::Cancelled.into());
+                }
+            }
+            finished = &mut termination => {
+                return finished.map_err(|join_error| {
+                    anyhow::anyhow!("deadline tree-termination worker failed: {join_error}")
+                });
+            }
+        }
+    }
 }
 
 /// Run the TUI application
@@ -356,10 +390,17 @@ async fn reap_finished_analysis(
         return Ok(());
     }
 
-    let task = analysis.take().expect("finished task was present");
-    task.disarm_deadline();
+    let mut task = analysis.take().expect("finished task was present");
+    let fired_deadline = task.disarm_deadline();
     let expired = task.governor.cancel_reason();
-    match task.handle.await {
+    let joined = task.handle.await;
+    // Before anything is returned: an expired run ends the session, and the
+    // session ends in `process::exit`, so the kill must be finished by now or
+    // the cargo/semgrep descendants outlive the safety net that stopped them.
+    if let Some(termination) = fired_deadline {
+        wait_for_deadline_termination(termination).await?;
+    }
+    match joined {
         Ok(Ok(())) => {}
         // The governor, not the error, is the authority on WHY a run stopped:
         // any stage may have returned the plain cancellation it always did.
@@ -383,16 +424,27 @@ async fn reap_finished_analysis(
 }
 
 async fn cancel_analysis(analysis: &mut Option<AnalysisTask>) -> Result<()> {
-    let Some(task) = analysis.take() else {
+    let Some(mut task) = analysis.take() else {
         return Ok(());
     };
-    task.disarm_deadline();
+    let fired_deadline = task.disarm_deadline();
 
     // Publish cancellation before returning, but move platform tree termination
     // off the event-loop thread. Windows may need to wait for taskkill; raw input
     // must remain live throughout that wait so a second Ctrl-C can force exit.
     let termination = task.governor.begin_background_cancel();
-    wait_for_cancelled_analysis(task.handle, termination).await
+    let result = wait_for_cancelled_analysis(task.handle, termination).await;
+    // The operator quit into a deadline that had already started killing the
+    // tree. Their own cancel batch has nothing left to drain, so the kill that
+    // matters is the deadline's, and it is still the one that must finish.
+    if let Some(deadline_termination) = fired_deadline {
+        if result.is_ok() {
+            wait_for_deadline_termination(deadline_termination).await?;
+        } else {
+            deadline_termination.abort();
+        }
+    }
+    result
 }
 
 async fn wait_for_cancelled_analysis(
@@ -785,6 +837,7 @@ mod tests {
     use super::*;
     use crate::config::test_config;
     use crate::tui::types::CheckLifecycle;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn default_config() -> Config {
         test_config()
@@ -1542,5 +1595,119 @@ mod tests {
             rx.try_recv().is_err(),
             "an expired run reports through the exit code, not as an in-session error toast",
         );
+    }
+
+    /// `main` ends an expired TUI with `process::exit(3)`, which waits for no
+    /// worker. So the session must not give up while the deadline's own
+    /// process-tree kill is still running: the reap waits for that task before
+    /// it returns the typed deadline.
+    #[tokio::test]
+    async fn an_expired_analysis_waits_for_its_tree_kill_before_giving_up() {
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        let budget = Duration::from_secs(1800);
+        governor.cancel_with(crate::governor::CancelReason::Deadline { budget });
+
+        let cancelled = Arc::clone(&governor);
+        let handle = tokio::spawn(async move {
+            cancelled.cancelled().await;
+            Err(crate::governor::Cancelled.into())
+        });
+        while !handle.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Stands in for the blocking tree kill the fired deadline task owns.
+        let killing = Duration::from_millis(250);
+        let still_killing = Arc::new(AtomicBool::new(true));
+        let worker = Arc::clone(&still_killing);
+        let mut analysis = Some(AnalysisTask {
+            governor: Arc::clone(&governor),
+            handle,
+            deadline: Some(tokio::spawn(async move {
+                tokio::time::sleep(killing).await;
+                worker.store(false, Ordering::SeqCst);
+            })),
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_input_tx, input_rx) = mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        let error = TEST_INPUT_EVENTS
+            .scope(
+                std::cell::RefCell::new(input_rx),
+                reap_finished_analysis(&mut analysis, &tx),
+            )
+            .await
+            .expect_err("an expired analysis must end the session");
+
+        assert!(
+            !still_killing.load(Ordering::SeqCst),
+            "the session gave up while the deadline was still killing the tree",
+        );
+        assert!(
+            started.elapsed() >= killing,
+            "the reap returned before the termination worker finished",
+        );
+        assert_eq!(crate::governor::deadline_exceeded(&error), Some(budget));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The other half of the same contract: the deadline task itself owns the
+    /// kill, so awaiting it means the descendants are gone — not merely that a
+    /// signal has been scheduled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fired_deadline_owns_the_tree_kill_to_completion() {
+        use std::os::unix::process::CommandExt;
+
+        let tmp = tempfile::tempdir().expect("deadline process-tree tempdir");
+        let pidfile = tmp.path().join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > {} ; wait", pidfile.display());
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(script).process_group(0);
+        let mut child = command.spawn().expect("spawn deadline process tree");
+        let root_pid = child.id();
+
+        let published = std::time::Instant::now() + Duration::from_secs(2);
+        while crate::proc::read_published_unix_pid(&pidfile).is_none() {
+            assert!(
+                std::time::Instant::now() < published,
+                "complete grandchild pid was not published"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let grandchild_pid = crate::proc::read_published_unix_pid(&pidfile)
+            .expect("complete numeric grandchild pid");
+
+        let governor = Arc::new(crate::governor::ResourceGovernor::new());
+        assert!(governor.register_child("tui-deadline", root_pid));
+
+        let budget = Duration::from_millis(20);
+        let armed = arm_deadline(&governor, Some(budget)).expect("a bounded analysis arms a timer");
+        armed
+            .await
+            .expect("the deadline task completes, kill included");
+
+        assert!(
+            governor.is_cancelled(),
+            "the deadline must have cancelled the governor before it returned",
+        );
+        let _ = child.wait();
+
+        let gone = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal 0 only probes the PID published by this fixture.
+            if unsafe { libc::kill(grandchild_pid, 0) } == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if matches!(errno, Some(libc::ESRCH) | Some(libc::EPERM)) {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < gone,
+                "deadline grandchild {grandchild_pid} survived the expired run"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

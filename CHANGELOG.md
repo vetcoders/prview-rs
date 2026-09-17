@@ -115,7 +115,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of a test suite must run").
 - `--deadline <TIME>` and `--no-deadline` bound a whole run, or remove the
   bound. The value needs a unit (`90s`, `45m`, `2h`); a bare number is rejected
-  rather than guessed, and the two flags conflict. `--deadline` is also refused
+  rather than guessed, as is a value that overflows or that the runtime timer
+  cannot represent, and the two flags conflict. `--deadline` is also refused
   with `--watch`, which is a session rather than a run and is never bounded — an
   accepted-then-ignored budget is worse than no budget. The deadline is a second
   implementation of the existing `Interrupts` trait, so an expiring run takes
@@ -125,8 +126,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Every run is now bounded in time.** A local review, `--tui`, and MCP
-  `run_review` get 30 minutes; `--ci` and `prview gate` get 60. The numbers come
+- **Every run is now bounded in time.** A local review, `--tui`, and a detached
+  MCP `run_review deep` get 30 minutes; `--ci` and `prview gate` get 60. (An MCP
+  `quick` review keeps its own, tighter 120-second server budget.) The numbers
+  come
   from measuring the heaviest workload the project runs on itself — a full
   `--deep --no-cache` review of prview-rs takes 616 s on a 14-core host and
   514 s on a 24-core one — and leave roughly a 3× margin. `--watch` and the

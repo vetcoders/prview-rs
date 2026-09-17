@@ -310,6 +310,14 @@ pub fn format_budget(budget: Duration) -> String {
     rendered
 }
 
+/// The longest budget the runtime timer can actually hold.
+///
+/// `tokio::time::sleep_until` documents a maximum sleep of 68_719_476_734
+/// milliseconds (~2.2 years) and panics past it. A deadline the timer cannot
+/// represent would take down the run it exists to protect, so it is refused at
+/// the parser instead.
+pub const MAX_DEADLINE: Duration = Duration::from_millis(68_719_476_734);
+
 /// Parse an operator-typed run deadline such as `90s`, `30m`, `1h`, `1h30m`.
 ///
 /// A unit is REQUIRED. A bare number is the one input whose meaning a reader
@@ -348,8 +356,12 @@ pub fn parse_deadline(raw: &str) -> std::result::Result<Duration, String> {
         let value: u64 = digits
             .parse()
             .map_err(|_| format!("deadline value out of range: {raw}"))?;
-        total = total
-            .checked_add(value.saturating_mul(multiplier))
+        // Checked, not saturating: a component that saturates would be accepted
+        // as some other budget entirely, which is exactly the silent guess this
+        // parser exists to refuse.
+        total = value
+            .checked_mul(multiplier)
+            .and_then(|seconds| total.checked_add(seconds))
             .ok_or_else(|| format!("deadline value out of range: {raw}"))?;
         digits.clear();
         units_seen += 1;
@@ -366,7 +378,11 @@ pub fn parse_deadline(raw: &str) -> std::result::Result<Duration, String> {
             "a zero deadline would stop the run before it started: {ACCEPTED}"
         ));
     }
-    Ok(Duration::from_secs(total))
+    let budget = Duration::from_secs(total);
+    if budget > MAX_DEADLINE {
+        return Err(format!("deadline value out of range: {raw}"));
+    }
+    Ok(budget)
 }
 
 /// A slice of the run's budget, held for exactly as long as the task runs.
@@ -1645,6 +1661,40 @@ mod tests {
                 "the error must say what is accepted: {error}",
             );
         }
+    }
+
+    /// A budget nobody could honour is a lie about the safety net, so it is
+    /// refused rather than silently turned into a different number.
+    #[test]
+    fn a_deadline_bigger_than_the_clock_is_out_of_range() {
+        // Saturating multiplication used to turn this into `u64::MAX` seconds
+        // and accept it as a budget the operator never asked for.
+        for overflowing in [
+            "18446744073709551615h",
+            "18446744073709551615m",
+            "99999999999999999999s",
+            "1h18446744073709551615m",
+        ] {
+            let error = parse_deadline(overflowing)
+                .expect_err(&format!("{overflowing:?} overflows and must be refused"));
+            assert!(
+                error.contains("out of range"),
+                "an overflow must be named as one: {error}",
+            );
+        }
+
+        // The timer itself is the other bound: tokio panics past its documented
+        // maximum sleep, and the deadline must not be the thing that kills the
+        // run it protects.
+        let past_the_clock = MAX_DEADLINE.as_secs() + 1;
+        let error = parse_deadline(&format!("{past_the_clock}s"))
+            .expect_err("a budget the timer cannot hold must be refused");
+        assert!(error.contains("out of range"), "got: {error}");
+
+        assert!(
+            parse_deadline(&format!("{}s", MAX_DEADLINE.as_secs())).is_ok(),
+            "the bound itself is still a budget the timer can hold",
+        );
     }
 
     /// The formatter is what the operator reads back in the stderr message, so
