@@ -128,8 +128,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Every run is now bounded in time.** A local review, `--tui`, and MCP
   `run_review` get 30 minutes; `--ci` and `prview gate` get 60. The numbers come
   from measuring the heaviest workload the project runs on itself — a full
-  `--deep --no-cache` review of prview-rs takes ~10 minutes on a 14-core host —
-  and leave roughly a 3× margin. `--watch` and the startup preflight stay
+  `--deep --no-cache` review of prview-rs takes 616 s on a 14-core host and
+  514 s on a 24-core one — and leave roughly a 3× margin. `--watch` and the
+  startup preflight stay
   unbounded on purpose. A run that was previously able to hang forever now ends;
   a run that finished before still finishes.
 - **A run stopped by its deadline exits `3`, not `130`.** `130` means the

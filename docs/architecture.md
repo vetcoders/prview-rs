@@ -2083,16 +2083,24 @@ pack keeps no success-shaped surface, `latest` and the run index are untouched,
 and no partial PASS exists to be mistaken for a verdict.
 
 **The number comes from measurement, not taste.** A full
-`prview --deep --no-cache --local-only` of prview-rs itself — the heaviest
-workload the project runs on itself, with `cargo test` and `cargo check` on a
-14-core host — takes about 10 minutes end to end (616 s measured; `cargo test`
-429 s of it). The local default of 30 minutes is ~3× that, which leaves room for
-a colder cache, a slower machine, and a bigger repository while still being a
-number an operator can hold in their head. CI gets 60 minutes because a hosted
-runner is slower and its job timeout (`timeout-minutes: 60`) should not be the
-first thing to notice a hang. Watch mode and the startup preflight are
-deliberately unbounded: watch is a session, not a run, and the preflight already
-has its own probe timeouts.
+`prview --deep --no-cache --local-only` of prview-rs itself is the heaviest
+workload the project runs on itself — `cargo check` and the whole `cargo test`
+suite under the default `safe` budget. Measured twice in September 2026:
+
+| Host | Total | `Cargo test` |
+|------|-------|--------------|
+| 14 logical cores | 616 s (10.3 min) | 429 s |
+| 24 logical cores | 514 s (8.6 min) | 473 s |
+
+More cores buy very little, because `safe` serializes the whole-machine tools by
+design; the run is as long as its longest tool. The local default of 30 minutes
+is ~3× the slower of the two, which leaves room for a colder cache, a slower
+machine, and a bigger repository while still being a number an operator can hold
+in their head. CI gets 60 minutes because a hosted runner has fewer cores than
+either host measured here, and because a job should learn from prview that its
+review hung, not from the runner killing it. Watch mode and the startup
+preflight are deliberately unbounded: watch is a session, not a run, and the
+preflight already has its own probe timeouts.
 
 | Mode | Default |
 |------|---------|

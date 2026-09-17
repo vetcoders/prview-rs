@@ -491,11 +491,12 @@ The distinction matters in automation — a job that retries on `130` because a
 human cancelled should not retry on a run that will exhaust the same budget
 again.
 
-The defaults come from measurement, not taste: a full `--deep` self-review of
-prview-rs on a 14-core laptop took 616 seconds in September 2026 (`cargo test`
-alone 429 s of it), so the local default is roughly three times the longest run
-anybody has measured on an ordinary machine — long enough that an honest review
-never meets it, short enough to end a stuck one while you are still watching.
+The defaults come from measurement, not taste: a full `--deep --no-cache`
+self-review of prview-rs took 616 seconds on a 14-core machine and 514 seconds
+on a 24-core one in September 2026, `cargo test` being most of both. The local
+default is roughly three times the slower of those — long enough that an honest
+review never meets it, short enough to end a stuck one while you are still
+watching.
 
 ### Test selection
 
