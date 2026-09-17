@@ -447,6 +447,59 @@ or unreadable, the row is an `error` saying the run could not be verified, not a
 pass and not a skip. A full `vitest run` is untouched: same command, same
 exit-code verdict.
 
+### Run deadline
+
+Every run is bounded. If the work does not fit in the budget, prview stops it
+and says so — it never reports what it managed to finish as a verdict.
+
+| Where | Default budget |
+|---|---|
+| a local run (`--quick`, `--deep`, plain) | 30 minutes |
+| `--ci` | 60 minutes |
+| `prview gate` | 60 minutes (`prview --deadline 2h gate` — the flag goes before the subcommand) |
+| `--watch` | none: a watch session is a loop, not a review — `--deadline` is refused with it rather than ignored |
+| `prview mcp` `run_review` (`deep`) | the local default it inherits from the CLI it spawns |
+| `prview mcp` `run_review` (`quick`) | the server's own 120-second budget, which is always the tighter one |
+
+```bash
+prview --deep --deadline 2h        # a big repo, deliberately
+prview --deep --no-deadline        # no net at all
+```
+
+`--deadline` requires a unit — `90s`, `30m`, `1h`, `1h30m`. A bare `30` is
+thirty seconds to one reader and thirty minutes to the next, so it is refused
+rather than guessed, and so is a number too large for the runtime clock to
+hold. `--deadline` and `--no-deadline` cannot be combined.
+
+**It is a safety net, not a scheduler.** The deadline decides nothing about
+what a review checks: the change decides how much work is necessary (see
+*Change-scoped test runs*), `--resource-budget` decides how gently that work is
+done, and the deadline only decides what happens when the necessary work did
+not fit. It never turns a partial run into a partial `PASS`.
+
+**What an expired run leaves behind.** The governor stops granting budget and
+kills the process groups the run started, then the run unwinds through its own
+error path — the same path Ctrl-C uses, which is what removes the temporary
+worktrees a killed process would leave on disk. Stopped during its checks, the
+run publishes no pack at all. Stopped during artifact generation, it removes
+every success-shaped surface and writes `00_summary/INCOMPLETE.json` with
+`reason: "deadline exceeded"`, `deadline_secs`, and the stage it reached;
+`latest` and the run index are untouched.
+
+**Exit 3, not 130.** An expired run exits `3`, prview's existing "could not
+reach a trustworthy verdict" code, and prints the budget it spent plus how to
+change it. `130` stays what it has always meant: the operator pressed Ctrl-C.
+The distinction matters in automation — a job that retries on `130` because a
+human cancelled should not retry on a run that will exhaust the same budget
+again.
+
+The defaults come from measurement, not taste: a full `--deep --no-cache`
+self-review of prview-rs took 616 seconds on a 14-core machine and 514 seconds
+on a 24-core one in September 2026, `cargo test` being most of both. The local
+default is roughly three times the slower of those — long enough that an honest
+review never meets it, short enough to end a stuck one while you are still
+watching.
+
 ### Test selection
 
 `--tests-pattern PATTERN` is runner-aware rather than one portable regex:
@@ -604,6 +657,8 @@ job passed or failed.
 | `--policy-file <path>` | Path to `.prview-policy.yml` |
 | `--policy-mode <shadow\|warn\|block>` | Override the policy mode |
 | `--why-blocked` | Explain why the merge gate is blocking |
+| `--deadline <time>` | Bound the whole run at `90s` / `30m` / `1h30m` instead of the default (30m local, 60m `--ci`); a unit is required |
+| `--no-deadline` | Remove the whole-run deadline; the run ends only on its own or on Ctrl-C |
 
 ### Output
 
@@ -651,6 +706,16 @@ exit code is derived from that pack like any other run's: a reused `BLOCK` or a
 reused warning under `--fail-on-warnings` exits non-zero rather than reporting a
 green second invocation over an artifact nothing re-checked. `--soft-exit`
 remains the one way to ask for `0` regardless.
+
+Two exits are not verdicts at all and mean what they mean in every mode:
+
+| Exit | Meaning |
+|------|---------|
+| `3` | prview could not reach a trustworthy verdict — an unreadable pack, or a run stopped by its deadline (see *Run deadline*) |
+| `130` | the operator cancelled with Ctrl-C |
+
+`--soft-exit` does not apply to either: it converts a verdict into `0`, and
+neither of these is a verdict.
 
 ## Examples
 
@@ -740,7 +805,9 @@ An unexpected invalid `00_summary/SANITY.json` is a fatal generation result:
 the diagnostic directory and SANITY evidence remain on disk, but no ZIP,
 `latest` update, index row, or successful completion message is produced.
 A cancellation observed before the durable publication commit writes
-`00_summary/INCOMPLETE.json` and does not update `latest` or the run index. If
+`00_summary/INCOMPLETE.json` and does not update `latest` or the run index. The
+marker names its cause: `reason: "cancelled"` for the operator's Ctrl-C, and
+`reason: "deadline exceeded"` plus `deadline_secs` for an expired run. If
 cancellation is observed after `latest` has
 already been retargeted, the previous completed run is restored. A cancel
 during index registration rolls the index file back and does not prune older
@@ -967,7 +1034,8 @@ generation announces and records `rust-api.fast-preset-unknown` or
 failure, or malformed output becomes an exact-comparison typed unknown.
 Headless Ctrl-C terminates the governed child and remains cancellation with
 exit 130; the TUI retains the first/second-interrupt semantics documented in
-the architecture guide.
+the architecture guide. A run stopped by its own deadline follows the same
+termination path but exits 3, because nobody cancelled it.
 Typed unknowns degrade confidence and require review without claiming a
 confirmed removal. Rust identities include ordinary type/value/macro items plus
 public modules, library crates, and Cargo features. An implicit library target

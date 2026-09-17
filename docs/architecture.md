@@ -1567,7 +1567,10 @@ impl ResourceGovernor {
     pub fn try_acquire(&self, weight: Weight) -> Option<GovernorPermit>;
     pub fn register_child(&self, key: impl Into<String>, pid: u32) -> bool;
     pub fn unregister_child(&self, key: &str);
-    pub fn cancel(&self);
+    pub fn cancel(&self);                                   // CancelReason::Operator
+    pub fn cancel_with(&self, reason: CancelReason);
+    pub fn cancel_reason(&self) -> Option<CancelReason>;     // the first reason wins
+    pub fn cancellation_error(&self) -> anyhow::Error;       // Cancelled | DeadlineExceeded
     pub fn cancelled_signal(&self) -> tokio::sync::watch::Receiver<bool>;
     pub async fn cancelled(&self);
     pub fn is_cancelled(&self) -> bool;
@@ -1726,13 +1729,13 @@ Admission is what makes the distinction real, so the run reports it:
 #### Cancellation path (Ctrl-C)
 
 ```
-governor::with_cancellation(work, governor, CtrlC)
+governor::with_cancellation(work, governor, DeadlineOrCtrlC::new(config.deadline))
       │
       ├─ tokio::spawn(supervise)
       │        └── a SEPARATE task, drained by an explicit stop handoff
       │        │  first interrupt
       │        ▼
-      │   governor.begin_cancel()
+      │   governor.begin_cancel_with(interrupt.reason())
       │        ├─► semaphore.close()  ── refuses newcomers AND tasks already waiting
       │        ├─► watch::send(true)  ── wakes the dispatcher's select! arm
       │        └─► drain children into an owned termination batch
@@ -1752,6 +1755,7 @@ governor::with_cancellation(work, governor, CtrlC)
              │                           heuristics AnalysisSnapshots
              ▼
         main exits `CANCELLED_EXIT_CODE` (130 = 128 + SIGINT)
+                   ── or 3 when the reason was the run deadline
 ```
 
 **The supervisor is its own task.** It used to be an arm of the same `select!`
@@ -1769,7 +1773,7 @@ is the `Interrupts` trait rather than a direct `ctrl_c()` call, so the state
 machine is testable without raising a real signal at the test harness.
 
 Cancellation has a synchronous truth boundary and a blocking cleanup half.
-`begin_cancel()` publishes the cancelled state, closes admission, and drains
+`begin_cancel_with()` publishes the cancelled state and its reason, closes admission, and drains
 the child registry before the work future can finish. The owned termination
 batch then runs outside the async signal owner, which keeps polling a second
 interrupt while a platform tree killer is blocked. Headless completion uses the
@@ -2031,6 +2035,87 @@ does not yet exist. The supervisor stays alive until raw mode is enabled, then
 completes an explicit biased handoff that consumes any already-pending signal
 before key events take ownership. Both the post-stage and post-handoff checks
 convert a late interrupt into typed cancellation.
+
+#### Run deadline
+
+Scope, governor, and deadline are three independent mechanisms and each answers
+a different question. Scope decides **how much has to run**, the governor decides
+**how gently it runs**, and the deadline decides **what happens if it still did
+not fit**. A tighter scope and a safe budget both make a run likelier to finish,
+but neither is a bound: a single hung `cargo test` or an unexpectedly huge
+repository defeats both. The deadline is the safety net under them, so it is
+deliberately not derived from either.
+
+It is implemented as a second `Interrupts` rather than a timer bolted onto the
+run, because the interrupt supervisor already owns everything an expiring run
+needs — closing admission, killing the child tree, refusing a verdict, writing
+`INCOMPLETE.json`. `DeadlineOrCtrlC` selects (biased towards the operator)
+between `CtrlC` and a `sleep_until`, and both arms produce the same typed
+`Interrupt`:
+
+```rust
+pub enum Interrupt { Operator, Deadline { budget: Duration } }
+pub enum CancelReason { Operator, Deadline { budget: Duration } }
+```
+
+The supervisor hands that reason to `governor.begin_background_cancel_with(…)`,
+so the governor remembers *why* it was cancelled. The first reason wins: a
+deadline that fires while an operator cancel is already unwinding does not
+relabel it. The reason is what makes the two outcomes distinguishable
+downstream — `governor.cancellation_error()` returns `Cancelled` or
+`DeadlineExceeded { budget }`, `is_cancellation()` accepts both so every existing
+cancellation seam keeps working, and only `main` separates them: cancellation
+exits 130, an expired deadline exits `GATE_EXECUTION_ERROR_EXIT_CODE` (3). 130
+means "the operator stopped this"; a deadline is prview failing to reach a
+verdict in the time it was given, which is exactly what 3 already means. The
+governor also records the stage it entered (`preparing` / `checks` / `artifact
+generation`) so the stderr line can name where the time went.
+
+A deadline reaching artifact generation takes the existing incomplete-pack path
+and adds its cause to the marker, additively (schema `1.0` is unchanged):
+
+```json
+{ "status": "incomplete", "reason": "deadline exceeded", "deadline_secs": 1800 }
+```
+
+`reason: "cancelled"` is still what an operator interrupt writes. Either way the
+pack keeps no success-shaped surface, `latest` and the run index are untouched,
+and no partial PASS exists to be mistaken for a verdict.
+
+**The number comes from measurement, not taste.** A full
+`prview --deep --no-cache --local-only` of prview-rs itself is the heaviest
+workload the project runs on itself — `cargo check` and the whole `cargo test`
+suite under the default `safe` budget. Measured twice in September 2026:
+
+| Host | Total | `Cargo test` |
+|------|-------|--------------|
+| 14 logical cores | 616 s (10.3 min) | 429 s |
+| 24 logical cores | 514 s (8.6 min) | 473 s |
+
+More cores buy very little, because `safe` serializes the whole-machine tools by
+design; the run is as long as its longest tool. The local default of 30 minutes
+is ~3× the slower of the two, which leaves room for a colder cache, a slower
+machine, and a bigger repository while still being a number an operator can hold
+in their head. CI gets 60 minutes because a hosted runner has fewer cores than
+either host measured here, and because a job should learn from prview that its
+review hung, not from the runner killing it. Watch mode and the startup
+preflight are deliberately unbounded: watch is a session, not a run, and the
+preflight already has its own probe timeouts.
+
+| Mode | Default |
+|------|---------|
+| local review, `--tui`, detached MCP `run_review deep` | 30 minutes |
+| `--ci`, `prview gate` | 60 minutes |
+| `--watch`, startup preflight | none |
+
+`--deadline <time>` (unit required: `90s`, `45m`, `2h`) overrides any of them and
+`--no-deadline` removes the bound; the two conflict, and `--deadline` is refused
+with `--watch` rather than accepted and ignored. `prview gate` reads the same two
+flags from before the subcommand, so the profile raises the default without
+overruling a request. The TUI has no headless
+signal supervisor, so it arms the same budget as a spawned timer that calls
+`begin_background_cancel_with` on the analysis governor and is disarmed when the
+analysis finishes or the operator quits first.
 
 **Operator surface.** `--resource-budget safe|balanced` selects the plan; preflight
 prints requested/effective budget, parent permits, child-worker cap, current-load

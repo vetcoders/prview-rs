@@ -228,6 +228,10 @@ impl App {
                 .map(|paths| checks::scope::ChangeSet::new(paths, diff_bases.len() == 1)))
         })?;
         self.ensure_not_cancelled()?;
+        // Where the run is, for an interrupt that has to say where it landed.
+        // A deadline in the checks leaves no pack at all; one in artifact
+        // generation leaves a pack marked incomplete.
+        self.governor.enter_stage(governor::RunStage::Checks);
         let (check_results, skipped_checks) = if self.config.update_mode {
             // In update mode, skip heavy checks UNLESS user explicitly forced them
             // via --with-tests or --with-security (respect user intent over preset)
@@ -285,6 +289,7 @@ impl App {
         // for as long as it runs, so the runtime is told to keep a thread free
         // for the interrupt supervisor.
         self.ensure_not_cancelled()?;
+        self.governor.enter_stage(governor::RunStage::Artifacts);
         let artifacts_dir = governor::blocking_stage(|| {
             artifacts::generate(artifacts::GenerateInput {
                 config: &self.config,
@@ -983,7 +988,7 @@ mod tests {
 
     #[cfg(unix)]
     impl crate::governor::Interrupts for InterruptWhenFileExists {
-        async fn next(&mut self) {
+        async fn next(&mut self) -> crate::governor::Interrupt {
             if self.delivered {
                 std::future::pending::<()>().await;
             }
@@ -991,6 +996,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             self.delivered = true;
+            crate::governor::Interrupt::Operator
         }
     }
 
@@ -1237,10 +1243,11 @@ mod tests {
         struct OneInterrupt(mpsc::UnboundedReceiver<()>);
 
         impl Interrupts for OneInterrupt {
-            async fn next(&mut self) {
+            async fn next(&mut self) -> crate::governor::Interrupt {
                 if self.0.recv().await.is_none() {
                     std::future::pending::<()>().await;
                 }
+                crate::governor::Interrupt::Operator
             }
         }
 
@@ -1291,10 +1298,11 @@ mod tests {
         struct OneInterrupt(mpsc::UnboundedReceiver<()>);
 
         impl Interrupts for OneInterrupt {
-            async fn next(&mut self) {
+            async fn next(&mut self) -> crate::governor::Interrupt {
                 if self.0.recv().await.is_none() {
                     std::future::pending::<()>().await;
                 }
+                crate::governor::Interrupt::Operator
             }
         }
 
@@ -1322,6 +1330,49 @@ mod tests {
         assert!(
             std::fs::read_dir(out.path()).unwrap().next().is_none(),
             "watch cancellation before diff resolution must publish no pack"
+        );
+    }
+
+    /// Contract §12 pt 7: a deadline that expires while the run is still
+    /// working stops it with no pack and no verdict, through the production
+    /// interrupt source and nobody pressing anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expired_deadline_stops_the_run_and_publishes_no_pack() {
+        use crate::governor::DeadlineOrCtrlC;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let repo = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let app = crate::App::from_config(reviewable_repo(repo.path(), out.path())).unwrap();
+        let governor = app.governor();
+        let probe_governor = Arc::clone(&governor);
+        let budget = Duration::from_millis(50);
+
+        let work = app.run_quick_with_sync_probe(move || {
+            let limit = std::time::Instant::now() + Duration::from_secs(5);
+            while !probe_governor.is_cancelled() && std::time::Instant::now() < limit {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let error =
+            crate::governor::with_cancellation(work, &governor, DeadlineOrCtrlC::new(Some(budget)))
+                .await
+                .expect_err("an expired run produces no report");
+
+        assert!(crate::governor::is_cancellation(&error), "{error:#}");
+        assert_eq!(
+            crate::governor::deadline_exceeded(&error),
+            Some(budget),
+            "the run must end in its own typed deadline: {error:#}"
+        );
+        assert_eq!(
+            governor.cancel_reason(),
+            Some(crate::governor::CancelReason::Deadline { budget })
+        );
+        assert!(
+            std::fs::read_dir(out.path()).unwrap().next().is_none(),
+            "a run stopped during its checks must publish no pack at all"
         );
     }
 
