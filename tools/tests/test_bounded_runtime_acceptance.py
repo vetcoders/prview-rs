@@ -41,6 +41,116 @@ class SuccessfulLiveCheckTests(unittest.TestCase):
                 )
 
 
+class RequiredRunChecksTests(unittest.TestCase):
+    def evaluate_with_checks(self, checks: list[dict]) -> list[str]:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        work = pathlib.Path(temp.name)
+        summary = work / "pack" / "00_summary"
+        summary.mkdir(parents=True)
+        (summary / "RUN.json").write_text(
+            json.dumps(
+                {
+                    "resources": {
+                        "requested_budget": "safe",
+                        "effective_budget": "safe",
+                        "parent_permits": 1,
+                        "child_worker_limit": 1,
+                    },
+                    "checks": checks,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (summary / "SANITY.json").write_text("{}", encoding="utf-8")
+        (summary / "MERGE_GATE.json").write_text(
+            json.dumps({"decision": {}}), encoding="utf-8"
+        )
+        log = work / "prview.log"
+        log.write_text("Schedule:\nQueued:\nRunning:\n", encoding="utf-8")
+        receipt = {
+            "violations": [],
+            "process": {"exit_code": 0, "timed_out": False},
+            "command": ["prview", "--deep"],
+        }
+        census = {
+            "seen_tools": {tool: True for tool in MODULE.WHOLE_MACHINE_TOOLS},
+            "max_whole_machine_parents": 1,
+            "max_descendants": {
+                "rustc": 1,
+                "vitest_workers": 1,
+                "semgrep_core": 1,
+            },
+            "observed_caps": {
+                "cargo_build_jobs": {"1"},
+                "vitest_max_workers": {"1"},
+                "semgrep_jobs": {"1"},
+            },
+            "observed_commands": set(),
+            "cargo_invocations": [],
+            "truncated": False,
+        }
+
+        MODULE.evaluate(
+            receipt,
+            census,
+            work / "pack",
+            log,
+            {"assert_scope": lambda *_: None},
+        )
+        return receipt["violations"]
+
+    def test_clippy_and_rustfmt_are_required_live_checks(self) -> None:
+        self.assertEqual(MODULE.REQUIRED_RUN_CHECKS["clippy"], "Clippy")
+        self.assertEqual(MODULE.REQUIRED_RUN_CHECKS["rustfmt"], "Rustfmt")
+        self.assertIn("clippy", MODULE.REQUIRED_LIVE_CHECKS_ONLY)
+        self.assertIn("rustfmt", MODULE.REQUIRED_LIVE_CHECKS_ONLY)
+
+        run = {
+            "checks": [
+                {"name": "Clippy", "status": "passed", "cached": False},
+                {"name": "Rustfmt", "status": "passed", "cached": False},
+            ]
+        }
+        self.assertTrue(MODULE.has_successful_live_check(run, "Clippy"))
+        self.assertTrue(MODULE.has_successful_live_check(run, "Rustfmt"))
+
+    def test_rejects_a_missing_toolchain_component(self) -> None:
+        run = {
+            "checks": [
+                {"name": "Clippy", "status": "failed", "cached": False},
+                {"name": "Rustfmt", "status": "skipped", "cached": False},
+            ]
+        }
+        self.assertFalse(MODULE.has_successful_live_check(run, "Clippy"))
+        self.assertFalse(MODULE.has_successful_live_check(run, "Rustfmt"))
+
+    def test_evaluate_enforces_each_required_live_check(self) -> None:
+        passing_checks = [
+            {"name": name, "status": "passed", "cached": False}
+            for name in MODULE.REQUIRED_RUN_CHECKS.values()
+        ]
+
+        for check_name in ("Clippy", "Rustfmt"):
+            for failure in ("missing", "failed"):
+                with self.subTest(check=check_name, failure=failure):
+                    checks = [dict(row) for row in passing_checks]
+                    if failure == "missing":
+                        checks = [row for row in checks if row["name"] != check_name]
+                    else:
+                        next(row for row in checks if row["name"] == check_name)[
+                            "status"
+                        ] = "failed"
+
+                    self.assertEqual(
+                        self.evaluate_with_checks(checks),
+                        [
+                            "RUN.json does not contain a live successful "
+                            f"{check_name} gate"
+                        ],
+                    )
+
+
 class CaseCatalogueTests(unittest.TestCase):
     def test_every_case_has_a_mutation_and_an_assertion(self) -> None:
         self.assertEqual(

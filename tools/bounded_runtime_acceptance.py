@@ -31,7 +31,16 @@ REQUIRED_RUN_CHECKS = {
     "tsc": "TypeScript",
     "eslint": "ESLint",
     "stylelint": "Stylelint",
+    "clippy": "Clippy",
+    "rustfmt": "Rustfmt",
 }
+# Clippy and Rustfmt both invoke the `cargo` executable (`cargo clippy`,
+# `cargo fmt --check`), so the process census already counts them under the
+# "cargo" whole-machine tool in WHOLE_MACHINE_TOOLS above; they are not a
+# second whole-machine parent to track. They still need their own live,
+# non-cached, passed row in RUN.json, since a missing toolchain component
+# makes cargo itself run while these two checks fail or are skipped.
+REQUIRED_LIVE_CHECKS_ONLY = ("clippy", "rustfmt")
 
 
 def utc_now() -> str:
@@ -1098,6 +1107,13 @@ def evaluate(
             census["seen_tools"][tool],
             f"no real {tool} process was observed",
         )
+        check_name = REQUIRED_RUN_CHECKS[tool]
+        add_assertion(
+            violations,
+            has_successful_live_check(run, check_name),
+            f"RUN.json does not contain a live successful {check_name} gate",
+        )
+    for tool in REQUIRED_LIVE_CHECKS_ONLY:
         check_name = REQUIRED_RUN_CHECKS[tool]
         add_assertion(
             violations,
