@@ -119,13 +119,8 @@ workers. The receipt also requires a clean source tree whose `HEAD` is the exact
 candidate SHA. The release build embeds that exact `PRVIEW_SOURCE_SHA`; the
 harness probes it from the binary, requires it to match the requested commit,
 and records the binary's SHA-256 digest. A dirty or stale local build therefore
-cannot masquerade as exact-SHA evidence. The pull-request workflow definition
-can come from a newer merge ref while the acceptance checkout deliberately
-remains pinned to the exact PR head. The job therefore selects newer acceptance
-cases only when that head's harness exposes them; every case exposed by `main`
-remains mandatory on `main`, while an intentionally unsynchronised older PR
-cannot fail merely because it cannot parse a case introduced later on the base
-branch. The job keeps its failure-shaped receipt under the runner's temporary directory so
+cannot masquerade as exact-SHA evidence. The
+job keeps its failure-shaped receipt under the runner's temporary directory so
 initializing that evidence cannot dirty the checkout it is about to validate.
 It has an internal 20-minute deadline inside a 45-minute Actions timeout, then
 always uploads a compact JSON receipt plus the captured CLI log.

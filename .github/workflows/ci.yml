@@ -132,9 +132,8 @@ jobs:
   ordinary-machine-resource-acceptance:
     name: Ordinary-machine bounded deep review
     runs-on: ubuntu-latest
-    # Run every scope case supported by the exact PR head. A merge-ref workflow
-    # can be newer than an intentionally unsynchronised head, so newer cases
-    # must not be passed to an older harness that cannot parse them yet.
+    # Three deep reviews of the fixture now, one per scope case, each with its
+    # own npm install and its own cargo/semgrep/vitest passes.
     timeout-minutes: 60
     env:
       PRVIEW_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -174,20 +173,14 @@ jobs:
         env:
           PRVIEW_ACCEPTANCE_DIR: ${{ runner.temp }}/prview-resource-acceptance
         run: |
-          acceptance_cases=(
-            --case mixed
-            --case js-only
-            --case unknown-input
-          )
-          if python3 -c 'import tools.bounded_runtime_acceptance as m; raise SystemExit("deadline" not in m.CASES)'; then
-            acceptance_cases+=(--case deadline)
-          fi
           python3 tools/bounded_runtime_acceptance.py \
             --binary "$GITHUB_WORKSPACE/target/release/prview" \
             --fixture "$GITHUB_WORKSPACE/tools/fixtures/bounded-runtime" \
             --receipt-dir "$PRVIEW_ACCEPTANCE_DIR" \
             --source-sha "$PRVIEW_SOURCE_SHA" \
-            "${acceptance_cases[@]}" \
+            --case mixed \
+            --case js-only \
+            --case unknown-input \
             --timeout-seconds 1200
       - name: Upload bounded-runtime receipt
         if: always()
