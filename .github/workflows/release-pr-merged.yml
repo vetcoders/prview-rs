@@ -1,0 +1,138 @@
+name: Tag Merged Release PR
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+concurrency:
+  group: release-tag-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  tag:
+    name: Validate merge and create exact tag
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      release: ${{ steps.marker.outputs.release }}
+      version: ${{ steps.marker.outputs.version }}
+      merge_sha: ${{ github.event.pull_request.merge_commit_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Validate release PR marker
+        id: marker
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PR_HEAD_REPO" == "$GITHUB_REPOSITORY" ]] || {
+            echo "::notice::Ignoring a merged fork PR; release PRs must originate in this repository."
+            echo "release=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          }
+          if ! grep -q '^<!-- prview-release-pr:v1$' <<<"$PR_BODY"; then
+            if [[ "$PR_HEAD_REF" == release/v* ]] || [[ "$PR_TITLE" == "chore(release): prepare v"* ]]; then
+              echo "::error::release-shaped PR is missing the exact prview-release-pr:v1 marker"
+              exit 1
+            fi
+            echo "::notice::Merged PR is not marked as a release PR."
+            echo "release=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          VERSION=$(sed -n 's/^version=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' <<<"$PR_BODY")
+          EXPECTED_MAIN_SHA=$(sed -n 's/^expected_main_sha=\([0-9a-f]\{40\}\)$/\1/p' <<<"$PR_BODY")
+          [[ -n "$VERSION" && -n "$EXPECTED_MAIN_SHA" ]] || {
+            echo "::error::release PR marker is incomplete or malformed"
+            exit 1
+          }
+          [[ "$PR_TITLE" == "chore(release): prepare v$VERSION" ]] || {
+            echo "::error::release PR title does not match marker version"
+            exit 1
+          }
+          [[ "$PR_HEAD_REF" == "release/v$VERSION" ]] || {
+            echo "::error::release PR branch must be release/v$VERSION"
+            exit 1
+          }
+          {
+            echo "release=true"
+            echo "version=$VERSION"
+            echo "base_sha=$EXPECTED_MAIN_SHA"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Validate merged release contract
+        if: steps.marker.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.marker.outputs.version }}
+          BASE_SHA: ${{ steps.marker.outputs.base_sha }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VALIDATOR="$RUNNER_TEMP/release-contract.sh"
+          git show "$BASE_SHA:tools/release-contract.sh" >"$VALIDATOR"
+          chmod +x "$VALIDATOR"
+          "$VALIDATOR" merged "$VERSION" "$BASE_SHA" "$MERGE_SHA"
+
+      - name: Create immutable release tag
+        if: steps.marker.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.marker.outputs.version }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v$VERSION"
+          REMOTE_SHA=$(git ls-remote --tags origin "refs/tags/$TAG^{}" | awk '{print $1}')
+          if [[ -z "$REMOTE_SHA" ]]; then
+            REMOTE_SHA=$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}')
+          fi
+          if [[ -n "$REMOTE_SHA" ]]; then
+            [[ "$REMOTE_SHA" == "$MERGE_SHA" ]] || {
+              echo "::error::$TAG already exists at $REMOTE_SHA, expected $MERGE_SHA"
+              exit 1
+            }
+            echo "$TAG already points to the validated merge; nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" "$MERGE_SHA" -m "Release $TAG"
+          git push origin "refs/tags/$TAG"
+          {
+            echo "### Release tag created"
+            echo
+            echo "- tag: $TAG"
+            echo "- commit: $MERGE_SHA"
+            echo "- next: signed release workflow"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Dispatch trusted publication continuation
+        if: steps.marker.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.marker.outputs.version }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches" \
+            -f event_type=prview-release-publish \
+            -F "client_payload[release_tag]=v$VERSION" \
+            -F "client_payload[release_commit]=$MERGE_SHA" \
+            -F "client_payload[pull_request_number]=$PR_NUMBER"
+          echo "Trusted publication continuation dispatched for v$VERSION."

@@ -293,7 +293,14 @@ Use `prview mcp --probe` as the first manual smoke check; it performs a real MCP
 - `main` — the trunk and the stable release branch
 - feature / fix / chore branches are created from `main` and open PRs back into `main`
 - PRs land as merge commits (no squash)
-- release tags (`v*`) are cut from `main`
+- release tags (`v*`) are created automatically from validated release PR
+  merge commits on `main`
+
+Maintainers choose the version and expected `main` SHA in the **Prepare
+Release PR** workflow. Review the generated draft carefully: merging it triggers
+the signed GitHub Release and crates.io publication. The canonical procedure,
+dry run, guards, and recovery table are in
+[`docs/RELEASING.md`](docs/RELEASING.md).
 
 The `prview` tool itself analyzes repositories using any base branch (`develop`, `main`, `master`, …).
 
@@ -315,6 +322,7 @@ prview completions fish > $HOME/.config/fish/completions/prview.fish
 - [`docs/mcp-smoke.md`](docs/mcp-smoke.md) — MCP smoke walkthrough for agents
 - [`docs/architecture.md`](docs/architecture.md) — how it works
 - [`docs/development.md`](docs/development.md) — contributing
+- [`docs/RELEASING.md`](docs/RELEASING.md) — maintainer release workflow
 - [`docs/contracts/merge_gate.md`](docs/contracts/merge_gate.md) — `MERGE_GATE.json` contract
 
 ## License

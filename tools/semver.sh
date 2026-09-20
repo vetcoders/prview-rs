@@ -7,15 +7,11 @@ Usage:
   tools/semver.sh show
   tools/semver.sh check [--allow-dirty] [--allow-existing-tag]
   tools/semver.sh plan
-  tools/semver.sh tag
-  tools/semver.sh push
 
 Commands:
   show   Print current package version, binary name, changelog status, and tag state
   check  Validate Cargo.toml, CHANGELOG.md, release workflow, and release tag assumptions
-  plan   Print the recommended post-merge release flow for the current Cargo.toml version
-  tag    Create annotated tag vX.Y.Z from Cargo.toml after strict checks
-  push   Push the current release tag to origin
+  plan   Print the automated release-PR flow
 EOF
 }
 
@@ -87,7 +83,7 @@ has_unreleased_section() {
 
 release_workflow_valid() {
   require_file .github/workflows/release.yml
-  grep -Eq 'tags:\s*\["v\*"\]' .github/workflows/release.yml \
+  grep -Eq '^  repository_dispatch:' .github/workflows/release.yml \
     && grep -Eq 'cargo publish' .github/workflows/release.yml
 }
 
@@ -163,7 +159,7 @@ check_semver() {
   fi
 
   if ! release_workflow_valid; then
-    fail ".github/workflows/release.yml must trigger on v* tags and publish the crate"
+    fail ".github/workflows/release.yml must expose repository_dispatch and publish the crate"
   fi
 
   if [ "$allow_dirty" -ne 1 ]; then
@@ -180,7 +176,7 @@ check_semver() {
         fail "Remote tag ${TAG} already exists on origin"
         ;;
       unknown)
-        echo "[!] Could not verify remote tag state on origin; continuing with local checks."
+        fail "Could not verify whether remote tag ${TAG} exists on origin"
         ;;
     esac
   fi
@@ -204,41 +200,23 @@ show_status() {
 
 print_plan() {
   cat <<EOF
-Release flow for ${TAG}
+Release PR flow (current package version: ${VERSION})
 
-1. git checkout main
-2. git pull origin main
-3. make release-check
-4. make release-tag
-5. make release-push
-6. make publish-checklist
-7. make install-bin
-8. ${BIN_NAME} --version
-9. gh release view ${TAG} --repo vetcoders/prview-rs
-10. cargo search ${PACKAGE_NAME}
-11. cargo info ${PACKAGE_NAME}
+1. Read the full current main SHA:
+   git rev-parse origin/main
+2. Dispatch "Prepare Release PR" with patch/minor/major or an exact version,
+   plus that expected main SHA.
+3. Review the generated draft PR. Its body states that merging triggers publish.
+4. Merge only after required review and CI. The merge validator creates the
+   exact vX.Y.Z tag; release.yml signs, notarizes, publishes, and verifies it.
+5. Read the workflow summaries and docs/RELEASING.md recovery table.
 
 Notes:
 - Package name on crates.io is '${PACKAGE_NAME}'.
 - Binary name is '${BIN_NAME}'.
-- GitHub Release should contain two tar.gz archives plus SHA256SUMS.
-- crates.io search/index can lag briefly after publish.
+- Do not create or push release tags manually.
+- workflow_dispatch on release.yml is a producer-path dry run and never publishes.
 EOF
-}
-
-create_tag() {
-  check_semver
-  git tag -a "${TAG}" -m "Release ${TAG}"
-  echo "Created tag ${TAG}"
-}
-
-push_tag() {
-  if ! local_tag_exists; then
-    fail "Local tag ${TAG} does not exist. Run 'make release-tag' first."
-  fi
-
-  git push origin "${TAG}"
-  echo "Pushed tag ${TAG} to origin"
 }
 
 VERSION=$(package_version)
@@ -277,18 +255,6 @@ case "$command" in
     ;;
   plan)
     print_plan
-    ;;
-  tag)
-    if [ $# -gt 0 ]; then
-      fail "tag does not accept extra options"
-    fi
-    create_tag
-    ;;
-  push)
-    if [ $# -gt 0 ]; then
-      fail "push does not accept extra options"
-    fi
-    push_tag
     ;;
   --help|-h|help)
     usage

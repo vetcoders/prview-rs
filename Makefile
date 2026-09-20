@@ -3,7 +3,7 @@
 
 .PHONY: all build install install-bin install-cargo git-hooks
 .PHONY: precommit precheck test check fmt fmt-check clippy semgrep ci
-.PHONY: version version-show version-check release-plan release-check release-tag release-push publish-checklist
+.PHONY: version version-show version-check release-plan release-check publish-checklist
 .PHONY: release-gate clean help unlock
 
 # Default target
@@ -146,7 +146,7 @@ ci: check
 # SemVer + release helpers
 version:
 	@chmod +x "$(VERSION_BUMP_SCRIPT)"
-	@"$(VERSION_BUMP_SCRIPT)" $(if $(SET),--set $(SET),--$(TYPE)) $(if $(DRY),--dry-run) $(if $(FORCE),--force) $(if $(NO_TEST),--no-test) $(if $(TAG),--tag) $(if $(PUSH),--push)
+	@"$(VERSION_BUMP_SCRIPT)" $(if $(SET),--set $(SET),--$(TYPE)) $(if $(DRY),--dry-run) $(if $(FORCE),--force) $(if $(NO_TEST),--no-test)
 
 version-show:
 	@chmod +x "$(SEMVER_SCRIPT)"
@@ -167,14 +167,6 @@ release-check:
 	@cargo package --locked
 	@$(MAKE) check
 	@echo "Release readiness passed."
-
-release-tag:
-	@chmod +x "$(SEMVER_SCRIPT)"
-	@"$(SEMVER_SCRIPT)" tag
-
-release-push:
-	@chmod +x "$(SEMVER_SCRIPT)"
-	@"$(SEMVER_SCRIPT)" push
 
 publish-checklist:
 	@chmod +x "$(PUBLISH_CHECKLIST_SCRIPT)"
@@ -211,19 +203,17 @@ help:
 	@echo "  make clean           - Clean build artifacts"
 	@echo ""
 	@echo "SemVer / Release:"
-	@echo "  make version TYPE=patch - Local version bump + changelog + checks + commit"
-	@echo "    Options: TYPE=patch|minor|major, SET=X.Y.Z, DRY=1, FORCE=1, NO_TEST=1, TAG=1, PUSH=1"
+	@echo "  make version TYPE=patch - Prepare local release metadata + checks + commit"
+	@echo "    Options: TYPE=patch|minor|major, SET=X.Y.Z, DRY=1, FORCE=1, NO_TEST=1"
 	@echo "  make version-show    - Show package version, tag state, binary name"
 	@echo "  make version-check   - Validate Cargo.toml + CHANGELOG structure"
-	@echo "  make release-plan    - Print the post-merge release flow"
+	@echo "  make release-plan    - Print the automated release-PR flow"
 	@echo "  make release-check   - Strict release readiness gate"
-	@echo "  make release-tag     - Create annotated tag from Cargo.toml version"
-	@echo "  make release-push    - Push the release tag to origin"
 	@echo "  make publish-checklist - Sync GitHub metadata for release"
 	@echo ""
 	@echo "Quick start:"
 	@echo "  make install         - Contributor setup"
 	@echo "  make check           - Full local verification"
-	@echo "  make version TYPE=patch - Local patch bump with generated changelog"
+	@echo "  make release-plan    - Start with the operator release-PR instructions"
 	@echo "  make release-gate    - Full pre-release verification (smoke + packaging + workflow)"
 	@echo "  make release-plan    - Review release flow after PR merge"
