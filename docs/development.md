@@ -141,6 +141,15 @@ once it hits its command cap, so `truncated: true` fails the case too. The pack
 must tell the same story: the skipped `Cargo test` gate publishes
 `<no command recorded>` as its command.
 
+A fourth case, `deadline`, proves the run bound on the same fixture: the same
+mixed change is reviewed with `--deadline 2s`, which cannot possibly finish, and
+the case requires the binary to exit `3` on its own (not to be killed by the
+harness timeout), to say "deadline" in its log, and to leave neither `RUN.json`
+nor `MERGE_GATE.json` nor any other success-shaped surface behind. It also
+requires every process the run owned to be gone, so an expiring run is held to
+the same cleanup standard as a cancelled one. This is the binary-level proof of
+the exit-code contract; the unit tests cover the reason plumbing.
+
 The mixed fixture intentionally has no Python project, so this receipt does not
 prove uv/PEP 517/pytest-xdist limits; those are covered by the Rust contract
 tests and their real behavior remains part of repository-specific dogfood.

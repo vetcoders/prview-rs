@@ -113,6 +113,15 @@ the rule that named it in the `scope` object on the test rows and as a
 `## Test scope` table in `MERGE_GATE.md`, so a reviewer who disagrees with the
 call can argue with the rule rather than read the source.
 
+### Not in the manifest: the run deadline
+
+`prview.toml` describes the repository, not the invocation. The run deadline is
+a property of *this* run — an operator waiting at a terminal and an unattended
+CI job want different bounds from the same checkout — so it lives on the command
+line only (`--deadline <TIME>` / `--no-deadline`, defaults in
+[`docs/usage.md`](usage.md#run-deadline)) and has no manifest key. The same is
+true of `--resource-budget`.
+
 ---
 
 ## 2. `.prview-policy.yml` — merge rules (CI/gate)

@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -88,6 +89,29 @@ jobs:
       - name: Prove the installer fails closed
         run: sh tools/tests/test_install.sh
 
+  release-automation:
+    name: Release automation contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Lint release shell
+        run: |
+          shellcheck tools/version-bump.sh tools/semver.sh \
+            tools/release-contract.sh tools/release-gate.sh \
+            tools/publish-checklist.sh tools/verify-existing-release.sh \
+            tools/verify-crates-publication.sh \
+            tools/tests/test_release_automation.sh \
+            tools/tests/test_release_publication_recovery.sh
+      - name: Validate workflow syntax and expressions
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+      - name: Prove release preparation and workflow guards
+        run: |
+          tools/tests/test_release_automation.sh
+          tools/tests/test_release_publication_recovery.sh
+
   windows-process-tree:
     name: Windows process-tree cancellation
     runs-on: windows-latest
@@ -132,8 +156,9 @@ jobs:
   ordinary-machine-resource-acceptance:
     name: Ordinary-machine bounded deep review
     runs-on: ubuntu-latest
-    # Three deep reviews of the fixture now, one per scope case, each with its
-    # own npm install and its own cargo/semgrep/vitest passes.
+    # Three deep reviews of the fixture, one per scope case, each with its own
+    # npm install and its own cargo/semgrep/vitest passes — plus the deadline
+    # case, which prepares the same fixture and is then stopped after 2s.
     timeout-minutes: 60
     env:
       PRVIEW_SOURCE_SHA: ${{ github.sha }}
@@ -179,6 +204,7 @@ jobs:
             --case mixed \
             --case js-only \
             --case unknown-input \
+            --case deadline \
             --timeout-seconds 1200
       - name: Upload bounded-runtime receipt
         if: always()

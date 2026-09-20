@@ -5,11 +5,11 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  tools/publish-checklist.sh [--create-tag] [--push-tag] [--repo ORG/REPO]
+  tools/publish-checklist.sh [--repo ORG/REPO]
 
 Defaults:
   - updates GitHub topics, homepage, and description
-  - does not create or push git tags unless explicitly requested
+  - never creates or pushes git tags
 EOF
 }
 
@@ -19,18 +19,8 @@ fail() {
 }
 
 REPO="vetcoders/prview-rs"
-CREATE_TAG=0
-PUSH_TAG=0
-
 while [ $# -gt 0 ]; do
   case "$1" in
-    --create-tag)
-      CREATE_TAG=1
-      ;;
-    --push-tag)
-      CREATE_TAG=1
-      PUSH_TAG=1
-      ;;
     --repo)
       shift
       [ $# -gt 0 ] || fail "--repo requires a value"
@@ -86,25 +76,9 @@ echo "[3/5] Setting description..."
 gh repo edit "$REPO" --description "High-signal PR review CLI: cross-language checks, artifact packs, SARIF findings, merge gates"
 echo "  Done."
 
-# 4. Optional version tag
-echo "[4/5] Tag status..."
-if [ "$CREATE_TAG" -eq 1 ]; then
-  if git tag -l "$TAG" | grep -q .; then
-    echo "  Tag ${TAG} already exists locally, skipping creation."
-  else
-    echo "  Creating tag ${TAG}..."
-    git tag -a "$TAG" -m "Release ${TAG}"
-  fi
-
-  if [ "$PUSH_TAG" -eq 1 ]; then
-    echo "  Pushing tag ${TAG}..."
-    git push origin "$TAG"
-  else
-    echo "  Tag ready locally. Push with: git push origin ${TAG}"
-  fi
-else
-  echo "  Metadata updated. Tag creation skipped by default."
-fi
+# 4. Release automation status
+echo "[4/5] Release automation..."
+echo "  Tags are created only after a validated release PR merge."
 
 # 5. Summary
 echo
@@ -116,13 +90,9 @@ echo "  Topics:  cli, pr-review, rust, code-review, developer-tools, sarif, merg
 echo "  Assets:  2 tar.gz archives + SHA256SUMS"
 echo
 echo "Next steps:"
-if [ "$CREATE_TAG" -eq 0 ]; then
-  echo "  1. make release-tag"
-  echo "  2. make release-push"
-  echo "  3. gh release view ${TAG} --repo ${REPO}"
-else
-  echo "  1. gh release view ${TAG} --repo ${REPO}"
-fi
+echo "  1. make release-plan"
+echo "  2. review and merge the generated release PR"
+echo "  3. gh release view ${TAG} --repo ${REPO}"
 echo "  4. cargo search ${PACKAGE_NAME}"
 echo "  5. cargo info ${PACKAGE_NAME}"
 echo

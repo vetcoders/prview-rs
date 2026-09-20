@@ -1,13 +1,17 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
   # Dry run: executes the identical preflight/validate/build/sign/notarize/
   # checksum path and uploads the archives + SHA256SUMS as workflow artifacts.
-  # The `release` and `publish` jobs are event-gated, so a dispatch can never
-  # create a GitHub Release or publish to crates.io.
+  # The `release` and `publish` jobs require a separately revalidated
+  # repository_dispatch receipt, so a manual dispatch can never publish.
   workflow_dispatch:
+  repository_dispatch:
+    types: [prview-release-publish]
+
+concurrency:
+  group: release-${{ github.event.client_payload.release_tag || github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,6 +28,8 @@ env:
   # dropped matrix leg goes red instead of shipping a partial release. Keep it
   # in step with the `build` matrix below.
   PRVIEW_RELEASE_TARGETS: "aarch64-apple-darwin x86_64-unknown-linux-gnu"
+  PRVIEW_RELEASE_SHA: ${{ github.event.client_payload.release_commit || github.sha }}
+  PRVIEW_RELEASE_TAG: ${{ github.event.client_payload.release_tag || github.ref_name }}
 
 permissions:
   contents: read
@@ -69,21 +75,88 @@ jobs:
   validate:
     name: Validate Release Metadata
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ env.PRVIEW_RELEASE_SHA }}
       - name: Validate tag, Cargo.toml, and CHANGELOG
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.client_payload.pull_request_number }}
         shell: bash
         run: |
           set -euo pipefail
 
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
 
-          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            TAG="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" = "repository_dispatch" ]; then
+            TAG="${PRVIEW_RELEASE_TAG}"
             if [ "v${VERSION}" != "${TAG}" ]; then
               echo "::error::Tag ${TAG} does not match Cargo.toml version v${VERSION}"
               exit 1
             fi
+            git fetch --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+            TAG_COMMIT=$(git rev-list -n 1 "refs/tags/$TAG")
+            if [ "$TAG_COMMIT" != "$PRVIEW_RELEASE_SHA" ]; then
+              echo "::error::Tag $TAG resolves to $TAG_COMMIT, not release commit $PRVIEW_RELEASE_SHA"
+              exit 1
+            fi
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor "$PRVIEW_RELEASE_SHA" origin/main; then
+              echo "::error::Release commit $PRVIEW_RELEASE_SHA is not on origin/main"
+              exit 1
+            fi
+            [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || {
+              echo "::error::trusted continuation is missing a pull request number"
+              exit 1
+            }
+            PR_JSON=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")
+            PR_MERGED=$(jq -r '.merged' <<<"$PR_JSON")
+            PR_MERGE_SHA=$(jq -r '.merge_commit_sha' <<<"$PR_JSON")
+            PR_BASE=$(jq -r '.base.ref' <<<"$PR_JSON")
+            PR_HEAD=$(jq -r '.head.ref' <<<"$PR_JSON")
+            PR_HEAD_REPO=$(jq -r '.head.repo.full_name' <<<"$PR_JSON")
+            PR_TITLE=$(jq -r '.title' <<<"$PR_JSON")
+            PR_BODY=$(jq -r '.body // ""' <<<"$PR_JSON")
+            PR_BODY=${PR_BODY//$'\r\n'/$'\n'}
+            [[ "$PR_MERGED" == true && "$PR_MERGE_SHA" == "$PRVIEW_RELEASE_SHA" ]] || {
+              echo "::error::receipt PR is not merged at the requested release commit"
+              exit 1
+            }
+            [[ "$PR_BASE" == main && "$PR_HEAD_REPO" == "$GITHUB_REPOSITORY" ]] || {
+              echo "::error::receipt PR must target main and originate in this repository"
+              exit 1
+            }
+            BASE_SHA=$(git rev-parse "$PRVIEW_RELEASE_SHA^1")
+            EXPECTED_BRANCH="release/v$VERSION-${BASE_SHA:0:12}"
+            [[ "$PR_HEAD" == "$EXPECTED_BRANCH" ]] || {
+              echo "::error::receipt PR branch does not match release version"
+              exit 1
+            }
+            [[ "$PR_TITLE" == "chore(release): prepare v$VERSION" ]] || {
+              echo "::error::receipt PR title does not match release version"
+              exit 1
+            }
+            grep -q '^<!-- prview-release-pr:v1$' <<<"$PR_BODY" || {
+              echo "::error::receipt PR is missing the release marker"
+              exit 1
+            }
+            grep -q "^version=$VERSION$" <<<"$PR_BODY" || {
+              echo "::error::receipt marker version does not match the tag"
+              exit 1
+            }
+            grep -q "^expected_main_sha=$BASE_SHA$" <<<"$PR_BODY" || {
+              echo "::error::receipt expected main SHA does not match the merge first parent"
+              exit 1
+            }
+            VALIDATOR="$RUNNER_TEMP/release-contract.sh"
+            git show "$BASE_SHA:tools/release-contract.sh" >"$VALIDATOR"
+            chmod +x "$VALIDATOR"
+            "$VALIDATOR" merged "$VERSION" "$BASE_SHA" "$PRVIEW_RELEASE_SHA"
           else
             # Dry run: there is no tag to compare against, so the Cargo.toml
             # version is authoritative. Every other check below is identical.
@@ -113,6 +186,8 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PRVIEW_RELEASE_SHA }}
       # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
@@ -123,7 +198,7 @@ jobs:
         env:
           # build.rs bakes this into PRVIEW_BUILD_SOURCE_SHA. Without it the
           # official binaries report "unknown" provenance.
-          PRVIEW_SOURCE_SHA: ${{ github.sha }}
+          PRVIEW_SOURCE_SHA: ${{ env.PRVIEW_RELEASE_SHA }}
         run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Strip binary
         shell: bash
@@ -139,7 +214,7 @@ jobs:
       - name: Assert embedded provenance
         shell: bash
         env:
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ env.PRVIEW_RELEASE_SHA }}
         run: |
           set -euo pipefail
 
@@ -306,7 +381,7 @@ jobs:
         if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
         env:
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ env.PRVIEW_RELEASE_SHA }}
         run: |
           set -euo pipefail
 
@@ -584,7 +659,7 @@ jobs:
   release:
     name: Create Release
     needs: checksums
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'repository_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -592,6 +667,8 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PRVIEW_RELEASE_SHA }}
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -608,14 +685,25 @@ jobs:
               exit 1
             fi
           done
+      - name: Verify an existing release without replacing assets
+        id: existing_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.PRVIEW_RELEASE_TAG }}
+        shell: bash
+        run: tools/verify-existing-release.sh
       - name: Attest build provenance
+        if: steps.existing_release.outputs.exists != 'true'
         uses: actions/attest-build-provenance@v4.2.2
         with:
           subject-path: |
             artifacts/prview-*.tar.gz
             artifacts/SHA256SUMS
       - uses: softprops/action-gh-release@v3
+        if: steps.existing_release.outputs.exists != 'true'
         with:
+          tag_name: ${{ env.PRVIEW_RELEASE_TAG }}
+          target_commitish: ${{ env.PRVIEW_RELEASE_SHA }}
           generate_release_notes: true
           files: |
             artifacts/prview-*.tar.gz
@@ -626,7 +714,7 @@ jobs:
   publish:
     name: Publish to crates.io
     needs: release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'repository_dispatch'
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -634,6 +722,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PRVIEW_RELEASE_SHA }}
       # Pinned master snapshot verified 2026-09-14; supports Rust branches through 1.120.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
@@ -644,4 +734,157 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
       - name: Log in to crates.io
         run: cargo login "${{ steps.auth.outputs.token }}"
-      - run: cargo publish --locked
+      - name: Publish idempotently
+        env:
+          VERSION: ${{ env.PRVIEW_RELEASE_TAG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=${VERSION#v}
+          VERSION_URL="https://crates.io/api/v1/crates/prview/$VERSION"
+          cargo package --locked
+          CRATE="target/package/prview-$VERSION.crate"
+          EXPECTED_CHECKSUM=$(sha256sum "$CRATE" | awk '{print $1}')
+
+          verify_registry_copy() {
+            local json registry_checksum
+            json=$(curl -fsSL "$VERSION_URL" 2>/dev/null) || return 1
+            registry_checksum=$(jq -r '.version.checksum // empty' <<<"$json")
+            [[ -n "$registry_checksum" ]] || return 1
+            [[ "$registry_checksum" == "$EXPECTED_CHECKSUM" ]] || {
+              echo "::error::crates.io v$VERSION checksum $registry_checksum does not match candidate $EXPECTED_CHECKSUM"
+              return 2
+            }
+            return 0
+          }
+
+          if verify_registry_copy; then
+            echo "crates.io already has the byte-identical prview v$VERSION crate; nothing to do."
+            exit 0
+          else
+            STATUS=$?
+            [[ "$STATUS" -ne 2 ]] || exit 1
+          fi
+
+          LOG=$(mktemp)
+          set +e
+          cargo publish --locked 2>&1 | tee "$LOG"
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [[ "$STATUS" -eq 0 ]]; then
+            exit 0
+          fi
+
+          for ATTEMPT in {1..6}; do
+            if verify_registry_copy; then
+              echo "Registry now exposes the byte-identical crate; treating the ambiguous publish response as success."
+              exit 0
+            else
+              VERIFY_STATUS=$?
+              [[ "$VERIFY_STATUS" -ne 2 ]] || exit 1
+            fi
+            echo "Publish failed and registry has no v$VERSION yet (check $ATTEMPT/6)."
+            sleep 10
+          done
+          echo "::error::cargo publish failed and crates.io does not expose prview v$VERSION"
+          exit "$STATUS"
+
+  verify:
+    name: Verify Published Release (${{ matrix.target }})
+    needs: [release, publish]
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      attestations: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PRVIEW_RELEASE_SHA }}
+      - name: Wait for public release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.PRVIEW_RELEASE_TAG }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for ATTEMPT in {1..12}; do
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "prview-$TARGET.tar.gz" --pattern SHA256SUMS --clobber; then
+              exit 0
+            fi
+            echo "Release assets not ready (attempt $ATTEMPT/12); retrying in 10s"
+            sleep 10
+          done
+          echo "::error::published assets did not become available"
+          exit 1
+      - name: Verify checksum and build provenance attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="prview-$TARGET.tar.gz"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            grep "  $ARCHIVE$" SHA256SUMS | shasum -a 256 -c -
+          else
+            grep "  $ARCHIVE$" SHA256SUMS | sha256sum -c -
+          fi
+          gh attestation verify "$ARCHIVE" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify SHA256SUMS --repo "$GITHUB_REPOSITORY"
+      - name: Cold-install the exact published version
+        env:
+          PRVIEW_INSTALL_DIR: ${{ runner.temp }}/prview-cold-install
+          PRVIEW_VERSION: ${{ env.PRVIEW_RELEASE_TAG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./install.sh
+          BIN="$PRVIEW_INSTALL_DIR/prview"
+          [[ "$("$BIN" --version)" == "prview ${PRVIEW_VERSION#v}" ]]
+          [[ "$("$BIN" --build-source-sha)" == "$PRVIEW_RELEASE_SHA" ]]
+          {
+            echo "### Published artifact verified"
+            echo
+            echo "- target: ${{ matrix.target }}"
+            echo "- version: $("$BIN" --version)"
+            echo "- source: $("$BIN" --build-source-sha)"
+            echo "- checksum: verified"
+            echo "- GitHub provenance: verified"
+          } >>"$GITHUB_STEP_SUMMARY"
+      - name: Recheck macOS signature and notarization
+        if: runner.os == 'macOS'
+        env:
+          PRVIEW_INSTALL_DIR: ${{ runner.temp }}/prview-cold-install
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$PRVIEW_INSTALL_DIR/prview"
+          codesign --verify --strict --verbose=2 "$BIN"
+          SIGNATURE=$(codesign -dvv "$BIN" 2>&1)
+          grep -q 'TeamIdentifier=MW223P3NPX' <<<"$SIGNATURE"
+          SPCTL=$(mktemp)
+          set +e
+          spctl -a -t open --context context:primary-signature -vv "$BIN" >"$SPCTL" 2>&1
+          STATUS=$?
+          set -e
+          cat "$SPCTL"
+          [[ "$STATUS" -eq 0 ]]
+          grep -q 'source=Notarized Developer ID' "$SPCTL"
+          echo "- macOS signature/notarization: verified" >>"$GITHUB_STEP_SUMMARY"
+      - name: Verify crates.io publication
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ env.PRVIEW_RELEASE_TAG }}
+        shell: bash
+        run: tools/verify-crates-publication.sh

@@ -1,0 +1,241 @@
+name: Prepare Release PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version selection (use exact with exact_version)
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - exact
+      exact_version:
+        description: Exact X.Y.Z version (required when bump is exact)
+        required: false
+        type: string
+      expected_main_sha:
+        description: Full current main SHA; the workflow fails if main moved
+        required: true
+        type: string
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prepare:
+    name: Prepare validated draft PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Assert main enforces the release merge gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RULES=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/main")
+          jq -e '
+            any(.[];
+              .type == "required_status_checks"
+              and .parameters.strict_required_status_checks_policy == true
+              and any(.parameters.required_status_checks[]; .context == "Release PR contract")
+            )
+          ' <<<"$RULES" >/dev/null || {
+            echo "::error::main must require the Release PR contract check with strict up-to-date enforcement"
+            exit 1
+          }
+          jq -e '
+            any(.[];
+              .type == "pull_request"
+              and .parameters.allowed_merge_methods == ["merge"]
+            )
+          ' <<<"$RULES" >/dev/null || {
+            echo "::error::main must allow merge commits only before release automation can run"
+            exit 1
+          }
+
+      - name: Pin expected main
+        id: pin
+        env:
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::expected_main_sha must be a full lowercase commit SHA"
+            exit 1
+          }
+          ACTUAL_MAIN_SHA=$(git rev-parse origin/main)
+          [[ "$ACTUAL_MAIN_SHA" == "$EXPECTED_MAIN_SHA" ]] || {
+            echo "::error::main moved: expected $EXPECTED_MAIN_SHA, found $ACTUAL_MAIN_SHA"
+            exit 1
+          }
+          git checkout --detach "$EXPECTED_MAIN_SHA"
+          echo "sha=$EXPECTED_MAIN_SHA" >>"$GITHUB_OUTPUT"
+
+      - name: Resolve operator-selected version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXACT_VERSION: ${{ inputs.exact_version }}
+          EXPECTED_MAIN_SHA: ${{ steps.pin.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$BUMP" in
+            patch|minor|major)
+              [[ -z "$EXACT_VERSION" ]] || {
+                echo "::error::exact_version is allowed only with bump=exact"
+                exit 1
+              }
+              ARGS=(--"$BUMP")
+              ;;
+            exact)
+              [[ "$EXACT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+                echo "::error::bump=exact requires exact_version in X.Y.Z form"
+                exit 1
+              }
+              ARGS=(--set "$EXACT_VERSION")
+              ;;
+            *)
+              echo "::error::unsupported bump selection: $BUMP"
+              exit 1
+              ;;
+          esac
+          OUTPUT=$(tools/version-bump.sh "${ARGS[@]}" --dry-run)
+          printf '%s\n' "$OUTPUT"
+          VERSION=$(printf '%s\n' "$OUTPUT" | awk '/^New:/ { print $2 }')
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::could not resolve selected release version"
+            exit 1
+          }
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+          echo "branch=release/v$VERSION-${EXPECTED_MAIN_SHA:0:12}" >>"$GITHUB_OUTPUT"
+
+      - name: Detect an idempotent rerun
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+          VERSION: ${{ steps.version.outputs.version }}
+          EXPECTED_MAIN_SHA: ${{ steps.pin.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --head "$BRANCH" --base main --json url,body --jq ".[] | select(.body | contains(\"version=$VERSION\") and contains(\"expected_main_sha=$EXPECTED_MAIN_SHA\")) | .url" | head -1)
+          if [[ -n "$URL" ]]; then
+            REMOTE_SHA=$(gh pr view "$URL" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+            VALIDATOR="$RUNNER_TEMP/release-contract.sh"
+            git show "$EXPECTED_MAIN_SHA:tools/release-contract.sh" >"$VALIDATOR"
+            chmod +x "$VALIDATOR"
+            git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            git checkout --detach "$REMOTE_SHA"
+            "$VALIDATOR" candidate "$VERSION" "$EXPECTED_MAIN_SHA" "$REMOTE_SHA"
+            echo "found=true" >>"$GITHUB_OUTPUT"
+            echo "url=$URL" >>"$GITHUB_OUTPUT"
+            printf '### Existing release PR\n\n%s\n' "$URL" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "found=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Recover or prepare release branch
+        if: steps.existing.outputs.found != 'true'
+        id: branch
+        env:
+          BRANCH: ${{ steps.version.outputs.branch }}
+          VERSION: ${{ steps.version.outputs.version }}
+          EXPECTED_MAIN_SHA: ${{ steps.pin.outputs.sha }}
+          BUMP: ${{ inputs.bump }}
+          EXACT_VERSION: ${{ inputs.exact_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VALIDATOR="$RUNNER_TEMP/release-contract.sh"
+          git show "$EXPECTED_MAIN_SHA:tools/release-contract.sh" >"$VALIDATOR"
+          chmod +x "$VALIDATOR"
+          REMOTE_SHA=$(git ls-remote --heads origin "refs/heads/$BRANCH" | awk '{print $1}')
+          if [[ -n "$REMOTE_SHA" ]]; then
+            git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            git checkout --detach "$REMOTE_SHA"
+            "$VALIDATOR" candidate "$VERSION" "$EXPECTED_MAIN_SHA" "$REMOTE_SHA"
+            echo "recovered=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ "$BUMP" == exact ]]; then
+            tools/version-bump.sh --set "$EXACT_VERSION" --no-test
+          else
+            tools/version-bump.sh --"$BUMP" --no-test
+          fi
+          "$VALIDATOR" candidate "$VERSION" "$EXPECTED_MAIN_SHA" HEAD
+          echo "recovered=false" >>"$GITHUB_OUTPUT"
+
+      - name: Run release gates
+        if: steps.existing.outputs.found != 'true'
+        run: make release-check
+
+      - name: Push new release branch
+        if: steps.existing.outputs.found != 'true' && steps.branch.outputs.recovered != 'true'
+        env:
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: git push origin "HEAD:refs/heads/$BRANCH"
+
+      - name: Open draft release PR
+        if: steps.existing.outputs.found != 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+          VERSION: ${{ steps.version.outputs.version }}
+          EXPECTED_MAIN_SHA: ${{ steps.pin.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY=$(printf '%s\n' \
+            '<!-- prview-release-pr:v1' \
+            "version=$VERSION" \
+            "expected_main_sha=$EXPECTED_MAIN_SHA" \
+            '-->' \
+            '' \
+            "## Release v$VERSION" \
+            '' \
+            "This draft promotes the reviewed [Unreleased] changelog into v$VERSION." \
+            'It contains no product-code changes.' \
+            '' \
+            '**Merging this PR triggers publication.** After validation, automation' \
+            "creates tag v$VERSION at the merge commit and starts signed publication." \
+            '' \
+            'Operator receipts:' \
+            "- expected main SHA: $EXPECTED_MAIN_SHA" \
+            "- release branch: $BRANCH" \
+            '- allowed files: Cargo.toml, Cargo.lock, CHANGELOG.md')
+          URL=$(gh pr create --repo "$GITHUB_REPOSITORY" --draft --base main --head "$BRANCH" --title "chore(release): prepare v$VERSION" --body "$BODY")
+          echo "url=$URL" >>"$GITHUB_OUTPUT"
+          printf '### Draft release PR\n\n%s\n\nMerging it triggers publication.\n' "$URL" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Report
+        env:
+          EXISTING_URL: ${{ steps.existing.outputs.url }}
+          CREATED_URL: ${{ steps.pr.outputs.url }}
+          VERSION: ${{ steps.version.outputs.version }}
+          EXPECTED_MAIN_SHA: ${{ steps.pin.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${CREATED_URL:-$EXISTING_URL}"
+          echo "Prepared v$VERSION from $EXPECTED_MAIN_SHA"
+          echo "Draft PR: $URL"

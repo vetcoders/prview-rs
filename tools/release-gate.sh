@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # release-gate.sh — Pre-release verification gate
-# Runs all quality + packaging checks that must pass before tagging a release.
+# Runs all quality + packaging checks that must pass in a release PR.
 # Exit 0 = ship it, exit 1 = blocked.
 set -euo pipefail
 
@@ -117,10 +117,10 @@ fi
 # 8. Release workflow exists
 echo "[8/9] Release workflow"
 if [ -f .github/workflows/release.yml ]; then
-  if grep -Eq 'tags:\s*\["v\*"\]' .github/workflows/release.yml; then
-    pass "release.yml triggers on v* tags"
+  if grep -Eq '^  repository_dispatch:' .github/workflows/release.yml; then
+    pass "release.yml exposes the trusted continuation publish path"
   else
-    fail "release.yml missing v* tag trigger"
+    fail "release.yml missing repository_dispatch"
   fi
   if grep -q 'cargo publish' .github/workflows/release.yml; then
     pass "release.yml publishes to crates.io"
@@ -139,9 +139,9 @@ fi
 # 9. Tag state
 echo "[9/9] Tag state"
 if git tag -l "$TAG" | grep -q .; then
-  pass "local tag ${TAG} exists"
+  fail "local tag ${TAG} already exists; release tags are automation-owned"
 else
-  warn "local tag ${TAG} not created yet (run: make release-tag)"
+  pass "release tag ${TAG} is not pre-created"
 fi
 
 # Summary
@@ -161,9 +161,9 @@ else
   echo
   echo "Next steps:"
   echo "  1. gh auth login                    # authenticate GitHub CLI"
-  echo "  2. make release-tag                 # create v${VERSION} tag"
-  echo "  3. make release-push                # push tag → triggers CI release"
-  echo "  4. make publish-checklist           # sync GitHub metadata"
-  echo "  5. gh release view ${TAG}           # verify release artifacts"
+  echo "  2. make release-plan                # read the automated release-PR flow"
+  echo "  3. dispatch Prepare Release PR with the expected main SHA"
+  echo "  4. review the draft PR; merging it triggers publication"
+  echo "  5. read release.yml verification summaries after publish"
   exit 0
 fi

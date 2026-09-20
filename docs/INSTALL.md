@@ -210,8 +210,10 @@ supported on Linux, macOS, and Windows. On other targets, use the CLI directly.
 
 ## Verifying a release
 
-Official releases are built by `.github/workflows/release.yml` on a pushed `v*`
-tag. Every published artifact can be verified offline or against Apple.
+Official releases are built by `.github/workflows/release.yml` after a
+validated release PR merge creates an immutable `v*` tag and dispatches the
+trusted publish continuation. Every published artifact can be verified offline or
+against Apple.
 
 ### Checksums
 
@@ -281,7 +283,7 @@ gh attestation verify prview-aarch64-apple-darwin.tar.gz --repo vetcoders/prview
 
 ### Local build health
 
-To confirm the state of a local checkout before tagging:
+To confirm the state of a release PR checkout:
 
 ```bash
 make release-gate
@@ -308,7 +310,9 @@ The install contract for automated consumption:
   any `prview` already in the install directory is untouched
 - **Minimum invocation**: `prview --quick` (fast local scan, no network)
 - **crates.io package**: `prview`
-- **GitHub release trigger**: push of `v*` tag to `main`
+- **GitHub release trigger**: merge of a validated release PR creates a `v*`
+  tag on `main` and dispatches the trusted publication workflow on that exact
+  merge commit
 
 To pin a specific version in CI:
 

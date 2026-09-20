@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Release preparation is now an operator-selected, expected-SHA-pinned draft PR
+  workflow. A separate fail-closed merge validator creates the immutable tag
+  only for a machine-marked release PR, while the existing signed publish
+  pipeline now adds concurrency and public cold-install, source-SHA, signature,
+  provenance, and crates.io verification. Manual dispatch remains a
+  non-publishing producer-path dry run.
 - `prview gate --base <REF>` reviews the current checkout against an explicit
   branch, tag, or commit SHA instead of the auto-detected
   `develop`/`main`/`master` base. An explicit base that does not resolve exits
@@ -113,8 +119,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_scope`, `operator_worktree_clean` and `full_tests`. The next release is a
   minor version bump. Contract and rationale: `docs/architecture.md` ("How much
   of a test suite must run").
+- `--deadline <TIME>` and `--no-deadline` bound a whole run, or remove the
+  bound. The value needs a unit (`90s`, `45m`, `2h`); a bare number is rejected
+  rather than guessed, as is a value that overflows or that the runtime timer
+  cannot represent, and the two flags conflict. `--deadline` is also refused
+  with `--watch`, which is a session rather than a run and is never bounded — an
+  accepted-then-ignored budget is worse than no budget. The deadline is a second
+  implementation of the existing `Interrupts` trait, so an expiring run takes
+  the same path a Ctrl-C takes: admission closes, the child tree is killed, the
+  worktrees are removed, and no verdict is published. Contract and rationale:
+  `docs/architecture.md` ("Run deadline"), `docs/usage.md` ("Run deadline").
 
 ### Changed
+
+- **Every run is now bounded in time.** A local review, `--tui`, and a detached
+  MCP `run_review deep` get 30 minutes; `--ci` and `prview gate` get 60. (An MCP
+  `quick` review keeps its own, tighter 120-second server budget.) The numbers
+  come
+  from measuring the heaviest workload the project runs on itself — a full
+  `--deep --no-cache` review of prview-rs takes 616 s on a 14-core host and
+  514 s on a 24-core one — and leave roughly a 3× margin. `--watch` and the
+  startup preflight stay
+  unbounded on purpose. A run that was previously able to hang forever now ends;
+  a run that finished before still finishes.
+- **A run stopped by its deadline exits `3`, not `130`.** `130` means the
+  operator cancelled; a deadline is prview failing to reach a verdict in the
+  time it was given, which is what `3` already means everywhere else. The
+  governor remembers which of the two happened (first reason wins), and when a
+  deadline reaches artifact generation `00_summary/INCOMPLETE.json` says so:
+  `reason: "deadline exceeded"` plus `deadline_secs`, additively, with
+  `schema_version` unchanged at `1.0`. An operator interrupt still writes
+  `reason: "cancelled"`.
 
 - Test execution now obeys the scope decision. `Cargo test` appends `-p <pkg>`
   for each selected package, before the optional positional test filter;
