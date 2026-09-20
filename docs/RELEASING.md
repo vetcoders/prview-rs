@@ -39,7 +39,9 @@ Then:
    the copied SHA as `expected_main_sha`.
 3. The workflow fails if `main` moved, the version is not strictly newer,
    `[Unreleased]` has no entries, the target tag exists, or a gate fails. On
-   success it opens one draft `release/vX.Y.Z` PR.
+   success it opens one draft `release/vX.Y.Z-<main-sha-prefix>` PR. Binding
+   the branch name to the selected base lets a later run safely prepare the
+   same version from a newer `main` without replacing the earlier branch.
 4. Review that PR as a publication action. It may change only `Cargo.toml`,
    `Cargo.lock`, and `CHANGELOG.md`; the latter has an empty new
    `[Unreleased]` section followed by the dated promoted release notes.
@@ -64,7 +66,8 @@ a local metadata preparation helper, but it never tags or pushes.
 `release-pr-merged.yml` ignores ordinary PRs. A release PR must have all of:
 
 - the versioned machine marker created by `prepare-release.yml`;
-- a same-repository `release/vX.Y.Z` head and matching title;
+- a same-repository `release/vX.Y.Z-<main-sha-prefix>` head bound to the
+  expected base and a matching title;
 - the exact expected `main` SHA as the first parent of a two-parent merge;
 - one release preparation commit with the canonical subject;
 - exactly `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md` changed;
@@ -79,7 +82,9 @@ rerun is a successful no-op; if it points elsewhere, the run fails closed.
 
 The preparation workflow is similarly recoverable: it reuses an already-open
 matching PR, and if a prior run pushed the release branch but failed before PR
-creation, it validates and reuses that exact branch.
+creation, it validates and reuses that exact branch. A newer `main` produces a
+different base-bound branch; the stale draft cannot pass the live-main contract
+and may be closed without rewriting or deleting either branch.
 
 ## Dry run without publication
 
@@ -112,7 +117,9 @@ For a validated tag on `main`, `.github/workflows/release.yml`:
    `source=Notarized Developer ID`, and proves the archived code directory
    hash is the one notarized;
 6. requires the exact archive set and regenerates/verifies `SHA256SUMS`;
-7. creates GitHub build-provenance attestations and the GitHub Release;
+7. creates GitHub build-provenance attestations and the GitHub Release; a replay
+   verifies an existing release's exact asset set and checksums and never
+   replaces its assets;
 8. publishes to crates.io through OIDC trusted publishing;
 9. cold-installs from the public release on Linux and macOS, then independently
    rechecks version, source SHA, checksums, attestations, Apple signature,

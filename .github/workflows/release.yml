@@ -131,7 +131,9 @@ jobs:
               echo "::error::receipt PR must target main and originate in this repository"
               exit 1
             }
-            [[ "$PR_HEAD" == "release/v$VERSION" ]] || {
+            BASE_SHA=$(git rev-parse "$PRVIEW_RELEASE_SHA^1")
+            EXPECTED_BRANCH="release/v$VERSION-${BASE_SHA:0:12}"
+            [[ "$PR_HEAD" == "$EXPECTED_BRANCH" ]] || {
               echo "::error::receipt PR branch does not match release version"
               exit 1
             }
@@ -147,7 +149,6 @@ jobs:
               echo "::error::receipt marker version does not match the tag"
               exit 1
             }
-            BASE_SHA=$(git rev-parse "$PRVIEW_RELEASE_SHA^1")
             grep -q "^expected_main_sha=$BASE_SHA$" <<<"$PR_BODY" || {
               echo "::error::receipt expected main SHA does not match the merge first parent"
               exit 1
@@ -684,13 +685,22 @@ jobs:
               exit 1
             fi
           done
+      - name: Verify an existing release without replacing assets
+        id: existing_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.PRVIEW_RELEASE_TAG }}
+        shell: bash
+        run: tools/verify-existing-release.sh
       - name: Attest build provenance
+        if: steps.existing_release.outputs.exists != 'true'
         uses: actions/attest-build-provenance@v4.2.2
         with:
           subject-path: |
             artifacts/prview-*.tar.gz
             artifacts/SHA256SUMS
       - uses: softprops/action-gh-release@v3
+        if: steps.existing_release.outputs.exists != 'true'
         with:
           tag_name: ${{ env.PRVIEW_RELEASE_TAG }}
           target_commitish: ${{ env.PRVIEW_RELEASE_SHA }}
@@ -877,29 +887,4 @@ jobs:
         env:
           VERSION: ${{ env.PRVIEW_RELEASE_TAG }}
         shell: bash
-        run: |
-          set -euo pipefail
-          VERSION=${VERSION#v}
-          VERSION_URL="https://crates.io/api/v1/crates/prview/$VERSION"
-          for ATTEMPT in {1..18}; do
-            if JSON=$(curl -fsSL "$VERSION_URL"); then
-              REGISTRY_VERSION=$(jq -r '.version.num' <<<"$JSON")
-              REGISTRY_CHECKSUM=$(jq -r '.version.checksum' <<<"$JSON")
-              [[ "$REGISTRY_VERSION" == "$VERSION" ]]
-              curl -fsSL "$VERSION_URL/download" -o "prview-$VERSION.crate"
-              ACTUAL_CHECKSUM=$(sha256sum "prview-$VERSION.crate" | awk '{print $1}')
-              [[ "$ACTUAL_CHECKSUM" == "$REGISTRY_CHECKSUM" ]]
-              CRATE_SOURCE_SHA=$(tar -xOf "prview-$VERSION.crate" "prview-$VERSION/.cargo_vcs_info.json" | jq -r '.git.sha1')
-              [[ "$CRATE_SOURCE_SHA" == "$PRVIEW_RELEASE_SHA" ]]
-              {
-                echo "- crates.io v$VERSION: verified"
-                echo "- crate checksum: $REGISTRY_CHECKSUM"
-                echo "- crate source: $CRATE_SOURCE_SHA"
-              } >>"$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "crates.io index not ready (attempt $ATTEMPT/18); retrying in 10s"
-            sleep 10
-          done
-          echo "::error::crates.io did not expose prview v$VERSION"
-          exit 1
+        run: tools/verify-crates-publication.sh

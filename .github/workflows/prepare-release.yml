@@ -90,6 +90,7 @@ jobs:
         env:
           BUMP: ${{ inputs.bump }}
           EXACT_VERSION: ${{ inputs.exact_version }}
+          EXPECTED_MAIN_SHA: ${{ steps.pin.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -121,7 +122,7 @@ jobs:
             exit 1
           }
           echo "version=$VERSION" >>"$GITHUB_OUTPUT"
-          echo "branch=release/v$VERSION" >>"$GITHUB_OUTPUT"
+          echo "branch=release/v$VERSION-${EXPECTED_MAIN_SHA:0:12}" >>"$GITHUB_OUTPUT"
 
       - name: Detect an idempotent rerun
         id: existing

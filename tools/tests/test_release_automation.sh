@@ -127,15 +127,19 @@ MERGED="$ROOT/.github/workflows/release-pr-merged.yml"
 RELEASE="$ROOT/.github/workflows/release.yml"
 PR_CHECK="$ROOT/.github/workflows/release-pr-contract.yml"
 CI="$ROOT/.github/workflows/ci.yml"
+RECOVERY_TEST="$ROOT/tools/tests/test_release_publication_recovery.sh"
 
 assert_contains "$PREP" 'expected_main_sha:'
 assert_contains "$PREP" 'strict_required_status_checks_policy == true'
 assert_contains "$PREP" '.parameters.allowed_merge_methods == ["merge"]'
 assert_contains "$PREP" '<!-- prview-release-pr:v1'
 assert_contains "$PREP" '**Merging this PR triggers publication.**'
+assert_contains "$PREP" "release/v\$VERSION-\${EXPECTED_MAIN_SHA:0:12}"
 assert_contains "$PREP" "\"\$VALIDATOR\" candidate"
+assert_contains "$PR_CHECK" "EXPECTED_BRANCH=\"release/v\$VERSION-\${EXPECTED_MAIN_SHA:0:12}\""
 assert_contains "$MERGED" "github.event.pull_request.merged == true"
 assert_contains "$MERGED" "\"\$VALIDATOR\" merged"
+assert_contains "$MERGED" "EXPECTED_BRANCH=\"release/v\$VERSION-\${EXPECTED_MAIN_SHA:0:12}\""
 assert_contains "$MERGED" "git push origin \"refs/tags/\$TAG\""
 assert_contains "$MERGED" 'event_type=prview-release-publish'
 assert_contains "$RELEASE" 'workflow_dispatch:'
@@ -151,6 +155,11 @@ assert_contains "$MERGED" "PR_BODY=\${PR_BODY//\$'\\r\\n'/\$'\\n'}"
 assert_contains "$RELEASE" "PR_BODY=\${PR_BODY//\$'\\r\\n'/\$'\\n'}"
 assert_contains "$RELEASE" "tag_name: \${{ env.PRVIEW_RELEASE_TAG }}"
 assert_contains "$RELEASE" "target_commitish: \${{ env.PRVIEW_RELEASE_SHA }}"
+assert_contains "$RELEASE" 'Verify an existing release without replacing assets'
+assert_contains "$RELEASE" "if: steps.existing_release.outputs.exists != 'true'"
+assert_contains "$RELEASE" 'tools/verify-existing-release.sh'
+assert_contains "$RELEASE" "EXPECTED_BRANCH=\"release/v\$VERSION-\${BASE_SHA:0:12}\""
+assert_contains "$RELEASE" 'tools/verify-crates-publication.sh'
 assert_contains "$RELEASE" 'Verify Published Release'
 assert_contains "$RELEASE" 'gh attestation verify'
 assert_contains "$PR_CHECK" 'pull_request_target:'
@@ -160,6 +169,12 @@ assert_contains "$PR_CHECK" 'release-shaped PR is missing the exact prview-relea
 assert_contains "$MERGED" 'release-shaped PR is missing the exact prview-release-pr:v1 marker'
 assert_contains "$CI" 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7'
 assert_contains "$CI" 'persist-credentials: false'
+assert_contains "$CI" 'types: [opened, synchronize, reopened, ready_for_review]'
+assert_contains "$CI" 'tools/tests/test_release_publication_recovery.sh'
+assert_contains "$RECOVERY_TEST" 'run_crates_case download_fail 2'
+assert_contains "$RECOVERY_TEST" 'run_crates_case checksum_fail 2'
+assert_contains "$RECOVERY_TEST" 'run_crates_case source_fail 2'
+assert_contains "$RECOVERY_TEST" 'run_crates_case tar_fail 2'
 assert_contains "$ROOT/tools/semver.sh" 'git fetch origin main'
 
 CRLF_BODY=$'<!-- prview-release-pr:v1\r\nversion=0.8.1\r\nexpected_main_sha=0123456789012345678901234567890123456789\r\n-->'

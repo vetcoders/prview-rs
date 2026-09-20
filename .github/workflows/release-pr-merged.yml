@@ -64,8 +64,9 @@ jobs:
             echo "::error::release PR title does not match marker version"
             exit 1
           }
-          [[ "$PR_HEAD_REF" == "release/v$VERSION" ]] || {
-            echo "::error::release PR branch must be release/v$VERSION"
+          EXPECTED_BRANCH="release/v$VERSION-${EXPECTED_MAIN_SHA:0:12}"
+          [[ "$PR_HEAD_REF" == "$EXPECTED_BRANCH" ]] || {
+            echo "::error::release PR branch must be $EXPECTED_BRANCH"
             exit 1
           }
           {
