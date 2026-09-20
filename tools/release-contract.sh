@@ -47,12 +47,18 @@ case "$mode" in
     read -r merge_commit first_parent second_parent extra <<EOF
 $(git rev-list --parents -n 1 "$target_sha")
 EOF
-    [ -n "${second_parent:-}" ] && [ -z "${extra:-}" ] || fail "Release PR must land as a two-parent merge commit"
-    [ "$merge_commit" = "$target_sha" ] && [ "$first_parent" = "$expected_base" ] || fail "Release merge first parent must be expected main SHA $expected_base"
+    if [ -z "${second_parent:-}" ] || [ -n "${extra:-}" ]; then
+      fail "Release PR must land as a two-parent merge commit"
+    fi
+    if [ "$merge_commit" != "$target_sha" ] || [ "$first_parent" != "$expected_base" ]; then
+      fail "Release merge first parent must be expected main SHA $expected_base"
+    fi
     read -r head_commit head_parent head_extra <<EOF
 $(git rev-list --parents -n 1 "$second_parent")
 EOF
-    [ "$head_commit" = "$second_parent" ] && [ "$head_parent" = "$expected_base" ] && [ -z "${head_extra:-}" ] || fail "Release PR must contain exactly one non-merge commit on the expected main SHA"
+    if [ "$head_commit" != "$second_parent" ] || [ "$head_parent" != "$expected_base" ] || [ -n "${head_extra:-}" ]; then
+      fail "Release PR must contain exactly one non-merge commit on the expected main SHA"
+    fi
     expected_subject="chore(release): prepare v$version"
     [ "$(git log -1 --format=%s "$second_parent")" = "$expected_subject" ] || fail "Release PR head commit subject must be: $expected_subject"
     ;;
