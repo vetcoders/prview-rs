@@ -214,6 +214,4 @@ help:
 	@echo "Quick start:"
 	@echo "  make install         - Contributor setup"
 	@echo "  make check           - Full local verification"
-	@echo "  make release-plan    - Start with the operator release-PR instructions"
 	@echo "  make release-gate    - Full pre-release verification (smoke + packaging + workflow)"
-	@echo "  make release-plan    - Review release flow after PR merge"

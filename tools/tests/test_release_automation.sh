@@ -126,6 +126,7 @@ assert_contains "$MERGED" 'event_type=prview-release-publish'
 assert_contains "$RELEASE" 'workflow_dispatch:'
 assert_contains "$RELEASE" 'repository_dispatch:'
 assert_contains "$RELEASE" "github.event_name == 'repository_dispatch'"
+assert_contains "$RELEASE" 'pull-requests: read'
 assert_contains "$RELEASE" "tag_name: \${{ env.PRVIEW_RELEASE_TAG }}"
 assert_contains "$RELEASE" "target_commitish: \${{ env.PRVIEW_RELEASE_SHA }}"
 assert_contains "$RELEASE" 'Verify Published Release'
@@ -141,6 +142,9 @@ if grep -Eq 'MACOS_CERT|NOTARY_API|CARGO_REGISTRY_TOKEN' "$PREP"; then
 fi
 if grep -Eq 'force-with-lease|git push --force|git tag -f' "$PREP" "$MERGED"; then
   fail "release automation must not force-update branches or tags"
+fi
+if [[ $(make -s -C "$ROOT" help | grep -Fc 'make release-plan') -ne 1 ]]; then
+  fail "make help must list release-plan exactly once"
 fi
 
 echo "Release automation contract tests passed."
