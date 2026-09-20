@@ -145,11 +145,11 @@ jobs:
               echo "::error::receipt marker version does not match the tag"
               exit 1
             }
-            grep -q "^expected_main_sha=$(git rev-parse "$PRVIEW_RELEASE_SHA^1")$" <<<"$PR_BODY" || {
+            BASE_SHA=$(git rev-parse "$PRVIEW_RELEASE_SHA^1")
+            grep -q "^expected_main_sha=$BASE_SHA$" <<<"$PR_BODY" || {
               echo "::error::receipt expected main SHA does not match the merge first parent"
               exit 1
             }
-            BASE_SHA=$(git rev-parse "$PRVIEW_RELEASE_SHA^1")
             VALIDATOR="$RUNNER_TEMP/release-contract.sh"
             git show "$BASE_SHA:tools/release-contract.sh" >"$VALIDATOR"
             chmod +x "$VALIDATOR"

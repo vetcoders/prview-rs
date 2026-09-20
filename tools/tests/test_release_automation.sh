@@ -127,6 +127,8 @@ assert_contains "$RELEASE" 'workflow_dispatch:'
 assert_contains "$RELEASE" 'repository_dispatch:'
 assert_contains "$RELEASE" "github.event_name == 'repository_dispatch'"
 assert_contains "$RELEASE" 'pull-requests: read'
+assert_contains "$RELEASE" "BASE_SHA=\$(git rev-parse \"\$PRVIEW_RELEASE_SHA^1\")"
+assert_contains "$RELEASE" "grep -q \"^expected_main_sha=\$BASE_SHA\$\""
 assert_contains "$RELEASE" "tag_name: \${{ env.PRVIEW_RELEASE_TAG }}"
 assert_contains "$RELEASE" "target_commitish: \${{ env.PRVIEW_RELEASE_SHA }}"
 assert_contains "$RELEASE" 'Verify Published Release'
