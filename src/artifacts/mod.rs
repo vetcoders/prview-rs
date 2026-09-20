@@ -468,25 +468,39 @@ fn ensure_generation_active(
         return Ok(());
     }
 
-    mark_generation_cancelled(out_dir, seam)?;
-    Err(crate::governor::Cancelled.into())
+    mark_generation_cancelled(out_dir, seam, governor.cancel_reason())?;
+    Err(governor.cancellation_error())
 }
 
-fn mark_generation_cancelled(out_dir: &Path, seam: ArtifactGenerationSeam) -> Result<()> {
+fn mark_generation_cancelled(
+    out_dir: &Path,
+    seam: ArtifactGenerationSeam,
+    reason: Option<crate::governor::CancelReason>,
+) -> Result<()> {
     for relative in CANCELLED_GENERATION_SUCCESS_SURFACES {
         let _ = fs::remove_file(out_dir.join(relative));
+    }
+
+    // Schema 1.0 is unchanged: `reason` is a string that already varied by
+    // cause, and `deadline_secs` is an ADDITIVE field that only a deadline
+    // carries. A reader that knows nothing about deadlines still finds a run
+    // marked incomplete at a named stage.
+    let mut marker = serde_json::json!({
+        "schema_version": "1.0",
+        "status": "incomplete",
+        "reason": "cancelled",
+        "stage": seam.label(),
+    });
+    if let Some(crate::governor::CancelReason::Deadline { budget }) = reason {
+        marker["reason"] = serde_json::json!("deadline exceeded");
+        marker["deadline_secs"] = serde_json::json!(budget.as_secs());
     }
 
     let summary_dir = out_dir.join("00_summary");
     fs::create_dir_all(&summary_dir)?;
     fs::write(
         summary_dir.join("INCOMPLETE.json"),
-        serde_json::to_string_pretty(&serde_json::json!({
-            "schema_version": "1.0",
-            "status": "incomplete",
-            "reason": "cancelled",
-            "stage": seam.label(),
-        }))?,
+        serde_json::to_string_pretty(&marker)?,
     )?;
     Ok(())
 }
@@ -514,12 +528,16 @@ fn publication_failure_after_rollback(
         let cancellation = if crate::governor::is_cancellation(&publication_error) {
             publication_error
         } else {
-            anyhow::Error::new(crate::governor::Cancelled).context(format!(
+            governor.cancellation_error().context(format!(
                 "run publication failed and cancellation was observed before rollback completion: {publication_error:#}"
             ))
         };
         let cancellation = preserve_primary_error_after_latest_rollback(cancellation, rollback);
-        return match mark_generation_cancelled(out_dir, ArtifactGenerationSeam::IndexCommit) {
+        return match mark_generation_cancelled(
+            out_dir,
+            ArtifactGenerationSeam::IndexCommit,
+            governor.cancel_reason(),
+        ) {
             Ok(()) => cancellation,
             Err(cleanup_error) => cancellation.context(format!(
                 "failed to mark the cancelled pack incomplete: {cleanup_error:#}"
@@ -2815,9 +2833,9 @@ mod generation_seam_test_hook {
     use crate::governor::ResourceGovernor;
     use std::cell::RefCell;
 
-    #[derive(Default)]
     struct ProbeState {
         cancel_at: Option<ArtifactGenerationSeam>,
+        reason: crate::governor::CancelReason,
         observed: Vec<ArtifactGenerationSeam>,
     }
 
@@ -2829,9 +2847,19 @@ mod generation_seam_test_hook {
 
     impl ProbeGuard {
         pub(super) fn install(cancel_at: Option<ArtifactGenerationSeam>) -> Self {
+            Self::install_with_reason(cancel_at, crate::governor::CancelReason::Operator)
+        }
+
+        /// The same injection, cancelling for a stated reason — the artifact
+        /// stage has to publish WHICH cause made the pack incomplete.
+        pub(super) fn install_with_reason(
+            cancel_at: Option<ArtifactGenerationSeam>,
+            reason: crate::governor::CancelReason,
+        ) -> Self {
             PROBE.with(|probe| {
                 let previous = probe.borrow_mut().replace(ProbeState {
                     cancel_at,
+                    reason,
                     observed: Vec::new(),
                 });
                 assert!(previous.is_none(), "nested artifact seam probe");
@@ -2867,7 +2895,7 @@ mod generation_seam_test_hook {
             if let Some(state) = probe.borrow_mut().as_mut() {
                 state.observed.push(seam);
                 if state.cancel_at == Some(seam) {
-                    governor.cancel();
+                    governor.cancel_with(state.reason);
                 }
             }
         });

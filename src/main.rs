@@ -4,8 +4,8 @@ use colored::Colorize;
 use prview::cli::{GateArgs, McpArgs};
 use prview::git::git_cmd;
 use prview::governor::{
-    CtrlC, is_cancellation, supervise_startup_stage, with_cancellation,
-    with_cancellation_after_commit_if,
+    CtrlC, DeadlineOrCtrlC, deadline_exceeded, format_budget, is_cancellation,
+    supervise_startup_stage, with_cancellation, with_cancellation_after_commit_if,
 };
 use prview::{App, Cli, CliCommand, Config, OpenArgs, RunsArgs, ScopeArgs, StateArgs};
 use std::path::{Path, PathBuf};
@@ -50,6 +50,20 @@ fn run_on_root_thread() {
         .expect("Failed building the Runtime");
 
     if let Err(err) = runtime.block_on(run()) {
+        // An expired run is prview failing to reach a verdict inside the time
+        // it was given: an execution error (exit 3, the same contract as
+        // `prview gate`), not an interrupt. 130 is reserved for the operator,
+        // and reporting it here would name them as the author of a stop they
+        // had nothing to do with.
+        if let Some(budget) = deadline_exceeded(&err) {
+            eprintln!(
+                "{} run deadline of {} exceeded — no verdict was reached; \
+                 re-run with --deadline <time> for a longer budget or --no-deadline for none",
+                "⏱".yellow().bold(),
+                format_budget(budget),
+            );
+            std::process::exit(prview::gate::GATE_EXECUTION_ERROR_EXIT_CODE);
+        }
         // A cancelled run produced no verdict. Reporting one of prview's own
         // codes would claim it did, so it exits on the shell's interrupt
         // convention instead.
@@ -187,16 +201,23 @@ async fn run() -> Result<()> {
     let app = App::from_config(config)?;
     let governor = app.governor();
 
-    // Watch mode
+    // Watch mode. Deliberately unbounded: the deadline bounds ONE review, and
+    // watch is a loop the operator leaves running for as long as they are
+    // editing. Bounding it would kill a healthy session at the half hour; each
+    // iteration is still cancellable with Ctrl-C.
     if cli.watch {
         with_cancellation(app.run_watch(), &governor, CtrlC).await?;
         return Ok(());
     }
 
-    // Normal run
-    let report =
-        with_cancellation_after_commit_if(app.run(), &governor, CtrlC, |report| !report.unchanged)
-            .await?;
+    // Normal run, bounded by its own deadline unless the operator removed it.
+    let report = with_cancellation_after_commit_if(
+        app.run(),
+        &governor,
+        DeadlineOrCtrlC::new(app.config.deadline),
+        |report| !report.unchanged,
+    )
+    .await?;
 
     // The verdict comes from the pack's MERGE_GATE.json and nowhere else. If it
     // cannot be read, prview cannot report a verdict — that is an execution
@@ -373,16 +394,20 @@ async fn run_gate_command(cli: &Cli, args: &GateArgs) -> Result<i32> {
         args.strict,
         args.fail_on_warnings,
     );
-    config.apply_gate_profile(enforcement_mode);
+    config.apply_gate_profile(enforcement_mode, prview::config::resolve_gate_deadline(cli));
     let mut app = App::from_config(config)?;
     if let Some(base) = &args.base {
         pin_explicit_gate_base(&mut app, base, args.exact_base)?;
     }
     let governor = app.governor();
-    let report =
-        with_cancellation_after_commit_if(app.run(), &governor, CtrlC, |report| !report.unchanged)
-            .await
-            .context("gate review run failed")?;
+    let report = with_cancellation_after_commit_if(
+        app.run(),
+        &governor,
+        DeadlineOrCtrlC::new(app.config.deadline),
+        |report| !report.unchanged,
+    )
+    .await
+    .context("gate review run failed")?;
     let cli_summary = prview::output::build_cli_json_summary(&app.config, &report)?;
     let merge_gate_path = report
         .artifacts_dir

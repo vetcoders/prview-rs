@@ -44,12 +44,76 @@ class SuccessfulLiveCheckTests(unittest.TestCase):
 class CaseCatalogueTests(unittest.TestCase):
     def test_every_case_has_a_mutation_and_an_assertion(self) -> None:
         self.assertEqual(
-            sorted(MODULE.CASES), ["js-only", "mixed", "unknown-input"]
+            sorted(MODULE.CASES), ["deadline", "js-only", "mixed", "unknown-input"]
         )
         for name, case in MODULE.CASES.items():
             with self.subTest(case=name):
                 self.assertTrue(callable(case["mutate"]))
-                self.assertTrue(callable(case["assert_scope"]))
+                # A case either judges the scope of a completed review or
+                # brings its own evaluator, because a run that reaches no
+                # verdict has no scope rows to judge.
+                self.assertTrue(
+                    callable(case.get("assert_scope"))
+                    or callable(case.get("evaluate"))
+                )
+
+    def test_the_deadline_case_asks_the_binary_for_a_bounded_run(self) -> None:
+        case = MODULE.CASES["deadline"]
+        self.assertEqual(case["extra_args"], ["--deadline", "2s"])
+        self.assertIs(case["evaluate"], MODULE.evaluate_deadline)
+
+
+class DeadlineEvaluationTests(unittest.TestCase):
+    """Contract §10 at the process boundary: exit 3, no verdict, no orphans."""
+
+    def receipt(self, exit_code: int) -> dict:
+        return {
+            "violations": [],
+            "process": {"exit_code": exit_code, "timed_out": False},
+        }
+
+    def evaluate(self, receipt: dict, log_text: str, pack_files: list[str]) -> list[str]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            pack = root / "pack"
+            for name in pack_files:
+                path = pack / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}", encoding="utf-8")
+            log = root / "prview.log"
+            log.write_text(log_text, encoding="utf-8")
+            MODULE.evaluate_deadline(
+                receipt, {"seen_pids": set()}, pack, log, MODULE.CASES["deadline"]
+            )
+        return receipt["violations"]
+
+    def test_accepts_a_run_its_deadline_stopped(self) -> None:
+        violations = self.evaluate(
+            self.receipt(3), "prview: deadline of 2s exceeded during checks\n", []
+        )
+        self.assertEqual(violations, [])
+
+    def test_rejects_a_verdict_shaped_exit(self) -> None:
+        violations = self.evaluate(
+            self.receipt(0), "prview: deadline of 2s exceeded\n", []
+        )
+        self.assertTrue(any("exit 3" in violation for violation in violations))
+
+    def test_rejects_a_pack_that_still_published_a_verdict(self) -> None:
+        violations = self.evaluate(
+            self.receipt(3),
+            "deadline\n",
+            ["00_summary/MERGE_GATE.json", "report.json"],
+        )
+        self.assertTrue(
+            any("verdict-shaped" in violation for violation in violations)
+        )
+
+    def test_rejects_a_silent_stop(self) -> None:
+        violations = self.evaluate(self.receipt(3), "nothing to see here\n", [])
+        self.assertTrue(
+            any("deadline stopped it" in violation for violation in violations)
+        )
 
 
 class CommandCensusTests(unittest.TestCase):

@@ -144,6 +144,31 @@ change travels through a channel no import graph describes asks for the whole
 suite with `full_tests: true`, which passes `--full-tests` to the review and is
 published as `full test run requested (--full-tests)`.
 
+**Each profile has its own bound, and they are not the same bound.** There is no
+per-call deadline argument: a tool call that needs a different budget is a CLI
+run (`prview --deadline <time>`), not a wider MCP surface.
+
+- **quick** is synchronous and wrapped in this server's own hard 120-second
+  budget. That is far shorter than the CLI's 30-minute run deadline, so the
+  deadline never fires on this path; a quick review that does not finish comes
+  back as `run_timeout`, and the spawned process tree is terminated.
+- **deep** is detached, so the CLI's own 30-minute deadline is the bound that
+  applies. A deep review that exceeds it stops itself: the process tree is
+  killed, nothing is published, and prview exits `3`.
+
+What the caller then sees for that expired deep run is `stale`, not
+`run_failed`. The reaper only discards `RUNNING.json` for a run that published
+a pack, so an expired run keeps its marker as diagnostic evidence; because the
+marker's pid is dead, `verdict` reports `status: "stale"` with the run's
+`started_at`, and `read_artifact`/`findings` fail with `stale_run`. A stale
+marker is *not* an active run, so it locks nothing out — the next `run_review`
+on the same branch is admitted normally.
+
+That wording is accurate rather than convenient: `stale` says "the process died
+before completing", which is true of an expired run but does not say that it
+stopped itself on purpose. Reporting a typed `run_failed` with the deadline as
+its reason needs a terminal marker this server does not write yet.
+
 **`quick` is synchronous.** It blocks until the pack is written, under a hard
 **120-second budget**. Exceeding the budget runs bounded whole-tree containment
 and returns `run_timeout` with `retry_hint.profile: "deep"` plus

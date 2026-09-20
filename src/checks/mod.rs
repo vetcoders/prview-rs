@@ -3658,7 +3658,10 @@ mod tests {
         let mut config = rust_config(true, true, true);
         config.execution_mode = ExecutionMode::Deep;
         config.security_full = true;
-        config.apply_gate_profile(crate::policy::engine::EnforcementMode::Advisory);
+        config.apply_gate_profile(
+            crate::policy::engine::EnforcementMode::Advisory,
+            Some(std::time::Duration::from_secs(3600)),
+        );
 
         let checks = get_checks_for_profile(&config);
         let check_names: Vec<String> = checks
