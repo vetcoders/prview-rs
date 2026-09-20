@@ -108,20 +108,22 @@ also requires the `Clippy` and `Rustfmt` checks (both of which invoke `cargo`
 under the hood, so they don't add a seventh whole-machine process family) to
 have their own exact, live, non-cached `passed` row, which is why the job's
 `dtolnay/rust-toolchain` step installs the `clippy` and `rustfmt` components
-explicitly rather than relying on the default profile. It
-fails when more than one
-whole-machine tool is active, when a Cargo/rustc, Vitest, or Semgrep pool
+explicitly rather than relying on the default profile. It fails when more than
+one whole-machine tool is active, when a Cargo/rustc, Vitest, or Semgrep pool
 exceeds the selected cap, or when the final pack and its resource metadata do
 not agree. This proves the CLI default itself resolves to the one-parent,
 one-child `safe` envelope; an explicit selector cannot hide default-wiring
 drift. Semgrep RPC coordinators are reported separately from its actual scan
 workers. The receipt also requires a clean source tree whose `HEAD` is the exact
-candidate SHA. The release build embeds that exact `PRVIEW_SOURCE_SHA`; the
-harness probes it from the binary, requires it to match the requested commit,
-and records the binary's SHA-256 digest. A dirty or stale local build therefore
-cannot masquerade as exact-SHA evidence. The
-job keeps its failure-shaped receipt under the runner's temporary directory so
-initializing that evidence cannot dirty the checkout it is about to validate.
+candidate SHA. For pull requests, that candidate is GitHub's synthesized merge
+commit, so the acceptance job exercises the PR together with the current base
+instead of combining a newer merge-ref workflow with an older head checkout.
+On `main`, the candidate is the pushed commit itself. The release build embeds
+that exact `PRVIEW_SOURCE_SHA`; the harness probes it from the binary, requires
+it to match the requested commit, and records the binary's SHA-256 digest. A
+dirty or stale local build therefore cannot masquerade as exact-SHA evidence.
+The job keeps its failure-shaped receipt under the runner's temporary directory
+so initializing that evidence cannot dirty the checkout it is about to validate.
 It has an internal 20-minute deadline inside a 45-minute Actions timeout, then
 always uploads a compact JSON receipt plus the captured CLI log.
 Only the published job on the exact candidate SHA is platform evidence; a local

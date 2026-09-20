@@ -136,11 +136,9 @@ jobs:
     # own npm install and its own cargo/semgrep/vitest passes.
     timeout-minutes: 60
     env:
-      PRVIEW_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PRVIEW_SOURCE_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ env.PRVIEW_SOURCE_SHA }}
       - name: Initialize failure-shaped receipt
         env:
           PRVIEW_ACCEPTANCE_DIR: ${{ runner.temp }}/prview-resource-acceptance
