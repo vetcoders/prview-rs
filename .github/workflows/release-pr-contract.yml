@@ -1,0 +1,74 @@
+name: Release PR contract
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Release PR contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.sha }}
+      - name: Validate marked release PR with trusted base code
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PR_BODY=${PR_BODY//$'\r\n'/$'\n'}
+          if ! grep -q '^<!-- prview-release-pr:v1$' <<<"$PR_BODY"; then
+            if [[ "$PR_HEAD_REPO" == "$GITHUB_REPOSITORY" ]] \
+              && { [[ "$PR_HEAD_REF" == release/v* ]] || [[ "$PR_TITLE" == "chore(release): prepare v"* ]]; }; then
+              echo "::error::release-shaped PR is missing the exact prview-release-pr:v1 marker"
+              exit 1
+            fi
+            echo "Ordinary PR: release contract is not applicable."
+            exit 0
+          fi
+          VERSION=$(sed -n 's/^version=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' <<<"$PR_BODY")
+          EXPECTED_MAIN_SHA=$(sed -n 's/^expected_main_sha=\([0-9a-f]\{40\}\)$/\1/p' <<<"$PR_BODY")
+          [[ -n "$VERSION" && -n "$EXPECTED_MAIN_SHA" ]] || {
+            echo "::error::release marker is malformed or incomplete"
+            exit 1
+          }
+          [[ "$PR_HEAD_REPO" == "$GITHUB_REPOSITORY" ]] || {
+            echo "::error::release PR must originate in this repository"
+            exit 1
+          }
+          EXPECTED_BRANCH="release/v$VERSION-${EXPECTED_MAIN_SHA:0:12}"
+          [[ "$PR_HEAD_REF" == "$EXPECTED_BRANCH" ]] || {
+            echo "::error::release PR branch must be $EXPECTED_BRANCH"
+            exit 1
+          }
+          [[ "$PR_TITLE" == "chore(release): prepare v$VERSION" ]] || {
+            echo "::error::release PR title does not match marker version"
+            exit 1
+          }
+          LIVE_MAIN_SHA=$(git ls-remote origin refs/heads/main | awk '{print $1}')
+          [[ "$LIVE_MAIN_SHA" == "$EXPECTED_MAIN_SHA" ]] || {
+            echo "::error::main moved from $EXPECTED_MAIN_SHA to $LIVE_MAIN_SHA; prepare a new release PR"
+            exit 1
+          }
+          git fetch origin "pull/$PR_NUMBER/head:refs/remotes/origin/release-candidate"
+          [[ "$(git rev-parse refs/remotes/origin/release-candidate)" == "$PR_HEAD_SHA" ]] || {
+            echo "::error::fetched release head does not match the pull request event"
+            exit 1
+          }
+          VALIDATOR="$RUNNER_TEMP/release-contract.sh"
+          git show "$EXPECTED_MAIN_SHA:tools/release-contract.sh" >"$VALIDATOR"
+          chmod +x "$VALIDATOR"
+          git checkout --detach "$PR_HEAD_SHA"
+          "$VALIDATOR" candidate "$VERSION" "$EXPECTED_MAIN_SHA" "$PR_HEAD_SHA"

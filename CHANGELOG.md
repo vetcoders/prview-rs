@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Release preparation is now an operator-selected, expected-SHA-pinned draft PR
+  workflow. A separate fail-closed merge validator creates the immutable tag
+  only for a machine-marked release PR, while the existing signed publish
+  pipeline now adds concurrency and public cold-install, source-SHA, signature,
+  provenance, and crates.io verification. Manual dispatch remains a
+  non-publishing producer-path dry run.
 - `prview gate --base <REF>` reviews the current checkout against an explicit
   branch, tag, or commit SHA instead of the auto-detected
   `develop`/`main`/`master` base. An explicit base that does not resolve exits
