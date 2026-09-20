@@ -122,6 +122,7 @@ jobs:
             PR_HEAD_REPO=$(jq -r '.head.repo.full_name' <<<"$PR_JSON")
             PR_TITLE=$(jq -r '.title' <<<"$PR_JSON")
             PR_BODY=$(jq -r '.body // ""' <<<"$PR_JSON")
+            PR_BODY=${PR_BODY//$'\r\n'/$'\n'}
             [[ "$PR_MERGED" == true && "$PR_MERGE_SHA" == "$PRVIEW_RELEASE_SHA" ]] || {
               echo "::error::receipt PR is not merged at the requested release commit"
               exit 1

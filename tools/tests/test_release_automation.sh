@@ -78,6 +78,20 @@ assert_contains "$FIXTURE/CHANGELOG.md" '[Unreleased]: https://github.com/vetcod
 assert_contains "$FIXTURE/CHANGELOG.md" '[0.8.1]: https://github.com/vetcoders/prview-rs/compare/v0.8.0...v0.8.1'
 [[ -z "$(git -C "$FIXTURE" tag --list)" ]] || fail "metadata preparation created a tag"
 
+git -C "$FIXTURE" checkout -qb nonempty-unreleased "$CANDIDATE"
+awk '
+  /^## \[Unreleased\]$/ { print; print ""; print "### Added"; next }
+  { print }
+' "$FIXTURE/CHANGELOG.md" >"$FIXTURE/CHANGELOG.md.tmp"
+mv "$FIXTURE/CHANGELOG.md.tmp" "$FIXTURE/CHANGELOG.md"
+git -C "$FIXTURE" add CHANGELOG.md
+git -C "$FIXTURE" commit -q --amend --no-edit
+if UNRELEASED_OUTPUT=$(cd "$FIXTURE" && tools/release-contract.sh candidate 0.8.1 "$BASE" HEAD 2>&1); then
+  fail "candidate contract accepted non-empty Unreleased content"
+fi
+grep -Fq 'CHANGELOG [Unreleased] must be empty and immediately precede release 0.8.1' <<<"$UNRELEASED_OUTPUT" \
+  || fail "candidate contract did not reject non-empty Unreleased content at the strict parser"
+
 git -C "$FIXTURE" checkout -qb main "$BASE"
 git -C "$FIXTURE" merge -q --no-ff "$CANDIDATE" -m "Merge release fixture"
 MERGE=$(git -C "$FIXTURE" rev-parse HEAD)
@@ -112,6 +126,7 @@ PREP="$ROOT/.github/workflows/prepare-release.yml"
 MERGED="$ROOT/.github/workflows/release-pr-merged.yml"
 RELEASE="$ROOT/.github/workflows/release.yml"
 PR_CHECK="$ROOT/.github/workflows/release-pr-contract.yml"
+CI="$ROOT/.github/workflows/ci.yml"
 
 assert_contains "$PREP" 'expected_main_sha:'
 assert_contains "$PREP" 'strict_required_status_checks_policy == true'
@@ -131,6 +146,9 @@ assert_contains "$RELEASE" "git fetch --no-tags origin \"refs/tags/\$TAG:refs/ta
 assert_contains "$RELEASE" "TAG_COMMIT=\$(git rev-list -n 1 \"refs/tags/\$TAG\")"
 assert_contains "$RELEASE" "BASE_SHA=\$(git rev-parse \"\$PRVIEW_RELEASE_SHA^1\")"
 assert_contains "$RELEASE" "grep -q \"^expected_main_sha=\$BASE_SHA\$\""
+assert_contains "$PR_CHECK" "PR_BODY=\${PR_BODY//\$'\\r\\n'/\$'\\n'}"
+assert_contains "$MERGED" "PR_BODY=\${PR_BODY//\$'\\r\\n'/\$'\\n'}"
+assert_contains "$RELEASE" "PR_BODY=\${PR_BODY//\$'\\r\\n'/\$'\\n'}"
 assert_contains "$RELEASE" "tag_name: \${{ env.PRVIEW_RELEASE_TAG }}"
 assert_contains "$RELEASE" "target_commitish: \${{ env.PRVIEW_RELEASE_SHA }}"
 assert_contains "$RELEASE" 'Verify Published Release'
@@ -140,6 +158,21 @@ assert_contains "$PR_CHECK" 'git ls-remote origin refs/heads/main'
 assert_contains "$PR_CHECK" "git show \"\$EXPECTED_MAIN_SHA:tools/release-contract.sh\""
 assert_contains "$PR_CHECK" 'release-shaped PR is missing the exact prview-release-pr:v1 marker'
 assert_contains "$MERGED" 'release-shaped PR is missing the exact prview-release-pr:v1 marker'
+assert_contains "$CI" 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7'
+assert_contains "$CI" 'persist-credentials: false'
+assert_contains "$ROOT/tools/semver.sh" 'git fetch origin main'
+
+CRLF_BODY=$'<!-- prview-release-pr:v1\r\nversion=0.8.1\r\nexpected_main_sha=0123456789012345678901234567890123456789\r\n-->'
+CRLF_BODY=${CRLF_BODY//$'\r\n'/$'\n'}
+grep -q '^<!-- prview-release-pr:v1$' <<<"$CRLF_BODY" \
+  || fail "CRLF normalization did not preserve the exact release marker"
+grep -q '^version=0.8.1$' <<<"$CRLF_BODY" \
+  || fail "CRLF normalization did not preserve release marker fields"
+MALFORMED_BODY=$'<!-- prview-release-pr:v\r1\nversion=0.8.1\n-->'
+MALFORMED_BODY=${MALFORMED_BODY//$'\r\n'/$'\n'}
+if grep -q '^<!-- prview-release-pr:v1$' <<<"$MALFORMED_BODY"; then
+  fail "CRLF normalization accepted a standalone carriage return inside the marker"
+fi
 
 if grep -Eq 'MACOS_CERT|NOTARY_API|CARGO_REGISTRY_TOKEN' "$PREP"; then
   fail "PR workflows must not reference release secrets"

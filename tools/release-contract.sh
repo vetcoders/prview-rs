@@ -100,7 +100,8 @@ if ! awk -v version="$version" '
   /^## \[Unreleased\]$/ { in_unreleased = 1; next }
   in_unreleased && $0 == "## [" version "]" { exit 1 }
   in_unreleased && $0 ~ ("^## \\[" version "\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$") { found = 1; exit }
-  in_unreleased && /^- / { exit 2 }
+  in_unreleased && $0 ~ /^[[:space:]]*$/ { next }
+  in_unreleased { exit 2 }
   END { exit(found ? 0 : 3) }
 ' CHANGELOG.md; then
   fail "CHANGELOG [Unreleased] must be empty and immediately precede release $version"

@@ -39,6 +39,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          PR_BODY=${PR_BODY//$'\r\n'/$'\n'}
           [[ "$PR_HEAD_REPO" == "$GITHUB_REPOSITORY" ]] || {
             echo "::notice::Ignoring a merged fork PR; release PRs must originate in this repository."
             echo "release=false" >>"$GITHUB_OUTPUT"

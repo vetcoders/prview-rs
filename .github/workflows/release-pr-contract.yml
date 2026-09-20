@@ -28,6 +28,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          PR_BODY=${PR_BODY//$'\r\n'/$'\n'}
           if ! grep -q '^<!-- prview-release-pr:v1$' <<<"$PR_BODY"; then
             if [[ "$PR_HEAD_REPO" == "$GITHUB_REPOSITORY" ]] \
               && { [[ "$PR_HEAD_REF" == release/v* ]] || [[ "$PR_TITLE" == "chore(release): prepare v"* ]]; }; then

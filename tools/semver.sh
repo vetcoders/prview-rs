@@ -202,7 +202,8 @@ print_plan() {
   cat <<EOF
 Release PR flow (current package version: ${VERSION})
 
-1. Read the full current main SHA:
+1. Fetch and read the full current main SHA:
+   git fetch origin main
    git rev-parse origin/main
 2. Dispatch "Prepare Release PR" with patch/minor/major or an exact version,
    plus that expected main SHA.
