@@ -99,7 +99,8 @@ jobs:
               echo "::error::Tag ${TAG} does not match Cargo.toml version v${VERSION}"
               exit 1
             fi
-            TAG_COMMIT=$(git rev-list -n 1 "$TAG")
+            git fetch --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+            TAG_COMMIT=$(git rev-list -n 1 "refs/tags/$TAG")
             if [ "$TAG_COMMIT" != "$PRVIEW_RELEASE_SHA" ]; then
               echo "::error::Tag $TAG resolves to $TAG_COMMIT, not release commit $PRVIEW_RELEASE_SHA"
               exit 1
