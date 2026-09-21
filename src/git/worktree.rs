@@ -208,15 +208,54 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
     // Symlink untracked dependencies (node_modules and .venv) to bypass reinstall overhead.
     // A failed borrow is terminal instead of silently leaving a snapshot whose
     // JS eligibility was decided from the operator checkout but whose toolchain
-    // is absent at execution time.
+    // is absent at execution time. A target is allowed to commit files under
+    // node_modules; preserve that directory and borrow only missing top-level
+    // dependency entries in that case. Linking `.bin` alone is insufficient for
+    // npm/pnpm shims because they resolve sibling package paths such as
+    // `../eslint` from the snapshot.
     #[cfg(unix)]
     {
         let nm = repo_root.join("node_modules");
         let snapshot_nm = worktree_path.join("node_modules");
-        if nm.exists() && !snapshot_nm.exists() {
-            std::os::unix::fs::symlink(&nm, &snapshot_nm).with_context(|| {
-                format!("failed to expose {} in exact-target snapshot", nm.display())
-            })?;
+        if nm.exists() {
+            if !snapshot_nm.exists() {
+                std::os::unix::fs::symlink(&nm, &snapshot_nm).with_context(|| {
+                    format!("failed to expose {} in exact-target snapshot", nm.display())
+                })?;
+            } else {
+                let ambient_bin = nm.join(".bin");
+                let snapshot_bin = snapshot_nm.join(".bin");
+                if ambient_bin.exists() && !snapshot_bin.exists() {
+                    for entry in std::fs::read_dir(&nm)
+                        .with_context(|| format!("failed to enumerate ambient {}", nm.display()))?
+                    {
+                        let entry = entry.with_context(|| {
+                            format!("failed to read an entry from ambient {}", nm.display())
+                        })?;
+                        let borrowed = entry.path();
+                        let exposed = snapshot_nm.join(entry.file_name());
+                        match std::fs::symlink_metadata(&exposed) {
+                            Ok(_) => continue,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(error).with_context(|| {
+                                    format!(
+                                        "failed to inspect target-owned dependency path {}",
+                                        exposed.display()
+                                    )
+                                });
+                            }
+                        }
+                        std::os::unix::fs::symlink(&borrowed, &exposed).with_context(|| {
+                            format!(
+                                "failed to expose {} in target-owned {}",
+                                borrowed.display(),
+                                snapshot_nm.display()
+                            )
+                        })?;
+                    }
+                }
+            }
         }
         let venv = repo_root.join(".venv");
         let snapshot_venv = worktree_path.join(".venv");

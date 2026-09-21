@@ -585,10 +585,15 @@ check. An explicit target, PR/MCP, remote/remote-only, or CI review materialises
 a detached `git worktree` at the target commit even when that commit equals
 `HEAD`. Only the default local invocation with no target keeps `repo_root`,
 because that mode intentionally reviews the developer's live, possibly dirty
-tree. On Unix, `node_modules` and `.venv` are symlinked into snapshots, so tests
-and linters keep their installed environment without a reinstall; a failed link
-aborts snapshot creation instead of leaving eligibility and execution on
-different toolchains. Non-Unix exact-target JS checks are currently skipped with
+tree. On Unix, an unowned `node_modules` and `.venv` are symlinked into snapshots,
+so tests and linters keep their installed environment without a reinstall. If
+the target commit already owns a `node_modules` directory, prview preserves its
+contents and links only the operator's missing top-level dependency entries
+inside it instead. This includes `.bin` plus the sibling packages its npm/pnpm
+shims resolve, and the nested `.bin` link is reported as
+`SnapshotBorrowedDeps`. A failed required link aborts snapshot creation instead
+of leaving eligibility and execution on different toolchains. Non-Unix
+exact-target JS checks are currently skipped with
 an explicit unsupported-borrow reason, while ambient JS checks remain unchanged.
 This avoids claiming `SnapshotBorrowedDeps` unless a real link exists. Snapshot
 creation uses an empty per-snapshot `core.hooksPath`; checkout hooks belong to

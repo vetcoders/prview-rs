@@ -242,7 +242,11 @@ fn borrows_local_dependencies(repo: &git2::Repository, consumable: &[&str]) -> b
     let Some(root) = repo.workdir() else {
         return false;
     };
-    consumable.iter().any(|name| root.join(name).is_symlink())
+    consumable.iter().any(|name| {
+        let scaffolding = root.join(name);
+        scaffolding.is_symlink()
+            || (*name == "node_modules" && scaffolding.join(".bin").is_symlink())
+    })
 }
 
 /// True when `repo` is the repository rooted at `repo_root` — its own working
@@ -4336,6 +4340,101 @@ test result: ok. 2 passed; 0 failed
         assert!(
             stdout.contains("LOCAL_BIN_RAN"),
             "run_js_command must exec the local bin directly, got: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_same_head_eslint_borrows_bin_inside_target_owned_node_modules() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let node_modules = root.join("node_modules");
+        std::fs::create_dir(&node_modules).expect("target node_modules");
+        std::fs::write(
+            node_modules.join("committed-marker.txt"),
+            "owned by target commit\n",
+        )
+        .expect("target marker");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+
+        let run_git = |args: &[&str]| {
+            let output = crate::git::cmd::git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        run_git(&[
+            "add",
+            "-f",
+            "package.json",
+            "node_modules/committed-marker.txt",
+        ]);
+        run_git(&["commit", "-q", "-m", "target owns node_modules"]);
+        let target = git2::Repository::open(root)
+            .expect("open fixture")
+            .head()
+            .expect("fixture head")
+            .peel_to_commit()
+            .expect("head commit")
+            .id()
+            .to_string();
+
+        let bin_dir = node_modules.join(".bin");
+        std::fs::create_dir(&bin_dir).expect("ambient bin dir");
+        let ambient_eslint = node_modules.join("eslint");
+        std::fs::create_dir(&ambient_eslint).expect("ambient eslint package");
+        std::fs::write(ambient_eslint.join("package-marker"), "ambient package\n")
+            .expect("ambient eslint package marker");
+        let eslint = bin_dir.join("eslint");
+        {
+            let mut executable = std::fs::File::create(&eslint).expect("ambient eslint");
+            executable
+                .write_all(
+                    b"#!/bin/sh\ntest -f node_modules/committed-marker.txt || exit 9\ntest -f node_modules/eslint/package-marker || exit 10\nprintf 'COLLISION_ESLINT_RAN\\n'\n",
+                )
+                .expect("write ambient eslint");
+            executable.sync_all().expect("sync ambient eslint");
+        }
+        let mut permissions = std::fs::metadata(&eslint)
+            .expect("eslint metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&eslint, permissions).expect("make eslint executable");
+
+        let mut config = test_config();
+        config.profile = crate::config::test_js_profile(false);
+        config.repo_root = root.to_path_buf();
+        config.target = Some(target.clone());
+        config.pinned_target = Some(crate::git::ResolvedRef {
+            name: target.clone(),
+            commit_id: target.clone(),
+            is_remote: false,
+        });
+        config.run_lint = true;
+
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let result = check.run(&config).await.expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(!result.cached);
+        assert!(result.output.contains("COLLISION_ESLINT_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_ne!(provenance.cwd, root.display().to_string());
+        assert_eq!(provenance.target_sha.as_deref(), Some(target.as_str()));
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "a nested ambient .bin link is a real dependency borrow",
         );
     }
 
