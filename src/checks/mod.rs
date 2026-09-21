@@ -134,7 +134,7 @@ pub struct ScanSubstrate {
 /// ([`SNAPSHOT_SCAFFOLDING`]) are excluded: they are the tool's own scaffolding,
 /// not a modification of the reviewed tree. They are not free of consequence
 /// either — a snapshot is `snapshot-borrowed-deps` when it carries a link THIS
-/// command could actually consume, named by `consumable` (see
+/// command could actually consume, named by its resolved path in `consumable` (see
 /// [`consumable_scaffolding`]).
 ///
 /// Best effort: a `cwd` that is not in a git repository yields `None` for both
@@ -187,7 +187,7 @@ pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path, consumable: &[&str])
 /// and must not make the snapshot look modified.
 const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
 
-/// Which scaffolding links a given check could actually READ.
+/// Which resolved paths a given check could actually READ.
 ///
 /// Presence of a link is not consumption of it, and the two must not be
 /// confused: a mixed repository has `node_modules` linked into every snapshot,
@@ -196,9 +196,11 @@ const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
 /// same class of false claim, pointing the other way, as certifying an exact
 /// scan.
 ///
-/// The JS checks resolve their compiler, plugins, type definitions and runtime
-/// through `node_modules` (`local_js_bin` looks in `node_modules/.bin` first),
-/// so for them a linked tree is genuinely the operator's.
+/// JS checks name the concrete executable they run under `node_modules/.bin`.
+/// This distinction is load-bearing: a target may own `.bin` as a directory or
+/// symlink while prview borrows one missing tool inside it. Provenance follows
+/// the resolved tool path and counts a borrow only when that path crosses a link
+/// recorded by the snapshot builder.
 ///
 /// The Python checks return NOTHING, deliberately. The snapshot still links
 /// `.venv` — `create_worktree_snapshot` does not know who will run there — but
@@ -220,21 +222,24 @@ const SNAPSHOT_SCAFFOLDING: &[&str] = &["node_modules", ".venv"];
 /// only knew display names would answer "consumes nothing" for every one of them.
 pub(crate) fn consumable_scaffolding(check: &str) -> &'static [&'static str] {
     match crate::check_id::check_id_from_name(check).as_str() {
-        // JS checks and context generators — as their canonical ids. The
-        // latter prefer local binaries or traverse the dependency tree too.
-        "tsc" | "eslint" | "tests" | "stylelint" | "tauri_info" | "esbuild_meta" | "npm_sbom" => {
-            &["node_modules"]
-        }
+        "tsc" => &["node_modules/.bin/tsc"],
+        "eslint" => &["node_modules/.bin/eslint"],
+        "tests" => &["node_modules/.bin/vitest"],
+        "stylelint" => &["node_modules/.bin/stylelint"],
+        "tauri_info" => &["node_modules/.bin/tauri"],
+        "esbuild_meta" => &["node_modules/.bin/esbuild"],
+        // The SBOM command traverses the dependency tree rather than resolving
+        // one executable from it, so its consumable path is intentionally broad.
+        "npm_sbom" => &["node_modules"],
         _ => &[],
     }
 }
 
-/// Whether the snapshot actually CARRIES a link this command could consume.
+/// Whether a command's resolved path crosses a link this snapshot builder made.
 ///
-/// Presence, not policy: an off-HEAD review of a repo with no local
-/// `node_modules` installs nothing and links nothing, and stays an exact
-/// snapshot scan. Only a link that exists AND is consumable could have been
-/// followed.
+/// The sidecar is explicit creator provenance, not a symlink-shape heuristic.
+/// A target-owned `.bin -> bin-owned` therefore stays `snapshot`, while a
+/// missing `.bin/eslint` linked by prview is `snapshot-borrowed-deps`.
 ///
 /// Checked at the WORKTREE ROOT, not at the check's `cwd` — a cargo member runs
 /// in a subdirectory while the scaffolding sits at the top of the snapshot.
@@ -242,11 +247,9 @@ fn borrows_local_dependencies(repo: &git2::Repository, consumable: &[&str]) -> b
     let Some(root) = repo.workdir() else {
         return false;
     };
-    consumable.iter().any(|name| {
-        let scaffolding = root.join(name);
-        scaffolding.is_symlink()
-            || (*name == "node_modules" && scaffolding.join(".bin").is_symlink())
-    })
+    consumable
+        .iter()
+        .any(|path| crate::git::path_uses_prview_borrow(root, Path::new(path)))
 }
 
 /// True when `repo` is the repository rooted at `repo_root` — its own working
@@ -1996,10 +1999,9 @@ async fn install_run_scope(
 /// How each tool reads `scan_dir`, for re-keying the entries decided before the
 /// run knew which tree it was reading.
 ///
-/// One `git status` per distinct consumable set, not per entry: there are only
-/// two sets in the table ([`consumable_scaffolding`] answers either nothing or
-/// `node_modules`), and the run-wide resolution seeds the first of them, so a
-/// whole adoption costs at most one status read more than it used to.
+/// One `git status` per distinct resolved path set, not per entry. The run-wide
+/// resolution seeds the empty set; repeated display-name/id aliases reuse the
+/// same static slice and therefore the same substrate result.
 fn adopted_substrate(
     scan_dir: PathBuf,
     repo_root: PathBuf,
@@ -2206,51 +2208,37 @@ pub async fn run_command_with_timeout_and_env(
     .await
 }
 
-/// Helper to run JS tools via pnpm or npx (with tool availability check)
+/// Run the exact local JS binary selected by eligibility and snapshot overlay.
 pub async fn run_js_command(tool: &str, args: &[&str], cwd: &Path) -> Result<Output> {
     run_js_command_with_timeout(tool, args, cwd, CHECK_TIMEOUT_SECS).await
 }
 
-/// Helper to run JS tools with custom timeout (for tests)
+/// Run a resolved JS tool with a custom timeout (for tests).
+///
+/// A missing binary is rejected before spawn. Falling back to `pnpm exec` or
+/// `npx` here would create a second resolver after eligibility and could publish
+/// a launcher-level "command not found" as a check result.
 pub async fn run_js_command_with_timeout(
     tool: &str,
     args: &[&str],
     cwd: &Path,
     timeout_secs: u64,
 ) -> Result<Output> {
-    // Build full args list
-    let pnpm_args: Vec<&str> = std::iter::once("exec")
-        .chain(std::iter::once(tool))
-        .chain(args.iter().copied())
-        .collect();
-
-    // --no-install: a missing tool must fail fast and parseably, never reach
-    // npm's interactive "Ok to proceed?" prompt (the --deep hang class).
-    let npx_args: Vec<&str> = ["--no-install", tool]
-        .into_iter()
-        .chain(args.iter().copied())
-        .collect();
-
-    // Prefer a resolved local binary: a direct exec with no launcher, no npm
-    // registry consult, and no prompt (PR #12 review #15/#17). Fall back to
-    // pnpm exec, then npx --no-install, only when the tool is not installed
-    // locally.
-    if let Some(bin) = local_js_bin(tool, cwd) {
-        let bin = bin.to_string_lossy().into_owned();
-        run_command_with_timeout(&bin, args, cwd, timeout_secs).await
-    } else if which::which("pnpm").is_ok() {
-        run_command_with_timeout("pnpm", &pnpm_args, cwd, timeout_secs).await
-    } else {
-        run_command_with_timeout("npx", &npx_args, cwd, timeout_secs).await
-    }
+    let bin = local_js_bin(tool, cwd).with_context(|| {
+        format!(
+            "resolved JS tool disappeared before spawn: {}",
+            cwd.join("node_modules/.bin").join(tool).display()
+        )
+    })?;
+    let bin = bin.to_string_lossy().into_owned();
+    run_command_with_timeout(&bin, args, cwd, timeout_secs).await
 }
 
 /// Resolve a JS tool to a directly-runnable local binary, bypassing npx.
 ///
-/// `npx --no-install` still consults npm and, on some npm versions, can prompt
-/// or hit the network; a resolved `node_modules/.bin/<tool>` is an unambiguous
-/// local exec with neither. Returns None when the tool is not installed locally
-/// (the caller then falls back to pnpm/npx) (PR #12 review #15/#17).
+/// A resolved `node_modules/.bin/<tool>` is an unambiguous local exec with no
+/// launcher, registry consult, or prompt. Returns `None` when that exact path
+/// cannot be executed (PR #12 review #15/#17).
 pub fn local_js_bin(tool: &str, cwd: &Path) -> Option<std::path::PathBuf> {
     let bin = cwd.join("node_modules/.bin").join(tool);
     bin.exists().then_some(bin)
@@ -2263,40 +2251,58 @@ pub fn js_tool_available(tool: &str, cwd: &Path) -> bool {
 
 /// Why a JS tool cannot run on the substrate this review requested.
 ///
-/// Exact snapshots currently borrow the operator's `node_modules` through a
-/// directory symlink. That mechanism is guaranteed only on Unix. On other
-/// platforms, claiming eligibility from `repo_root` and then looking for the
-/// executable inside the snapshot makes a runnable check disappear at spawn
-/// time. Fail closed with an explicit skip until a portable borrow mechanism is
-/// available; ambient local reviews keep their existing behavior.
+/// Exact eligibility first resolves the tool in the reviewed commit (following
+/// target-owned symlinks), then considers an ambient tool only as a borrow
+/// candidate. Ambient eligibility reads only the live checkout. Execution uses
+/// the same concrete `node_modules/.bin/<tool>` path and fails before spawn if
+/// that path disappears.
 pub(crate) fn js_tool_unavailable_reason(tool: &str, config: &Config) -> Option<String> {
+    let available_in_target = match review_substrate(config) {
+        Ok(ReviewSubstrate::ExactTarget(target)) => {
+            crate::git::commit_path_exists_following_symlinks(
+                &config.repo_root,
+                &target.commit_id,
+                &js_tool_relative_path(tool),
+            )
+        }
+        Ok(ReviewSubstrate::Ambient) | Err(_) => false,
+    };
     js_tool_unavailable_reason_with(
         tool,
         config,
         js_tool_available(tool, &config.repo_root),
+        available_in_target,
         cfg!(unix),
     )
+}
+
+fn js_tool_relative_path(tool: &str) -> PathBuf {
+    Path::new("node_modules/.bin").join(tool)
 }
 
 fn js_tool_unavailable_reason_with(
     tool: &str,
     config: &Config,
     available_in_operator_checkout: bool,
+    available_in_target: bool,
     snapshot_dependency_links_supported: bool,
 ) -> Option<String> {
-    if !available_in_operator_checkout {
-        return Some(format!(
-            "tool not installed (node_modules/.bin/{tool} is missing)"
-        ));
-    }
     match review_substrate(config) {
+        Ok(ReviewSubstrate::Ambient) if available_in_operator_checkout => None,
+        Ok(ReviewSubstrate::Ambient) => Some(format!(
+            "tool not installed (node_modules/.bin/{tool} is missing)"
+        )),
+        Ok(ReviewSubstrate::ExactTarget(_)) if available_in_target => None,
+        Ok(ReviewSubstrate::ExactTarget(_)) if !available_in_operator_checkout => Some(format!(
+            "tool not installed in reviewed target or operator checkout (node_modules/.bin/{tool} is missing)"
+        )),
         Ok(ReviewSubstrate::ExactTarget(_)) if !snapshot_dependency_links_supported => {
             Some(format!(
                 "tool unavailable for exact-target snapshot: borrowing node_modules is unsupported on this platform ({tool})"
             ))
         }
         Err(error) => Some(format!("exact review target unavailable: {error:#}")),
-        Ok(ReviewSubstrate::Ambient | ReviewSubstrate::ExactTarget(_)) => None,
+        Ok(ReviewSubstrate::ExactTarget(_)) => None,
     }
 }
 
@@ -3164,19 +3170,19 @@ mod tests {
                 "{check} does not read prview's dependency links",
             );
         }
-        for check in [
-            "TypeScript",
-            "ESLint",
-            "Vitest",
-            "Stylelint",
-            "tauri_info",
-            "esbuild_meta",
-            "npm_sbom",
+        for (check, expected) in [
+            ("TypeScript", "node_modules/.bin/tsc"),
+            ("ESLint", "node_modules/.bin/eslint"),
+            ("Vitest", "node_modules/.bin/vitest"),
+            ("Stylelint", "node_modules/.bin/stylelint"),
+            ("tauri_info", "node_modules/.bin/tauri"),
+            ("esbuild_meta", "node_modules/.bin/esbuild"),
+            ("npm_sbom", "node_modules"),
         ] {
             assert_eq!(
                 consumable_scaffolding(check),
-                &["node_modules"],
-                "{check} resolves its toolchain through node_modules",
+                &[expected],
+                "{check} must name the concrete path it resolves",
             );
         }
     }
@@ -4345,7 +4351,7 @@ test result: ok. 2 passed; 0 failed
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn exact_same_head_eslint_borrows_bin_inside_target_owned_node_modules() {
+    async fn exact_same_head_eslint_borrows_missing_tool_inside_target_owned_bin() {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
 
@@ -4360,6 +4366,10 @@ test result: ok. 2 passed; 0 failed
         .expect("target marker");
         std::fs::write(root.join("package.json"), "{\"private\":true}\n")
             .expect("package manifest");
+        let bin_dir = node_modules.join(".bin");
+        std::fs::create_dir(&bin_dir).expect("target bin dir");
+        std::fs::write(bin_dir.join("target-tool"), "target-owned\n")
+            .expect("target-owned sibling tool");
 
         let run_git = |args: &[&str]| {
             let output = crate::git::cmd::git_cmd()
@@ -4374,8 +4384,9 @@ test result: ok. 2 passed; 0 failed
             "-f",
             "package.json",
             "node_modules/committed-marker.txt",
+            "node_modules/.bin/target-tool",
         ]);
-        run_git(&["commit", "-q", "-m", "target owns node_modules"]);
+        run_git(&["commit", "-q", "-m", "target owns partial bin"]);
         let target = git2::Repository::open(root)
             .expect("open fixture")
             .head()
@@ -4385,8 +4396,6 @@ test result: ok. 2 passed; 0 failed
             .id()
             .to_string();
 
-        let bin_dir = node_modules.join(".bin");
-        std::fs::create_dir(&bin_dir).expect("ambient bin dir");
         let ambient_eslint = node_modules.join("eslint");
         std::fs::create_dir(&ambient_eslint).expect("ambient eslint package");
         std::fs::write(ambient_eslint.join("package-marker"), "ambient package\n")
@@ -4428,13 +4437,109 @@ test result: ok. 2 passed; 0 failed
         assert_eq!(result.status, CheckStatus::Passed);
         assert!(!result.cached);
         assert!(result.output.contains("COLLISION_ESLINT_RAN"));
+        assert!(
+            !result.output.contains("Command \"eslint\" not found"),
+            "a resolved tool must not fall through to a launcher-level failure",
+        );
         let provenance = result.provenance.expect("ESLint provenance");
         assert_ne!(provenance.cwd, root.display().to_string());
         assert_eq!(provenance.target_sha.as_deref(), Some(target.as_str()));
         assert_eq!(
             provenance.tree_state,
             Some(TreeState::SnapshotBorrowedDeps),
-            "a nested ambient .bin link is a real dependency borrow",
+            "the concrete eslint path crosses a link created by prview",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_target_owned_bin_symlink_executes_target_as_snapshot() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let node_modules = root.join("node_modules");
+        let owned_bin = node_modules.join("bin-owned");
+        std::fs::create_dir_all(&owned_bin).expect("target-owned bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let eslint = owned_bin.join("eslint");
+        {
+            let mut executable = std::fs::File::create(&eslint).expect("target eslint");
+            executable
+                .write_all(b"#!/bin/sh\nprintf 'TARGET_SYMLINK_ESLINT_RAN\\n'\n")
+                .expect("write target eslint");
+            executable.sync_all().expect("sync target eslint");
+        }
+        let mut permissions = std::fs::metadata(&eslint)
+            .expect("target eslint metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&eslint, permissions).expect("make target eslint executable");
+        std::os::unix::fs::symlink("bin-owned", node_modules.join(".bin"))
+            .expect("target-owned .bin symlink");
+
+        let run_git = |args: &[&str]| {
+            let output = crate::git::cmd::git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        run_git(&[
+            "add",
+            "-f",
+            "package.json",
+            "node_modules/.bin",
+            "node_modules/bin-owned/eslint",
+        ]);
+        run_git(&["commit", "-q", "-m", "target owns symlinked bin"]);
+        let target = git2::Repository::open(root)
+            .expect("open fixture")
+            .head()
+            .expect("fixture head")
+            .peel_to_commit()
+            .expect("head commit")
+            .id()
+            .to_string();
+
+        // Make the operator checkout prove nothing about target eligibility.
+        // The exact target still contains the symlink and executable; HEAD does not.
+        run_git(&["rm", "-q", "-r", "node_modules"]);
+        run_git(&["commit", "-q", "-m", "operator head removes target tool"]);
+        assert!(!root.join("node_modules/.bin/eslint").exists());
+
+        let mut config = test_config();
+        config.profile = crate::config::test_js_profile(false);
+        config.repo_root = root.to_path_buf();
+        config.target = Some(target.clone());
+        config.pinned_target = Some(crate::git::ResolvedRef {
+            name: target.clone(),
+            commit_id: target.clone(),
+            is_remote: false,
+        });
+        config.run_lint = true;
+
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let result = check.run(&config).await.expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(!result.cached);
+        assert!(result.output.contains("TARGET_SYMLINK_ESLINT_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(provenance.target_sha.as_deref(), Some(target.as_str()));
+        assert_eq!(provenance.tree_state, Some(TreeState::Snapshot));
+        assert_ne!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "target-owned symlink shape must not impersonate a prview-created borrow",
         );
     }
 
@@ -4450,7 +4555,7 @@ test result: ok. 2 passed; 0 failed
             is_remote: false,
         });
 
-        let reason = js_tool_unavailable_reason_with("eslint", &config, true, false)
+        let reason = js_tool_unavailable_reason_with("eslint", &config, true, false, false)
             .expect("non-Unix exact snapshot must skip borrowed toolchain");
         assert!(reason.contains("exact-target snapshot"), "{reason}");
         assert!(reason.contains("unsupported on this platform"), "{reason}");
@@ -4458,7 +4563,7 @@ test result: ok. 2 passed; 0 failed
         let mut ambient = config;
         ambient.target = None;
         assert_eq!(
-            js_tool_unavailable_reason_with("eslint", &ambient, true, false),
+            js_tool_unavailable_reason_with("eslint", &ambient, true, false, false),
             None,
             "ambient local review executes the tool directly from its checkout",
         );

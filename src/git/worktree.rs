@@ -7,7 +7,251 @@ use super::cmd::git_cmd;
 #[cfg(unix)]
 use anyhow::Context;
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+const BORROWED_LINKS_MANIFEST: &str = ".prview-borrowed-links";
+
+const MAX_SYMLINK_RESOLUTIONS: usize = 40;
+
+/// Whether `relative_path` exists in `commit`, following repository-relative
+/// symlinks the way a checked-out filesystem would.
+///
+/// `git2::Tree::get_path` deliberately does not traverse a blob stored with
+/// mode `120000`, so a target-owned `.bin -> bin-owned` needs this small
+/// resolver before eligibility can truthfully say whether the target contains
+/// `node_modules/.bin/<tool>`.
+pub(crate) fn commit_path_exists_following_symlinks(
+    repo_root: &Path,
+    commit: &str,
+    relative_path: &Path,
+) -> bool {
+    let Ok(repo) = git2::Repository::discover(repo_root) else {
+        return false;
+    };
+    let Ok(commit) = repo
+        .revparse_single(commit)
+        .and_then(|object| object.peel_to_commit())
+    else {
+        return false;
+    };
+    let Ok(tree) = commit.tree() else {
+        return false;
+    };
+    let Some(mut pending) = relative_components(relative_path) else {
+        return false;
+    };
+    let mut resolved = PathBuf::new();
+
+    for _ in 0..MAX_SYMLINK_RESOLUTIONS {
+        let Some(component) = pending.pop_front() else {
+            return false;
+        };
+        resolved.push(component);
+        let Ok(entry) = tree.get_path(&resolved) else {
+            return false;
+        };
+
+        if entry.filemode() == 0o120000 {
+            let Ok(object) = entry.to_object(&repo) else {
+                return false;
+            };
+            let Some(blob) = object.as_blob() else {
+                return false;
+            };
+            let Ok(target) = std::str::from_utf8(blob.content()) else {
+                return false;
+            };
+            let Some(next) = resolved_symlink_path(&resolved, Path::new(target), &pending) else {
+                return false;
+            };
+            let Some(next_components) = relative_components(&next) else {
+                return false;
+            };
+            resolved.clear();
+            pending = next_components;
+            continue;
+        }
+
+        if pending.is_empty() {
+            return entry.kind() == Some(git2::ObjectType::Blob);
+        }
+        if entry.kind() != Some(git2::ObjectType::Tree) {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn relative_components(path: &Path) -> Option<VecDeque<std::ffi::OsString>> {
+    let mut normalized = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => normalized.push(component.to_os_string()),
+            std::path::Component::ParentDir => {
+                normalized.pop()?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized.into())
+}
+
+fn resolved_symlink_path(
+    symlink_path: &Path,
+    target: &Path,
+    tail: &VecDeque<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if target.is_absolute() {
+        return None;
+    }
+    let mut combined = symlink_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(target);
+    combined.extend(tail.iter());
+    let normalized = relative_components(&combined)?;
+    Some(normalized.into_iter().collect())
+}
+
+/// True only when resolving `relative_path` in this snapshot crosses a symlink
+/// recorded by this snapshot builder.
+///
+/// The manifest lives beside the worktree, inside the same temporary directory,
+/// so target-owned files cannot forge or collide with it and it disappears with
+/// the snapshot. Merely being a symlink is intentionally insufficient evidence:
+/// target commits may own symlinked `.bin` directories themselves.
+#[cfg(unix)]
+pub(crate) fn path_uses_prview_borrow(snapshot_root: &Path, relative_path: &Path) -> bool {
+    let Some(parent) = snapshot_root.parent() else {
+        return false;
+    };
+    let Ok(encoded) = std::fs::read(parent.join(BORROWED_LINKS_MANIFEST)) else {
+        return false;
+    };
+    use std::os::unix::ffi::OsStringExt as _;
+    let borrowed: std::collections::HashSet<PathBuf> = encoded
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
+        .collect();
+    if borrowed.iter().any(|path| path.starts_with(relative_path)) {
+        return true;
+    }
+    let Some(mut pending) = relative_components(relative_path) else {
+        return false;
+    };
+    let mut resolved = PathBuf::new();
+
+    for _ in 0..MAX_SYMLINK_RESOLUTIONS {
+        let Some(component) = pending.pop_front() else {
+            return false;
+        };
+        resolved.push(component);
+        if borrowed.contains(&resolved) {
+            return true;
+        }
+
+        let path = snapshot_root.join(&resolved);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() {
+            let Ok(target) = std::fs::read_link(path) else {
+                return false;
+            };
+            let Some(next) = resolved_symlink_path(&resolved, &target, &pending) else {
+                return false;
+            };
+            let Some(next_components) = relative_components(&next) else {
+                return false;
+            };
+            resolved.clear();
+            pending = next_components;
+        }
+    }
+
+    false
+}
+
+#[cfg(not(unix))]
+pub(crate) fn path_uses_prview_borrow(_snapshot_root: &Path, _relative_path: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn create_borrowed_link(
+    source: &Path,
+    exposed: &Path,
+    snapshot_root: &Path,
+    borrowed_links: &mut Vec<PathBuf>,
+) -> Result<()> {
+    std::os::unix::fs::symlink(source, exposed).with_context(|| {
+        format!(
+            "failed to expose {} as borrowed dependency {}",
+            source.display(),
+            exposed.display()
+        )
+    })?;
+    borrowed_links.push(
+        exposed
+            .strip_prefix(snapshot_root)
+            .context("borrowed dependency escaped snapshot root")?
+            .to_path_buf(),
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn link_missing_entries(
+    ambient: &Path,
+    snapshot: &Path,
+    snapshot_root: &Path,
+    borrowed_links: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(ambient)
+        .with_context(|| format!("failed to enumerate ambient {}", ambient.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!("failed to read an entry from ambient {}", ambient.display())
+        })?;
+        let borrowed = entry.path();
+        let exposed = snapshot.join(entry.file_name());
+        match std::fs::symlink_metadata(&exposed) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect target-owned dependency path {}",
+                        exposed.display()
+                    )
+                });
+            }
+        }
+        create_borrowed_link(&borrowed, &exposed, snapshot_root, borrowed_links)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_borrowed_links_manifest(temp_root: &Path, borrowed_links: &mut [PathBuf]) -> Result<()> {
+    if borrowed_links.is_empty() {
+        return Ok(());
+    }
+    borrowed_links.sort();
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut encoded = Vec::new();
+    for path in borrowed_links {
+        encoded.extend_from_slice(path.as_os_str().as_bytes());
+        encoded.push(0);
+    }
+    std::fs::write(temp_root.join(BORROWED_LINKS_MANIFEST), encoded)
+        .context("failed to record snapshot borrowed-link provenance")
+}
 
 /// Roll back one exact worktree registration without spawning another child.
 ///
@@ -215,44 +459,26 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
     // `../eslint` from the snapshot.
     #[cfg(unix)]
     {
+        let mut borrowed_links = Vec::new();
         let nm = repo_root.join("node_modules");
         let snapshot_nm = worktree_path.join("node_modules");
         if nm.exists() {
             if !snapshot_nm.exists() {
-                std::os::unix::fs::symlink(&nm, &snapshot_nm).with_context(|| {
-                    format!("failed to expose {} in exact-target snapshot", nm.display())
-                })?;
+                create_borrowed_link(&nm, &snapshot_nm, &worktree_path, &mut borrowed_links)?;
             } else {
                 let ambient_bin = nm.join(".bin");
                 let snapshot_bin = snapshot_nm.join(".bin");
-                if ambient_bin.exists() && !snapshot_bin.exists() {
-                    for entry in std::fs::read_dir(&nm)
-                        .with_context(|| format!("failed to enumerate ambient {}", nm.display()))?
+                if ambient_bin.exists() {
+                    link_missing_entries(&nm, &snapshot_nm, &worktree_path, &mut borrowed_links)?;
+                    if std::fs::symlink_metadata(&snapshot_bin)
+                        .is_ok_and(|metadata| metadata.file_type().is_dir())
                     {
-                        let entry = entry.with_context(|| {
-                            format!("failed to read an entry from ambient {}", nm.display())
-                        })?;
-                        let borrowed = entry.path();
-                        let exposed = snapshot_nm.join(entry.file_name());
-                        match std::fs::symlink_metadata(&exposed) {
-                            Ok(_) => continue,
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(error) => {
-                                return Err(error).with_context(|| {
-                                    format!(
-                                        "failed to inspect target-owned dependency path {}",
-                                        exposed.display()
-                                    )
-                                });
-                            }
-                        }
-                        std::os::unix::fs::symlink(&borrowed, &exposed).with_context(|| {
-                            format!(
-                                "failed to expose {} in target-owned {}",
-                                borrowed.display(),
-                                snapshot_nm.display()
-                            )
-                        })?;
+                        link_missing_entries(
+                            &ambient_bin,
+                            &snapshot_bin,
+                            &worktree_path,
+                            &mut borrowed_links,
+                        )?;
                     }
                 }
             }
@@ -260,13 +486,9 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
         let venv = repo_root.join(".venv");
         let snapshot_venv = worktree_path.join(".venv");
         if venv.exists() && !snapshot_venv.exists() {
-            std::os::unix::fs::symlink(&venv, &snapshot_venv).with_context(|| {
-                format!(
-                    "failed to expose {} in exact-target snapshot",
-                    venv.display()
-                )
-            })?;
+            create_borrowed_link(&venv, &snapshot_venv, &worktree_path, &mut borrowed_links)?;
         }
+        write_borrowed_links_manifest(tmp.path(), &mut borrowed_links)?;
     }
 
     registration_rollback.disarm();

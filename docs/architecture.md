@@ -589,15 +589,37 @@ tree. On Unix, an unowned `node_modules` and `.venv` are symlinked into snapshot
 so tests and linters keep their installed environment without a reinstall. If
 the target commit already owns a `node_modules` directory, prview preserves its
 contents and links only the operator's missing top-level dependency entries
-inside it instead. This includes `.bin` plus the sibling packages its npm/pnpm
-shims resolve, and the nested `.bin` link is reported as
-`SnapshotBorrowedDeps`. A failed required link aborts snapshot creation instead
-of leaving eligibility and execution on different toolchains. Non-Unix
-exact-target JS checks are currently skipped with
-an explicit unsupported-borrow reason, while ambient JS checks remain unchanged.
-This avoids claiming `SnapshotBorrowedDeps` unless a real link exists. Snapshot
-creation uses an empty per-snapshot `core.hooksPath`; checkout hooks belong to
-the operator's workflow and must not mutate or block exact-SHA review input.
+inside it instead. If the target also owns `.bin` as a directory, missing tool
+entries are linked inside that directory as well; sibling packages are still
+linked at the top level because npm/pnpm shims commonly resolve `../<package>`.
+
+JS eligibility, execution, and provenance share the concrete resolved path
+`node_modules/.bin/<tool>`. Exact eligibility checks the target commit first,
+following target-owned relative symlinks, and consults the operator checkout
+only for a borrow candidate. The snapshot builder records every link it creates
+in a sidecar outside the reviewed tree. `SnapshotBorrowedDeps` is emitted only
+when resolving that concrete tool path crosses one of those recorded links —
+never merely because `node_modules` or `.bin` happens to be a symlink. Therefore:
+
+- no target `node_modules`: the whole dependency tree is borrowed;
+- target `node_modules` without `.bin`: missing top-level entries, including
+  `.bin` and shim siblings, are borrowed;
+- target `.bin` directory without the requested tool: the missing tool plus
+  required siblings are borrowed, while target entries keep precedence;
+- target-owned `.bin/<tool>` (a file or a symlink resolving to target bytes):
+  the target tool executes and provenance remains `Snapshot`;
+- target-owned `.bin` symlink that does not resolve the requested tool is not
+  mutated through the symlink; if no resolved tool exists in the finished
+  snapshot, the check fails loudly before spawn instead of publishing a package
+  manager's `Command not found` as a gate result.
+
+A failed required link aborts snapshot creation instead of leaving eligibility
+and execution on different toolchains. Non-Unix exact-target JS checks may run a
+tool already present in the target; a tool requiring ambient borrowing is
+skipped with an explicit unsupported-borrow reason. Ambient JS checks remain
+unchanged. Snapshot creation uses an empty per-snapshot `core.hooksPath`;
+checkout hooks belong to the operator's workflow and must not mutate or block
+exact-SHA review input.
 
 The Python and JS checks (`Ruff`, `Mypy`, `Pytest`, `TypeScript`, `ESLint`,
 `Vitest`, `Stylelint`) share **one** run-wide snapshot rather than each creating
