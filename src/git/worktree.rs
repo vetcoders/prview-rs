@@ -4,6 +4,8 @@
 //! local dependencies (node_modules, .venv) symlinked to preserve local caches.
 
 use super::cmd::git_cmd;
+#[cfg(unix)]
+use anyhow::Context;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -203,16 +205,28 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
         anyhow::bail!("git worktree add failed: {}", stderr.trim());
     }
 
-    // Symlink untracked dependencies (node_modules and .venv) to bypass reinstall overhead
+    // Symlink untracked dependencies (node_modules and .venv) to bypass reinstall overhead.
+    // A failed borrow is terminal instead of silently leaving a snapshot whose
+    // JS eligibility was decided from the operator checkout but whose toolchain
+    // is absent at execution time.
     #[cfg(unix)]
     {
         let nm = repo_root.join("node_modules");
-        if nm.exists() {
-            let _ = std::os::unix::fs::symlink(&nm, worktree_path.join("node_modules"));
+        let snapshot_nm = worktree_path.join("node_modules");
+        if nm.exists() && !snapshot_nm.exists() {
+            std::os::unix::fs::symlink(&nm, &snapshot_nm).with_context(|| {
+                format!("failed to expose {} in exact-target snapshot", nm.display())
+            })?;
         }
         let venv = repo_root.join(".venv");
-        if venv.exists() {
-            let _ = std::os::unix::fs::symlink(&venv, worktree_path.join(".venv"));
+        let snapshot_venv = worktree_path.join(".venv");
+        if venv.exists() && !snapshot_venv.exists() {
+            std::os::unix::fs::symlink(&venv, &snapshot_venv).with_context(|| {
+                format!(
+                    "failed to expose {} in exact-target snapshot",
+                    venv.display()
+                )
+            })?;
         }
     }
 
@@ -367,6 +381,32 @@ mod tests {
             .expect("operator hooks must not participate in snapshot creation");
         assert!(snapshot.worktree_path.is_dir());
         assert!(!marker.exists(), "post-checkout hook must stay isolated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_borrows_untracked_node_modules_with_a_real_symlink() {
+        let (repo_tmp, repo) = repo_with_commit();
+        let node_modules = repo_tmp.path().join("node_modules");
+        std::fs::create_dir(&node_modules).expect("node_modules");
+        std::fs::write(node_modules.join("marker"), "operator dependency\n")
+            .expect("dependency marker");
+        let head = repo.head().unwrap().target().unwrap().to_string();
+
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head).expect("snapshot");
+        let borrowed = snapshot.worktree_path.join("node_modules");
+        assert!(
+            borrowed.is_symlink(),
+            "borrow must be visible to provenance"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&borrowed).expect("borrow target"),
+            std::fs::canonicalize(&node_modules).expect("operator dependencies"),
+        );
+        assert_eq!(
+            std::fs::read_to_string(borrowed.join("marker")).expect("borrowed marker"),
+            "operator dependency\n",
+        );
     }
 
     #[cfg(unix)]

@@ -1,9 +1,9 @@
 //! Python checks (ruff, mypy, pytest)
 
 use super::{
-    Check, CheckProvenance, CheckResult, CheckStatus, TEST_TIMEOUT_SECS, find_hard_fail_signatures,
-    off_head_target_commit, plan_check_run, run_command_with_env, run_command_with_timeout_and_env,
-    tool_spawn_failure_in_output,
+    Check, CheckProvenance, CheckResult, CheckStatus, TEST_TIMEOUT_SECS, exact_target_commit,
+    find_hard_fail_signatures, plan_check_run, run_command_with_env,
+    run_command_with_timeout_and_env, tool_spawn_failure_in_output,
 };
 use crate::Config;
 use crate::cache;
@@ -39,7 +39,7 @@ const MAX_PYTHON_CONFIG_BYTES: u64 = 1024 * 1024;
 /// Fail open at every step: a question git cannot answer must not become a skip,
 /// so an unreadable repo or a failed walk leaves the check running.
 fn missing_reviewed_python_project(config: &Config) -> Option<String> {
-    let commit = off_head_target_commit(config)?;
+    let commit = exact_target_commit(config).ok().flatten()?;
     let repo = crate::git::Repository::open(&config.repo_root).ok()?;
 
     // A pyproject.toml is an explicit project declaration and settles it alone,
@@ -96,8 +96,8 @@ pub(super) struct PythonRun {
 /// keeping the environment warm across runs of the SAME commit, which is the
 /// case that pays for itself (re-review, `--watch`).
 ///
-/// A local review (target == `HEAD`) keeps its checkout environment directory;
-/// only the bounded descendant pools are added.
+/// An ambient target-less review keeps its checkout environment directory;
+/// exact-target reviews, including target == `HEAD`, use the commit-scoped one.
 pub(super) fn plan_python_run(config: &Config) -> Result<PythonRun> {
     plan_python_run_with_env(config, |key| std::env::var_os(key))
 }
@@ -1282,11 +1282,13 @@ fn positive_uv_concurrency_limit(
 /// Name of the environment for the substrate this run analyses.
 ///
 /// The reviewed commit IS the dependency set, so it names the environment. When
-/// no off-`HEAD` commit resolves while the scan still happens elsewhere (an
+/// no exact-target commit resolves while the scan still happens elsewhere (an
 /// injected scan dir), the snapshot path stands in: unknown provenance must not
 /// collapse two different substrates onto one environment.
 fn reviewed_env_token(config: &Config, scan_dir: &Path) -> String {
-    off_head_target_commit(config)
+    exact_target_commit(config)
+        .ok()
+        .flatten()
         .unwrap_or_else(|| format!("snapshot-{}", cache::key_token(&scan_dir.to_string_lossy())))
 }
 
@@ -1795,6 +1797,34 @@ mod tests {
         run_git(&["commit", "-q", "-m", "add python"]);
 
         (tmp, target)
+    }
+
+    #[test]
+    fn python_preflight_reads_exact_same_head_commit_not_ambient_files() {
+        let (repo, target) = repo_whose_target_dropped_python();
+        run_git(repo.path(), &["checkout", "-q", "--detach", &target]);
+        std::fs::write(
+            repo.path().join("pyproject.toml"),
+            "[project]\nname = 'ambient-only'\nversion = '0.0.0'\n",
+        )
+        .expect("ambient pyproject");
+        std::fs::write(repo.path().join("ambient.py"), "print('ambient')\n")
+            .expect("ambient source");
+
+        let mut ambient = create_test_config(true, true, true);
+        ambient.repo_root = repo.path().to_path_buf();
+        ambient.pinned_target = Some(crate::git::ResolvedRef {
+            name: target.clone(),
+            commit_id: target.clone(),
+            is_remote: false,
+        });
+        assert_eq!(missing_reviewed_python_project(&ambient), None);
+
+        let mut exact = ambient;
+        exact.target = Some(target);
+        let reason = missing_reviewed_python_project(&exact)
+            .expect("committed target has no Python project");
+        assert!(reason.contains("no pyproject.toml"), "{reason}");
     }
 
     /// A target that is not a Python project must not be judged by Python

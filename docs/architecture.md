@@ -585,25 +585,30 @@ check. An explicit target, PR/MCP, remote/remote-only, or CI review materialises
 a detached `git worktree` at the target commit even when that commit equals
 `HEAD`. Only the default local invocation with no target keeps `repo_root`,
 because that mode intentionally reviews the developer's live, possibly dirty
-tree. `node_modules` and `.venv` are symlinked into snapshots, so tests and
-linters keep their installed environment without a reinstall. Snapshot creation
-uses an empty per-snapshot `core.hooksPath`; checkout hooks belong to the
-operator's workflow and must not mutate or block exact-SHA review input.
+tree. On Unix, `node_modules` and `.venv` are symlinked into snapshots, so tests
+and linters keep their installed environment without a reinstall; a failed link
+aborts snapshot creation instead of leaving eligibility and execution on
+different toolchains. Non-Unix exact-target JS checks are currently skipped with
+an explicit unsupported-borrow reason, while ambient JS checks remain unchanged.
+This avoids claiming `SnapshotBorrowedDeps` unless a real link exists. Snapshot
+creation uses an empty per-snapshot `core.hooksPath`; checkout hooks belong to
+the operator's workflow and must not mutate or block exact-SHA review input.
 
 The Python and JS checks (`Ruff`, `Mypy`, `Pytest`, `TypeScript`, `ESLint`,
 `Vitest`, `Stylelint`) share **one** run-wide snapshot rather than each creating
-its own — see `uses_shared_scan_dir()`. `SemgrepCheck` is the single deliberate
-opt-out: it manages its own worktree because it also needs a baseline commit.
+its own — see `uses_shared_scan_dir()`. Semgrep has its own baseline planner but
+uses the same `ReviewSubstrate` discriminator and reuses `scan_dir_override`
+when the dispatcher already owns the exact-target snapshot.
 
 `share_target_snapshot()` decides whether that snapshot is materialised at all,
 and the condition is **not** "some gate needs it". It is:
 
-> a runnable check is in `uses_shared_scan_dir()`, **or** the reviewed target is
-> off-`HEAD` (`off_head_target_commit()`).
+> a runnable check is in `uses_shared_scan_dir()`, **or** `ReviewSubstrate`
+> classifies the invocation as exact-target.
 
 The second arm exists because the gates are not the only stage that reads the
 tree: the context stage plans and produces the whole of `30_context` from
-`ledger.scan_dir()`. An off-`HEAD` run can have nothing snapshot-backed to run —
+`ledger.scan_dir()`. An exact-target run can have nothing snapshot-backed to run —
 for example, the fast remote-only preset, where those gates skip and only
 semgrep remains, or a profile whose complete runnable set has sound cache hits.
 TypeScript, ESLint, Stylelint, Ruff and Mypy do not currently take that path:
@@ -919,9 +924,10 @@ manufacture confident false skips for deep layouts. Every step fails open.
 
 Cache keys follow the same substrate. Cached results are looked up **before**
 the shared snapshot exists, so cargo cache keys resolve the target commit
-directly (`off_head_target_commit()`) and key on the commit id whenever it
-differs from `HEAD` — otherwise a `--pr` run would hit an entry a previous local
-run stored under a working-tree hash and serve the local checkout's verdict. The
+through `ReviewSubstrate` and key on the commit id for every exact-target run,
+including exact same-`HEAD` — otherwise an exact run could hit an entry a
+previous ambient run stored under a working-tree hash and serve the local
+checkout's verdict. The
 commit is not the whole substrate, though: the same commit checked from the
 workspace root and from a configured member yields different results, so the
 repo-relative cargo root travels in the key beside it — the discriminator the
@@ -1069,6 +1075,14 @@ answers depend on config, ignore rules, plugins and installed tool/dependency
 state beyond the former source-only hashes. They still participate in same-run
 `Run` to `Reused` context dedup; only persistent cross-run replay is disabled.
 
+Cargo cache keys use the same `ReviewSubstrate` decision before snapshot
+materialisation. Ambient runs hash the live Cargo tree; exact-target runs use a
+`commit-<sha>-root-<token>` component even when the target equals checked-out
+`HEAD`. An exact target that cannot be resolved returns no cache key, so lookup
+cannot fall back to an ambient entry. Cargo and Python preflight reads use that
+same exact commit identity; dirty manifests or source files in the operator
+checkout cannot make an exact same-`HEAD` gate runnable or applicable.
+
 The entry is written to a `<key>.tmp-<pid>-<nanos>` staging file and published
 with a single `fs::rename`, so a concurrent reader sees either the old entry or
 the new one — never a result paired with another run's provenance. Staging files
@@ -1099,8 +1113,9 @@ collapse onto the target and reduce the scanned delta to nothing while the pack
 diff stays non-empty. A pinned target carrying no captured base is the same class
 of planning refusal as an unavailable pinned commit, never a symbolic fallback.
 Multi-base and `--current-only` runs still fall back to a full scan (R3-15).
-Local targets that still match HEAD
-keep the operator checkout. Each new watch iteration resolves its target anew.
+Only ambient target-less local invocations keep the operator checkout; an
+explicit local target matching `HEAD` still uses the exact snapshot. Each new
+watch iteration resolves its target anew.
 
 `checks::snapshot_integrity::SnapshotObservation` compares the ledger-owned
 worktree with the immutable commit resolved before worktree creation. The shared

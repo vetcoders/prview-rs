@@ -2,7 +2,7 @@
 
 use super::{
     Check, CheckProvenance, CheckResult, CheckStatus, TEST_TIMEOUT_SECS, find_hard_fail_signatures,
-    js_tool_available, plan_check_run, run_js_command, run_js_command_with_timeout,
+    js_tool_unavailable_reason, plan_check_run, run_js_command, run_js_command_with_timeout,
 };
 use crate::Config;
 use anyhow::Result;
@@ -590,10 +590,8 @@ impl Check for TypeScriptCheck {
         if config.is_fast_remote_only_standard() && !config.lint_forced {
             return super::CheckEligibility::Skip("fast remote-only preset".to_string());
         }
-        if !js_tool_available("tsc", &config.repo_root) {
-            return super::CheckEligibility::Skip(
-                "tool not installed (node_modules/.bin/tsc is missing)".to_string(),
-            );
+        if let Some(reason) = js_tool_unavailable_reason("tsc", config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -681,10 +679,8 @@ impl Check for ESLintCheck {
         if !config.run_lint {
             return super::CheckEligibility::Skip("lint disabled".to_string());
         }
-        if !js_tool_available("eslint", &config.repo_root) {
-            return super::CheckEligibility::Skip(
-                "tool not installed (node_modules/.bin/eslint is missing)".to_string(),
-            );
+        if let Some(reason) = js_tool_unavailable_reason("eslint", config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -822,10 +818,8 @@ impl Check for VitestCheck {
         if !config.run_tests {
             return super::CheckEligibility::Skip("tests disabled".to_string());
         }
-        if !js_tool_available("vitest", &config.repo_root) {
-            return super::CheckEligibility::Skip(
-                "tool not installed (node_modules/.bin/vitest is missing)".to_string(),
-            );
+        if let Some(reason) = js_tool_unavailable_reason("vitest", config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -953,10 +947,8 @@ impl Check for StylelintCheck {
         if !config.run_lint {
             return super::CheckEligibility::Skip("lint disabled".to_string());
         }
-        if !js_tool_available("stylelint", &config.repo_root) {
-            return super::CheckEligibility::Skip(
-                "tool not installed (node_modules/.bin/stylelint is missing)".to_string(),
-            );
+        if let Some(reason) = js_tool_unavailable_reason("stylelint", config) {
+            return super::CheckEligibility::Skip(reason);
         }
         super::CheckEligibility::Run
     }
@@ -1081,7 +1073,7 @@ mod tests {
 
     #[test]
     fn test_js_tool_available_nonexistent() {
-        use super::js_tool_available;
+        use crate::checks::js_tool_available;
         use std::path::PathBuf;
         // Non-existent path should return false
         assert!(!js_tool_available("tsc", &PathBuf::from("/nonexistent")));

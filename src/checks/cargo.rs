@@ -1,9 +1,9 @@
 //! Rust/Cargo checks
 
 use super::{
-    Check, CheckResult, CheckStatus, ProvenanceBuilder, TEST_TIMEOUT_SECS,
-    bounded_descendant_limit, has_tool_crash, off_head_target_commit, plan_check_run,
-    run_command_with_env, run_command_with_timeout_and_env,
+    Check, CheckResult, CheckStatus, ProvenanceBuilder, ReviewSubstrate, TEST_TIMEOUT_SECS,
+    bounded_descendant_limit, exact_target_commit, has_tool_crash, plan_check_run,
+    review_substrate, run_command_with_env, run_command_with_timeout_and_env,
 };
 use crate::Config;
 use crate::cache;
@@ -62,11 +62,11 @@ struct CargoRun {
 /// under the reviewed PR's name (the 2026-07-24 remote-only regression).
 ///
 /// Two cases:
-/// - local review (target == `HEAD`, or the repo/refs cannot be resolved):
-///   unchanged — the local cargo root, no environment override, so the
-///   operator's own warm `target/` is used and left exactly as it was;
-/// - reviewed review (target != `HEAD`): the matching cargo root INSIDE the
-///   snapshot, with `CARGO_TARGET_DIR` pointed at the per-repo shared build
+/// - ambient target-less review: unchanged — the local cargo root, no
+///   environment override, so the operator's own warm `target/` is used and
+///   left exactly as it was;
+/// - exact-target review (including target == `HEAD`): the matching cargo root
+///   INSIDE the snapshot, with `CARGO_TARGET_DIR` pointed at the per-repo shared build
 ///   cache. Without that redirect every run would compile the entire dependency
 ///   graph from zero, because the snapshot is a fresh temp dir thrown away at
 ///   the end of the run — which is the reason the checks were pinned to the
@@ -955,7 +955,7 @@ fn repo_relative_cargo_root(local_root: &Path, repo_root: &Path) -> Option<PathB
 /// under the reviewed commit. The honest answer is no verdict: skip with a reason
 /// the pack records, rather than a green light earned by a different tree.
 fn unreachable_reviewed_cargo_root(config: &Config) -> Option<String> {
-    let commit = off_head_target_commit(config)?;
+    let commit = exact_target_commit(config).ok().flatten()?;
     let local_root = cargo_cache_root(config);
     if repo_relative_cargo_root(local_root, &config.repo_root).is_some() {
         return None;
@@ -1019,7 +1019,7 @@ const CARGO_ROOT_DISCOVERY_DEPTH: usize = 2;
 /// cache key.
 fn resolve_reviewed_cargo_root(config: &Config) -> ReviewedCargoRoot {
     let (Some(commit), Some(relative)) = (
-        off_head_target_commit(config),
+        exact_target_commit(config).ok().flatten(),
         repo_relative_cargo_root(cargo_cache_root(config), &config.repo_root),
     ) else {
         return ReviewedCargoRoot::Unknown;
@@ -1182,29 +1182,35 @@ fn missing_reviewed_cargo_manifest(config: &Config) -> Option<String> {
 /// root-lockfile-only dependency bump reuse a stale cached result. Fold the
 /// repo-root lockfile in whenever the cargo root differs from the repo root so
 /// such a bump invalidates the member key.
-fn cargo_content_hash(config: &Config) -> String {
-    let base = cargo_substrate_hash(config);
-    match unlocked_substrate_stamp(config) {
+fn cargo_content_hash(config: &Config) -> Option<String> {
+    let base = cargo_substrate_hash(config)?;
+    Some(match unlocked_substrate_stamp(config) {
         Some(day) => format!("{base}-unlocked-{day}"),
         None => base,
-    }
+    })
 }
 
 /// The substrate half of [`cargo_content_hash`], without the freshness stamp.
-fn cargo_substrate_hash(config: &Config) -> String {
-    if let Some(commit) = reviewed_substrate_key(config) {
-        return commit;
-    }
-    let cargo_root = cargo_cache_root(config);
-    let base = cache::rust_hash(cargo_root);
-    if cargo_root == config.repo_root.as_path() {
-        base
-    } else {
-        format!(
-            "{}-root-{}",
-            base,
-            cache::cargo_lock_hash(&config.repo_root)
-        )
+fn cargo_substrate_hash(config: &Config) -> Option<String> {
+    match review_substrate(config).ok()? {
+        ReviewSubstrate::ExactTarget(target) => reviewed_substrate_key_for(
+            &target.commit_id,
+            cargo_cache_root(config),
+            &config.repo_root,
+        ),
+        ReviewSubstrate::Ambient => {
+            let cargo_root = cargo_cache_root(config);
+            let base = cache::rust_hash(cargo_root);
+            Some(if cargo_root == config.repo_root.as_path() {
+                base
+            } else {
+                format!(
+                    "{}-root-{}",
+                    base,
+                    cache::cargo_lock_hash(&config.repo_root)
+                )
+            })
+        }
     }
 }
 
@@ -1250,9 +1256,9 @@ enum SubstrateLock {
 
 /// Whether the tree this run judges pins its dependency set.
 ///
-/// The reviewed commit is asked through git (no snapshot needed); a local review
-/// — and an off-`HEAD` run whose repository git cannot read — is answered from
-/// the working tree. Both look at the cargo root first and the repo root second,
+/// The exact reviewed commit is asked through git (no snapshot needed); an
+/// ambient local review is answered from the working tree. Both look at the
+/// cargo root first and the repo root second,
 /// because a workspace member resolves from the workspace lockfile.
 ///
 /// Existence used to be the whole test, and existence is not a pin: a target that
@@ -1300,7 +1306,7 @@ fn substrate_manifest_and_lock(
     };
 
     if let (Some(commit), ReviewedCargoRoot::Resolved(relative)) = (
-        off_head_target_commit(config),
+        exact_target_commit(config).ok().flatten(),
         resolve_reviewed_cargo_root(config),
     ) && let Ok(repo) = crate::git::Repository::open(&config.repo_root)
     {
@@ -1460,8 +1466,9 @@ fn dependency_specs(manifest: &toml::Table) -> Vec<(&str, &toml::Value)> {
 /// tree is analysed at all (the check is skipped, see
 /// [`unreachable_reviewed_cargo_root`]) and a commit-shaped key would promise a
 /// result about a commit nothing scanned.
+#[cfg(test)]
 fn reviewed_substrate_key(config: &Config) -> Option<String> {
-    let commit = off_head_target_commit(config)?;
+    let commit = exact_target_commit(config).ok().flatten()?;
     reviewed_substrate_key_for(&commit, cargo_cache_root(config), &config.repo_root)
 }
 
@@ -1506,8 +1513,15 @@ fn cargo_root_token(relative: &Path) -> String {
 
 /// Source hash for source-only cargo checks (rustfmt): the reviewed commit when
 /// one is being analysed, the local tree hash otherwise.
-fn cargo_source_hash(config: &Config) -> String {
-    reviewed_substrate_key(config).unwrap_or_else(|| cache::rust_hash(cargo_cache_root(config)))
+fn cargo_source_hash(config: &Config) -> Option<String> {
+    match review_substrate(config).ok()? {
+        ReviewSubstrate::ExactTarget(target) => reviewed_substrate_key_for(
+            &target.commit_id,
+            cargo_cache_root(config),
+            &config.repo_root,
+        ),
+        ReviewSubstrate::Ambient => Some(cache::rust_hash(cargo_cache_root(config))),
+    }
 }
 
 #[async_trait]
@@ -1539,7 +1553,7 @@ impl Check for CargoCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(cargo_content_hash(config))
+        cargo_content_hash(config)
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -1626,7 +1640,7 @@ impl Check for ClippyCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("clippy-{}", cargo_content_hash(config)))
+        cargo_content_hash(config).map(|hash| format!("clippy-{hash}"))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -1871,7 +1885,7 @@ impl Check for RustfmtCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("rustfmt-{}", cargo_source_hash(config)))
+        cargo_source_hash(config).map(|hash| format!("rustfmt-{hash}"))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -2001,8 +2015,14 @@ impl Check for CargoAuditCheck {
         // was served (PR #12 review #22). When a reviewed commit is analysed the
         // lock that matters lives in the snapshot, and the commit id names it
         // exactly.
-        let lock = reviewed_substrate_key(config)
-            .unwrap_or_else(|| cache::cargo_lock_hash(cargo_cache_root(config)));
+        let lock = match review_substrate(config).ok()? {
+            ReviewSubstrate::ExactTarget(target) => reviewed_substrate_key_for(
+                &target.commit_id,
+                cargo_cache_root(config),
+                &config.repo_root,
+            )?,
+            ReviewSubstrate::Ambient => cache::cargo_lock_hash(cargo_cache_root(config)),
+        };
         Some(format!("audit-{lock}-{day}"))
     }
 
@@ -2175,7 +2195,7 @@ impl Check for CargoGeigerCheck {
     }
 
     fn cache_key(&self, config: &Config) -> Option<String> {
-        Some(format!("geiger-{}", cargo_content_hash(config)))
+        cargo_content_hash(config).map(|hash| format!("geiger-{hash}"))
     }
 
     async fn run(&self, config: &Config) -> Result<CheckResult> {
@@ -3091,6 +3111,97 @@ mod tests {
     }
 
     #[test]
+    fn same_head_exact_and_ambient_cargo_cache_keys_are_disjoint() {
+        let (repo, _) = repo_with_two_commits_containing(&["Cargo.toml"]);
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn ambient_dirty() {}\n").unwrap();
+        let head = head_sha(root);
+
+        let mut ambient = create_test_config(true, false, false);
+        ambient.repo_root = root.to_path_buf();
+        ambient.profile.cargo_root = Some(root.to_path_buf());
+        ambient.pinned_target = Some(crate::git::ResolvedRef {
+            name: "main".to_string(),
+            commit_id: head.clone(),
+            is_remote: false,
+        });
+
+        let mut exact = ambient.clone();
+        exact.target = Some("main".to_string());
+
+        let ambient_key = CargoCheck.cache_key(&ambient).expect("ambient key");
+        let exact_key = CargoCheck.cache_key(&exact).expect("exact key");
+        assert_ne!(ambient_key, exact_key);
+        assert!(
+            exact_key.starts_with(&format!("commit-{head}-root-")),
+            "exact key must name the immutable target substrate: {exact_key}",
+        );
+        assert!(
+            !ambient_key.starts_with("commit-"),
+            "ambient key must remain a dirty-tree content hash: {ambient_key}",
+        );
+    }
+
+    #[test]
+    fn cargo_preflight_reads_exact_same_head_commit_not_ambient_manifest() {
+        use crate::git::cmd::git_cmd;
+
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let root = repo.path();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "prview@example.test"][..],
+            &["config", "user.name", "prview test"][..],
+        ] {
+            assert!(
+                git_cmd()
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(root.join("tracked.txt"), "committed non-Cargo tree\n").unwrap();
+        assert!(
+            git_cmd()
+                .args(["add", "tracked.txt"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            git_cmd()
+                .args(["commit", "-q", "-m", "initial"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let head = head_sha(root);
+
+        // Ambient checkout looks like Cargo only because of uncommitted files.
+        write_crate(root, true);
+        let mut ambient = create_test_config(true, false, false);
+        ambient.repo_root = root.to_path_buf();
+        ambient.profile.cargo_root = Some(root.to_path_buf());
+        ambient.pinned_target = Some(crate::git::ResolvedRef {
+            name: "main".to_string(),
+            commit_id: head,
+            is_remote: false,
+        });
+        assert_eq!(missing_reviewed_cargo_manifest(&ambient), None);
+
+        let mut exact = ambient;
+        exact.target = Some("main".to_string());
+        let reason = missing_reviewed_cargo_manifest(&exact)
+            .expect("committed target has no Cargo manifest");
+        assert!(reason.contains("has no Cargo.toml"), "{reason}");
+    }
+
+    #[test]
     fn test_clippy_check_cache_key() {
         let config = create_test_config(true, true, false);
         let check = ClippyCheck;
@@ -3771,9 +3882,9 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         );
     }
 
-    /// A local review (target == HEAD) is unchanged: the local cargo root, and
-    /// no `CARGO_TARGET_DIR` redirect, so the operator's warm `target/` is used.
-    /// The descendant job cap still applies.
+    /// An ambient target-less local review is unchanged: the local cargo root,
+    /// and no `CARGO_TARGET_DIR` redirect, so the operator's warm `target/` is
+    /// used. The descendant job cap still applies.
     #[tokio::test]
     async fn test_cargo_run_local_target_is_unchanged() {
         let repo_root = tempfile::tempdir().expect("repo_root tempdir");
@@ -4518,7 +4629,7 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         config.repo_root = repo_root.path().to_path_buf();
         config.profile.cargo_root = Some(repo_root.path().join("crates/core"));
 
-        let key = cargo_content_hash(&config);
+        let key = cargo_content_hash(&config).expect("local cache key");
         assert!(
             !key.contains('/') && !key.contains('\\') && !key.contains(':'),
             "a cache key must be a single path component, got: {key}",
@@ -4538,7 +4649,7 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             .profile(test_rust_profile(true))
             .target(Some(&unlocked_target))
             .build();
-        let key = cargo_content_hash(&config);
+        let key = cargo_content_hash(&config).expect("reviewed cache key");
         assert!(
             key.contains("-unlocked-"),
             "an unresolved dependency set must not be keyed on the commit alone: {key}",
@@ -4558,7 +4669,7 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
             .target(Some(&locked_target))
             .build();
         assert_eq!(
-            cargo_content_hash(&config),
+            cargo_content_hash(&config).expect("reviewed cache key"),
             reviewed_substrate_key(&config).expect("reviewed key"),
             "a locked target must keep its permanent, content-addressed key",
         );
@@ -4606,14 +4717,14 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
                 .build()
         };
 
-        let key = cargo_content_hash(&config_for(&stale));
+        let key = cargo_content_hash(&config_for(&stale)).expect("stale cache key");
         assert!(
             key.contains("-unlocked-"),
             "a lock cargo must update does not make the commit a complete key: {key}",
         );
         let config = config_for(&fresh);
         assert_eq!(
-            cargo_content_hash(&config),
+            cargo_content_hash(&config).expect("fresh cache key"),
             reviewed_substrate_key(&config).expect("reviewed key"),
             "a lock that covers the manifest keeps the permanent, content-addressed key",
         );
@@ -4658,13 +4769,17 @@ src/lib.rs:3:1: warning: function `foo` is never used\n";
         config.repo_root = repo_root.path().to_path_buf();
 
         assert!(
-            cargo_content_hash(&config).contains("-unlocked-"),
+            cargo_content_hash(&config)
+                .expect("local cache key")
+                .contains("-unlocked-"),
             "a working tree with no Cargo.lock resolves dependencies at run time",
         );
 
         std::fs::write(repo_root.path().join("Cargo.lock"), "version = 4\n").unwrap();
         assert!(
-            !cargo_content_hash(&config).contains("-unlocked-"),
+            !cargo_content_hash(&config)
+                .expect("local cache key")
+                .contains("-unlocked-"),
             "a locked working tree is fully described by its files",
         );
     }

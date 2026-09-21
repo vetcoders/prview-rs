@@ -1479,8 +1479,7 @@ fn errored_check_scan_dir(name: &str, config: &Config) -> Option<std::path::Path
     let scan_dir = if let Some(scan_dir) = &config.scan_dir_override {
         uses_shared_scan_dir(name).then(|| scan_dir.clone())?
     } else {
-        off_head_target_commit(config)
-            .is_none()
+        matches!(review_substrate(config).ok()?, ReviewSubstrate::Ambient)
             .then(|| config.repo_root.clone())?
     };
     Some(match is_cargo_target_check(name) {
@@ -1768,7 +1767,8 @@ fn is_cargo_target_check(name: &str) -> bool {
 /// The cargo checks are listed too: they analyse the reviewed snapshot like
 /// every other language check and only redirect their *build cache* away from
 /// it (see `plan_cargo_run` in `checks::cargo`). Semgrep is the single opt-out —
-/// it manages its own worktree because it also needs a baseline commit.
+/// it has an independent baseline planner, but exact-target runs still reuse the
+/// dispatcher-owned override when one is available.
 fn uses_shared_scan_dir(name: &str) -> bool {
     matches!(
         name,
@@ -1788,23 +1788,67 @@ fn uses_shared_scan_dir(name: &str) -> bool {
     )
 }
 
-/// Commit id of the reviewed target when it differs from the checked-out `HEAD`.
+/// The only discriminator for deciding which bytes a check must read.
 ///
-/// `None` whenever target equals `HEAD`, and whenever the repo or its refs cannot
-/// be resolved. Callers that need to distinguish an exact same-`HEAD` review
-/// from ambient local mode use [`requires_exact_target_snapshot`] separately.
+/// `App::run` pins every resolved target, including the default local invocation,
+/// so `pinned_target` alone cannot distinguish an exact review from an ambient
+/// dirty-tree review. Entry intent can: explicit target, PR, remote, remote-only,
+/// and CI invocations all ask for an immutable commit; ordinary target-less CLI,
+/// TUI, and gate invocations ask for the live working tree.
+/// A pin from an internal caller with no entry flags is ambient only when it is
+/// verifiably the checked-out `HEAD`; a differing or unverifiable pin remains
+/// exact so the old fail-loud pinned-target contract cannot regress.
 ///
-/// Cache keys need this INDEPENDENTLY of `config.scan_dir_override`: the cached-
-/// result lookup runs in the dispatcher's first pass, BEFORE the shared snapshot
-/// is materialised. A key derived from the scan dir alone would therefore read a
-/// local-tree key and write a snapshot key — and, worse, a `--pr` run would hit
-/// the entry a previous local run stored under that same local-tree key, serving
-/// the local checkout's verdict as if it were the reviewed commit's.
-pub fn off_head_target_commit(config: &Config) -> Option<String> {
-    let repo = crate::git::Repository::open(&config.repo_root).ok()?;
-    let target = repo.resolve_target(config).ok()?;
-    let head = repo.head_commit_id().ok()?;
-    (target.commit_id != head).then_some(target.commit_id)
+/// This decision is deliberately independent of `scan_dir_override`. Cache and
+/// eligibility run before the shared snapshot exists, while planners run after
+/// it may exist; both sides must still classify the run identically.
+#[derive(Debug, Clone)]
+pub(crate) enum ReviewSubstrate {
+    Ambient,
+    ExactTarget(crate::git::ResolvedRef),
+}
+
+pub(crate) fn review_substrate(config: &Config) -> Result<ReviewSubstrate> {
+    let exact_requested = config.target.is_some()
+        || config.pr_number.is_some()
+        || config.remote_mode
+        || config.remote_only
+        || matches!(config.execution_mode, crate::cli::ExecutionMode::Ci);
+
+    if exact_requested {
+        let target = match &config.pinned_target {
+            Some(target) => target.clone(),
+            None => crate::git::Repository::open(&config.repo_root)
+                .context("cannot open repository for exact review target")?
+                .resolve_target(config)
+                .context("cannot resolve exact review target")?,
+        };
+        return Ok(ReviewSubstrate::ExactTarget(target));
+    }
+
+    // A pinned target with no explicit entry intent is the ordinary ambient
+    // target only while it is verifiably the checked-out HEAD. A differing pin
+    // is an internal exact-target caller; an unreadable repository cannot prove
+    // ambient equivalence and therefore fails closed as exact too.
+    if let Some(target) = &config.pinned_target {
+        let is_head = crate::git::Repository::open(&config.repo_root)
+            .and_then(|repo| repo.head_commit_id())
+            .is_ok_and(|head| head == target.commit_id);
+        if !is_head {
+            return Ok(ReviewSubstrate::ExactTarget(target.clone()));
+        }
+    }
+
+    Ok(ReviewSubstrate::Ambient)
+}
+
+/// Commit id for exact-target reads, including exact reviews of checked-out
+/// `HEAD`. Ambient local reviews intentionally return `None`.
+pub(crate) fn exact_target_commit(config: &Config) -> Result<Option<String>> {
+    Ok(match review_substrate(config)? {
+        ReviewSubstrate::Ambient => None,
+        ReviewSubstrate::ExactTarget(target) => Some(target.commit_id),
+    })
 }
 
 /// Materialise ONE target snapshot for the whole run, point `config` at it and
@@ -1819,9 +1863,9 @@ pub fn off_head_target_commit(config: &Config) -> Option<String> {
 /// giving it the handle makes ONE snapshot the substrate of every stage instead
 /// of just the gates.
 ///
-/// A snapshot is materialised when a runnable check needs one and
-/// [`plan_check_run`] classifies the review as exact/off-`HEAD`. An off-`HEAD`
-/// target also requires planning even when no runnable gate needs the shared
+/// A snapshot is materialised when a runnable check needs one or
+/// [`review_substrate`] classifies the review as exact-target. An exact target
+/// also requires planning even when no runnable gate needs the shared
 /// directory. That second arm is not redundant: the gates are not the only
 /// stage that reads the tree.
 /// The context stage plans and produces the whole of `30_context` from
@@ -1836,7 +1880,7 @@ pub fn off_head_target_commit(config: &Config) -> Option<String> {
 /// gates: a correct pack is worth more than a saved checkout.
 ///
 /// Nothing is installed (`scan_dir_override` stays unset, the ledger keeps no
-/// snapshot) only when no pinned/off-`HEAD` run exists and no runnable check
+/// snapshot) only when the run is ambient and no runnable check
 /// wants a shared directory. An ambient local run that reaches the planner may
 /// install the repo root as its override; an exact same-`HEAD` run installs a
 /// snapshot. Once a snapshot is required, creation failure is terminal:
@@ -1860,10 +1904,7 @@ fn share_target_snapshot_with(
     let wanted_by_a_gate = runnable_checks
         .iter()
         .any(|c| uses_shared_scan_dir(c.name()));
-    if !wanted_by_a_gate
-        && config.pinned_target.is_none()
-        && off_head_target_commit(config).is_none()
-    {
+    if !wanted_by_a_gate && matches!(review_substrate(config)?, ReviewSubstrate::Ambient) {
         return Ok(());
     }
     let plan = planner(config).context("failed to materialize shared review snapshot")?;
@@ -2216,30 +2257,51 @@ pub fn js_tool_available(tool: &str, cwd: &Path) -> bool {
     local_js_bin(tool, cwd).is_some()
 }
 
+/// Why a JS tool cannot run on the substrate this review requested.
+///
+/// Exact snapshots currently borrow the operator's `node_modules` through a
+/// directory symlink. That mechanism is guaranteed only on Unix. On other
+/// platforms, claiming eligibility from `repo_root` and then looking for the
+/// executable inside the snapshot makes a runnable check disappear at spawn
+/// time. Fail closed with an explicit skip until a portable borrow mechanism is
+/// available; ambient local reviews keep their existing behavior.
+pub(crate) fn js_tool_unavailable_reason(tool: &str, config: &Config) -> Option<String> {
+    js_tool_unavailable_reason_with(
+        tool,
+        config,
+        js_tool_available(tool, &config.repo_root),
+        cfg!(unix),
+    )
+}
+
+fn js_tool_unavailable_reason_with(
+    tool: &str,
+    config: &Config,
+    available_in_operator_checkout: bool,
+    snapshot_dependency_links_supported: bool,
+) -> Option<String> {
+    if !available_in_operator_checkout {
+        return Some(format!(
+            "tool not installed (node_modules/.bin/{tool} is missing)"
+        ));
+    }
+    match review_substrate(config) {
+        Ok(ReviewSubstrate::ExactTarget(_)) if !snapshot_dependency_links_supported => {
+            Some(format!(
+                "tool unavailable for exact-target snapshot: borrowing node_modules is unsupported on this platform ({tool})"
+            ))
+        }
+        Err(error) => Some(format!("exact review target unavailable: {error:#}")),
+        Ok(ReviewSubstrate::Ambient | ReviewSubstrate::ExactTarget(_)) => None,
+    }
+}
+
 /// A resolved plan for running a check.
 pub struct CheckPlan {
     /// Directory to run the check command in.
     pub scan_dir: std::path::PathBuf,
     /// Ephemeral worktree snapshot, kept alive until the check finishes.
     pub _snapshot: Option<crate::git::WorktreeSnapshot>,
-}
-
-/// Whether the caller asked to review a commit identity rather than the live
-/// working tree.
-///
-/// `App::run` pins every resolved target before dispatching checks, including
-/// the default `prview` invocation that intentionally reviews the operator's
-/// uncommitted work. `pinned_target` alone therefore cannot distinguish an
-/// exact-SHA review from that ambient local mode. The original entry intent is
-/// still present on `Config`: an explicit target (also how MCP launches a run),
-/// PR, remote, remote-only, or CI invocation is exact; only the ordinary local
-/// invocation with no target remains ambient.
-fn requires_exact_target_snapshot(config: &Config) -> bool {
-    config.target.is_some()
-        || config.pr_number.is_some()
-        || config.remote_mode
-        || config.remote_only
-        || matches!(config.execution_mode, crate::cli::ExecutionMode::Ci)
 }
 
 /// Plan check execution path. Exact-target reviews use an ephemeral worktree
@@ -2261,43 +2323,16 @@ pub fn plan_check_run(config: &Config) -> Result<CheckPlan> {
     }
 
     let repo_root = config.repo_root.clone();
-    let repo = match crate::git::Repository::open(&repo_root) {
-        Ok(repo) => repo,
-        Err(error) => {
-            if config.pinned_target.is_some() {
-                return Err(error.context("cannot open repository for pinned review target"));
-            }
+    let target = match review_substrate(config)? {
+        ReviewSubstrate::Ambient => {
             return Ok(CheckPlan {
                 scan_dir: repo_root,
                 _snapshot: None,
             });
         }
+        ReviewSubstrate::ExactTarget(target) => target,
     };
 
-    let resolution = repo
-        .resolve_target(config)
-        .and_then(|target| repo.head_commit_id().map(|head| (target, head)));
-    let (target, head) = match resolution {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            if config.pinned_target.is_some() {
-                return Err(error.context("cannot plan checks for pinned review target"));
-            }
-            return Ok(CheckPlan {
-                scan_dir: repo_root,
-                _snapshot: None,
-            });
-        }
-    };
-
-    if head == target.commit_id && !requires_exact_target_snapshot(config) {
-        return Ok(CheckPlan {
-            scan_dir: repo_root,
-            _snapshot: None,
-        });
-    }
-
-    // Ephemeral worktree
     let snapshot = crate::git::create_worktree_snapshot(&repo_root, &target.commit_id)?;
     Ok(CheckPlan {
         scan_dir: snapshot.worktree_path.clone(),
@@ -2459,6 +2494,70 @@ mod tests {
         run_git(&["checkout", "-q", "main"]);
 
         (tmp, target)
+    }
+
+    #[test]
+    fn review_substrate_matrix_preserves_entrypoint_intent() {
+        let (repo, head) = repo_with_one_commit();
+        let pinned = crate::git::ResolvedRef {
+            name: "main".to_string(),
+            commit_id: head.clone(),
+            is_remote: false,
+        };
+        let base = || {
+            let mut config = test_config();
+            config.repo_root = repo.path().to_path_buf();
+            // Headless and TUI dispatchers pin even the ordinary local target.
+            // The discriminator must ignore that pin for ambient entrypoints.
+            config.pinned_target = Some(pinned.clone());
+            config
+        };
+
+        let mut rows = Vec::new();
+
+        let mut explicit = base();
+        explicit.target = Some("main".to_string());
+        rows.push(("explicit target", explicit, true));
+
+        let mut pr = base();
+        pr.pr_number = Some(42);
+        rows.push(("PR", pr, true));
+
+        let mut mcp = base();
+        mcp.target = Some(head.clone());
+        rows.push(("MCP explicit target", mcp, true));
+
+        let mut remote = base();
+        remote.remote_mode = true;
+        rows.push(("remote", remote, true));
+
+        let mut remote_only = base();
+        remote_only.remote_only = true;
+        rows.push(("remote-only", remote_only, true));
+
+        let mut ci = base();
+        ci.execution_mode = ExecutionMode::Ci;
+        rows.push(("CI", ci, true));
+
+        let mut tui = base();
+        tui.tui_mode = true;
+        tui.target = Some("main".to_string());
+        rows.push(("TUI explicit target", tui, true));
+
+        rows.push(("default CLI", base(), false));
+
+        let mut gate = base();
+        gate.enforcement_mode = crate::policy::engine::EnforcementMode::GateStrict;
+        rows.push(("target-less gate", gate, false));
+
+        for (name, config, expected_exact) in rows {
+            let substrate = review_substrate(&config).expect(name);
+            assert_eq!(
+                matches!(substrate, ReviewSubstrate::ExactTarget(_)),
+                expected_exact,
+                "entrypoint matrix row: {name}",
+            );
+        }
     }
 
     #[test]
@@ -4240,6 +4339,32 @@ test result: ok. 2 passed; 0 failed
         );
     }
 
+    #[test]
+    fn exact_js_review_skips_when_snapshot_cannot_borrow_node_modules() {
+        let (repo, head) = repo_with_one_commit();
+        let mut config = test_config();
+        config.repo_root = repo.path().to_path_buf();
+        config.target = Some(head.clone());
+        config.pinned_target = Some(crate::git::ResolvedRef {
+            name: head,
+            commit_id: config.target.clone().unwrap(),
+            is_remote: false,
+        });
+
+        let reason = js_tool_unavailable_reason_with("eslint", &config, true, false)
+            .expect("non-Unix exact snapshot must skip borrowed toolchain");
+        assert!(reason.contains("exact-target snapshot"), "{reason}");
+        assert!(reason.contains("unsupported on this platform"), "{reason}");
+
+        let mut ambient = config;
+        ambient.target = None;
+        assert_eq!(
+            js_tool_unavailable_reason_with("eslint", &ambient, true, false),
+            None,
+            "ambient local review executes the tool directly from its checkout",
+        );
+    }
+
     /// Every check a run considers must leave exactly one ledger entry, stating
     /// how it resolved. A gate that is missing from the ledger is a gate a later
     /// consumer would re-run instead of recognising as already done.
@@ -4502,6 +4627,117 @@ test result: ok. 2 passed; 0 failed
         );
     }
 
+    #[tokio::test]
+    async fn ambient_cargo_cache_entry_never_replays_into_exact_same_head() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CargoKeyProbe {
+            executions: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Check for CargoKeyProbe {
+            fn name(&self) -> &str {
+                "Cargo check"
+            }
+
+            fn check_eligibility(&self, _config: &Config) -> CheckEligibility {
+                CheckEligibility::Run
+            }
+
+            fn cache_key(&self, config: &Config) -> Option<String> {
+                cargo::CargoCheck.cache_key(config)
+            }
+
+            async fn run(&self, config: &Config) -> Result<CheckResult> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                let plan = plan_check_run(config)?;
+                let observed = std::fs::read_to_string(plan.scan_dir.join("tracked.txt"))?;
+                Ok(CheckResult {
+                    name: self.name().to_string(),
+                    status: CheckStatus::Passed,
+                    duration: Duration::from_millis(1),
+                    output: observed,
+                    cached: false,
+                    provenance: None,
+                })
+            }
+        }
+
+        let (repo, head) = repo_with_one_commit();
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname='probe'\nversion='0.0.0'\n",
+        )
+        .expect("ambient manifest");
+        std::fs::write(repo.path().join("tracked.txt"), "ambient dirty\n").expect("dirty checkout");
+
+        let mut ambient = rust_config(false, false, false);
+        ambient.repo_root = repo.path().to_path_buf();
+        ambient.profile.cargo_root = Some(repo.path().to_path_buf());
+        ambient.pinned_target = Some(crate::git::ResolvedRef {
+            name: "main".to_string(),
+            commit_id: head.clone(),
+            is_remote: false,
+        });
+        ambient.quiet = true;
+
+        let mut exact = ambient.clone();
+        exact.target = Some("main".to_string());
+
+        let ambient_key = cargo::CargoCheck
+            .cache_key(&ambient)
+            .expect("ambient Cargo key");
+        let exact_key = cargo::CargoCheck
+            .cache_key(&exact)
+            .expect("exact Cargo key");
+        assert_ne!(ambient_key, exact_key, "substrates must partition cache");
+
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let executions = Arc::new(AtomicUsize::new(0));
+        let ambient_checks: Vec<Box<dyn Check>> = vec![Box::new(CargoKeyProbe {
+            executions: Arc::clone(&executions),
+        })];
+        let ambient_ledger = TaskLedger::new();
+        let ambient_governor = Arc::new(ResourceGovernor::new());
+        let (ambient_results, _) = run_all_checks(
+            ambient_checks,
+            Cache::with_dir(cache_dir.path().to_path_buf(), true),
+            &ambient,
+            &ambient_ledger,
+            &ambient_governor,
+        )
+        .await
+        .expect("ambient run");
+
+        let exact_checks: Vec<Box<dyn Check>> = vec![Box::new(CargoKeyProbe {
+            executions: Arc::clone(&executions),
+        })];
+        let exact_ledger = TaskLedger::new();
+        let exact_governor = Arc::new(ResourceGovernor::new());
+        let (exact_results, _) = run_all_checks(
+            exact_checks,
+            Cache::with_dir(cache_dir.path().to_path_buf(), true),
+            &exact,
+            &exact_ledger,
+            &exact_governor,
+        )
+        .await
+        .expect("exact run");
+
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert!(!ambient_results[0].cached);
+        assert!(
+            !exact_results[0].cached,
+            "exact run must execute, not replay"
+        );
+        assert_eq!(ambient_results[0].output, "ambient dirty\n");
+        assert_eq!(
+            exact_results[0].output, "one\n",
+            "exact run must observe the committed target bytes",
+        );
+    }
+
     /// The other way to end up with nothing snapshot-backed to run: the fast
     /// remote-only preset, where the snapshot-backed gates are ruled out at
     /// eligibility and the one runnable check is semgrep — which owns its own
@@ -4579,7 +4815,7 @@ test result: ok. 2 passed; 0 failed
         assert!(results[0].cached);
         assert!(
             ledger.scan_dir().is_none(),
-            "target == HEAD: the artifact stage's fallback to repo_root is the right answer",
+            "ambient target-less: the artifact fallback to repo_root is the right answer",
         );
         assert!(ledger.resolved_substrate().is_none());
     }
