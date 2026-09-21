@@ -38,7 +38,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "chrono",
- "dirs",
+ "dirs 6.0.0",
  "getrandom 0.3.4",
  "globset",
  "hex",
@@ -63,7 +63,7 @@ checksum = "9bd45260b57074d771dc5ab864c7aa2d2ae3ac464e9558942e1653cfb7657945"
 dependencies = [
  "anyhow",
  "chrono",
- "dirs",
+ "dirs 6.0.0",
  "regex",
  "schemars",
  "serde",
@@ -956,6 +956,15 @@ name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys",
 ]
@@ -2211,7 +2220,7 @@ dependencies = [
  "chrono",
  "colored",
  "console",
- "dirs",
+ "dirs 6.0.0",
  "fs4",
  "git2",
  "globset",
@@ -3252,7 +3261,7 @@ dependencies = [
  "colored",
  "comrak",
  "crossterm",
- "dirs",
+ "dirs 7.0.0",
  "futures",
  "git2",
  "glob",
