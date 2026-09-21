@@ -302,9 +302,12 @@ exactly one diff base.
 
 **The substrate.** Whether a selection can be trusted also depends on which tree
 the checks actually read, and that is a separate fact decided later, inside
-`run_all` (`share_target_snapshot`). A pinned target does NOT always mean a
-snapshot: when the reviewed target is the checked-out `HEAD`, `plan_check_run`
-hands the gates the repository root itself. `ReviewedTree` names the four cases
+`run_all` (`share_target_snapshot`). An exact-target review uses a snapshot even
+when the reviewed commit equals the checked-out `HEAD`; target equality is not
+permission to read untracked operator files. The one exception is the ordinary
+local invocation with no explicit target or automation/remote mode: it
+intentionally reviews the live working tree so a developer can inspect
+uncommitted work. `ReviewedTree` names the four cases
 — `Snapshot`, `LocalClean`, `LocalDirty`, `Unknown` — and is resolved from what
 the ledger recorded plus the operator cleanliness frozen before the run. A
 snapshot the ledger reports as `SnapshotDirty`, or one whose substrate cannot be
@@ -350,8 +353,8 @@ snapshot*. A `--pr` review is about the pinned target and the canonical PR diff;
 the gates never open the operator's tree, so escalating on it would make the
 feature useless during exactly the work it exists for.
 
-The mirror of that rule: when the run reads the operator checkout itself — an
-on-`HEAD` review — the same uncommitted work IS what the tools compile, while
+The mirror of that rule: when an ambient local run reads the operator checkout
+itself, the same uncommitted work IS what the tools compile, while
 the commit-range change set cannot list it. Selecting from a set that is missing
 files the tools will read is the silent narrowing the contract forbids, so that
 case escalates. The fact that decides which of the two applies is never "is the
@@ -578,12 +581,14 @@ preset, because naming the operator is the more specific truth.
 
 Checks must judge the *reviewed* commit, not whatever happens to be checked out
 locally. `plan_check_run()` resolves the working directory for every language
-check: when the resolved target equals `HEAD` (the ordinary local review) it
-returns `repo_root` unchanged; when they differ (`--pr`, `--remote`, or an
-explicit target) it materialises a detached `git worktree` at the target commit
-and returns that path. `node_modules` and `.venv` are symlinked into the
-snapshot, so tests and linters keep their installed environment without a
-reinstall.
+check. An explicit target, PR/MCP, remote/remote-only, or CI review materialises
+a detached `git worktree` at the target commit even when that commit equals
+`HEAD`. Only the default local invocation with no target keeps `repo_root`,
+because that mode intentionally reviews the developer's live, possibly dirty
+tree. `node_modules` and `.venv` are symlinked into snapshots, so tests and
+linters keep their installed environment without a reinstall. Snapshot creation
+uses an empty per-snapshot `core.hooksPath`; checkout hooks belong to the
+operator's workflow and must not mutate or block exact-SHA review input.
 
 The Python and JS checks (`Ruff`, `Mypy`, `Pytest`, `TypeScript`, `ESLint`,
 `Vitest`, `Stylelint`) share **one** run-wide snapshot rather than each creating
@@ -611,9 +616,12 @@ commit, and `RUN.json` looked identical either way
 pays for one `git worktree` its gates do not need: a correct pack outranks a
 saved checkout.
 
-When the target **is** the checked-out `HEAD` and no runnable check wants a
-snapshot, nothing is materialised — there the repo root genuinely is the reviewed
-tree, and the artifact stage's fallback to `config.repo_root` is the right answer.
+When an ambient local target is the checked-out `HEAD` and no runnable check
+wants a snapshot, nothing is materialised — there the repo root genuinely is
+the reviewed tree, and the artifact stage's fallback to `config.repo_root` is
+the right answer. Exact-target runs do not use that equivalence: a runnable
+shared-scan check materialises the same-`HEAD` snapshot so untracked operator
+files cannot enter its input.
 The call therefore sits *outside* the dispatcher's "anything to run" guard, since
 a run with an empty runnable set is exactly the case it exists to cover.
 
@@ -1030,7 +1038,7 @@ returns an error, and that row used to carry no provenance at all — null `cwd`
 `target_sha` and `tree_state` for exactly the rows a reviewer most needs to
 place. The error path now reconstructs the directory the check was about to read
 without materialising anything: the run-wide shared snapshot is already on disk,
-and a review whose target is the checked-out `HEAD` reads the repo root. Two
+and only an ambient local review reads the repo root. Two
 absences stay absences rather than being filled: `command` is an explicit
 `<no command recorded>`, and an off-`HEAD` check with no shared snapshot keeps a
 `None` provenance, because its own worktree is gone by then and naming the local
@@ -1383,9 +1391,9 @@ The ledger also **owns** the run's shared target snapshot
 dispatcher's job, but the handle lives here because the ledger outlives every
 stage: a snapshot parked in it is still on disk when artifact generation asks
 where the reviewed tree is, instead of having been dropped with the frame that
-created it. Because the artifact stage reads it too, an off-`HEAD` target is on
-its own enough to materialise one, whether or not any gate had to run — see
-*Where checks run*.
+created it. Because the artifact stage reads it too, an off-`HEAD` target or an
+exact-target same-`HEAD` run is enough to materialise one, whether or not any
+gate had to run — see *Where checks run*.
 
 The ledger observes; it never runs, skips or caches anything itself.
 
@@ -1521,8 +1529,8 @@ resolved substrate on the ledger, and hands the ledger the snapshot handle.
 context generators' root as `ledger.scan_dir()`, falling back to
 `config.repo_root`.
 
-That fallback is valid only when the reviewed target is the checked-out
-`HEAD`, where both paths name the same tree. If an off-`HEAD` snapshot is
+That fallback is valid only for the ambient local mode, where the reviewed tree
+is deliberately the live checkout. If an exact-target or off-`HEAD` snapshot is
 required but cannot be created, the checks dispatcher returns an error before
 pre-sync or gate execution; it never publishes a mixed-revision pack.
 
@@ -1535,8 +1543,9 @@ had checked out locally (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`). Every context
 command's cwd and every filesystem probe that decides which commands to plan now
 read the reviewed tree. Static Tauri discovery, its source walk, and the
 repo-relative mapping used to compare head commands with the base commit use
-that same tree and repository view. A local review resolves to the repo root,
-which *is* the reviewed tree, so its behaviour is unchanged. Cargo context
+that same tree and repository view. The default target-less local review still
+resolves to the repo root, which *is* its intentionally ambient reviewed tree;
+an explicit same-`HEAD` review resolves to a snapshot instead. Cargo context
 commands resolve their directory through `checks::planned_cargo_cwd`, the same
 resolution the cargo gates use, so a workspace member is not collapsed to the
 snapshot root.

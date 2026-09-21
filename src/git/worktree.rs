@@ -170,13 +170,24 @@ pub fn create_worktree_snapshot(repo_root: &Path, commit: &str) -> Result<Worktr
     // `git worktree add` wants a path it can create, so point it at a fresh
     // subdirectory of the temp dir rather than the (already-created) temp root.
     let worktree_path = tmp.path().join("snapshot");
+    // A reviewed commit is input data, not an operator checkout. In particular,
+    // `worktree add` must not execute an inherited/global post-checkout hook:
+    // that hook can require ambient tools, mutate the snapshot, or inspect an
+    // unrelated checkout. Point Git at an empty, snapshot-owned hook directory
+    // without changing the repository's persistent configuration.
+    let hooks_path = tmp.path().join("hooks");
+    std::fs::create_dir(&hooks_path)?;
     // Armed before the child starts: if cancellation/timeout wins after Git has
     // registered the path but before the command returns, Drop can still undo
     // that exact administrative entry in-process.
     let mut registration_rollback = WorktreeRegistrationRollback::new(repo_root, &worktree_path);
 
+    let mut hooks_config = std::ffi::OsString::from("core.hooksPath=");
+    hooks_config.push(&hooks_path);
     let mut command = git_cmd();
     command
+        .arg("-c")
+        .arg(hooks_config)
         .args(["worktree", "add", "--detach", "--force"])
         .arg(&worktree_path)
         .arg(&original_target_sha)
@@ -325,6 +336,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn snapshot_creation_does_not_execute_checkout_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo_tmp, repo) = repo_with_commit();
+        let hooks = repo_tmp.path().join("operator-hooks");
+        std::fs::create_dir(&hooks).expect("hooks dir");
+        let marker = repo_tmp.path().join("post-checkout-ran");
+        let hook = hooks.join("post-checkout");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf called > '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .expect("write hook");
+        let mut permissions = std::fs::metadata(&hook)
+            .expect("hook metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&hook, permissions).expect("make hook executable");
+        repo.config()
+            .expect("repo config")
+            .set_str("core.hooksPath", hooks.to_str().expect("utf8 temp path"))
+            .expect("configure hooks");
+
+        let head = repo.head().unwrap().target().unwrap().to_string();
+        let snapshot = create_worktree_snapshot(repo_tmp.path(), &head)
+            .expect("operator hooks must not participate in snapshot creation");
+        assert!(snapshot.worktree_path.is_dir());
+        assert!(!marker.exists(), "post-checkout hook must stay isolated");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn ordinary_drop_deregisters_in_process_without_spawning_git() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -419,7 +465,7 @@ mod tests {
         std::fs::write(
             &shim,
             format!(
-                "#!/bin/sh\ngit \"$@\"\nstatus=$?\nif [ \"$1\" = worktree ] && [ \"$2\" = add ] && [ \"$status\" -eq 0 ]; then\n  printf '%s\\n' \"$5\" > '{}'\n  sleep 30\nfi\nexit \"$status\"\n",
+                "#!/bin/sh\ngit \"$@\"\nstatus=$?\nif [ \"$3\" = worktree ] && [ \"$4\" = add ] && [ \"$status\" -eq 0 ]; then\n  printf '%s\\n' \"$7\" > '{}'\n  sleep 30\nfi\nexit \"$status\"\n",
                 ready.display()
             ),
         )

@@ -1790,8 +1790,9 @@ fn uses_shared_scan_dir(name: &str) -> bool {
 
 /// Commit id of the reviewed target when it differs from the checked-out `HEAD`.
 ///
-/// `None` for an ordinary local review (target == `HEAD`) and whenever the repo
-/// or its refs cannot be resolved — both keep the plain working-tree behaviour.
+/// `None` whenever target equals `HEAD`, and whenever the repo or its refs cannot
+/// be resolved. Callers that need to distinguish an exact same-`HEAD` review
+/// from ambient local mode use [`requires_exact_target_snapshot`] separately.
 ///
 /// Cache keys need this INDEPENDENTLY of `config.scan_dir_override`: the cached-
 /// result lookup runs in the dispatcher's first pass, BEFORE the shared snapshot
@@ -1818,9 +1819,11 @@ pub fn off_head_target_commit(config: &Config) -> Option<String> {
 /// giving it the handle makes ONE snapshot the substrate of every stage instead
 /// of just the gates.
 ///
-/// A snapshot is materialised when EITHER a runnable check needs one
-/// ([`uses_shared_scan_dir`]) OR the reviewed target is off-`HEAD`. The second
-/// arm is not redundant: the gates are not the only stage that reads the tree.
+/// A snapshot is materialised when a runnable check needs one and
+/// [`plan_check_run`] classifies the review as exact/off-`HEAD`. An off-`HEAD`
+/// target also requires planning even when no runnable gate needs the shared
+/// directory. That second arm is not redundant: the gates are not the only
+/// stage that reads the tree.
 /// The context stage plans and produces the whole of `30_context` from
 /// `ledger.scan_dir()`, so tying materialisation to the runnable set alone gave
 /// back `PRV-CONTEXT-SNAPSHOT-PROVENANCE` through a quieter door — a run whose
@@ -1833,11 +1836,13 @@ pub fn off_head_target_commit(config: &Config) -> Option<String> {
 /// gates: a correct pack is worth more than a saved checkout.
 ///
 /// Nothing is installed (`scan_dir_override` stays unset, the ledger keeps no
-/// snapshot) when the target IS the checked-out `HEAD` and no runnable check
-/// wants one — there the repo root genuinely is the reviewed tree. Once a
-/// snapshot is required, creation failure is terminal: per-check snapshots do
-/// not give later artifact stages a verified tree and would permit one pack to
-/// mix the reviewed target with the operator's checkout.
+/// snapshot) only when no pinned/off-`HEAD` run exists and no runnable check
+/// wants a shared directory. An ambient local run that reaches the planner may
+/// install the repo root as its override; an exact same-`HEAD` run installs a
+/// snapshot. Once a snapshot is required, creation failure is terminal:
+/// per-check snapshots do not give later artifact stages a verified tree and
+/// would permit one pack to mix the reviewed target with the operator's
+/// checkout.
 fn share_target_snapshot(
     config: &mut Config,
     runnable_checks: &[Box<dyn Check>],
@@ -2219,9 +2224,27 @@ pub struct CheckPlan {
     pub _snapshot: Option<crate::git::WorktreeSnapshot>,
 }
 
-/// Plan check execution path: if we are in a remote/PR mode (meaning resolved target
-/// commit is different from the checked-out HEAD commit), create an ephemeral worktree
-/// snapshot of the target commit and run there. Otherwise, scan the working tree in place.
+/// Whether the caller asked to review a commit identity rather than the live
+/// working tree.
+///
+/// `App::run` pins every resolved target before dispatching checks, including
+/// the default `prview` invocation that intentionally reviews the operator's
+/// uncommitted work. `pinned_target` alone therefore cannot distinguish an
+/// exact-SHA review from that ambient local mode. The original entry intent is
+/// still present on `Config`: an explicit target (also how MCP launches a run),
+/// PR, remote, remote-only, or CI invocation is exact; only the ordinary local
+/// invocation with no target remains ambient.
+fn requires_exact_target_snapshot(config: &Config) -> bool {
+    config.target.is_some()
+        || config.pr_number.is_some()
+        || config.remote_mode
+        || config.remote_only
+        || matches!(config.execution_mode, crate::cli::ExecutionMode::Ci)
+}
+
+/// Plan check execution path. Exact-target reviews use an ephemeral worktree
+/// snapshot even when the resolved commit equals checked-out `HEAD`; only the
+/// default target-less local review scans the working tree in place.
 ///
 /// When the dispatcher has already materialised ONE shared snapshot for the run
 /// (`config.scan_dir_override`), reuse its directory instead of creating a
@@ -2267,7 +2290,7 @@ pub fn plan_check_run(config: &Config) -> Result<CheckPlan> {
         }
     };
 
-    if head == target.commit_id {
+    if head == target.commit_id && !requires_exact_target_snapshot(config) {
         return Ok(CheckPlan {
             scan_dir: repo_root,
             _snapshot: None,
@@ -2530,8 +2553,21 @@ mod tests {
     }
 
     #[test]
-    fn pinned_local_target_keeps_operator_checkout() {
+    fn same_head_exact_review_snapshots_target_and_excludes_ambient_worktrees() {
         let (repo, _) = repo_with_off_head_target();
+        let foreign = repo.path().join(".claude/worktrees/foreign-js");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(
+            foreign.join("package.json"),
+            r#"{"scripts":{"lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            foreign.join("broken.js"),
+            "const definitelyLintBreaking = ;\n",
+        )
+        .unwrap();
+
         let mut config = test_config();
         config.repo_root = repo.path().to_path_buf();
         config.target = Some("main".to_owned());
@@ -2542,9 +2578,75 @@ mod tests {
                 .unwrap(),
         );
         let ledger = TaskLedger::new();
-        share_target_snapshot(&mut config, &[], &ledger).unwrap();
+        let eslint: Vec<Box<dyn Check>> = vec![Box::new(typescript::ESLintCheck)];
+        share_target_snapshot(&mut config, &eslint, &ledger).unwrap();
+
+        let scan_dir = ledger
+            .scan_dir()
+            .expect("an exact same-HEAD review must retain its snapshot");
+        assert_ne!(scan_dir, config.repo_root);
+        assert_eq!(config.scan_dir_override.as_ref(), Some(&scan_dir));
+        assert!(scan_dir.join("tracked.txt").is_file());
+        assert!(
+            !scan_dir.join(".claude/worktrees/foreign-js").exists(),
+            "untracked agent worktrees must not enter an exact-SHA scan",
+        );
+
+        let substrate = resolve_scan_substrate(&scan_dir, &config.repo_root, &[]);
+        assert_eq!(
+            substrate.target_sha.as_deref(),
+            config
+                .pinned_target
+                .as_ref()
+                .map(|target| target.commit_id.as_str()),
+        );
+        assert_eq!(substrate.tree_state, Some(TreeState::Snapshot));
+
+        let provenance = CheckProvenance {
+            command: "eslint .".to_owned(),
+            tool_version: None,
+            cwd: scan_dir.display().to_string(),
+            target_sha: None,
+            tree_state: None,
+            exit_code: Some(0),
+            executed_scope: None,
+            started_at: "start".to_owned(),
+            finished_at: "finish".to_owned(),
+            hard_fail_signatures: Vec::new(),
+            cache_key: None,
+        }
+        .with_scan_substrate("ESLint", &scan_dir, &config.repo_root);
+        assert_eq!(provenance.cwd, scan_dir.display().to_string());
+        assert_eq!(provenance.target_sha, substrate.target_sha);
+        assert_eq!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[test]
+    fn same_head_ambient_review_keeps_dirty_operator_checkout() {
+        let (repo, _) = repo_with_off_head_target();
+        let foreign = repo.path().join(".claude/worktrees/foreign-js");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("broken.js"), "const broken = ;\n").unwrap();
+
+        let mut config = test_config();
+        config.repo_root = repo.path().to_path_buf();
+        let owner = crate::git::Repository::open(repo.path()).unwrap();
+        config.pinned_target = Some(owner.resolve_target(&config).unwrap());
+
+        let ledger = TaskLedger::new();
+        let eslint: Vec<Box<dyn Check>> = vec![Box::new(typescript::ESLintCheck)];
+        share_target_snapshot(&mut config, &eslint, &ledger).unwrap();
+
         assert!(ledger.scan_dir().is_none());
         assert_eq!(config.scan_dir_override.as_ref(), Some(&config.repo_root));
+        assert!(
+            config
+                .repo_root
+                .join(".claude/worktrees/foreign-js")
+                .exists()
+        );
+        let substrate = resolve_scan_substrate(&config.repo_root, &config.repo_root, &[]);
+        assert_eq!(substrate.tree_state, Some(TreeState::LocalDirty));
     }
 
     #[test]
