@@ -2224,10 +2224,21 @@ pub async fn run_js_command_with_timeout(
     cwd: &Path,
     timeout_secs: u64,
 ) -> Result<Output> {
+    let bin_path = cwd.join("node_modules/.bin").join(tool);
+    #[cfg(unix)]
+    if std::fs::metadata(&bin_path).is_ok_and(|metadata| {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 == 0
+    }) {
+        anyhow::bail!(
+            "resolved JS tool is not executable before spawn: {}",
+            bin_path.display()
+        );
+    }
     let bin = local_js_bin(tool, cwd).with_context(|| {
         format!(
             "resolved JS tool disappeared before spawn: {}",
-            cwd.join("node_modules/.bin").join(tool).display()
+            bin_path.display()
         )
     })?;
     let bin = bin.to_string_lossy().into_owned();
@@ -4640,6 +4651,154 @@ test result: ok. 2 passed; 0 failed
             "the shim's executed sibling payload is prview-borrowed",
         );
         assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_unrecognized_wrapper_is_conservatively_borrowed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let wrapper = bin_dir.join("eslint");
+        std::fs::write(
+            &wrapper,
+            b"#!/bin/sh\ntool_dir=$(dirname \"$0\")\nexec node \"$tool_dir/../eslint/bin/eslint.js\" \"$@\"\n",
+        )
+        .expect("unrecognized wrapper");
+        let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions).expect("executable wrapper");
+        let target = commit_fixture(
+            root,
+            "target owns unrecognized wrapper",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let payload_dir = root.join("node_modules/eslint/bin");
+        std::fs::create_dir_all(&payload_dir).expect("ambient eslint package");
+        std::fs::write(
+            payload_dir.join("eslint.js"),
+            "console.log('UNRECOGNIZED_AMBIENT_PAYLOAD_RAN')\n",
+        )
+        .expect("ambient eslint payload");
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("UNRECOGNIZED_AMBIENT_PAYLOAD_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "an unproved script closure must never be certified as target-only",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_direct_script_ignores_wrapper_text_in_comments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let tool = bin_dir.join("eslint");
+        std::fs::write(
+            &tool,
+            b"#!/bin/sh\n# Documentation example only: require(\"never-loaded\")\nprintf 'DIRECT_TARGET_ONLY_RAN\\n'\n",
+        )
+        .expect("direct target tool");
+        let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).expect("executable target tool");
+        let target = commit_fixture(
+            root,
+            "target owns direct tool with wrapper-like comment",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let unrelated = root.join("node_modules/unrelated");
+        std::fs::create_dir_all(&unrelated).expect("ambient unrelated package");
+        std::fs::write(unrelated.join("index.js"), "console.log('UNRELATED')\n")
+            .expect("ambient unrelated payload");
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("DIRECT_TARGET_ONLY_RAN"));
+        assert!(!result.output.contains("UNRELATED"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::Snapshot),
+            "comments and string literals are not structural wrapper evidence",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_non_executable_file_fails_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let marker = root.join("nonexec-spawned");
+        let tool = bin_dir.join("eslint");
+        std::fs::write(
+            &tool,
+            format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+        )
+        .expect("non-executable target tool");
+        let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&tool, permissions).expect("remove execute bits");
+        let target = commit_fixture(
+            root,
+            "target owns non-executable tool",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let config = exact_js_config(root, &target);
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let error = check
+            .run(&config)
+            .await
+            .expect_err("a non-executable tool must fail before spawn");
+
+        assert!(
+            error.to_string().contains("not executable before spawn"),
+            "unexpected pre-spawn error: {error:#}",
+        );
+        assert!(
+            !error.to_string().contains("Permission denied"),
+            "the OS spawn boundary must not decide tool eligibility: {error:#}",
+        );
+        assert!(!marker.exists(), "the non-executable tool must never run");
     }
 
     #[cfg(unix)]

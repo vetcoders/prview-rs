@@ -157,11 +157,10 @@ fn resolved_symlink_path(
 /// created link. Canonical resolution also exposes target-owned absolute
 /// symlinks that escape the snapshot.
 ///
-/// A real npm/pnpm/yarn wrapper is not the final payload. Known wrapper-relative
-/// paths (`$basedir/../...`, JS `require("../...")`) and effective `NODE_PATH`
-/// roots are included in the resolution, so a target-owned shim that executes a
-/// borrowed sibling package is still reported as borrowed. Plain target-owned
-/// scripts with no wrapper indirection remain target bytes.
+/// A package-manager wrapper is not the final payload. Only strict, anchored
+/// wrapper grammars contribute payload paths; comments, strings, and arbitrary
+/// `require(` substrings are not evidence. A script whose closure cannot be
+/// proved from one of those grammars is classified conservatively as borrowed.
 #[cfg(unix)]
 pub(crate) fn path_uses_prview_borrow(snapshot_root: &Path, relative_path: &Path) -> bool {
     let Some(parent) = snapshot_root.parent() else {
@@ -181,6 +180,9 @@ pub(crate) fn path_uses_prview_borrow(snapshot_root: &Path, relative_path: &Path
         return true;
     }
     let consumed = consumed_paths(snapshot_root, relative_path);
+    if !consumed.closure_proven {
+        return true;
+    }
     if consumed.package_wrapper
         && borrowed.iter().any(|created| {
             created.starts_with("node_modules") || Path::new("node_modules").starts_with(created)
@@ -217,6 +219,7 @@ fn path_is_external_or_borrowed(snapshot_root: &Path, path: &Path, borrowed: &[P
 struct ConsumedPaths {
     paths: Vec<PathBuf>,
     package_wrapper: bool,
+    closure_proven: bool,
 }
 
 #[cfg(unix)]
@@ -227,70 +230,90 @@ fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
         return ConsumedPaths {
             paths: consumed,
             package_wrapper: false,
+            // Nothing can execute when final resolution fails. The check layer
+            // reports that failure before spawn; provenance still describes the
+            // target snapshot rather than inventing a borrowed execution.
+            closure_proven: true,
         };
     };
-    if !metadata.is_file() || metadata.len() > MAX_JS_SHIM_BYTES {
+    if !metadata.is_file() {
         return ConsumedPaths {
             paths: consumed,
             package_wrapper: false,
+            closure_proven: true,
+        };
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: true,
+        };
+    }
+    if metadata.len() > MAX_JS_SHIM_BYTES {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: false,
         };
     }
     let Ok(bytes) = std::fs::read(&invocation) else {
         return ConsumedPaths {
             paths: consumed,
             package_wrapper: false,
+            closure_proven: false,
         };
     };
+    if !bytes.starts_with(b"#!") {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: true,
+        };
+    }
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return ConsumedPaths {
             paths: consumed,
             package_wrapper: false,
+            closure_proven: false,
         };
     };
     let Some(bin_dir) = invocation.parent() else {
         return ConsumedPaths {
             paths: consumed,
             package_wrapper: false,
+            closure_proven: false,
         };
     };
 
-    let package_wrapper = text.contains("NODE_PATH=")
-        || (text.contains("$basedir/") && text.contains("node"))
-        || text.contains("require(")
-        || text.contains("import(");
-
-    let basedir = regex::Regex::new(r#"\$basedir/([^\"'\s;|&)]+)"#).expect("static basedir regex");
-    for capture in basedir.captures_iter(text) {
-        let Some(relative) = capture.get(1) else {
-            continue;
+    let active_lines: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let package_wrapper = is_known_pnpm_shell_wrapper(text, &active_lines);
+    if !package_wrapper && !is_proved_direct_shell_script(text, &active_lines) {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: false,
         };
-        let candidate = bin_dir.join(relative.as_str());
-        if candidate.exists() {
-            consumed.push(candidate);
-        }
     }
 
-    let relative_literal =
-        regex::Regex::new(r#"[\"'](\.\.?/[^\"'\s]+)[\"']"#).expect("static wrapper-relative regex");
-    for capture in relative_literal.captures_iter(text) {
-        let Some(relative) = capture.get(1) else {
-            continue;
-        };
-        let candidate = bin_dir.join(relative.as_str());
-        if candidate.exists() {
-            consumed.push(candidate);
-        }
-    }
-
-    let node_path = regex::Regex::new(r#"(?m)(?:export\s+)?NODE_PATH=\"([^\"]+)\""#)
-        .expect("static NODE_PATH regex");
-    for capture in node_path.captures_iter(text) {
-        let Some(paths) = capture.get(1) else {
-            continue;
-        };
-        for path in std::env::split_paths(paths.as_str()) {
-            if path.exists() {
-                consumed.push(path);
+    if package_wrapper {
+        let basedir =
+            regex::Regex::new(r#"\$basedir/([^\"'\s;|&)]+)"#).expect("static basedir regex");
+        for line in &active_lines {
+            for capture in basedir.captures_iter(line) {
+                let Some(relative) = capture.get(1) else {
+                    continue;
+                };
+                let candidate = bin_dir.join(relative.as_str());
+                if candidate.exists() {
+                    consumed.push(candidate);
+                }
             }
         }
     }
@@ -300,7 +323,49 @@ fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
     ConsumedPaths {
         paths: consumed,
         package_wrapper,
+        closure_proven: true,
     }
+}
+
+#[cfg(unix)]
+fn is_known_pnpm_shell_wrapper(text: &str, active_lines: &[&str]) -> bool {
+    let Some(shebang) = text.lines().next() else {
+        return false;
+    };
+    if !matches!(shebang.trim(), "#!/bin/sh" | "#!/usr/bin/env sh") {
+        return false;
+    }
+    if active_lines.len() != 2 || active_lines[0] != "basedir=$(dirname \"$0\")" {
+        return false;
+    }
+    regex::Regex::new(r#"^exec node \"\$basedir/[^\"]+\" \"\$@\"$"#)
+        .expect("static pnpm wrapper regex")
+        .is_match(active_lines[1])
+}
+
+#[cfg(unix)]
+fn is_proved_direct_shell_script(text: &str, active_lines: &[&str]) -> bool {
+    let Some(shebang) = text.lines().next() else {
+        return false;
+    };
+    if !matches!(
+        shebang.trim(),
+        "#!/bin/sh" | "#!/bin/bash" | "#!/usr/bin/env sh" | "#!/usr/bin/env bash"
+    ) {
+        return false;
+    }
+    let literal_output = regex::Regex::new(r#"^(?:printf|echo) '[^']*'$"#)
+        .expect("static direct shell output regex");
+    active_lines.iter().all(|line| {
+        line == &":"
+            || line == &"true"
+            || line == &"false"
+            || literal_output.is_match(line)
+            || line == &"exit"
+            || line
+                .strip_prefix("exit ")
+                .is_some_and(|code| !code.is_empty() && code.chars().all(|ch| ch.is_ascii_digit()))
+    })
 }
 
 #[cfg(not(unix))]

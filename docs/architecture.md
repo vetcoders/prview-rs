@@ -602,25 +602,44 @@ before spawn. A missing target entry may use the operator checkout only as a
 borrow candidate. Execution never falls back to a package-manager launcher.
 
 The finished-snapshot resolver follows the invocation path to its canonical
-filesystem identity. It also follows recognized npm/pnpm/yarn wrapper payloads:
-`$basedir`-relative paths, relative JS wrapper literals, and effective
-`NODE_PATH` roots. Consequently the provenance describes the bytes the wrapper
-executes, not only the wrapper file. The snapshot builder records every link it
-creates in a sidecar outside the reviewed tree. Sidecar entries are compared by
-canonical filesystem identity rather than byte-exact spelling, and any final
-payload outside the canonical snapshot root is borrowed even when a tracked
-absolute symlink led there. A recognized package wrapper can resolve plugins,
-types, or transitive modules dynamically, so any prview-created entry in its
-`node_modules` is conservatively part of that command's substrate; this closes
-the gap where the wrapper and first payload are target-owned but a transitive
-dependency is borrowed.
+filesystem identity. The publication rule is intentionally asymmetric:
+`Snapshot` is allowed only when the complete statically visible executable
+closure is proved target-owned. Any unresolved identity, path outside the
+canonical snapshot root, case-ambiguous creator identity, unreadable or
+oversized executable whose bounded kind cannot be proved, or unrecognized
+script grammar publishes `SnapshotBorrowedDeps`. A false borrowed alarm is
+acceptable; certifying
+ambient or host-local executable bytes as `Snapshot` is not.
+
+The proof boundary has two structural sources. A symlink is resolved by
+canonical filesystem identity. A bounded regular executable is either a
+native/direct file with no script indirection, or a wrapper matching an
+anchored known shim grammar. On Unix, the recognized content wrapper is the
+strict pnpm shell skeleton: a shell shebang, the canonical
+`basedir=$(dirname "$0")` assignment, and
+`exec node "$basedir/<payload>" "$@"`. npm/yarn's ordinary Unix symlink shape is
+covered by canonical symlink resolution. Comments, string literals, dead code,
+and the mere occurrence of `require(`, `import(`, `NODE_PATH=`, or a path
+fragment are never wrapper evidence. Any other executable script is
+conservative-borrowed rather than guessed from substrings.
+
+For a recognized wrapper, the resolver follows its `$basedir` payload. The
+snapshot builder records every link it creates in a sidecar outside the reviewed
+tree. Sidecar entries are compared by canonical filesystem identity rather than
+byte-exact spelling, and any final payload outside the canonical snapshot root
+is borrowed even when a tracked absolute symlink led there. A recognized
+package wrapper can resolve plugins, types, or transitive modules dynamically,
+so any prview-created entry in its `node_modules` is conservatively part of that
+command's substrate. Only a proved-direct shell script (the intentionally small
+grammar of terminal shell builtins used by direct launchers) can remain
+`Snapshot` without wrapper-payload traversal.
 
 The entry/creator matrix is:
 
 | `.bin/<tool>` entry | Target-owned | Prview-created | Ambient/untracked only |
 |---|---|---|---|
 | missing | ineligible unless a borrow candidate can be exposed | link creation failure aborts the snapshot | never executed directly; becomes prview-created when borrowed |
-| runnable file | `Snapshot`, unless a shim payload is borrowed | `SnapshotBorrowedDeps` | same borrow rule |
+| executable regular file | `Snapshot` only with proved target-owned closure; otherwise `SnapshotBorrowedDeps` | `SnapshotBorrowedDeps` | same borrow rule |
 | directory | explicit pre-spawn failure | not a valid created tool | not a borrow candidate |
 | relative symlink | `Snapshot` when the final payload stays in-tree; borrowed when it crosses a created link | `SnapshotBorrowedDeps` | same borrow rule |
 | absolute symlink | `SnapshotBorrowedDeps` when it resolves outside the snapshot; explicit pre-spawn failure when broken | `SnapshotBorrowedDeps` | same borrow rule |
@@ -631,17 +650,40 @@ The executable/layout matrix composes with every row above:
 
 | Executable | Flat `node_modules` | `.pnpm` store | Nested `node_modules` |
 |---|---|---|---|
-| direct binary/script | invocation bytes only | invocation bytes only | invocation bytes only |
-| npm shim | follow the package payload and dynamic `node_modules` dependencies | follow package links into the store | follow the wrapper-relative nested payload and dependencies |
-| pnpm shell shim | follow `$basedir/../<package>`, `NODE_PATH`, and dynamic dependencies | follow sibling links into `.pnpm` plus `NODE_PATH` | follow wrapper-relative nested payloads plus `NODE_PATH` |
-| yarn shim | follow the Unix symlink or wrapper payload and dynamic dependencies | follow any store link | follow the wrapper-relative nested payload and dependencies |
+| native binary / proved-direct shell script | invocation bytes only | invocation bytes only | invocation bytes only |
+| npm shim | canonical Unix symlink target or conservative-borrowed script | follow package links into the store | follow the canonical target or classify as borrowed |
+| strict pnpm shell shim | follow the anchored `$basedir/<payload>` grammar and dynamic `node_modules` dependencies | follow sibling links into `.pnpm`; any created dependency makes the closure borrowed | follow the wrapper-relative nested payload; any unresolved grammar is borrowed |
+| yarn shim | canonical Unix symlink target or conservative-borrowed script | follow any store link | follow the canonical target or classify as borrowed |
+
+Unix permissions are an independent, final-resolution axis. The earlier
+entry/creator (28 logical cells) and executable/layout (12 cells) axes therefore
+compose with two permission states: **28 × 12 × 2 = 672 logical cells**.
+
+| Permission at the resolved file | Target-owned identity | Prview-created / external identity | Result |
+|---|---|---|---|
+| executable (`mode & 0o111 != 0`) | apply the closure-proof rule above | `SnapshotBorrowedDeps` | spawn only after proof/classification |
+| non-executable (`mode & 0o111 == 0`) | `Snapshot` provenance for the unexecuted target tree | borrowed provenance when resolution crossed a created/external identity | explicit pre-spawn `ERROR`; the OS is never asked to spawn it |
+
+Thus every one of the 336 non-executable cells terminates before spawn. Every
+executable cell applies the same asymmetric closure rule: proved target-only is
+`Snapshot`; created, external, case-ambiguous, unreadable, oversized, or
+unrecognized-script closure is `SnapshotBorrowedDeps`. The three cells missed
+at `4bd02645` are pinned by regression tests: alternate-variable wrapper
+(`exact_eslint_unrecognized_wrapper_is_conservatively_borrowed`), wrapper text
+in a comment (`exact_eslint_direct_script_ignores_wrapper_text_in_comments`),
+and mode `100644` (`exact_eslint_non_executable_file_fails_before_spawn`).
 
 Target entries always win collisions: prview never overwrites them. Missing
-top-level packages and tools may be linked around them, and provenance becomes
-`SnapshotBorrowedDeps` only when the resolved invocation or wrapper payload
-actually consumes those links or another host-local path. A plain target-owned
-shell script does not become borrowed merely because unrelated ambient packages
-were exposed elsewhere in `node_modules`.
+top-level packages and tools may be linked around them. A proved-direct
+target-owned shell script does not become borrowed merely because unrelated
+ambient packages were exposed elsewhere in `node_modules`; an unrecognized
+script does, because its closure is not proved.
+
+This remains a static proof, not a syscall trace. A proved-direct target script
+can read a runtime path without syntactic indirection that the classifier can
+see. That residual limitation is accepted here; expanding the direct grammar
+requires a new regression and cannot weaken the rule that an unknown wrapper is
+borrowed.
 
 A failed required link aborts snapshot creation instead of leaving eligibility
 and execution on different toolchains. Non-Unix exact-target JS checks may run a
