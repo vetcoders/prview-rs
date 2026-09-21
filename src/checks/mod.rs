@@ -2241,7 +2241,11 @@ pub async fn run_js_command_with_timeout(
 /// cannot be executed (PR #12 review #15/#17).
 pub fn local_js_bin(tool: &str, cwd: &Path) -> Option<std::path::PathBuf> {
     let bin = cwd.join("node_modules/.bin").join(tool);
-    bin.exists().then_some(bin)
+    let metadata = std::fs::metadata(&bin).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some(bin)
 }
 
 /// Check if a JS tool is available in node_modules
@@ -2257,21 +2261,22 @@ pub fn js_tool_available(tool: &str, cwd: &Path) -> bool {
 /// the same concrete `node_modules/.bin/<tool>` path and fails before spawn if
 /// that path disappears.
 pub(crate) fn js_tool_unavailable_reason(tool: &str, config: &Config) -> Option<String> {
-    let available_in_target = match review_substrate(config) {
-        Ok(ReviewSubstrate::ExactTarget(target)) => {
-            crate::git::commit_path_exists_following_symlinks(
+    let candidate_in_target = match review_substrate(config) {
+        Ok(ReviewSubstrate::ExactTarget(target)) => !matches!(
+            crate::git::commit_path_resolution(
                 &config.repo_root,
                 &target.commit_id,
                 &js_tool_relative_path(tool),
-            )
-        }
+            ),
+            crate::git::CommitPathResolution::Missing
+        ),
         Ok(ReviewSubstrate::Ambient) | Err(_) => false,
     };
     js_tool_unavailable_reason_with(
         tool,
         config,
         js_tool_available(tool, &config.repo_root),
-        available_in_target,
+        candidate_in_target,
         cfg!(unix),
     )
 }
@@ -2284,7 +2289,7 @@ fn js_tool_unavailable_reason_with(
     tool: &str,
     config: &Config,
     available_in_operator_checkout: bool,
-    available_in_target: bool,
+    candidate_in_target: bool,
     snapshot_dependency_links_supported: bool,
 ) -> Option<String> {
     match review_substrate(config) {
@@ -2292,7 +2297,7 @@ fn js_tool_unavailable_reason_with(
         Ok(ReviewSubstrate::Ambient) => Some(format!(
             "tool not installed (node_modules/.bin/{tool} is missing)"
         )),
-        Ok(ReviewSubstrate::ExactTarget(_)) if available_in_target => None,
+        Ok(ReviewSubstrate::ExactTarget(_)) if candidate_in_target => None,
         Ok(ReviewSubstrate::ExactTarget(_)) if !available_in_operator_checkout => Some(format!(
             "tool not installed in reviewed target or operator checkout (node_modules/.bin/{tool} is missing)"
         )),
@@ -2441,6 +2446,47 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let sha = init_repo_with_one_commit(tmp.path());
         (tmp, sha)
+    }
+
+    fn commit_fixture(root: &Path, message: &str, paths: &[&str]) -> String {
+        use crate::git::cmd::git_cmd;
+
+        let run_git = |args: &[&str]| {
+            let output = git_cmd()
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        let mut add = vec!["add", "-f"];
+        add.extend_from_slice(paths);
+        run_git(&add);
+        run_git(&["commit", "-q", "-m", message]);
+        let output = git_cmd()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .expect("rev-parse");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("utf8 commit id")
+            .trim()
+            .to_string()
+    }
+
+    fn exact_js_config(root: &Path, target: &str) -> Config {
+        let mut config = test_config();
+        config.profile = crate::config::test_js_profile(false);
+        config.repo_root = root.to_path_buf();
+        config.target = Some(target.to_string());
+        config.pinned_target = Some(crate::git::ResolvedRef {
+            name: target.to_string(),
+            commit_id: target.to_string(),
+            is_remote: false,
+        });
+        config.run_lint = true;
+        config
     }
 
     fn init_repo_with_one_commit(root: &Path) -> String {
@@ -4540,6 +4586,260 @@ test result: ok. 2 passed; 0 failed
             provenance.tree_state,
             Some(TreeState::SnapshotBorrowedDeps),
             "target-owned symlink shape must not impersonate a prview-created borrow",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_target_owned_pnpm_shim_reports_borrowed_payload() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let shim = bin_dir.join("eslint");
+        std::fs::write(
+            &shim,
+            b"#!/bin/sh\nbasedir=$(dirname \"$0\")\nexec node \"$basedir/../eslint/bin/eslint.js\" \"$@\"\n",
+        )
+        .expect("pnpm-style shim");
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).expect("executable shim");
+        let target = commit_fixture(
+            root,
+            "target owns pnpm shim",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let payload_dir = root.join("node_modules/eslint/bin");
+        std::fs::create_dir_all(&payload_dir).expect("ambient eslint package");
+        std::fs::write(
+            payload_dir.join("eslint.js"),
+            "console.log('PNPM_BORROWED_PAYLOAD_RAN')\n",
+        )
+        .expect("ambient eslint payload");
+
+        let config = exact_js_config(root, &target);
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let result = check.run(&config).await.expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("PNPM_BORROWED_PAYLOAD_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "the shim's executed sibling payload is prview-borrowed",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_target_wrapper_reports_borrowed_transitive_dependency() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        let payload_dir = root.join("node_modules/eslint/bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::create_dir_all(&payload_dir).expect("target eslint package");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let shim = bin_dir.join("eslint");
+        std::fs::write(
+            &shim,
+            b"#!/bin/sh\nbasedir=$(dirname \"$0\")\nexec node \"$basedir/../eslint/bin/eslint.js\" \"$@\"\n",
+        )
+        .expect("pnpm-style shim");
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).expect("executable shim");
+        std::fs::write(
+            payload_dir.join("eslint.js"),
+            "require('helper'); console.log('TARGET_PAYLOAD_RAN')\n",
+        )
+        .expect("target eslint payload");
+        let target = commit_fixture(
+            root,
+            "target owns wrapper and payload",
+            &[
+                "package.json",
+                "node_modules/.bin/eslint",
+                "node_modules/eslint/bin/eslint.js",
+            ],
+        );
+
+        let helper_dir = root.join("node_modules/helper");
+        std::fs::create_dir_all(&helper_dir).expect("ambient helper package");
+        std::fs::write(
+            helper_dir.join("index.js"),
+            "console.log('BORROWED_TRANSITIVE_DEP_RAN')\n",
+        )
+        .expect("ambient helper payload");
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("BORROWED_TRANSITIVE_DEP_RAN"));
+        assert!(result.output.contains("TARGET_PAYLOAD_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "a target wrapper can dynamically load a prview-borrowed transitive package",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_absolute_target_symlink_reports_external_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let external = tempfile::tempdir().expect("external tool dir");
+        let external_tool = external.path().join("eslint");
+        std::fs::write(
+            &external_tool,
+            b"#!/bin/sh\nprintf 'ABSOLUTE_EXTERNAL_ESLINT_RAN\\n'\n",
+        )
+        .expect("external eslint");
+        let mut permissions = std::fs::metadata(&external_tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&external_tool, permissions).expect("external executable");
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let node_modules = root.join("node_modules");
+        std::fs::create_dir(&node_modules).expect("target node_modules");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        std::os::unix::fs::symlink(external.path(), node_modules.join(".bin"))
+            .expect("absolute target bin symlink");
+        let target = commit_fixture(
+            root,
+            "target owns absolute bin symlink",
+            &["package.json", "node_modules/.bin"],
+        );
+
+        let config = exact_js_config(root, &target);
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let result = check.run(&config).await.expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("ABSOLUTE_EXTERNAL_ESLINT_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "host-local bytes behind a target-owned absolute symlink are not an exact snapshot",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn exact_eslint_casefolded_prview_link_reports_borrowed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let external = tempfile::tempdir().expect("external tool dir");
+        let external_tool = external.path().join("eslint");
+        std::fs::write(
+            &external_tool,
+            b"#!/bin/sh\nprintf 'CASEFOLD_BORROWED_ESLINT_RAN\\n'\n",
+        )
+        .expect("external eslint");
+        let mut permissions = std::fs::metadata(&external_tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&external_tool, permissions).expect("external executable");
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        std::fs::write(bin_dir.join("target-tool"), "target-owned\n").expect("target tool");
+        let target = commit_fixture(
+            root,
+            "target owns partial bin",
+            &["package.json", "node_modules/.bin/target-tool"],
+        );
+        std::os::unix::fs::symlink(&external_tool, bin_dir.join("ESLint"))
+            .expect("case-variant ambient eslint");
+        assert!(
+            bin_dir.join("eslint").is_file(),
+            "this regression requires the case-insensitive APFS lookup exercised in F03",
+        );
+
+        let config = exact_js_config(root, &target);
+        let check = typescript::ESLintCheck;
+        assert!(matches!(
+            check.check_eligibility(&config),
+            CheckEligibility::Run
+        ));
+        let result = check.run(&config).await.expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(result.output.contains("CASEFOLD_BORROWED_ESLINT_RAN"));
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "case-folded lookup must retain creator provenance",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+    }
+
+    #[tokio::test]
+    async fn exact_eslint_directory_entry_fails_before_spawn() {
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let directory = root.join("node_modules/.bin/eslint");
+        std::fs::create_dir_all(&directory).expect("directory-shaped tool entry");
+        std::fs::write(directory.join("not-an-executable"), "fixture\n").expect("fixture");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let target = commit_fixture(
+            root,
+            "target owns directory-shaped tool",
+            &["package.json", "node_modules/.bin/eslint/not-an-executable"],
+        );
+
+        let config = exact_js_config(root, &target);
+        let eligibility = typescript::ESLintCheck.check_eligibility(&config);
+        assert!(
+            matches!(eligibility, CheckEligibility::Run),
+            "the target-owned entry is admitted for final snapshot resolution: {eligibility:?}",
+        );
+        assert!(!js_tool_available("eslint", root));
+        assert!(local_js_bin("eslint", root).is_none());
+        let error = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect_err("a directory-shaped tool must fail before spawn");
+        assert!(
+            error
+                .to_string()
+                .contains("resolved JS tool disappeared before spawn"),
+            "unexpected pre-spawn error: {error:#}",
         );
     }
 

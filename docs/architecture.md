@@ -593,25 +593,55 @@ inside it instead. If the target also owns `.bin` as a directory, missing tool
 entries are linked inside that directory as well; sibling packages are still
 linked at the top level because npm/pnpm shims commonly resolve `../<package>`.
 
-JS eligibility, execution, and provenance share the concrete resolved path
-`node_modules/.bin/<tool>`. Exact eligibility checks the target commit first,
-following target-owned relative symlinks, and consults the operator checkout
-only for a borrow candidate. The snapshot builder records every link it creates
-in a sidecar outside the reviewed tree. `SnapshotBorrowedDeps` is emitted only
-when resolving that concrete tool path crosses one of those recorded links —
-never merely because `node_modules` or `.bin` happens to be a symlink. Therefore:
+JS eligibility, execution, and provenance use one resolution model rooted at
+`node_modules/.bin/<tool>`. Exact preflight classifies the target entry as
+missing, runnable, or present-but-unresolved. The last class is admitted only so
+the finished snapshot can resolve absolute/case-sensitive filesystem semantics;
+a directory, broken link, or vanished target is rejected
+before spawn. A missing target entry may use the operator checkout only as a
+borrow candidate. Execution never falls back to a package-manager launcher.
 
-- no target `node_modules`: the whole dependency tree is borrowed;
-- target `node_modules` without `.bin`: missing top-level entries, including
-  `.bin` and shim siblings, are borrowed;
-- target `.bin` directory without the requested tool: the missing tool plus
-  required siblings are borrowed, while target entries keep precedence;
-- target-owned `.bin/<tool>` (a file or a symlink resolving to target bytes):
-  the target tool executes and provenance remains `Snapshot`;
-- target-owned `.bin` symlink that does not resolve the requested tool is not
-  mutated through the symlink; if no resolved tool exists in the finished
-  snapshot, the check fails loudly before spawn instead of publishing a package
-  manager's `Command not found` as a gate result.
+The finished-snapshot resolver follows the invocation path to its canonical
+filesystem identity. It also follows recognized npm/pnpm/yarn wrapper payloads:
+`$basedir`-relative paths, relative JS wrapper literals, and effective
+`NODE_PATH` roots. Consequently the provenance describes the bytes the wrapper
+executes, not only the wrapper file. The snapshot builder records every link it
+creates in a sidecar outside the reviewed tree. Sidecar entries are compared by
+canonical filesystem identity rather than byte-exact spelling, and any final
+payload outside the canonical snapshot root is borrowed even when a tracked
+absolute symlink led there. A recognized package wrapper can resolve plugins,
+types, or transitive modules dynamically, so any prview-created entry in its
+`node_modules` is conservatively part of that command's substrate; this closes
+the gap where the wrapper and first payload are target-owned but a transitive
+dependency is borrowed.
+
+The entry/creator matrix is:
+
+| `.bin/<tool>` entry | Target-owned | Prview-created | Ambient/untracked only |
+|---|---|---|---|
+| missing | ineligible unless a borrow candidate can be exposed | link creation failure aborts the snapshot | never executed directly; becomes prview-created when borrowed |
+| runnable file | `Snapshot`, unless a shim payload is borrowed | `SnapshotBorrowedDeps` | same borrow rule |
+| directory | explicit pre-spawn failure | not a valid created tool | not a borrow candidate |
+| relative symlink | `Snapshot` when the final payload stays in-tree; borrowed when it crosses a created link | `SnapshotBorrowedDeps` | same borrow rule |
+| absolute symlink | `SnapshotBorrowedDeps` when it resolves outside the snapshot; explicit pre-spawn failure when broken | `SnapshotBorrowedDeps` | same borrow rule |
+| broken symlink | explicit pre-spawn failure | explicit pre-spawn failure after a source race | not executable |
+| case variant | on case-insensitive filesystems, classify the actual target/creator identity; on case-sensitive filesystems the differently-cased name is missing | same, with `SnapshotBorrowedDeps` on a case-folded created link | same borrow rule |
+
+The executable/layout matrix composes with every row above:
+
+| Executable | Flat `node_modules` | `.pnpm` store | Nested `node_modules` |
+|---|---|---|---|
+| direct binary/script | invocation bytes only | invocation bytes only | invocation bytes only |
+| npm shim | follow the package payload and dynamic `node_modules` dependencies | follow package links into the store | follow the wrapper-relative nested payload and dependencies |
+| pnpm shell shim | follow `$basedir/../<package>`, `NODE_PATH`, and dynamic dependencies | follow sibling links into `.pnpm` plus `NODE_PATH` | follow wrapper-relative nested payloads plus `NODE_PATH` |
+| yarn shim | follow the Unix symlink or wrapper payload and dynamic dependencies | follow any store link | follow the wrapper-relative nested payload and dependencies |
+
+Target entries always win collisions: prview never overwrites them. Missing
+top-level packages and tools may be linked around them, and provenance becomes
+`SnapshotBorrowedDeps` only when the resolved invocation or wrapper payload
+actually consumes those links or another host-local path. A plain target-owned
+shell script does not become borrowed merely because unrelated ambient packages
+were exposed elsewhere in `node_modules`.
 
 A failed required link aborts snapshot creation instead of leaving eligibility
 and execution on different toolchains. Non-Unix exact-target JS checks may run a

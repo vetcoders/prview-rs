@@ -13,8 +13,8 @@ pub use snapshot::AnalysisSnapshot;
 pub(crate) use snapshot::override_test_tar_program;
 
 mod worktree;
+pub(crate) use worktree::{CommitPathResolution, commit_path_resolution, path_uses_prview_borrow};
 pub use worktree::{WorktreeSnapshot, create_worktree_snapshot};
-pub(crate) use worktree::{commit_path_exists_following_symlinks, path_uses_prview_borrow};
 
 use crate::Config;
 use anyhow::{Context, Result};

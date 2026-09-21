@@ -15,59 +15,84 @@ const BORROWED_LINKS_MANIFEST: &str = ".prview-borrowed-links";
 
 const MAX_SYMLINK_RESOLUTIONS: usize = 40;
 
-/// Whether `relative_path` exists in `commit`, following repository-relative
-/// symlinks the way a checked-out filesystem would.
+#[cfg(unix)]
+const MAX_JS_SHIM_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitPathResolution {
+    Missing,
+    Runnable,
+    /// The target owns the requested entry or a symlink prefix, but Git alone
+    /// cannot prove a runnable final file. The finished snapshot must resolve
+    /// it and fail before spawn when it remains a directory/broken/non-file.
+    Unresolved,
+}
+
+/// Classify `relative_path` in `commit`, following repository-relative
+/// symlinks as far as the Git tree can prove.
 ///
 /// `git2::Tree::get_path` deliberately does not traverse a blob stored with
 /// mode `120000`, so a target-owned `.bin -> bin-owned` needs this small
 /// resolver before eligibility can truthfully say whether the target contains
-/// `node_modules/.bin/<tool>`.
-pub(crate) fn commit_path_exists_following_symlinks(
+/// `node_modules/.bin/<tool>`. An absolute target-owned symlink is an existing
+/// tool candidate too, but its final host path cannot be resolved from the Git
+/// tree; admit it here and let the finished-snapshot resolver either reject a
+/// missing/non-file target or classify the external bytes as borrowed.
+pub(crate) fn commit_path_resolution(
     repo_root: &Path,
     commit: &str,
     relative_path: &Path,
-) -> bool {
+) -> CommitPathResolution {
     let Ok(repo) = git2::Repository::discover(repo_root) else {
-        return false;
+        return CommitPathResolution::Unresolved;
     };
     let Ok(commit) = repo
         .revparse_single(commit)
         .and_then(|object| object.peel_to_commit())
     else {
-        return false;
+        return CommitPathResolution::Unresolved;
     };
     let Ok(tree) = commit.tree() else {
-        return false;
+        return CommitPathResolution::Unresolved;
     };
     let Some(mut pending) = relative_components(relative_path) else {
-        return false;
+        return CommitPathResolution::Unresolved;
     };
     let mut resolved = PathBuf::new();
+    let mut followed_symlink = false;
 
     for _ in 0..MAX_SYMLINK_RESOLUTIONS {
         let Some(component) = pending.pop_front() else {
-            return false;
+            return CommitPathResolution::Unresolved;
         };
         resolved.push(component);
         let Ok(entry) = tree.get_path(&resolved) else {
-            return false;
+            return if followed_symlink {
+                CommitPathResolution::Unresolved
+            } else {
+                CommitPathResolution::Missing
+            };
         };
 
         if entry.filemode() == 0o120000 {
+            followed_symlink = true;
             let Ok(object) = entry.to_object(&repo) else {
-                return false;
+                return CommitPathResolution::Unresolved;
             };
             let Some(blob) = object.as_blob() else {
-                return false;
+                return CommitPathResolution::Unresolved;
             };
             let Ok(target) = std::str::from_utf8(blob.content()) else {
-                return false;
+                return CommitPathResolution::Unresolved;
             };
+            if Path::new(target).is_absolute() {
+                return CommitPathResolution::Runnable;
+            }
             let Some(next) = resolved_symlink_path(&resolved, Path::new(target), &pending) else {
-                return false;
+                return CommitPathResolution::Unresolved;
             };
             let Some(next_components) = relative_components(&next) else {
-                return false;
+                return CommitPathResolution::Unresolved;
             };
             resolved.clear();
             pending = next_components;
@@ -75,14 +100,18 @@ pub(crate) fn commit_path_exists_following_symlinks(
         }
 
         if pending.is_empty() {
-            return entry.kind() == Some(git2::ObjectType::Blob);
+            return if entry.kind() == Some(git2::ObjectType::Blob) {
+                CommitPathResolution::Runnable
+            } else {
+                CommitPathResolution::Unresolved
+            };
         }
         if entry.kind() != Some(git2::ObjectType::Tree) {
-            return false;
+            return CommitPathResolution::Unresolved;
         }
     }
 
-    false
+    CommitPathResolution::Unresolved
 }
 
 fn relative_components(path: &Path) -> Option<VecDeque<std::ffi::OsString>> {
@@ -117,64 +146,161 @@ fn resolved_symlink_path(
     Some(normalized.into_iter().collect())
 }
 
-/// True only when resolving `relative_path` in this snapshot crosses a symlink
-/// recorded by this snapshot builder.
+/// True only when resolving `relative_path` in this snapshot consumes bytes
+/// outside the snapshot tree.
 ///
 /// The manifest lives beside the worktree, inside the same temporary directory,
 /// so target-owned files cannot forge or collide with it and it disappears with
-/// the snapshot. Merely being a symlink is intentionally insufficient evidence:
-/// target commits may own symlinked `.bin` directories themselves.
+/// the snapshot. Its paths identify links created by prview, but comparison is
+/// made through canonical filesystem identity rather than byte-exact spelling:
+/// on a case-insensitive filesystem `ESLint` and `eslint` may name the same
+/// created link. Canonical resolution also exposes target-owned absolute
+/// symlinks that escape the snapshot.
+///
+/// A real npm/pnpm/yarn wrapper is not the final payload. Known wrapper-relative
+/// paths (`$basedir/../...`, JS `require("../...")`) and effective `NODE_PATH`
+/// roots are included in the resolution, so a target-owned shim that executes a
+/// borrowed sibling package is still reported as borrowed. Plain target-owned
+/// scripts with no wrapper indirection remain target bytes.
 #[cfg(unix)]
 pub(crate) fn path_uses_prview_borrow(snapshot_root: &Path, relative_path: &Path) -> bool {
     let Some(parent) = snapshot_root.parent() else {
         return false;
     };
-    let Ok(encoded) = std::fs::read(parent.join(BORROWED_LINKS_MANIFEST)) else {
-        return false;
-    };
+    let encoded = std::fs::read(parent.join(BORROWED_LINKS_MANIFEST)).unwrap_or_default();
     use std::os::unix::ffi::OsStringExt as _;
-    let borrowed: std::collections::HashSet<PathBuf> = encoded
+    let borrowed: Vec<PathBuf> = encoded
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
         .map(|path| PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
         .collect();
-    if borrowed.iter().any(|path| path.starts_with(relative_path)) {
+    if borrowed
+        .iter()
+        .any(|created| relative_path.starts_with(created) || created.starts_with(relative_path))
+    {
         return true;
     }
-    let Some(mut pending) = relative_components(relative_path) else {
+    let consumed = consumed_paths(snapshot_root, relative_path);
+    if consumed.package_wrapper
+        && borrowed.iter().any(|created| {
+            created.starts_with("node_modules") || Path::new("node_modules").starts_with(created)
+        })
+    {
+        return true;
+    }
+    consumed
+        .paths
+        .iter()
+        .any(|path| path_is_external_or_borrowed(snapshot_root, path, borrowed.as_slice()))
+}
+
+#[cfg(unix)]
+fn path_is_external_or_borrowed(snapshot_root: &Path, path: &Path, borrowed: &[PathBuf]) -> bool {
+    let Ok(snapshot_identity) = std::fs::canonicalize(snapshot_root) else {
         return false;
     };
-    let mut resolved = PathBuf::new();
+    let Ok(path_identity) = std::fs::canonicalize(path) else {
+        return false;
+    };
 
-    for _ in 0..MAX_SYMLINK_RESOLUTIONS {
-        let Some(component) = pending.pop_front() else {
-            return false;
-        };
-        resolved.push(component);
-        if borrowed.contains(&resolved) {
-            return true;
-        }
+    if !path_identity.starts_with(&snapshot_identity) {
+        return true;
+    }
 
-        let path = snapshot_root.join(&resolved);
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            return false;
+    borrowed.iter().any(|relative| {
+        std::fs::canonicalize(snapshot_root.join(relative))
+            .is_ok_and(|identity| path_identity.starts_with(identity))
+    })
+}
+
+#[cfg(unix)]
+struct ConsumedPaths {
+    paths: Vec<PathBuf>,
+    package_wrapper: bool,
+}
+
+#[cfg(unix)]
+fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
+    let invocation = snapshot_root.join(relative_path);
+    let mut consumed = vec![invocation.clone()];
+    let Ok(metadata) = std::fs::metadata(&invocation) else {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
         };
-        if metadata.file_type().is_symlink() {
-            let Ok(target) = std::fs::read_link(path) else {
-                return false;
-            };
-            let Some(next) = resolved_symlink_path(&resolved, &target, &pending) else {
-                return false;
-            };
-            let Some(next_components) = relative_components(&next) else {
-                return false;
-            };
-            resolved.clear();
-            pending = next_components;
+    };
+    if !metadata.is_file() || metadata.len() > MAX_JS_SHIM_BYTES {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+        };
+    }
+    let Ok(bytes) = std::fs::read(&invocation) else {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+        };
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+        };
+    };
+    let Some(bin_dir) = invocation.parent() else {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+        };
+    };
+
+    let package_wrapper = text.contains("NODE_PATH=")
+        || (text.contains("$basedir/") && text.contains("node"))
+        || text.contains("require(")
+        || text.contains("import(");
+
+    let basedir = regex::Regex::new(r#"\$basedir/([^\"'\s;|&)]+)"#).expect("static basedir regex");
+    for capture in basedir.captures_iter(text) {
+        let Some(relative) = capture.get(1) else {
+            continue;
+        };
+        let candidate = bin_dir.join(relative.as_str());
+        if candidate.exists() {
+            consumed.push(candidate);
         }
     }
 
-    false
+    let relative_literal =
+        regex::Regex::new(r#"[\"'](\.\.?/[^\"'\s]+)[\"']"#).expect("static wrapper-relative regex");
+    for capture in relative_literal.captures_iter(text) {
+        let Some(relative) = capture.get(1) else {
+            continue;
+        };
+        let candidate = bin_dir.join(relative.as_str());
+        if candidate.exists() {
+            consumed.push(candidate);
+        }
+    }
+
+    let node_path = regex::Regex::new(r#"(?m)(?:export\s+)?NODE_PATH=\"([^\"]+)\""#)
+        .expect("static NODE_PATH regex");
+    for capture in node_path.captures_iter(text) {
+        let Some(paths) = capture.get(1) else {
+            continue;
+        };
+        for path in std::env::split_paths(paths.as_str()) {
+            if path.exists() {
+                consumed.push(path);
+            }
+        }
+    }
+
+    consumed.sort();
+    consumed.dedup();
+    ConsumedPaths {
+        paths: consumed,
+        package_wrapper,
+    }
 }
 
 #[cfg(not(unix))]
