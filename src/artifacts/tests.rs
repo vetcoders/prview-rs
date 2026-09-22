@@ -38,6 +38,16 @@ fn generate_fixture_pack_with_ledger(
 struct FixturePackOptions<'a> {
     diffs: &'a [Diff],
     worktree_head: FixtureWorktreeHead<'a>,
+    /// Executed checks the pack must judge. Empty is the historical shape: a
+    /// pack whose verdict rests on structure alone.
+    checks: &'a [CheckResult],
+    /// The operator worktree's dirty paths, frozen before the checks (R4-19).
+    /// `Some(empty)` — a clean tree — is the default so existing fixtures keep
+    /// their meaning.
+    worktree_dirty_paths: Option<std::collections::BTreeSet<String>>,
+    /// `None` keeps the builder's default (`warn`). A fixture that needs a
+    /// failing check to actually hold the merge says so here.
+    policy_mode: Option<crate::policy::PolicyMode>,
 }
 
 /// What a fixture pack captured about the operator checkout. The default is the
@@ -79,6 +89,10 @@ fn generate_fixture_pack_with_ledger_and_diffs(
     config.create_dashboard = true;
     config.quiet = true;
     config.output_dir = Some(output_dir.to_path_buf());
+    if let Some(mode) = options.policy_mode {
+        config.policy.mode = mode;
+    }
+    let fixture_dirty_paths = options.worktree_dirty_paths.clone().unwrap_or_default();
 
     let resolved_target = ResolvedRef {
         name: "feature".to_string(),
@@ -96,14 +110,19 @@ fn generate_fixture_pack_with_ledger_and_diffs(
         ledger,
         scope: None,
         diffs: options.diffs,
-        checks: &[],
+        checks: options.checks,
         heuristics: None,
         resolved_target: &resolved_target,
         resolved_bases: &resolved_bases,
         run_start: Instant::now(),
         skipped_checks: Vec::new(),
-        worktree_clean: Some(true),
+        // One status read, two derived facts — exactly as
+        // `capture_worktree_provenance` produces them. Deriving cleanliness
+        // from the path set keeps a fixture from claiming a clean tree beside a
+        // list of dirty files.
+        worktree_clean: Some(fixture_dirty_paths.is_empty()),
         worktree_status_digest: None,
+        worktree_dirty_paths: Some(fixture_dirty_paths),
         worktree_head_sha: match options.worktree_head {
             FixtureWorktreeHead::IsTarget => Some(target_sha.to_owned()),
             FixtureWorktreeHead::Sha(sha) => Some(sha.to_owned()),
@@ -1724,6 +1743,7 @@ fn merge_gate_blocks_failed_cargo_audit_in_warn_mode_when_severity_is_block() {
         provenance: None,
     }];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -1804,6 +1824,7 @@ fn merge_gate_executed_cargo_check_carries_real_evidence_and_log() {
         provenance: None,
     }];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -2908,6 +2929,7 @@ fn synthetic_heuristics_check_skips_zero_file_scan() {
 fn merge_gate_marks_heuristics_disabled_as_not_run() {
     let config = create_test_config(PolicyConfig::default());
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -2975,6 +2997,7 @@ fn merge_gate_marks_heuristics_disabled_as_not_run() {
 fn merge_gate_files_field_omits_inline_findings_path_when_no_findings() {
     let config = create_test_config(PolicyConfig::default());
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3032,6 +3055,7 @@ fn merge_gate_files_field_omits_inline_findings_path_when_no_findings() {
 fn merge_gate_includes_inline_findings_path_when_sarif_exists() {
     let config = create_test_config(PolicyConfig::default());
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 1,
         dashboard_findings: vec![],
@@ -3101,6 +3125,7 @@ fn merge_gate_surfaces_review_caveats_when_merge_needs_review() {
         },
     ];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 1,
         dashboard_findings: vec![DashboardFinding {
@@ -3219,6 +3244,7 @@ fn merge_gate_splits_introduced_and_preexisting_inline_findings() {
         in_diff: Some(in_diff),
     };
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 5,
         dashboard_findings: vec![mk(true), mk(false), mk(false), mk(false), mk(false)],
@@ -3406,6 +3432,7 @@ fn merge_gate_reason_mentions_preexisting_failures_under_merge_with_review() {
         provenance: None,
     }];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 1,
         dashboard_findings: vec![DashboardFinding {
@@ -3484,6 +3511,7 @@ fn merge_gate_marks_skipped_rust_quality_signals_as_review_caveats() {
     let config = create_test_config(PolicyConfig::default());
 
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3558,6 +3586,7 @@ fn merge_gate_surfaces_skipped_cargo_geiger_when_security_was_requested() {
     config.run_security = true;
 
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3627,6 +3656,7 @@ fn merge_gate_surfaces_runtime_skipped_cargo_geiger() {
         config.run_security = true;
 
         let inline = InlineFindingsSummary {
+            cargo_audit: None,
             status: "passed".to_string(),
             findings_count: 0,
             dashboard_findings: vec![],
@@ -3704,6 +3734,7 @@ fn merge_gate_surfaces_cargo_audit_informational_warnings_as_review_caveat() {
             provenance: None,
         }];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3810,6 +3841,7 @@ fn merge_gate_names_the_origin_of_every_quality_failure_entry() {
         },
     ];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3893,6 +3925,7 @@ fn merge_gate_does_not_fail_fast_remote_only_for_expected_rust_gaps() {
     config.remote_only = true;
 
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -3964,6 +3997,7 @@ fn merge_gate_blocks_missing_rust_quality_signal_when_policy_sets_block() {
     let config = create_test_config(policy);
 
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -4032,6 +4066,7 @@ fn merge_gate_skipped_cargo_geiger_with_ignore_severity_produces_no_caveat() {
     let config = create_test_config(policy);
     let tmp = tempfile::tempdir().expect("tempdir");
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 0,
         dashboard_findings: vec![],
@@ -6265,6 +6300,7 @@ fn preexisting_failures_do_not_block_gate() {
     ];
     // All findings are outside the diff
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 2,
         dashboard_findings: vec![
@@ -6385,6 +6421,7 @@ fn introduced_failures_still_block_gate() {
     }];
     // Finding is IN the diff (introduced)
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 1,
         dashboard_findings: vec![DashboardFinding {
@@ -6491,6 +6528,7 @@ fn mixed_failures_include_both_preexisting_and_introduced_in_output() {
     // ESLint has findings both in and out of diff (mixed)
     // Prettier has findings only out of diff (pre-existing)
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "warnings".to_string(),
         findings_count: 3,
         dashboard_findings: vec![
@@ -7767,6 +7805,7 @@ fn informational_notes_keep_current_and_historical_counts_comparable() {
         in_diff: Some(false),
     };
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_string(),
         findings_count: 1,
         dashboard_findings: vec![baseline_note],
@@ -7926,6 +7965,7 @@ fn snapshot_integrity_gate_preserves_check_results_and_dashboard_parity() {
         is_remote: false,
     }];
     let inline = InlineFindingsSummary {
+        cargo_audit: None,
         status: "passed".to_owned(),
         findings_count: 0,
         dashboard_findings: Vec::new(),
@@ -8015,4 +8055,205 @@ fn snapshot_integrity_gate_preserves_check_results_and_dashboard_parity() {
         assert_eq!(gate_caveats, dashboard_caveats);
         assert_eq!(gate_caveats.len(), usize::from(integrity.requires_review()));
     }
+}
+
+// --- Cargo audit lock-based pre-existing proof, through the real pack path ---
+
+fn cargo_audit_pack_check() -> CheckResult {
+    CheckResult {
+        name: "Cargo audit".to_string(),
+        status: crate::checks::CheckStatus::Failed,
+        duration: std::time::Duration::from_millis(900),
+        output: r#"{
+            "vulnerabilities": {
+                "found": true,
+                "count": 2,
+                "list": [
+                    {
+                        "advisory": {"id": "RUSTSEC-2026-0001", "title": "first advisory"},
+                        "package": {"name": "alpha", "version": "1.0.0"},
+                        "versions": {"patched": [">=1.0.1"]}
+                    },
+                    {
+                        "advisory": {"id": "RUSTSEC-2026-0002", "title": "second advisory"},
+                        "package": {"name": "beta", "version": "2.0.0"},
+                        "versions": {"patched": [">=2.0.1"]}
+                    }
+                ]
+            },
+            "warnings": {}
+        }"#
+        .to_string(),
+        cached: false,
+        provenance: None,
+    }
+}
+
+fn source_only_diff(base_sha: &str, target_sha: &str) -> Diff {
+    Diff {
+        target: "feature".to_string(),
+        base: "main".to_string(),
+        target_commit_id: target_sha.to_string(),
+        base_commit_id: base_sha.to_string(),
+        files: vec![FileChange {
+            path: "own.rs".to_string(),
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 1,
+        }],
+        stats: DiffStats {
+            files_changed: 1,
+            additions: 1,
+            deletions: 1,
+            copied: 0,
+        },
+        commits: vec![],
+    }
+}
+
+fn cargo_audit_pack(
+    dirty: &[&str],
+    pack_name: &str,
+) -> (
+    tempfile::TempDir,
+    serde_json::Value,
+    serde_json::Value,
+    String,
+) {
+    let publication_home = tempfile::tempdir().unwrap();
+    let _home = crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base, target) = init_advanced_base_fixture();
+    let governor = crate::governor::ResourceGovernor::new();
+    let output = publication_home.path().join(pack_name);
+    let diffs = [source_only_diff(&base, &target)];
+    let checks = [cargo_audit_pack_check()];
+    let pack = generate_fixture_pack_with_ledger_and_diffs(
+        repo.path(),
+        &output,
+        &target,
+        &base,
+        &governor,
+        &TaskLedger::new(),
+        FixturePackOptions {
+            diffs: &diffs,
+            checks: &checks,
+            worktree_dirty_paths: Some(dirty.iter().map(|p| p.to_string()).collect()),
+            // The incident ran under a blocking policy; a warn-mode pack would
+            // not reproduce the BLOCK it produced.
+            policy_mode: Some(crate::policy::PolicyMode::Block),
+            ..Default::default()
+        },
+    )
+    .expect("pack");
+
+    let gate: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pack.join("00_summary/MERGE_GATE.json")).unwrap())
+            .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pack.join("report.json")).unwrap()).unwrap();
+    let dashboard = fs::read_to_string(pack.join("dashboard.html")).unwrap();
+    (publication_home, gate, report, dashboard)
+}
+
+/// The incident, end to end: a diff that touches no dependency, an operator
+/// tree dirty somewhere unrelated, and two advisories the baseline already
+/// knows are pre-existing. The pack used to carry `new=0, pre-existing=2` in
+/// its caveat and `BLOCK … Cargo audit (Failed)` in its decision, with nothing
+/// bridging the two. Now one classification produces both, and it says why.
+#[test]
+fn an_untouched_lock_keeps_cargo_audit_off_the_blocking_list() {
+    let (_home, gate, report, dashboard) = cargo_audit_pack(&["notes.md"], "untouched-lock");
+
+    let decision = &gate["decision"];
+    let blocking = decision["blocking_issues"].as_array().unwrap();
+    assert!(
+        !blocking
+            .iter()
+            .any(|issue| issue.as_str().is_some_and(|s| s.contains("Cargo audit"))),
+        "an advisory in an untouched lock is not this diff's blocker: {blocking:?}"
+    );
+    assert_eq!(
+        decision["preexisting_quality_failures"][0].as_str(),
+        Some("Cargo audit")
+    );
+    assert!(
+        decision["unclassified_quality_failures"]
+            .as_array()
+            .is_none_or(|arr| arr.is_empty()),
+        "the classification is established, not unknown"
+    );
+    assert_eq!(decision["quality_pass"].as_bool(), Some(true));
+
+    // The row states the proof rather than leaving the reader to infer it.
+    let audit_row = gate["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "Cargo audit")
+        .expect("cargo audit row");
+    assert_eq!(audit_row["blocking"].as_bool(), Some(false));
+    assert_eq!(audit_row["policy_conclusion"], "advisory");
+    assert_eq!(
+        audit_row["reason"].as_str(),
+        Some("pre-existing: Cargo.lock unchanged by this PR (2 advisories)")
+    );
+
+    // The caveat and the decision now agree, and both artifacts plus the
+    // dashboard carry the same verdict (THREAD 5 parity).
+    let caveats = decision["review_caveats"].as_array().unwrap();
+    assert!(
+        caveats.iter().any(|c| c
+            .as_str()
+            .is_some_and(|s| s.contains("new=0") && s.contains("pre-existing=2"))),
+        "{caveats:?}"
+    );
+    assert_eq!(report["gate"]["status"], decision["verdict"]);
+    assert_eq!(report["gate"]["allow_merge"], decision["allow_merge"]);
+    assert_eq!(report["gate"]["quality_pass"], decision["quality_pass"]);
+    assert_eq!(report["gate"]["summary"], decision["decision_reason"]);
+    assert_eq!(
+        report["gate"]["preexisting_quality_failures"][0].as_str(),
+        Some("Cargo audit")
+    );
+    let verdict = decision["verdict"].as_str().unwrap();
+    assert!(
+        dashboard.contains(verdict),
+        "dashboard must render the same verdict ({verdict})"
+    );
+}
+
+/// The one edit that revokes the proof. Same diff, same advisories, but the
+/// lockfile the audit read carried uncommitted changes — so it is not provably
+/// the target's, and the audit keeps gating.
+#[test]
+fn a_dirty_lockfile_puts_cargo_audit_back_on_the_blocking_list() {
+    let (_home, gate, report, _dashboard) = cargo_audit_pack(&["Cargo.lock"], "dirty-lock");
+
+    let decision = &gate["decision"];
+    assert!(
+        decision["blocking_issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue.as_str().is_some_and(|s| s.contains("Cargo audit"))),
+        "an unproven lockfile must keep the audit blocking"
+    );
+    assert_eq!(
+        decision["unclassified_quality_failures"][0].as_str(),
+        Some("Cargo audit")
+    );
+    assert!(
+        decision["preexisting_quality_failures"]
+            .as_array()
+            .is_none_or(|arr| arr.is_empty()),
+        "nothing was proven pre-existing"
+    );
+    assert_eq!(decision["quality_pass"].as_bool(), Some(false));
+    assert_eq!(report["gate"]["status"], decision["verdict"]);
+    assert_eq!(report["gate"]["allow_merge"], decision["allow_merge"]);
+    assert_eq!(report["gate"]["quality_pass"], decision["quality_pass"]);
+    assert_eq!(
+        report["gate"]["summary"], decision["decision_reason"],
+        "the narrative and the gate state one decision"
+    );
 }

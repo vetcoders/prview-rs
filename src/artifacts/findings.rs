@@ -7,6 +7,37 @@ pub(super) struct InlineFindingsSummary {
     pub(super) status: String,
     pub(super) findings_count: usize,
     pub(super) dashboard_findings: Vec<DashboardFinding>,
+    /// Cargo audit's baseline comparison, as structured data rather than the
+    /// rendered `Cargo audit baseline: …` note.
+    ///
+    /// The gate needs the same numbers the caveat prints in order to SAY what it
+    /// decided and why — the incident this exists for had the caveat reporting
+    /// `new=0, pre-existing=2` beside a bare `Cargo audit (Failed)` blocker.
+    /// Re-parsing the note would make the message layer depend on the wording of
+    /// a human-facing string, so the counts travel here and the note is rendered
+    /// from the same values.
+    ///
+    /// `None` when the run had no `Cargo audit` check at all.
+    pub(super) cargo_audit: Option<CargoAuditGateEvidence>,
+}
+
+/// What cargo audit's baseline comparison concluded, for the surfaces that must
+/// explain the verdict rather than merely reach it.
+#[derive(Debug, Clone)]
+pub(super) struct CargoAuditGateEvidence {
+    /// `not-required` | `available` | `unavailable` | `current-unavailable`,
+    /// verbatim from [`CargoAuditBaselineCounts`].
+    pub(super) status: &'static str,
+    pub(super) new: usize,
+    pub(super) preexisting: usize,
+    pub(super) unknown: usize,
+    /// Whether the diff touched the effective `Cargo.lock`. Selects which proof
+    /// the advisory reason cites: an untouched lock, or an unchanged comparison
+    /// against the base audit.
+    pub(super) lock_changed: bool,
+    /// Advisory ids this diff introduced, in report order and deduplicated.
+    /// Empty whenever `new == 0`.
+    pub(super) new_advisory_ids: Vec<String>,
 }
 
 pub(super) fn is_operator_finding(finding: &DashboardFinding) -> bool {
@@ -409,6 +440,7 @@ pub(super) fn generate_inline_findings(
     }
 
     let mut tool_findings_sets: Vec<ToolFindings> = Vec::new();
+    let mut cargo_audit_evidence: Option<CargoAuditGateEvidence> = None;
 
     for check in checks {
         let check_id = check_id_from_name(&check.name);
@@ -449,6 +481,19 @@ pub(super) fn generate_inline_findings(
                 in_diff: Some(false),
             });
 
+            // The same values the note above renders, kept structured for the
+            // gate. Built before the per-finding loop so `new_advisory_ids` can
+            // be filled from the identical `in_diff` decision the SARIF rows
+            // carry — one classification, not two.
+            let mut evidence = CargoAuditGateEvidence {
+                status: baseline.status,
+                new: baseline.new,
+                preexisting: baseline.preexisting,
+                unknown: baseline.unknown,
+                lock_changed: cargo_lock_changed,
+                new_advisory_ids: Vec::new(),
+            };
+
             let location = cargo_audit_location_for_check(check);
             for finding in &audit_findings {
                 match finding.sarif_level {
@@ -480,6 +525,14 @@ pub(super) fn generate_inline_findings(
                     cargo_lock_changed,
                     base_audit_cache.as_ref(),
                 );
+                if current_audit_in_diff == Some(true)
+                    && !evidence
+                        .new_advisory_ids
+                        .iter()
+                        .any(|id| id == &finding.advisory_id)
+                {
+                    evidence.new_advisory_ids.push(finding.advisory_id.clone());
+                }
 
                 dashboard_findings.push(DashboardFinding {
                     file: None,
@@ -517,6 +570,7 @@ pub(super) fn generate_inline_findings(
                     }
                 }));
             }
+            cargo_audit_evidence = Some(evidence);
             continue;
         }
 
@@ -869,6 +923,7 @@ pub(super) fn generate_inline_findings(
         status,
         findings_count: error_count + warning_count,
         dashboard_findings,
+        cargo_audit: cargo_audit_evidence,
     })
 }
 
@@ -1709,6 +1764,7 @@ FAILED tests/test_parser.py::test_roundtrip\n\
             status: "failed".to_string(),
             findings_count: dashboard_findings.len(),
             dashboard_findings,
+            cargo_audit: None,
         }
     }
 
@@ -2123,6 +2179,107 @@ FAILED tests/test_parser.py::test_roundtrip\n\
             .find(|finding| finding.check_id == "cargo_audit")
             .expect("cargo-audit advisory");
         assert_eq!(advisory.in_diff, Some(false));
+    }
+
+    /// The gate's numbers and the caveat's numbers are the same numbers. The
+    /// incident pack could state `new=0, pre-existing=2` in one artifact and
+    /// block without explanation in another precisely because the decision path
+    /// had no access to these counts.
+    #[test]
+    fn cargo_audit_evidence_matches_the_rendered_baseline_note() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = [cargo_audit_check(
+            crate::checks::CheckStatus::Failed,
+            VULNERABLE_CARGO_AUDIT,
+        )];
+        let diffs = [one_file_diff("src/lib.rs")];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &diffs, None, None).expect("findings");
+
+        let evidence = summary
+            .cargo_audit
+            .as_ref()
+            .expect("a run with a cargo audit check carries its baseline evidence");
+        assert_eq!(evidence.status, "not-required");
+        assert_eq!(evidence.new, 0);
+        assert_eq!(evidence.preexisting, 1);
+        assert_eq!(evidence.unknown, 0);
+        assert!(!evidence.lock_changed);
+        assert!(evidence.new_advisory_ids.is_empty());
+
+        let note = &summary.dashboard_findings[0].message;
+        assert_eq!(
+            note,
+            "Cargo audit baseline: status=not-required, new=0, pre-existing=1, \
+             resolved=0, unknown-baseline=0",
+            "the note and the evidence are one value rendered twice"
+        );
+    }
+
+    /// No base audit is no proof, and the evidence says so rather than
+    /// reporting a comfortable zero: `unknown`, not `new=0, pre-existing=0`.
+    #[test]
+    fn cargo_audit_evidence_keeps_an_unknown_baseline_unknown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = [cargo_audit_check(
+            crate::checks::CheckStatus::Failed,
+            VULNERABLE_CARGO_AUDIT,
+        )];
+        let diffs = [one_file_diff("Cargo.lock")];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &diffs, None, None).expect("findings");
+
+        let evidence = summary.cargo_audit.as_ref().expect("evidence");
+        assert_eq!(evidence.status, "unavailable");
+        assert_eq!(evidence.new, 0);
+        assert_eq!(evidence.preexisting, 0);
+        assert_eq!(evidence.unknown, 1);
+        assert!(evidence.lock_changed);
+        assert!(
+            evidence.new_advisory_ids.is_empty(),
+            "an advisory with no base comparison was not shown to be new"
+        );
+    }
+
+    /// A run with no cargo audit check has nothing to say about lockfiles, and
+    /// says nothing — rather than an all-zero record a reader would take as a
+    /// clean audit.
+    #[test]
+    fn a_run_without_cargo_audit_carries_no_audit_evidence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = vec![rustfmt_check("Diff in src/changed.rs:3:\n-old\n+new\n")];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &[], None, None).expect("findings");
+        assert!(summary.cargo_audit.is_none());
+    }
+
+    /// The introduced-advisory list is read off the SAME `in_diff` decision the
+    /// SARIF rows carry, so the gate sentence cannot name an advisory the pack
+    /// classified as pre-existing (or miss one it classified as new).
+    #[test]
+    fn introduced_advisory_ids_track_the_in_diff_decision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checks = [cargo_audit_check(
+            crate::checks::CheckStatus::Failed,
+            VULNERABLE_CARGO_AUDIT,
+        )];
+        let summary =
+            generate_inline_findings(tmp.path(), &checks, &[], None, None).expect("findings");
+        let evidence = summary.cargo_audit.as_ref().expect("evidence");
+        let advisory_rows: Vec<_> = summary
+            .dashboard_findings
+            .iter()
+            .filter(|finding| finding.check_id == "cargo_audit")
+            .collect();
+        let introduced: Vec<_> = advisory_rows
+            .iter()
+            .filter(|finding| finding.in_diff == Some(true))
+            .collect();
+        assert_eq!(
+            evidence.new_advisory_ids.len(),
+            introduced.len(),
+            "the named ids and the in-diff rows are one classification"
+        );
     }
 
     fn sarif_results(dir: &Path) -> Vec<serde_json::Value> {

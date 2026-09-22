@@ -295,6 +295,40 @@ fn effective_cargo_lock_path_at_commit(
     }
 }
 
+/// The working-tree `Cargo.lock` paths (repository-relative) the live
+/// `cargo audit` run could have read for `cargo_root`.
+///
+/// Mirrors [`effective_cargo_lock_path_at_commit`], which resolves the same
+/// question against a commit: the member lock first, then the workspace-root
+/// lock it falls back to when the member has none. The working tree cannot be
+/// interrogated as cheaply as a tree object, so BOTH candidates are returned
+/// and the caller treats either one being dirty as a lost proof. That is the
+/// conservative direction: an unrelated dirty member lock suppresses the
+/// pre-existing downgrade instead of licensing it.
+///
+/// A `cargo_root` outside the repository yields no candidate — nothing inside
+/// the reviewed tree can vouch for the lockfile that was scanned.
+pub(crate) fn cargo_audit_candidate_lock_paths(
+    repo_root: &std::path::Path,
+    cargo_root: Option<&std::path::Path>,
+) -> Vec<String> {
+    let configured_root = cargo_root.unwrap_or(repo_root);
+    let normalized =
+        crate::paths::normalize_to_repo_relative(&configured_root.display().to_string(), repo_root);
+    if normalized.is_external {
+        return Vec::new();
+    }
+    let relative_root = std::path::Path::new(&normalized.display);
+    if relative_root == std::path::Path::new(".") {
+        return vec!["Cargo.lock".to_string()];
+    }
+    let member_lock = relative_root
+        .join("Cargo.lock")
+        .to_string_lossy()
+        .replace('\\', "/");
+    vec![member_lock, "Cargo.lock".to_string()]
+}
+
 fn cargo_audit_comparison_context_for_diff(
     repo: &crate::git::Repository,
     diff: &crate::git::Diff,

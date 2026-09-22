@@ -695,6 +695,84 @@ pub(crate) fn check_id_is_baseline_signal(check_id: &str) -> bool {
     )
 }
 
+/// Whether the `Cargo.lock` the live `cargo audit` read is provably the
+/// analysed target's lockfile.
+///
+/// This is cargo audit's substrate proof, and it exists because R2-9 — "a dirty
+/// worktree can pass an uncommitted finding off as out-of-diff" — is the wrong
+/// evidence for this check. A `rustfmt`/`eslint`/`semgrep` finding IS a source
+/// file, so uncommitted source bytes can forge its out-of-diff position. A
+/// cargo-audit advisory is not: it lives in `Cargo.lock` × the advisory
+/// database, and no amount of edited source can move it. Gating it on
+/// whole-tree cleanliness made the pack state `new=0, pre-existing=2` in the
+/// baseline caveat and `BLOCK … Cargo audit (Failed)` in the decision, with
+/// nothing bridging the two.
+///
+/// The proof that IS load-bearing is lockfile provenance, and it covers every
+/// branch of the baseline comparison at once, because `in_diff` already carries
+/// the rest of the evidence:
+///
+/// * lock untouched by the diff → every advisory is `in_diff == Some(false)`,
+///   and the downgrade is sound exactly when the scanned lock was the target's;
+/// * lock changed with a base audit → `in_diff` is a real `current ∖ base`
+///   comparison, sound under the same condition and no other;
+/// * lock changed with no base audit → every row is `in_diff == None`, so
+///   R5-23 keeps the check Unclassified whatever this proof says (R3-14/R4-20
+///   likewise stay in force upstream of it).
+///
+/// A freshly published advisory against an unchanged lock is therefore
+/// pre-existing debt newly revealed, not debt this PR introduced — the correct
+/// reading, since the PR did not touch a single dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CargoAuditLockProof {
+    /// The audited lockfile is the target's: either the run scanned a snapshot
+    /// materialised at the target commit, or it scanned the local checkout and
+    /// the lockfile itself carried no uncommitted change.
+    TargetLock,
+    /// Provenance not established — no downgrade.
+    Unproven,
+}
+
+/// Resolve [`CargoAuditLockProof`] for this run.
+///
+/// `target_is_checkout == Some(false)` is the remote/snapshot shape: `cargo
+/// audit` runs through `plan_cargo_run`, which materialises a worktree snapshot
+/// at the target commit and executes there, so the lock it read IS the target's
+/// by construction. This widens the pre-existing downgrade to `cargo_audit` on
+/// snapshot runs — a deliberate gate-semantics decision (the case
+/// `check_scans_target_snapshot` documents as deliberately deferred), earned
+/// here by a proof rather than inherited from a check having moved substrate.
+///
+/// `Some(true)` is the local shape: the lock is the target's only while the
+/// lockfile carries no uncommitted change. The dirty set is the one frozen
+/// before the checks ran, so a lock a later `cargo build` rewrote cannot revoke
+/// a proof that held when the audit actually read it. An unreadable status
+/// (`None`) establishes nothing.
+fn resolve_cargo_audit_lock_proof(
+    config: &Config,
+    target_is_checkout: Option<bool>,
+    worktree_dirty_paths: Option<&std::collections::BTreeSet<String>>,
+) -> CargoAuditLockProof {
+    match target_is_checkout {
+        Some(false) => CargoAuditLockProof::TargetLock,
+        Some(true) => {
+            let Some(dirty) = worktree_dirty_paths else {
+                return CargoAuditLockProof::Unproven;
+            };
+            let candidates = crate::artifacts::audit::cargo_audit_candidate_lock_paths(
+                &config.repo_root,
+                config.profile.cargo_root.as_deref(),
+            );
+            if candidates.is_empty() || candidates.iter().any(|path| dirty.contains(path)) {
+                CargoAuditLockProof::Unproven
+            } else {
+                CargoAuditLockProof::TargetLock
+            }
+        }
+        None => CargoAuditLockProof::Unproven,
+    }
+}
+
 /// Per-check clean-comparison signal: whether an all-out-of-diff location set for
 /// a given check may be trusted as pre-existing debt and downgraded off the merge
 /// gate.
@@ -742,6 +820,11 @@ pub(crate) struct CleanComparison {
     /// provably pre-existing. The downgrade is suppressed for these check_ids
     /// (R5-21).
     configs_changed: std::collections::BTreeSet<&'static str>,
+    /// Cargo audit's own substrate proof. `cargo_audit` is the one
+    /// baseline-signal check whose findings do not live in source files, so the
+    /// whole-tree cleanliness rule above is not evidence about it either way —
+    /// see [`CargoAuditLockProof`].
+    cargo_audit_lock: CargoAuditLockProof,
 }
 
 impl CleanComparison {
@@ -756,6 +839,7 @@ impl CleanComparison {
         resolved_target: &crate::git::ResolvedRef,
         resolved_bases: &[crate::git::ResolvedRef],
         worktree_clean: Option<bool>,
+        worktree_dirty_paths: Option<&std::collections::BTreeSet<String>>,
         worktree_head_sha: Option<&str>,
         diffs: &[crate::git::Diff],
     ) -> Self {
@@ -767,12 +851,18 @@ impl CleanComparison {
         // A later HEAD can invalidate source stability, never grant a new
         // source identity to results produced earlier in the run.
         let stable_head = worktree_head_sha.filter(|captured| head.as_deref() == Some(*captured));
+        let target_is_checkout = stable_head.map(|captured| captured == resolved_target.commit_id);
         CleanComparison {
-            target_is_checkout: stable_head.map(|captured| captured == resolved_target.commit_id),
+            target_is_checkout,
             worktree_clean,
             current_only: config.current_only,
             has_base_diff,
             configs_changed,
+            cargo_audit_lock: resolve_cargo_audit_lock_proof(
+                config,
+                target_is_checkout,
+                worktree_dirty_paths,
+            ),
         }
     }
 
@@ -806,6 +896,16 @@ impl CleanComparison {
             // full-scan findings all sit "out of diff" trivially (R3-14).
             return false;
         }
+        if check_id == "cargo_audit" {
+            // R2-9's dirty-worktree rule is about source bytes that could forge
+            // an out-of-diff position. A cargo-audit advisory has no source
+            // position to forge — it is `Cargo.lock` × the advisory database —
+            // so uncommitted changes elsewhere in the tree are not evidence
+            // about it. The proof this check needs is that the lockfile it read
+            // was the target's; the checks above (R5-21, R4-20, R3-14) still
+            // apply, and R5-23 still governs rows whose origin is unknown.
+            return self.cargo_audit_lock == CargoAuditLockProof::TargetLock;
+        }
         match self.target_is_checkout {
             // Local checkout was the target: both captured cleanliness and HEAD
             // stability are required. Generated files do not trigger a new status read.
@@ -825,6 +925,21 @@ impl CleanComparison {
             current_only: false,
             has_base_diff: true,
             configs_changed: std::collections::BTreeSet::new(),
+            // The lockfile proof is orthogonal to whole-tree cleanliness, which
+            // is the whole point of the split: a test that dirties the tree is
+            // not thereby saying the lockfile moved. Tests that mean the lock
+            // itself is unproven say so with `for_test_cargo_audit_lock`.
+            cargo_audit_lock: CargoAuditLockProof::TargetLock,
+        }
+    }
+
+    /// A clean local comparison in which only cargo audit's lockfile proof is
+    /// varied.
+    #[cfg(test)]
+    pub(crate) fn for_test_cargo_audit_lock(proof: CargoAuditLockProof) -> Self {
+        CleanComparison {
+            cargo_audit_lock: proof,
+            ..CleanComparison::for_test(true, true)
         }
     }
 
@@ -836,6 +951,7 @@ impl CleanComparison {
             current_only: true,
             has_base_diff: true,
             configs_changed: std::collections::BTreeSet::new(),
+            cargo_audit_lock: CargoAuditLockProof::TargetLock,
         }
     }
 
@@ -847,6 +963,7 @@ impl CleanComparison {
             current_only: false,
             has_base_diff: false,
             configs_changed: std::collections::BTreeSet::new(),
+            cargo_audit_lock: CargoAuditLockProof::TargetLock,
         }
     }
 
@@ -858,6 +975,7 @@ impl CleanComparison {
             current_only: false,
             has_base_diff: true,
             configs_changed: owners.iter().copied().collect(),
+            cargo_audit_lock: CargoAuditLockProof::TargetLock,
         }
     }
 }
@@ -945,8 +1063,13 @@ fn has_resolvable_base_diff(
 /// `rustfmt` and `cargo_audit` were originally excluded because they ran at the
 /// local checkout (R3-16). They now scan the snapshot too, but stay off this
 /// list: widening the pre-existing downgrade is a gate-semantics decision, not a
-/// side effect of moving a check onto the reviewed substrate. Keeping them out
-/// is the conservative side — findings surface instead of being suppressed.
+/// side effect of moving a check onto the reviewed substrate. Keeping `rustfmt`
+/// out is the conservative side — findings surface instead of being suppressed.
+///
+/// `cargo_audit` never reaches this function any more: [`CleanComparison::applies_to`]
+/// answers it from [`CargoAuditLockProof`] first, which is that deliberate
+/// gate-semantics decision taken explicitly and on a stated proof rather than
+/// by adding a name to this list.
 fn check_scans_target_snapshot(check_id: &str) -> bool {
     matches!(check_id, "semgrep_scan" | "ruff" | "eslint" | "stylelint")
 }
@@ -970,6 +1093,18 @@ pub struct WorktreeProvenance {
     /// [`render_status_fingerprint`]). `None` when the repository could not be
     /// inspected — an unknown fingerprint stays visibly unknown.
     pub status_digest: Option<String>,
+    /// The repository-relative paths that were dirty in that SAME status read.
+    ///
+    /// `clean` collapses the status to one boolean, which is the right evidence
+    /// for a whole-tree scanner but the wrong evidence for a check whose
+    /// substrate is a single file. Keeping the path set lets a per-file proof
+    /// (today: cargo audit's lockfile, see [`CargoAuditLockProof`]) ask about
+    /// the file it actually read without taking a second, later reading of the
+    /// tree — which is exactly what R4-19 forbids.
+    ///
+    /// `None` whenever `clean` is `None`: a status nobody could read names no
+    /// paths, and an empty set there would read as "nothing was dirty".
+    pub dirty_paths: Option<std::collections::BTreeSet<String>>,
 }
 
 /// Read the working tree at `repo_root` once and derive both the cleanliness
@@ -1007,6 +1142,7 @@ fn capture_worktree_provenance_inner(
             head_sha: None,
             clean: Some(true),
             status_digest: None,
+            dirty_paths: Some(std::collections::BTreeSet::new()),
         };
     };
     let read_head = || {
@@ -1025,6 +1161,7 @@ fn capture_worktree_provenance_inner(
             head_sha,
             clean: None,
             status_digest: None,
+            dirty_paths: None,
         };
     };
 
@@ -1046,6 +1183,14 @@ fn capture_worktree_provenance_inner(
         head_sha,
         clean: Some(statuses.is_empty()),
         status_digest: Some(format!("sha256:{:x}", hasher.finalize())),
+        // Derived from the SAME `statuses` the cleanliness flag and the digest
+        // come from, so the three can never describe different observations.
+        dirty_paths: Some(
+            statuses
+                .iter()
+                .filter_map(|entry| entry.path().map(str::to_string))
+                .collect(),
+        ),
     }
 }
 
@@ -2073,8 +2218,14 @@ mod tests {
         // R3-16: on a remote/snapshot target (head != target) the snapshot-backed
         // checks (semgrep + the plan_check_run linters ruff/eslint/stylelint)
         // scanned the target snapshot, so their out-of-diff rows may downgrade.
-        // rustfmt/cargo_audit scanned the local checkout — a different tree — so
-        // their out-of-diff rows must NOT be downgraded to pre-existing.
+        // rustfmt scanned the local checkout — a different tree — so its
+        // out-of-diff rows must NOT be downgraded to pre-existing.
+        //
+        // `cargo_audit` is deliberately NOT judged by this list any more: it
+        // runs in the target snapshot via `plan_cargo_run`, so the lockfile it
+        // read IS the target's and `CargoAuditLockProof::TargetLock` holds. Its
+        // membership is asserted below as the proof it now is, not as an
+        // inherited property of the rustfmt case.
         let clean = CleanComparison::for_test(false, true);
         assert!(
             clean.applies_to("semgrep_scan"),
@@ -2097,8 +2248,13 @@ mod tests {
             "rustfmt scanned the local checkout, downgrade must not apply"
         );
         assert!(
-            !clean.applies_to("cargo_audit"),
-            "cargo_audit scanned the local checkout, downgrade must not apply"
+            clean.applies_to("cargo_audit"),
+            "cargo audit reads the target snapshot's lockfile, so the proof holds"
+        );
+        assert!(
+            !CleanComparison::for_test_cargo_audit_lock(CargoAuditLockProof::Unproven)
+                .applies_to("cargo_audit"),
+            "without lockfile provenance cargo audit must not downgrade"
         );
 
         let findings = [out_of_diff_finding("rustfmt")];
@@ -2122,6 +2278,153 @@ mod tests {
         assert_eq!(
             semgrep_summary.preexisting_quality_failures,
             vec!["Semgrep scan"]
+        );
+    }
+
+    /// The defect this proof exists for: a pack that knows `new=0,
+    /// pre-existing=2` and blocks anyway, because R2-9 asked a question about
+    /// source files of a check whose findings are not source files.
+    #[test]
+    fn unrelated_worktree_dirt_no_longer_gates_cargo_audit() {
+        // Lock untouched by the diff (every advisory out-of-diff), tree dirty in
+        // something that has nothing to do with dependencies.
+        let dirty_tree = CleanComparison::for_test(true, false);
+        assert!(
+            dirty_tree.applies_to("cargo_audit"),
+            "uncommitted source cannot move an advisory that lives in Cargo.lock"
+        );
+        let summary = build_quality_failure_summary(
+            &[failed_check("Cargo audit")],
+            &[out_of_diff_finding("cargo_audit")],
+            &dirty_tree,
+        );
+        assert_eq!(summary.preexisting_quality_failures, vec!["Cargo audit"]);
+        assert!(
+            !summary.has_new_failures(),
+            "a pre-existing-only audit must not fail the quality gate"
+        );
+
+        // R2-9 is narrowed, not broken: the same dirty tree still gates every
+        // check whose findings ARE source locations.
+        for id in ["rustfmt", "semgrep_scan", "eslint", "ruff"] {
+            assert!(
+                !dirty_tree.applies_to(id),
+                "{id} findings are source locations; dirty tree still gates them"
+            );
+        }
+    }
+
+    /// The narrowing has a floor: dirt in the lockfile itself is exactly the
+    /// evidence that the audited lock was not the target's.
+    #[test]
+    fn a_dirty_lockfile_revokes_the_cargo_audit_downgrade() {
+        let unproven = CleanComparison::for_test_cargo_audit_lock(CargoAuditLockProof::Unproven);
+        assert!(!unproven.applies_to("cargo_audit"));
+        let summary = build_quality_failure_summary(
+            &[failed_check("Cargo audit")],
+            &[out_of_diff_finding("cargo_audit")],
+            &unproven,
+        );
+        assert!(summary.preexisting_quality_failures.is_empty());
+        assert_eq!(summary.unclassified_quality_failures, vec!["Cargo audit"]);
+        assert!(
+            summary.has_new_failures(),
+            "an unproven lockfile must keep the audit gating"
+        );
+    }
+
+    /// The proof licenses the downgrade; it never manufactures one. An advisory
+    /// the diff introduced stays introduced, and a row with no base comparison
+    /// (R5-23) stays unclassified, whatever the lockfile provenance says.
+    #[test]
+    fn cargo_audit_lock_proof_never_launders_new_or_unknown_advisories() {
+        let proven = CleanComparison::for_test(true, true);
+
+        let introduced = build_quality_failure_summary(
+            &[failed_check("Cargo audit")],
+            &[in_diff_finding("cargo_audit")],
+            &proven,
+        );
+        assert_eq!(introduced.introduced_quality_failures, vec!["Cargo audit"]);
+        assert!(introduced.has_new_failures());
+
+        let unknown_base = build_quality_failure_summary(
+            &[failed_check("Cargo audit")],
+            &[unlocated_finding("cargo_audit")],
+            &proven,
+        );
+        assert!(unknown_base.preexisting_quality_failures.is_empty());
+        assert_eq!(
+            unknown_base.unclassified_quality_failures,
+            vec!["Cargo audit"]
+        );
+        assert!(
+            unknown_base.has_new_failures(),
+            "no base audit means no proof, whatever the lockfile says"
+        );
+    }
+
+    /// R3-14 and R4-20 sit upstream of the lockfile proof and keep their veto:
+    /// with no diff baseline at all, "out of diff" is an artefact of an empty
+    /// changed-file set, not evidence about a lockfile.
+    #[test]
+    fn cargo_audit_lock_proof_does_not_outrank_a_missing_baseline() {
+        assert!(
+            !CleanComparison::for_test_current_only().applies_to("cargo_audit"),
+            "--current-only has no baseline to predate (R3-14)"
+        );
+        assert!(
+            !CleanComparison::for_test_no_base_diff().applies_to("cargo_audit"),
+            "no resolvable base diff proves nothing pre-existing (R4-20)"
+        );
+    }
+
+    /// The proof is read off the lockfile, and off the status frozen before the
+    /// checks ran — not off the tree as it stands at artifact time (R4-19).
+    #[test]
+    fn cargo_audit_lock_proof_reads_the_lockfile_not_the_tree() {
+        let (tmp, _repo, first, target) = comparison_repo();
+        let config = crate::config::test_config_builder()
+            .repo_root(tmp.path())
+            .build();
+        let resolve = |dirty: &[&str]| {
+            let dirty: std::collections::BTreeSet<String> =
+                dirty.iter().map(|path| path.to_string()).collect();
+            CleanComparison::resolve(
+                &config,
+                &resolved_ref(&first.to_string()),
+                &[resolved_ref(&target.to_string())],
+                Some(dirty.is_empty()),
+                Some(&dirty),
+                Some(&first.to_string()),
+                &[],
+            )
+        };
+
+        assert!(
+            resolve(&["src/unrelated.rs"]).applies_to("cargo_audit"),
+            "a dirty source file says nothing about the lockfile"
+        );
+        assert!(
+            !resolve(&["src/unrelated.rs"]).applies_to("rustfmt"),
+            "the same dirt still gates a source-file scanner"
+        );
+        assert!(
+            !resolve(&["Cargo.lock"]).applies_to("cargo_audit"),
+            "a dirty lockfile is the one edit that breaks the proof"
+        );
+        assert!(
+            !CleanComparison::resolve(
+                &config,
+                &resolved_ref(&first.to_string()),
+                &[resolved_ref(&target.to_string())],
+                None,
+                None,
+                Some(&first.to_string()),
+                &[],
+            )
+            .applies_to("cargo_audit"),
+            "an unreadable status establishes nothing"
         );
     }
 
@@ -2400,6 +2703,7 @@ mod tests {
             &resolved_ref(&target.to_string()),
             &[resolved_ref(&first.to_string())],
             captured.clean,
+            captured.dirty_paths.as_ref(),
             captured.head_sha.as_deref(),
             &[],
         );
@@ -2411,6 +2715,7 @@ mod tests {
             &resolved_ref(&target.to_string()),
             &[resolved_ref(&first.to_string())],
             captured.clean,
+            captured.dirty_paths.as_ref(),
             captured.head_sha.as_deref(),
             &[],
         );
@@ -2445,6 +2750,7 @@ mod tests {
                 &resolved_ref(&first.to_string()),
                 &[resolved_ref(&other.to_string())],
                 captured.clean,
+                captured.dirty_paths.as_ref(),
                 captured.head_sha.as_deref(),
                 &[],
             )
@@ -2472,6 +2778,7 @@ mod tests {
             &resolved_ref(&first.to_string()),
             &[resolved_ref(&other.to_string())],
             Some(true),
+            Some(&std::collections::BTreeSet::new()),
             None,
             &[],
         );
@@ -2851,6 +3158,7 @@ mod tests {
             current_only: false,
             has_base_diff: true,
             configs_changed: std::collections::BTreeSet::new(),
+            cargo_audit_lock: CargoAuditLockProof::Unproven,
         };
         assert!(
             !unknown.applies_to("clippy"),

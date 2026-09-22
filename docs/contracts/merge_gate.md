@@ -262,6 +262,49 @@ remains effective. An all-pre-existing count does **not** prove `PASS`, because
 the effective downgrade also depends on baseline/trust provenance that the
 aggregate does not carry.
 
+### What licenses a pre-existing downgrade
+
+An all-out-of-diff failure is downgraded only for a check whose finding
+*locations* are an exhaustive baseline signal, and only when that check's
+findings are provably from the analysed target. For the file-scoped scanners
+(`semgrep_scan`, `eslint`, `stylelint`, `ruff`, `prettier`, `rustfmt`) the
+provenance question is about the tree: a dirty worktree can present an
+uncommitted finding as out-of-diff, so a dirty local scan downgrades nothing,
+and on a remote/snapshot target only the checks that scan the target snapshot
+qualify.
+
+`cargo_audit` is judged differently, because its findings are not source
+locations. An advisory is `Cargo.lock` × the advisory database, so no
+uncommitted source can move it and whole-tree cleanliness is not evidence about
+it either way. Its proof is that the audited `Cargo.lock` was the target's:
+trivially true when the run scanned a target snapshot, and true for a local run
+when the lockfile itself carried no uncommitted change (read from the status
+frozen before the checks ran, scoped to the `cargo_root` lock and the
+workspace-root lock it falls back to). Unrelated dirt in the tree no longer
+suppresses the downgrade; a dirty lockfile does, and an unreadable status
+establishes nothing.
+
+The proof licenses a downgrade; it never manufactures one. Advisories the diff
+introduced stay `introduced`, and a changed lock with no base audit leaves every
+row `in_diff: null`, which stays `unclassified` and keeps gating. A run with no
+diff baseline at all (`--current-only`, or no resolved base differing from the
+target) downgrades nothing, whatever the lockfile says.
+
+A consequence worth stating: an advisory published *after* the base commit, on a
+lockfile this change never touched, is reported as pre-existing. It is debt
+newly revealed, not debt introduced — the change moved no dependency, the
+advisory database moved. The `Cargo audit baseline` caveat's `status` and counts
+remain the record of what was compared.
+
+Both outcomes are named in the check row's `reason`: a downgraded audit reads
+`pre-existing: Cargo.lock unchanged by this PR (N advisories)` or `pre-existing:
+unchanged vs base audit (N advisories)`, while a blocking one appears in
+`decision.blocking_issues` as `Cargo audit (<Status>): N new vulnerabilities
+introduced (RUSTSEC-…), M pre-existing`, or `… : N advisories with no base
+comparison (baseline <status>)` when nothing could be compared. `blocking_issues`
+entries remain free-form non-empty strings; consumers that need structure read
+`checks[]` and `decision.quality_failure_details[]`, not this text.
+
 The emitter and validator share this per-source disposition table:
 
 | Effective inline fact | Per-source disposition |

@@ -233,6 +233,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `Cargo audit` failure whose advisories the baseline already proved
+  pre-existing no longer blocks the merge because of unrelated uncommitted
+  changes. The pre-existing downgrade for this one check now rests on lockfile
+  provenance — the audited `Cargo.lock` is the analysed target's — instead of
+  whole-tree cleanliness, which is evidence about source files and says nothing
+  about an advisory that lives in `Cargo.lock` × the advisory database. A pack
+  could previously carry `Cargo audit baseline: new=0, pre-existing=2` in its
+  review caveats and `BLOCK … Cargo audit (Failed)` in its decision with nothing
+  bridging the two. Dirt in the lockfile itself still revokes the downgrade, an
+  introduced advisory still blocks, and a changed lock with no base audit is
+  still unclassified rather than assumed clean. The gate now states which proof
+  it applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by
+  this PR (N advisories)`, and a blocking one names the advisories it blocks on.
+  `docs/contracts/merge_gate.md` and `docs/architecture.md` carry the rule.
+
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The
   review opens with `git fetch --quiet --prune origin`, and base resolution drops
   a ref it cannot resolve, so a `--base origin/<branch>` whose upstream branch

@@ -164,6 +164,10 @@ pub struct GenerateInput<'a> {
     /// `worktree_clean`. Recorded in `00_summary/PROVENANCE.json`; `None` when
     /// the repository could not be inspected.
     pub worktree_status_digest: Option<String>,
+    /// The dirty paths from that same read, for the per-file substrate proofs
+    /// the whole-tree `worktree_clean` boolean cannot answer (cargo audit's
+    /// lockfile). `None` when the status could not be read.
+    pub worktree_dirty_paths: Option<std::collections::BTreeSet<String>>,
     /// Operator checkout HEAD captured before checks, independently of the
     /// reviewed target. Never read again while publishing provenance.
     pub worktree_head_sha: Option<String>,
@@ -570,6 +574,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         skipped_checks,
         worktree_clean,
         worktree_status_digest,
+        worktree_dirty_paths,
         worktree_head_sha,
         governor,
     } = input;
@@ -891,6 +896,7 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         resolved_target,
         resolved_bases,
         worktree_clean,
+        worktree_dirty_paths.as_ref(),
         worktree_head_sha.as_deref(),
         diffs,
     );

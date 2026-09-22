@@ -263,6 +263,46 @@ The decision caveat always enumerates counts for `new`, `pre-existing`,
 `resolved`, and `unknown-baseline`, plus an explicit baseline status
 (`not-required`, `available`, `unavailable`, or `current-unavailable`).
 
+Those counts also travel to the gate as structured data
+(`InlineFindingsSummary::cargo_audit`), not as the rendered caveat string. The
+caveat and the decision are one value rendered twice, so the pack cannot state
+`new=0, pre-existing=2` in `review_caveats` while blocking on an unexplained
+`Cargo audit (Failed)` — which is exactly what it did before the counts reached
+the decision path.
+
+**Lock-based pre-existing proof.** Whether an all-out-of-diff cargo-audit
+failure may be downgraded to pre-existing is decided by `CargoAuditLockProof`,
+not by the whole-tree cleanliness rule (R2-9) that governs every other
+baseline-signal check. R2-9 exists because uncommitted *source* bytes can make a
+finding look out-of-diff; a cargo-audit advisory has no source location to
+forge, since it lives in `Cargo.lock` × the advisory database. The proof that is
+load-bearing is therefore lockfile provenance: the audited `Cargo.lock` is the
+analysed target's. It holds when the run scanned a target snapshot (`cargo
+audit` executes inside the materialised snapshot via `plan_cargo_run`), and,
+for a local run, when the lockfile itself carried no uncommitted change — read
+from the dirty-path set frozen before the checks ran (R4-19), scoped to the
+`cargo_root` lock and the workspace-root lock it falls back to. Dirt anywhere
+else in the tree is not evidence about the lockfile and no longer suppresses the
+downgrade; dirt in the lockfile is, and does.
+
+One proof covers every branch of the comparison, because `in_diff` already
+carries the rest: an untouched lock makes every advisory `in_diff = false`; a
+changed lock with a base audit makes `in_diff` a real `current ∖ base`
+comparison; a changed lock with no base audit leaves every row `in_diff = null`,
+which R5-23 keeps Unclassified whatever the lockfile proof says. R3-14
+(`--current-only`) and R4-20 (no resolvable base diff) still veto the downgrade
+upstream of the proof. A newly published advisory against an unchanged lock is
+therefore reported as pre-existing debt newly revealed, not as debt this change
+introduced — the correct reading, because the change touched no dependency; the
+advisory database moved, the lockfile did not.
+
+The gate says which of these it applied. A downgraded audit carries
+`reason: "pre-existing: Cargo.lock unchanged by this PR (N advisories)"` or
+`"pre-existing: unchanged vs base audit (N advisories)"`; a blocking one names
+what it blocks on — `Cargo audit (Failed): N new vulnerabilities introduced
+(RUSTSEC-…), M pre-existing`, or `N advisories with no base comparison (baseline
+unavailable)` when nothing could be compared.
+
 Semgrep's `errors[]` remains a completeness signal independently of findings.
 Path-like `path`, `location.path`, and span `file` fields are collected into a
 stable deduplicated list and emitted in decision caveats. A partial parser run
@@ -1200,7 +1240,10 @@ The per-check rows answer "what did *this gate* read". `PROVENANCE.json` answers
   this detects a changed endpoint, not edits under an unchanged HEAD or a change
   followed by a return to the original commit (ABA);
   The gate's pre-existing downgrade also uses the captured HEAD, never a later
-  checkout to infer where checks ran. With no captured HEAD no downgrade is
+  checkout to infer where checks ran. The same single status read also yields
+  the dirty-path set the per-file substrate proofs consult (today: cargo audit's
+  lockfile), so cleanliness, the digest and those paths can never describe
+  different observations of the tree. With no captured HEAD no downgrade is
   authorized. HEAD must still match at artifact generation for any downgrade;
   this extra stability check does not re-read cleanliness or rewrite recorded
   starting provenance. With a stable captured non-target checkout, only checks
