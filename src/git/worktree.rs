@@ -543,7 +543,11 @@ const HOST_ELF_MACHINE: Option<u16> = None;
 /// check and is still dropped to `/bin/sh`. The set accepted here is not
 /// proved shell-free by measurement the way the macOS set is — there was no
 /// Linux host in the round that wrote it — so every field it does model is
-/// matched exactly rather than loosely.
+/// matched exactly rather than loosely: `e_phentsize` for equality, and the
+/// program-header table against the same `56 * e_phnum` product the kernel
+/// computes, BOTH halves of that bound. An earlier round asserted that
+/// exactness while `e_phnum` was still bounded from below only, which left
+/// `e_phnum = 1171` claimed here and `-ENOEXEC` in the kernel.
 #[cfg(target_os = "linux")]
 fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool {
     const ELF_HEADER_BYTES: u64 = 64;
@@ -558,6 +562,24 @@ fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool 
     /// reaches `/bin/sh`. A larger entry size is a header the validator would
     /// pass and the kernel would drop.
     const PROGRAM_HEADER_BYTES: u16 = 56;
+    /// The kernel's bound on the WHOLE program-header table, reproduced as the
+    /// same arithmetic rather than as a count. `load_elf_phdrs()` computes
+    /// `sizeof(struct elf_phdr) * e_phnum` and leaves through the same
+    /// `goto out` as the entry size above — hence the same `-ENOEXEC`, hence
+    /// `/bin/sh` — when that product is `0` or greater than 65536. With the
+    /// 56-byte entry demanded above, the largest claimable count is 1170, so
+    /// `e_phnum = 1171` is the first header a looser check hands to the shell.
+    ///
+    /// The lower half of that condition (`size == 0`) is why a count of zero is
+    /// refused here: a table of no segments is not a cautious reading of a
+    /// claimable image, it is an image the loader itself drops.
+    ///
+    /// `PN_XNUM` (`0xffff`, "the real count lives in section 0's `sh_info`")
+    /// needs no arm of its own. `binfmt_elf` implements extended numbering only
+    /// where it WRITES a core dump; the load path just multiplies, and
+    /// `56 * 0xffff` is fifty-odd times past the bound — so this arithmetic
+    /// already refuses that header exactly as the kernel does.
+    const PROGRAM_HEADER_TABLE_BYTES_MAX: u64 = 65536;
 
     let Some(host_machine) = HOST_ELF_MACHINE else {
         return false;
@@ -590,14 +612,19 @@ fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool 
     let header_size = u16::from_le_bytes([header[52], header[53]]);
     let program_header_size = u16::from_le_bytes([header[54], header[55]]);
     let program_headers = u16::from_le_bytes([header[56], header[57]]);
+    // Widened to `u64` BEFORE the multiply, because the product of two `u16`
+    // fields leaves `u16` long before it reaches the bound, and a wrapped
+    // product reads as a small, legal table — the precise false positive this
+    // comparison exists to refuse.
+    let table_bytes = u64::from(program_headers).saturating_mul(u64::from(program_header_size));
     if u64::from(header_size) != ELF_HEADER_BYTES
         || program_header_size != PROGRAM_HEADER_BYTES
-        || program_headers == 0
+        || table_bytes == 0
+        || table_bytes > PROGRAM_HEADER_TABLE_BYTES_MAX
         || program_header_offset == 0
     {
         return false;
     }
-    let table_bytes = u64::from(program_headers).saturating_mul(u64::from(program_header_size));
     program_header_offset.saturating_add(table_bytes) <= length
 }
 
@@ -1516,6 +1543,186 @@ mod tests {
                 proof,
                 ClosureProof::TargetOnly,
                 "a program-header size the kernel refuses must never certify a snapshot scan",
+            );
+        }
+    }
+
+    /// A 64-bit ELF header built from the specification instead of from a host
+    /// toolchain. The cells below then measure format discrimination on every
+    /// runner, including the ones with no `cc` and no readable system binary,
+    /// where a toolchain-derived fixture can only skip itself — and a cell that
+    /// skips proves nothing about the field it is named after.
+    #[cfg(target_os = "linux")]
+    fn synthetic_host_elf(machine: u16, file_type: u16, entry_size: u16, entries: u16) -> Vec<u8> {
+        const PROGRAM_HEADER_OFFSET: u64 = 64;
+        /// Bytes past the advertised table, so no fixture built here is ever
+        /// refused by the header-length gate or by the in-file bounds check —
+        /// a rejection has to come from the field under test.
+        const TAIL_BYTES: usize = 16;
+
+        let mut bytes = vec![0u8; usize::try_from(PROGRAM_HEADER_OFFSET).expect("header fits")];
+        bytes[..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // ELFDATA2LSB
+        bytes[6] = 1; // EV_CURRENT
+        bytes[16..18].copy_from_slice(&file_type.to_le_bytes());
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        bytes[32..40].copy_from_slice(&PROGRAM_HEADER_OFFSET.to_le_bytes()); // e_phoff
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        bytes[54..56].copy_from_slice(&entry_size.to_le_bytes());
+        bytes[56..58].copy_from_slice(&entries.to_le_bytes());
+        let table_bytes = usize::from(entries) * usize::from(entry_size);
+        bytes.resize(bytes.len() + table_bytes + TAIL_BYTES, 0);
+        bytes
+    }
+
+    /// The cell the verifier's F3 asked for. On Linux the magic-prefix fixtures
+    /// are refused by the 64-byte length gate before a single field is read, so
+    /// they would still pass with `e_machine` deleted — and deleting it accepts
+    /// a cross-compiled ELF as target-only, which is the false positive this
+    /// whole proof exists to refuse. This cell runs the other way round: a
+    /// complete, claimable header is the control, and each rejection moves
+    /// exactly one field away from it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_complete_elf_header_is_claimed_only_for_this_host_and_this_kind() {
+        /// The header length gate, which no fixture in this cell may trip.
+        const ELF_HEADER_BYTES: usize = 64;
+        const ET_REL: u16 = 1;
+        const ET_EXEC: u16 = 2;
+        const ET_DYN: u16 = 3;
+        const PROGRAM_HEADER_BYTES: u16 = 56;
+        /// `EM_386`: a real machine and never this branch's host, so it is the
+        /// shape a cross-compiler emits — claimed by no loader running here.
+        const FOREIGN_MACHINE: u16 = 3;
+
+        let relative = Path::new("node_modules/.bin/eslint");
+        let Some(host_machine) = HOST_ELF_MACHINE else {
+            eprintln!("skipped: this build has no host `e_machine`, so no header can match it");
+            return;
+        };
+
+        for file_type in [ET_EXEC, ET_DYN] {
+            let image = synthetic_host_elf(host_machine, file_type, PROGRAM_HEADER_BYTES, 9);
+            let (_tmp, root) = snapshot_with_tool(&image);
+            assert_eq!(
+                path_uses_prview_borrow(&root, relative),
+                ClosureProof::TargetOnly,
+                "control: a complete host header with `e_type` = {file_type} is claimed by \
+                 `binfmt_elf`, so every rejection below is the rewritten field and nothing else",
+            );
+        }
+
+        for (label, image) in [
+            (
+                "a cross-compiled `e_machine`",
+                synthetic_host_elf(FOREIGN_MACHINE, ET_DYN, PROGRAM_HEADER_BYTES, 9),
+            ),
+            (
+                "a relocatable object rather than an executable",
+                synthetic_host_elf(host_machine, ET_REL, PROGRAM_HEADER_BYTES, 9),
+            ),
+            (
+                "an `e_phentsize` the loader refuses",
+                synthetic_host_elf(host_machine, ET_DYN, PROGRAM_HEADER_BYTES + 1, 9),
+            ),
+        ] {
+            // Without this the case could be passing on the length gate, which
+            // reads no field at all — exactly the vacuity F3 found.
+            assert!(
+                image.len() > ELF_HEADER_BYTES,
+                "{label}: the fixture must outlive the header-length gate, or the case would \
+                 pass without the validator reading a single field",
+            );
+
+            let (_tmp, root) = snapshot_with_tool(&image);
+            let proof = path_uses_prview_borrow(&root, relative);
+            assert_eq!(
+                proof,
+                ClosureProof::Unproven,
+                "{label}: `binfmt_elf` drops this header with `-ENOEXEC`, the one code that \
+                 sends the file to `/bin/sh`",
+            );
+            assert_ne!(
+                proof,
+                ClosureProof::TargetOnly,
+                "{label} must never certify an exact snapshot scan",
+            );
+        }
+    }
+
+    /// `e_phnum` is bounded from ABOVE as well as from below: `load_elf_phdrs()`
+    /// computes `sizeof(Elf64_Phdr) * e_phnum` and refuses the image when that
+    /// product is `0` or greater than 65536 — the same `goto out`, the same
+    /// `-ENOEXEC`, the same `/bin/sh` as the entry size beside it. `1170` is the
+    /// largest count that fits; `1171` is the first that does not.
+    ///
+    /// STATIC correction, like its sibling: no Linux host measured this cell,
+    /// the source is `fs/binfmt_elf.c`, `load_elf_phdrs()`. It runs on CI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_elf_program_header_count_the_kernel_rejects_is_unproven() {
+        const ET_DYN: u16 = 3;
+        const PROGRAM_HEADER_BYTES: u16 = 56;
+        /// `56 * 1170 = 65_520`, the largest table `load_elf_phdrs()` reads.
+        const LARGEST_CLAIMABLE_COUNT: u16 = 1170;
+        /// `PN_XNUM`. Extended numbering lives only in the kernel's core-dump
+        /// writer, never on the load path, so here it is just a huge product.
+        const PN_XNUM: u16 = 0xffff;
+
+        let relative = Path::new("node_modules/.bin/eslint");
+        let Some(host_machine) = HOST_ELF_MACHINE else {
+            eprintln!("skipped: this build has no host `e_machine`, so no header can match it");
+            return;
+        };
+
+        let accepted = synthetic_host_elf(
+            host_machine,
+            ET_DYN,
+            PROGRAM_HEADER_BYTES,
+            LARGEST_CLAIMABLE_COUNT,
+        );
+        // The largest claimable table also carries the image past the script
+        // size bound, which pins the ordering this proof depends on: the header
+        // is read first, so a claim here is a claim about the header.
+        assert!(
+            u64::try_from(accepted.len()).expect("image length fits u64") > MAX_JS_SHIM_BYTES,
+            "the control must sit past the shim bound, or it would not show that the header \
+             proof runs before the size bound",
+        );
+        let (_tmp, root) = snapshot_with_tool(&accepted);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "control: `56 * 1170` is exactly the kernel's bound, so this header is claimed and \
+             each rejection below is the count and nothing else",
+        );
+
+        for count in [0, LARGEST_CLAIMABLE_COUNT + 1, 2000, PN_XNUM] {
+            let image = synthetic_host_elf(host_machine, ET_DYN, PROGRAM_HEADER_BYTES, count);
+            // Without this the case could be passing on the in-file bounds
+            // check — the last thing the branch evaluates — and would prove
+            // nothing about the kernel's arithmetic.
+            let table_bytes = u64::from(count) * u64::from(PROGRAM_HEADER_BYTES);
+            assert!(
+                64 + table_bytes <= u64::try_from(image.len()).expect("image length fits u64"),
+                "the advertised table must fit inside the fixture, or the rejection would come \
+                 from the bounds check rather than from `e_phnum` = {count}",
+            );
+
+            let (_tmp, root) = snapshot_with_tool(&image);
+            let proof = path_uses_prview_borrow(&root, relative);
+            assert_eq!(
+                proof,
+                ClosureProof::Unproven,
+                "`56 * {count}` is outside `load_elf_phdrs()`'s bound, so the kernel returns \
+                 `-ENOEXEC` and `execvp` retries the file through `/bin/sh`",
+            );
+            assert_ne!(
+                proof,
+                ClosureProof::TargetOnly,
+                "a program-header count the kernel refuses must never certify a snapshot scan",
             );
         }
     }

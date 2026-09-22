@@ -159,8 +159,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validated platform header for the running kernel**: on macOS a complete
   `mach_header` with the host `cputype` and `MH_EXECUTE`, or a 32-bit universal
   binary in which **every** host-`cputype` slice is claimable; on Linux a
-  complete ELF header with the host `e_machine`, `ET_EXEC`/`ET_DYN` and
-  `e_phentsize` equal to `sizeof(Elf64_Phdr)`; on any other Unix, nothing. A
+  complete ELF header with the host `e_machine`, `ET_EXEC`/`ET_DYN`,
+  `e_phentsize` equal to `sizeof(Elf64_Phdr)` and a program-header table within
+  the kernel's `56 * e_phnum <= 65536` bound; on any other Unix, nothing. A
   format this kernel has no loader for — ELF on macOS, Mach-O on Linux — is
   recognisable but not executable, so it is the fallback vector rather than
   evidence. The proof reads a bounded header window and so still runs before the
@@ -178,9 +179,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the state that promises the scanned bytes are exactly `target_sha`. So the
   accepted set is narrowed to what a kernel probe measured with zero fallback:
   all host slices claimable for fat, `FAT_MAGIC_64` recognised and refused, and
-  on Linux `e_phentsize` matched for equality because `load_elf_phdrs()` turns
-  any other size into the same `ENOEXEC`. One thing is named rather than relied
-  on: bash refuses a file carrying a NUL before its first newline, and every
+  on Linux the whole of `load_elf_phdrs()`'s arithmetic reproduced rather than
+  half of it: `e_phentsize` matched for equality, and the program-header table
+  refused when `56 * e_phnum` is zero or above 65536, because every one of those
+  exits is the same `ENOEXEC`. Modelling only the lower half of that bound left
+  `e_phnum` = 1171 claimed here and dropped to `/bin/sh` there. One thing is
+  named rather than relied on: bash refuses a file carrying a NUL before its
+  first newline, and every
   accepted macOS header happens to carry one, so no accepted file ran as a
   script even before this fix — that is an accident of the binary formats, not
   part of the contract, and `dash` makes no such promise.

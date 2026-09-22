@@ -682,14 +682,19 @@ but not executable, so they are the fallback vector rather than evidence:
 - **Linux** accepts only ELF: a complete 64-bit header with valid `e_ident`
   (class, data, version), `e_type` of `ET_EXEC` or `ET_DYN` (every PIE
   executable is `ET_DYN`), `e_machine` equal to the host's, `e_phentsize`
-  **equal** to `sizeof(Elf64_Phdr)`, and a program-header table inside the file.
-  `binfmt_elf` rejects a foreign `e_machine` with `ENOEXEC`, which is precisely
-  the code that reaches `/bin/sh`, and `load_elf_phdrs()` turns any other
-  entry size into the same code. This branch stays deliberately narrower than
-  `binfmt_elf`'s full triage: the exits it does not model — no `PT_LOAD`
-  segment, a `PT_INTERP` failing the loader's bounds — are further `ENOEXEC`
-  paths, and unlike the macOS set this one carries no kernel measurement behind
-  it yet.
+  **equal** to `sizeof(Elf64_Phdr)`, a program-header table whose total size
+  `sizeof(Elf64_Phdr) * e_phnum` is neither zero nor greater than **65536**,
+  and that table inside the file. `binfmt_elf` rejects a foreign `e_machine`
+  with `ENOEXEC`, which is precisely the code that reaches `/bin/sh`, and
+  `load_elf_phdrs()` turns any other entry size — and any table outside that
+  size bound — into the same code, in one `goto out` chain. With a 56-byte
+  entry the bound is `e_phnum <= 1170`; `e_phnum = 0xffff` (`PN_XNUM`) needs no
+  special case, because extended numbering exists only in the kernel's
+  core-dump writer and the load path simply multiplies. This branch stays
+  deliberately narrower than `binfmt_elf`'s full triage: the exits it does not
+  model — no `PT_LOAD` segment, a `PT_INTERP` failing the loader's bounds — are
+  further `ENOEXEC` paths, and unlike the macOS set this one carries no kernel
+  measurement behind it yet.
 - **Any other Unix** has no proof path, so every header is unproven.
 
 Several of these fields are load-bearing rather than hygienic, measured on
