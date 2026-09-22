@@ -626,19 +626,56 @@ scan.
 
 The proof boundary has three structural sources. A symlink is resolved by
 canonical filesystem identity. A regular executable is proved target-only either
-by **native object-file magic** or by an **anchored grammar**; anything else is
-unproven.
+by a **fully validated platform header** or by an **anchored grammar**; anything
+else is unproven.
 
-Native recognition reads the first four bytes and accepts only ELF
-(`7F 45 4C 46`), thin Mach-O in both endiannesses and both widths
-(`MH_MAGIC`/`MH_CIGAM`, `MH_MAGIC_64`/`MH_CIGAM_64`), and fat/universal Mach-O
-(`FAT_MAGIC`/`FAT_CIGAM`, `FAT_MAGIC_64`/`FAT_CIGAM_64`). The **absence of `#!`
-is not native recognition** and must never stand in for it: prview spawns
-through `Command`, hence `execvp`, and POSIX requires `execvp` to retry an
-`ENOEXEC` file through `/bin/sh` — so a file with no interpreter directive is a
-shell script with unbounded indirection, not a native binary. Magic is read
-before the script size bound, because four bytes settle a file's kind at any
-size and real compiled tools are routinely larger than that bound.
+The native test is whether the kernel's own image loader **claims** the file,
+not whether prview recognises its opening bytes. The distinction is the whole
+proof. prview spawns through `Command`, hence `execvp`, and POSIX requires
+`execvp` to retry through `/bin/sh` on exactly one condition: `ENOEXEC`, meaning
+no loader recognised the image as its own. A file whose platform header
+validates completely therefore has only two futures, and both keep the closure
+target-only — the kernel executes the committed bytes, or the loader rejects the
+image outright (`EBADMACHO`, `EBADARCH`, `EBADEXEC`) with no shell in the path.
+A recognised **prefix** buys neither: a host-format magic on a truncated or
+non-executable header is claimed by nothing, returns `ENOEXEC`, and `/bin/sh`
+then runs the remaining bytes as a script with the full indirection a shell
+allows. Four bytes are a hope about a file's kind; the loader settles the kind
+after the whole header.
+
+Validation is therefore per platform, and a format the running kernel has no
+loader for is never a proof — ELF on macOS and Mach-O on Linux are recognisable
+but not executable, so they are the fallback vector rather than evidence:
+
+- **macOS** accepts only Mach-O. A thin image must carry a complete
+  `mach_header`/`mach_header_64` in host byte order (`MH_MAGIC`/`MH_MAGIC_64`)
+  whose `cputype` is the host's, whose `filetype` is `MH_EXECUTE`, and whose
+  load-command table fits inside the file. A fat/universal image
+  (`FAT_MAGIC`/`FAT_MAGIC_64`, big-endian by definition) must carry a
+  `fat_arch` entry for the host `cputype` whose extent is in bounds and whose
+  slice header is itself claimable. `cpusubtype` is deliberately not matched,
+  because Apple ships `/bin/ls` as an `arm64e` slice a plain `arm64` host runs.
+- **Linux** accepts only ELF: a complete 64-bit header with valid `e_ident`
+  (class, data, version), `e_type` of `ET_EXEC` or `ET_DYN` (every PIE
+  executable is `ET_DYN`), `e_machine` equal to the host's, and a program-header
+  table inside the file. `binfmt_elf` rejects a foreign `e_machine` with
+  `ENOEXEC`, which is precisely the code that reaches `/bin/sh`.
+- **Any other Unix** has no proof path, so every header is unproven.
+
+Two of these fields are load-bearing rather than hygienic, measured on
+macOS/arm64: a header valid in every other respect but declaring `MH_DYLIB` is
+not claimed and reaches `/bin/sh`, and so is a fat header advertising a host
+slice whose bytes are not a Mach-O image. The bounds checks are the conservative
+half — an overflowing table already fails `EBADMACHO` without a fallback — and
+only narrow an acceptance set that is safe without them.
+
+The **absence of `#!` is not native recognition** and must never stand in for
+it: a file with no interpreter directive is a shell script with unbounded
+indirection. The header proof runs before the script size bound, because it
+reads a bounded header window rather than content, so file size neither grants
+nor withholds it and a large compiled tool still proves its own kind. An
+oversized file that fails the header proof falls through to that bound and stays
+unproved.
 
 The recognized content grammars are two, both narrow, and both able only to
 RAISE confidence: the strict pnpm-shaped shell skeleton (a shell shebang, a
@@ -660,7 +697,8 @@ byte-exact spelling, and any final payload outside the canonical snapshot root
 is borrowed even when a tracked absolute symlink led there. A recognized
 package wrapper can resolve plugins, types, or transitive modules dynamically,
 so any prview-created entry in its `node_modules` is conservatively part of that
-command's substrate. Only a native object file or a proved-direct shell script
+command's substrate. Only a file whose platform header the loader claims, or a proved-direct shell
+script
 (the intentionally small grammar of terminal shell builtins used by direct
 launchers) can remain `Snapshot` without wrapper-payload traversal.
 
@@ -680,7 +718,7 @@ The executable/layout matrix composes with every row above:
 
 | Executable | Flat `node_modules` | `.pnpm` store | Nested `node_modules` |
 |---|---|---|---|
-| native object file (ELF / Mach-O magic) | invocation bytes only | invocation bytes only | invocation bytes only |
+| native object file (fully validated platform header) | invocation bytes only | invocation bytes only | invocation bytes only |
 | proved-direct shell script (terminal-builtin grammar) | invocation bytes only | invocation bytes only | invocation bytes only |
 | npm shim | canonical Unix symlink target; a real shell shim matches no grammar and is `SnapshotUnprovenDeps` | follow package links into the store | follow the canonical target, else unproven |
 | strict pnpm-shaped shell shim | follow the anchored `$basedir/<payload>` grammar and dynamic `node_modules` dependencies | follow sibling links into `.pnpm`; any created dependency makes the closure borrowed | follow the wrapper-relative nested payload; an unmatched grammar is unproven |
@@ -689,8 +727,10 @@ The executable/layout matrix composes with every row above:
 Unix permissions are an independent, final-resolution axis. The
 executable/layout axis grew from 12 to 15 cells with the third provenance state:
 `native object file` and `proved-direct shell script` are no longer one row,
-because they are now two structurally different proofs — a byte-prefix magic and
-a line grammar — and only the first is available to a file with no `#!`. So the
+because they are now two structurally different proofs — a validated platform
+header and a line grammar — and only the first is available to a file with no
+`#!`. The row count is unchanged: validating the whole header instead of a
+four-byte prefix narrows which files land in that row, not how many rows exist. So the
 entry/creator (28 logical cells) and executable/layout (5 × 3 = 15 cells) axes
 compose with two permission states: **28 × 15 × 2 = 840 logical cells**.
 

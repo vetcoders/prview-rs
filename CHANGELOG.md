@@ -144,16 +144,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `snapshot-unproven-deps` as cautiously as `snapshot-borrowed-deps`: it is not
   an exact scan. Existing values are unchanged, and test/package selection
   treats the new state exactly like the other two exact-source snapshots.
-- **A tool with no `#!` is no longer certified as an exact snapshot scan.**
-  "No shebang" was standing in for "native binary, no indirection". It is the
-  opposite: prview spawns through `Command`, hence `execvp`, and POSIX requires
-  `execvp` to retry an `ENOEXEC` file through `/bin/sh` — so such a file is a
-  shell script with unbounded indirection. Deleting one `#!/bin/sh` line was
-  enough to flip a run that executed the operator's uncommitted bytes from
-  `snapshot-borrowed-deps` to `snapshot`. Target-only closure is now proved only
-  by explicit object-file magic (ELF, thin Mach-O in both endiannesses and
-  widths, fat/universal Mach-O in both offset widths), read before the script
-  size bound so a large compiled tool still proves its own kind.
+- **A tool with no `#!` is no longer certified as an exact snapshot scan, and
+  neither is one that merely opens with an object-file magic.** "No shebang" was
+  standing in for "native binary, no indirection". It is the opposite: prview
+  spawns through `Command`, hence `execvp`, and POSIX requires `execvp` to retry
+  an `ENOEXEC` file through `/bin/sh` — so such a file is a shell script with
+  unbounded indirection. Deleting one `#!/bin/sh` line was enough to flip a run
+  that executed the operator's uncommitted bytes from `snapshot-borrowed-deps`
+  to `snapshot`. Recognising a four-byte magic does not close that hole, because
+  `ENOEXEC` is returned by the *loader*, after the whole header: prefixing the
+  same launcher with `\x7fELF` — or even with the host's own `CF FA ED FE` —
+  still reaches `/bin/sh`, and merely recognising the prefix turned silence into
+  a false positive claim. Target-only closure is now proved only by a **fully
+  validated platform header for the running kernel**: on macOS a complete
+  `mach_header` with the host `cputype` and `MH_EXECUTE`, or a universal binary
+  carrying a claimable host slice; on Linux a complete ELF header with the host
+  `e_machine` and `ET_EXEC`/`ET_DYN`; on any other Unix, nothing. A format this
+  kernel has no loader for — ELF on macOS, Mach-O on Linux — is recognisable but
+  not executable, so it is the fallback vector rather than evidence. The proof
+  reads a bounded header window and so still runs before the script size bound,
+  leaving a large compiled tool able to prove its own kind while an oversized
+  file with no claimable header stays unproved.
 - **Every run is now bounded in time.** A local review, `--tui`, and a detached
   MCP `run_review deep` get 30 minutes; `--ci` and `prview gate` get 60. (An MCP
   `quick` review keeps its own, tighter 120-second server budget.) The numbers

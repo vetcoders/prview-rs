@@ -251,68 +251,321 @@ fn path_is_external_or_borrowed(snapshot_root: &Path, path: &Path, borrowed: &[P
     })
 }
 
-/// How many leading bytes settle a native object file's identity.
-#[cfg(unix)]
-const NATIVE_MAGIC_BYTES: usize = 4;
-
-/// The object-file magics that positively prove "this file is executed by the
-/// kernel, not by an interpreter", in on-disk byte order:
+/// Whether the kernel's own image loader CLAIMS `path` as an executable for
+/// this platform and this architecture.
 ///
-/// - `7F 45 4C 46` — ELF (`\x7FELF`): every Linux and BSD executable;
-/// - `CE FA ED FE` / `FE ED FA CE` — thin Mach-O 32-bit, `MH_MAGIC` /
-///   `MH_CIGAM` (both endiannesses);
-/// - `CF FA ED FE` / `FE ED FA CF` — thin Mach-O 64-bit, `MH_MAGIC_64` /
-///   `MH_CIGAM_64`;
-/// - `CA FE BA BE` / `BE BA FE CA` — fat/universal Mach-O with 32-bit offsets,
-///   `FAT_MAGIC` / `FAT_CIGAM`: the shape Apple actually ships in `/bin`;
-/// - `CA FE BA BF` / `BF BA FE CA` — fat/universal Mach-O with 64-bit offsets,
-///   `FAT_MAGIC_64` / `FAT_CIGAM_64`.
+/// This is the one positive proof that no interpreter indirection exists, and
+/// the bar has to be "the loader claims the file", never "the file opens with a
+/// magic we recognise". prview spawns through `Command`, hence `execvp`, and
+/// POSIX requires `execvp` to retry a file through `/bin/sh` on exactly one
+/// condition: `ENOEXEC` — no loader recognised the image as its own. So a file
+/// whose platform header validates completely has only two futures, and both
+/// keep the closure target-only: the kernel executes the committed bytes, or
+/// the loader rejects the image outright (`EBADMACHO`, `EBADARCH`,
+/// `EBADEXEC`) with no shell in the path. A recognised PREFIX buys neither. A
+/// host-format magic on a truncated or non-executable header is claimed by
+/// nothing, falls through to `ENOEXEC`, and `/bin/sh` then runs the remaining
+/// bytes as a script with the full unbounded indirection a shell allows —
+/// measured on macOS/arm64: a `CF FA ED FE` prefix followed by a shell line
+/// executes that line, while the same magic carrying a complete `MH_EXECUTE`
+/// header for the host `cputype` fails `EBADMACHO` without a fallback.
 ///
-/// `CA FE BA BE` is also the Java class-file magic. The collision cannot produce
-/// a false exact-snapshot claim in practice: a class file at
-/// `node_modules/.bin/<tool>` has no interpreter of its own, so the spawn fails
-/// and no ambient bytes execute. Recognising the fat magic is worth that, since
-/// it is the format every Apple-shipped executable uses.
+/// Everything the loader does not claim is [`ClosureProof::Unproven`]. That
+/// includes formats this platform has no loader for at all: ELF on macOS and
+/// Mach-O on Linux are recognisable, not executable, so they are the fallback
+/// case rather than a proof.
+///
+/// The read is bounded — a header and, for a universal binary, one slice
+/// header — so the proof costs the same on a 4 KiB launcher and a 400 MiB
+/// toolchain. That is why it may run before the script size bound: nothing here
+/// reads content, and file size neither strengthens nor weakens the claim.
 #[cfg(unix)]
-const NATIVE_EXECUTABLE_MAGICS: &[[u8; NATIVE_MAGIC_BYTES]] = &[
-    [0x7F, b'E', b'L', b'F'],
-    [0xCE, 0xFA, 0xED, 0xFE],
-    [0xFE, 0xED, 0xFA, 0xCE],
-    [0xCF, 0xFA, 0xED, 0xFE],
-    [0xFE, 0xED, 0xFA, 0xCF],
-    [0xCA, 0xFE, 0xBA, 0xBE],
-    [0xBE, 0xBA, 0xFE, 0xCA],
-    [0xCA, 0xFE, 0xBA, 0xBF],
-    [0xBF, 0xBA, 0xFE, 0xCA],
-];
-
-#[cfg(unix)]
-fn is_native_executable_magic(header: &[u8; NATIVE_MAGIC_BYTES]) -> bool {
-    NATIVE_EXECUTABLE_MAGICS.contains(header)
+fn kernel_claims_native_executable(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    platform_header_claims_executable(&file, metadata.len())
 }
 
-/// The first [`NATIVE_MAGIC_BYTES`] of `path`, or `None` when the file is
-/// shorter than that or cannot be read.
-///
-/// Deliberately a bounded header read rather than a whole-file read: this runs
-/// before the script size bound, so the file on the other end may be an
-/// arbitrarily large binary.
+/// Reads exactly `buffer.len()` bytes at `offset`, or reports failure. A short
+/// file is a failed proof, never a partial one.
 #[cfg(unix)]
-fn native_magic_header(path: &Path) -> Option<[u8; NATIVE_MAGIC_BYTES]> {
-    use std::io::Read as _;
+fn read_header_at(file: &std::fs::File, offset: u64, buffer: &mut [u8]) -> bool {
+    use std::os::unix::fs::FileExt as _;
 
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut header = [0u8; NATIVE_MAGIC_BYTES];
-    let mut filled = 0;
-    while filled < header.len() {
-        match file.read(&mut header[filled..]) {
-            Ok(0) => return None,
-            Ok(read) => filled += read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
+    file.read_exact_at(buffer, offset).is_ok()
+}
+
+/// `CPU_TYPE_ARM64` / `CPU_TYPE_X86_64` — `CPU_ARCH_ABI64 | CPU_TYPE_{ARM,X86}`.
+/// An architecture with no entry here has no proof path, because a `cputype`
+/// this build cannot name cannot be compared against the running kernel.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const HOST_MACH_CPU_TYPE: Option<u32> = Some(0x0100_0000 | 12);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const HOST_MACH_CPU_TYPE: Option<u32> = Some(0x0100_0000 | 7);
+#[cfg(all(
+    target_os = "macos",
+    not(any(target_arch = "aarch64", target_arch = "x86_64"))
+))]
+const HOST_MACH_CPU_TYPE: Option<u32> = None;
+
+/// macOS: only Mach-O, only this host's `cputype`, only a complete header.
+///
+/// Thin magics are read in host byte order on purpose. The byte-swapped forms
+/// (`MH_CIGAM`, `MH_CIGAM_64`) describe an image for a machine of the opposite
+/// endianness, which this kernel never executes; the same goes for the
+/// little-endian fat forms (`FAT_CIGAM`, `FAT_CIGAM_64`), since the fat header
+/// is big-endian by definition. Recognising them would only widen the set of
+/// files that are named and not claimed.
+#[cfg(target_os = "macos")]
+fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool {
+    const MH_MAGIC: u32 = 0xFEED_FACE;
+    const MH_MAGIC_64: u32 = 0xFEED_FACF;
+    const FAT_MAGIC: u32 = 0xCAFE_BABE;
+    const FAT_MAGIC_64: u32 = 0xCAFE_BABF;
+
+    let Some(host_cpu_type) = HOST_MACH_CPU_TYPE else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    if !read_header_at(file, 0, &mut magic) {
+        return false;
+    }
+    match u32::from_le_bytes(magic) {
+        MH_MAGIC_64 => mach_header_claims_executable(file, 0, length, host_cpu_type, true),
+        MH_MAGIC => mach_header_claims_executable(file, 0, length, host_cpu_type, false),
+        _ => match u32::from_be_bytes(magic) {
+            FAT_MAGIC => fat_header_claims_executable(file, length, host_cpu_type, false),
+            FAT_MAGIC_64 => fat_header_claims_executable(file, length, host_cpu_type, true),
+            _ => false,
+        },
+    }
+}
+
+/// A complete `mach_header`/`mach_header_64` at `slice_offset`, for an image of
+/// `slice_length` bytes.
+///
+/// `filetype` is load-bearing rather than decorative: a header that is valid in
+/// every other respect but says `MH_DYLIB` is NOT claimed, returns `ENOEXEC`,
+/// and hands the file to `/bin/sh` — measured on macOS/arm64. The `sizeofcmds`
+/// bound is the weaker, conservative half: an overflowing load-command table
+/// fails `EBADMACHO` without a fallback, so checking it only narrows an already
+/// safe acceptance set.
+#[cfg(target_os = "macos")]
+fn mach_header_claims_executable(
+    file: &std::fs::File,
+    slice_offset: u64,
+    slice_length: u64,
+    host_cpu_type: u32,
+    wide: bool,
+) -> bool {
+    /// Smallest `load_command`: `cmd` plus `cmdsize`.
+    const LOAD_COMMAND_MIN_BYTES: u64 = 8;
+    const MH_EXECUTE: u32 = 2;
+
+    let header_bytes: u64 = if wide { 32 } else { 28 };
+    if slice_length < header_bytes {
+        return false;
+    }
+    // Every field this proof reads lives in the 24 bytes both layouts share.
+    let mut header = [0u8; 24];
+    if !read_header_at(file, slice_offset, &mut header) {
+        return false;
+    }
+    let field = |offset: usize| -> u32 {
+        u32::from_le_bytes([
+            header[offset],
+            header[offset + 1],
+            header[offset + 2],
+            header[offset + 3],
+        ])
+    };
+    if field(4) != host_cpu_type || field(12) != MH_EXECUTE {
+        return false;
+    }
+    let commands = u64::from(field(16));
+    let commands_bytes = u64::from(field(20));
+    if commands == 0 || commands_bytes == 0 {
+        return false;
+    }
+    if commands.saturating_mul(LOAD_COMMAND_MIN_BYTES) > commands_bytes {
+        return false;
+    }
+    header_bytes.saturating_add(commands_bytes) <= slice_length
+}
+
+/// A universal binary is claimed only through the slice the loader would pick:
+/// the first entry whose `cputype` is the host's, whose extent is inside the
+/// file, and whose own `mach_header` is itself claimable.
+///
+/// Validating that inner header is load-bearing. A fat header advertising a
+/// host slice whose bytes are not a Mach-O image is NOT claimed, returns
+/// `ENOEXEC`, and reaches `/bin/sh` — measured on macOS/arm64. Matching the
+/// `cpusubtype` is deliberately NOT required: Apple ships `/bin/ls` as an
+/// `arm64e` slice that a plain `arm64` host executes.
+#[cfg(target_os = "macos")]
+fn fat_header_claims_executable(
+    file: &std::fs::File,
+    length: u64,
+    host_cpu_type: u32,
+    wide: bool,
+) -> bool {
+    const MH_MAGIC: u32 = 0xFEED_FACE;
+    const MH_MAGIC_64: u32 = 0xFEED_FACF;
+    const FAT_HEADER_BYTES: u64 = 8;
+    /// Sanity ceiling on `nfat_arch`; Apple ships a handful, never thousands.
+    const MAX_FAT_ARCHITECTURES: u32 = 64;
+
+    let architecture_bytes: u64 = if wide { 32 } else { 20 };
+    let mut count = [0u8; 4];
+    if !read_header_at(file, 4, &mut count) {
+        return false;
+    }
+    let architectures = u32::from_be_bytes(count);
+    if architectures == 0 || architectures > MAX_FAT_ARCHITECTURES {
+        return false;
+    }
+    let table_bytes = u64::from(architectures).saturating_mul(architecture_bytes);
+    if FAT_HEADER_BYTES.saturating_add(table_bytes) > length {
+        return false;
+    }
+    for index in 0..u64::from(architectures) {
+        let entry = FAT_HEADER_BYTES + index * architecture_bytes;
+        let mut cpu_type = [0u8; 4];
+        if !read_header_at(file, entry, &mut cpu_type) {
+            return false;
+        }
+        if u32::from_be_bytes(cpu_type) != host_cpu_type {
+            continue;
+        }
+        let (offset, size) = if wide {
+            let mut extent = [0u8; 16];
+            if !read_header_at(file, entry + 8, &mut extent) {
+                return false;
+            }
+            (
+                u64::from_be_bytes(extent[..8].try_into().expect("eight bytes")),
+                u64::from_be_bytes(extent[8..].try_into().expect("eight bytes")),
+            )
+        } else {
+            let mut extent = [0u8; 8];
+            if !read_header_at(file, entry + 8, &mut extent) {
+                return false;
+            }
+            (
+                u64::from(u32::from_be_bytes(
+                    extent[..4].try_into().expect("four bytes"),
+                )),
+                u64::from(u32::from_be_bytes(
+                    extent[4..].try_into().expect("four bytes"),
+                )),
+            )
+        };
+        if offset.saturating_add(size) > length {
+            continue;
+        }
+        let mut slice_magic = [0u8; 4];
+        if !read_header_at(file, offset, &mut slice_magic) {
+            continue;
+        }
+        let claimed = match u32::from_le_bytes(slice_magic) {
+            MH_MAGIC_64 => mach_header_claims_executable(file, offset, size, host_cpu_type, true),
+            MH_MAGIC => mach_header_claims_executable(file, offset, size, host_cpu_type, false),
+            _ => false,
+        };
+        if claimed {
+            return true;
         }
     }
-    Some(header)
+    false
+}
+
+/// `EM_X86_64` / `EM_AARCH64`. As on macOS, an architecture with no entry has
+/// no proof path.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const HOST_ELF_MACHINE: Option<u16> = Some(62);
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const HOST_ELF_MACHINE: Option<u16> = Some(183);
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+const HOST_ELF_MACHINE: Option<u16> = None;
+
+/// Linux: only ELF, only this host's `e_machine`, only a complete header.
+///
+/// `e_machine` is the load-bearing field here — `binfmt_elf` rejects a foreign
+/// machine with `ENOEXEC`, which is precisely the code that reaches `/bin/sh`,
+/// so a Mach-O (or a cross-compiled ELF) is a fallback vector rather than a
+/// proof. `ET_DYN` is accepted beside `ET_EXEC` because every PIE executable —
+/// which is what a modern toolchain emits by default — is `ET_DYN`, and the
+/// kernel claims both.
+#[cfg(target_os = "linux")]
+fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool {
+    const ELF_HEADER_BYTES: u64 = 64;
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const EV_CURRENT: u8 = 1;
+    const ET_EXEC: u16 = 2;
+    const ET_DYN: u16 = 3;
+    /// Smallest 64-bit `Elf64_Phdr`.
+    const PROGRAM_HEADER_MIN_BYTES: u16 = 56;
+
+    let Some(host_machine) = HOST_ELF_MACHINE else {
+        return false;
+    };
+    if length < ELF_HEADER_BYTES {
+        return false;
+    }
+    let mut header = [0u8; 64];
+    if !read_header_at(file, 0, &mut header) {
+        return false;
+    }
+    if header[..4] != [0x7F, b'E', b'L', b'F'] {
+        return false;
+    }
+    if header[4] != ELFCLASS64 || header[5] != ELFDATA2LSB || header[6] != EV_CURRENT {
+        return false;
+    }
+    let file_type = u16::from_le_bytes([header[16], header[17]]);
+    if file_type != ET_EXEC && file_type != ET_DYN {
+        return false;
+    }
+    if u16::from_le_bytes([header[18], header[19]]) != host_machine {
+        return false;
+    }
+    if u32::from_le_bytes([header[20], header[21], header[22], header[23]]) != u32::from(EV_CURRENT)
+    {
+        return false;
+    }
+    let program_header_offset = u64::from_le_bytes(header[32..40].try_into().expect("eight bytes"));
+    let header_size = u16::from_le_bytes([header[52], header[53]]);
+    let program_header_size = u16::from_le_bytes([header[54], header[55]]);
+    let program_headers = u16::from_le_bytes([header[56], header[57]]);
+    if u64::from(header_size) != ELF_HEADER_BYTES
+        || program_header_size < PROGRAM_HEADER_MIN_BYTES
+        || program_headers == 0
+        || program_header_offset == 0
+    {
+        return false;
+    }
+    let table_bytes = u64::from(program_headers).saturating_mul(u64::from(program_header_size));
+    program_header_offset.saturating_add(table_bytes) <= length
+}
+
+/// Every other Unix: no proof path, so no file is ever proved target-only by
+/// its header. The conservative answer is the only honest one — claiming a
+/// closure this build cannot reason about is the failure mode this whole
+/// function exists to prevent.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn platform_header_claims_executable(_file: &std::fs::File, _length: u64) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -351,17 +604,17 @@ fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
             closure_proven: true,
         };
     }
-    // A recognised object file is the ONE positive proof that no script
-    // indirection exists: the kernel executes these bytes directly, so the
-    // closure is the invocation itself.
+    // A header the platform's loader claims is the ONE positive proof that no
+    // script indirection exists: the kernel either executes these bytes or
+    // refuses the image, and neither path reaches an interpreter.
     //
-    // Read BEFORE the size bound. Four bytes settle a file's kind at any size,
+    // Checked BEFORE the size bound, because the proof reads a bounded header
+    // rather than content — it neither gains nor loses strength with file size,
     // and real compiled tools are routinely larger than a shim bound (macOS
-    // ships `/bin/echo` at ~100 KiB). The bound exists for CONTENT analysis,
-    // which magic recognition does not perform.
-    if let Some(header) = native_magic_header(&invocation)
-        && is_native_executable_magic(&header)
-    {
+    // ships `/bin/ls` at ~150 KiB). The bound guards CONTENT analysis, which
+    // this does not perform. An oversized file that fails the header proof
+    // still falls through to that bound and stays unproved.
+    if kernel_claims_native_executable(&invocation) {
         return ConsumedPaths {
             paths: consumed,
             package_wrapper: false,
@@ -382,12 +635,12 @@ fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
             closure_proven: false,
         };
     };
-    // No `#!` and no recognised magic proves NOTHING about the closure, and it
-    // must never be read as "native binary". prview spawns through `Command`,
-    // hence `execvp`, and POSIX requires `execvp` to retry an `ENOEXEC` file
-    // through `/bin/sh` — so this file is a shell script whose interpreter was
-    // chosen for it, with the full, unbounded indirection a shell allows. The
-    // magic check above is the only thing that can rule that out.
+    // No `#!` and no claimed platform header proves NOTHING about the closure,
+    // and it must never be read as "native binary". prview spawns through
+    // `Command`, hence `execvp`, and POSIX requires `execvp` to retry an
+    // `ENOEXEC` file through `/bin/sh` — so this file is a shell script whose
+    // interpreter was chosen for it, with the full, unbounded indirection a
+    // shell allows. The header proof above is the only thing that rules it out.
     if !bytes.starts_with(b"#!") {
         return ConsumedPaths {
             paths: consumed,
@@ -862,38 +1115,180 @@ mod tests {
         (tmp, root)
     }
 
+    /// Bytes of a real, kernel-executable image for THIS host.
+    ///
+    /// Synthesising one from a magic prefix is the circularity these fixtures
+    /// exist to break: it would prove only that the validator agrees with
+    /// itself, and the prefix-shaped file it produces is exactly the one the
+    /// kernel hands to `/bin/sh`. A freshly compiled binary is the strongest
+    /// available source; a system executable the OS itself ships and runs is
+    /// the fallback on a machine with no C compiler.
+    #[cfg(unix)]
+    fn host_native_executable_bytes(scratch: &Path) -> Option<Vec<u8>> {
+        let source = scratch.join("probe.c");
+        let binary = scratch.join("probe");
+        if std::fs::write(&source, "int main(void) { return 0; }\n").is_ok()
+            && std::process::Command::new("cc")
+                .arg("-o")
+                .arg(&binary)
+                .arg(&source)
+                .status()
+                .is_ok_and(|status| status.success())
+            && let Ok(bytes) = std::fs::read(&binary)
+        {
+            return Some(bytes);
+        }
+        ["/bin/ls", "/bin/cat", "/bin/sh", "/usr/bin/env"]
+            .into_iter()
+            .find_map(|candidate| std::fs::read(candidate).ok())
+    }
+
+    /// The magic of a format this platform has NO loader for. It is
+    /// recognisable and never executable, which is precisely the shape that
+    /// returns `ENOEXEC` and reaches `/bin/sh`.
+    #[cfg(target_os = "macos")]
+    const FOREIGN_FORMAT_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
+    #[cfg(target_os = "linux")]
+    const FOREIGN_FORMAT_MAGIC: [u8; 4] = [0xCF, 0xFA, 0xED, 0xFE];
+
+    /// The magic of THIS platform's own executable format. On its own, without
+    /// the rest of the header, it is still not a proof — the loader claims
+    /// nothing from four bytes.
+    #[cfg(target_os = "macos")]
+    const HOST_FORMAT_MAGIC: [u8; 4] = [0xCF, 0xFA, 0xED, 0xFE];
+    #[cfg(target_os = "linux")]
+    const HOST_FORMAT_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
+
     #[cfg(unix)]
     #[test]
-    fn native_object_file_magic_proves_a_target_only_closure() {
+    fn a_real_host_binary_proves_a_target_only_closure() {
         let relative = Path::new("node_modules/.bin/eslint");
-
-        // Every entry is padded past the SCRIPT bound on purpose. That is the
-        // one shape where real magic recognition and the discarded "no `#!`"
-        // proxy disagree, so each list entry has to carry its own weight here —
-        // and it matches reality, where compiled tools are larger than the
-        // bound (macOS ships `/bin/echo` at ~100 KiB). Four bytes settle a
-        // file's kind at any size; the bound exists for content analysis only.
-        let bound = usize::try_from(MAX_JS_SHIM_BYTES).expect("shim bound fits usize");
-        for magic in NATIVE_EXECUTABLE_MAGICS {
-            let mut bytes = magic.to_vec();
-            bytes.resize(bound * 2, 0);
-            let (_tmp, root) = snapshot_with_tool(&bytes);
-            assert_eq!(
-                path_uses_prview_borrow(&root, relative),
-                ClosureProof::TargetOnly,
-                "magic {magic:02X?} names an object file the kernel executes directly, \
-                 so the closure is the invocation itself at any file size",
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let Some(native) = host_native_executable_bytes(scratch.path()) else {
+            // Nothing on this machine is independently established as
+            // kernel-executable, so there is no honest positive fixture. A
+            // synthesised one would re-introduce the circularity above, so the
+            // case is skipped by name rather than faked.
+            eprintln!(
+                "skipped: no C compiler and no readable system executable on this host, \
+                 so no independently kernel-executable fixture exists"
             );
-        }
+            return;
+        };
 
-        // A small object file is proved by the same four bytes.
-        let mut small = NATIVE_EXECUTABLE_MAGICS[0].to_vec();
-        small.extend_from_slice(b"\x00\x00 remainder of an object file");
-        let (_tmp, root) = snapshot_with_tool(&small);
+        // Real compiled tools run past the shim bound, and that is the point:
+        // the header proof reads a bounded window, so size neither grants nor
+        // withholds it.
+        let (_tmp, root) = snapshot_with_tool(&native);
         assert_eq!(
             path_uses_prview_borrow(&root, relative),
             ClosureProof::TargetOnly,
-            "magic recognition does not depend on file size in either direction",
+            "a complete platform header for this host's architecture is claimed by the \
+             kernel's loader, so the closure is the invocation itself",
+        );
+    }
+
+    /// Apple ships `/bin/ls` as a universal binary, so this is the fat path on
+    /// real bytes: a `cputype` match inside the `fat_arch` table, and a slice
+    /// whose own `mach_header` is claimable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_universal_binary_with_a_host_slice_proves_a_target_only_closure() {
+        let relative = Path::new("node_modules/.bin/eslint");
+        let Ok(universal) = std::fs::read("/bin/ls") else {
+            eprintln!("skipped: /bin/ls is not readable, so no real universal binary is available");
+            return;
+        };
+        assert_eq!(
+            universal.get(..4),
+            Some([0xCA, 0xFE, 0xBA, 0xBE].as_slice()),
+            "this fixture is only meaningful while /bin/ls is a fat binary",
+        );
+        let (_tmp, root) = snapshot_with_tool(&universal);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "a universal binary carrying a claimable slice for the host cputype is \
+             executed by the kernel, not by an interpreter",
+        );
+    }
+
+    /// A shell launcher wearing an object-file prefix. Everything after the
+    /// magic is what `/bin/sh` would run.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn magic_prefixed_launcher(magic: [u8; 4]) -> Vec<u8> {
+        let mut bytes = magic.to_vec();
+        bytes.extend_from_slice(
+            b"\nexec node \"$(dirname \"$0\")/../eslint/bin/eslint.js\" \"$@\"\n",
+        );
+        bytes
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_foreign_object_format_prefix_is_unproven() {
+        // A format with no loader on this platform, in front of a shell line.
+        // `execvp` returns `ENOEXEC`, `/bin/sh` runs the line with full
+        // indirection, and the operator's ambient bytes execute — so
+        // recognising the magic must certify nothing.
+        let relative = Path::new("node_modules/.bin/eslint");
+        let (_tmp, root) = snapshot_with_tool(&magic_prefixed_launcher(FOREIGN_FORMAT_MAGIC));
+        let proof = path_uses_prview_borrow(&root, relative);
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "a foreign object format is recognisable, not executable, so it proves nothing",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "prefixing a shell script with a foreign magic must never flip a run to an \
+             exact snapshot claim",
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_host_format_magic_without_a_complete_header_is_unproven() {
+        // The sharpest cell: the magic is the one every real binary on this
+        // host carries, and the file still falls through to `/bin/sh`, because
+        // a loader claims a header, not a prefix.
+        let relative = Path::new("node_modules/.bin/eslint");
+        let (_tmp, root) = snapshot_with_tool(&magic_prefixed_launcher(HOST_FORMAT_MAGIC));
+        let proof = path_uses_prview_borrow(&root, relative);
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "a host-format magic on an incomplete header is claimed by no loader",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "four bytes of the host's own magic are not a platform header",
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_oversized_magic_prefix_is_unproven() {
+        // Size is not what withholds the proof here — the absent header is —
+        // but this is the cell the size bound used to keep cautious, so it gets
+        // its own pin.
+        let relative = Path::new("node_modules/.bin/eslint");
+        let bound = usize::try_from(MAX_JS_SHIM_BYTES).expect("shim bound fits usize");
+        let mut oversized = HOST_FORMAT_MAGIC.to_vec();
+        oversized.resize(bound * 2, 0);
+        let (_tmp, root) = snapshot_with_tool(&oversized);
+        let proof = path_uses_prview_borrow(&root, relative);
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "padding a magic prefix past the shim bound does not build a platform header",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "an oversized file with no claimable header is unread, not proved",
         );
     }
 
@@ -902,10 +1297,11 @@ mod tests {
     fn an_executable_without_a_shebang_is_unproven_never_native() {
         let relative = Path::new("node_modules/.bin/eslint");
 
-        // The exact regressed vector: no `#!` and no magic. `Command` spawns
-        // through `execvp`, which POSIX requires to retry an `ENOEXEC` file
-        // through `/bin/sh`, so these bytes run with full shell indirection.
-        // Certifying them as an exact snapshot scan is the claim this pins shut.
+        // The exact regressed vector: no `#!` and no platform header. `Command`
+        // spawns through `execvp`, which POSIX requires to retry an `ENOEXEC`
+        // file through `/bin/sh`, so these bytes run with full shell
+        // indirection. Certifying them as an exact snapshot scan is the claim
+        // this pins shut.
         let (_tmp, root) =
             snapshot_with_tool(b"exec node \"$(dirname \"$0\")/../eslint/bin/eslint.js\" \"$@\"\n");
         let proof = path_uses_prview_borrow(&root, relative);
@@ -917,23 +1313,15 @@ mod tests {
         assert_ne!(
             proof,
             ClosureProof::TargetOnly,
-            "the absence of `#!` must never stand in for native object-file magic",
+            "the absence of `#!` must never stand in for a claimed platform header",
         );
 
-        // One byte off the ELF magic is not the ELF magic.
-        let (_tmp, root) = snapshot_with_tool(&[0x7F, b'E', b'L', b'G', 0x00]);
-        assert_eq!(
-            path_uses_prview_borrow(&root, relative),
-            ClosureProof::Unproven,
-            "magic recognition is exact, not approximate",
-        );
-
-        // Shorter than the magic window: nothing to recognise.
+        // Shorter than any header window: nothing to validate.
         let (_tmp, root) = snapshot_with_tool(b"\x7FEL");
         assert_eq!(
             path_uses_prview_borrow(&root, relative),
             ClosureProof::Unproven,
-            "a file too short to carry a magic cannot have proved one",
+            "a file too short to carry a header cannot have proved one",
         );
 
         // An oversized SCRIPT still has no proved kind, so the content bound
