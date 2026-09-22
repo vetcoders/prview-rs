@@ -229,7 +229,10 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
     ));
     review_caveats.extend(rust_quality_review_caveats(config, checks));
     review_caveats.extend(cargo_audit_review_caveats(checks));
-    review_caveats.extend(cargo_audit_baseline_review_caveats(inline));
+    review_caveats.extend(cargo_audit_baseline_review_caveats(
+        inline,
+        clean_comparison.cargo_audit_lock_proof(),
+    ));
     review_caveats.extend(semgrep_partial_parse_review_caveats(checks));
     // Advisory only, and from the same renderer MERGE_GATE.json reads: a suite
     // that did not run in full is a fact a reviewer needs on every surface, not

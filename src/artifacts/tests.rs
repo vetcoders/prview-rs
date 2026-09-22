@@ -8142,6 +8142,7 @@ fn cargo_audit_pack(
     serde_json::Value,
     serde_json::Value,
     String,
+    PathBuf,
 ) {
     cargo_audit_pack_inner(dirty, pack_name, true)
 }
@@ -8155,6 +8156,7 @@ fn cargo_audit_pack_inner(
     serde_json::Value,
     serde_json::Value,
     String,
+    PathBuf,
 ) {
     let publication_home = tempfile::tempdir().unwrap();
     let _home = crate::config::override_test_prview_home(publication_home.path().to_path_buf());
@@ -8188,7 +8190,51 @@ fn cargo_audit_pack_inner(
     let report: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(pack.join("report.json")).unwrap()).unwrap();
     let dashboard = fs::read_to_string(pack.join("dashboard.html")).unwrap();
-    (publication_home, gate, report, dashboard)
+    (publication_home, gate, report, dashboard, pack)
+}
+
+/// Every published file in a pack, as text.
+///
+/// Compressed and binary members decode to lossy text rather than being
+/// skipped: a sweep that quietly drops files it cannot read would report
+/// "nothing claims X" about a pack it never finished reading.
+fn pack_text_files(pack: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![pack.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("pack dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = fs::read(&path) {
+                out.push((path, String::from_utf8_lossy(&bytes).into_owned()));
+            }
+        }
+    }
+    assert!(!out.is_empty(), "an empty pack sweep proves nothing");
+    out
+}
+
+/// The one baseline caveat the gate publishes, as the reader sees it.
+///
+/// `cargo_audit_baseline_review_caveats` clones a single dashboard note into
+/// `review_caveats`, so exactly one caveat may carry this prefix; asserting on
+/// a `contains` over the whole list would let a second, contradicting copy
+/// slip in unnoticed.
+fn cargo_audit_baseline_caveat(decision: &serde_json::Value) -> String {
+    let matching: Vec<&str> = decision["review_caveats"]
+        .as_array()
+        .expect("review_caveats")
+        .iter()
+        .filter_map(|c| c.as_str())
+        .filter(|c| c.starts_with("Cargo audit baseline:"))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly one baseline caveat states the counts: {matching:?}"
+    );
+    matching[0].to_string()
 }
 
 /// The incident, end to end: a diff that touches no dependency, an operator
@@ -8198,7 +8244,7 @@ fn cargo_audit_pack_inner(
 /// bridging the two. Now one classification produces both, and it says why.
 #[test]
 fn an_untouched_lock_keeps_cargo_audit_off_the_blocking_list() {
-    let (_home, gate, report, dashboard) = cargo_audit_pack(&["notes.md"], "untouched-lock");
+    let (_home, gate, report, dashboard, _pack) = cargo_audit_pack(&["notes.md"], "untouched-lock");
 
     let decision = &gate["decision"];
     let blocking = decision["blocking_issues"].as_array().unwrap();
@@ -8236,12 +8282,12 @@ fn an_untouched_lock_keeps_cargo_audit_off_the_blocking_list() {
 
     // The caveat and the decision now agree, and both artifacts plus the
     // dashboard carry the same verdict (THREAD 5 parity).
-    let caveats = decision["review_caveats"].as_array().unwrap();
-    assert!(
-        caveats.iter().any(|c| c
-            .as_str()
-            .is_some_and(|s| s.contains("new=0") && s.contains("pre-existing=2"))),
-        "{caveats:?}"
+    // The proof held here, so the counts stand unqualified: the honesty
+    // clause is owed to a revoked proof and must not leak onto a sound one.
+    assert_eq!(
+        cargo_audit_baseline_caveat(decision),
+        "Cargo audit baseline: status=not-required, new=0, pre-existing=2, \
+         resolved=0, unknown-baseline=0"
     );
     assert_eq!(report["gate"]["status"], decision["verdict"]);
     assert_eq!(report["gate"]["allow_merge"], decision["allow_merge"]);
@@ -8289,7 +8335,7 @@ fn assert_dashboard_verdict(dashboard: &str, verdict: &str) {
 /// the target's, and the audit keeps gating.
 #[test]
 fn a_dirty_lockfile_puts_cargo_audit_back_on_the_blocking_list() {
-    let (_home, gate, report, _dashboard) = cargo_audit_pack(&["Cargo.lock"], "dirty-lock");
+    let (_home, gate, report, _dashboard, _pack) = cargo_audit_pack(&["Cargo.lock"], "dirty-lock");
 
     let decision = &gate["decision"];
     assert!(
@@ -8336,12 +8382,15 @@ fn a_dirty_lockfile_puts_cargo_audit_back_on_the_blocking_list() {
          the scanned tree (2 advisories not shown to predate this change)",
         "a blocker for want of a proof names the proof it wanted"
     );
-    let caveats = decision["review_caveats"].as_array().unwrap();
-    assert!(
-        caveats.iter().any(|c| c
-            .as_str()
-            .is_some_and(|s| s.contains("new=0") && s.contains("pre-existing=2"))),
-        "the counts the blocker is now reconciled with: {caveats:?}"
+    // The counts the blocker is reconciled with — and, since the proof was
+    // revoked, the caveat may not offer `pre-existing=2` as an established
+    // fact while the blocker beside it says the opposite.
+    assert_eq!(
+        cargo_audit_baseline_caveat(decision),
+        "Cargo audit baseline: status=not-required, new=0, pre-existing=2, \
+         resolved=0, unknown-baseline=0 (provenance proof unavailable: \
+         Cargo.lock dirty in the scanned tree; pre-existing=2 is not shown to \
+         predate this change)"
     );
     assert_dashboard_verdict(&_dashboard, decision["verdict"].as_str().unwrap());
 }
@@ -8358,7 +8407,8 @@ fn a_dirty_lockfile_puts_cargo_audit_back_on_the_blocking_list() {
 /// is gone, and only the file was ever the premise.
 #[test]
 fn a_target_without_a_lockfile_keeps_cargo_audit_on_the_blocking_list() {
-    let (_home, gate, report, dashboard) = cargo_audit_pack_inner(&["notes.md"], "no-lock", false);
+    let (_home, gate, report, dashboard, pack) =
+        cargo_audit_pack_inner(&["notes.md"], "no-lock", false);
 
     let decision = &gate["decision"];
     let audit_blocker = decision["blocking_issues"]
@@ -8385,8 +8435,6 @@ fn a_target_without_a_lockfile_keeps_cargo_audit_on_the_blocking_list() {
     );
     assert_eq!(decision["quality_pass"].as_bool(), Some(false));
 
-    // No artifact anywhere in the pack claims the file is unchanged, because no
-    // artifact may claim anything about a file the target does not carry.
     let audit_row = gate["checks"]
         .as_array()
         .unwrap()
@@ -8394,12 +8442,31 @@ fn a_target_without_a_lockfile_keeps_cargo_audit_on_the_blocking_list() {
         .find(|row| row["name"] == "Cargo audit")
         .expect("cargo audit row");
     assert_eq!(audit_row["blocking"].as_bool(), Some(true));
-    assert!(
-        audit_row["reason"]
-            .as_str()
-            .is_none_or(|reason| !reason.contains("Cargo.lock unchanged")),
-        "a lock-less target cannot report an unchanged lockfile: {audit_row:?}"
+
+    // The caveat may not hand the reader `pre-existing=2` as a settled fact
+    // next to a blocker that refuses to settle it. `status=not-required` reads
+    // as "the lock did not change", which is how a missing file is mistaken for
+    // an untouched one, so the clause names the absent lockfile outright.
+    assert_eq!(
+        cargo_audit_baseline_caveat(decision),
+        "Cargo audit baseline: status=not-required, new=0, pre-existing=2, \
+         resolved=0, unknown-baseline=0 (provenance proof unavailable: no \
+         Cargo.lock in the target tree; pre-existing=2 is not shown to predate \
+         this change)"
     );
+
+    // No artifact ANYWHERE in the pack claims the file is unchanged, because no
+    // artifact may claim anything about a file the target does not carry. The
+    // assertion sweeps every file the pack published rather than the one JSON
+    // field it used to read, so the claim the comment makes is the claim the
+    // test measures.
+    for (path, text) in pack_text_files(&pack) {
+        assert!(
+            !text.contains("Cargo.lock unchanged"),
+            "a lock-less target cannot report an unchanged lockfile, but {} does",
+            path.display()
+        );
+    }
 
     assert_eq!(report["gate"]["status"], decision["verdict"]);
     assert_eq!(report["gate"]["quality_pass"], decision["quality_pass"]);

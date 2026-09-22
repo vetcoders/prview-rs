@@ -363,7 +363,10 @@ pub(super) fn generate_merge_gate(input: MergeGateInput<'_>) -> Result<()> {
     all_review_caveats.extend(review_caveats);
     all_review_caveats.extend(rust_quality_review_caveats(config, checks));
     all_review_caveats.extend(cargo_audit_review_caveats(checks));
-    all_review_caveats.extend(cargo_audit_baseline_review_caveats(inline));
+    all_review_caveats.extend(cargo_audit_baseline_review_caveats(
+        inline,
+        clean_comparison.cargo_audit_lock_proof(),
+    ));
     all_review_caveats.extend(semgrep_partial_parse_review_caveats(checks));
     // Advisory only: a narrower test run is still a real result, but a reviewer
     // must be told the suite was not exhaustive. Never moves the verdict.
@@ -749,15 +752,27 @@ fn cargo_audit_preexisting_reason(audit: &super::findings::CargoAuditGateEvidenc
 /// What a blocking `Cargo audit` is blocking on, when the run has something to
 /// say about it.
 ///
-/// Three facts can carry the sentence, in order of how much they say:
+/// Four facts can carry the sentence, in order of how much they say:
 /// advisories the diff introduced (named from the same key set they are counted
-/// from), advisories with no base to compare against, and — when the counts are
-/// silent — a withheld lockfile provenance proof. The last one matters because
-/// a revoked proof is precisely how a pre-existing-only audit ends up
-/// `unclassified` and blocking: the counts then read `new=0, pre-existing=N`
-/// while the decision shows a bare `Cargo audit (Failed)`, which is the mute
-/// blocker this text exists to abolish. "Unclassified" names the outcome; the
-/// gap names the cause.
+/// from), advisories with no base to compare against, an unreadable advisory
+/// report, and — when the counts are silent — a withheld lockfile provenance
+/// proof. The last one matters because a revoked proof is precisely how a
+/// pre-existing-only audit ends up `unclassified` and blocking: the counts then
+/// read `new=0, pre-existing=N` while the decision shows a bare
+/// `Cargo audit (Failed)`, which is the mute blocker this text exists to
+/// abolish. "Unclassified" names the outcome; the gap names the cause.
+///
+/// The unreadable report earns its own branch because it is a DIFFERENT cause
+/// wearing the same zero counts. `status == "current-unavailable"` means
+/// `cargo audit` produced nothing this run could parse, so every count
+/// collapses to zero and the lockfile — proven or not — never entered the
+/// question: there was no advisory to tie to it. Folding that case into the
+/// provenance branch named the wrong cause, and named it with a count of zero.
+///
+/// No branch asserts a count it does not have. A count is printed only where it
+/// is non-zero and earned; `{N} advisories not shown to predate this change`
+/// qualifies a real `pre-existing`, and when that number is zero the gap states
+/// itself alone.
 ///
 /// `None` only when there is genuinely nothing to add — the proof held and the
 /// counts are empty — so a bare blocker stays bare rather than gaining a
@@ -787,7 +802,17 @@ fn cargo_audit_blocker_detail(
             audit.status
         ));
     }
+    if audit.status == "current-unavailable" {
+        return Some(
+            "no readable advisory report (baseline current-unavailable), so no \
+             advisory could be classified either way"
+                .to_string(),
+        );
+    }
     if let super::verdict::CargoAuditLockProof::Unproven(gap) = lock_proof {
+        if audit.preexisting == 0 {
+            return Some(gap.gate_note().to_string());
+        }
         return Some(format!(
             "{} ({} advisor{} not shown to predate this change)",
             gap.gate_note(),
@@ -2141,6 +2166,77 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    /// The zero-count shapes of the same blocking row: the sentence must name
+    /// the fact that actually withheld the classification, and must not assert
+    /// a count it does not have.
+    ///
+    /// Two distinct causes used to render as one. When `cargo audit` produces
+    /// no readable report the baseline collapses to
+    /// `status=current-unavailable` with every count zero — the report is the
+    /// missing thing, not the lockfile — yet the row blocked with a sentence
+    /// about lock provenance plus `(0 advisories not shown to predate this
+    /// change)`. That is the wrong cause and an assertion of zero, which is
+    /// exactly what `cargo_audit_blocker_detail`'s contract forbids.
+    #[test]
+    fn a_zero_count_blocker_names_its_cause_without_asserting_a_count() {
+        use crate::policy::engine::PolicyEngine;
+
+        let mut config = test_config();
+        config.policy.mode = crate::policy::PolicyMode::Block;
+        let engine = PolicyEngine::new(&config);
+        let checks = vec![cargo_audit_check(CheckStatus::Failed)];
+        let summary = engine.evaluate_all(&checks, &[]);
+        let none_preexisting = std::collections::BTreeSet::new();
+
+        // An unreadable report: the cause is the report, whatever the lock did.
+        let unreadable = cargo_audit_evidence("current-unavailable", 0, 0, 0, false, &[]);
+        for gap in [
+            LockProofGap::NoTargetLock,
+            LockProofGap::DirtyLock,
+            LockProofGap::UnknownProvenance,
+        ] {
+            let outcome = compute_effective_policy_outcome(
+                &summary.evaluations,
+                &none_preexisting,
+                Some(&unreadable),
+                CargoAuditLockProof::Unproven(gap),
+            );
+            assert_eq!(
+                outcome.blocking_issues,
+                vec![
+                    "Cargo audit (Failed): no readable advisory report (baseline \
+                     current-unavailable), so no advisory could be classified either way"
+                        .to_string()
+                ],
+                "{gap:?}: the unreadable report is the cause, not the lockfile"
+            );
+        }
+
+        // A readable report with nothing in it: the gap is the cause and it is
+        // named, but there is no count to qualify, so none is printed.
+        let empty = cargo_audit_evidence("not-required", 0, 0, 0, false, &[]);
+        let outcome = compute_effective_policy_outcome(
+            &summary.evaluations,
+            &none_preexisting,
+            Some(&empty),
+            CargoAuditLockProof::Unproven(LockProofGap::NoTargetLock),
+        );
+        assert_eq!(
+            outcome.blocking_issues,
+            vec![
+                "Cargo audit (Failed): provenance proof unavailable: no Cargo.lock \
+                 in the target tree"
+                    .to_string()
+            ]
+        );
+        for issue in &outcome.blocking_issues {
+            assert!(
+                !issue.contains("0 advisor"),
+                "a zero count is never asserted: {issue}"
+            );
+        }
     }
 
     #[test]

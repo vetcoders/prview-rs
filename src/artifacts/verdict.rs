@@ -543,12 +543,64 @@ pub(crate) fn semgrep_partial_parse_review_caveats(checks: &[CheckResult]) -> Ve
     )]
 }
 
-pub(super) fn cargo_audit_baseline_review_caveats(inline: &InlineFindingsSummary) -> Vec<String> {
+/// The baseline counts as a review caveat — qualified by the proof that earned
+/// them, or by the gap that did not.
+///
+/// `cargo_audit_baseline_counts` classifies against the lockfile, and
+/// `pre-existing=N` is a PROVENANCE claim: these advisories predate the change.
+/// [`CargoAuditLockProof`] is what makes that claim true, so when the proof is
+/// `Unproven` the number is still the right count of advisories and the wrong
+/// thing to state as settled. Left bare it contradicted the blocker standing
+/// beside it in the same decision — `pre-existing=2` against `2 advisories not
+/// shown to predate this change` — with `preexisting_quality_failures` empty
+/// and nothing telling the reader which surface to believe.
+///
+/// The qualifier is rendered from [`LockProofGap::gate_note`], the same words
+/// the blocking line uses, so the two surfaces cannot drift into describing one
+/// gap two ways. It also repairs a second misreading the counts carry on their
+/// own: `status=not-required` means "the lock did not change, so no base audit
+/// was needed", which about a target with NO lockfile reads as an untouched
+/// file rather than an absent one. Naming the absent lockfile in the same
+/// sentence settles it.
+///
+/// The counts themselves are untouched — classification is the proof's job, not
+/// this renderer's. This is the single place the note's text is published (the
+/// `note`-level finding it clones is filtered out of `operator_findings`), so
+/// qualifying it here leaves no second, unqualified copy behind.
+pub(super) fn cargo_audit_baseline_review_caveats(
+    inline: &InlineFindingsSummary,
+    lock_proof: CargoAuditLockProof,
+) -> Vec<String> {
     inline
         .dashboard_findings
         .iter()
         .find(|finding| finding.check_id == "cargo_audit_baseline")
-        .map(|finding| vec![finding.message.clone()])
+        .map(|finding| {
+            let counts = &finding.message;
+            let CargoAuditLockProof::Unproven(gap) = lock_proof else {
+                return vec![counts.clone()];
+            };
+            let note = gap.gate_note();
+            // The number comes from `InlineFindingsSummary::cargo_audit`, the
+            // same structured value the note above was rendered from — never
+            // parsed back out of that human-facing string, which would make
+            // this surface depend on its wording.
+            let preexisting = inline
+                .cargo_audit
+                .as_ref()
+                .map_or(0, |audit| audit.preexisting);
+            // Nothing to qualify when nothing was claimed: a zero count is not
+            // a provenance claim, so it does not get a disclaimer either.
+            let caveat = if preexisting > 0 {
+                format!(
+                    "{counts} ({note}; pre-existing={preexisting} is not shown to \
+                     predate this change)"
+                )
+            } else {
+                format!("{counts} ({note})")
+            };
+            vec![caveat]
+        })
         .unwrap_or_default()
 }
 

@@ -304,6 +304,26 @@ newly revealed, not debt introduced — the change moved no dependency, the
 advisory database moved. The `Cargo audit baseline` caveat's `status` and counts
 remain the record of what was compared.
 
+That caveat states a provenance claim, so it is qualified by the same proof the
+check row is. When the lockfile proof holds it reads plainly:
+
+- `Cargo audit baseline: status=<status>, new=N, pre-existing=M, resolved=R,
+  unknown-baseline=U`
+
+When the proof was withheld, the counts are still the right count of advisories
+and the wrong thing to state as settled, so the gap is appended in the same
+words the blocking line uses:
+
+- `… unknown-baseline=U (<gap>; pre-existing=M is not shown to predate this
+  change)`, or `… unknown-baseline=U (<gap>)` when `M` is zero and there is no
+  claim to qualify.
+
+The counts themselves never change — classification is the proof's job, not the
+renderer's. The qualifier also disambiguates `status=not-required`, which means
+"the lock did not change, so no base audit was needed" and would otherwise read,
+against a target carrying no lockfile at all, as an untouched file rather than
+an absent one.
+
 Both outcomes are named in the check row's `reason`: a downgraded audit reads
 `pre-existing: Cargo.lock unchanged by this PR (N advisories)` or `pre-existing:
 unchanged vs base audit (N advisories)`, while a blocking one appears in
@@ -312,12 +332,17 @@ unchanged vs base audit (N advisories)`, while a blocking one appears in
 - `Cargo audit (<Status>): N new advisories introduced (RUSTSEC-… in <package>
   <version>, …), M pre-existing`,
 - `Cargo audit (<Status>): N advisories with no base comparison (baseline
-  <status>)` when nothing could be compared, or
+  <status>)` when nothing could be compared,
+- `Cargo audit (<Status>): no readable advisory report (baseline
+  current-unavailable), so no advisory could be classified either way` when the
+  run produced nothing parseable — the report is the missing thing, so the
+  lockfile is not what the sentence is about, or
 - `Cargo audit (<Status>): provenance proof unavailable: <gap> (M advisories not
   shown to predate this change)` when the counts are silent and the lockfile
   proof was withheld — `<gap>` being `no Cargo.lock in the target tree`,
   `Cargo.lock dirty in the scanned tree`, or `the scanned tree could not be tied
-  to the target commit`.
+  to the target commit`. When `M` is zero the parenthetical is omitted and the
+  gap stands alone: no line asserts a count it does not have.
 
 The set the first line counts and the set it names are one set: `new` counts
 every advisory in the report, `vulnerabilities` and the `warnings` categories
