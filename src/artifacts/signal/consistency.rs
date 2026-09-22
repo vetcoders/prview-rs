@@ -446,8 +446,12 @@ pub fn detect_provenance_contradictions(
             let check_local_clean = match state {
                 TreeState::LocalClean => Some(true),
                 TreeState::LocalDirty => Some(false),
-                // Snapshot states describe an ephemeral worktree, not the
-                // operator's checkout; they cannot contradict its cleanliness.
+                // Every snapshot state — exact, dirty, borrowed-deps or
+                // unproven-deps — describes an ephemeral worktree, not the
+                // operator's checkout, so none of them can contradict its
+                // cleanliness. `snapshot-unproven-deps` in particular says
+                // nothing about the operator tree: its uncertainty is about
+                // which dependency bytes a tool executed.
                 _ => None,
             };
             if let Some(check_clean) = check_local_clean {

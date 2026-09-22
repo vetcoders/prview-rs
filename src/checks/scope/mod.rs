@@ -142,6 +142,13 @@ impl ReviewedTree {
     /// Its reviewed SOURCE is exactly `target_sha` — only the dependency links
     /// came from the operator checkout — and source is the whole of what test
     /// selection reads.
+    ///
+    /// [`TreeState::SnapshotUnprovenDeps`] joins it for the same reason, and the
+    /// reason is worth stating precisely: an unproved closure is a statement
+    /// about DEPENDENCY bytes, never about source. The snapshot was still
+    /// materialised from exactly `target_sha`, so the change set lists every
+    /// file a selection can read. Escalating here would punish selection for an
+    /// uncertainty that cannot reach it.
     pub fn resolve(
         repo_root: &Path,
         scan_dir: Option<PathBuf>,
@@ -151,9 +158,11 @@ impl ReviewedTree {
         use crate::checks::TreeState;
         match scan_dir {
             Some(snapshot) => match snapshot_tree_state {
-                Some(TreeState::Snapshot | TreeState::SnapshotBorrowedDeps) => {
-                    Self::Snapshot(snapshot)
-                }
+                Some(
+                    TreeState::Snapshot
+                    | TreeState::SnapshotBorrowedDeps
+                    | TreeState::SnapshotUnprovenDeps,
+                ) => Self::Snapshot(snapshot),
                 // Includes `None`: a snapshot on disk whose substrate the run
                 // never resolved is a tree nobody has identified. Unknown is the
                 // honest name for it, and it escalates.

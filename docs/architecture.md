@@ -602,26 +602,56 @@ before spawn. A missing target entry may use the operator checkout only as a
 borrow candidate. Execution never falls back to a package-manager launcher.
 
 The finished-snapshot resolver follows the invocation path to its canonical
-filesystem identity. The publication rule is intentionally asymmetric:
-`Snapshot` is allowed only when the complete statically visible executable
-closure is proved target-owned. Any unresolved identity, path outside the
-canonical snapshot root, case-ambiguous creator identity, unreadable or
-oversized executable whose bounded kind cannot be proved, or unrecognized
-script grammar publishes `SnapshotBorrowedDeps`. A false borrowed alarm is
-acceptable; certifying
-ambient or host-local executable bytes as `Snapshot` is not.
+filesystem identity and publishes one of **three** provenance states. The rule
+is intentionally asymmetric, and the asymmetry runs in both directions:
 
-The proof boundary has two structural sources. A symlink is resolved by
-canonical filesystem identity. A bounded regular executable is either a
-native/direct file with no script indirection, or a wrapper matching an
-anchored known shim grammar. On Unix, the recognized content wrapper is the
-strict pnpm shell skeleton: a shell shebang, the canonical
-`basedir=$(dirname "$0")` assignment, and
-`exec node "$basedir/<payload>" "$@"`. npm/yarn's ordinary Unix symlink shape is
-covered by canonical symlink resolution. Comments, string literals, dead code,
-and the mere occurrence of `require(`, `import(`, `NODE_PATH=`, or a path
-fragment are never wrapper evidence. Any other executable script is
-conservative-borrowed rather than guessed from substrings.
+- `Snapshot` requires the complete statically visible executable closure to be
+  **proved** target-owned.
+- `SnapshotBorrowedDeps` requires **positive evidence** of borrowed bytes: a
+  prview-created link inside the closure, a canonical identity resolving outside
+  the snapshot root, or a case-ambiguous creator identity.
+- `SnapshotUnprovenDeps` is everything in between — a genuine snapshot of
+  exactly `target_sha` whose dependency closure the resolver could not read in
+  either direction: an unreadable, non-UTF-8 or oversized executable whose
+  bounded kind cannot be proved, a text file with no interpreter directive, or a
+  shebang script matching no recognized grammar.
+
+Unknown is not evidence. Certifying ambient or host-local executable bytes as
+`Snapshot` is forbidden — and so is asserting a borrow nobody observed, because
+that turns `snapshot-borrowed-deps` into a bag for unread files and destroys the
+one state that carries a claim. Both wrong answers are excluded by naming the
+uncertainty instead of resolving it by default. `snapshot-unproven-deps` must be
+read exactly as cautiously as `snapshot-borrowed-deps`: it is **not** an exact
+scan.
+
+The proof boundary has three structural sources. A symlink is resolved by
+canonical filesystem identity. A regular executable is proved target-only either
+by **native object-file magic** or by an **anchored grammar**; anything else is
+unproven.
+
+Native recognition reads the first four bytes and accepts only ELF
+(`7F 45 4C 46`), thin Mach-O in both endiannesses and both widths
+(`MH_MAGIC`/`MH_CIGAM`, `MH_MAGIC_64`/`MH_CIGAM_64`), and fat/universal Mach-O
+(`FAT_MAGIC`/`FAT_CIGAM`, `FAT_MAGIC_64`/`FAT_CIGAM_64`). The **absence of `#!`
+is not native recognition** and must never stand in for it: prview spawns
+through `Command`, hence `execvp`, and POSIX requires `execvp` to retry an
+`ENOEXEC` file through `/bin/sh` — so a file with no interpreter directive is a
+shell script with unbounded indirection, not a native binary. Magic is read
+before the script size bound, because four bytes settle a file's kind at any
+size and real compiled tools are routinely larger than that bound.
+
+The recognized content grammars are two, both narrow, and both able only to
+RAISE confidence: the strict pnpm-shaped shell skeleton (a shell shebang, a
+`basedir=$(dirname "$0")` assignment, and `exec node "$basedir/<payload>"
+"$@"`), and the proved-direct script of terminal shell builtins used by direct
+launchers. Real `npm`/`pnpm`/`yarn` shims do **not** match: a current pnpm shim
+is ~18 active lines with a `sed`-normalised `basedir`, a `case uname` block, a
+`NODE_PATH` export and an `if [ -x "$basedir/node" ]` fork. Matching a grammar
+can prove a closure; failing to match proves nothing and publishes
+`SnapshotUnprovenDeps`. npm/yarn's ordinary Unix symlink shape is covered by
+canonical symlink resolution. Comments, string literals, dead code, and the mere
+occurrence of `require(`, `import(`, `NODE_PATH=`, or a path fragment are never
+wrapper evidence.
 
 For a recognized wrapper, the resolver follows its `$basedir` payload. The
 snapshot builder records every link it creates in a sidecar outside the reviewed
@@ -630,18 +660,18 @@ byte-exact spelling, and any final payload outside the canonical snapshot root
 is borrowed even when a tracked absolute symlink led there. A recognized
 package wrapper can resolve plugins, types, or transitive modules dynamically,
 so any prview-created entry in its `node_modules` is conservatively part of that
-command's substrate. Only a proved-direct shell script (the intentionally small
-grammar of terminal shell builtins used by direct launchers) can remain
-`Snapshot` without wrapper-payload traversal.
+command's substrate. Only a native object file or a proved-direct shell script
+(the intentionally small grammar of terminal shell builtins used by direct
+launchers) can remain `Snapshot` without wrapper-payload traversal.
 
 The entry/creator matrix is:
 
 | `.bin/<tool>` entry | Target-owned | Prview-created | Ambient/untracked only |
 |---|---|---|---|
 | missing | ineligible unless a borrow candidate can be exposed | link creation failure aborts the snapshot | never executed directly; becomes prview-created when borrowed |
-| executable regular file | `Snapshot` only with proved target-owned closure; otherwise `SnapshotBorrowedDeps` | `SnapshotBorrowedDeps` | same borrow rule |
+| executable regular file | `Snapshot` only with proved target-owned closure; `SnapshotBorrowedDeps` on positive borrow evidence; otherwise `SnapshotUnprovenDeps` | `SnapshotBorrowedDeps` | same borrow rule |
 | directory | explicit pre-spawn failure | not a valid created tool | not a borrow candidate |
-| relative symlink | `Snapshot` when the final payload stays in-tree; borrowed when it crosses a created link | `SnapshotBorrowedDeps` | same borrow rule |
+| relative symlink | `Snapshot` when the final payload stays in-tree and its closure is proved; borrowed when it crosses a created link; `SnapshotUnprovenDeps` when the in-tree final file's closure is unreadable | `SnapshotBorrowedDeps` | same borrow rule |
 | absolute symlink | `SnapshotBorrowedDeps` when it resolves outside the snapshot; explicit pre-spawn failure when broken | `SnapshotBorrowedDeps` | same borrow rule |
 | broken symlink | explicit pre-spawn failure | explicit pre-spawn failure after a source race | not executable |
 | case variant | on case-insensitive filesystems, classify the actual target/creator identity; on case-sensitive filesystems the differently-cased name is missing | same, with `SnapshotBorrowedDeps` on a case-folded created link | same borrow rule |
@@ -650,26 +680,32 @@ The executable/layout matrix composes with every row above:
 
 | Executable | Flat `node_modules` | `.pnpm` store | Nested `node_modules` |
 |---|---|---|---|
-| native binary / proved-direct shell script | invocation bytes only | invocation bytes only | invocation bytes only |
-| npm shim | canonical Unix symlink target or conservative-borrowed script | follow package links into the store | follow the canonical target or classify as borrowed |
-| strict pnpm shell shim | follow the anchored `$basedir/<payload>` grammar and dynamic `node_modules` dependencies | follow sibling links into `.pnpm`; any created dependency makes the closure borrowed | follow the wrapper-relative nested payload; any unresolved grammar is borrowed |
-| yarn shim | canonical Unix symlink target or conservative-borrowed script | follow any store link | follow the canonical target or classify as borrowed |
+| native object file (ELF / Mach-O magic) | invocation bytes only | invocation bytes only | invocation bytes only |
+| proved-direct shell script (terminal-builtin grammar) | invocation bytes only | invocation bytes only | invocation bytes only |
+| npm shim | canonical Unix symlink target; a real shell shim matches no grammar and is `SnapshotUnprovenDeps` | follow package links into the store | follow the canonical target, else unproven |
+| strict pnpm-shaped shell shim | follow the anchored `$basedir/<payload>` grammar and dynamic `node_modules` dependencies | follow sibling links into `.pnpm`; any created dependency makes the closure borrowed | follow the wrapper-relative nested payload; an unmatched grammar is unproven |
+| yarn shim | canonical Unix symlink target; a real shell shim is `SnapshotUnprovenDeps` | follow any store link | follow the canonical target, else unproven |
 
-Unix permissions are an independent, final-resolution axis. The earlier
-entry/creator (28 logical cells) and executable/layout (12 cells) axes therefore
-compose with two permission states: **28 × 12 × 2 = 672 logical cells**.
+Unix permissions are an independent, final-resolution axis. The
+executable/layout axis grew from 12 to 15 cells with the third provenance state:
+`native object file` and `proved-direct shell script` are no longer one row,
+because they are now two structurally different proofs — a byte-prefix magic and
+a line grammar — and only the first is available to a file with no `#!`. So the
+entry/creator (28 logical cells) and executable/layout (5 × 3 = 15 cells) axes
+compose with two permission states: **28 × 15 × 2 = 840 logical cells**.
 
 | Permission at the resolved file | Target-owned identity | Prview-created / external identity | Result |
 |---|---|---|---|
 | executable (`mode & 0o111 != 0`) | apply the closure-proof rule above | `SnapshotBorrowedDeps` | spawn only after proof/classification |
 | non-executable (`mode & 0o111 == 0`) | `Snapshot` provenance for the unexecuted target tree | borrowed provenance when resolution crossed a created/external identity | explicit pre-spawn `ERROR`; the OS is never asked to spawn it |
 
-Thus every one of the 336 non-executable cells terminates before spawn. Every
-executable cell applies the same asymmetric closure rule: proved target-only is
-`Snapshot`; created, external, case-ambiguous, unreadable, oversized, or
-unrecognized-script closure is `SnapshotBorrowedDeps`. The three cells missed
+Thus every one of the 420 non-executable cells terminates before spawn. Every
+executable cell applies the same three-way closure rule: proved target-only is
+`Snapshot`; created, external or case-ambiguous identity is
+`SnapshotBorrowedDeps`; unreadable, oversized, shebang-less or
+unrecognized-script closure is `SnapshotUnprovenDeps`. The three cells missed
 at `4bd02645` are pinned by regression tests: alternate-variable wrapper
-(`exact_eslint_unrecognized_wrapper_is_conservatively_borrowed`), wrapper text
+(`exact_eslint_unrecognized_wrapper_closure_is_unproven`), wrapper text
 in a comment (`exact_eslint_direct_script_ignores_wrapper_text_in_comments`),
 and mode `100644` (`exact_eslint_non_executable_file_fails_before_spawn`).
 
@@ -742,7 +778,8 @@ replays off the unknown substrate they were necessarily recorded under. That is
 the quiet half of the same bug: a warm `--pr` run used to report its own
 decisions as being about no particular tree. The run-wide substrate is resolved
 with an **empty** consumable-scaffolding list, so it reports `snapshot` and never
-`snapshot-borrowed-deps` — with no command to name, nothing at that point can
+`snapshot-borrowed-deps` or `snapshot-unproven-deps` — with no command to name,
+there is no closure to prove and nothing at that point can
 consume the linked `node_modules`; a command that does resolve through the link
 reports that for itself.
 
@@ -1114,7 +1151,19 @@ Every check records a `CheckProvenance` alongside its result: `command`,
     resolve their toolchain through `node_modules`; the Python checks resolve
     theirs through the per-commit `UV_PROJECT_ENVIRONMENT` prview points uv at,
     never the linked `.venv`. Installing the target's own dependencies instead is
-    a network operation of unbounded cost and is not attempted;
+    a network operation of unbounded cost and is not attempted. Reported only on
+    **positive** evidence of borrowed bytes — a prview-created link inside the
+    closure, or a canonical identity outside the snapshot root;
+  - `snapshot-unproven-deps` — the reviewed commit's tree, unmodified and
+    materialised from exactly `target_sha`, but the executable closure of the
+    tool the check ran could not be proved in either direction. The **source** is
+    the reviewed commit; which dependency bytes the tool executed is unknown.
+    This is what an unreadable, non-UTF-8 or oversized executable, a text file
+    with no `#!`, or a shebang script matching no recognized wrapper grammar
+    publishes — and that last case covers every real `npm`/`pnpm`/`yarn` shim.
+    It exists so `snapshot-borrowed-deps` can stay a claim with evidence instead
+    of a bag for files nobody could read. Read it as cautiously as
+    `snapshot-borrowed-deps`: it is **not** an exact scan;
   - `local-clean` — repo working tree, nothing uncommitted;
   - `local-dirty` — repo working tree with uncommitted changes — the scanned
     bytes are **not** exactly `target_sha`;

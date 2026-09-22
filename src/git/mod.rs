@@ -13,7 +13,9 @@ pub use snapshot::AnalysisSnapshot;
 pub(crate) use snapshot::override_test_tar_program;
 
 mod worktree;
-pub(crate) use worktree::{CommitPathResolution, commit_path_resolution, path_uses_prview_borrow};
+pub(crate) use worktree::{
+    ClosureProof, CommitPathResolution, commit_path_resolution, path_uses_prview_borrow,
+};
 pub use worktree::{WorktreeSnapshot, create_worktree_snapshot};
 
 use crate::Config;

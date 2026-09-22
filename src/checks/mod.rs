@@ -72,6 +72,19 @@ pub enum TreeState {
     /// from the local checkout. A dependency-changing PR is precisely where the
     /// two differ, so this must not be reported as an exact snapshot scan.
     SnapshotBorrowedDeps,
+    /// The reviewed commit's tree, unmodified and materialised from exactly
+    /// `target_sha` — but the executable closure of the tool this check ran
+    /// could not be proved in either direction. The SOURCE is the reviewed
+    /// commit; which dependency bytes the tool actually executed is unknown.
+    ///
+    /// This is the honest third answer, and it exists so
+    /// [`Self::SnapshotBorrowedDeps`] can stay a CLAIM WITH EVIDENCE rather
+    /// than a bag for everything the static proof cannot read. Every real
+    /// `npm`/`pnpm`/`yarn` shim lands here: prview does not recognise their
+    /// grammar, and not recognising a wrapper is not the same as observing it
+    /// load the operator's dependencies. A reviewer must read this as "not
+    /// certified exact" — never as an exact snapshot scan.
+    SnapshotUnprovenDeps,
     /// The repo's own working tree with no uncommitted changes — the scanned
     /// bytes are exactly `target_sha`.
     LocalClean,
@@ -91,6 +104,7 @@ impl TreeState {
             Self::Snapshot => "snapshot",
             Self::SnapshotDirty => "snapshot-dirty",
             Self::SnapshotBorrowedDeps => "snapshot-borrowed-deps",
+            Self::SnapshotUnprovenDeps => "snapshot-unproven-deps",
             Self::LocalClean => "local-clean",
             Self::LocalDirty => "local-dirty",
             Self::Foreign => "foreign",
@@ -133,9 +147,10 @@ pub struct ScanSubstrate {
 /// not). In a snapshot the dependency symlinks prview itself creates
 /// ([`SNAPSHOT_SCAFFOLDING`]) are excluded: they are the tool's own scaffolding,
 /// not a modification of the reviewed tree. They are not free of consequence
-/// either — a snapshot is `snapshot-borrowed-deps` when it carries a link THIS
-/// command could actually consume, named by its resolved path in `consumable` (see
-/// [`consumable_scaffolding`]).
+/// either — a snapshot is `snapshot-borrowed-deps` when THIS command's closure
+/// is proved to cross one, named by its resolved path in `consumable` (see
+/// [`consumable_scaffolding`]), and `snapshot-unproven-deps` when that closure
+/// could be proved neither target-only nor borrowed.
 ///
 /// Best effort: a `cwd` that is not in a git repository yields `None` for both
 /// fields rather than a guess, and a status that cannot be read yields a `None`
@@ -168,10 +183,11 @@ pub fn resolve_scan_substrate(cwd: &Path, repo_root: &Path, consumable: &[&str])
     } else {
         working_tree_is_dirty(&repo, SNAPSHOT_SCAFFOLDING).map(|dirty| match dirty {
             true => TreeState::SnapshotDirty,
-            false if borrows_local_dependencies(&repo, consumable) => {
-                TreeState::SnapshotBorrowedDeps
-            }
-            false => TreeState::Snapshot,
+            false => match dependency_closure_proof(&repo, consumable) {
+                crate::git::ClosureProof::Borrowed => TreeState::SnapshotBorrowedDeps,
+                crate::git::ClosureProof::Unproven => TreeState::SnapshotUnprovenDeps,
+                crate::git::ClosureProof::TargetOnly => TreeState::Snapshot,
+            },
         })
     };
 
@@ -235,21 +251,38 @@ pub(crate) fn consumable_scaffolding(check: &str) -> &'static [&'static str] {
     }
 }
 
-/// Whether a command's resolved path crosses a link this snapshot builder made.
+/// What this command's resolved paths prove about the bytes it consumes.
 ///
 /// The sidecar is explicit creator provenance, not a symlink-shape heuristic.
 /// A target-owned `.bin -> bin-owned` therefore stays `snapshot`, while a
-/// missing `.bin/eslint` linked by prview is `snapshot-borrowed-deps`.
+/// missing `.bin/eslint` linked by prview is `snapshot-borrowed-deps` and a
+/// shim whose grammar nobody here can read is `snapshot-unproven-deps`.
+///
+/// Across several consumable paths the states do not average: one proved borrow
+/// settles the command, because a later path being fine cannot un-borrow bytes
+/// that were already shown to come from outside. Absent any proved borrow, one
+/// unproved path is enough to withhold the exact-snapshot claim for all of them.
 ///
 /// Checked at the WORKTREE ROOT, not at the check's `cwd` — a cargo member runs
 /// in a subdirectory while the scaffolding sits at the top of the snapshot.
-fn borrows_local_dependencies(repo: &git2::Repository, consumable: &[&str]) -> bool {
+fn dependency_closure_proof(
+    repo: &git2::Repository,
+    consumable: &[&str],
+) -> crate::git::ClosureProof {
+    use crate::git::ClosureProof;
+
     let Some(root) = repo.workdir() else {
-        return false;
+        return ClosureProof::TargetOnly;
     };
-    consumable
-        .iter()
-        .any(|path| crate::git::path_uses_prview_borrow(root, Path::new(path)))
+    let mut proof = ClosureProof::TargetOnly;
+    for path in consumable {
+        match crate::git::path_uses_prview_borrow(root, Path::new(path)) {
+            ClosureProof::Borrowed => return ClosureProof::Borrowed,
+            ClosureProof::Unproven => proof = ClosureProof::Unproven,
+            ClosureProof::TargetOnly => {}
+        }
+    }
+    proof
 }
 
 /// True when `repo` is the repository rooted at `repo_root` — its own working
@@ -4655,7 +4688,7 @@ test result: ok. 2 passed; 0 failed
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn exact_eslint_unrecognized_wrapper_is_conservatively_borrowed() {
+    async fn exact_eslint_unrecognized_wrapper_closure_is_unproven() {
         use std::os::unix::fs::PermissionsExt;
 
         let (repo, _) = repo_with_one_commit();
@@ -4698,10 +4731,237 @@ test result: ok. 2 passed; 0 failed
         let provenance = result.provenance.expect("ESLint provenance");
         assert_eq!(
             provenance.tree_state,
-            Some(TreeState::SnapshotBorrowedDeps),
-            "an unproved script closure must never be certified as target-only",
+            Some(TreeState::SnapshotUnprovenDeps),
+            "an unreadable wrapper grammar withholds the exact claim without \
+             inventing a borrow nobody observed",
         );
         assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+        assert_ne!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "`borrowed` is a claim with evidence; this closure produced none",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_shebangless_launcher_is_unproven_not_an_exact_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let launcher = bin_dir.join("eslint");
+        // No `#!` at all. That is NOT a native binary: `Command` spawns through
+        // `execvp`, POSIX requires `execvp` to retry an `ENOEXEC` file through
+        // `/bin/sh`, and the shell then honours every indirection in the line
+        // below. Treating "no shebang" as proof of a bounded closure published
+        // `snapshot` for a run that executed the operator's uncommitted bytes.
+        std::fs::write(
+            &launcher,
+            b"exec node \"$(dirname \"$0\")/../eslint/bin/eslint.js\" \"$@\"\n",
+        )
+        .expect("shebangless launcher");
+        let mut permissions = std::fs::metadata(&launcher).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&launcher, permissions).expect("executable launcher");
+        let target = commit_fixture(
+            root,
+            "target owns a shebangless launcher",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        // The payload the launcher executes exists ONLY in the operator's
+        // working tree — it is in no commit.
+        let payload_dir = root.join("node_modules/eslint/bin");
+        std::fs::create_dir_all(&payload_dir).expect("ambient eslint package");
+        std::fs::write(
+            payload_dir.join("eslint.js"),
+            "console.log('SHEBANGLESS_AMBIENT_PAYLOAD_RAN')\n",
+        )
+        .expect("ambient eslint payload");
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(
+            result.output.contains("SHEBANGLESS_AMBIENT_PAYLOAD_RAN"),
+            "the shebangless launcher must really reach the ambient payload, \
+             otherwise this fixture proves nothing: {}",
+            result.output,
+        );
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotUnprovenDeps),
+            "a missing interpreter directive leaves the closure unread, so the \
+             pack must say so instead of certifying the scan",
+        );
+        assert_ne!(
+            provenance.tree_state,
+            Some(TreeState::Snapshot),
+            "ambient bytes executed here; `snapshot` would be a false exact claim",
+        );
+    }
+
+    /// The bytes are a real pnpm shim taken from an actual installation, not a
+    /// shape reconstructed to fit the recognizer: ~18 active lines, a
+    /// `sed`-normalised `basedir`, a `case uname` block, a `NODE_PATH` export
+    /// and an `if [ -x "$basedir/node" ]` fork. Only two substitutions were made
+    /// — the payload package name, and the absolute store paths, replaced with a
+    /// neutral prefix so no operator path enters this repository.
+    ///
+    /// Everything here is target-owned: shim and payload are both in the commit
+    /// and no file is ambient. The honest answer is therefore neither `snapshot`
+    /// (prview cannot read this grammar, so it proved nothing) nor
+    /// `snapshot-borrowed-deps` (nothing borrowed was observed).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_real_pnpm_shim_closure_is_unproven() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let payload_dir = root.join("node_modules/eslint/bin");
+        std::fs::create_dir_all(&payload_dir).expect("target eslint package");
+        std::fs::write(
+            payload_dir.join("eslint.js"),
+            "console.log('REAL_PNPM_SHIM_TARGET_PAYLOAD_RAN')\n",
+        )
+        .expect("target eslint payload");
+        let shim = bin_dir.join("eslint");
+        std::fs::write(
+            &shim,
+            br#"#!/bin/sh
+basedir=$(dirname "$(echo "$0" | sed -e 's,\\,/,g')")
+
+case `uname` in
+    *CYGWIN*|*MINGW*|*MSYS*)
+        if command -v cygpath > /dev/null 2>&1; then
+            basedir=`cygpath -w "$basedir"`
+        fi
+    ;;
+esac
+
+if [ -z "$NODE_PATH" ]; then
+  export NODE_PATH="/opt/pnpm-store/.pnpm/eslint@9.0.0/node_modules/eslint/node_modules:/opt/pnpm-store/.pnpm/eslint@9.0.0/node_modules:/opt/pnpm-store/.pnpm/node_modules"
+else
+  export NODE_PATH="/opt/pnpm-store/.pnpm/eslint@9.0.0/node_modules/eslint/node_modules:/opt/pnpm-store/.pnpm/eslint@9.0.0/node_modules:/opt/pnpm-store/.pnpm/node_modules:$NODE_PATH"
+fi
+if [ -x "$basedir/node" ]; then
+  exec "$basedir/node"  "$basedir/../eslint/bin/eslint.js" "$@"
+else
+  exec node  "$basedir/../eslint/bin/eslint.js" "$@"
+fi
+"#,
+        )
+        .expect("real pnpm shim");
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).expect("executable shim");
+        let target = commit_fixture(
+            root,
+            "target owns a real pnpm shim and its payload",
+            &[
+                "package.json",
+                "node_modules/.bin/eslint",
+                "node_modules/eslint/bin/eslint.js",
+            ],
+        );
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(
+            result.output.contains("REAL_PNPM_SHIM_TARGET_PAYLOAD_RAN"),
+            "the real shim must execute its committed payload: {}",
+            result.output,
+        );
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotUnprovenDeps),
+            "prview recognises no real package-manager shim grammar, and not \
+             recognising one is not evidence of a borrow",
+        );
+        assert_ne!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotBorrowedDeps),
+            "every byte in this closure is in the commit; calling it borrowed \
+             makes `borrowed` a bag for unread files",
+        );
+        assert_ne!(
+            provenance.tree_state,
+            Some(TreeState::Snapshot),
+            "the grammar was never read, so target-only was never proved",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_eslint_direct_node_shebang_closure_is_unproven() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _) = repo_with_one_commit();
+        let root = repo.path();
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("target bin dir");
+        std::fs::write(root.join("package.json"), "{\"private\":true}\n")
+            .expect("package manifest");
+        let tool = bin_dir.join("eslint");
+        // A `node` interpreter directive with the whole program inline. Nothing
+        // is borrowed and nothing indirects, but the recognized grammars are
+        // shell grammars: prview cannot read a JS program's closure, so it must
+        // not pretend to have proved one either way.
+        std::fs::write(
+            &tool,
+            b"#!/usr/bin/env node\nconsole.log('DIRECT_NODE_INLINE_RAN')\n",
+        )
+        .expect("direct node tool");
+        let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).expect("executable tool");
+        let target = commit_fixture(
+            root,
+            "target owns a direct node tool",
+            &["package.json", "node_modules/.bin/eslint"],
+        );
+
+        let config = exact_js_config(root, &target);
+        let result = typescript::ESLintCheck
+            .run(&config)
+            .await
+            .expect("exact ESLint run");
+
+        assert_eq!(result.status, CheckStatus::Passed);
+        assert!(
+            result.output.contains("DIRECT_NODE_INLINE_RAN"),
+            "the direct node tool must run: {}",
+            result.output,
+        );
+        let provenance = result.provenance.expect("ESLint provenance");
+        assert_eq!(
+            provenance.tree_state,
+            Some(TreeState::SnapshotUnprovenDeps),
+            "a JS interpreter directive is outside every recognized grammar",
+        );
+        assert_ne!(provenance.tree_state, Some(TreeState::Snapshot));
+        assert_ne!(provenance.tree_state, Some(TreeState::SnapshotBorrowedDeps));
     }
 
     #[cfg(unix)]

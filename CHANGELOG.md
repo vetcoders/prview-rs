@@ -132,6 +132,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`checks[].tree_state` has a third snapshot value: `snapshot-unproven-deps`.**
+  A JS gate's provenance used to have two answers for three facts, so
+  `snapshot-borrowed-deps` carried both "these bytes came from outside the
+  snapshot" and "this closure could not be read". Since prview recognises no
+  real `npm`/`pnpm`/`yarn` shim grammar, the second meaning swallowed the
+  ordinary case and a fully target-owned toolchain reported borrowed. The new
+  value says what is actually known — the reviewed source is exactly
+  `target_sha`, the dependency closure is unread — and `snapshot-borrowed-deps`
+  goes back to meaning a borrow that was positively observed. Read
+  `snapshot-unproven-deps` as cautiously as `snapshot-borrowed-deps`: it is not
+  an exact scan. Existing values are unchanged, and test/package selection
+  treats the new state exactly like the other two exact-source snapshots.
+- **A tool with no `#!` is no longer certified as an exact snapshot scan.**
+  "No shebang" was standing in for "native binary, no indirection". It is the
+  opposite: prview spawns through `Command`, hence `execvp`, and POSIX requires
+  `execvp` to retry an `ENOEXEC` file through `/bin/sh` — so such a file is a
+  shell script with unbounded indirection. Deleting one `#!/bin/sh` line was
+  enough to flip a run that executed the operator's uncommitted bytes from
+  `snapshot-borrowed-deps` to `snapshot`. Target-only closure is now proved only
+  by explicit object-file magic (ELF, thin Mach-O in both endiannesses and
+  widths, fat/universal Mach-O in both offset widths), read before the script
+  size bound so a large compiled tool still proves its own kind.
 - **Every run is now bounded in time.** A local review, `--tui`, and a detached
   MCP `run_review deep` get 30 minutes; `--ci` and `prview gate` get 60. (An MCP
   `quick` review keeps its own, tighter 120-second server budget.) The numbers

@@ -146,8 +146,32 @@ fn resolved_symlink_path(
     Some(normalized.into_iter().collect())
 }
 
-/// True only when resolving `relative_path` in this snapshot consumes bytes
-/// outside the snapshot tree.
+/// What a static proof could establish about the executable closure a check
+/// resolves through this snapshot.
+///
+/// Three states, not two, because "proved to read borrowed bytes" and "could
+/// not be proved either way" are different facts. Collapsing them makes
+/// `Borrowed` a bag for everything the resolver cannot read — and every real
+/// `npm`/`pnpm`/`yarn` shim is something it cannot read, so the bag swallows
+/// the ordinary case. An unrecognised grammar is the ABSENCE of evidence, in
+/// both directions; it is not evidence that ambient bytes ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClosureProof {
+    /// Every statically visible byte of the closure is target-owned: the
+    /// scanned bytes are exactly the reviewed commit's.
+    TargetOnly,
+    /// Positive evidence that the closure consumes bytes from outside the
+    /// snapshot — a link prview itself created, or a canonical identity that
+    /// resolves outside the snapshot root.
+    Borrowed,
+    /// The snapshot is genuine (its source is exactly the reviewed commit), but
+    /// the dependency chain the tool would execute is opaque to a static proof.
+    /// Neither `TargetOnly` nor `Borrowed` is earned, so neither is claimed.
+    Unproven,
+}
+
+/// What resolving `relative_path` in this snapshot proves about the bytes it
+/// consumes.
 ///
 /// The manifest lives beside the worktree, inside the same temporary directory,
 /// so target-owned files cannot forge or collide with it and it disappears with
@@ -160,11 +184,19 @@ fn resolved_symlink_path(
 /// A package-manager wrapper is not the final payload. Only strict, anchored
 /// wrapper grammars contribute payload paths; comments, strings, and arbitrary
 /// `require(` substrings are not evidence. A script whose closure cannot be
-/// proved from one of those grammars is classified conservatively as borrowed.
+/// proved from one of those grammars is [`ClosureProof::Unproven`] — not
+/// borrowed, because nothing here observed a borrow.
+///
+/// Positive borrow evidence is settled BEFORE the unproved case. The two are
+/// not competing guesses: one is a proof and the other is its absence, so the
+/// proof publishes even when the closure analysis also came up short. A
+/// target-owned absolute symlink into the operator's tree is exactly that
+/// shape — its content may be unreadable while its canonical identity is
+/// plainly outside the snapshot.
 #[cfg(unix)]
-pub(crate) fn path_uses_prview_borrow(snapshot_root: &Path, relative_path: &Path) -> bool {
+pub(crate) fn path_uses_prview_borrow(snapshot_root: &Path, relative_path: &Path) -> ClosureProof {
     let Some(parent) = snapshot_root.parent() else {
-        return false;
+        return ClosureProof::TargetOnly;
     };
     let encoded = std::fs::read(parent.join(BORROWED_LINKS_MANIFEST)).unwrap_or_default();
     use std::os::unix::ffi::OsStringExt as _;
@@ -177,23 +209,27 @@ pub(crate) fn path_uses_prview_borrow(snapshot_root: &Path, relative_path: &Path
         .iter()
         .any(|created| relative_path.starts_with(created) || created.starts_with(relative_path))
     {
-        return true;
+        return ClosureProof::Borrowed;
     }
     let consumed = consumed_paths(snapshot_root, relative_path);
-    if !consumed.closure_proven {
-        return true;
-    }
     if consumed.package_wrapper
         && borrowed.iter().any(|created| {
             created.starts_with("node_modules") || Path::new("node_modules").starts_with(created)
         })
     {
-        return true;
+        return ClosureProof::Borrowed;
     }
-    consumed
+    if consumed
         .paths
         .iter()
         .any(|path| path_is_external_or_borrowed(snapshot_root, path, borrowed.as_slice()))
+    {
+        return ClosureProof::Borrowed;
+    }
+    if !consumed.closure_proven {
+        return ClosureProof::Unproven;
+    }
+    ClosureProof::TargetOnly
 }
 
 #[cfg(unix)]
@@ -213,6 +249,70 @@ fn path_is_external_or_borrowed(snapshot_root: &Path, path: &Path, borrowed: &[P
         std::fs::canonicalize(snapshot_root.join(relative))
             .is_ok_and(|identity| path_identity.starts_with(identity))
     })
+}
+
+/// How many leading bytes settle a native object file's identity.
+#[cfg(unix)]
+const NATIVE_MAGIC_BYTES: usize = 4;
+
+/// The object-file magics that positively prove "this file is executed by the
+/// kernel, not by an interpreter", in on-disk byte order:
+///
+/// - `7F 45 4C 46` — ELF (`\x7FELF`): every Linux and BSD executable;
+/// - `CE FA ED FE` / `FE ED FA CE` — thin Mach-O 32-bit, `MH_MAGIC` /
+///   `MH_CIGAM` (both endiannesses);
+/// - `CF FA ED FE` / `FE ED FA CF` — thin Mach-O 64-bit, `MH_MAGIC_64` /
+///   `MH_CIGAM_64`;
+/// - `CA FE BA BE` / `BE BA FE CA` — fat/universal Mach-O with 32-bit offsets,
+///   `FAT_MAGIC` / `FAT_CIGAM`: the shape Apple actually ships in `/bin`;
+/// - `CA FE BA BF` / `BF BA FE CA` — fat/universal Mach-O with 64-bit offsets,
+///   `FAT_MAGIC_64` / `FAT_CIGAM_64`.
+///
+/// `CA FE BA BE` is also the Java class-file magic. The collision cannot produce
+/// a false exact-snapshot claim in practice: a class file at
+/// `node_modules/.bin/<tool>` has no interpreter of its own, so the spawn fails
+/// and no ambient bytes execute. Recognising the fat magic is worth that, since
+/// it is the format every Apple-shipped executable uses.
+#[cfg(unix)]
+const NATIVE_EXECUTABLE_MAGICS: &[[u8; NATIVE_MAGIC_BYTES]] = &[
+    [0x7F, b'E', b'L', b'F'],
+    [0xCE, 0xFA, 0xED, 0xFE],
+    [0xFE, 0xED, 0xFA, 0xCE],
+    [0xCF, 0xFA, 0xED, 0xFE],
+    [0xFE, 0xED, 0xFA, 0xCF],
+    [0xCA, 0xFE, 0xBA, 0xBE],
+    [0xBE, 0xBA, 0xFE, 0xCA],
+    [0xCA, 0xFE, 0xBA, 0xBF],
+    [0xBF, 0xBA, 0xFE, 0xCA],
+];
+
+#[cfg(unix)]
+fn is_native_executable_magic(header: &[u8; NATIVE_MAGIC_BYTES]) -> bool {
+    NATIVE_EXECUTABLE_MAGICS.contains(header)
+}
+
+/// The first [`NATIVE_MAGIC_BYTES`] of `path`, or `None` when the file is
+/// shorter than that or cannot be read.
+///
+/// Deliberately a bounded header read rather than a whole-file read: this runs
+/// before the script size bound, so the file on the other end may be an
+/// arbitrarily large binary.
+#[cfg(unix)]
+fn native_magic_header(path: &Path) -> Option<[u8; NATIVE_MAGIC_BYTES]> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; NATIVE_MAGIC_BYTES];
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => return None,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(header)
 }
 
 #[cfg(unix)]
@@ -251,6 +351,23 @@ fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
             closure_proven: true,
         };
     }
+    // A recognised object file is the ONE positive proof that no script
+    // indirection exists: the kernel executes these bytes directly, so the
+    // closure is the invocation itself.
+    //
+    // Read BEFORE the size bound. Four bytes settle a file's kind at any size,
+    // and real compiled tools are routinely larger than a shim bound (macOS
+    // ships `/bin/echo` at ~100 KiB). The bound exists for CONTENT analysis,
+    // which magic recognition does not perform.
+    if let Some(header) = native_magic_header(&invocation)
+        && is_native_executable_magic(&header)
+    {
+        return ConsumedPaths {
+            paths: consumed,
+            package_wrapper: false,
+            closure_proven: true,
+        };
+    }
     if metadata.len() > MAX_JS_SHIM_BYTES {
         return ConsumedPaths {
             paths: consumed,
@@ -265,11 +382,17 @@ fn consumed_paths(snapshot_root: &Path, relative_path: &Path) -> ConsumedPaths {
             closure_proven: false,
         };
     };
+    // No `#!` and no recognised magic proves NOTHING about the closure, and it
+    // must never be read as "native binary". prview spawns through `Command`,
+    // hence `execvp`, and POSIX requires `execvp` to retry an `ENOEXEC` file
+    // through `/bin/sh` — so this file is a shell script whose interpreter was
+    // chosen for it, with the full, unbounded indirection a shell allows. The
+    // magic check above is the only thing that can rule that out.
     if !bytes.starts_with(b"#!") {
         return ConsumedPaths {
             paths: consumed,
             package_wrapper: false,
-            closure_proven: true,
+            closure_proven: false,
         };
     }
     let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -369,8 +492,11 @@ fn is_proved_direct_shell_script(text: &str, active_lines: &[&str]) -> bool {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn path_uses_prview_borrow(_snapshot_root: &Path, _relative_path: &Path) -> bool {
-    false
+pub(crate) fn path_uses_prview_borrow(
+    _snapshot_root: &Path,
+    _relative_path: &Path,
+) -> ClosureProof {
+    ClosureProof::TargetOnly
 }
 
 #[cfg(unix)]
@@ -713,6 +839,114 @@ mod tests {
                 .expect("initial commit");
         }
         (tmp, repo)
+    }
+
+    /// A snapshot-shaped directory holding one executable tool, with no
+    /// borrowed-links manifest beside it — so nothing but the tool's own bytes
+    /// can decide the classification.
+    #[cfg(unix)]
+    fn snapshot_with_tool(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("snapshot tempdir");
+        let root = tmp.path().join("snapshot");
+        let bin_dir = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).expect("snapshot bin dir");
+        let tool = bin_dir.join("eslint");
+        std::fs::write(&tool, bytes).expect("snapshot tool");
+        let mut permissions = std::fs::metadata(&tool)
+            .expect("tool metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).expect("executable tool");
+        (tmp, root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_object_file_magic_proves_a_target_only_closure() {
+        let relative = Path::new("node_modules/.bin/eslint");
+
+        // Every entry is padded past the SCRIPT bound on purpose. That is the
+        // one shape where real magic recognition and the discarded "no `#!`"
+        // proxy disagree, so each list entry has to carry its own weight here —
+        // and it matches reality, where compiled tools are larger than the
+        // bound (macOS ships `/bin/echo` at ~100 KiB). Four bytes settle a
+        // file's kind at any size; the bound exists for content analysis only.
+        let bound = usize::try_from(MAX_JS_SHIM_BYTES).expect("shim bound fits usize");
+        for magic in NATIVE_EXECUTABLE_MAGICS {
+            let mut bytes = magic.to_vec();
+            bytes.resize(bound * 2, 0);
+            let (_tmp, root) = snapshot_with_tool(&bytes);
+            assert_eq!(
+                path_uses_prview_borrow(&root, relative),
+                ClosureProof::TargetOnly,
+                "magic {magic:02X?} names an object file the kernel executes directly, \
+                 so the closure is the invocation itself at any file size",
+            );
+        }
+
+        // A small object file is proved by the same four bytes.
+        let mut small = NATIVE_EXECUTABLE_MAGICS[0].to_vec();
+        small.extend_from_slice(b"\x00\x00 remainder of an object file");
+        let (_tmp, root) = snapshot_with_tool(&small);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "magic recognition does not depend on file size in either direction",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_without_a_shebang_is_unproven_never_native() {
+        let relative = Path::new("node_modules/.bin/eslint");
+
+        // The exact regressed vector: no `#!` and no magic. `Command` spawns
+        // through `execvp`, which POSIX requires to retry an `ENOEXEC` file
+        // through `/bin/sh`, so these bytes run with full shell indirection.
+        // Certifying them as an exact snapshot scan is the claim this pins shut.
+        let (_tmp, root) =
+            snapshot_with_tool(b"exec node \"$(dirname \"$0\")/../eslint/bin/eslint.js\" \"$@\"\n");
+        let proof = path_uses_prview_borrow(&root, relative);
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "a missing interpreter directive proves nothing in either direction",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "the absence of `#!` must never stand in for native object-file magic",
+        );
+
+        // One byte off the ELF magic is not the ELF magic.
+        let (_tmp, root) = snapshot_with_tool(&[0x7F, b'E', b'L', b'G', 0x00]);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven,
+            "magic recognition is exact, not approximate",
+        );
+
+        // Shorter than the magic window: nothing to recognise.
+        let (_tmp, root) = snapshot_with_tool(b"\x7FEL");
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven,
+            "a file too short to carry a magic cannot have proved one",
+        );
+
+        // An oversized SCRIPT still has no proved kind, so the content bound
+        // keeps withholding the exact claim.
+        let bound = usize::try_from(MAX_JS_SHIM_BYTES).expect("shim bound fits usize");
+        let mut oversized = b"#!/bin/sh\n".to_vec();
+        oversized.resize(bound * 2, b'\n');
+        let (_tmp, root) = snapshot_with_tool(&oversized);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::Unproven,
+            "an oversized script's closure is unread, not borrowed and not proved",
+        );
     }
 
     fn registered_paths(repo: &git2::Repository) -> Vec<PathBuf> {
