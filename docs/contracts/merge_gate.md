@@ -276,13 +276,21 @@ qualify.
 `cargo_audit` is judged differently, because its findings are not source
 locations. An advisory is `Cargo.lock` × the advisory database, so no
 uncommitted source can move it and whole-tree cleanliness is not evidence about
-it either way. Its proof is that the audited `Cargo.lock` was the target's:
-trivially true when the run scanned a target snapshot, and true for a local run
-when the lockfile itself carried no uncommitted change (read from the status
-frozen before the checks ran, scoped to the `cargo_root` lock and the
-workspace-root lock it falls back to). Unrelated dirt in the tree no longer
-suppresses the downgrade; a dirty lockfile does, and an unreadable status
-establishes nothing.
+it either way. Its proof has two premises, and both must hold.
+
+First, the target commit's tree must actually carry a `Cargo.lock` (the
+`cargo_root` member lock, or the workspace-root lock it falls back to). `cargo
+audit` does not refuse a crate that has no lockfile: it resolves one from the
+registry, audits that, and exits non-zero on a hit. Those advisories are real,
+but they are about a file no commit contains, so nothing about them can be
+"unchanged by this PR". A target with no lockfile, or a lock question that
+cannot be answered, proves nothing — in every run shape.
+
+Second, the lockfile the audit read must be that one: trivially true when the
+run scanned a target snapshot, and true for a local run when the lockfile
+carried no uncommitted change (read from the status frozen before the checks
+ran). Unrelated dirt in the tree no longer suppresses the downgrade; a dirty
+lockfile does, and an unreadable status establishes nothing.
 
 The proof licenses a downgrade; it never manufactures one. Advisories the diff
 introduced stay `introduced`, and a changed lock with no base audit leaves every
@@ -299,11 +307,27 @@ remain the record of what was compared.
 Both outcomes are named in the check row's `reason`: a downgraded audit reads
 `pre-existing: Cargo.lock unchanged by this PR (N advisories)` or `pre-existing:
 unchanged vs base audit (N advisories)`, while a blocking one appears in
-`decision.blocking_issues` as `Cargo audit (<Status>): N new vulnerabilities
-introduced (RUSTSEC-…), M pre-existing`, or `… : N advisories with no base
-comparison (baseline <status>)` when nothing could be compared. `blocking_issues`
-entries remain free-form non-empty strings; consumers that need structure read
-`checks[]` and `decision.quality_failure_details[]`, not this text.
+`decision.blocking_issues` as one of
+
+- `Cargo audit (<Status>): N new advisories introduced (RUSTSEC-… in <package>
+  <version>, …), M pre-existing`,
+- `Cargo audit (<Status>): N advisories with no base comparison (baseline
+  <status>)` when nothing could be compared, or
+- `Cargo audit (<Status>): provenance proof unavailable: <gap> (M advisories not
+  shown to predate this change)` when the counts are silent and the lockfile
+  proof was withheld — `<gap>` being `no Cargo.lock in the target tree`,
+  `Cargo.lock dirty in the scanned tree`, or `the scanned tree could not be tied
+  to the target commit`.
+
+The set the first line counts and the set it names are one set: `new` counts
+every advisory in the report, `vulnerabilities` and the `warnings` categories
+(`unmaintained`, `unsound`, `yanked`) alike, and each one is named with the
+locked package the key carries. The noun is therefore "advisories", not
+"vulnerabilities", and `N` always equals the number of names.
+
+`blocking_issues` entries remain free-form non-empty strings; consumers that
+need structure read `checks[]` and `decision.quality_failure_details[]`, not
+this text.
 
 The emitter and validator share this per-source disposition table:
 

@@ -729,12 +729,65 @@ pub(crate) enum CargoAuditLockProof {
     /// materialised at the target commit, or it scanned the local checkout and
     /// the lockfile itself carried no uncommitted change.
     TargetLock,
-    /// Provenance not established — no downgrade.
-    Unproven,
+    /// Provenance not established — no downgrade. The variant names WHICH
+    /// premise failed, because a check that blocks for want of a proof owes the
+    /// reader that sentence: `Cargo audit (Failed)` beside `new=0,
+    /// pre-existing=2` is exactly the mute blocker this line of work exists to
+    /// close, and revoking a proof reproduces it in the other direction.
+    Unproven(LockProofGap),
+}
+
+/// Which premise of the lockfile proof was missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockProofGap {
+    /// The target commit's tree carries no `Cargo.lock` at all, so the audit
+    /// read a lockfile `cargo audit` generated from the registry rather than one
+    /// this repository committed.
+    NoTargetLock,
+    /// The scanned checkout's lockfile carried an uncommitted change, so it is
+    /// not provably the target's.
+    DirtyLock,
+    /// The worktree status or the checkout's identity could not be read, so
+    /// nothing about the scanned lockfile was established either way.
+    UnknownProvenance,
+}
+
+impl LockProofGap {
+    /// The gap in one clause, for the merge gate's blocking line. Free-form
+    /// text by contract: structural consumers read `checks[]`, not this string.
+    pub(crate) fn gate_note(self) -> &'static str {
+        match self {
+            LockProofGap::NoTargetLock => {
+                "provenance proof unavailable: no Cargo.lock in the target tree"
+            }
+            LockProofGap::DirtyLock => {
+                "provenance proof unavailable: Cargo.lock dirty in the scanned tree"
+            }
+            LockProofGap::UnknownProvenance => {
+                "provenance proof unavailable: the scanned tree could not be tied \
+                 to the target commit"
+            }
+        }
+    }
 }
 
 /// Resolve [`CargoAuditLockProof`] for this run.
 ///
+/// The proof has TWO premises, and both branches of the checkout shape share
+/// the first one.
+///
+/// **Premise 1 — the target tree has a lockfile at all.** `cargo audit` does
+/// not refuse a crate without `Cargo.lock`; it resolves one from the registry,
+/// audits that, and exits non-zero on a hit (measured: cargo-audit 0.22.2).
+/// Such a run produces genuine advisories about a lockfile no commit contains,
+/// and calling them "pre-existing: Cargo.lock unchanged by this PR" is a claim
+/// about a file the target does not have — a false PASS on a security gate, in
+/// a repository whose `Cargo.lock` is untracked or ignored and whose PR just
+/// added a vulnerable dependency. So the proof asks the target COMMIT, through
+/// the same member-then-workspace-root precedence the live run follows; a tree
+/// with no lockfile, or an unanswerable question, establishes nothing.
+///
+/// **Premise 2 — the lockfile that was read was that one.**
 /// `target_is_checkout == Some(false)` is the remote/snapshot shape: `cargo
 /// audit` runs through `plan_cargo_run`, which materialises a worktree snapshot
 /// at the target commit and executes there, so the lock it read IS the target's
@@ -745,31 +798,54 @@ pub(crate) enum CargoAuditLockProof {
 ///
 /// `Some(true)` is the local shape: the lock is the target's only while the
 /// lockfile carries no uncommitted change. The dirty set is the one frozen
-/// before the checks ran, so a lock a later `cargo build` rewrote cannot revoke
-/// a proof that held when the audit actually read it. An unreadable status
-/// (`None`) establishes nothing.
+/// before the checks ran (R4-19), which is a statement about the tree the run
+/// started from, not about the instant the audit read the file. An unreadable
+/// status (`None`) establishes nothing.
 fn resolve_cargo_audit_lock_proof(
     config: &Config,
+    repo: Option<&crate::git::Repository>,
+    resolved_target: &crate::git::ResolvedRef,
     target_is_checkout: Option<bool>,
     worktree_dirty_paths: Option<&std::collections::BTreeSet<String>>,
 ) -> CargoAuditLockProof {
+    if target_is_checkout.is_none() {
+        return CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance);
+    }
+    // Premise 1, shared by both shapes: no lockfile in the target tree, or no
+    // readable answer, and there is nothing for premise 2 to be about.
+    let Some(repo) = repo else {
+        return CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance);
+    };
+    match crate::artifacts::audit::cargo_audit_lock_path_in_commit(
+        repo,
+        &resolved_target.commit_id,
+        &config.repo_root,
+        config.profile.cargo_root.as_deref(),
+    ) {
+        Some(Some(_)) => {}
+        Some(None) => return CargoAuditLockProof::Unproven(LockProofGap::NoTargetLock),
+        None => return CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
+    }
+
     match target_is_checkout {
         Some(false) => CargoAuditLockProof::TargetLock,
         Some(true) => {
             let Some(dirty) = worktree_dirty_paths else {
-                return CargoAuditLockProof::Unproven;
+                return CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance);
             };
             let candidates = crate::artifacts::audit::cargo_audit_candidate_lock_paths(
                 &config.repo_root,
                 config.profile.cargo_root.as_deref(),
             );
-            if candidates.is_empty() || candidates.iter().any(|path| dirty.contains(path)) {
-                CargoAuditLockProof::Unproven
+            if candidates.is_empty() {
+                CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance)
+            } else if candidates.iter().any(|path| dirty.contains(path)) {
+                CargoAuditLockProof::Unproven(LockProofGap::DirtyLock)
             } else {
                 CargoAuditLockProof::TargetLock
             }
         }
-        None => CargoAuditLockProof::Unproven,
+        None => CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
     }
 }
 
@@ -845,9 +921,8 @@ impl CleanComparison {
     ) -> Self {
         let has_base_diff = has_resolvable_base_diff(resolved_target, resolved_bases);
         let configs_changed = changed_tool_config_owners(diffs);
-        let head = crate::git::Repository::open(&config.repo_root)
-            .ok()
-            .and_then(|repo| repo.head_commit_id().ok());
+        let repo = crate::git::Repository::open(&config.repo_root).ok();
+        let head = repo.as_ref().and_then(|repo| repo.head_commit_id().ok());
         // A later HEAD can invalidate source stability, never grant a new
         // source identity to results produced earlier in the run.
         let stable_head = worktree_head_sha.filter(|captured| head.as_deref() == Some(*captured));
@@ -860,6 +935,8 @@ impl CleanComparison {
             configs_changed,
             cargo_audit_lock: resolve_cargo_audit_lock_proof(
                 config,
+                repo.as_ref(),
+                resolved_target,
                 target_is_checkout,
                 worktree_dirty_paths,
             ),
@@ -874,6 +951,15 @@ impl CleanComparison {
     /// second, later reading of the tree.
     pub(crate) fn operator_worktree_clean(&self) -> Option<bool> {
         self.worktree_clean
+    }
+
+    /// Cargo audit's lockfile provenance proof, as resolved for this run.
+    ///
+    /// Exposed so the merge gate can state WHY a cargo audit blocked when the
+    /// counts have nothing to add: "unclassified" names the outcome, not the
+    /// missing premise.
+    pub(crate) fn cargo_audit_lock_proof(&self) -> CargoAuditLockProof {
+        self.cargo_audit_lock
     }
 
     /// Whether the pre-existing downgrade may fire for `check_id`'s findings.
@@ -2226,6 +2312,15 @@ mod tests {
         // read IS the target's and `CargoAuditLockProof::TargetLock` holds. Its
         // membership is asserted below as the proof it now is, not as an
         // inherited property of the rustfmt case.
+        //
+        // The class this list used to hold for cargo audit — "no proof, no
+        // downgrade" — did not move out of the suite when it moved out of the
+        // list. `for_test` hands this test a proof that already holds, so the
+        // assertion below is about the widening; the premises themselves are
+        // guarded through the real resolver by
+        // `cargo_audit_lock_proof_reads_the_lockfile_not_the_tree` (dirty lock,
+        // unreadable status) and `a_target_without_a_lockfile_proves_nothing`
+        // (no lockfile in the target, in BOTH checkout shapes).
         let clean = CleanComparison::for_test(false, true);
         assert!(
             clean.applies_to("semgrep_scan"),
@@ -2252,8 +2347,10 @@ mod tests {
             "cargo audit reads the target snapshot's lockfile, so the proof holds"
         );
         assert!(
-            !CleanComparison::for_test_cargo_audit_lock(CargoAuditLockProof::Unproven)
-                .applies_to("cargo_audit"),
+            !CleanComparison::for_test_cargo_audit_lock(CargoAuditLockProof::Unproven(
+                LockProofGap::DirtyLock,
+            ))
+            .applies_to("cargo_audit"),
             "without lockfile provenance cargo audit must not downgrade"
         );
 
@@ -2318,7 +2415,9 @@ mod tests {
     /// evidence that the audited lock was not the target's.
     #[test]
     fn a_dirty_lockfile_revokes_the_cargo_audit_downgrade() {
-        let unproven = CleanComparison::for_test_cargo_audit_lock(CargoAuditLockProof::Unproven);
+        let unproven = CleanComparison::for_test_cargo_audit_lock(CargoAuditLockProof::Unproven(
+            LockProofGap::DirtyLock,
+        ));
         assert!(!unproven.applies_to("cargo_audit"));
         let summary = build_quality_failure_summary(
             &[failed_check("Cargo audit")],
@@ -2383,7 +2482,7 @@ mod tests {
     /// checks ran — not off the tree as it stands at artifact time (R4-19).
     #[test]
     fn cargo_audit_lock_proof_reads_the_lockfile_not_the_tree() {
-        let (tmp, _repo, first, target) = comparison_repo();
+        let (tmp, _repo, first, target) = comparison_repo_with_lock();
         let config = crate::config::test_config_builder()
             .repo_root(tmp.path())
             .build();
@@ -2426,6 +2525,89 @@ mod tests {
             .applies_to("cargo_audit"),
             "an unreadable status establishes nothing"
         );
+    }
+
+    /// P1: the proof never asserted that the lockfile it vouches for EXISTS.
+    ///
+    /// `cargo audit` does not refuse a crate without `Cargo.lock` — it resolves
+    /// one from the registry, audits that, and exits non-zero on a hit
+    /// (measured: cargo-audit 0.22.2 generates the file in place). Granting
+    /// `TargetLock` there let the gate downgrade a real security failure to
+    /// "pre-existing: Cargo.lock unchanged by this PR" in a repository that has
+    /// no `Cargo.lock` at all — a false PASS, in both the local and the snapshot
+    /// shape, since neither branch consulted the target tree.
+    #[test]
+    fn a_target_without_a_lockfile_proves_nothing() {
+        let (tmp, _repo, first, target) = comparison_repo();
+        let config = crate::config::test_config_builder()
+            .repo_root(tmp.path())
+            .build();
+        let clean: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        // Local shape: head == target, tree spotless, and still no proof —
+        // the missing premise is the file, not the dirt.
+        let local = CleanComparison::resolve(
+            &config,
+            &resolved_ref(&first.to_string()),
+            &[resolved_ref(&target.to_string())],
+            Some(true),
+            Some(&clean),
+            Some(&first.to_string()),
+            &[],
+        );
+        assert!(
+            !local.applies_to("cargo_audit"),
+            "a clean tree with no Cargo.lock vouches for no lockfile"
+        );
+        assert_eq!(
+            local.cargo_audit_lock_proof(),
+            CargoAuditLockProof::Unproven(LockProofGap::NoTargetLock),
+            "the gap is named so the merge gate can state it"
+        );
+
+        // Snapshot shape: the snapshot is materialised at the target commit, so
+        // "the lock it read is the target's" is vacuous when the target has none.
+        let snapshot = CleanComparison::resolve(
+            &config,
+            &resolved_ref(&target.to_string()),
+            &[resolved_ref(&first.to_string())],
+            Some(true),
+            Some(&clean),
+            Some(&first.to_string()),
+            &[],
+        );
+        assert!(
+            !snapshot.applies_to("cargo_audit"),
+            "a snapshot of a lock-less target audits a lockfile no commit carries"
+        );
+        assert_eq!(
+            snapshot.cargo_audit_lock_proof(),
+            CargoAuditLockProof::Unproven(LockProofGap::NoTargetLock)
+        );
+
+        // The control: the same two shapes over a target that DOES carry a
+        // committed lockfile keep the proof, so this is the file premise and
+        // nothing else.
+        let (lock_tmp, _lock_repo, lock_first, lock_target) = comparison_repo_with_lock();
+        let lock_config = crate::config::test_config_builder()
+            .repo_root(lock_tmp.path())
+            .build();
+        for (target_ref, base_ref) in [(&lock_first, &lock_target), (&lock_target, &lock_first)] {
+            let proven = CleanComparison::resolve(
+                &lock_config,
+                &resolved_ref(&target_ref.to_string()),
+                &[resolved_ref(&base_ref.to_string())],
+                Some(true),
+                Some(&clean),
+                Some(&lock_first.to_string()),
+                &[],
+            );
+            assert_eq!(
+                proven.cargo_audit_lock_proof(),
+                CargoAuditLockProof::TargetLock
+            );
+            assert!(proven.applies_to("cargo_audit"));
+        }
     }
 
     #[test]
@@ -2671,10 +2853,36 @@ mod tests {
         }
     }
 
+    /// A two-commit repo whose tree carries a real, committed `Cargo.lock`.
+    ///
+    /// The lockfile is not decoration: cargo audit's provenance proof asks the
+    /// target COMMIT whether a lockfile exists there, because a run in a
+    /// lock-less tree audits one `cargo audit` generated from the registry. A
+    /// fixture without the file can only assert about a world the proof refuses.
+    fn comparison_repo_with_lock() -> (tempfile::TempDir, git2::Repository, git2::Oid, git2::Oid) {
+        comparison_repo_inner(true)
+    }
+
     fn comparison_repo() -> (tempfile::TempDir, git2::Repository, git2::Oid, git2::Oid) {
+        comparison_repo_inner(false)
+    }
+
+    fn comparison_repo_inner(
+        with_lock: bool,
+    ) -> (tempfile::TempDir, git2::Repository, git2::Oid, git2::Oid) {
         let tmp = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(tmp.path()).unwrap();
         let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        if with_lock {
+            std::fs::write(
+                tmp.path().join("Cargo.lock"),
+                "version = 3\n\n[[package]]\nname = \"demo\"\nversion = \"1.2.3\"\n",
+            )
+            .unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("Cargo.lock")).unwrap();
+            index.write().unwrap();
+        }
         let tree_id = repo.index().unwrap().write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
         let first = repo
@@ -3158,7 +3366,7 @@ mod tests {
             current_only: false,
             has_base_diff: true,
             configs_changed: std::collections::BTreeSet::new(),
-            cargo_audit_lock: CargoAuditLockProof::Unproven,
+            cargo_audit_lock: CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
         };
         assert!(
             !unknown.applies_to("clippy"),

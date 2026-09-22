@@ -243,9 +243,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   review caveats and `BLOCK … Cargo audit (Failed)` in its decision with nothing
   bridging the two. Dirt in the lockfile itself still revokes the downgrade, an
   introduced advisory still blocks, and a changed lock with no base audit is
-  still unclassified rather than assumed clean. The gate now states which proof
-  it applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by
-  this PR (N advisories)`, and a blocking one names the advisories it blocks on.
+  still unclassified rather than assumed clean. The proof also requires that the
+  target tree actually carry a `Cargo.lock`: `cargo audit` resolves one from the
+  registry when a crate has none and audits that, so advisories from such a run
+  are real but concern a file no commit contains, and they now keep gating
+  instead of being reported as unchanged. The gate states which proof it
+  applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by this
+  PR (N advisories)`; a blocking one names the advisories it blocks on — all of
+  them, counted and named from one set, so an `unmaintained` warning is no
+  longer counted as a "vulnerability" nor silently left unnamed — and an audit
+  that blocks for want of the proof says which premise was missing instead of
+  reporting a bare `Cargo audit (Failed)`. The dashboard now states the gate
+  verdict as a `data-merge-verdict` attribute on the merge chip, so its parity
+  with `MERGE_GATE.json` is assertable rather than assumed.
   `docs/contracts/merge_gate.md` and `docs/architecture.md` carry the rule.
 
 - `prview gate --base <REF>` is pinned to a commit before the review starts. The

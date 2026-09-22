@@ -1526,8 +1526,31 @@ fn write_commit_fixture(repo: &Path, name: &str, body: &str) -> String {
 }
 
 fn init_advanced_base_fixture() -> (tempfile::TempDir, String, String) {
+    init_advanced_base_fixture_inner(true)
+}
+
+/// The shared base fixture, with or without a committed `Cargo.lock`.
+///
+/// Cargo audit's provenance proof asks the target COMMIT whether a lockfile
+/// exists there, so a fixture that asserts `pre-existing: Cargo.lock unchanged
+/// by this PR` has to actually HAVE that file — otherwise it pins a sentence
+/// about a world the pack never describes. The manifest and lock are committed
+/// before the branch point, so every diff in this fixture stays source-only.
+fn init_advanced_base_fixture_inner(with_lock: bool) -> (tempfile::TempDir, String, String) {
     let tmp = tempfile::tempdir().expect("tempdir");
     run_git_fixture(tmp.path(), &["init", "-q", "-b", "main"]);
+    if with_lock {
+        write_commit_fixture(
+            tmp.path(),
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write_commit_fixture(
+            tmp.path(),
+            "Cargo.lock",
+            "version = 3\n\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        );
+    }
     let merge_base = write_commit_fixture(tmp.path(), "own.rs", "pub fn own() -> u8 { 1 }\n");
     run_git_fixture(tmp.path(), &["checkout", "-q", "-b", "feature"]);
     let target = write_commit_fixture(tmp.path(), "own.rs", "pub fn own() -> u8 { 2 }\n");
@@ -8120,9 +8143,22 @@ fn cargo_audit_pack(
     serde_json::Value,
     String,
 ) {
+    cargo_audit_pack_inner(dirty, pack_name, true)
+}
+
+fn cargo_audit_pack_inner(
+    dirty: &[&str],
+    pack_name: &str,
+    with_lock: bool,
+) -> (
+    tempfile::TempDir,
+    serde_json::Value,
+    serde_json::Value,
+    String,
+) {
     let publication_home = tempfile::tempdir().unwrap();
     let _home = crate::config::override_test_prview_home(publication_home.path().to_path_buf());
-    let (repo, base, target) = init_advanced_base_fixture();
+    let (repo, base, target) = init_advanced_base_fixture_inner(with_lock);
     let governor = crate::governor::ResourceGovernor::new();
     let output = publication_home.path().join(pack_name);
     let diffs = [source_only_diff(&base, &target)];
@@ -8216,10 +8252,36 @@ fn an_untouched_lock_keeps_cargo_audit_off_the_blocking_list() {
         Some("Cargo audit")
     );
     let verdict = decision["verdict"].as_str().unwrap();
+    assert_dashboard_verdict(&dashboard, verdict);
+}
+
+/// The dashboard's one machine-readable statement of the gate verdict.
+///
+/// `dashboard.contains(verdict)` asserted nothing: the hero renders a localized
+/// ALLOW/HOLD/BLOCK label, while PASS/CONDITIONAL/BLOCK appear all over the
+/// document in legends, check rows and status chips — measured on one pack,
+/// `PASS` x6, `CONDITIONAL` x9, `BLOCK` x8, so the assertion passed for every
+/// possible verdict. THREAD 5 parity is only a test when it has an anchor.
+fn assert_dashboard_verdict(dashboard: &str, verdict: &str) {
+    let marker = format!(r#"data-merge-verdict="{verdict}""#);
     assert!(
-        dashboard.contains(verdict),
-        "dashboard must render the same verdict ({verdict})"
+        dashboard.contains(&marker),
+        "dashboard must carry the gate verdict as {marker}"
     );
+    assert_eq!(
+        dashboard.matches("data-merge-verdict=").count(),
+        1,
+        "exactly one element states the verdict, so the assertion cannot match a second one"
+    );
+    for other in ["PASS", "CONDITIONAL", "BLOCK"] {
+        if other == verdict {
+            continue;
+        }
+        assert!(
+            !dashboard.contains(&format!(r#"data-merge-verdict="{other}""#)),
+            "the dashboard must not claim {other} beside a {verdict} gate"
+        );
+    }
 }
 
 /// The one edit that revokes the proof. Same diff, same advisories, but the
@@ -8256,4 +8318,90 @@ fn a_dirty_lockfile_puts_cargo_audit_back_on_the_blocking_list() {
         report["gate"]["summary"], decision["decision_reason"],
         "the narrative and the gate state one decision"
     );
+
+    // P2-2: the pack used to reproduce the incident signature in the revoke
+    // direction — `reason: null`, a bare `Cargo audit (Failed)`, and a caveat
+    // announcing `new=0, pre-existing=2` right beside it. A withheld proof is a
+    // fact, not an absence, and the blocker says which one was withheld.
+    let audit_blocker = decision["blocking_issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|issue| issue.as_str())
+        .find(|issue| issue.contains("Cargo audit"))
+        .expect("cargo audit blocker");
+    assert_eq!(
+        audit_blocker,
+        "Cargo audit (Failed): provenance proof unavailable: Cargo.lock dirty in \
+         the scanned tree (2 advisories not shown to predate this change)",
+        "a blocker for want of a proof names the proof it wanted"
+    );
+    let caveats = decision["review_caveats"].as_array().unwrap();
+    assert!(
+        caveats.iter().any(|c| c
+            .as_str()
+            .is_some_and(|s| s.contains("new=0") && s.contains("pre-existing=2"))),
+        "the counts the blocker is now reconciled with: {caveats:?}"
+    );
+    assert_dashboard_verdict(&_dashboard, decision["verdict"].as_str().unwrap());
+}
+
+/// P1, at pack level: a target tree that carries no `Cargo.lock` at all.
+///
+/// `cargo audit` resolves a lockfile from the registry when the crate has none,
+/// audits it and exits non-zero on a hit, so this run produces real advisories
+/// about a file no commit contains. The proof used to be granted regardless —
+/// the pack then approved a failing security gate with the sentence
+/// `pre-existing: Cargo.lock unchanged by this PR`, about a `Cargo.lock` the
+/// repository does not have. Same diff, same advisories, same spotless tree as
+/// `an_untouched_lock_keeps_cargo_audit_off_the_blocking_list`; only the file
+/// is gone, and only the file was ever the premise.
+#[test]
+fn a_target_without_a_lockfile_keeps_cargo_audit_on_the_blocking_list() {
+    let (_home, gate, report, dashboard) = cargo_audit_pack_inner(&["notes.md"], "no-lock", false);
+
+    let decision = &gate["decision"];
+    let audit_blocker = decision["blocking_issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|issue| issue.as_str())
+        .find(|issue| issue.contains("Cargo audit"))
+        .expect("an audit with no target lockfile must keep gating");
+    assert_eq!(
+        audit_blocker,
+        "Cargo audit (Failed): provenance proof unavailable: no Cargo.lock in \
+         the target tree (2 advisories not shown to predate this change)"
+    );
+    assert_eq!(
+        decision["unclassified_quality_failures"][0].as_str(),
+        Some("Cargo audit")
+    );
+    assert!(
+        decision["preexisting_quality_failures"]
+            .as_array()
+            .is_none_or(|arr| arr.is_empty()),
+        "nothing can be pre-existing against a lockfile that does not exist"
+    );
+    assert_eq!(decision["quality_pass"].as_bool(), Some(false));
+
+    // No artifact anywhere in the pack claims the file is unchanged, because no
+    // artifact may claim anything about a file the target does not carry.
+    let audit_row = gate["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "Cargo audit")
+        .expect("cargo audit row");
+    assert_eq!(audit_row["blocking"].as_bool(), Some(true));
+    assert!(
+        audit_row["reason"]
+            .as_str()
+            .is_none_or(|reason| !reason.contains("Cargo.lock unchanged")),
+        "a lock-less target cannot report an unchanged lockfile: {audit_row:?}"
+    );
+
+    assert_eq!(report["gate"]["status"], decision["verdict"]);
+    assert_eq!(report["gate"]["quality_pass"], decision["quality_pass"]);
+    assert_dashboard_verdict(&dashboard, decision["verdict"].as_str().unwrap());
 }

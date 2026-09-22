@@ -149,6 +149,7 @@ pub(crate) fn build_dashboard_context(input: DashboardContextInput<'_>) -> Dashb
         &policy_summary.evaluations,
         &preexisting_quality_failure_names,
         inline.cargo_audit.as_ref(),
+        clean_comparison.cargo_audit_lock_proof(),
     );
 
     let mut check_gates = Vec::new();

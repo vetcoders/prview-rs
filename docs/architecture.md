@@ -277,13 +277,19 @@ baseline-signal check. R2-9 exists because uncommitted *source* bytes can make a
 finding look out-of-diff; a cargo-audit advisory has no source location to
 forge, since it lives in `Cargo.lock` × the advisory database. The proof that is
 load-bearing is therefore lockfile provenance: the audited `Cargo.lock` is the
-analysed target's. It holds when the run scanned a target snapshot (`cargo
+analysed target's — which first requires that the target HAVE one. `cargo audit`
+generates a lockfile from the registry when the crate has none and audits that,
+so the proof asks the target commit's tree (the `cargo_root` member lock, then
+the workspace-root lock it falls back to) before anything else; no lockfile
+there, or no readable answer, and the proof is withheld in every run shape.
+Given the file, the proof holds when the run scanned a target snapshot (`cargo
 audit` executes inside the materialised snapshot via `plan_cargo_run`), and,
 for a local run, when the lockfile itself carried no uncommitted change — read
-from the dirty-path set frozen before the checks ran (R4-19), scoped to the
-`cargo_root` lock and the workspace-root lock it falls back to. Dirt anywhere
+from the dirty-path set frozen before the checks ran (R4-19). Dirt anywhere
 else in the tree is not evidence about the lockfile and no longer suppresses the
-downgrade; dirt in the lockfile is, and does.
+downgrade; dirt in the lockfile is, and does. A withheld proof names its gap
+(`CargoAuditLockProof::Unproven(LockProofGap)`), and the merge gate states that
+gap rather than blocking on a bare `Cargo audit (Failed)`.
 
 One proof covers every branch of the comparison, because `in_diff` already
 carries the rest: an untouched lock makes every advisory `in_diff = false`; a

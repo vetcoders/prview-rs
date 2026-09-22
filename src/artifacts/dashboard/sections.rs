@@ -402,7 +402,7 @@ pub(super) fn build_header(
             <span class="badge badge-info header-profile-badge">{profile}</span>
         </div>
         <div class="merge-decision">
-            <span class="merge-chip {mc}">{ml}</span>
+            <span class="merge-chip {mc}" data-merge-verdict="{mv}">{ml}</span>
             {qb}
             {policy}
             {review_note}
@@ -419,6 +419,14 @@ pub(super) fn build_header(
         stats = stats_html,
         profile = escape_html(profile),
         mc = merge_class,
+        // The gate verdict as a machine-readable attribute. The hero renders a
+        // localized ALLOW/HOLD/BLOCK label, which is a different vocabulary from
+        // MERGE_GATE's PASS/CONDITIONAL/BLOCK — so parity between the two
+        // artifacts had no anchor to assert against, and a substring search for
+        // the verdict matched legend copy, check rows and status chips instead
+        // (PASS x6, CONDITIONAL x9, BLOCK x8 in one document). One attribute,
+        // one occurrence, one thing to assert.
+        mv = escape_html(ctx.verdict),
         ml = merge_label,
         qb = quality_badge,
         policy = policy_html,

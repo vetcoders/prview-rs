@@ -35,9 +35,56 @@ pub(super) struct CargoAuditGateEvidence {
     /// the advisory reason cites: an untouched lock, or an unchanged comparison
     /// against the base audit.
     pub(super) lock_changed: bool,
-    /// Advisory ids this diff introduced, in report order and deduplicated.
-    /// Empty whenever `new == 0`.
-    pub(super) new_advisory_ids: Vec<String>,
+    /// The advisories counted by `new`, one label each, sorted.
+    ///
+    /// Derived from the SAME key set `new` is counted from, so the gate
+    /// sentence names exactly what it counts: `new == new_advisories.len()`
+    /// holds by construction, and empty means `new == 0`.
+    pub(super) new_advisories: Vec<String>,
+}
+
+/// Label one advisory key for the gate sentence.
+///
+/// The locked package and version are part of the label because they are part
+/// of the key (R5-22): one advisory id can be counted twice when two locked
+/// versions of a crate are both affected, and two identical ids in a list would
+/// read as a rendering bug rather than as two findings.
+fn cargo_audit_advisory_label(key: &(String, String, String)) -> String {
+    let (advisory_id, package_name, package_version) = key;
+    format!("{advisory_id} in {package_name} {package_version}")
+}
+
+/// The advisories counted as `new`, labelled — ONE stream for the count and the
+/// names.
+///
+/// `CargoAuditBaselineCounts::new` counts `current ∖ base` over the FULL
+/// advisory set: `vulnerabilities.list` PLUS every `warnings` category
+/// (`unmaintained`, `unsound`, `yanked`). The gate sentence used to take its
+/// number from that set and its names from the vulnerability list alone, so a
+/// blocker could print `1 new …` and name nothing at all, or print `2` while
+/// naming one of them and calling an `unmaintained` warning a "vulnerability".
+/// Both are the same defect: two sets, one sentence. The names now come from
+/// the counted keys, and the sentence says "advisories" because that is what
+/// the set contains.
+fn cargo_audit_new_advisory_labels(
+    current: Option<&std::collections::HashSet<(String, String, String)>>,
+    cargo_lock_changed: bool,
+    base: Option<&std::collections::HashSet<(String, String, String)>>,
+) -> Vec<String> {
+    // Mirrors the one branch of `cargo_audit_baseline_counts` that can produce
+    // a non-zero `new`: a current report, a changed lock, and a base to compare
+    // against. Every other shape counts zero new advisories and names none.
+    let (Some(current), true, Some(base)) = (current, cargo_lock_changed, base) else {
+        return Vec::new();
+    };
+    let mut labels: Vec<String> = current
+        .difference(base)
+        .map(cargo_audit_advisory_label)
+        .collect();
+    // The source is a `HashSet`; sort so the sentence is byte-identical across
+    // runs of the same pack.
+    labels.sort();
+    labels
 }
 
 pub(super) fn is_operator_finding(finding: &DashboardFinding) -> bool {
@@ -482,16 +529,20 @@ pub(super) fn generate_inline_findings(
             });
 
             // The same values the note above renders, kept structured for the
-            // gate. Built before the per-finding loop so `new_advisory_ids` can
-            // be filled from the identical `in_diff` decision the SARIF rows
-            // carry — one classification, not two.
-            let mut evidence = CargoAuditGateEvidence {
+            // gate. `new_advisories` is derived from the identical key set
+            // `baseline.new` counts, so the number and the names cannot come
+            // from two different reads of the same report.
+            let evidence = CargoAuditGateEvidence {
                 status: baseline.status,
                 new: baseline.new,
                 preexisting: baseline.preexisting,
                 unknown: baseline.unknown,
                 lock_changed: cargo_lock_changed,
-                new_advisory_ids: Vec::new(),
+                new_advisories: cargo_audit_new_advisory_labels(
+                    current_advisories.as_ref(),
+                    cargo_lock_changed,
+                    base_audit_cache.as_ref(),
+                ),
             };
 
             let location = cargo_audit_location_for_check(check);
@@ -525,15 +576,6 @@ pub(super) fn generate_inline_findings(
                     cargo_lock_changed,
                     base_audit_cache.as_ref(),
                 );
-                if current_audit_in_diff == Some(true)
-                    && !evidence
-                        .new_advisory_ids
-                        .iter()
-                        .any(|id| id == &finding.advisory_id)
-                {
-                    evidence.new_advisory_ids.push(finding.advisory_id.clone());
-                }
-
                 dashboard_findings.push(DashboardFinding {
                     file: None,
                     line: None,
@@ -2020,6 +2062,44 @@ FAILED tests/test_parser.py::test_roundtrip\n\
         },
         "warnings": {}
     }"#;
+    /// One vulnerability plus one `unmaintained` warning — the shape that split
+    /// the counter from the names: the counter reads BOTH, the vulnerability
+    /// list reads one.
+    const MIXED_CARGO_AUDIT: &str = r#"{
+        "vulnerabilities": {
+            "found": true,
+            "count": 2,
+            "list": [{
+                "advisory": {"id": "RUSTSEC-2024-0001", "title": "demo advisory"},
+                "package": {"name": "demo", "version": "1.2.3"},
+                "versions": {"patched": [">=1.2.4"]}
+            }, {
+                "advisory": {"id": "RUSTSEC-2024-0002", "title": "second advisory"},
+                "package": {"name": "other", "version": "0.4.0"},
+                "versions": {"patched": [">=0.5.0"]}
+            }]
+        },
+        "warnings": {
+            "unmaintained": [{
+                "advisory": {"id": "RUSTSEC-2024-9999"},
+                "package": {"name": "stale", "version": "0.1.0"}
+            }]
+        }
+    }"#;
+    /// The base the mixed report is compared against: it already knew the first
+    /// vulnerability, so exactly two advisories are new.
+    const BASE_CARGO_AUDIT: &str = r#"{
+        "vulnerabilities": {
+            "found": true,
+            "count": 1,
+            "list": [{
+                "advisory": {"id": "RUSTSEC-2024-0001", "title": "demo advisory"},
+                "package": {"name": "demo", "version": "1.2.3"},
+                "versions": {"patched": [">=1.2.4"]}
+            }]
+        },
+        "warnings": {}
+    }"#;
     const INFORMATIONAL_CARGO_AUDIT: &str = r#"{
         "vulnerabilities": {"found": false, "count": 0, "list": []},
         "warnings": {
@@ -2205,7 +2285,7 @@ FAILED tests/test_parser.py::test_roundtrip\n\
         assert_eq!(evidence.preexisting, 1);
         assert_eq!(evidence.unknown, 0);
         assert!(!evidence.lock_changed);
-        assert!(evidence.new_advisory_ids.is_empty());
+        assert!(evidence.new_advisories.is_empty());
 
         let note = &summary.dashboard_findings[0].message;
         assert_eq!(
@@ -2236,7 +2316,7 @@ FAILED tests/test_parser.py::test_roundtrip\n\
         assert_eq!(evidence.unknown, 1);
         assert!(evidence.lock_changed);
         assert!(
-            evidence.new_advisory_ids.is_empty(),
+            evidence.new_advisories.is_empty(),
             "an advisory with no base comparison was not shown to be new"
         );
     }
@@ -2276,10 +2356,93 @@ FAILED tests/test_parser.py::test_roundtrip\n\
             .filter(|finding| finding.in_diff == Some(true))
             .collect();
         assert_eq!(
-            evidence.new_advisory_ids.len(),
+            evidence.new_advisories.len(),
             introduced.len(),
-            "the named ids and the in-diff rows are one classification"
+            "the named advisories and the in-diff rows are one classification"
         );
+        assert_eq!(
+            evidence.new,
+            evidence.new_advisories.len(),
+            "the gate sentence names exactly as many advisories as it counts"
+        );
+    }
+
+    /// P2-1: the number in the gate sentence and the advisories it names used to
+    /// come from two different reads of one report. `new` counts the FULL
+    /// advisory set — `vulnerabilities.list` plus every `warnings` category —
+    /// while the names were scraped off the vulnerability list alone. A blocker
+    /// could therefore print `1 new …` and name nothing, or print `2` and name
+    /// one of them while calling an `unmaintained` warning a "vulnerability".
+    ///
+    /// The old derivation is measured here rather than described, so the split
+    /// cannot quietly reopen.
+    #[test]
+    fn the_advisory_count_and_the_named_advisories_come_from_one_set() {
+        let current = crate::artifacts::audit::cargo_audit_report_advisory_keys(MIXED_CARGO_AUDIT)
+            .expect("a valid current report");
+        let base = crate::artifacts::audit::cargo_audit_report_advisory_keys(BASE_CARGO_AUDIT)
+            .expect("a valid base report");
+
+        let counts = cargo_audit_baseline_counts(Some(&current), true, Some(&base));
+        let labels = cargo_audit_new_advisory_labels(Some(&current), true, Some(&base));
+
+        assert_eq!(
+            counts.new, 2,
+            "one new vulnerability and one new unmaintained warning"
+        );
+        assert_eq!(
+            labels.len(),
+            counts.new,
+            "the sentence names every advisory the counter counted"
+        );
+        assert_eq!(
+            labels,
+            vec![
+                "RUSTSEC-2024-0002 in other 0.4.0".to_string(),
+                "RUSTSEC-2024-9999 in stale 0.1.0".to_string(),
+            ],
+            "each label carries the locked package, because the key does (R5-22)"
+        );
+
+        // The derivation this replaces, run side by side: the vulnerability list
+        // alone sees one of the two advisories the counter reports.
+        let vulnerability_list_only: Vec<String> =
+            crate::artifacts::audit::parse_cargo_audit_findings(MIXED_CARGO_AUDIT)
+                .iter()
+                .filter(|finding| {
+                    cargo_audit_finding_in_diff(
+                        &crate::artifacts::audit::cargo_audit_finding_key(finding),
+                        true,
+                        true,
+                        Some(&base),
+                    ) == Some(true)
+                })
+                .map(|finding| finding.advisory_id.clone())
+                .collect();
+        assert_eq!(
+            vulnerability_list_only,
+            vec!["RUSTSEC-2024-0002".to_string()],
+            "the vulnerability list names 1 of the 2 counted advisories — the split \
+             that made the gate sentence name less than it claimed"
+        );
+    }
+
+    /// The counters and the names stay joined in the shapes that count nothing:
+    /// an unchanged lock and a changed lock with no base audit both name zero,
+    /// because both count zero.
+    #[test]
+    fn no_countable_new_advisory_names_none() {
+        let current = crate::artifacts::audit::cargo_audit_report_advisory_keys(MIXED_CARGO_AUDIT)
+            .expect("a valid current report");
+        let base = crate::artifacts::audit::cargo_audit_report_advisory_keys(BASE_CARGO_AUDIT)
+            .expect("a valid base report");
+
+        for (lock_changed, base_report) in [(false, Some(&base)), (true, None)] {
+            let counts = cargo_audit_baseline_counts(Some(&current), lock_changed, base_report);
+            let labels = cargo_audit_new_advisory_labels(Some(&current), lock_changed, base_report);
+            assert_eq!(counts.new, 0);
+            assert_eq!(labels.len(), counts.new);
+        }
     }
 
     fn sarif_results(dir: &Path) -> Vec<serde_json::Value> {

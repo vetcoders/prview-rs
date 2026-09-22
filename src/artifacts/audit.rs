@@ -295,6 +295,37 @@ fn effective_cargo_lock_path_at_commit(
     }
 }
 
+/// The repository-relative `Cargo.lock` recorded IN `commit_id`'s tree for
+/// `cargo_root`, resolved through the same member-then-workspace-root
+/// precedence the live run follows.
+///
+/// `Some(Some(path))` is "the target tree carries this lockfile", `Some(None)`
+/// is "the target tree carries none", and `None` is "the question could not be
+/// answered". Only the first licenses cargo audit's provenance proof: `cargo
+/// audit` GENERATES a lockfile from the registry when none is present
+/// (measured on cargo-audit 0.22.2), so a run in a lock-less tree reports real
+/// advisories against a lockfile that exists in no commit at all. Naming that
+/// "pre-existing: Cargo.lock unchanged by this PR" would assert a fact about a
+/// file the target does not have.
+///
+/// A `cargo_root` outside the repository is treated as "no lockfile in the
+/// target tree": nothing inside the reviewed tree can vouch for what was
+/// scanned, which is the same conclusion by a different route.
+pub(crate) fn cargo_audit_lock_path_in_commit(
+    repo: &crate::git::Repository,
+    commit_id: &str,
+    repo_root: &std::path::Path,
+    cargo_root: Option<&std::path::Path>,
+) -> Option<Option<String>> {
+    let configured_root = cargo_root.unwrap_or(repo_root);
+    let normalized =
+        crate::paths::normalize_to_repo_relative(&configured_root.display().to_string(), repo_root);
+    if normalized.is_external {
+        return Some(None);
+    }
+    effective_cargo_lock_path_at_commit(repo, commit_id, std::path::Path::new(&normalized.display))
+}
+
 /// The working-tree `Cargo.lock` paths (repository-relative) the live
 /// `cargo audit` run could have read for `cargo_root`.
 ///
