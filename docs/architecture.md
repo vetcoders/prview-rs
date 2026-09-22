@@ -633,15 +633,34 @@ The native test is whether the kernel's own image loader **claims** the file,
 not whether prview recognises its opening bytes. The distinction is the whole
 proof. prview spawns through `Command`, hence `execvp`, and POSIX requires
 `execvp` to retry through `/bin/sh` on exactly one condition: `ENOEXEC`, meaning
-no loader recognised the image as its own. A file whose platform header
-validates completely therefore has only two futures, and both keep the closure
-target-only — the kernel executes the committed bytes, or the loader rejects the
-image outright (`EBADMACHO`, `EBADARCH`, `EBADEXEC`) with no shell in the path.
-A recognised **prefix** buys neither: a host-format magic on a truncated or
-non-executable header is claimed by nothing, returns `ENOEXEC`, and `/bin/sh`
-then runs the remaining bytes as a script with the full indirection a shell
-allows. Four bytes are a hope about a file's kind; the loader settles the kind
-after the whole header.
+no loader recognised the image as its own.
+
+Validating a header is not the same as predicting that verdict, and the proof is
+stated in those terms: it holds where the loader claims the file **and** the
+accepted set has been narrowed to shapes a kernel probe measured with **zero**
+fallback. The gap is real, not theoretical. macOS grades fat slices — `arm64e`
+outranks `arm64`, `x86_64h` outranks `x86_64`, under one and the same
+`cputype` — so an image in which merely *some* host slice validates can still be
+handed to `/bin/sh` through the slice the grader picks; measured on macOS/arm64,
+a real `arm64` binary beside a bogus `arm64e` entry ran under the shell (exit
+126), and so did every `FAT_MAGIC_64` image, real slice included. Inside the
+narrowed set a file has two futures, and both keep the closure target-only — the
+kernel executes the committed bytes, or the loader rejects the image outright
+(`EBADMACHO`, `EBADARCH`, `EBADEXEC`) with no shell in the path. Outside it there
+is a third, which is the one this proof exists to exclude.
+
+Nothing in that argument leans on the shell declining to interpret the accepted
+bytes. bash refuses a file carrying a NUL before the first newline, and every
+header macOS accepts happens to carry one, so today no accepted file executes as
+a script even where the loader drops it — but that is an accident of the binary
+formats, not a defence prview chose, and `dash` promises nothing of the kind. It
+is named here so nobody mistakes it for part of the contract.
+
+A recognised **prefix** buys no future at all: a host-format magic on a
+truncated or non-executable header is claimed by nothing, returns `ENOEXEC`, and
+`/bin/sh` then runs the remaining bytes as a script with the full indirection a
+shell allows. Four bytes are a hope about a file's kind; the loader settles the
+kind after the whole header.
 
 Validation is therefore per platform, and a format the running kernel has no
 loader for is never a proof — ELF on macOS and Mach-O on Linux are recognisable
@@ -650,24 +669,37 @@ but not executable, so they are the fallback vector rather than evidence:
 - **macOS** accepts only Mach-O. A thin image must carry a complete
   `mach_header`/`mach_header_64` in host byte order (`MH_MAGIC`/`MH_MAGIC_64`)
   whose `cputype` is the host's, whose `filetype` is `MH_EXECUTE`, and whose
-  load-command table fits inside the file. A fat/universal image
-  (`FAT_MAGIC`/`FAT_MAGIC_64`, big-endian by definition) must carry a
-  `fat_arch` entry for the host `cputype` whose extent is in bounds and whose
-  slice header is itself claimable. `cpusubtype` is deliberately not matched,
-  because Apple ships `/bin/ls` as an `arm64e` slice a plain `arm64` host runs.
+  load-command table fits inside the file. A fat/universal image (`FAT_MAGIC`,
+  big-endian by definition) is claimed only when **every** `fat_arch` entry
+  carrying the host `cputype` has an in-bounds extent and a claimable slice
+  header, and at least one such entry exists — "some entry validates" is not
+  enough, because the grader picks and this code cannot rank grades for it.
+  `cpusubtype` is deliberately not matched, because Apple ships `/bin/ls` as an
+  `arm64e` slice a plain `arm64` host runs, and the all-host rule already covers
+  the grade that subtype encodes. `FAT_MAGIC_64` is recognised and **refused**:
+  this platform's `exec` does not claim a 64-bit fat image even when the slice
+  it advertises is a real, working host binary.
 - **Linux** accepts only ELF: a complete 64-bit header with valid `e_ident`
   (class, data, version), `e_type` of `ET_EXEC` or `ET_DYN` (every PIE
-  executable is `ET_DYN`), `e_machine` equal to the host's, and a program-header
-  table inside the file. `binfmt_elf` rejects a foreign `e_machine` with
-  `ENOEXEC`, which is precisely the code that reaches `/bin/sh`.
+  executable is `ET_DYN`), `e_machine` equal to the host's, `e_phentsize`
+  **equal** to `sizeof(Elf64_Phdr)`, and a program-header table inside the file.
+  `binfmt_elf` rejects a foreign `e_machine` with `ENOEXEC`, which is precisely
+  the code that reaches `/bin/sh`, and `load_elf_phdrs()` turns any other
+  entry size into the same code. This branch stays deliberately narrower than
+  `binfmt_elf`'s full triage: the exits it does not model — no `PT_LOAD`
+  segment, a `PT_INTERP` failing the loader's bounds — are further `ENOEXEC`
+  paths, and unlike the macOS set this one carries no kernel measurement behind
+  it yet.
 - **Any other Unix** has no proof path, so every header is unproven.
 
-Two of these fields are load-bearing rather than hygienic, measured on
+Several of these fields are load-bearing rather than hygienic, measured on
 macOS/arm64: a header valid in every other respect but declaring `MH_DYLIB` is
-not claimed and reaches `/bin/sh`, and so is a fat header advertising a host
-slice whose bytes are not a Mach-O image. The bounds checks are the conservative
-half — an overflowing table already fails `EBADMACHO` without a fallback — and
-only narrow an acceptance set that is safe without them.
+not claimed and reaches `/bin/sh`; so is a fat header advertising a host slice
+whose bytes are not a Mach-O image; so is one whose graded-higher host entry is
+unclaimable while a real binary sits beside it; and so is any `FAT_MAGIC_64`
+image. The bounds checks are the conservative half — an overflowing table
+already fails `EBADMACHO` without a fallback — and only narrow an acceptance set
+that is safe without them.
 
 The **absence of `#!` is not native recognition** and must never stand in for
 it: a file with no interpreter directive is a shell script with unbounded
@@ -697,10 +729,10 @@ byte-exact spelling, and any final payload outside the canonical snapshot root
 is borrowed even when a tracked absolute symlink led there. A recognized
 package wrapper can resolve plugins, types, or transitive modules dynamically,
 so any prview-created entry in its `node_modules` is conservatively part of that
-command's substrate. Only a file whose platform header the loader claims, or a proved-direct shell
-script
-(the intentionally small grammar of terminal shell builtins used by direct
-launchers) can remain `Snapshot` without wrapper-payload traversal.
+command's substrate. Only a file whose platform header the loader claims, or a
+proved-direct shell script (the intentionally small grammar of terminal shell
+builtins used by direct launchers), can remain `Snapshot` without
+wrapper-payload traversal.
 
 The entry/creator matrix is:
 

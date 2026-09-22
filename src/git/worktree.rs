@@ -258,11 +258,32 @@ fn path_is_external_or_borrowed(snapshot_root: &Path, path: &Path, borrowed: &[P
 /// the bar has to be "the loader claims the file", never "the file opens with a
 /// magic we recognise". prview spawns through `Command`, hence `execvp`, and
 /// POSIX requires `execvp` to retry a file through `/bin/sh` on exactly one
-/// condition: `ENOEXEC` — no loader recognised the image as its own. So a file
-/// whose platform header validates completely has only two futures, and both
-/// keep the closure target-only: the kernel executes the committed bytes, or
-/// the loader rejects the image outright (`EBADMACHO`, `EBADARCH`,
-/// `EBADEXEC`) with no shell in the path. A recognised PREFIX buys neither. A
+/// condition: `ENOEXEC` — no loader recognised the image as its own.
+///
+/// What that buys is narrower than "a header that parses", and the difference
+/// is the proof. Validating a header is not the same as predicting the
+/// loader's verdict: on macOS the kernel picks the fat slice with the highest
+/// `cpusubtype` GRADE, so an image in which merely SOME host slice validates
+/// can still be handed to `/bin/sh` through the slice the grader actually
+/// picks — measured on macOS/arm64, a real `arm64` binary beside a bogus
+/// `arm64e` entry fell through to the shell (exit 126), as did every
+/// `FAT_MAGIC_64` image, real slice included. So the proof holds only over an
+/// acceptance set narrowed to shapes a kernel probe measured with ZERO
+/// fallback: a fully validated thin header, or a 32-bit fat image in which
+/// EVERY host-`cputype` entry is itself claimable and at least one exists —
+/// whichever entry the grader picks is then one this proof read.
+///
+/// Inside that set a file has two futures, and both keep the closure
+/// target-only: the kernel executes the committed bytes, or the loader rejects
+/// the image outright (`EBADMACHO`, `EBADARCH`, `EBADEXEC`) with no shell in
+/// the path. Outside it there is a third one, and it is what this function
+/// exists to prevent. Nothing here leans on the shell declining to interpret
+/// accepted bytes: bash refuses a file carrying a NUL before the first
+/// newline, which every accepted macOS header happens to carry, but that is an
+/// accident of the format rather than a defence this code chose — `dash`, the
+/// `/bin/sh` of the Linux hosts this runs on, makes no such promise.
+///
+/// A recognised PREFIX buys neither future. A
 /// host-format magic on a truncated or non-executable header is claimed by
 /// nothing, falls through to `ENOEXEC`, and `/bin/sh` then runs the remaining
 /// bytes as a script with the full unbounded indirection a shell allows —
@@ -341,8 +362,14 @@ fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool 
         MH_MAGIC_64 => mach_header_claims_executable(file, 0, length, host_cpu_type, true),
         MH_MAGIC => mach_header_claims_executable(file, 0, length, host_cpu_type, false),
         _ => match u32::from_be_bytes(magic) {
-            FAT_MAGIC => fat_header_claims_executable(file, length, host_cpu_type, false),
-            FAT_MAGIC_64 => fat_header_claims_executable(file, length, host_cpu_type, true),
+            FAT_MAGIC => fat_header_claims_executable(file, length, host_cpu_type),
+            // Recognised and refused on purpose. `exec` does not claim a
+            // 64-bit fat image at all on this platform: measured on
+            // macOS/arm64, a `FAT_MAGIC_64` file carrying a real, working host
+            // slice still returned `ENOEXEC` and ran under `/bin/sh`. Naming
+            // the magic here is documentation of that measurement; treating it
+            // as evidence would certify exactly the files the loader drops.
+            FAT_MAGIC_64 => false,
             _ => false,
         },
     }
@@ -400,29 +427,39 @@ fn mach_header_claims_executable(
     header_bytes.saturating_add(commands_bytes) <= slice_length
 }
 
-/// A universal binary is claimed only through the slice the loader would pick:
-/// the first entry whose `cputype` is the host's, whose extent is inside the
-/// file, and whose own `mach_header` is itself claimable.
+/// A universal binary is claimed only when EVERY `fat_arch` entry carrying the
+/// host `cputype` is itself claimable, and at least one such entry exists.
 ///
-/// Validating that inner header is load-bearing. A fat header advertising a
-/// host slice whose bytes are not a Mach-O image is NOT claimed, returns
-/// `ENOEXEC`, and reaches `/bin/sh` — measured on macOS/arm64. Matching the
-/// `cpusubtype` is deliberately NOT required: Apple ships `/bin/ls` as an
-/// `arm64e` slice that a plain `arm64` host executes.
+/// "Some entry validates" is the wrong rule, and the difference is measurable.
+/// XNU does not take the first matching entry: it grades the candidates and
+/// picks the best one, with `arm64e` outranking `arm64` (and `x86_64h`
+/// outranking `x86_64`) under one and the same `cputype`. A real `arm64`
+/// binary in slice #1 beside an `arm64e` entry pointing at shell text is
+/// therefore accepted on the strongest possible evidence and still executed by
+/// `/bin/sh` — measured on macOS/arm64, exit 126. Since the grading order is
+/// the kernel's and not this code's to reproduce, the sound rule is to require
+/// ALL of them: then the entry the grader picks is one this proof validated,
+/// whichever it is. Rejecting the whole file on one unclaimable host entry
+/// costs nothing real — Apple ships one host slice per image.
+///
+/// Validating the inner header is load-bearing on top of that. A fat header
+/// advertising a host slice whose bytes are not a Mach-O image is NOT claimed,
+/// returns `ENOEXEC`, and reaches `/bin/sh` — measured on macOS/arm64.
+/// Matching the `cpusubtype` is deliberately NOT required: Apple ships
+/// `/bin/ls` as an `arm64e` slice that a plain `arm64` host executes, so a
+/// subtype match would reject the platform's own binaries while the all-host
+/// rule above already covers the grade it encodes.
 #[cfg(target_os = "macos")]
-fn fat_header_claims_executable(
-    file: &std::fs::File,
-    length: u64,
-    host_cpu_type: u32,
-    wide: bool,
-) -> bool {
+fn fat_header_claims_executable(file: &std::fs::File, length: u64, host_cpu_type: u32) -> bool {
     const MH_MAGIC: u32 = 0xFEED_FACE;
     const MH_MAGIC_64: u32 = 0xFEED_FACF;
     const FAT_HEADER_BYTES: u64 = 8;
+    /// One `fat_arch`: `cputype`, `cpusubtype`, `offset`, `size`, `align`.
+    /// Only the 32-bit table is read, because `FAT_MAGIC_64` is never a proof.
+    const FAT_ARCHITECTURE_BYTES: u64 = 20;
     /// Sanity ceiling on `nfat_arch`; Apple ships a handful, never thousands.
     const MAX_FAT_ARCHITECTURES: u32 = 64;
 
-    let architecture_bytes: u64 = if wide { 32 } else { 20 };
     let mut count = [0u8; 4];
     if !read_header_at(file, 4, &mut count) {
         return false;
@@ -431,12 +468,13 @@ fn fat_header_claims_executable(
     if architectures == 0 || architectures > MAX_FAT_ARCHITECTURES {
         return false;
     }
-    let table_bytes = u64::from(architectures).saturating_mul(architecture_bytes);
+    let table_bytes = u64::from(architectures).saturating_mul(FAT_ARCHITECTURE_BYTES);
     if FAT_HEADER_BYTES.saturating_add(table_bytes) > length {
         return false;
     }
+    let mut host_entry_seen = false;
     for index in 0..u64::from(architectures) {
-        let entry = FAT_HEADER_BYTES + index * architecture_bytes;
+        let entry = FAT_HEADER_BYTES + index * FAT_ARCHITECTURE_BYTES;
         let mut cpu_type = [0u8; 4];
         if !read_header_at(file, entry, &mut cpu_type) {
             return false;
@@ -444,46 +482,37 @@ fn fat_header_claims_executable(
         if u32::from_be_bytes(cpu_type) != host_cpu_type {
             continue;
         }
-        let (offset, size) = if wide {
-            let mut extent = [0u8; 16];
-            if !read_header_at(file, entry + 8, &mut extent) {
-                return false;
-            }
-            (
-                u64::from_be_bytes(extent[..8].try_into().expect("eight bytes")),
-                u64::from_be_bytes(extent[8..].try_into().expect("eight bytes")),
-            )
-        } else {
-            let mut extent = [0u8; 8];
-            if !read_header_at(file, entry + 8, &mut extent) {
-                return false;
-            }
-            (
-                u64::from(u32::from_be_bytes(
-                    extent[..4].try_into().expect("four bytes"),
-                )),
-                u64::from(u32::from_be_bytes(
-                    extent[4..].try_into().expect("four bytes"),
-                )),
-            )
-        };
+        // From here every failure is the whole file's failure: this entry is a
+        // candidate the grader may prefer, so an unclaimable one is a shell
+        // fallback waiting to happen, not an entry to skip past.
+        host_entry_seen = true;
+        let mut extent = [0u8; 8];
+        if !read_header_at(file, entry + 8, &mut extent) {
+            return false;
+        }
+        let offset = u64::from(u32::from_be_bytes(
+            extent[..4].try_into().expect("four bytes"),
+        ));
+        let size = u64::from(u32::from_be_bytes(
+            extent[4..].try_into().expect("four bytes"),
+        ));
         if offset.saturating_add(size) > length {
-            continue;
+            return false;
         }
         let mut slice_magic = [0u8; 4];
         if !read_header_at(file, offset, &mut slice_magic) {
-            continue;
+            return false;
         }
         let claimed = match u32::from_le_bytes(slice_magic) {
             MH_MAGIC_64 => mach_header_claims_executable(file, offset, size, host_cpu_type, true),
             MH_MAGIC => mach_header_claims_executable(file, offset, size, host_cpu_type, false),
             _ => false,
         };
-        if claimed {
-            return true;
+        if !claimed {
+            return false;
         }
     }
-    false
+    host_entry_seen
 }
 
 /// `EM_X86_64` / `EM_AARCH64`. As on macOS, an architecture with no entry has
@@ -506,6 +535,15 @@ const HOST_ELF_MACHINE: Option<u16> = None;
 /// proof. `ET_DYN` is accepted beside `ET_EXEC` because every PIE executable —
 /// which is what a modern toolchain emits by default — is `ET_DYN`, and the
 /// kernel claims both.
+///
+/// This branch is narrower than `binfmt_elf`'s full triage and deliberately
+/// stays on the conservative side of it, because the fields it does NOT model
+/// are all further `-ENOEXEC` exits: an image with no `PT_LOAD` segment, or a
+/// `PT_INTERP` whose length fails the loader's bounds, passes this header
+/// check and is still dropped to `/bin/sh`. The set accepted here is not
+/// proved shell-free by measurement the way the macOS set is — there was no
+/// Linux host in the round that wrote it — so every field it does model is
+/// matched exactly rather than loosely.
 #[cfg(target_os = "linux")]
 fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool {
     const ELF_HEADER_BYTES: u64 = 64;
@@ -514,8 +552,12 @@ fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool 
     const EV_CURRENT: u8 = 1;
     const ET_EXEC: u16 = 2;
     const ET_DYN: u16 = 3;
-    /// Smallest 64-bit `Elf64_Phdr`.
-    const PROGRAM_HEADER_MIN_BYTES: u16 = 56;
+    /// `sizeof(Elf64_Phdr)`, compared for EQUALITY rather than as a minimum.
+    /// `load_elf_phdrs()` demands the exact size and returns NULL otherwise,
+    /// which `load_elf_binary()` turns into `-ENOEXEC` — the one code that
+    /// reaches `/bin/sh`. A larger entry size is a header the validator would
+    /// pass and the kernel would drop.
+    const PROGRAM_HEADER_BYTES: u16 = 56;
 
     let Some(host_machine) = HOST_ELF_MACHINE else {
         return false;
@@ -549,7 +591,7 @@ fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool 
     let program_header_size = u16::from_le_bytes([header[54], header[55]]);
     let program_headers = u16::from_le_bytes([header[56], header[57]]);
     if u64::from(header_size) != ELF_HEADER_BYTES
-        || program_header_size < PROGRAM_HEADER_MIN_BYTES
+        || program_header_size != PROGRAM_HEADER_BYTES
         || program_headers == 0
         || program_header_offset == 0
     {
@@ -1211,6 +1253,271 @@ mod tests {
             "a universal binary carrying a claimable slice for the host cputype is \
              executed by the kernel, not by an interpreter",
         );
+    }
+
+    /// The `cpusubtype` XNU grades ABOVE the host's baseline under the same
+    /// `cputype`: `arm64e` on Apple Silicon, `x86_64h` on Intel. The validator
+    /// never compares it — this is the fixture side, where it is what makes a
+    /// hostile entry the one the kernel would actually pick.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const HOST_GRADED_CPU_SUBTYPE: u32 = 2;
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    const HOST_GRADED_CPU_SUBTYPE: u32 = 8;
+
+    /// A 32-bit universal binary over `(cputype, cpusubtype, bytes)` slices,
+    /// built from the format rather than from a recognised prefix: an 8-byte
+    /// fat header, one 20-byte `fat_arch` per slice, then the slice bodies.
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    fn universal_binary(slices: &[(u32, u32, &[u8])]) -> Vec<u8> {
+        const SLICE_ALIGNMENT: usize = 16;
+
+        let table_end = 8 + 20 * slices.len();
+        let mut image = 0xCAFE_BABEu32.to_be_bytes().to_vec();
+        image.extend_from_slice(
+            &u32::try_from(slices.len())
+                .expect("slice count")
+                .to_be_bytes(),
+        );
+        let mut body: Vec<u8> = Vec::new();
+        for (cpu_type, cpu_subtype, bytes) in slices {
+            let offset = (table_end + body.len()).next_multiple_of(SLICE_ALIGNMENT);
+            body.resize(offset - table_end, 0);
+            body.extend_from_slice(bytes);
+            image.extend_from_slice(&cpu_type.to_be_bytes());
+            image.extend_from_slice(&cpu_subtype.to_be_bytes());
+            image.extend_from_slice(&u32::try_from(offset).expect("slice offset").to_be_bytes());
+            image.extend_from_slice(
+                &u32::try_from(bytes.len())
+                    .expect("slice size")
+                    .to_be_bytes(),
+            );
+            image.extend_from_slice(&4u32.to_be_bytes());
+        }
+        assert_eq!(
+            image.len(),
+            table_end,
+            "the fat table ends where the bodies begin"
+        );
+        image.extend_from_slice(&body);
+        image
+    }
+
+    /// The same slices under `FAT_MAGIC_64`: 8-byte header, 32-byte entries
+    /// with 64-bit `offset`/`size` and a trailing `reserved` word.
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    fn fat64_universal_binary(slices: &[(u32, u32, &[u8])]) -> Vec<u8> {
+        const SLICE_ALIGNMENT: usize = 16;
+
+        let table_end = 8 + 32 * slices.len();
+        let mut image = 0xCAFE_BABFu32.to_be_bytes().to_vec();
+        image.extend_from_slice(
+            &u32::try_from(slices.len())
+                .expect("slice count")
+                .to_be_bytes(),
+        );
+        let mut body: Vec<u8> = Vec::new();
+        for (cpu_type, cpu_subtype, bytes) in slices {
+            let offset = (table_end + body.len()).next_multiple_of(SLICE_ALIGNMENT);
+            body.resize(offset - table_end, 0);
+            body.extend_from_slice(bytes);
+            image.extend_from_slice(&cpu_type.to_be_bytes());
+            image.extend_from_slice(&cpu_subtype.to_be_bytes());
+            image.extend_from_slice(&u64::try_from(offset).expect("slice offset").to_be_bytes());
+            image.extend_from_slice(
+                &u64::try_from(bytes.len())
+                    .expect("slice size")
+                    .to_be_bytes(),
+            );
+            image.extend_from_slice(&4u32.to_be_bytes());
+            image.extend_from_slice(&0u32.to_be_bytes());
+        }
+        assert_eq!(
+            image.len(),
+            table_end,
+            "the fat table ends where the bodies begin"
+        );
+        image.extend_from_slice(&body);
+        image
+    }
+
+    /// A thin Mach-O for this host, or a named skip. Fat bytes cannot be
+    /// nested inside a `fat_arch` slice, so a host whose only available
+    /// executable is universal has no honest fixture here.
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    fn thin_host_slice_bytes(scratch: &Path) -> Option<Vec<u8>> {
+        let native = host_native_executable_bytes(scratch)?;
+        if native.get(..4) == Some([0xCF, 0xFA, 0xED, 0xFE].as_slice()) {
+            return Some(native);
+        }
+        eprintln!(
+            "skipped: the only kernel-executable image available on this host is not a thin \
+             Mach-O, so it cannot stand in for a universal slice"
+        );
+        None
+    }
+
+    /// The whole file is refused when ONE host-`cputype` entry is unclaimable,
+    /// because the loader grades entries and this code cannot say which one it
+    /// will pick. The control in the same test is the point: the identical
+    /// builder with the real slice alone still proves a target-only closure,
+    /// so the refusal below is the hostile entry, never a broken fixture.
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn a_universal_binary_with_one_unclaimable_host_slice_is_unproven() {
+        let relative = Path::new("node_modules/.bin/eslint");
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let Some(host_cpu_type) = HOST_MACH_CPU_TYPE else {
+            eprintln!("skipped: this build has no host cputype, so no fat entry can match it");
+            return;
+        };
+        let Some(native) = thin_host_slice_bytes(scratch.path()) else {
+            return;
+        };
+
+        let (_tmp, root) = snapshot_with_tool(&universal_binary(&[(host_cpu_type, 0, &native)]));
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "control: a universal image whose only host entry is a real binary is claimed, \
+             so this fixture shape is sound and the case below is not passing by accident",
+        );
+
+        // The verifier's attack: the real binary is slice #1 on the host's
+        // baseline subtype, and the graded-higher entry points at shell text.
+        // Accepting on slice #1 hands the file to `/bin/sh` through slice #2.
+        let launcher = magic_prefixed_launcher(FOREIGN_FORMAT_MAGIC);
+        let proof = path_uses_prview_borrow(
+            &snapshot_with_tool(&universal_binary(&[
+                (host_cpu_type, 0, &native),
+                (host_cpu_type, HOST_GRADED_CPU_SUBTYPE, &launcher),
+            ]))
+            .1,
+            relative,
+        );
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "one unclaimable host slice is a shell fallback the grader may choose, so the \
+             image proves nothing however strong the other entries are",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "a real binary beside a hostile entry must never certify an exact snapshot scan",
+        );
+    }
+
+    /// `FAT_MAGIC_64` is recognised and never a proof: measured on
+    /// macOS/arm64, `exec` does not claim a 64-bit fat image even when the
+    /// slice it advertises is a real, working host binary — it returns
+    /// `ENOEXEC` and the file runs under `/bin/sh`.
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn a_fat64_universal_binary_is_unproven_even_with_a_real_host_slice() {
+        let relative = Path::new("node_modules/.bin/eslint");
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let Some(host_cpu_type) = HOST_MACH_CPU_TYPE else {
+            eprintln!("skipped: this build has no host cputype, so no fat entry can match it");
+            return;
+        };
+        let Some(native) = thin_host_slice_bytes(scratch.path()) else {
+            return;
+        };
+
+        let (_tmp, root) =
+            snapshot_with_tool(&fat64_universal_binary(&[(host_cpu_type, 0, &native)]));
+        let proof = path_uses_prview_borrow(&root, relative);
+        assert_eq!(
+            proof,
+            ClosureProof::Unproven,
+            "the strongest possible fat64 image is still not claimed by this platform's \
+             loader, so recognising its magic would certify a shell fallback",
+        );
+        assert_ne!(
+            proof,
+            ClosureProof::TargetOnly,
+            "a magic the kernel refuses is not evidence, whatever it wraps",
+        );
+    }
+
+    /// `e_phentsize` is matched for equality, not as a minimum: `load_elf_phdrs()`
+    /// demands `sizeof(Elf64_Phdr)` exactly and turns any other size into
+    /// `-ENOEXEC`, the code that reaches `/bin/sh`. The fixture is a real host
+    /// binary with that one field rewritten, so the control is the unmodified
+    /// image and the only variable is the field under test.
+    ///
+    /// STATIC correction: this cell has no runtime measurement behind it, the
+    /// round that wrote it had no Linux host. It runs on CI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_elf_program_header_size_the_kernel_rejects_is_unproven() {
+        let relative = Path::new("node_modules/.bin/eslint");
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let Some(native) = host_native_executable_bytes(scratch.path()) else {
+            eprintln!(
+                "skipped: no C compiler and no readable system executable on this host, \
+                 so no independently kernel-executable fixture exists"
+            );
+            return;
+        };
+        if native.get(..5) != Some([0x7F, b'E', b'L', b'F', 2].as_slice()) {
+            eprintln!("skipped: the available host executable is not a 64-bit ELF image");
+            return;
+        }
+
+        let (_tmp, root) = snapshot_with_tool(&native);
+        assert_eq!(
+            path_uses_prview_borrow(&root, relative),
+            ClosureProof::TargetOnly,
+            "control: the unmodified host binary is claimed, so each rejection below is \
+             the rewritten field and nothing else",
+        );
+
+        let program_header_offset =
+            u64::from_le_bytes(native[32..40].try_into().expect("eight bytes"));
+        let program_headers = u64::from(u16::from_le_bytes([native[56], native[57]]));
+        for size in [55u16, 57u16] {
+            // Without this the case could pass on the bounds check instead of
+            // the size check, and prove nothing about either.
+            let table_bytes = program_headers.saturating_mul(u64::from(size));
+            assert!(
+                program_header_offset.saturating_add(table_bytes)
+                    <= u64::try_from(native.len()).expect("image length fits u64"),
+                "the near-miss table must still fit inside the file, or the rejection \
+                 would come from the bounds check rather than from `e_phentsize`",
+            );
+
+            let mut mutated = native.clone();
+            mutated[54..56].copy_from_slice(&size.to_le_bytes());
+            let (_tmp, root) = snapshot_with_tool(&mutated);
+            let proof = path_uses_prview_borrow(&root, relative);
+            assert_eq!(
+                proof,
+                ClosureProof::Unproven,
+                "`e_phentsize` = {size} is not `sizeof(Elf64_Phdr)`, so `load_elf_phdrs()` \
+                 fails and the image falls through to `/bin/sh`",
+            );
+            assert_ne!(
+                proof,
+                ClosureProof::TargetOnly,
+                "a program-header size the kernel refuses must never certify a snapshot scan",
+            );
+        }
     }
 
     /// A shell launcher wearing an object-file prefix. Everything after the

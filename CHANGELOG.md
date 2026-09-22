@@ -157,14 +157,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still reaches `/bin/sh`, and merely recognising the prefix turned silence into
   a false positive claim. Target-only closure is now proved only by a **fully
   validated platform header for the running kernel**: on macOS a complete
-  `mach_header` with the host `cputype` and `MH_EXECUTE`, or a universal binary
-  carrying a claimable host slice; on Linux a complete ELF header with the host
-  `e_machine` and `ET_EXEC`/`ET_DYN`; on any other Unix, nothing. A format this
-  kernel has no loader for — ELF on macOS, Mach-O on Linux — is recognisable but
-  not executable, so it is the fallback vector rather than evidence. The proof
-  reads a bounded header window and so still runs before the script size bound,
-  leaving a large compiled tool able to prove its own kind while an oversized
-  file with no claimable header stays unproved.
+  `mach_header` with the host `cputype` and `MH_EXECUTE`, or a 32-bit universal
+  binary in which **every** host-`cputype` slice is claimable; on Linux a
+  complete ELF header with the host `e_machine`, `ET_EXEC`/`ET_DYN` and
+  `e_phentsize` equal to `sizeof(Elf64_Phdr)`; on any other Unix, nothing. A
+  format this kernel has no loader for — ELF on macOS, Mach-O on Linux — is
+  recognisable but not executable, so it is the fallback vector rather than
+  evidence. The proof reads a bounded header window and so still runs before the
+  script size bound, leaving a large compiled tool able to prove its own kind
+  while an oversized file with no claimable header stays unproved.
+- **Validating a header is not the same as predicting the loader's verdict, and
+  the proof now says so.** An earlier draft of this change claimed a completely
+  validated header leaves "only two futures … with no shell in the path". That
+  was false where it mattered most: macOS grades fat slices (`arm64e` outranks
+  `arm64`, `x86_64h` outranks `x86_64`, under one `cputype`), so accepting
+  because *some* host slice validates certified images the kernel hands to
+  `/bin/sh` — measured on macOS/arm64, a real `arm64` binary beside a bogus
+  `arm64e` entry ran under the shell at exit 126, as did every `FAT_MAGIC_64`
+  image with a real, working slice inside it. Both shapes reported `snapshot`,
+  the state that promises the scanned bytes are exactly `target_sha`. So the
+  accepted set is narrowed to what a kernel probe measured with zero fallback:
+  all host slices claimable for fat, `FAT_MAGIC_64` recognised and refused, and
+  on Linux `e_phentsize` matched for equality because `load_elf_phdrs()` turns
+  any other size into the same `ENOEXEC`. One thing is named rather than relied
+  on: bash refuses a file carrying a NUL before its first newline, and every
+  accepted macOS header happens to carry one, so no accepted file ran as a
+  script even before this fix — that is an accident of the binary formats, not
+  part of the contract, and `dash` makes no such promise.
 - **Every run is now bounded in time.** A local review, `--tui`, and a detached
   MCP `run_review deep` get 30 minutes; `--ci` and `prview gate` get 60. (An MCP
   `quick` review keeps its own, tighter 120-second server budget.) The numbers
