@@ -1,7 +1,7 @@
 //! Ghost References Scan — detects dangling usages of removed files.
 
 use crate::checks::{CheckResult, CheckStatus};
-use crate::git::{Diff, FileStatus, Repository};
+use crate::git::{Diff, FileStatus};
 use crate::paths::normalize_path_display;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
@@ -126,10 +126,21 @@ const SKIP_EXTENSIONS: &[&str] = &[
     "mp3", "mp4", "webp", "avif", "pdf", "svg",
 ];
 
+/// Audit the reviewed tree for references to files this PR deletes.
+///
+/// `scan_root` is the tree under review, NOT the operator's checkout: for an
+/// off-`HEAD` target that is the shared target snapshot
+/// (`PRV-CONTEXT-SNAPSHOT-PROVENANCE`), and only for a local review
+/// (`target == HEAD`) does it coincide with `config.repo_root`. Anchoring the
+/// walk on the ambient checkout made the audit describe a different revision
+/// than the pack: local untracked/dirty files leaked in as ghost findings that
+/// belong to no PR, and — the quieter half — a file deleted by the PR but still
+/// present in the operator's checkout looked like a relocation survivor, so the
+/// relocation guard suppressed a real deletion and the genuine ghosts vanished.
 pub fn generate_ghost_refs(
     dir: &Path,
     diffs: &[Diff],
-    repo: &Repository,
+    scan_root: &Path,
 ) -> anyhow::Result<Option<CheckResult>> {
     // 1. Collect deleted files and determine their Search Term.
     //
@@ -160,8 +171,6 @@ pub fn generate_ghost_refs(
         return Ok(None);
     }
 
-    let repo_root = repo.path();
-
     // Relocation guard, path-aware. The FULL path is the high-confidence
     // signal: if the exact deleted path still exists in the tree, the file was
     // NOT relocated, so a same-BASENAME file living elsewhere is a mere name
@@ -174,13 +183,13 @@ pub fn generate_ghost_refs(
     // `src/x.rs` moved to `crates/foo/src/x.rs`), so suppress to avoid
     // relocation noise; otherwise the name is fully gone and it is a real ghost.
     let mut surviving_by_basename: HashMap<String, Vec<String>> = HashMap::new();
-    for entry in WalkDir::new(repo_root)
+    for entry in WalkDir::new(scan_root)
         .max_depth(10)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
-        let Ok(rel) = entry.path().strip_prefix(repo_root) else {
+        let Ok(rel) = entry.path().strip_prefix(scan_root) else {
             continue;
         };
         // Dot-dir filter on the RELATIVE path: an absolute-path check made every
@@ -225,7 +234,7 @@ pub fn generate_ghost_refs(
     let mut noise_categories: HashMap<String, usize> = HashMap::new();
     let mut noise_filtered: usize = 0;
 
-    for entry in WalkDir::new(repo_root)
+    for entry in WalkDir::new(scan_root)
         .max_depth(10)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -233,7 +242,7 @@ pub fn generate_ghost_refs(
     {
         let path = entry.path();
 
-        let Ok(rel) = path.strip_prefix(repo_root) else {
+        let Ok(rel) = path.strip_prefix(scan_root) else {
             continue;
         };
         // Skip hidden paths (.git, etc) by RELATIVE component, so a repo under a
@@ -267,12 +276,12 @@ pub fn generate_ghost_refs(
         }
 
         let content =
-            crate::paths::read_to_string_within(repo_root, safe_rel_path).unwrap_or_default();
+            crate::paths::read_to_string_within(scan_root, safe_rel_path).unwrap_or_default();
         if content.is_empty() {
             continue;
         }
 
-        let normalized_rel = normalize_path_display(&rel_path, repo_root);
+        let normalized_rel = normalize_path_display(&rel_path, scan_root);
         let category = GhostRefCategory::classify(&normalized_rel);
 
         for (term, deleted_files) in &deleted_terms_to_file {
@@ -558,6 +567,165 @@ mod tests {
         (outer, repo, oid.to_string())
     }
 
+    /// Materialise a standalone "reviewed tree" — the bytes of the target
+    /// snapshot, with no git metadata and no local working-tree noise.
+    ///
+    /// The prefix carries no leading dot on purpose: `has_hidden_component`
+    /// runs on the path RELATIVE to the scan root, but a `.tmpXXX` scan root
+    /// would still be an odd shape to reason about, and `ghtest`/`ghsnap`
+    /// keep the two trees distinguishable in failure output.
+    fn make_snapshot_tree(file_specs: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let outer = tempfile::Builder::new().prefix("ghsnap").tempdir().unwrap();
+        let snapshot_dir = outer.path().join("snapshot");
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        for &(path, content) in file_specs {
+            if let Some(parent) = Path::new(path).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(snapshot_dir.join(parent)).unwrap();
+            }
+            fs::write(snapshot_dir.join(path), content).unwrap();
+        }
+        (outer, snapshot_dir)
+    }
+
+    fn deletion_diff(deleted_path: &str, commit_id: String) -> Diff {
+        Diff {
+            base: "main".into(),
+            target: "feature".into(),
+            base_commit_id: commit_id.clone(),
+            target_commit_id: commit_id,
+            files: vec![crate::git::FileChange {
+                path: deleted_path.to_string(),
+                status: FileStatus::Deleted,
+                additions: 0,
+                deletions: 5,
+            }],
+            stats: DiffStats::default(),
+            commits: vec![],
+        }
+    }
+
+    /// The incident shape (defect #2 of the vista run): the operator checkout
+    /// carries UNTRACKED files that reference a module the PR deletes. Those
+    /// files belong to no revision under review, so they must not appear as
+    /// ghost findings. Scanning the reviewed tree — not the ambient checkout —
+    /// is what keeps them out.
+    #[test]
+    fn ghost_refs_scan_root_excludes_untracked_local_noise() {
+        let (_tmp, repo, commit_id) = make_visible_repo(&[
+            (
+                "src/utils/calculator.rs",
+                "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+            ),
+            (
+                "src/main.rs",
+                "use utils::calculator;\nfn main() { calculator::add(1, 2); }",
+            ),
+        ]);
+
+        // Local-only scratch file: never staged, never committed, not in the PR.
+        fs::write(
+            repo.path().join("src/scratch_local.rs"),
+            "use utils::calculator;\nfn scratch() { calculator::add(3, 4); }",
+        )
+        .unwrap();
+
+        // The reviewed tree: tracked bytes of the target, no untracked noise.
+        let (_snap_tmp, snapshot_dir) = make_snapshot_tree(&[(
+            "src/main.rs",
+            "use utils::calculator;\nfn main() { calculator::add(1, 2); }",
+        )]);
+
+        let diff = deletion_diff("src/utils/calculator.rs", commit_id);
+        let out_dir = repo.path().join("output");
+        let result = generate_ghost_refs(&out_dir, &[diff], &snapshot_dir).unwrap();
+        assert!(
+            result.is_some(),
+            "the tracked ghost reference in src/main.rs must still be reported"
+        );
+
+        let audit: GhostRefsAudit = serde_json::from_str(
+            &fs::read_to_string(out_dir.join("GHOST_REFERENCES.json")).unwrap(),
+        )
+        .unwrap();
+        let files: Vec<&str> = audit
+            .findings
+            .values()
+            .flatten()
+            .map(|r| r.file.as_str())
+            .collect();
+        assert!(
+            files.contains(&"src/main.rs"),
+            "tracked reference missing from findings: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.contains("scratch_local")),
+            "untracked local file leaked into the audit: {files:?}"
+        );
+
+        let md = fs::read_to_string(out_dir.join("GHOST_REFERENCES.md")).unwrap();
+        assert!(
+            !md.contains("scratch_local"),
+            "untracked local file leaked into the markdown report"
+        );
+    }
+
+    /// The quiet half of the same defect: the relocation guard must ask the
+    /// REVIEWED tree whether a same-basename survivor exists. Asking the
+    /// operator checkout decides suppression on a revision nobody reviewed.
+    ///
+    /// Survivor lives in the ambient checkout only (the operator sits on another
+    /// branch). The reviewed tree has no `sanitize.rs`, so the deletion is real
+    /// and the dangling `pub mod sanitize;` must be reported, not suppressed as
+    /// a relocation.
+    #[test]
+    fn ghost_refs_relocation_guard_ignores_survivor_outside_the_reviewed_tree() {
+        let (_tmp_a, repo_a, commit_a) = make_visible_repo(&[
+            ("crates/aicx-parser/src/sanitize.rs", "pub fn clean() {}"),
+            ("crates/aicx-parser/src/lib.rs", "pub mod sanitize;\n"),
+        ]);
+        let (_snap_a, snapshot_a) =
+            make_snapshot_tree(&[("crates/aicx-parser/src/lib.rs", "pub mod sanitize;\n")]);
+
+        let out_a = repo_a.path().join("output-a");
+        let result_a = generate_ghost_refs(
+            &out_a,
+            &[deletion_diff("src/sanitize.rs", commit_a)],
+            &snapshot_a,
+        )
+        .unwrap();
+        assert!(
+            result_a.is_some(),
+            "a survivor that exists only in the ambient checkout must not suppress the audit"
+        );
+    }
+
+    /// The mirror image of the previous test. The survivor lives in the reviewed
+    /// tree (the PR relocated the file); the ambient checkout does not have it.
+    /// Suppression must follow the reviewed tree and stay silent.
+    #[test]
+    fn ghost_refs_relocation_guard_honours_survivor_inside_the_reviewed_tree() {
+        let (_tmp_b, repo_b, commit_b) =
+            make_visible_repo(&[("crates/aicx-parser/src/lib.rs", "pub mod sanitize;\n")]);
+        let (_snap_b, snapshot_b) = make_snapshot_tree(&[
+            ("crates/aicx-parser/src/sanitize.rs", "pub fn clean() {}"),
+            ("crates/aicx-parser/src/lib.rs", "pub mod sanitize;\n"),
+        ]);
+
+        let out_b = repo_b.path().join("output-b");
+        let result_b = generate_ghost_refs(
+            &out_b,
+            &[deletion_diff("src/sanitize.rs", commit_b)],
+            &snapshot_b,
+        )
+        .unwrap();
+        assert!(
+            result_b.is_none(),
+            "a relocation visible in the reviewed tree must suppress the audit"
+        );
+    }
+
     #[test]
     fn extract_search_term_handles_index_files() {
         assert_eq!(
@@ -684,7 +852,7 @@ mod tests {
         };
 
         let out_dir = repo.path().join("output");
-        let result = generate_ghost_refs(&out_dir, &[diff], &repo).unwrap();
+        let result = generate_ghost_refs(&out_dir, &[diff], repo.path()).unwrap();
         assert!(result.is_some(), "should detect ghost reference");
 
         let cr = result.unwrap();
@@ -738,7 +906,7 @@ mod tests {
         };
 
         let out_dir = repo.path().join("output");
-        let result = generate_ghost_refs(&out_dir, &[diff], &repo).unwrap();
+        let result = generate_ghost_refs(&out_dir, &[diff], repo.path()).unwrap();
         assert!(
             result.is_some(),
             "deletion of a/calculator.rs must not be suppressed by the surviving b/calculator.rs basename collision"
@@ -807,7 +975,7 @@ mod tests {
         };
 
         let out_dir = outer.path().join("output");
-        let result = generate_ghost_refs(&out_dir, &[diff], &repo).unwrap();
+        let result = generate_ghost_refs(&out_dir, &[diff], repo.path()).unwrap();
         assert!(
             result.is_some(),
             "ghost refs under a dotted ancestor must be detected, not skipped as a clean Ok(None)"
@@ -827,7 +995,7 @@ mod tests {
         );
 
         let out_dir = tmp.path().join("output");
-        let result = generate_ghost_refs(&out_dir, &[diff], &repo).unwrap();
+        let result = generate_ghost_refs(&out_dir, &[diff], repo.path()).unwrap();
         assert!(result.is_none(), "no deleted files means no ghost refs");
     }
 
@@ -851,7 +1019,7 @@ mod tests {
         );
 
         let out_dir = tmp.path().join("output");
-        let result = generate_ghost_refs(&out_dir, &[diff], &repo).unwrap();
+        let result = generate_ghost_refs(&out_dir, &[diff], repo.path()).unwrap();
         assert!(
             result.is_none(),
             "short term 'ab' (len=2, <=3) should be skipped"
@@ -893,7 +1061,7 @@ mod tests {
         };
 
         let out_dir = repo.path().join("output");
-        let result = generate_ghost_refs(&out_dir, &[diff], &repo).unwrap();
+        let result = generate_ghost_refs(&out_dir, &[diff], repo.path()).unwrap();
         let audit: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(out_dir.join("GHOST_REFERENCES.json")).unwrap(),
         )
@@ -938,7 +1106,7 @@ mod tests {
         };
 
         let out_dir = repo.path().join("output");
-        let result = generate_ghost_refs(&out_dir, &[diff], &repo).unwrap();
+        let result = generate_ghost_refs(&out_dir, &[diff], repo.path()).unwrap();
         assert!(
             result.is_none(),
             "relocated file (same basename surviving elsewhere) must not be a ghost"
@@ -984,7 +1152,7 @@ mod tests {
         };
 
         let out_dir = repo.path().join("output");
-        let result = generate_ghost_refs(&out_dir, &[diff], &repo).unwrap();
+        let result = generate_ghost_refs(&out_dir, &[diff], repo.path()).unwrap();
         assert!(result.is_some(), "should detect ghost reference in src/");
 
         let cr = result.unwrap();
@@ -1128,7 +1296,7 @@ mod tests {
         };
 
         let out_dir = repo.path().join("output");
-        let result = generate_ghost_refs(&out_dir, &[diff], &repo).unwrap();
+        let result = generate_ghost_refs(&out_dir, &[diff], repo.path()).unwrap();
         // Only noise found, no runtime refs, so result should be None
         assert!(
             result.is_none(),
