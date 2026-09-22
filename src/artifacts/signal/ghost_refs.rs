@@ -120,7 +120,9 @@ pub struct GhostRefsAudit {
     pub noise_categories: HashMap<String, usize>,
 }
 
-/// Binary-format extensions that should be skipped entirely.
+/// Extensions whose contents are never a source reference: binary media, fonts,
+/// archives, lockfiles, and the machine-report formats (`json`, `sarif`) whose
+/// own payloads quote every path the run touched.
 const SKIP_EXTENSIONS: &[&str] = &[
     "png", "jpg", "zip", "lock", "sarif", "json", "woff", "woff2", "ttf", "eot", "ico", "gif",
     "mp3", "mp4", "webp", "avif", "pdf", "svg",

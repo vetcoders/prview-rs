@@ -3442,9 +3442,11 @@ A match counts only when the deleted file's stem appears as a standalone identif
 in a module-path, import or file-path context: Rust `mod foo;` / `use crate::foo` /
 `foo::Bar`, JS/TS `import … from './foo'` / `require('foo')`, Python `from foo import`,
 and literal `foo.rs` / `foo/…` path references. Bare prose and identifier substrings
-(`high-signal`, `signals`, `signal_reasons`) are rejected. Binary and lockfile
-extensions are skipped outright, as are `logs/` and `archive/` paths and anything the
-PR itself touched.
+(`high-signal`, `signals`, `signal_reasons`) are rejected. The `SKIP_EXTENSIONS` list
+is skipped outright — images, media and fonts (`png`, `jpg`, `gif`, `webp`, `avif`,
+`ico`, `svg`, `mp3`, `mp4`, `pdf`, `woff`, `woff2`, `ttf`, `eot`), plus `zip`, `lock`
+and the machine-report formats `json` and `sarif` — as are `logs/` and `archive/`
+paths and anything the PR itself touched.
 
 #### signal/risk.rs — per-file risk scoring
 
