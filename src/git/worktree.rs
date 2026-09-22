@@ -536,18 +536,23 @@ const HOST_ELF_MACHINE: Option<u16> = None;
 /// which is what a modern toolchain emits by default — is `ET_DYN`, and the
 /// kernel claims both.
 ///
-/// This branch is narrower than `binfmt_elf`'s full triage and deliberately
-/// stays on the conservative side of it, because the fields it does NOT model
-/// are all further `-ENOEXEC` exits: an image with no `PT_LOAD` segment, or a
-/// `PT_INTERP` whose length fails the loader's bounds, passes this header
-/// check and is still dropped to `/bin/sh`. The set accepted here is not
-/// proved shell-free by measurement the way the macOS set is — there was no
-/// Linux host in the round that wrote it — so every field it does model is
-/// matched exactly rather than loosely: `e_phentsize` for equality, and the
-/// program-header table against the same `56 * e_phnum` product the kernel
-/// computes, BOTH halves of that bound. An earlier round asserted that
-/// exactness while `e_phnum` was still bounded from below only, which left
-/// `e_phnum = 1171` claimed here and `-ENOEXEC` in the kernel.
+/// This branch models fewer fields than `binfmt_elf`'s full triage, and the
+/// gap is NOT uniformly conservative: one unmodelled exit is a real
+/// `-ENOEXEC`, hence a real `/bin/sh` path — a `PT_INTERP` whose `p_filesz`
+/// leaves `[2, PATH_MAX]`. An image with no `PT_LOAD` segment is NOT such a
+/// path: the loader is already past `begin_new_exec()` by then, so it either
+/// execs and dies on its entry point or fails `-EINVAL`, and `execvp` retries
+/// only on `ENOEXEC`. One more real `-ENOEXEC` exit before that point of no
+/// return is `!can_mmap_file(bprm->file)`, and it is not a header field at
+/// all, so no header validator — this one included — can ever model it. The
+/// set accepted here is not proved shell-free by measurement the way the
+/// macOS set is — there was no Linux host in the round that wrote it — so
+/// every field it does model is matched exactly rather than loosely:
+/// `e_phentsize` for equality, and the program-header table against the same
+/// `56 * e_phnum` product the kernel computes, BOTH halves of that bound. An
+/// earlier round asserted that exactness while `e_phnum` was still bounded
+/// from below only, which left `e_phnum = 1171` claimed here and `-ENOEXEC`
+/// in the kernel.
 #[cfg(target_os = "linux")]
 fn platform_header_claims_executable(file: &std::fs::File, length: u64) -> bool {
     const ELF_HEADER_BYTES: u64 = 64;

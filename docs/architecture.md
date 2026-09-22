@@ -690,10 +690,15 @@ but not executable, so they are the fallback vector rather than evidence:
   size bound — into the same code, in one `goto out` chain. With a 56-byte
   entry the bound is `e_phnum <= 1170`; `e_phnum = 0xffff` (`PN_XNUM`) needs no
   special case, because extended numbering exists only in the kernel's
-  core-dump writer and the load path simply multiplies. This branch stays
-  deliberately narrower than `binfmt_elf`'s full triage: the exits it does not
-  model — no `PT_LOAD` segment, a `PT_INTERP` failing the loader's bounds — are
-  further `ENOEXEC` paths, and unlike the macOS set this one carries no kernel
+  core-dump writer and the load path simply multiplies. This branch models
+  fewer fields than `binfmt_elf`'s full triage, and the gap is **not**
+  uniformly conservative. A `PT_INTERP` whose `p_filesz` leaves
+  `[2, PATH_MAX]` is a real `ENOEXEC` exit, hence a real `/bin/sh` path, and so
+  is `!can_mmap_file()` — which is not a header field at all, so no header
+  validator models it. An image with **no `PT_LOAD` segment is not** such a
+  path: by then the loader is already past `begin_new_exec()`, so it either
+  execs and dies on its entry point or fails `EINVAL`, and `execvp` retries
+  only on `ENOEXEC`. Unlike the macOS set, this one carries no kernel
   measurement behind it yet.
 - **Any other Unix** has no proof path, so every header is unproven.
 
