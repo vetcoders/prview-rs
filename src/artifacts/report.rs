@@ -1156,6 +1156,23 @@ fn build_report(input: &ReportInput<'_>) -> Report {
             // `consistent: true` for the very run `CONSISTENCY_CHECK.json`
             // called inconsistent: one fact, two values.
             consistency.merge_provenance(input.provenance);
+            // The same checklist fold `CONSISTENCY_CHECK.json` applies, against
+            // the in-memory statuses this report is about to serialize.
+            let check_outcomes: Vec<_> = input
+                .checks
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        crate::artifacts::ChecklistCheckOutcome::from_status(c.status),
+                    )
+                })
+                .collect();
+            consistency.merge_pr_checklist(
+                disk.pr_checklist.as_deref(),
+                Some(&check_outcomes),
+                "report.json",
+            );
 
             ConsistencySection {
                 consistent: consistency.consistent,

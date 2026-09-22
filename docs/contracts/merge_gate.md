@@ -437,6 +437,10 @@ carrying a contradiction is also
 reported as `consistent: false` in `00_summary/CONSISTENCY_CHECK.json` **and** in
 `report.json`'s `quality.consistency`: the two sections check different counters,
 but neither may call a run consistent while a substrate contradiction stands.
+Both sections also re-derive the `PR_REVIEW.md` checklist claims from the check
+statuses and report any rendered mark those statuses do not earn as a
+`pr_checklist.<item>` warning. `CONSISTENCY_CHECK.json` is written after this
+file, so none of its warnings changes the gate decision.
 
 `tools/validate_merge_gate.py` enforces the whole of the above on a 3.0 gate, not
 just the row shapes:

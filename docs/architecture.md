@@ -3522,6 +3522,18 @@ changes, and inline findings to detect mismatches that would erode trust in the 
 This is the independent side of the cross-check: it recovers counters from the
 already-serialized artifacts on disk and flags any disagreement.
 
+Beyond counters it cross-checks one set of claims: the `PR_REVIEW.md` checklist.
+`pr_review.rs` owns the single derivation (`derive_pr_checklist`): a universal
+claim (`Compiles / type-checks`, `Tests pass`, `No lint errors`) is ticked only
+when every executed check of its category passed and at least one executed.
+The renderer prints that derivation; `ConsistencyReport::merge_pr_checklist`
+re-derives it from the statuses serialized in `report.json` (`/checks`) and
+compares it with the marks parsed back from `PR_REVIEW.md` — a divergence is a
+`pr_checklist.<item>` warning in both `CONSISTENCY_CHECK.json` and `report.json`'s
+`quality.consistency`. Because both sides share the derivation, the checker
+catches the rendered text drifting from the statuses; the derivation's own
+semantics (all-of, not any-of) are pinned by the `artifacts::tests` checklist tests.
+
 #### signal/semantic.rs — semantic cross-file rules
 
 Domain-aware finding generation backed by multi-file evidence. The first rule

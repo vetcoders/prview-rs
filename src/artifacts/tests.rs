@@ -38,6 +38,7 @@ fn generate_fixture_pack_with_ledger(
 struct FixturePackOptions<'a> {
     diffs: &'a [Diff],
     worktree_head: FixtureWorktreeHead<'a>,
+    checks: &'a [CheckResult],
 }
 
 /// What a fixture pack captured about the operator checkout. The default is the
@@ -96,7 +97,7 @@ fn generate_fixture_pack_with_ledger_and_diffs(
         ledger,
         scope: None,
         diffs: options.diffs,
-        checks: &[],
+        checks: options.checks,
         heuristics: None,
         resolved_target: &resolved_target,
         resolved_bases: &resolved_bases,
@@ -8015,4 +8016,227 @@ fn snapshot_integrity_gate_preserves_check_results_and_dashboard_parity() {
         assert_eq!(gate_caveats, dashboard_caveats);
         assert_eq!(gate_caveats.len(), usize::from(integrity.requires_review()));
     }
+}
+
+/// The vbl-190 incident vector (run 20260918-180535-08716c4): ESLint failed with
+/// 1042 problems while Clippy and Stylelint passed. Every other check of that
+/// run is carried with its real status so the pack sees the same mix.
+fn incident_vbl190_checks() -> Vec<CheckResult> {
+    [
+        ("TypeScript", CheckStatus::Passed),
+        ("ESLint", CheckStatus::Failed),
+        ("Stylelint", CheckStatus::Passed),
+        ("Vitest", CheckStatus::Passed),
+        ("Cargo check", CheckStatus::Passed),
+        ("Clippy", CheckStatus::Passed),
+        ("Rustfmt", CheckStatus::Passed),
+        ("Cargo test", CheckStatus::Passed),
+        ("Cargo audit", CheckStatus::Failed),
+    ]
+    .into_iter()
+    .map(|(name, status)| lint_check(name, status))
+    .collect()
+}
+
+fn checklist_section(pr_review: &str) -> &str {
+    let start = pr_review
+        .find("## Checklist")
+        .expect("PR_REVIEW.md checklist");
+    &pr_review[start..]
+}
+
+/// Defects #5 and #6 of vbl-190 through the real `generate()`: a pack carrying
+/// a failed AND a passed lint check must not tick the universal "No lint
+/// errors", and the consistency checker must see the contradiction when a
+/// pack's rendered checklist disagrees with its serialized check statuses.
+#[test]
+fn a_failed_lint_check_is_not_hidden_by_a_passed_one_and_the_checker_sees_the_lie() {
+    let publication_home = tempfile::tempdir().unwrap();
+    let _home = crate::config::override_test_prview_home(publication_home.path().to_path_buf());
+    let (repo, base, target) = init_advanced_base_fixture();
+    let governor = crate::governor::ResourceGovernor::new();
+    let checks = incident_vbl190_checks();
+    let output = publication_home.path().join("incident-pack");
+    let pack = generate_fixture_pack_with_ledger_and_diffs(
+        repo.path(),
+        &output,
+        &target,
+        &base,
+        &governor,
+        &TaskLedger::new(),
+        FixturePackOptions {
+            checks: &checks,
+            ..Default::default()
+        },
+    )
+    .expect("incident pack");
+
+    let pr_review = fs::read_to_string(pack.join("PR_REVIEW.md")).expect("PR_REVIEW.md");
+    let consistency_md =
+        fs::read_to_string(pack.join("00_summary/CONSISTENCY_CHECK.md")).expect("check md");
+    let checklist = checklist_section(&pr_review);
+    assert!(
+        checklist.contains("- [ ] No lint errors") && !checklist.contains("- [x] No lint errors"),
+        "ESLint failed, so 'No lint errors' must stay unticked:\n{checklist}\n{consistency_md}"
+    );
+    // The other two items have only passing checks in this vector.
+    assert!(
+        checklist.contains("- [x] Compiles / type-checks"),
+        "{checklist}"
+    );
+    assert!(checklist.contains("- [x] Tests pass"), "{checklist}");
+
+    // Healthy side: the renderer and the checker derive from one function, so the
+    // honest pack is consistent in BOTH consistency surfaces.
+    let summary: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(pack.join("00_summary/CONSISTENCY_CHECK.json")).expect("check json"),
+    )
+    .expect("parse check json");
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pack.join("report.json")).expect("report"))
+            .expect("parse report");
+    assert_eq!(summary["consistent"], true, "{summary}");
+    assert_eq!(
+        report["quality"]["consistency"]["consistent"], true,
+        "{}",
+        report["quality"]["consistency"]
+    );
+    let checked_honest = summary["checked_fields"].as_u64().expect("checked_fields");
+    assert!(
+        checked_honest >= 3,
+        "the three checklist items are compared in a real pack: {summary}"
+    );
+
+    // Needle: put the incident's rendered line back into this pack's
+    // PR_REVIEW.md and re-run the on-disk checker. It must name the lie.
+    let lying = pr_review.replace("- [ ] No lint errors", "- [x] No lint errors");
+    assert_ne!(lying, pr_review);
+    fs::write(pack.join("PR_REVIEW.md"), lying).expect("plant needle");
+    generate_consistency_check(
+        &pack.join("00_summary"),
+        &pack,
+        &[],
+        &ProvenanceConsistency::default(),
+    )
+    .expect("re-run checker");
+    let summary: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(pack.join("00_summary/CONSISTENCY_CHECK.json")).expect("check json"),
+    )
+    .expect("parse check json");
+    assert_eq!(summary["consistent"], false, "{summary}");
+    let warnings = summary["warnings"].as_array().expect("warnings");
+    let lint = warnings
+        .iter()
+        .find(|w| w["field"] == "pr_checklist.no_lint_errors")
+        .unwrap_or_else(|| panic!("named checklist warning: {summary}"));
+    let message = lint["message"].as_str().expect("message");
+    assert!(message.contains("ESLint"), "{message}");
+    // Same comparisons as the honest run: only the rendered mark changed.
+    assert_eq!(
+        summary["checked_fields"].as_u64(),
+        Some(checked_honest),
+        "{summary}"
+    );
+    let md = fs::read_to_string(pack.join("00_summary/CONSISTENCY_CHECK.md")).expect("md");
+    assert!(md.contains("- Consistent: `false`"), "{md}");
+    assert!(md.contains("pr_checklist.no_lint_errors"), "{md}");
+}
+
+fn rendered_checklist(checks: &[CheckResult]) -> String {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = create_test_config(PolicyConfig::default());
+    generate_pr_review(
+        tmp.path(),
+        &config,
+        &[],
+        checks,
+        &[],
+        &CoverageDelta {
+            total_source: 0,
+            covered_count: 0,
+            pct: None,
+            uncovered: vec![],
+            covered: vec![],
+            non_code_count: 0,
+            ghost_tests: vec![],
+        },
+        None,
+    )
+    .expect("pr review");
+    let content = std::fs::read_to_string(tmp.path().join("PR_REVIEW.md")).expect("read");
+    checklist_section(&content).to_string()
+}
+
+/// Defect #5 is a class, not one line: every universal checklist claim was
+/// derived with `any()`, so one passing check hid a failing sibling in the same
+/// category. Each category is exercised with a failed + passed pair.
+#[test]
+fn every_checklist_claim_needs_every_check_of_its_category_to_pass() {
+    use CheckStatus::{Failed, Passed};
+    let cases: [(&str, &[(&str, CheckStatus)]); 3] = [
+        (
+            "Compiles / type-checks",
+            &[("TypeScript", Failed), ("Cargo check", Passed)],
+        ),
+        ("Tests pass", &[("Cargo test", Failed), ("Vitest", Passed)]),
+        ("No lint errors", &[("ESLint", Failed), ("Clippy", Passed)]),
+    ];
+    for (label, vector) in cases {
+        let checks: Vec<_> = vector.iter().map(|(n, s)| lint_check(n, *s)).collect();
+        let checklist = rendered_checklist(&checks);
+        assert!(
+            checklist.contains(&format!("- [ ] {label}")),
+            "{label} must stay unticked when a check of its category failed:\n{checklist}"
+        );
+    }
+
+    // All checks of every category passed: every claim is earned.
+    let healthy: Vec<_> = incident_vbl190_checks()
+        .into_iter()
+        .map(|mut c| {
+            c.status = Passed;
+            c
+        })
+        .collect();
+    let checklist = rendered_checklist(&healthy);
+    for label in ["Compiles / type-checks", "Tests pass", "No lint errors"] {
+        assert!(checklist.contains(&format!("- [x] {label}")), "{checklist}");
+    }
+}
+
+/// A claim with no executed check behind it is not evidence: a run with no
+/// checks at all used to tick "Compiles / type-checks". Skipped checks did not
+/// run, and a lint that only produced warnings is not "No lint errors".
+#[test]
+fn checklist_claims_without_an_executed_passing_check_stay_unticked() {
+    let checklist = rendered_checklist(&[]);
+    assert!(
+        checklist.contains("- [ ] Compiles / type-checks"),
+        "{checklist}"
+    );
+    assert!(checklist.contains("- [ ] Tests pass"), "{checklist}");
+    assert!(checklist.contains("- [ ] No lint errors"), "{checklist}");
+
+    let checklist = rendered_checklist(&[
+        lint_check("Clippy", CheckStatus::Skipped),
+        lint_check("Cargo check", CheckStatus::Skipped),
+    ]);
+    assert!(checklist.contains("- [ ] No lint errors"), "{checklist}");
+    assert!(
+        checklist.contains("- [ ] Compiles / type-checks"),
+        "{checklist}"
+    );
+
+    // A skipped sibling does not veto a category whose executed checks passed.
+    let checklist = rendered_checklist(&[
+        lint_check("Clippy", CheckStatus::Passed),
+        lint_check("ESLint", CheckStatus::Skipped),
+    ]);
+    assert!(checklist.contains("- [x] No lint errors"), "{checklist}");
+
+    let checklist = rendered_checklist(&[
+        lint_check("Clippy", CheckStatus::Warnings),
+        lint_check("ESLint", CheckStatus::Passed),
+    ]);
+    assert!(checklist.contains("- [ ] No lint errors"), "{checklist}");
 }

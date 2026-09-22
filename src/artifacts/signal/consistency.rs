@@ -2,7 +2,10 @@
 //!
 //! Compares key counters between MERGE_GATE, report.json, coverage, breaking
 //! changes, and inline findings to detect mismatches that would erode trust.
+//! Also re-derives the PR_REVIEW.md checklist claims from the serialized check
+//! statuses, so a ticked claim the checks do not earn is a caught mismatch.
 
+use crate::artifacts::{ChecklistCheckOutcome, PrChecklistItem, derive_pr_checklist};
 use serde::Serialize;
 use std::path::Path;
 
@@ -23,6 +26,10 @@ pub struct DiskArtifactCounters {
     pub files_changed_report: Option<usize>,
     pub findings_count_report: Option<usize>,
     pub commit_count_report: Option<usize>,
+    /// Checklist marks rendered in `PR_REVIEW.md` (pack root).
+    pub pr_checklist: Option<Vec<(PrChecklistItem, Option<bool>)>>,
+    /// `(name, outcome)` per check serialized in report.json `/checks`.
+    pub check_outcomes_report: Option<Vec<(String, ChecklistCheckOutcome)>>,
 }
 
 /// Read the serialized cross-artifact counters under `pack_root` (the pack
@@ -66,7 +73,28 @@ pub fn read_disk_artifact_counters(pack_root: &Path) -> DiskArtifactCounters {
         out.files_changed_report = usize_at(&report, "/diff/stats/files_changed");
         out.findings_count_report = usize_at(&report, "/quality/sarif/findings_count");
         out.commit_count_report = usize_at(&report, "/diff/stats/commits");
+        out.check_outcomes_report =
+            report
+                .pointer("/checks")
+                .and_then(|c| c.as_array())
+                .map(|checks| {
+                    checks
+                        .iter()
+                        .filter_map(|check| {
+                            let name = check.get("name")?.as_str()?;
+                            let status = check.get("status")?.as_str()?;
+                            Some((
+                                name.to_string(),
+                                ChecklistCheckOutcome::from_report_status(status),
+                            ))
+                        })
+                        .collect()
+                });
     }
+
+    out.pr_checklist = std::fs::read_to_string(pack_root.join("PR_REVIEW.md"))
+        .ok()
+        .and_then(|text| crate::artifacts::parse_pr_checklist(&text));
 
     out
 }
@@ -114,6 +142,73 @@ impl ConsistencyReport {
                     },
                 ],
                 message: format!("{}: {}", contradiction.code, contradiction.explanation),
+            });
+        }
+        self.consistent = self.warnings.is_empty();
+    }
+
+    /// Fold the PR checklist cross-check into this report.
+    ///
+    /// Each rendered checklist mark in `PR_REVIEW.md` is compared with the claim
+    /// `derive_pr_checklist` makes from `checks` (the statuses serialized in, or
+    /// about to be serialized into, `checks_artifact`). A ticked universal claim
+    /// ("No lint errors") next to a failed check of that category is the vbl-190
+    /// class; a claim left unticked that the checks earn is the same divergence
+    /// in the other direction. An item with no rendered line, or a run with no
+    /// serialized checks, is not compared — never faked into agreement.
+    pub fn merge_pr_checklist(
+        &mut self,
+        rendered: Option<&[(PrChecklistItem, Option<bool>)]>,
+        checks: Option<&[(String, ChecklistCheckOutcome)]>,
+        checks_artifact: &str,
+    ) {
+        let (Some(rendered), Some(checks)) = (rendered, checks) else {
+            return;
+        };
+        let outcomes: Vec<_> = checks
+            .iter()
+            .map(|(name, outcome)| (name.as_str(), *outcome))
+            .collect();
+        for claim in derive_pr_checklist(&outcomes) {
+            let Some(rendered_mark) = rendered
+                .iter()
+                .find(|(item, _)| *item == claim.item)
+                .and_then(|(_, mark)| *mark)
+            else {
+                continue;
+            };
+            self.checked_fields += 1;
+            let earned = claim.ticked();
+            if rendered_mark == earned {
+                continue;
+            }
+            let mark = |ticked: bool| if ticked { "[x]" } else { "[ ]" };
+            let why = if !claim.not_passed.is_empty() {
+                format!("not passed: {}", claim.not_passed.join(", "))
+            } else if claim.executed.is_empty() {
+                "no check of this category executed".to_string()
+            } else {
+                format!("every executed check passed: {}", claim.executed.join(", "))
+            };
+            self.warnings.push(ConsistencyWarning {
+                field: format!("pr_checklist.{}", claim.item.key()),
+                sources: vec![
+                    ConsistencySource {
+                        artifact: "PR_REVIEW.md".to_string(),
+                        value: mark(rendered_mark).to_string(),
+                    },
+                    ConsistencySource {
+                        artifact: checks_artifact.to_string(),
+                        value: format!("{} ({why})", mark(earned)),
+                    },
+                ],
+                message: format!(
+                    "PR checklist mismatch: PR_REVIEW.md renders {} '{}', but the {} check statuses earn {} ({why})",
+                    mark(rendered_mark),
+                    claim.item.label(),
+                    checks_artifact,
+                    mark(earned),
+                ),
             });
         }
         self.consistent = self.warnings.is_empty();
@@ -502,6 +597,122 @@ pub fn detect_provenance_contradictions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PR Template tail of the vbl-190 incident pack
+    /// (run 20260918-180535-08716c4, PR_REVIEW.md:147-164), verbatim.
+    const INCIDENT_PR_TEMPLATE: &str = "## PR Template\n\n\
+_Copy below for GitHub PR description:_\n\n```markdown\n## Description\n\
+<!-- Describe your changes -->\n## Type of Change\n- [ ] Bug fix\n- [ ] New feature\n\
+- [ ] Breaking change\n- [ ] Refactoring\n## Checklist\n- [x] Compiles / type-checks\n\
+- [x] Tests pass\n- [x] No lint errors\n- [ ] Manually tested\n```\n";
+
+    /// The incident's serialized check statuses (report.json `/checks`).
+    fn incident_report_json(eslint_status: &str) -> String {
+        let checks: Vec<_> = [
+            ("TypeScript", "PASS"),
+            ("ESLint", eslint_status),
+            ("Stylelint", "PASS"),
+            ("Vitest", "PASS"),
+            ("Cargo check", "PASS"),
+            ("Clippy", "PASS"),
+            ("Rustfmt", "PASS"),
+            ("Cargo test", "PASS"),
+            ("Cargo audit", "FAIL"),
+        ]
+        .into_iter()
+        .map(|(name, status)| serde_json::json!({ "name": name, "status": status }))
+        .collect();
+        serde_json::json!({ "checks": checks }).to_string()
+    }
+
+    fn checklist_report(root: &Path) -> ConsistencyReport {
+        let disk = read_disk_artifact_counters(root);
+        let mut report = ArtifactCounters::default().check_consistency();
+        report.merge_pr_checklist(
+            disk.pr_checklist.as_deref(),
+            disk.check_outcomes_report.as_deref(),
+            "report.json",
+        );
+        report
+    }
+
+    #[test]
+    fn incident_checklist_contradicting_serialized_statuses_is_caught_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("PR_REVIEW.md"),
+            format!("# PR Review\n\n{INCIDENT_PR_TEMPLATE}"),
+        )
+        .unwrap();
+        std::fs::write(root.join("report.json"), incident_report_json("FAIL")).unwrap();
+
+        let report = checklist_report(root);
+        assert!(!report.consistent, "{report:?}");
+        assert_eq!(report.checked_fields, 3, "{report:?}");
+        assert_eq!(report.warnings.len(), 1, "{report:?}");
+        let warning = &report.warnings[0];
+        assert_eq!(warning.field, "pr_checklist.no_lint_errors");
+        assert_eq!(warning.sources[0].value, "[x]");
+        assert_eq!(warning.sources[1].value, "[ ] (not passed: ESLint)");
+        assert!(
+            warning.message.contains("'No lint errors'"),
+            "{}",
+            warning.message
+        );
+
+        // Healthy counterpart: the same rendered checklist over statuses that
+        // earn every tick is consistent, and all three items were compared.
+        std::fs::write(root.join("report.json"), incident_report_json("PASS")).unwrap();
+        let report = checklist_report(root);
+        assert!(report.consistent, "{report:?}");
+        assert_eq!(report.checked_fields, 3);
+    }
+
+    #[test]
+    fn an_unticked_claim_the_checks_earn_is_also_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let unticked = INCIDENT_PR_TEMPLATE.replace("- [x] Tests pass", "- [ ] Tests pass");
+        std::fs::write(root.join("PR_REVIEW.md"), format!("# R\n\n{unticked}")).unwrap();
+        std::fs::write(root.join("report.json"), incident_report_json("PASS")).unwrap();
+        let report = checklist_report(root);
+        assert!(!report.consistent);
+        assert_eq!(report.warnings.len(), 1, "{report:?}");
+        assert_eq!(report.warnings[0].field, "pr_checklist.tests_pass");
+        assert!(
+            report.warnings[0].sources[1]
+                .value
+                .contains("every executed check passed: Vitest, Cargo test"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn checklist_is_not_compared_without_both_serialized_sides() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Neither artifact: nothing compared, nothing faked.
+        let report = checklist_report(root);
+        assert!(report.consistent);
+        assert_eq!(report.checked_fields, 0);
+
+        // PR_REVIEW.md without report.json: still unchecked.
+        std::fs::write(
+            root.join("PR_REVIEW.md"),
+            format!("# R\n\n{INCIDENT_PR_TEMPLATE}"),
+        )
+        .unwrap();
+        let report = checklist_report(root);
+        assert_eq!(report.checked_fields, 0);
+
+        // Checkbox lines outside `## Checklist` are not checklist claims.
+        std::fs::write(root.join("PR_REVIEW.md"), "# R\n\n- [x] No lint errors\n").unwrap();
+        std::fs::write(root.join("report.json"), incident_report_json("FAIL")).unwrap();
+        let report = checklist_report(root);
+        assert_eq!(report.checked_fields, 0);
+        assert!(report.consistent);
+    }
 
     #[test]
     fn consistent_counters_produce_no_warnings() {

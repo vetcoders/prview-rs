@@ -1265,6 +1265,18 @@ quality, policy, and permission axes beside that explanation.
   Any contradiction turns `consistent` to `false` in BOTH `00_summary/CONSISTENCY_CHECK.json` and
   `report.json`'s `quality.consistency`, so no reader can pick a surface that calls the run clean.
 - `PR_REVIEW.md` is a concise review narrative, not a raw log dump.
+- The `## Checklist` of the PR Template in `PR_REVIEW.md` auto-ticks three universal claims —
+  `Compiles / type-checks` (TypeScript, `cargo check`), `Tests pass` (checks named `*test*`, Vitest,
+  Pytest) and `No lint errors` (checks named `*lint*`, Clippy, Ruff). A claim is ticked only when at least
+  one check of its category executed and **every** executed check of that category passed; a failed,
+  errored or warnings-only check, or no executed check at all, leaves it `[ ]` (skipped checks neither
+  earn nor veto it). A failing ESLint next to a passing Clippy therefore leaves `No lint errors` unticked;
+  the failing check is named in the Check Status table above it. `Manually tested` is never auto-ticked.
+- `00_summary/CONSISTENCY_CHECK.json` (and `report.json`'s `quality.consistency`) re-derive those three
+  claims from the serialized check statuses and compare them with the marks rendered in `PR_REVIEW.md`.
+  A mark the statuses do not earn — or an earned claim left unticked — is a `pr_checklist.<item>` warning
+  (`compiles`, `tests_pass`, `no_lint_errors`) and turns `consistent` to `false`. Each compared item counts
+  toward `checked_fields`; with no `PR_REVIEW.md` checklist or no serialized checks nothing is compared.
 - `00_summary/FAILURES_SUMMARY.md` summarizes blocking failures and advisories without copying whole JSON files.
 - When `30_context/INLINE_FINDINGS.sarif` exists, it emits findings per location/advisory and is suitable for annotation integrations.
 - In Rust runs, `PR_REVIEW.md` and `FAILURES_SUMMARY.md` can surface dependency paths to vulnerable crates based on `30_context/cargo-tree.txt`.
