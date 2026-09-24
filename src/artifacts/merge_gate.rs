@@ -2143,8 +2143,8 @@ mod tests {
             (
                 LockProofGap::AuditConfigChanged,
                 "Cargo audit (Failed): provenance proof unavailable: the cargo-audit \
-                 configuration (.cargo/audit.toml) changed (2 advisories not shown to \
-                 predate this change)",
+                 configuration (.cargo/audit.toml) changed or is dirty in the scanned \
+                 tree (2 advisories not shown to predate this change)",
             ),
             (
                 LockProofGap::UnknownProvenance,

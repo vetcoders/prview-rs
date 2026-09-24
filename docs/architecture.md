@@ -348,10 +348,19 @@ so a rename or deletion counts even though those rows keep only a rename's new
 path. Anything a checkout could resolve differently (a symlink at the path or
 at a parent, an unreadable tree) counts as a change. A configuration elsewhere,
 such as the repository root's for a member cargo root, is not the file the
-audit read and does not count. Only the committed file is compared: an
-uncommitted or untracked one is not part of the change, and it cannot age an
-introduced advisory, because the baseline only ever reports advisories the
-base's lockfile carries.
+audit read and does not count. The committed comparison speaks only for the
+commits, so the file the audit read must also be the target's
+(`scanned_audit_config_is_target`). A local review audits the checkout, where a
+staged, unstaged, untracked or ignored configuration can ignore the advisory
+the change introduced while pre-existing ones still fail. The local shape
+mirrors the lockfile's two observations. Before the checks, the frozen dirty
+set must not list the file or a parent of it, such as an untracked symlinked
+`.cargo`. After the checks, the tracked file is read against the target on the
+index and working-tree axes, and where the target has no configuration, any
+file at the path counts. That last test catches an ignored configuration,
+which no status read lists. A snapshot run audits a tree materialised from the
+target, so only a check boundary that saw the file rewritten withholds the
+proof there.
 
 One proof covers every branch of the comparison, because `in_diff` already
 carries the rest: an untouched lock makes every advisory `in_diff = false`; a

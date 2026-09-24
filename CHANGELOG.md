@@ -278,10 +278,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   member's resolution), so an advisory the new member lock introduced is no
   longer classified as pre-existing — that baseline is unavailable instead. A
   change to the cargo-audit configuration (`.cargo/audit.toml` in the cargo
-  root, which the baseline audit also reads from the reviewed tree) withholds
-  the proof as `the cargo-audit configuration (.cargo/audit.toml) changed`, so
-  dropping an ignored advisory no longer passes its failure off as
-  pre-existing. A lock that was staged and then reverted in the working file no
+  root, whose base copy no audit reads) withholds the proof as `the
+  cargo-audit configuration (.cargo/audit.toml) changed or is dirty in the
+  scanned tree`, so dropping an ignored advisory no longer passes its failure
+  off as pre-existing. So does a configuration in the checkout that is not the
+  target's, whether staged, unstaged, untracked or ignored: it could ignore the
+  advisory a change introduced while the pre-existing ones still fail and are
+  downgraded. A lock that was staged and then reverted in the working file no
   longer reads as untouched: the local re-read checks the index and the working
   tree separately. The gate states which proof it
   applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by this

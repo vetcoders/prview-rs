@@ -323,13 +323,27 @@ such as a symlink at the path or at a parent. A configuration anywhere else, for
 example the repository root's for a member cargo root, is not the file the audit
 read and does not count.
 
-Only the committed file is compared. An uncommitted or untracked
-`.cargo/audit.toml` in the checkout is not part of the change, and it cannot
-make an advisory the change introduced look older: whatever configuration the
-base audit applies, it only ever reports advisories the base's lockfile already
-carries. The path is matched as Git stores it, so on a case-insensitive
-filesystem a committed `.cargo/Audit.toml`, which `cargo audit` would read, is
-not compared.
+The file the audit read must also be the target's. A local review audits the
+checkout, so a staged, unstaged, untracked or ignored `.cargo/audit.toml` there
+is the configuration `cargo audit` applied. Such a file can ignore the advisory
+the change introduced while pre-existing ones still fail, and the downgrade
+would then pass a change that its own committed configuration blocks. A local
+review therefore withholds the proof when any of these holds:
+
+- the status read before the checks lists the file or a parent of it, such as
+  an untracked symlinked `.cargo`;
+- after the checks, the tracked file differs from the target's in the index or
+  in the working tree;
+- the target has no configuration and a file exists at the path. This is what
+  catches an ignored configuration, which no status read lists.
+
+A snapshot run audits a tree materialised from the target, so there only a
+check boundary that saw the file rewritten withholds the proof. The path is
+matched as Git stores it, so on a case-insensitive filesystem a committed
+`.cargo/Audit.toml`, which `cargo audit` would read, is not compared.
+`$CARGO_HOME/audit.toml` lies outside the reviewed tree: it is the
+environment's policy, applied alike to the audit and its baseline, and no
+commit speaks for it.
 
 The proof licenses a downgrade; it never manufactures one. Advisories the diff
 introduced stay `introduced` — warnings-category ones too (`unmaintained`,
@@ -394,8 +408,9 @@ unchanged vs base audit (N advisories)`, while a blocking one appears in
   proof was withheld — `<gap>` being `no Cargo.lock in the target tree`,
   `Cargo.lock dirty or rewritten in the scanned tree`, `the reviewed commit moved the cargo
   root away from the configured one`, `the cargo-audit configuration
-  (.cargo/audit.toml) changed`, or `the scanned tree could not be tied to
-  the target commit`. When `M` is zero the parenthetical is omitted and the gap
+  (.cargo/audit.toml) changed or is dirty in the scanned tree`, or `the
+  scanned tree could not be tied to the target commit`. When `M` is zero the
+  parenthetical is omitted and the gap
   stands alone: no line asserts a count it does not have.
 
 The set the first line counts and the set it names are one set: `new` counts
