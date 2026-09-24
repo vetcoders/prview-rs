@@ -155,15 +155,22 @@ struct SnapshotEvidence<'a> {
     target_regions: &'a SnapshotRegions<'a>,
 }
 
+/// A module of one crate: (crate, module path).
+type ModuleKey<'a> = (&'a str, &'a [String]);
+
+/// A name bound by a re-export: (crate, re-exporting module path, external
+/// name).
+type ReexportKey<'a> = (&'a str, &'a [String], &'a str);
+
 /// What one snapshot's unknown regions can hide from pairing: the unknowns
 /// and the module structure the snapshot still proves around them.
 struct SnapshotRegions<'a> {
     unknowns: &'a [RustApiUnknown],
     /// The cfg guard of every processed module, per crate and module path.
-    module_guards: BTreeMap<(&'a str, &'a [String]), Vec<&'a [String]>>,
+    module_guards: BTreeMap<ModuleKey<'a>, Vec<&'a [String]>>,
     /// The origin module of every re-export, per crate, re-exporting module
     /// and external name.
-    reexport_origins: BTreeMap<(&'a str, &'a [String], &'a str), Vec<&'a [String]>>,
+    reexport_origins: BTreeMap<ReexportKey<'a>, Vec<&'a [String]>>,
     /// Public module aliases as (crate, alias path, target module path).
     module_aliases: Vec<(&'a str, &'a [String], &'a [String])>,
 }
