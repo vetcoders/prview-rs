@@ -356,14 +356,18 @@ matches `.cargo/audit.toml` only when case is ignored, in the target or on
 either side of any diff, therefore withholds the proof on its own, and the
 dirty paths above are matched ignoring case as well.
 
-With an absolute `CARGO_HOME`, `$CARGO_HOME/audit.toml` lies outside the
-reviewed tree: it is the environment's policy, applied alike to the audit and
-its baseline, and no commit speaks for it. prview does not set `CARGO_HOME` for
-its checks, so they inherit the operator's, and a relative one resolves against
-the directory the audit ran in. That puts the fallback configuration, and the
-advisory database under it, inside the scanned tree, where a change can edit
-them with the lockfile untouched. A relative `CARGO_HOME` therefore withholds
-the proof on its own. An empty one counts as unset, as it does for cargo-audit.
+With an absolute `CARGO_HOME` outside the repository checkout and the target
+snapshot, `$CARGO_HOME/audit.toml` lies outside the reviewed tree: it is the
+environment's policy, applied alike to the audit and its baseline, and no
+commit speaks for it. prview does not set `CARGO_HOME` for its checks, so they
+inherit the operator's, and a relative one resolves against the directory the
+audit ran in. That puts the fallback configuration, and the advisory database
+under it, inside the scanned tree, where a change can edit them with the
+lockfile untouched. An absolute one that is, or lies inside, the checkout or
+the snapshot (`CARGO_HOME=$PWD/.cargo-home`) does the same. Either withholds
+the proof on its own; containment is judged on the path as spelled and as
+resolved through symbolic links, ignoring case. An empty one counts as unset,
+as it does for cargo-audit.
 
 The proof licenses a downgrade; it never manufactures one. Advisories the diff
 introduced stay `introduced` — warnings-category ones too (`unmaintained`,
@@ -440,7 +444,9 @@ unchanged vs base audit (N advisories)`, while a blocking one appears in
   (.cargo/audit.toml) changed or is dirty in the scanned tree`, `.cargo/audit.toml
   is committed under another case, which a case-insensitive checkout reads`,
   `CARGO_HOME is relative, so cargo audit read its fallback configuration and
-  advisory database inside the scanned tree`, or
+  advisory database inside the scanned tree`, `CARGO_HOME lies inside the
+  checkout or the scanned tree, so cargo audit read its fallback configuration
+  and advisory database from files there`, or
   `the scanned tree could not be tied to the target commit`. When `M` is zero the
   parenthetical is omitted and the gap
   stands alone: no line asserts a count it does not have.

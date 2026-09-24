@@ -382,13 +382,20 @@ sees, and with two spellings committed the checkout picks which one is on disk.
 path that matches `.cargo/audit.toml` only when case is ignored
 (`Repository::case_variant_at_commit`), and the dirty-set match
 (`path_or_parent_is`) ignores case too. The `$CARGO_HOME/audit.toml` fallback
-is the environment's policy only while `CARGO_HOME` is absolute. prview does
-not set it for its checks, so they inherit the operator's value, and a
-relative one resolves against the directory the audit ran in, which puts the
-fallback configuration and the advisory database inside the scanned tree.
+is the environment's policy only while `CARGO_HOME` is absolute and outside
+the reviewed trees. prview does not set it for its checks, so they inherit the
+operator's value. A relative one resolves against the directory the audit ran
+in, which puts the fallback configuration and the advisory database inside
+the scanned tree, and an absolute one can point into the checkout or the
+snapshot just the same (`CARGO_HOME=$PWD/.cargo-home`).
 `cargo_audit_config_gap` withholds the proof as `RelativeCargoHome` for a
-non-empty relative value before any other question
-(`LockEvidence::cargo_home`, read from this process's environment).
+non-empty relative value, and as `InTreeCargoHome` for an absolute one that is
+or lies inside the repository root or the snapshot root, before any other
+question (`LockEvidence::cargo_home`, read from this process's environment).
+Containment (`cargo_home_inside_trees`) compares every pairing of a lexical
+reading and a link-resolved reading of both paths, the latter through the
+deepest existing ancestor, and ignores ASCII case, so a spelling through `..`,
+a symbolic link or another case cannot place an in-tree home outside.
 
 `cargo_audit_report_advisory_keys` keys each report item by advisory id,
 package name and locked version, without the package source. rustsec reports

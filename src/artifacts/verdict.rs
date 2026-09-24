@@ -824,6 +824,12 @@ pub(crate) enum LockProofGap {
     /// files in the scanned tree, which no comparison of `.cargo/audit.toml`
     /// covers.
     RelativeCargoHome,
+    /// The `CARGO_HOME` the checks inherited is absolute but lies inside the
+    /// repository checkout or the scanned tree, however it is spelled or
+    /// linked ([`cargo_home_inside_trees`]). The fallback configuration and the
+    /// advisory database are then files there, which no comparison of
+    /// `.cargo/audit.toml` covers, just as for a relative value.
+    InTreeCargoHome,
     /// The worktree status or the checkout's identity could not be read, so
     /// nothing about the scanned lockfile was established either way.
     UnknownProvenance,
@@ -856,6 +862,11 @@ impl LockProofGap {
                 "provenance proof unavailable: CARGO_HOME is relative, so cargo \
                  audit read its fallback configuration and advisory database \
                  inside the scanned tree"
+            }
+            LockProofGap::InTreeCargoHome => {
+                "provenance proof unavailable: CARGO_HOME lies inside the checkout \
+                 or the scanned tree, so cargo audit read its fallback configuration \
+                 and advisory database from files there"
             }
             LockProofGap::UnknownProvenance => {
                 "provenance proof unavailable: the scanned tree could not be tied \
@@ -1319,11 +1330,13 @@ fn config_file_owner(basename: &str) -> Option<&'static str> {
 ///
 /// cargo-audit falls back to `$CARGO_HOME/audit.toml` when the cargo root has
 /// no `.cargo/audit.toml`, and reads its advisory database under
-/// `$CARGO_HOME` either way. An absolute `CARGO_HOME` lies outside what the
-/// change can edit, but a relative one resolves against the directory the
-/// audit ran in, making both files part of the scanned tree that no comparison
-/// here covers. The proof is then withheld as
-/// [`LockProofGap::RelativeCargoHome`] before anything else is asked.
+/// `$CARGO_HOME` either way. A relative `CARGO_HOME` resolves against the
+/// directory the audit ran in, making both files part of the scanned tree
+/// that no comparison here covers. The proof is then withheld as
+/// [`LockProofGap::RelativeCargoHome`] before anything else is asked. An
+/// absolute one is the environment's only while it lies outside the checkout
+/// and the scanned tree; inside either, the proof is withheld the same way, as
+/// [`LockProofGap::InTreeCargoHome`].
 ///
 /// With a Cargo root outside the repository there is no in-tree file, and no
 /// lock proof either.
@@ -1346,6 +1359,14 @@ fn cargo_audit_config_gap(
         .is_some_and(|home| !home.is_empty() && !std::path::Path::new(home).is_absolute())
     {
         return Some(LockProofGap::RelativeCargoHome);
+    }
+    if let Some(home) = evidence.cargo_home.filter(|home| !home.is_empty())
+        && cargo_home_inside_trees(
+            std::path::Path::new(home),
+            std::iter::once(config.repo_root.as_path()).chain(evidence.snapshot_root),
+        )
+    {
+        return Some(LockProofGap::InTreeCargoHome);
     }
     let Some(repo) = repo else {
         return Some(LockProofGap::AuditConfigChanged);
@@ -1376,6 +1397,61 @@ fn cargo_audit_config_gap(
         scanned_audit_config_is_target(repo, &path, resolved_target, target_is_checkout, evidence);
     (unreadable || committed_change || !scanned_is_target)
         .then_some(LockProofGap::AuditConfigChanged)
+}
+
+/// Whether the absolute `home` is, or lies inside, one of `roots`.
+///
+/// Every path is read twice: lexically, with `.` and `..` resolved, and
+/// through the filesystem, with symbolic links resolved up to its deepest
+/// existing ancestor, since cargo-audit may create the directory itself. Any
+/// pairing of the readings counts, so a home spelled through `..` or reached
+/// through a link is where it leads. Components compare without regard to
+/// ASCII case, as a case-insensitive filesystem opens the same directory under
+/// either spelling. A match that only case produces on a case-sensitive one
+/// withholds the proof needlessly, never grants it. Only absolute readings
+/// take part: a relative root read lexically would contain every path.
+fn cargo_home_inside_trees<'a>(
+    home: &std::path::Path,
+    roots: impl IntoIterator<Item = &'a std::path::Path>,
+) -> bool {
+    fn readings(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut readings = vec![crate::paths::clean_path_buf(path)];
+        readings.extend(resolved_through_links(path));
+        readings.retain(|reading| reading.is_absolute());
+        readings
+    }
+    fn resolved_through_links(path: &std::path::Path) -> Option<std::path::PathBuf> {
+        let mut missing = Vec::new();
+        let mut existing = path;
+        loop {
+            if let Ok(real) = existing.canonicalize() {
+                return Some(
+                    missing
+                        .iter()
+                        .rev()
+                        .fold(real, |real, part| real.join(part)),
+                );
+            }
+            missing.push(existing.file_name()?);
+            existing = existing.parent()?;
+        }
+    }
+    fn starts_with_ignoring_ascii_case(path: &std::path::Path, prefix: &std::path::Path) -> bool {
+        let mut components = path.components();
+        prefix.components().all(|part| {
+            components
+                .next()
+                .is_some_and(|own| own.as_os_str().eq_ignore_ascii_case(part.as_os_str()))
+        })
+    }
+    let homes = readings(home);
+    roots.into_iter().any(|root| {
+        readings(root).iter().any(|root| {
+            homes
+                .iter()
+                .any(|home| starts_with_ignoring_ascii_case(home, root))
+        })
+    })
 }
 
 /// Whether the `.cargo/audit.toml` the audit read in the scanned tree is the
@@ -3621,6 +3697,90 @@ mod tests {
                 proof(Some(relative.as_ref())),
                 CargoAuditLockProof::Unproven(LockProofGap::RelativeCargoHome),
                 "CARGO_HOME={relative}"
+            );
+        }
+    }
+
+    /// An absolute `CARGO_HOME` is the environment's only while it lies
+    /// outside the checkout and the scanned tree. Inside either, however it is
+    /// spelled or linked, its `audit.toml` and advisory database are files the
+    /// change can edit with the lockfile untouched.
+    #[test]
+    fn an_absolute_cargo_home_inside_the_tree_withholds_the_lock_proof() {
+        use LockProofEntry::Blob;
+        let files = || {
+            [
+                ("Cargo.toml", Blob(CORE_MANIFEST)),
+                ("Cargo.lock", Blob(CORE_LOCK)),
+            ]
+        };
+        let (tmp, head, target) = lock_proof_repo(&files(), &files());
+        let config = crate::config::test_config_builder()
+            .repo_root(tmp.path())
+            .build();
+        let parent = tmp.path().parent().unwrap();
+        let snapshot = tempfile::tempdir_in(parent).unwrap();
+        let outside = tempfile::tempdir_in(parent).unwrap();
+        let clean = std::collections::BTreeSet::new();
+        let untouched = snapshot_observed(&target, &[]);
+        let proof = |cargo_home: &std::path::Path| {
+            CleanComparison::resolve(
+                &config,
+                &resolved_ref(&target),
+                &[resolved_ref(&head)],
+                Some(true),
+                LockEvidence {
+                    dirty_before_checks: Some(&clean),
+                    snapshot_integrity: Some(&untouched),
+                    snapshot_root: Some(snapshot.path()),
+                    cargo_home: Some(cargo_home.as_os_str()),
+                },
+                Some(&head),
+                &[],
+            )
+            .cargo_audit_lock_proof()
+        };
+        let repo_name = tmp.path().file_name().unwrap();
+        assert_eq!(
+            proof(&outside.path().join("cargo-home")),
+            CargoAuditLockProof::TargetLock,
+            "a sibling of both trees is the environment's"
+        );
+        let inside = [
+            (tmp.path().join(".cargo-home"), "in the checkout"),
+            (tmp.path().to_path_buf(), "the checkout itself"),
+            (snapshot.path().join("home"), "in the scanned tree"),
+            (
+                outside
+                    .path()
+                    .join("..")
+                    .join(repo_name)
+                    .join(".cargo-home"),
+                "spelled through `..`",
+            ),
+            (
+                parent
+                    .join(repo_name.to_ascii_uppercase())
+                    .join(".cargo-home"),
+                "spelled in another case",
+            ),
+        ];
+        for (home, why) in inside {
+            assert_eq!(
+                proof(&home),
+                CargoAuditLockProof::Unproven(LockProofGap::InTreeCargoHome),
+                "{why}: CARGO_HOME={}",
+                home.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            let link = outside.path().join("link");
+            std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
+            assert_eq!(
+                proof(&link.join(".cargo-home")),
+                CargoAuditLockProof::Unproven(LockProofGap::InTreeCargoHome),
+                "reached through a link, not yet created"
             );
         }
     }

@@ -303,6 +303,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tree, where cargo-audit's fallback configuration and advisory database then
   live; it withholds the proof as `CARGO_HOME is relative, so cargo audit read
   its fallback configuration and advisory database inside the scanned tree`.
+  An absolute `CARGO_HOME` that is, or lies inside, the checkout or the
+  snapshot, however it is spelled or linked, withholds it the same way, as
+  `CARGO_HOME lies inside the checkout or the scanned tree, so cargo audit read
+  its fallback configuration and advisory database from files there`.
   The gate states which proof it
   applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by this
   PR (N advisories)`; a blocking one names the advisories it blocks on — all of

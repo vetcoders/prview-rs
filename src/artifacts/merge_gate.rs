@@ -2160,6 +2160,13 @@ mod tests {
                  this change)",
             ),
             (
+                LockProofGap::InTreeCargoHome,
+                "Cargo audit (Failed): provenance proof unavailable: CARGO_HOME lies \
+                 inside the checkout or the scanned tree, so cargo audit read its \
+                 fallback configuration and advisory database from files there (2 \
+                 advisories not shown to predate this change)",
+            ),
+            (
                 LockProofGap::UnknownProvenance,
                 "Cargo audit (Failed): provenance proof unavailable: the scanned tree \
                  could not be tied to the target commit (2 advisories not shown to \
@@ -2245,6 +2252,7 @@ mod tests {
             LockProofGap::AuditConfigChanged,
             LockProofGap::AuditConfigCaseVariant,
             LockProofGap::RelativeCargoHome,
+            LockProofGap::InTreeCargoHome,
             LockProofGap::UnknownProvenance,
         ] {
             let outcome = compute_effective_policy_outcome(
