@@ -8378,8 +8378,8 @@ fn a_dirty_lockfile_puts_cargo_audit_back_on_the_blocking_list() {
         .expect("cargo audit blocker");
     assert_eq!(
         audit_blocker,
-        "Cargo audit (Failed): provenance proof unavailable: Cargo.lock dirty in \
-         the scanned tree (2 advisories not shown to predate this change)",
+        "Cargo audit (Failed): provenance proof unavailable: Cargo.lock dirty or \
+         rewritten in the scanned tree (2 advisories not shown to predate this change)",
         "a blocker for want of a proof names the proof it wanted"
     );
     // The counts the blocker is reconciled with — and, since the proof was
