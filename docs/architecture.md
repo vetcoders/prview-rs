@@ -336,8 +336,9 @@ The lockfile is not the audit's only in-tree input. `cargo audit` reads
 `.cargo/audit.toml` in its working directory, without walking up, and otherwise
 `$CARGO_HOME/audit.toml` (`CargoAuditCommand::config_path` upstream). That
 file's `ignore` list, `informational_warnings` and `[output] deny` decide which
-advisories fail. The baseline audit reads the base's lockfile but runs in the
-reviewed tree, so it reads the target's configuration as well. A change that
+advisories fail. No audit reads the base's configuration: the audit runs in the
+reviewed tree (the checkout, or the target snapshot), and the baseline audit
+reads the base's lockfile but runs in the repository's checkout. A change that
 only drops an ignored advisory therefore fails the audit with the lockfile
 untouched and every finding out-of-diff. `CleanComparison::resolve` compares
 `.cargo/audit.toml` in the cargo root by blob identity in the base and the
@@ -347,7 +348,10 @@ so a rename or deletion counts even though those rows keep only a rename's new
 path. Anything a checkout could resolve differently (a symlink at the path or
 at a parent, an unreadable tree) counts as a change. A configuration elsewhere,
 such as the repository root's for a member cargo root, is not the file the
-audit read and does not count.
+audit read and does not count. Only the committed file is compared: an
+uncommitted or untracked one is not part of the change, and it cannot age an
+introduced advisory, because the baseline only ever reports advisories the
+base's lockfile carries.
 
 One proof covers every branch of the comparison, because `in_diff` already
 carries the rest: an untouched lock makes every advisory `in_diff = false`; a

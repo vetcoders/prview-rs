@@ -308,19 +308,28 @@ staged and then reverted in the working file cancels out in one combined
 diff), and a lock that no longer matches the target commit in either proves
 nothing either.
 
-Third, the audit's configuration must be the base's. `cargo audit` reads
-`.cargo/audit.toml` in the directory it runs in, without walking up, and
-otherwise `$CARGO_HOME/audit.toml`. That file's `ignore` list,
-`informational_warnings` and `[output] deny` decide which advisories fail. The
-base audit reads the base's lockfile but runs in the reviewed tree, so it reads
-the target's configuration too. A change that only drops an ignored advisory
-therefore fails the audit with the lockfile untouched and every finding
-out-of-diff. `.cargo/audit.toml` in the cargo root must be the same file in the
+Third, the configuration the audit applies must not have changed between the
+base and the target. `cargo audit` reads `.cargo/audit.toml` in the directory it
+runs in, without walking up, and otherwise `$CARGO_HOME/audit.toml`. That file's
+`ignore` list, `informational_warnings` and `[output] deny` decide which
+advisories fail. No audit reads the base's configuration: the audit runs in the
+reviewed tree, and the base audit reads the base's lockfile but runs in the
+repository's checkout. A change that only drops an ignored advisory therefore
+fails the audit with the lockfile untouched and every finding out-of-diff.
+`.cargo/audit.toml` in the cargo root must be the same committed file in the
 base and the target of every diff, or the proof is withheld. A rename or
 deletion counts, and so does anything a checkout could resolve differently,
 such as a symlink at the path or at a parent. A configuration anywhere else, for
 example the repository root's for a member cargo root, is not the file the audit
 read and does not count.
+
+Only the committed file is compared. An uncommitted or untracked
+`.cargo/audit.toml` in the checkout is not part of the change, and it cannot
+make an advisory the change introduced look older: whatever configuration the
+base audit applies, it only ever reports advisories the base's lockfile already
+carries. The path is matched as Git stores it, so on a case-insensitive
+filesystem a committed `.cargo/Audit.toml`, which `cargo audit` would read, is
+not compared.
 
 The proof licenses a downgrade; it never manufactures one. Advisories the diff
 introduced stay `introduced` — warnings-category ones too (`unmaintained`,

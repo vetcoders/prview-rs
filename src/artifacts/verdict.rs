@@ -1251,21 +1251,24 @@ fn config_file_owner(basename: &str) -> Option<&'static str> {
 ///
 /// That file is part of the substrate the audit verdict is computed on, like
 /// the lockfile. Its `ignore` list, `informational_warnings` and
-/// `[output] deny` decide which advisories fail the audit. The baseline audit
-/// reads the base's lockfile but runs in the reviewed tree, so it reads the
-/// target's configuration as well, and a changed configuration never shows up
-/// in the lockfile comparison. A pull request that only removes an ignored
-/// advisory makes the audit fail with the lockfile unchanged and every finding
-/// out-of-diff. The lockfile proof alone would then downgrade that failure to
-/// pre-existing, a false PASS, so a changed configuration withholds the proof
-/// as [`LockProofGap::AuditConfigChanged`].
+/// `[output] deny` decide which advisories fail the audit. No audit reads the
+/// base's configuration: the audit runs in the reviewed tree, and the baseline
+/// audit reads the base's lockfile but runs in the repository's checkout, so a
+/// changed configuration never shows up in the lockfile comparison. A pull
+/// request that only removes an ignored advisory makes the audit fail with the
+/// lockfile unchanged and every finding out-of-diff. The lockfile proof alone
+/// would then downgrade that failure to pre-existing, a false PASS, so a
+/// changed configuration withholds the proof as
+/// [`LockProofGap::AuditConfigChanged`].
 ///
 /// The file is compared by blob identity at its exact path in both commits
 /// ([`crate::artifacts::audit::cargo_audit_config_path`]). A rename or deletion
 /// therefore counts, even though the pack's changed-file rows keep only a
 /// rename's new path. Anything the commits cannot answer for also counts as a
 /// change: an unreadable tree, a symlink at the path or at a parent, or no
-/// repository.
+/// repository. Only the committed file is compared: an uncommitted one is not
+/// part of the change, and it cannot age an introduced advisory, because the
+/// baseline only ever reports advisories the base's lockfile carries.
 ///
 /// With no diffs there is no baseline for a downgrade anyway (R4-20). With a
 /// Cargo root outside the repository there is no in-tree file, and no lock
@@ -2983,12 +2986,12 @@ mod tests {
         );
     }
 
-    /// cargo-audit's configuration is substrate, like the lockfile. The baseline
-    /// audit runs in the reviewed tree and reads its `.cargo/audit.toml`, so a
-    /// pull request that only drops an ignored advisory fails the audit with the
-    /// lockfile unchanged. Every finding then sits out-of-diff, and the lockfile
-    /// premises, which all still hold, must not license the downgrade on their
-    /// own: the proof is withheld and names the configuration as its gap.
+    /// cargo-audit's configuration is substrate, like the lockfile. No audit
+    /// reads the base's `.cargo/audit.toml`, so a pull request that only drops
+    /// an ignored advisory fails the audit with the lockfile unchanged. Every
+    /// finding then sits out-of-diff, and the lockfile premises, which all still
+    /// hold, must not license the downgrade on their own: the proof is withheld
+    /// and names the configuration as its gap.
     ///
     /// The file is compared at the one path cargo-audit reads, so a rename away
     /// counts even though the changed-file row keeps only the new path. A
