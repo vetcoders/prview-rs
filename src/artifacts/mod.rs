@@ -896,7 +896,10 @@ pub fn generate(input: GenerateInput<'_>) -> Result<PathBuf> {
         resolved_target,
         resolved_bases,
         worktree_clean,
-        worktree_dirty_paths.as_ref(),
+        LockEvidence {
+            dirty_before_checks: worktree_dirty_paths.as_ref(),
+            snapshot_integrity: snapshot_integrity.as_ref(),
+        },
         worktree_head_sha.as_deref(),
         diffs,
     );

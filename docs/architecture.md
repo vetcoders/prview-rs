@@ -296,7 +296,23 @@ possibly a stale lock left behind — so that shape withholds the proof
 lockfile carried no uncommitted change — read from the dirty-path set frozen
 before the checks ran (R4-19). Dirt anywhere else in the tree is not evidence
 about that lockfile and no longer suppresses the downgrade; dirt in it is, and
-does. A withheld proof names its gap
+does.
+
+Where the tree starts is only half of the proof. Cargo check, clippy, test and
+audit run in the same tree one after another, none of them passes `--locked`,
+and cargo rewrites a lockfile its manifest has outgrown — so a target that adds
+a dependency without regenerating `Cargo.lock` has the lock updated by the first
+cargo command, the audit reads the updated lock, and the lock-changed
+classification still compares the committed, untouched one. Both shapes
+therefore also require that the audited lock did not change while the checks
+ran. A snapshot run reads that off the shared snapshot's check-boundary
+observations (the ones `20_quality/SNAPSHOT_INTEGRITY.*` publishes); a boundary
+that saw the audited lock change withholds the proof as `DirtyLock`, and an
+unreadable boundary or a snapshot with no observation as `UnknownProvenance`. A
+local run reads the audited lock once more after the checks, against the target
+commit with untracked files excluded — the in-repo output and check caches
+R4-19 guards against cannot reach that one tracked file — and a lock that
+differs withholds the proof as `DirtyLock`. A withheld proof names its gap
 (`CargoAuditLockProof::Unproven(LockProofGap)`), and the merge gate states that
 gap rather than blocking on a bare `Cargo audit (Failed)`.
 

@@ -80,6 +80,12 @@ impl SnapshotIntegrity {
         self.status != SnapshotIntegrityStatus::Clean
     }
 
+    /// Every tracked path any check boundary observed changed against the
+    /// reviewed target, or `None` when some boundary could not be read.
+    pub(crate) fn tracked_changes(&self) -> Option<&[String]> {
+        self.changed_paths.as_deref()
+    }
+
     pub(crate) fn apply_review(
         &self,
         confidence: &mut AnalysisStatus,

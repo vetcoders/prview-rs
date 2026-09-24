@@ -253,7 +253,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symlink committed in the lockfile's place, proves nothing; and a reviewed
   commit that moved its crate away from the configured cargo root withholds the
   proof, because cargo ran in a directory the lockfile questions were not asked
-  about. A new `warnings`-category advisory (`unmaintained`, `unsound`,
+  about. The lock must also stay the committed one while the checks run: none
+  of prview's cargo commands pass `--locked`, so a target that adds a dependency
+  without regenerating `Cargo.lock` has the lock rewritten before the audit reads
+  it. A snapshot run whose check-boundary observations saw the audited lock
+  change, or could not be read, withholds the proof, and a local run reads the
+  audited lock again after the checks. A new `warnings`-category advisory (`unmaintained`, `unsound`,
   `yanked`) blocks the downgrade like a new vulnerability: it has no
   vulnerability row of its own, so it reaches the classifier as a dashboard
   note, and a changed lock that kept an old vulnerability while adding one no

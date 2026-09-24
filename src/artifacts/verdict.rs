@@ -796,8 +796,10 @@ pub(crate) enum LockProofGap {
     /// read a lockfile `cargo audit` generated from the registry rather than one
     /// this repository committed.
     NoTargetLock,
-    /// The scanned checkout's lockfile carried an uncommitted change, so it is
-    /// not provably the target's.
+    /// The scanned tree's lockfile differed from the target's: it carried an
+    /// uncommitted change before the run, or a command rewrote it during the
+    /// run (cargo updates a lock its manifest has outgrown unless `--locked`
+    /// forbids it, and none of prview's cargo commands pass it).
     DirtyLock,
     /// The reviewed commit moved its cargo project away from the configured
     /// cargo root, so cargo ran in a directory the lockfile questions were not
@@ -848,31 +850,45 @@ impl LockProofGap {
 /// `cargo audit` never falls back to a workspace root's — and a tree without
 /// it, or an unanswerable question, establishes nothing.
 ///
-/// **Premise 2 — the lockfile that was read was that one.**
+/// **Premise 2 — the lockfile that was read was that one.** Where the tree
+/// starts is only half of it: cargo check, clippy, test and audit run in the
+/// same tree one after another, none of them passes `--locked`, and cargo
+/// rewrites a lockfile its manifest has outgrown. A target that adds a
+/// dependency without regenerating `Cargo.lock` therefore has the lock updated
+/// by the first cargo command, and the audit reads that updated lock — while
+/// the lock-changed classification still compares the committed, untouched
+/// one, so an advisory the manifest change pulled in reads as pre-existing.
+/// Both shapes therefore also ask whether the lock changed WHILE the checks ran.
+///
 /// `target_is_checkout == Some(false)` is the remote/snapshot shape: `cargo
-/// audit` runs through `plan_cargo_run`, which materialises a worktree snapshot
-/// at the target commit and executes there, so the lock it read IS the target's
-/// by construction. This widens the pre-existing downgrade to `cargo_audit` on
-/// snapshot runs — a deliberate gate-semantics decision (the case
-/// `check_scans_target_snapshot` documents as deliberately deferred), earned
-/// here by a proof rather than inherited from a check having moved substrate.
-/// "By construction" holds only while cargo ran in the cargo root premise 1
+/// audit` runs through `plan_cargo_run`, in a worktree snapshot materialised at
+/// the target commit, so the lock it read is the target's unless a command
+/// rewrote it. The shared snapshot is observed at every check boundary
+/// ([`LockEvidence::snapshot_integrity`]); the proof holds only when no
+/// boundary saw the audited lock change, and an unreadable boundary — or no
+/// observation at all — establishes nothing. This widens the pre-existing
+/// downgrade to `cargo_audit` on snapshot runs — a deliberate gate-semantics
+/// decision (the case `check_scans_target_snapshot` documents as deliberately
+/// deferred), earned here by a proof rather than inherited from a check having
+/// moved substrate. It holds only while cargo ran in the cargo root premise 1
 /// asked about: a reviewed commit that moved its manifest (`crates/core` →
 /// `backend`) has cargo run in the new directory, while premise 1 and the
 /// lock-changed classification still read the configured one — possibly a
 /// stale lock left behind. That shape is refused before premise 1 is asked.
 ///
 /// `Some(true)` is the local shape: the lock is the target's only while the
-/// lockfile carries no uncommitted change. The dirty set is the one frozen
-/// before the checks ran (R4-19), which is a statement about the tree the run
-/// started from, not about the instant the audit read the file. An unreadable
-/// status (`None`) establishes nothing.
+/// lockfile carries no uncommitted change, both in the dirty set frozen before
+/// the checks ran (R4-19) and after them. The second reading is of the audited
+/// lock alone, against the target commit, with untracked files excluded — so
+/// the in-repo output and check caches R4-19 guards against cannot reach it,
+/// while a lock cargo rewrote mid-run does. An unreadable status (`None` or a
+/// failed read) establishes nothing.
 fn resolve_cargo_audit_lock_proof(
     config: &Config,
     repo: Option<&crate::git::Repository>,
     resolved_target: &crate::git::ResolvedRef,
     target_is_checkout: Option<bool>,
-    worktree_dirty_paths: Option<&std::collections::BTreeSet<String>>,
+    evidence: LockEvidence<'_>,
 ) -> CargoAuditLockProof {
     let Some(target_is_checkout) = target_is_checkout else {
         return CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance);
@@ -899,14 +915,59 @@ fn resolve_cargo_audit_lock_proof(
     };
 
     if !target_is_checkout {
-        return CargoAuditLockProof::TargetLock;
+        return match evidence
+            .snapshot_integrity
+            .map(|integrity| integrity.tracked_changes())
+        {
+            Some(Some(changed)) if changed.contains(&lock) => {
+                CargoAuditLockProof::Unproven(LockProofGap::DirtyLock)
+            }
+            Some(Some(_)) => CargoAuditLockProof::TargetLock,
+            Some(None) | None => CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
+        };
     }
-    match worktree_dirty_paths {
-        None => CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
+    match evidence.dirty_before_checks {
+        None => return CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
         Some(dirty) if dirty.contains(&lock) => {
+            return CargoAuditLockProof::Unproven(LockProofGap::DirtyLock);
+        }
+        Some(_) => {}
+    }
+    match repo.worktree_changes_from_oid(&resolved_target.commit_id) {
+        Ok(changes)
+            if changes.iter().any(|change| {
+                change.old_path.as_deref() == Some(lock.as_str())
+                    || change.new_path.as_deref() == Some(lock.as_str())
+            }) =>
+        {
             CargoAuditLockProof::Unproven(LockProofGap::DirtyLock)
         }
-        Some(_) => CargoAuditLockProof::TargetLock,
+        Ok(_) => CargoAuditLockProof::TargetLock,
+        Err(_) => CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
+    }
+}
+
+/// What the run observed about the lockfile `cargo audit` read — the evidence
+/// premise 2 of [`resolve_cargo_audit_lock_proof`] is decided on.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LockEvidence<'a> {
+    /// Operator-checkout paths dirty before the checks ran (R4-19); `None` when
+    /// that status could not be read.
+    pub(crate) dirty_before_checks: Option<&'a std::collections::BTreeSet<String>>,
+    /// The shared snapshot's check-boundary observations: how an off-`HEAD` run
+    /// learns whether a command rewrote the tree the audit read. `None` for a
+    /// local review, which has no snapshot to observe.
+    pub(crate) snapshot_integrity: Option<&'a super::signal::SnapshotIntegrity>,
+}
+
+impl<'a> LockEvidence<'a> {
+    /// Evidence carrying only the dirty set frozen before the checks.
+    #[cfg(test)]
+    pub(crate) fn before_checks(dirty: Option<&'a std::collections::BTreeSet<String>>) -> Self {
+        LockEvidence {
+            dirty_before_checks: dirty,
+            snapshot_integrity: None,
+        }
     }
 }
 
@@ -976,7 +1037,7 @@ impl CleanComparison {
         resolved_target: &crate::git::ResolvedRef,
         resolved_bases: &[crate::git::ResolvedRef],
         worktree_clean: Option<bool>,
-        worktree_dirty_paths: Option<&std::collections::BTreeSet<String>>,
+        lock_evidence: LockEvidence<'_>,
         worktree_head_sha: Option<&str>,
         diffs: &[crate::git::Diff],
     ) -> Self {
@@ -999,7 +1060,7 @@ impl CleanComparison {
                 repo.as_ref(),
                 resolved_target,
                 target_is_checkout,
-                worktree_dirty_paths,
+                lock_evidence,
             ),
         }
     }
@@ -1246,8 +1307,10 @@ pub struct WorktreeProvenance {
     /// for a whole-tree scanner but the wrong evidence for a check whose
     /// substrate is a single file. Keeping the path set lets a per-file proof
     /// (today: cargo audit's lockfile, see [`CargoAuditLockProof`]) ask about
-    /// the file it actually read without taking a second, later reading of the
-    /// tree — which is exactly what R4-19 forbids.
+    /// the file it actually read without a second, later reading of the whole
+    /// tree — which is exactly what R4-19 forbids. (The lockfile proof does read
+    /// its one tracked file again after the checks, because cargo itself may
+    /// rewrite it; untracked output, R4-19's concern, cannot reach that read.)
     ///
     /// `None` whenever `clean` is `None`: a status nobody could read names no
     /// paths, and an empty set there would read as "nothing was dirty".
@@ -2555,7 +2618,7 @@ mod tests {
                 &resolved_ref(&first.to_string()),
                 &[resolved_ref(&target.to_string())],
                 Some(dirty.is_empty()),
-                Some(&dirty),
+                LockEvidence::before_checks(Some(&dirty)),
                 Some(&first.to_string()),
                 &[],
             )
@@ -2579,7 +2642,7 @@ mod tests {
                 &resolved_ref(&first.to_string()),
                 &[resolved_ref(&target.to_string())],
                 None,
-                None,
+                LockEvidence::before_checks(None),
                 Some(&first.to_string()),
                 &[],
             )
@@ -2612,7 +2675,7 @@ mod tests {
             &resolved_ref(&first.to_string()),
             &[resolved_ref(&target.to_string())],
             Some(true),
-            Some(&clean),
+            LockEvidence::before_checks(Some(&clean)),
             Some(&first.to_string()),
             &[],
         );
@@ -2633,7 +2696,7 @@ mod tests {
             &resolved_ref(&target.to_string()),
             &[resolved_ref(&first.to_string())],
             Some(true),
-            Some(&clean),
+            LockEvidence::before_checks(Some(&clean)),
             Some(&first.to_string()),
             &[],
         );
@@ -2654,12 +2717,16 @@ mod tests {
             .repo_root(lock_tmp.path())
             .build();
         for (target_ref, base_ref) in [(&lock_first, &lock_target), (&lock_target, &lock_first)] {
+            let untouched = snapshot_observed(&target_ref.to_string(), &[]);
             let proven = CleanComparison::resolve(
                 &lock_config,
                 &resolved_ref(&target_ref.to_string()),
                 &[resolved_ref(&base_ref.to_string())],
                 Some(true),
-                Some(&clean),
+                LockEvidence {
+                    dirty_before_checks: Some(&clean),
+                    snapshot_integrity: Some(&untouched),
+                },
                 Some(&lock_first.to_string()),
                 &[],
             );
@@ -2744,6 +2811,31 @@ mod tests {
         (tmp, head.to_string(), target.to_string())
     }
 
+    /// The shared snapshot as its check-boundary observations saw it: `changed`
+    /// are the only tracked paths any boundary found differing from `target`.
+    fn snapshot_observed(
+        target: &str,
+        changed: &[&str],
+    ) -> super::super::signal::SnapshotIntegrity {
+        use crate::checks::snapshot_integrity::{SnapshotIntegrityStatus, SnapshotObservation};
+        super::super::signal::SnapshotIntegrity::from_observations(
+            SnapshotObservation {
+                expected_target_sha: target.to_string(),
+                observed_head_sha: Some(target.to_string()),
+                status: if changed.is_empty() {
+                    SnapshotIntegrityStatus::Clean
+                } else {
+                    SnapshotIntegrityStatus::Modified
+                },
+                changed_paths: Some(changed.iter().map(|path| path.to_string()).collect()),
+                error: None,
+                phase: "after-checks",
+                check_name: None,
+            },
+            Vec::new(),
+        )
+    }
+
     fn member_config(tmp: &tempfile::TempDir) -> Config {
         let mut config = crate::config::test_config_builder()
             .repo_root(tmp.path())
@@ -2786,7 +2878,7 @@ mod tests {
             &resolved_ref(&target),
             &[resolved_ref(&head)],
             Some(true),
-            Some(&clean),
+            LockEvidence::before_checks(Some(&clean)),
             Some(&head),
             &[],
         );
@@ -2801,12 +2893,16 @@ mod tests {
         let config = member_config(&tmp);
         let relocated = crate::checks::reviewed_cargo_root_relocated(&config, &target);
         assert!(!relocated, "a crate that stayed put is not relocated");
+        let untouched = snapshot_observed(&target, &[]);
         let kept = CleanComparison::resolve(
             &config,
             &resolved_ref(&target),
             &[resolved_ref(&head)],
             Some(true),
-            Some(&clean),
+            LockEvidence {
+                dirty_before_checks: Some(&clean),
+                snapshot_integrity: Some(&untouched),
+            },
             Some(&head),
             &[],
         );
@@ -2837,7 +2933,7 @@ mod tests {
                 &resolved_ref(reviewed),
                 &[resolved_ref(base)],
                 Some(true),
-                Some(&clean),
+                LockEvidence::before_checks(Some(&clean)),
                 Some(&head),
                 &[],
             );
@@ -2869,7 +2965,7 @@ mod tests {
             &resolved_ref(&target),
             &[resolved_ref(&head)],
             Some(true),
-            Some(&clean),
+            LockEvidence::before_checks(Some(&clean)),
             Some(&head),
             &[],
         );
@@ -2901,7 +2997,7 @@ mod tests {
                 &resolved_ref(&head),
                 &[resolved_ref(&target)],
                 Some(dirty.is_empty()),
-                Some(&dirty),
+                LockEvidence::before_checks(Some(&dirty)),
                 Some(&head),
                 &[],
             )
@@ -2915,6 +3011,161 @@ mod tests {
             local(&["Cargo.lock"]),
             CargoAuditLockProof::TargetLock,
             "a root lock the member's audit never reads cannot revoke its proof"
+        );
+    }
+
+    /// P1: a snapshot is materialised at the target commit, but cargo does not
+    /// keep it that way. A target that adds a dependency without regenerating
+    /// `Cargo.lock` has the lock rewritten by the first cargo command (none
+    /// passes `--locked`), the audit reads the rewritten lock, and the committed
+    /// lock the classification compares is untouched — so an advisory the
+    /// manifest change pulled in reads as pre-existing. The boundary
+    /// observations of the shared snapshot are what shows the rewrite.
+    #[test]
+    fn a_lock_rewritten_in_the_snapshot_withholds_the_proof() {
+        let (tmp, _repo, first, target) = comparison_repo_with_lock();
+        let config = crate::config::test_config_builder()
+            .repo_root(tmp.path())
+            .build();
+        let clean: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let target = target.to_string();
+        let proof = |integrity: Option<&super::super::signal::SnapshotIntegrity>| {
+            CleanComparison::resolve(
+                &config,
+                &resolved_ref(&target),
+                &[resolved_ref(&first.to_string())],
+                Some(true),
+                LockEvidence {
+                    dirty_before_checks: Some(&clean),
+                    snapshot_integrity: integrity,
+                },
+                Some(&first.to_string()),
+                &[],
+            )
+            .cargo_audit_lock_proof()
+        };
+
+        assert_eq!(
+            proof(Some(&snapshot_observed(&target, &["Cargo.lock"]))),
+            CargoAuditLockProof::Unproven(LockProofGap::DirtyLock),
+            "the audit read a lock a check rewrote, not the committed one"
+        );
+        assert_eq!(
+            proof(Some(&snapshot_observed(&target, &["src/generated.rs"]))),
+            CargoAuditLockProof::TargetLock,
+            "a rewrite of some other tracked file says nothing about the lock"
+        );
+        let unreadable = super::super::signal::SnapshotIntegrity::from_observations(
+            crate::checks::snapshot_integrity::SnapshotObservation {
+                expected_target_sha: target.clone(),
+                observed_head_sha: None,
+                status: crate::checks::snapshot_integrity::SnapshotIntegrityStatus::Unknown,
+                changed_paths: None,
+                error: Some("open shared snapshot: gone".to_string()),
+                phase: "after-checks",
+                check_name: None,
+            },
+            Vec::new(),
+        );
+        assert_eq!(
+            proof(Some(&unreadable)),
+            CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
+            "an unreadable boundary establishes nothing"
+        );
+        assert_eq!(
+            proof(None),
+            CargoAuditLockProof::Unproven(LockProofGap::UnknownProvenance),
+            "a snapshot nobody observed establishes nothing"
+        );
+
+        // The member's audit reads the member's lock, so only a rewrite of THAT
+        // path revokes its proof.
+        use LockProofEntry::Blob;
+        let files = || {
+            [
+                ("crates/core/Cargo.toml", Blob(CORE_MANIFEST)),
+                ("crates/core/Cargo.lock", Blob(CORE_LOCK)),
+                ("Cargo.lock", Blob(CORE_LOCK)),
+            ]
+        };
+        let (member_tmp, head, member_target) = lock_proof_repo(&files(), &files());
+        let member = member_config(&member_tmp);
+        let member_proof = |changed: &[&str]| {
+            let observed = snapshot_observed(&member_target, changed);
+            CleanComparison::resolve(
+                &member,
+                &resolved_ref(&member_target),
+                &[resolved_ref(&head)],
+                Some(true),
+                LockEvidence {
+                    dirty_before_checks: Some(&clean),
+                    snapshot_integrity: Some(&observed),
+                },
+                Some(&head),
+                &[],
+            )
+            .cargo_audit_lock_proof()
+        };
+        assert_eq!(
+            member_proof(&["crates/core/Cargo.lock"]),
+            CargoAuditLockProof::Unproven(LockProofGap::DirtyLock)
+        );
+        assert_eq!(
+            member_proof(&["Cargo.lock"]),
+            CargoAuditLockProof::TargetLock,
+            "a root lock the member's audit never reads cannot revoke its proof"
+        );
+    }
+
+    /// The local half of the same P1: the dirty set is frozen before the checks
+    /// (R4-19), so a lock cargo rewrites mid-run is invisible to it. The audited
+    /// lock is read again after the checks — that one tracked file only, so the
+    /// untracked output R4-19 guards against still cannot revoke the proof.
+    #[test]
+    fn a_lock_rewritten_in_the_local_checkout_withholds_the_proof() {
+        let (tmp, _repo, first, target) = comparison_repo_with_lock();
+        let config = crate::config::test_config_builder()
+            .repo_root(tmp.path())
+            .build();
+        let clean: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let proof = || {
+            CleanComparison::resolve(
+                &config,
+                &resolved_ref(&first.to_string()),
+                &[resolved_ref(&target.to_string())],
+                Some(true),
+                LockEvidence::before_checks(Some(&clean)),
+                Some(&first.to_string()),
+                &[],
+            )
+            .cargo_audit_lock_proof()
+        };
+        let committed = std::fs::read_to_string(tmp.path().join("Cargo.lock")).unwrap();
+
+        std::fs::create_dir_all(tmp.path().join("target")).unwrap();
+        std::fs::write(tmp.path().join("target/cache.bin"), "check output").unwrap();
+        assert_eq!(
+            proof(),
+            CargoAuditLockProof::TargetLock,
+            "untracked check output does not touch the lockfile"
+        );
+
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            format!("{committed}\n[[package]]\nname = \"vulnerable\"\nversion = \"0.1.0\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            proof(),
+            CargoAuditLockProof::Unproven(LockProofGap::DirtyLock),
+            "a lock rewritten after the dirty set was frozen is not the committed one"
+        );
+
+        std::fs::write(tmp.path().join("Cargo.lock"), committed).unwrap();
+        assert_eq!(
+            proof(),
+            CargoAuditLockProof::TargetLock,
+            "the committed bytes restored are the committed lock again"
         );
     }
 
@@ -3219,7 +3470,7 @@ mod tests {
             &resolved_ref(&target.to_string()),
             &[resolved_ref(&first.to_string())],
             captured.clean,
-            captured.dirty_paths.as_ref(),
+            LockEvidence::before_checks(captured.dirty_paths.as_ref()),
             captured.head_sha.as_deref(),
             &[],
         );
@@ -3231,7 +3482,7 @@ mod tests {
             &resolved_ref(&target.to_string()),
             &[resolved_ref(&first.to_string())],
             captured.clean,
-            captured.dirty_paths.as_ref(),
+            LockEvidence::before_checks(captured.dirty_paths.as_ref()),
             captured.head_sha.as_deref(),
             &[],
         );
@@ -3266,7 +3517,7 @@ mod tests {
                 &resolved_ref(&first.to_string()),
                 &[resolved_ref(&other.to_string())],
                 captured.clean,
-                captured.dirty_paths.as_ref(),
+                LockEvidence::before_checks(captured.dirty_paths.as_ref()),
                 captured.head_sha.as_deref(),
                 &[],
             )
@@ -3294,7 +3545,7 @@ mod tests {
             &resolved_ref(&first.to_string()),
             &[resolved_ref(&other.to_string())],
             Some(true),
-            Some(&std::collections::BTreeSet::new()),
+            LockEvidence::before_checks(Some(&std::collections::BTreeSet::new())),
             None,
             &[],
         );

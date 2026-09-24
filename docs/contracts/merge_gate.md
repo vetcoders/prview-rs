@@ -296,7 +296,14 @@ about, and true for a local run when that lockfile carried no uncommitted change
 moved its crate away from the configured cargo root (`crates/core` → `backend`)
 has cargo run in the new directory, so a snapshot of it proves nothing. Unrelated
 dirt in the tree no longer suppresses the downgrade; a dirty audited lockfile
-does, and an unreadable status establishes nothing.
+does, and an unreadable status establishes nothing. The lockfile must also have
+stayed that one while the checks ran: prview's cargo commands do not pass
+`--locked`, so a lock the manifest has outgrown is rewritten by the first of
+them before the audit reads it. A snapshot run whose check-boundary
+observations (`20_quality/SNAPSHOT_INTEGRITY.*`) saw the audited lock change,
+or could not be read, proves nothing; a local run reads the audited lock again
+after the checks, and a lock that no longer matches the target commit proves
+nothing either.
 
 The proof licenses a downgrade; it never manufactures one. Advisories the diff
 introduced stay `introduced` — warnings-category ones too (`unmaintained`,
