@@ -2141,6 +2141,12 @@ mod tests {
                  shown to predate this change)",
             ),
             (
+                LockProofGap::AuditConfigChanged,
+                "Cargo audit (Failed): provenance proof unavailable: the cargo-audit \
+                 configuration (.cargo/audit.toml) changed (2 advisories not shown to \
+                 predate this change)",
+            ),
+            (
                 LockProofGap::UnknownProvenance,
                 "Cargo audit (Failed): provenance proof unavailable: the scanned tree \
                  could not be tied to the target commit (2 advisories not shown to \
@@ -2223,6 +2229,7 @@ mod tests {
             LockProofGap::NoTargetLock,
             LockProofGap::DirtyLock,
             LockProofGap::RelocatedCargoRoot,
+            LockProofGap::AuditConfigChanged,
             LockProofGap::UnknownProvenance,
         ] {
             let outcome = compute_effective_policy_outcome(

@@ -805,6 +805,12 @@ pub(crate) enum LockProofGap {
     /// cargo root, so cargo ran in a directory the lockfile questions were not
     /// asked about.
     RelocatedCargoRoot,
+    /// The change edits the configuration `cargo audit` read, `.cargo/audit.toml`
+    /// in the cargo root ([`cargo_audit_config_changed`]). The lockfile may be
+    /// the target's, but that file decides which advisories fail, and the
+    /// baseline audit runs under the target's copy of it, so no lockfile
+    /// comparison can show a failure predates the change.
+    AuditConfigChanged,
     /// The worktree status or the checkout's identity could not be read, so
     /// nothing about the scanned lockfile was established either way.
     UnknownProvenance,
@@ -825,6 +831,10 @@ impl LockProofGap {
                 "provenance proof unavailable: the reviewed commit moved the cargo \
                  root away from the configured one"
             }
+            LockProofGap::AuditConfigChanged => {
+                "provenance proof unavailable: the cargo-audit configuration \
+                 (.cargo/audit.toml) changed"
+            }
             LockProofGap::UnknownProvenance => {
                 "provenance proof unavailable: the scanned tree could not be tied \
                  to the target commit"
@@ -835,8 +845,10 @@ impl LockProofGap {
 
 /// Resolve [`CargoAuditLockProof`] for this run.
 ///
-/// The proof has TWO premises, and both branches of the checkout shape share
-/// the first one.
+/// The lockfile half of the proof has TWO premises, and both branches of the
+/// checkout shape share the first one. The third premise, an unchanged audit
+/// configuration, needs the diffs and is applied by [`CleanComparison::resolve`]
+/// ([`cargo_audit_config_changed`]).
 ///
 /// **Premise 1 — the target tree has a lockfile at all.** `cargo audit` does
 /// not refuse a crate without `Cargo.lock`; it resolves one from the registry,
@@ -1017,7 +1029,9 @@ pub(crate) struct CleanComparison {
     /// Cargo audit's own substrate proof. `cargo_audit` is the one
     /// baseline-signal check whose findings do not live in source files, so the
     /// whole-tree cleanliness rule above is not evidence about it either way —
-    /// see [`CargoAuditLockProof`].
+    /// see [`CargoAuditLockProof`]. Its configuration file is part of that
+    /// proof rather than of `configs_changed`, so the gate can name it
+    /// ([`LockProofGap::AuditConfigChanged`]).
     cargo_audit_lock: CargoAuditLockProof,
 }
 
@@ -1051,13 +1065,20 @@ impl CleanComparison {
             current_only: config.current_only,
             has_base_diff,
             configs_changed,
-            cargo_audit_lock: resolve_cargo_audit_lock_proof(
+            cargo_audit_lock: match resolve_cargo_audit_lock_proof(
                 config,
                 repo.as_ref(),
                 resolved_target,
                 target_is_checkout,
                 lock_evidence,
-            ),
+            ) {
+                CargoAuditLockProof::TargetLock
+                    if cargo_audit_config_changed(config, repo.as_ref(), diffs) =>
+                {
+                    CargoAuditLockProof::Unproven(LockProofGap::AuditConfigChanged)
+                }
+                proof => proof,
+            },
         }
     }
 
@@ -1223,6 +1244,58 @@ fn config_file_owner(basename: &str) -> Option<&'static str> {
         "semgrep.yml" | "semgrep.yaml" | ".semgrep.yml" | ".semgrep.yaml" => Some("semgrep_scan"),
         _ => None,
     }
+}
+
+/// Whether the configuration `cargo audit` reads in the audited Cargo root
+/// differs between the base and the target of any diff.
+///
+/// That file is part of the substrate the audit verdict is computed on, like
+/// the lockfile. Its `ignore` list, `informational_warnings` and
+/// `[output] deny` decide which advisories fail the audit. The baseline audit
+/// reads the base's lockfile but runs in the reviewed tree, so it reads the
+/// target's configuration as well, and a changed configuration never shows up
+/// in the lockfile comparison. A pull request that only removes an ignored
+/// advisory makes the audit fail with the lockfile unchanged and every finding
+/// out-of-diff. The lockfile proof alone would then downgrade that failure to
+/// pre-existing, a false PASS, so a changed configuration withholds the proof
+/// as [`LockProofGap::AuditConfigChanged`].
+///
+/// The file is compared by blob identity at its exact path in both commits
+/// ([`crate::artifacts::audit::cargo_audit_config_path`]). A rename or deletion
+/// therefore counts, even though the pack's changed-file rows keep only a
+/// rename's new path. Anything the commits cannot answer for also counts as a
+/// change: an unreadable tree, a symlink at the path or at a parent, or no
+/// repository.
+///
+/// With no diffs there is no baseline for a downgrade anyway (R4-20). With a
+/// Cargo root outside the repository there is no in-tree file, and no lock
+/// proof either.
+fn cargo_audit_config_changed(
+    config: &Config,
+    repo: Option<&crate::git::Repository>,
+    diffs: &[crate::git::Diff],
+) -> bool {
+    if diffs.is_empty() {
+        return false;
+    }
+    let Some(path) = crate::artifacts::audit::cargo_audit_config_path(
+        &config.repo_root,
+        config.profile.cargo_root.as_deref(),
+    ) else {
+        return false;
+    };
+    let Some(repo) = repo else {
+        return true;
+    };
+    diffs.iter().any(|diff| {
+        match (
+            repo.regular_blob_at_commit(&diff.base_commit_id, &path),
+            repo.regular_blob_at_commit(&diff.target_commit_id, &path),
+        ) {
+            (Ok(base), Ok(target)) => base != target,
+            _ => true,
+        }
+    })
 }
 
 /// The set of baseline-signal check_ids whose config file appears in `diffs`.
@@ -2908,6 +2981,147 @@ mod tests {
             kept.cargo_audit_lock_proof(),
             CargoAuditLockProof::TargetLock
         );
+    }
+
+    /// cargo-audit's configuration is substrate, like the lockfile. The baseline
+    /// audit runs in the reviewed tree and reads its `.cargo/audit.toml`, so a
+    /// pull request that only drops an ignored advisory fails the audit with the
+    /// lockfile unchanged. Every finding then sits out-of-diff, and the lockfile
+    /// premises, which all still hold, must not license the downgrade on their
+    /// own: the proof is withheld and names the configuration as its gap.
+    ///
+    /// The file is compared at the one path cargo-audit reads, so a rename away
+    /// counts even though the changed-file row keeps only the new path. A
+    /// member's audit never reads the repository root's file. A symlinked
+    /// `.cargo` is never vouched for.
+    #[test]
+    fn a_changed_cargo_audit_config_withholds_the_lock_proof() {
+        use LockProofEntry::Blob;
+        const IGNORING: &str = "[advisories]\nignore = [\"RUSTSEC-2020-0001\"]\n";
+        const STRICT: &str = "[advisories]\nignore = []\n";
+        const KEPT: CargoAuditLockProof = CargoAuditLockProof::TargetLock;
+        const WITHHELD: CargoAuditLockProof =
+            CargoAuditLockProof::Unproven(LockProofGap::AuditConfigChanged);
+
+        /// The proof for a snapshot review of `target_files` against
+        /// `head_files`, whose lockfile is the same committed file on both sides.
+        fn proof(
+            head_files: &[(&str, LockProofEntry)],
+            target_files: &[(&str, LockProofEntry)],
+            member: bool,
+        ) -> CargoAuditLockProof {
+            let (tmp, head, target) = lock_proof_repo(head_files, target_files);
+            let config = if member {
+                member_config(&tmp)
+            } else {
+                crate::config::test_config_builder()
+                    .repo_root(tmp.path())
+                    .build()
+            };
+            let diff = crate::git::Repository::open(tmp.path())
+                .unwrap()
+                .diff_refs(&resolved_ref(&head), &resolved_ref(&target))
+                .unwrap();
+            let clean = std::collections::BTreeSet::new();
+            let untouched = snapshot_observed(&target, &[]);
+            let comparison = CleanComparison::resolve(
+                &config,
+                &resolved_ref(&target),
+                &[resolved_ref(&head)],
+                Some(true),
+                LockEvidence {
+                    dirty_before_checks: Some(&clean),
+                    snapshot_integrity: Some(&untouched),
+                },
+                Some(&head),
+                &[diff],
+            );
+            let proof = comparison.cargo_audit_lock_proof();
+            assert_eq!(
+                comparison.applies_to("cargo_audit"),
+                proof == CargoAuditLockProof::TargetLock,
+                "the downgrade follows the proof"
+            );
+            proof
+        }
+
+        let root = |config: Option<&'static str>| {
+            let mut files = vec![
+                ("Cargo.toml", Blob(CORE_MANIFEST)),
+                ("Cargo.lock", Blob(CORE_LOCK)),
+            ];
+            if let Some(config) = config {
+                files.push((".cargo/audit.toml", Blob(config)));
+            }
+            files
+        };
+
+        assert_eq!(
+            proof(&root(None), &root(None), false),
+            KEPT,
+            "no configuration on either side keeps the proof"
+        );
+        assert_eq!(
+            proof(&root(Some(IGNORING)), &root(Some(IGNORING)), false),
+            KEPT,
+            "an unchanged configuration keeps the proof"
+        );
+        assert_eq!(
+            proof(&root(Some(IGNORING)), &root(Some(STRICT)), false),
+            WITHHELD,
+            "a dropped ignore can fail the audit with the lockfile unchanged"
+        );
+        assert_eq!(
+            proof(&root(None), &root(Some(STRICT)), false),
+            WITHHELD,
+            "an added project configuration replaces the user's"
+        );
+        assert_eq!(
+            proof(&root(Some(IGNORING)), &root(None), false),
+            WITHHELD,
+            "a deleted configuration drops its ignores"
+        );
+        let mut renamed = root(None);
+        renamed.push((".cargo/audit.toml.off", Blob(IGNORING)));
+        assert_eq!(
+            proof(&root(Some(IGNORING)), &renamed, false),
+            WITHHELD,
+            "a rename away counts, though the changed-file row names only the new path"
+        );
+
+        let member = |root_config: &'static str, own_config: &'static str| {
+            vec![
+                ("crates/core/Cargo.toml", Blob(CORE_MANIFEST)),
+                ("crates/core/Cargo.lock", Blob(CORE_LOCK)),
+                (".cargo/audit.toml", Blob(root_config)),
+                ("crates/core/.cargo/audit.toml", Blob(own_config)),
+            ]
+        };
+        assert_eq!(
+            proof(&member(IGNORING, IGNORING), &member(STRICT, IGNORING), true),
+            KEPT,
+            "a member's audit never reads the repository root's configuration"
+        );
+        assert_eq!(
+            proof(&member(IGNORING, IGNORING), &member(IGNORING, STRICT), true),
+            WITHHELD,
+            "the member's own configuration is the one the audit read"
+        );
+
+        #[cfg(unix)]
+        {
+            let linked = || {
+                let mut files = root(None);
+                files.push(("config/audit.toml", Blob(IGNORING)));
+                files.push((".cargo", LockProofEntry::Link("config")));
+                files
+            };
+            assert_eq!(
+                proof(&linked(), &linked(), false),
+                WITHHELD,
+                "a symlinked .cargo resolves outside what the tree describes"
+            );
+        }
     }
 
     /// `cargo audit` reads `Cargo.lock` in the directory it runs in and never a

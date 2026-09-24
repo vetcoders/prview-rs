@@ -274,9 +274,10 @@ and on a remote/snapshot target only the checks that scan the target snapshot
 qualify.
 
 `cargo_audit` is judged differently, because its findings are not source
-locations. An advisory is `Cargo.lock` × the advisory database, so no
-uncommitted source can move it and whole-tree cleanliness is not evidence about
-it either way. Its proof has two premises, and both must hold.
+locations. An advisory is `Cargo.lock` × the advisory database, filtered by the
+audit's configuration, so no uncommitted source can move it and whole-tree
+cleanliness is not evidence about it either way. Its proof has three premises,
+and all must hold.
 
 First, the target commit's tree must actually carry the `Cargo.lock` the audit
 reads — the one in the cargo root itself, committed as a regular file. `cargo
@@ -302,8 +303,24 @@ stayed that one while the checks ran: prview's cargo commands do not pass
 them before the audit reads it. A snapshot run whose check-boundary
 observations (`20_quality/SNAPSHOT_INTEGRITY.*`) saw the audited lock change,
 or could not be read, proves nothing; a local run reads the audited lock again
-after the checks, and a lock that no longer matches the target commit proves
+after the checks, in the index and in the working tree separately (a change
+staged and then reverted in the working file cancels out in one combined
+diff), and a lock that no longer matches the target commit in either proves
 nothing either.
+
+Third, the audit's configuration must be the base's. `cargo audit` reads
+`.cargo/audit.toml` in the directory it runs in, without walking up, and
+otherwise `$CARGO_HOME/audit.toml`. That file's `ignore` list,
+`informational_warnings` and `[output] deny` decide which advisories fail. The
+base audit reads the base's lockfile but runs in the reviewed tree, so it reads
+the target's configuration too. A change that only drops an ignored advisory
+therefore fails the audit with the lockfile untouched and every finding
+out-of-diff. `.cargo/audit.toml` in the cargo root must be the same file in the
+base and the target of every diff, or the proof is withheld. A rename or
+deletion counts, and so does anything a checkout could resolve differently,
+such as a symlink at the path or at a parent. A configuration anywhere else, for
+example the repository root's for a member cargo root, is not the file the audit
+read and does not count.
 
 The proof licenses a downgrade; it never manufactures one. Advisories the diff
 introduced stay `introduced` — warnings-category ones too (`unmaintained`,
@@ -367,7 +384,8 @@ unchanged vs base audit (N advisories)`, while a blocking one appears in
   shown to predate this change)` when the counts are silent and the lockfile
   proof was withheld — `<gap>` being `no Cargo.lock in the target tree`,
   `Cargo.lock dirty or rewritten in the scanned tree`, `the reviewed commit moved the cargo
-  root away from the configured one`, or `the scanned tree could not be tied to
+  root away from the configured one`, `the cargo-audit configuration
+  (.cargo/audit.toml) changed`, or `the scanned tree could not be tied to
   the target commit`. When `M` is zero the parenthetical is omitted and the gap
   stands alone: no line asserts a count it does not have.
 

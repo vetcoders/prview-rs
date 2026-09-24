@@ -393,6 +393,29 @@ pub(crate) fn cargo_audit_lock_path(
     repo_root: &std::path::Path,
     cargo_root: Option<&std::path::Path>,
 ) -> Option<String> {
+    cargo_root_file_path(repo_root, cargo_root, "Cargo.lock")
+}
+
+/// The repository-relative path of the configuration a `cargo audit` run in
+/// `cargo_root` discovers: `.cargo/audit.toml` in that directory, and only
+/// there. cargo-audit reads `./.cargo/audit.toml` relative to its working
+/// directory without walking up, and otherwise falls back to
+/// `$CARGO_HOME/audit.toml`, which lies outside the reviewed tree
+/// (`CargoAuditCommand::config_path` upstream).
+///
+/// `None` for a `cargo_root` outside the repository, as for the lockfile.
+pub(crate) fn cargo_audit_config_path(
+    repo_root: &std::path::Path,
+    cargo_root: Option<&std::path::Path>,
+) -> Option<String> {
+    cargo_root_file_path(repo_root, cargo_root, ".cargo/audit.toml")
+}
+
+fn cargo_root_file_path(
+    repo_root: &std::path::Path,
+    cargo_root: Option<&std::path::Path>,
+    file: &str,
+) -> Option<String> {
     let configured_root = cargo_root.unwrap_or(repo_root);
     let normalized =
         crate::paths::normalize_to_repo_relative(&configured_root.display().to_string(), repo_root);
@@ -401,11 +424,11 @@ pub(crate) fn cargo_audit_lock_path(
     }
     let relative_root = std::path::Path::new(&normalized.display);
     if relative_root == std::path::Path::new(".") {
-        return Some("Cargo.lock".to_string());
+        return Some(file.to_string());
     }
     Some(
         relative_root
-            .join("Cargo.lock")
+            .join(file)
             .to_string_lossy()
             .replace('\\', "/"),
     )

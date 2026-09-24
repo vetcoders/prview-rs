@@ -1098,10 +1098,15 @@ impl Repository {
     /// Whether one tracked path differs between an exact target commit and the
     /// current index / working directory.
     ///
-    /// The single-file form of [`Self::worktree_changes_from_oid`]: the diff is
-    /// narrowed to `path` at construction time (a literal path, never a glob)
-    /// and needs no rename detection, so the caller does not pay for a whole
-    /// tree to ask about one file. Untracked content is excluded, as there.
+    /// The diff is narrowed to `path` at construction time (a literal path,
+    /// never a glob) and needs no rename detection, so the caller does not pay
+    /// for a whole tree to ask about one file. Untracked content is excluded.
+    ///
+    /// The target-to-index and index-to-working-tree axes are read apart, as
+    /// the snapshot-integrity check does: a change staged and then reverted in
+    /// the working file cancels out in one combined tree-to-workdir diff. Both
+    /// diffs load the index from disk rather than a copy cached before the
+    /// checks ran.
     pub(crate) fn tracked_path_differs_from_oid(
         &self,
         target_oid: &str,
@@ -1115,10 +1120,14 @@ impl Repository {
             .include_unreadable(true)
             .disable_pathspec_match(true)
             .pathspec(path);
-        let diff = self
+        let staged = self
             .inner
-            .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))?;
-        Ok(diff.deltas().next().is_some())
+            .diff_tree_to_index(Some(&tree), None, Some(&mut options))?;
+        if staged.deltas().next().is_some() {
+            return Ok(true);
+        }
+        let working = self.inner.diff_index_to_workdir(None, Some(&mut options))?;
+        Ok(working.deltas().next().is_some())
     }
 
     fn exact_commit_tree(&self, commit_oid: &str) -> Result<git2::Tree<'_>> {
@@ -1159,6 +1168,49 @@ impl Repository {
         };
         Ok(entry.kind() == Some(git2::ObjectType::Blob)
             && entry.filemode() != i32::from(git2::FileMode::Link))
+    }
+
+    /// The blob an exact commit holds as a regular file at `file_path`, or
+    /// `None` when the commit has no entry there. This is the identity of what
+    /// a checkout of the commit would let a tool read at that path.
+    ///
+    /// Anything else is an error, not an absence. That covers a symlink or
+    /// submodule at the path, and a nearest existing parent that is not a
+    /// directory, such as a symlinked `.cargo`. A checkout resolves those to
+    /// content this tree does not describe. Callers that compare two commits
+    /// must therefore treat an error as "may differ".
+    pub(crate) fn regular_blob_at_commit(
+        &self,
+        commit_oid: &str,
+        file_path: &str,
+    ) -> Result<Option<git2::Oid>> {
+        let safe_path = crate::paths::validate_repo_relative_str(file_path)?;
+        let tree = self.exact_commit_tree(commit_oid)?;
+        match tree.get_path(safe_path) {
+            Ok(entry)
+                if entry.kind() == Some(git2::ObjectType::Blob)
+                    && entry.filemode() != i32::from(git2::FileMode::Link) =>
+            {
+                return Ok(Some(entry.id()));
+            }
+            Ok(_) => anyhow::bail!("{file_path} is not a regular file in {commit_oid}"),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        for parent in safe_path.ancestors().skip(1) {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            if let Ok(entry) = tree.get_path(parent) {
+                anyhow::ensure!(
+                    entry.kind() == Some(git2::ObjectType::Tree),
+                    "{} is not a directory in {commit_oid}",
+                    parent.display()
+                );
+                break;
+            }
+        }
+        Ok(None)
     }
 
     /// Directories of `commit_ref` that contain `file_name`, repo-relative and
@@ -1722,6 +1774,34 @@ mod tests {
         assert!(!differs("a1.lock"));
         fs::remove_file(tmp.path().join("a1.lock")).expect("delete lock");
         assert!(differs("a1.lock"), "a deleted lock differs too");
+    }
+
+    /// A lock rewritten and staged, then restored in the working file: the
+    /// combined tree-to-workdir diff is empty (`git diff HEAD` shows nothing),
+    /// but the index still differs from the target, so the path differs. The
+    /// handle is opened before the index changes, so this also proves the index
+    /// is read from disk, not from a copy cached when the handle was opened.
+    #[test]
+    fn tracked_path_differs_from_oid_keeps_a_staged_change_the_worktree_restored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q", "-b", "main"]);
+        let target = write_commit(tmp.path(), "Cargo.lock", "target\n");
+        let repo = Repository::open(tmp.path()).expect("open repo");
+        assert!(
+            !repo
+                .tracked_path_differs_from_oid(&target, "Cargo.lock")
+                .expect("status")
+        );
+
+        fs::write(tmp.path().join("Cargo.lock"), "rewritten\n").expect("rewrite lock");
+        run_git(tmp.path(), &["add", "Cargo.lock"]);
+        fs::write(tmp.path().join("Cargo.lock"), "target\n").expect("restore lock");
+
+        assert!(
+            repo.tracked_path_differs_from_oid(&target, "Cargo.lock")
+                .expect("status"),
+            "a staged rewrite hidden by restored working bytes still differs"
+        );
     }
 
     fn init_repo_with_advanced_base() -> (tempfile::TempDir, String, String, String) {

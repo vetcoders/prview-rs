@@ -325,9 +325,29 @@ a rewrite by a later check withholds the proof too — deliberately conservative
 A local run reads the audited lock once more after the checks, with a diff
 narrowed to that one path against the target commit and untracked files excluded — the in-repo output and check caches
 R4-19 guards against cannot reach that one tracked file — and a lock that
-differs withholds the proof as `DirtyLock`. A withheld proof names its gap
+differs withholds the proof as `DirtyLock`. That reading compares the target
+with the index and the index with the working tree separately, as the
+snapshot-integrity check does: a change staged and then reverted in the
+working file cancels out in one combined target-to-worktree diff. A withheld proof names its gap
 (`CargoAuditLockProof::Unproven(LockProofGap)`), and the merge gate states that
 gap rather than blocking on a bare `Cargo audit (Failed)`.
+
+The lockfile is not the audit's only in-tree input. `cargo audit` reads
+`.cargo/audit.toml` in its working directory, without walking up, and otherwise
+`$CARGO_HOME/audit.toml` (`CargoAuditCommand::config_path` upstream). That
+file's `ignore` list, `informational_warnings` and `[output] deny` decide which
+advisories fail. The baseline audit reads the base's lockfile but runs in the
+reviewed tree, so it reads the target's configuration as well. A change that
+only drops an ignored advisory therefore fails the audit with the lockfile
+untouched and every finding out-of-diff. `CleanComparison::resolve` compares
+`.cargo/audit.toml` in the cargo root by blob identity in the base and the
+target of every diff, and any difference withholds the proof as
+`AuditConfigChanged`. The comparison is by path, not by the changed-file rows,
+so a rename or deletion counts even though those rows keep only a rename's new
+path. Anything a checkout could resolve differently (a symlink at the path or
+at a parent, an unreadable tree) counts as a change. A configuration elsewhere,
+such as the repository root's for a member cargo root, is not the file the
+audit read and does not count.
 
 One proof covers every branch of the comparison, because `in_diff` already
 carries the rest: an untouched lock makes every advisory `in_diff = false`; a
