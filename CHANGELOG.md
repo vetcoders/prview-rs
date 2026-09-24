@@ -272,7 +272,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `yanked`, and any vulnerability or counted `warnings` item that cannot be
   keyed makes the report unreadable rather than invisible — a vulnerability
   missing its advisory id or locked version no longer shares a placeholder key
-  with an unrelated malformed one in the base. The base audit reads the base's copy
+  with an unrelated malformed one in the base. Two items that share a key (the
+  key names no package source, and rustsec's yanked check accepts both
+  spellings of the crates.io index) make the report unreadable too, instead of
+  shrinking the compared set. The base audit reads the base's copy
   of the lockfile the audit read: a member that gains its own `Cargo.lock` is
   no longer compared against the repository-root lock (a superset of every
   member's resolution), so an advisory the new member lock introduced is no
@@ -292,7 +295,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index and the working tree separately. Nor does a lock or configuration
   edited under a skip-worktree or assume-unchanged flag, which status and the
   index's view hide: the re-read also compares the working tree with the target
-  commit directly. The gate states which proof it
+  commit directly, and the snapshot's check-boundary observations
+  (`SNAPSHOT_INTEGRITY`) read such entries on disk the same way. A snapshot
+  run whose target has no configuration withholds the proof when a check left
+  one at the path in the snapshot, which no boundary lists as untracked. A
+  relative `CARGO_HOME`, inherited by the checks, resolves inside the scanned
+  tree, where cargo-audit's fallback configuration and advisory database then
+  live; it withholds the proof as `CARGO_HOME is relative, so cargo audit read
+  its fallback configuration and advisory database inside the scanned tree`.
+  The gate states which proof it
   applied: a downgraded audit reads `pre-existing: Cargo.lock unchanged by this
   PR (N advisories)`; a blocking one names the advisories it blocks on — all of
   them, counted and named from one set, so an `unmaintained` warning is no

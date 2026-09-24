@@ -302,8 +302,10 @@ stayed that one while the checks ran: prview's cargo commands do not pass
 `--locked`, so a lock the manifest has outgrown is rewritten by the first of
 them before the audit reads it. A snapshot run whose check-boundary
 observations (`20_quality/SNAPSHOT_INTEGRITY.*`) saw the audited lock change,
-or could not be read, proves nothing; a local run reads the audited lock again
-after the checks, in the index and in the working tree separately (a change
+or could not be read, proves nothing (each boundary also reads an entry marked
+skip-worktree or assume-unchanged on disk, for the reason below); a local run
+reads the audited lock again after the checks, in the index and in the working
+tree separately (a change
 staged and then reverted in the working file cancels out in one combined
 diff), and once more on disk against the commit itself, past the index: an
 entry marked skip-worktree or assume-unchanged is reported unmodified by status
@@ -334,13 +336,17 @@ review therefore withholds the proof when any of these holds:
 
 - the status read before the checks lists the file or a parent of it, such as
   an untracked symlinked `.cargo`;
-- after the checks, the tracked file differs from the target's in the index or
-  in the working tree;
+- after the checks, the tracked file differs from the target's in the index, in
+  the working tree, or on disk past a skip-worktree or assume-unchanged flag;
 - the target has no configuration and a file exists at the path. This is what
   catches an ignored configuration, which no status read lists.
 
 A snapshot run audits a tree materialised from the target, so there only a
-check boundary that saw the file rewritten withholds the proof.
+check can make the file differ. A check boundary that saw the tracked file
+rewritten withholds the proof. No boundary lists an untracked or ignored file,
+though, and a check's build script can generate one, so where the target has no
+configuration any file at the path in the snapshot's working tree withholds the
+proof too, and a snapshot tree that cannot be looked at proves nothing.
 
 A case-insensitive filesystem reads `.cargo/audit.toml` under any spelling, so
 a committed `.cargo/Audit.toml` or `.CARGO/audit.toml` is a configuration the
@@ -350,9 +356,14 @@ matches `.cargo/audit.toml` only when case is ignored, in the target or on
 either side of any diff, therefore withholds the proof on its own, and the
 dirty paths above are matched ignoring case as well.
 
-`$CARGO_HOME/audit.toml` lies outside the reviewed tree: it is the
-environment's policy, applied alike to the audit and its baseline, and no
-commit speaks for it.
+With an absolute `CARGO_HOME`, `$CARGO_HOME/audit.toml` lies outside the
+reviewed tree: it is the environment's policy, applied alike to the audit and
+its baseline, and no commit speaks for it. prview does not set `CARGO_HOME` for
+its checks, so they inherit the operator's, and a relative one resolves against
+the directory the audit ran in. That puts the fallback configuration, and the
+advisory database under it, inside the scanned tree, where a change can edit
+them with the lockfile untouched. A relative `CARGO_HOME` therefore withholds
+the proof on its own. An empty one counts as unset, as it does for cargo-audit.
 
 The proof licenses a downgrade; it never manufactures one. Advisories the diff
 introduced stay `introduced` — warnings-category ones too (`unmaintained`,
@@ -365,8 +376,8 @@ keeps gating. The base audit reads the base's copy of the lockfile the audit
 read; a base without one (a member lock the change added beside a root lock)
 has no base audit. Every vulnerability entry and every `warnings` item the
 check status counts is part of the compared set — a yanked release, which has
-no advisory, under the id `yanked` — and an item that cannot be keyed makes
-the report unreadable. A run with no diff baseline at all (`--current-only`, or no
+no advisory, under the id `yanked` — and an item that cannot be keyed, or two
+items that share a key, make the report unreadable. A run with no diff baseline at all (`--current-only`, or no
 resolved base differing from the target) downgrades nothing, whatever the
 lockfile says.
 
@@ -418,7 +429,9 @@ unchanged vs base audit (N advisories)`, while a blocking one appears in
   `Cargo.lock dirty or rewritten in the scanned tree`, `the reviewed commit moved the cargo
   root away from the configured one`, `the cargo-audit configuration
   (.cargo/audit.toml) changed or is dirty in the scanned tree`, `.cargo/audit.toml
-  is committed under another case, which a case-insensitive checkout reads`, or
+  is committed under another case, which a case-insensitive checkout reads`,
+  `CARGO_HOME is relative, so cargo audit read its fallback configuration and
+  advisory database inside the scanned tree`, or
   `the scanned tree could not be tied to the target commit`. When `M` is zero the
   parenthetical is omitted and the gap
   stands alone: no line asserts a count it does not have.

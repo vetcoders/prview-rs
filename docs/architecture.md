@@ -320,6 +320,11 @@ ran. A snapshot run reads that off the shared snapshot's check-boundary
 observations (the ones `20_quality/SNAPSHOT_INTEGRITY.*` publishes); a boundary
 that saw the audited lock change withholds the proof as `DirtyLock`, and an
 unreadable boundary or a snapshot with no observation as `UnknownProvenance`.
+Each boundary diffs the target against the index and the index against the
+working tree, and then reads every index entry flagged skip-worktree or
+assume-unchanged once more straight from the target tree to disk, for the
+reason the local reading below gives; libgit2 also drops a deleted
+assume-unchanged entry from the index-to-worktree diff (`diff_delta__from_one`).
 The boundaries are unioned over the whole run rather than cut at the audit, so
 a rewrite by a later check withholds the proof too — deliberately conservative.
 A local run reads the audited lock once more after the checks, with a diff
@@ -361,18 +366,36 @@ the change introduced while pre-existing ones still fail. The local shape
 mirrors the lockfile's two observations. Before the checks, the frozen dirty
 set must not list the file or a parent of it, such as an untracked symlinked
 `.cargo`. After the checks, the tracked file is read against the target on the
-index and working-tree axes, and where the target has no configuration, any
-file at the path counts. That last test catches an ignored configuration,
-which no status read lists. A snapshot run audits a tree materialised from the
-target, so only a check boundary that saw the file rewritten withholds the
-proof there. A case-insensitive filesystem also reads `.cargo/Audit.toml` or
+index and working-tree axes and on disk past any skip flag, and where the
+target has no configuration, any file at the path counts. That last test
+catches an ignored configuration, which no status read lists. A snapshot run
+audits a tree materialised from the target, so only a check can make the file
+differ there: a boundary that saw the tracked file rewritten withholds the
+proof, and where the target has no configuration, so does any file at the path
+in the snapshot's working tree (`LockEvidence::snapshot_root`), because no
+boundary lists the untracked or ignored file a check's build script can
+generate. A case-insensitive filesystem also reads `.cargo/Audit.toml` or
 `.CARGO/audit.toml` as the configuration, which a comparison by exact path never
 sees, and with two spellings committed the checkout picks which one is on disk.
 `cargo_audit_config_gap` therefore withholds the proof as
 `AuditConfigCaseVariant` when the target, or either side of any diff, commits a
 path that matches `.cargo/audit.toml` only when case is ignored
 (`Repository::case_variant_at_commit`), and the dirty-set match
-(`path_or_parent_is`) ignores case too.
+(`path_or_parent_is`) ignores case too. The `$CARGO_HOME/audit.toml` fallback
+is the environment's policy only while `CARGO_HOME` is absolute. prview does
+not set it for its checks, so they inherit the operator's value, and a
+relative one resolves against the directory the audit ran in, which puts the
+fallback configuration and the advisory database inside the scanned tree.
+`cargo_audit_config_gap` withholds the proof as `RelativeCargoHome` for a
+non-empty relative value before any other question
+(`LockEvidence::cargo_home`, read from this process's environment).
+
+`cargo_audit_report_advisory_keys` keys each report item by advisory id,
+package name and locked version, without the package source. rustsec reports
+vulnerabilities and warnings for default-registry packages only, so two genuine
+items never share a key through different sources, but its yanked check
+accepts both spellings of the crates.io index. A key two items share would make
+the set smaller than the report, so it makes the report unreadable instead.
 
 One proof covers every branch of the comparison, because `in_diff` already
 carries the rest: an untouched lock makes every advisory `in_diff = false`; a
